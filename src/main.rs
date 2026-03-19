@@ -3,8 +3,10 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{CommandFactory, Parser};
+use lint4d::config::baseline::Baseline;
 use lint4d::config::Config;
 use lint4d::discovery::discover_files;
+use lint4d::discovery::dproj::parse_dproj;
 use lint4d::engine::{run_lint, Severity};
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;
@@ -15,6 +17,8 @@ use rayon::prelude::*;
 const EXIT_OK: i32 = 0;
 const EXIT_ISSUES: i32 = 1;
 const EXIT_ERROR: i32 = 2;
+
+const BASELINE_FILENAME: &str = ".lint4d-baseline.json";
 
 #[derive(Parser)]
 #[command(name = "lint4d", version, about = "An open-source Delphi linter")]
@@ -34,7 +38,7 @@ struct Cli {
     #[arg(long)]
     init: bool,
 
-    /// Generate a baseline file (not yet implemented)
+    /// Generate a baseline file from current violations
     #[arg(long)]
     generate_baseline: bool,
 
@@ -57,12 +61,6 @@ fn main() {
     // --init: create default config and exit
     if cli.init {
         run_init();
-        return;
-    }
-
-    // --generate-baseline: placeholder
-    if cli.generate_baseline {
-        eprintln!("lint4d: --generate-baseline is not yet implemented");
         return;
     }
 
@@ -104,12 +102,6 @@ fn main() {
         process::exit(EXIT_ERROR);
     }
 
-    // --project: not yet implemented (Task 21)
-    if cli.project.is_some() {
-        eprintln!("lint4d: --project is not yet implemented");
-        process::exit(EXIT_ERROR);
-    }
-
     // Discover config
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (config, _project_root) = match Config::discover(&cwd) {
@@ -120,12 +112,22 @@ fn main() {
         }
     };
 
-    // Build file list from CLI paths
-    let files = match discover_files(&cli.paths, &config.exclude) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("lint4d: file discovery error: {}", e);
-            process::exit(EXIT_ERROR);
+    // Build file list: --project uses dproj parser, otherwise glob discovery
+    let files = if let Some(ref project_path) = cli.project {
+        match parse_dproj(project_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("lint4d: project file error: {}", e);
+                process::exit(EXIT_ERROR);
+            }
+        }
+    } else {
+        match discover_files(&cli.paths, &config.exclude) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("lint4d: file discovery error: {}", e);
+                process::exit(EXIT_ERROR);
+            }
         }
     };
 
@@ -149,6 +151,30 @@ fn main() {
 
     // Sort by file path for deterministic output
     file_results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // --generate-baseline: collect all diagnostics, write baseline, and exit
+    if cli.generate_baseline {
+        run_generate_baseline(&cwd, &file_results);
+        return;
+    }
+
+    // Load baseline if it exists
+    let baseline = load_baseline(&cwd);
+
+    // Filter diagnostics against baseline
+    if let Some(ref bl) = baseline {
+        for (_file_path_str, source, diagnostics) in &mut file_results {
+            let source_text = String::from_utf8_lossy(source);
+            let source_lines: Vec<&str> = source_text.lines().collect();
+            diagnostics.retain(|diag| {
+                let line_content = source_lines
+                    .get(diag.line.saturating_sub(1))
+                    .unwrap_or(&"");
+                let file_path = &_file_path_str;
+                !bl.is_suppressed(file_path, diag, line_content)
+            });
+        }
+    }
 
     // Check threshold and produce output
     let mut has_issues_above_threshold = false;
@@ -178,6 +204,83 @@ fn main() {
 
     if has_issues_above_threshold {
         process::exit(EXIT_ISSUES);
+    }
+}
+
+fn run_generate_baseline(
+    cwd: &PathBuf,
+    file_results: &[(String, Vec<u8>, Vec<lint4d::engine::Diagnostic>)],
+) {
+    let mut baseline = Baseline::new();
+    let mut total_violations = 0;
+
+    for (file_path_str, source, diagnostics) in file_results {
+        if diagnostics.is_empty() {
+            continue;
+        }
+
+        let source_text = String::from_utf8_lossy(source);
+        let source_lines: Vec<&str> = source_text.lines().collect();
+
+        let diag_refs: Vec<&lint4d::engine::Diagnostic> = diagnostics.iter().collect();
+        let line_contents: Vec<&str> = diagnostics
+            .iter()
+            .map(|d| {
+                source_lines
+                    .get(d.line.saturating_sub(1))
+                    .copied()
+                    .unwrap_or("")
+            })
+            .collect();
+
+        let file_baseline =
+            Baseline::from_diagnostics(file_path_str, &diag_refs, &line_contents);
+        total_violations += file_baseline.violations.len();
+        baseline.violations.extend(file_baseline.violations);
+    }
+
+    let baseline_path = cwd.join(BASELINE_FILENAME);
+    let json = baseline.to_json();
+    if let Err(e) = fs::write(&baseline_path, &json) {
+        eprintln!("lint4d: failed to write baseline: {}", e);
+        process::exit(EXIT_ERROR);
+    }
+
+    eprintln!(
+        "Baseline generated: {} violation(s) recorded in {}",
+        total_violations, BASELINE_FILENAME
+    );
+}
+
+fn load_baseline(cwd: &PathBuf) -> Option<Baseline> {
+    let baseline_path = cwd.join(BASELINE_FILENAME);
+    if !baseline_path.exists() {
+        return None;
+    }
+
+    let content = match fs::read_to_string(&baseline_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "lint4d: warning: failed to read {}: {}",
+                BASELINE_FILENAME, e
+            );
+            return None;
+        }
+    };
+
+    match Baseline::from_json(&content) {
+        Ok(bl) => {
+            eprintln!(
+                "Loaded baseline with {} suppressed violation(s)",
+                bl.violations.len()
+            );
+            Some(bl)
+        }
+        Err(e) => {
+            eprintln!("lint4d: warning: {}", e);
+            None
+        }
     }
 }
 

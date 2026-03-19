@@ -150,10 +150,57 @@ fn fail_on_warning_catches_warnings() {
 }
 
 #[test]
-fn generate_baseline_placeholder() {
+fn generate_baseline_creates_file_and_suppresses() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Bad.pas"),
+        "unit Bad;\ninterface\nimplementation\nprocedure X;\nbegin\ntry\n  WriteLn('x');\nexcept\nend;\nend;\nend.\n",
+    )
+    .unwrap();
+
+    // Generate baseline
     lint4d()
         .arg("--generate-baseline")
+        .arg(dir.path().join("Bad.pas"))
+        .current_dir(dir.path())
         .assert()
-        .success()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .success();
+
+    assert!(dir.path().join(".lint4d-baseline.json").exists());
+
+    // Lint with baseline — should suppress existing violations
+    lint4d()
+        .arg(dir.path().join("Bad.pas"))
+        .current_dir(dir.path())
+        .assert()
+        .success(); // exit 0 because all violations are baselined
+}
+
+#[test]
+fn project_flag_lints_dproj_files() {
+    let dir = TempDir::new().unwrap();
+    // Create a simple .pas file
+    fs::write(
+        dir.path().join("Unit1.pas"),
+        "unit Unit1;\ninterface\nimplementation\nend.\n",
+    )
+    .unwrap();
+    // Create a .dproj referencing it
+    fs::write(
+        dir.path().join("MyProject.dproj"),
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ItemGroup>
+    <DCCReference Include="Unit1.pas"/>
+  </ItemGroup>
+</Project>"#,
+    )
+    .unwrap();
+
+    lint4d()
+        .arg("--project")
+        .arg(dir.path().join("MyProject.dproj"))
+        .current_dir(dir.path())
+        .assert()
+        .success();
 }

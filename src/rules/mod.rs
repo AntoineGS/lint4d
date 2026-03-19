@@ -1,3 +1,5 @@
+pub mod exception;
+
 use tree_sitter::Tree;
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
@@ -84,15 +86,7 @@ impl RuleRegistry {
                     description: "Detects resources created without any try block.",
                 },
             }),
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "empty-except",
-                    name: "Empty Except Block",
-                    category: RuleCategory::ExceptionHandling,
-                    default_severity: Severity::Warning,
-                    description: "Detects empty except blocks that silently swallow exceptions.",
-                },
-            }),
+            Box::new(exception::EmptyExceptRule::new()),
             Box::new(StubRule {
                 meta: RuleMeta {
                     id: "bare-except",

@@ -1,4 +1,5 @@
 mod context;
+pub mod suppress;
 
 pub use context::{Diagnostic, FileInfo, FileType, Severity};
 

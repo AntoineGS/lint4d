@@ -1,6 +1,7 @@
 pub mod dangerous;
 pub mod exception;
 pub mod naming;
+pub mod resource_leak;
 
 use tree_sitter::Tree;
 
@@ -70,15 +71,7 @@ pub struct RuleRegistry {
 impl RuleRegistry {
     pub fn new() -> Self {
         let rules: Vec<Box<dyn Rule>> = vec![
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "resource-leak-unprotected",
-                    name: "Resource Leak: Unprotected",
-                    category: RuleCategory::ResourceManagement,
-                    default_severity: Severity::Error,
-                    description: "Detects resources created without try..finally protection.",
-                },
-            }),
+            Box::new(resource_leak::ResourceLeakUnprotectedRule::new()),
             Box::new(StubRule {
                 meta: RuleMeta {
                     id: "resource-leak-no-try",

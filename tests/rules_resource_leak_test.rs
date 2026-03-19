@@ -57,3 +57,21 @@ fn resource_leak_no_try_skips_owned_objects() {
         .collect();
     assert!(matches.is_empty(), "Expected no resource-leak-no-try for owned objects, got: {:?}", matches);
 }
+
+#[test]
+fn resource_leak_unprotected_flags_multi_constructor() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/bad_multi_constructor.pas");
+    let matches: Vec<_> = diagnostics.iter()
+        .filter(|d| d.rule_id == "resource-leak-unprotected")
+        .collect();
+    assert!(!matches.is_empty(), "Should flag code between constructors and try");
+}
+
+#[test]
+fn resource_leak_accepts_free_and_nil() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_free_and_nil.pas");
+    let matches: Vec<_> = diagnostics.iter()
+        .filter(|d| d.rule_id.starts_with("resource-leak"))
+        .collect();
+    assert!(matches.is_empty(), "FreeAndNil should be recognized as cleanup: {:?}", matches);
+}

@@ -1,4 +1,5 @@
 mod toml_config;
+pub mod baseline;
 
 use crate::engine::Severity;
 use std::collections::HashMap;

@@ -16,10 +16,26 @@ fn formats_single_diagnostic() {
     };
 
     let output = format_diagnostics("src/MyUnit.pas", source.as_bytes(), &[diag], false);
-    assert!(output.contains("error[resource-leak-unprotected]"), "Missing rule header: {}", output);
-    assert!(output.contains("src/MyUnit.pas:4:1"), "Missing location: {}", output);
-    assert!(output.contains("obj.SomeFun;"), "Missing source line: {}", output);
-    assert!(output.contains("move this call inside the try block"), "Missing help: {}", output);
+    assert!(
+        output.contains("error[resource-leak-unprotected]"),
+        "Missing rule header: {}",
+        output
+    );
+    assert!(
+        output.contains("src/MyUnit.pas:4:1"),
+        "Missing location: {}",
+        output
+    );
+    assert!(
+        output.contains("obj.SomeFun;"),
+        "Missing source line: {}",
+        output
+    );
+    assert!(
+        output.contains("move this call inside the try block"),
+        "Missing help: {}",
+        output
+    );
 }
 
 #[test]

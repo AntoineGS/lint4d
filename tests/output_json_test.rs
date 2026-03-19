@@ -23,10 +23,16 @@ fn formats_json_output_structure() {
 
     assert_eq!(value["version"], 1);
     assert_eq!(value["files"][0]["file"], "src/MyUnit.pas");
-    assert_eq!(value["files"][0]["diagnostics"][0]["rule_id"], "empty-except");
+    assert_eq!(
+        value["files"][0]["diagnostics"][0]["rule_id"],
+        "empty-except"
+    );
     assert_eq!(value["files"][0]["diagnostics"][0]["severity"], "warning");
     assert_eq!(value["files"][0]["diagnostics"][0]["line"], 10);
-    assert_eq!(value["files"][0]["diagnostics"][0]["help"], "add error handling");
+    assert_eq!(
+        value["files"][0]["diagnostics"][0]["help"],
+        "add error handling"
+    );
 }
 
 #[test]

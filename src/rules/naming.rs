@@ -11,6 +11,12 @@ pub struct TypePrefixRule {
     meta: RuleMeta,
 }
 
+impl Default for TypePrefixRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypePrefixRule {
     pub fn new() -> Self {
         TypePrefixRule {
@@ -91,6 +97,12 @@ pub struct InterfacePrefixRule {
     meta: RuleMeta,
 }
 
+impl Default for InterfacePrefixRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InterfacePrefixRule {
     pub fn new() -> Self {
         InterfacePrefixRule {
@@ -165,6 +177,12 @@ fn check_interface_name(decl_type: Node, source: &[u8], ctx: &mut LintContext) {
 
 pub struct ConstantNamingRule {
     meta: RuleMeta,
+}
+
+impl Default for ConstantNamingRule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConstantNamingRule {

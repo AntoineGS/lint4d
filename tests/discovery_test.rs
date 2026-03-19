@@ -48,10 +48,7 @@ fn excludes_matching_patterns() {
     fs::write(dir.path().join("Unit1.pas"), "unit Unit1;").unwrap();
     fs::write(gen.join("Generated.pas"), "unit Generated;").unwrap();
 
-    let files = discover_files(
-        &[dir.path().to_path_buf()],
-        &["generated/**".to_string()],
-    ).unwrap();
+    let files = discover_files(&[dir.path().to_path_buf()], &["generated/**".to_string()]).unwrap();
     assert_eq!(files.len(), 1);
     assert!(files[0].path.to_str().unwrap().contains("Unit1"));
 }
@@ -74,6 +71,9 @@ fn results_sorted_by_path() {
     fs::write(dir.path().join("Mid.pas"), "unit Mid;").unwrap();
 
     let files = discover_files(&[dir.path().to_path_buf()], &[]).unwrap();
-    let names: Vec<&str> = files.iter().map(|f| f.path.file_name().unwrap().to_str().unwrap()).collect();
+    let names: Vec<&str> = files
+        .iter()
+        .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["Alpha.pas", "Mid.pas", "Zebra.pas"]);
 }

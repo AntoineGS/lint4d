@@ -42,13 +42,20 @@ pub fn format_diagnostics(
         }
 
         // ---- Arrow line: --> file:line:col ----
-        out.push_str(&format!("  --> {}:{}:{}\n", file_path, diag.line, diag.column));
+        out.push_str(&format!(
+            "  --> {}:{}:{}\n",
+            file_path, diag.line, diag.column
+        ));
 
         // ---- Source context ----
         // Show previous line, the diagnostic line, and next line.
         let diag_line_idx = diag.line.saturating_sub(1); // 0-based index
 
-        let context_start = if diag_line_idx > 0 { diag_line_idx - 1 } else { diag_line_idx };
+        let context_start = if diag_line_idx > 0 {
+            diag_line_idx - 1
+        } else {
+            diag_line_idx
+        };
         let context_end = (diag_line_idx + 1).min(lines.len().saturating_sub(1));
 
         // Determine width of line number column (based on largest line number shown).
@@ -62,7 +69,12 @@ pub fn format_diagnostics(
         for line_idx in context_start..=context_end {
             let line_no = line_idx + 1;
             let line_content = lines.get(line_idx).copied().unwrap_or("");
-            out.push_str(&format!("{:>width$} | {}\n", line_no, line_content, width = lno_width));
+            out.push_str(&format!(
+                "{:>width$} | {}\n",
+                line_no,
+                line_content,
+                width = lno_width
+            ));
 
             // After the diagnostic line emit the underline
             if line_idx == diag_line_idx {
@@ -72,7 +84,11 @@ pub fn format_diagnostics(
                 } else {
                     line_content.len()
                 };
-                let underline_len = if col_end > col_start { col_end - col_start } else { 1 };
+                let underline_len = if col_end > col_start {
+                    col_end - col_start
+                } else {
+                    1
+                };
                 let underline = "^".repeat(underline_len);
                 let padding = " ".repeat(col_start);
                 if use_color {

@@ -11,6 +11,12 @@ pub struct BareExceptRule {
     meta: RuleMeta,
 }
 
+impl Default for BareExceptRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BareExceptRule {
     pub fn new() -> Self {
         BareExceptRule {
@@ -159,6 +165,12 @@ fn check_try_bare_except(node: Node, source: &[u8], ctx: &mut LintContext) {
 
 pub struct EmptyExceptRule {
     meta: RuleMeta,
+}
+
+impl Default for EmptyExceptRule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EmptyExceptRule {

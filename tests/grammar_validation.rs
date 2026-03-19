@@ -1,8 +1,8 @@
-use tree_sitter::Parser;
-use tree_sitter_pascal::LANGUAGE;
-use tree_sitter_language::LanguageFn;
 use std::fs;
 use std::path::Path;
+use tree_sitter::Parser;
+use tree_sitter_language::LanguageFn;
+use tree_sitter_pascal::LANGUAGE;
 
 fn parse_and_check_no_errors(fixture_path: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
@@ -11,7 +11,9 @@ fn parse_and_check_no_errors(fixture_path: &str) {
 
     let mut parser = Parser::new();
     let language = LanguageFn::from(LANGUAGE);
-    parser.set_language(&language.into()).expect("Failed to set language");
+    parser
+        .set_language(&language.into())
+        .expect("Failed to set language");
 
     let tree = parser.parse(&source, None).expect("Failed to parse");
     let root = tree.root_node();

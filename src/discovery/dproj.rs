@@ -15,9 +15,7 @@ pub fn parse_dproj(dproj_path: &Path) -> Result<Vec<FileInfo>, String> {
     let content = std::fs::read_to_string(dproj_path)
         .map_err(|e| format!("Failed to read {}: {}", dproj_path.display(), e))?;
 
-    let base_dir = dproj_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let base_dir = dproj_path.parent().unwrap_or_else(|| Path::new("."));
 
     let mut reader = Reader::from_str(&content);
     reader.config_mut().trim_text(true);
@@ -35,15 +33,13 @@ pub fn parse_dproj(dproj_path: &Path) -> Result<Vec<FileInfo>, String> {
                             format!("Attribute error in {}: {}", dproj_path.display(), err)
                         })?;
                         if attr.key.local_name().as_ref() == b"Include" {
-                            let value = attr
-                                .unescape_value()
-                                .map_err(|err| {
-                                    format!(
-                                        "Failed to unescape attribute in {}: {}",
-                                        dproj_path.display(),
-                                        err
-                                    )
-                                })?;
+                            let value = attr.unescape_value().map_err(|err| {
+                                format!(
+                                    "Failed to unescape attribute in {}: {}",
+                                    dproj_path.display(),
+                                    err
+                                )
+                            })?;
                             // Normalise Windows path separators.
                             let normalised = value.replace('\\', "/");
                             let file_path = base_dir.join(PathBuf::from(&normalised));
@@ -55,7 +51,10 @@ pub fn parse_dproj(dproj_path: &Path) -> Result<Vec<FileInfo>, String> {
                                 .and_then(FileType::from_extension)
                                 .unwrap_or(FileType::Pas);
 
-                            results.push(FileInfo { path: file_path, file_type });
+                            results.push(FileInfo {
+                                path: file_path,
+                                file_type,
+                            });
                         }
                     }
                 }

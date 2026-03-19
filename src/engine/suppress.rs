@@ -50,7 +50,10 @@ pub fn parse_suppressions(source: &[u8]) -> Vec<Suppression> {
         if let Some(rest) = comment.strip_prefix("lint4d:ignore-next-line") {
             let rule_id = extract_rule_id(rest);
             let target_line = line_number + 1;
-            result.push(Suppression { target_line, rule_id });
+            result.push(Suppression {
+                target_line,
+                rule_id,
+            });
         } else if let Some(rest) = comment.strip_prefix("lint4d:ignore") {
             let rule_id = extract_rule_id(rest);
             let target_line = if is_line_comment_only {
@@ -60,7 +63,10 @@ pub fn parse_suppressions(source: &[u8]) -> Vec<Suppression> {
                 // Inline comment — suppress the current line.
                 line_number
             };
-            result.push(Suppression { target_line, rule_id });
+            result.push(Suppression {
+                target_line,
+                rule_id,
+            });
         }
     }
 
@@ -130,7 +136,10 @@ mod unit_tests {
     #[test]
     fn find_line_comment_ignores_slashes_in_strings() {
         // The // inside the string should not be treated as a comment start.
-        assert_eq!(find_line_comment("s := '//not a comment'; // real"), Some(24));
+        assert_eq!(
+            find_line_comment("s := '//not a comment'; // real"),
+            Some(24)
+        );
     }
 
     #[test]

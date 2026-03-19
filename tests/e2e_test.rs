@@ -31,8 +31,8 @@ fn e2e_json_output_is_valid() {
         .output()
         .unwrap();
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .expect("JSON output should be valid");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON output should be valid");
     assert_eq!(json["version"], 1);
     assert!(!json["files"].as_array().unwrap().is_empty());
 }
@@ -52,15 +52,22 @@ fn e2e_fail_on_error_only() {
 fn e2e_directory_scan_produces_deterministic_output() {
     let output1 = Command::cargo_bin("lint4d")
         .unwrap()
-        .arg("--format").arg("json")
+        .arg("--format")
+        .arg("json")
         .arg(fixture_path("project"))
-        .output().unwrap();
+        .output()
+        .unwrap();
 
     let output2 = Command::cargo_bin("lint4d")
         .unwrap()
-        .arg("--format").arg("json")
+        .arg("--format")
+        .arg("json")
         .arg(fixture_path("project"))
-        .output().unwrap();
+        .output()
+        .unwrap();
 
-    assert_eq!(output1.stdout, output2.stdout, "Output should be deterministic");
+    assert_eq!(
+        output1.stdout, output2.stdout,
+        "Output should be deterministic"
+    );
 }

@@ -33,7 +33,10 @@ fn parses_inline_ignore_same_line() {
     let suppressions = parse_suppressions(source.as_bytes());
     assert_eq!(suppressions.len(), 1);
     assert_eq!(suppressions[0].target_line, 1);
-    assert_eq!(suppressions[0].rule_id, Some("resource-leak-no-try".to_string()));
+    assert_eq!(
+        suppressions[0].rule_id,
+        Some("resource-leak-no-try".to_string())
+    );
 }
 
 #[test]
@@ -41,7 +44,10 @@ fn strips_reason_after_dash() {
     let source = "// lint4d:ignore resource-leak-no-try -- owned by form\n";
     let suppressions = parse_suppressions(source.as_bytes());
     assert_eq!(suppressions.len(), 1);
-    assert_eq!(suppressions[0].rule_id, Some("resource-leak-no-try".to_string()));
+    assert_eq!(
+        suppressions[0].rule_id,
+        Some("resource-leak-no-try".to_string())
+    );
 }
 
 #[test]

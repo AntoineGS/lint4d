@@ -14,20 +14,33 @@ fn lint_fixture(fixture_path: &str) -> Vec<lint4d::engine::Diagnostic> {
 #[test]
 fn with_statement_flagged() {
     let diagnostics = lint_fixture("tests/fixtures/dangerous/bad_with.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "with-statement").collect();
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "with-statement")
+        .collect();
     assert_eq!(matches.len(), 1);
 }
 
 #[test]
 fn no_with_passes() {
     let diagnostics = lint_fixture("tests/fixtures/dangerous/good_no_with.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "with-statement").collect();
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "with-statement")
+        .collect();
     assert!(matches.is_empty());
 }
 
 #[test]
 fn nested_with_produces_two_diagnostics() {
     let diagnostics = lint_fixture("tests/fixtures/dangerous/bad_nested_with.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "with-statement").collect();
-    assert_eq!(matches.len(), 2, "Expected 2 with-statement diagnostics for nested with");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "with-statement")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        2,
+        "Expected 2 with-statement diagnostics for nested with"
+    );
 }

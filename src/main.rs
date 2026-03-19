@@ -167,9 +167,7 @@ fn main() {
             let source_text = String::from_utf8_lossy(source);
             let source_lines: Vec<&str> = source_text.lines().collect();
             diagnostics.retain(|diag| {
-                let line_content = source_lines
-                    .get(diag.line.saturating_sub(1))
-                    .unwrap_or(&"");
+                let line_content = source_lines.get(diag.line.saturating_sub(1)).unwrap_or(&"");
                 let file_path = &_file_path_str;
                 !bl.is_suppressed(file_path, diag, line_content)
             });
@@ -233,8 +231,7 @@ fn run_generate_baseline(
             })
             .collect();
 
-        let file_baseline =
-            Baseline::from_diagnostics(file_path_str, &diag_refs, &line_contents);
+        let file_baseline = Baseline::from_diagnostics(file_path_str, &diag_refs, &line_contents);
         total_violations += file_baseline.violations.len();
         baseline.violations.extend(file_baseline.violations);
     }
@@ -325,9 +322,7 @@ fn run_list_rules() {
         let meta = rule.meta();
         println!(
             "{:<30} {:<10} {}",
-            meta.id,
-            meta.default_severity,
-            meta.description
+            meta.id, meta.default_severity, meta.description
         );
     }
 }

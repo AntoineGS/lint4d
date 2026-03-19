@@ -7,6 +7,12 @@ pub struct ResourceLeakUnprotectedRule {
     meta: RuleMeta,
 }
 
+impl Default for ResourceLeakUnprotectedRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ResourceLeakUnprotectedRule {
     pub fn new() -> Self {
         ResourceLeakUnprotectedRule {
@@ -219,6 +225,12 @@ fn node_text(node: Node, source: &[u8]) -> String {
 
 pub struct ResourceLeakNoTryRule {
     meta: RuleMeta,
+}
+
+impl Default for ResourceLeakNoTryRule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ResourceLeakNoTryRule {

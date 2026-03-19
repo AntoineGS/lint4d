@@ -11,6 +11,12 @@ pub struct WithStatementRule {
     meta: RuleMeta,
 }
 
+impl Default for WithStatementRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WithStatementRule {
     pub fn new() -> Self {
         WithStatementRule {

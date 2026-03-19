@@ -132,7 +132,11 @@ pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnost
 
     // Filter out suppressed diagnostics.
     let suppressions = suppress::parse_suppressions(source);
-    diagnostics.retain(|diag| !suppressions.iter().any(|s| s.matches(&diag.rule_id, diag.line)));
+    diagnostics.retain(|diag| {
+        !suppressions
+            .iter()
+            .any(|s| s.matches(&diag.rule_id, diag.line))
+    });
 
     // Sort by line, then column.
     diagnostics.sort_by(|a, b| a.line.cmp(&b.line).then(a.column.cmp(&b.column)));

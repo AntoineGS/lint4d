@@ -24,7 +24,10 @@ pub fn discover_files(
         if path.is_file() {
             if let Some(ft) = file_type_for_path(path) {
                 if !is_excluded(path, path.parent().unwrap_or(path), &excludes) {
-                    results.push(FileInfo { path: path.clone(), file_type: ft });
+                    results.push(FileInfo {
+                        path: path.clone(),
+                        file_type: ft,
+                    });
                 }
             }
         } else if path.is_dir() {
@@ -59,10 +62,13 @@ fn file_type_for_path(path: &std::path::Path) -> Option<FileType> {
 fn build_glob_set(patterns: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern).map_err(|e| format!("invalid glob pattern {:?}: {}", pattern, e))?;
+        let glob =
+            Glob::new(pattern).map_err(|e| format!("invalid glob pattern {:?}: {}", pattern, e))?;
         builder.add(glob);
     }
-    builder.build().map_err(|e| format!("failed to build glob set: {}", e))
+    builder
+        .build()
+        .map_err(|e| format!("failed to build glob set: {}", e))
 }
 
 /// Check whether `file_path` matches any exclusion pattern.

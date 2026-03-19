@@ -1,5 +1,5 @@
-use lint4d::rules::{RuleRegistry, RuleCategory};
 use lint4d::engine::Severity;
+use lint4d::rules::{RuleCategory, RuleRegistry};
 
 #[test]
 fn registry_returns_all_rules() {

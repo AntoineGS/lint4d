@@ -1,4 +1,4 @@
-use lint4d::engine::{Severity, FileType, FileInfo, Diagnostic};
+use lint4d::engine::{Diagnostic, FileInfo, FileType, Severity};
 use std::path::PathBuf;
 
 #[test]

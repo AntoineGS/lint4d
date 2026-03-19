@@ -18,7 +18,10 @@ pub struct BaselineEntry {
 
 impl Baseline {
     pub fn new() -> Self {
-        Baseline { version: 1, violations: Vec::new() }
+        Baseline {
+            version: 1,
+            violations: Vec::new(),
+        }
     }
 
     pub fn from_diagnostics(
@@ -39,7 +42,10 @@ impl Baseline {
                 line_content_trimmed: line_content.to_string(),
             });
         }
-        Baseline { version: 1, violations }
+        Baseline {
+            version: 1,
+            violations,
+        }
     }
 
     pub fn is_suppressed(&self, file_path: &str, diag: &Diagnostic, source_line: &str) -> bool {

@@ -58,10 +58,7 @@ fn discover_config_walks_up() {
     let dir = TempDir::new().unwrap();
     let sub = dir.path().join("src").join("units");
     fs::create_dir_all(&sub).unwrap();
-    fs::write(
-        dir.path().join(".lint4d.toml"),
-        "version = 1\n",
-    ).unwrap();
+    fs::write(dir.path().join(".lint4d.toml"), "version = 1\n").unwrap();
 
     let (config, root) = Config::discover(&sub).unwrap();
     assert_eq!(config.version, 1);

@@ -1,5 +1,6 @@
 pub mod dangerous;
 pub mod exception;
+pub mod naming;
 
 use tree_sitter::Tree;
 
@@ -89,24 +90,8 @@ impl RuleRegistry {
             }),
             Box::new(exception::EmptyExceptRule::new()),
             Box::new(exception::BareExceptRule::new()),
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "type-prefix",
-                    name: "Type Prefix Convention",
-                    category: RuleCategory::NamingConvention,
-                    default_severity: Severity::Hint,
-                    description: "Enforces 'T' prefix on type declarations.",
-                },
-            }),
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "interface-prefix",
-                    name: "Interface Prefix Convention",
-                    category: RuleCategory::NamingConvention,
-                    default_severity: Severity::Hint,
-                    description: "Enforces 'I' prefix on interface declarations.",
-                },
-            }),
+            Box::new(naming::TypePrefixRule::new()),
+            Box::new(naming::InterfacePrefixRule::new()),
             Box::new(StubRule {
                 meta: RuleMeta {
                     id: "constant-naming",

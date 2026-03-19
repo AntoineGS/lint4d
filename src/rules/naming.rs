@@ -216,7 +216,10 @@ fn check_constant_name(decl_const: Node, source: &[u8], ctx: &mut LintContext) {
     };
 
     // UPPER_CASE: only uppercase letters, digits, and underscores
-    if name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+    if name
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
         return;
     }
 

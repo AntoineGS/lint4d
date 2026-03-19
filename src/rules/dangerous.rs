@@ -37,7 +37,10 @@ impl Rule for WithStatementRule {
 
 fn visit_with(node: Node, ctx: &mut LintContext) {
     if node.kind() == "with" {
-        if let Some(kw) = node.children(&mut node.walk()).find(|c| c.kind() == "kWith") {
+        if let Some(kw) = node
+            .children(&mut node.walk())
+            .find(|c| c.kind() == "kWith")
+        {
             let start = kw.start_position();
             let end = kw.end_position();
             ctx.report(Diagnostic {

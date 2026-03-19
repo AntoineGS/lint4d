@@ -136,10 +136,7 @@ fn is_constructor_call(node: Node, source: &[u8]) -> bool {
                 None => return false,
             };
             let rhs_text = node_text(rhs, source);
-            rhs_text.eq_ignore_ascii_case("create")
-                || rhs_text
-                    .to_lowercase()
-                    .starts_with("create")
+            rhs_text.eq_ignore_ascii_case("create") || rhs_text.to_lowercase().starts_with("create")
         }
         "exprCall" => {
             let entity = match node.child_by_field_name("entity") {
@@ -350,9 +347,7 @@ fn constructor_has_owner_args(rhs: Node, source: &[u8]) -> bool {
             return false;
         }
         // Strip closing paren and whitespace.
-        let args = after_paren
-            .trim_end_matches(')')
-            .trim();
+        let args = after_paren.trim_end_matches(')').trim();
         // `nil` by itself is not an owner.
         if args.eq_ignore_ascii_case("nil") || args.is_empty() {
             return false;

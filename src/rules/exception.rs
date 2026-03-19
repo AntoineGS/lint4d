@@ -62,7 +62,8 @@ fn source_contains_raise(text: &str) -> bool {
         // Check we have "raise" at position i
         if bytes[i..i + len] == *raise {
             // Check that it's not preceded by an identifier character
-            let preceded_by_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let preceded_by_ident =
+                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             // Check that it's not followed by an identifier character
             let followed_by_ident = i + len < bytes.len()
                 && (bytes[i + len].is_ascii_alphanumeric() || bytes[i + len] == b'_');
@@ -218,10 +219,7 @@ fn check_try_node(node: Node, ctx: &mut LintContext) {
 
     if !has_body {
         // Find the kExcept keyword for precise location reporting.
-        if let Some(except_kw) = except_children
-            .iter()
-            .find(|c| c.kind() == "kExcept")
-        {
+        if let Some(except_kw) = except_children.iter().find(|c| c.kind() == "kExcept") {
             let start = except_kw.start_position();
             let end = except_kw.end_position();
             ctx.report(Diagnostic {

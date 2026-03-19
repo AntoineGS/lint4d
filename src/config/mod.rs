@@ -1,5 +1,5 @@
-mod toml_config;
 pub mod baseline;
+mod toml_config;
 
 use crate::engine::Severity;
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ pub struct Config {
 }
 
 impl Config {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, String> {
         let raw: toml_config::RawConfig =
             toml::from_str(s).map_err(|e| format!("Invalid config: {}", e))?;

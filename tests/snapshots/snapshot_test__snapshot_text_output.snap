@@ -1,0 +1,12 @@
+---
+source: tests/snapshot_test.rs
+expression: output
+---
+warning[empty-except]: Empty except block silently swallows exceptions.
+  --> tests/fixtures/exception/bad_empty_except.pas:11:3
+   |
+10 |     WriteLn('risky');
+11 |   except
+   |   ^^^^^^
+12 |   end;
+   = help: Add an exception handler or log the error. Use 'on E: Exception do ...' to handle specific exceptions.

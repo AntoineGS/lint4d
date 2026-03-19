@@ -1,3 +1,4 @@
+pub mod dangerous;
 pub mod exception;
 
 use tree_sitter::Tree;
@@ -115,15 +116,7 @@ impl RuleRegistry {
                     description: "Enforces naming conventions for constants.",
                 },
             }),
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "with-statement",
-                    name: "With Statement",
-                    category: RuleCategory::DangerousPattern,
-                    default_severity: Severity::Warning,
-                    description: "Detects use of 'with' statements which can cause subtle bugs.",
-                },
-            }),
+            Box::new(dangerous::WithStatementRule::new()),
         ];
 
         RuleRegistry { rules }

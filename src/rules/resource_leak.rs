@@ -131,9 +131,10 @@ fn extract_constructor_assignment<'a>(node: Node<'a>, source: &'a [u8]) -> Optio
 
 /// Check whether a node represents a constructor call pattern.
 ///
-/// Matches:
-/// - `exprDot` where rhs text starts with "Create" (e.g., `TFoo.Create`)
-/// - `exprCall` whose entity is an `exprDot` matching the above
+/// Matches only `TFoo.Create` (exact match, case-insensitive).
+/// Does NOT match factory methods like `TFoo.CreateRunner` or
+/// `TFoo.CreateInstance`, which are typically class functions returning
+/// interfaces or other managed types.
 fn is_constructor_call(node: Node, source: &[u8]) -> bool {
     match node.kind() {
         "exprDot" => {
@@ -142,7 +143,7 @@ fn is_constructor_call(node: Node, source: &[u8]) -> bool {
                 None => return false,
             };
             let rhs_text = node_text(rhs, source);
-            rhs_text.eq_ignore_ascii_case("create") || rhs_text.to_lowercase().starts_with("create")
+            rhs_text.eq_ignore_ascii_case("create")
         }
         "exprCall" => {
             let entity = match node.child_by_field_name("entity") {
@@ -164,25 +165,31 @@ fn finally_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool
         .children_by_field_name("finally", &mut try_node.walk())
         .collect();
 
-    // Find the statements node(s) in the finally field (skip the kFinally keyword).
     for child in &finally_children {
         if child.kind() == "statements" {
-            let text = node_text(*child, source).to_lowercase();
-            let var_lower = var_name.to_lowercase();
-
-            // Check for `variable.Free` or `variable.Destroy`
-            let dot_free = format!("{}.free", var_lower);
-            let dot_destroy = format!("{}.destroy", var_lower);
-            if text.contains(&dot_free) || text.contains(&dot_destroy) {
-                return true;
-            }
-
-            // Check for `FreeAndNil(variable)`
-            let free_and_nil = format!("freeandnil({})", var_lower);
-            if text.contains(&free_and_nil) {
-                return true;
-            }
+            return statements_free_variable(*child, source, var_name);
         }
+    }
+
+    false
+}
+
+/// Check whether a `statements` node contains a free/destroy call for the variable.
+fn statements_free_variable(statements: Node, source: &[u8], var_name: &str) -> bool {
+    let text = node_text(statements, source).to_lowercase();
+    let var_lower = var_name.to_lowercase();
+
+    // Check for `variable.Free` or `variable.Destroy`
+    let dot_free = format!("{}.free", var_lower);
+    let dot_destroy = format!("{}.destroy", var_lower);
+    if text.contains(&dot_free) || text.contains(&dot_destroy) {
+        return true;
+    }
+
+    // Check for `FreeAndNil(variable)`
+    let free_and_nil = format!("freeandnil({})", var_lower);
+    if text.contains(&free_and_nil) {
+        return true;
     }
 
     false
@@ -270,12 +277,13 @@ fn visit_blocks_no_try(node: Node, source: &[u8], ctx: &mut LintContext) {
     }
 }
 
-/// Check a block for constructor assignments that have no matching try..finally
-/// block anywhere in the same block that frees the variable.
+/// Check a block for constructor assignments that have no matching try block
+/// (either `try..finally` or `try..except`) that frees the variable.
 ///
-/// Owner-managed objects are skipped: if the constructor call has arguments
-/// (i.e., `TFoo.Create(something)` where `something` is not empty), the object
-/// lifetime is delegated to the owner.
+/// Skipped cases:
+/// - Owner-managed objects: constructor called with non-nil arguments
+/// - Field assignments in methods: fields are freed by the destructor
+/// - `Result` assignments: ownership transfers to the caller
 fn check_block_no_try(block: Node, source: &[u8], ctx: &mut LintContext) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
 
@@ -294,9 +302,21 @@ fn check_block_no_try(block: Node, source: &[u8], ctx: &mut LintContext) {
             continue;
         }
 
-        // Look ahead for any try..finally that frees this variable.
+        // Skip field assignments: fields are owned by the class and freed
+        // in the destructor.
+        if is_field_name(&var_name) {
+            continue;
+        }
+
+        // Skip `Result` assignments: a function returning a newly created
+        // object transfers ownership to the caller.
+        if var_name.eq_ignore_ascii_case("result") {
+            continue;
+        }
+
+        // Look ahead for any try block (finally or except) that frees this variable.
         let has_protecting_try = children[(i + 1)..].iter().any(|sibling| {
-            sibling.kind() == "try" && finally_frees_variable(*sibling, source, &var_name)
+            sibling.kind() == "try" && try_frees_variable(*sibling, source, &var_name)
         });
 
         if !has_protecting_try {
@@ -321,6 +341,40 @@ fn check_block_no_try(block: Node, source: &[u8], ctx: &mut LintContext) {
             });
         }
     }
+}
+
+/// Check whether a variable name follows the Delphi field naming convention.
+///
+/// Fields in Delphi conventionally start with 'F' followed by an uppercase
+/// letter (e.g., `FDatabase`, `FAdapter`).
+fn is_field_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() >= 2 && bytes[0] == b'F' && bytes[1].is_ascii_uppercase()
+}
+
+/// Check whether a `try` block (either finally or except) frees the given variable.
+fn try_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool {
+    finally_frees_variable(try_node, source, var_name)
+        || except_frees_variable(try_node, source, var_name)
+}
+
+/// Check whether the `except` clause of a `try` node frees the given variable.
+///
+/// Recognises the cleanup-then-reraise pattern:
+///   try ... except variable.Free; raise; end;
+fn except_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool {
+    let mut found_except = false;
+    let mut cursor = try_node.walk();
+    for child in try_node.children(&mut cursor) {
+        if child.kind() == "kExcept" {
+            found_except = true;
+            continue;
+        }
+        if found_except && child.kind() == "statements" {
+            return statements_free_variable(child, source, var_name);
+        }
+    }
+    false
 }
 
 /// Like `extract_constructor_assignment` but also returns the RHS node so

@@ -95,3 +95,73 @@ fn resource_leak_accepts_free_and_nil() {
         matches
     );
 }
+
+#[test]
+fn resource_leak_no_try_skips_constructor_field_assignments() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_constructor_field.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Field assignments inside constructors should not flag resource-leak-no-try: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_skips_factory_methods() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_factory_method.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Factory methods like CreateRunner should not flag resource-leak-no-try: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_skips_result_assignments() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_result_return.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Result assignments (function return values) should not flag resource-leak-no-try: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_skips_try_except_with_free() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_try_except_raise.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "try..except with Free+raise should be recognized as cleanup: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_skips_field_in_any_method() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_field_in_method.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Field assignments in any method should not flag resource-leak-no-try: {:?}",
+        matches
+    );
+}

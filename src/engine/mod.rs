@@ -38,6 +38,14 @@ fn collect_parse_errors(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<Diagnost
 
 fn visit_node(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>) {
     if node.is_error() || node.is_missing() {
+        // Skip bare `raise;` ERROR nodes — tree-sitter-pascal does not
+        // recognise standalone `raise` (re-raise) as valid syntax, but
+        // it is perfectly legal Delphi. The error node contains a single
+        // `kRaise` child.
+        if node.is_error() && is_bare_raise_error(node) {
+            return;
+        }
+
         let start = node.start_position();
         let end = node.end_position();
 
@@ -72,6 +80,20 @@ fn visit_node(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>)
     for child in node.children(&mut node.walk()) {
         visit_node(child, source, out);
     }
+}
+
+/// Check whether an ERROR node represents a bare `raise;` statement.
+///
+/// tree-sitter-pascal does not support standalone `raise` (re-raise the
+/// current exception). The ERROR node in this case contains a single
+/// `kRaise` child.
+fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
+    if node.child_count() == 1 {
+        if let Some(child) = node.child(0) {
+            return child.kind() == "kRaise";
+        }
+    }
+    false
 }
 
 /// Run all lint rules on a single file and return sorted, filtered diagnostics.
@@ -125,6 +147,14 @@ pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnost
         if let Some(RuleSeverityOverride::Severity(s)) = config.rule_severity(&diag.rule_id) {
             diag.severity = s;
         }
+    }
+
+    // Skip parse-error diagnostics for .dpr/.dpk files.
+    // The tree-sitter-pascal grammar does not support the `in 'path'` clause
+    // used in project/package uses sections, which produces numerous spurious
+    // parse errors on otherwise valid code.
+    if matches!(file.file_type, FileType::Dpr | FileType::Dpk) {
+        diagnostics.retain(|d| d.rule_id != "parse-error");
     }
 
     // Merge parse-error diagnostics with rule diagnostics.

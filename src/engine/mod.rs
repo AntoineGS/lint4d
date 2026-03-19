@@ -3,6 +3,8 @@ pub mod suppress;
 
 pub use context::{Diagnostic, FileInfo, FileType, Severity};
 
+use crate::config::{Config, RuleSeverityOverride};
+use crate::rules::{LintContext, RuleCategory, RuleRegistry};
 use tree_sitter::Parser;
 use tree_sitter_language::LanguageFn;
 
@@ -71,4 +73,70 @@ fn visit_node(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>)
     for child in node.children(&mut node.walk()) {
         visit_node(child, source, out);
     }
+}
+
+/// Run all lint rules on a single file and return sorted, filtered diagnostics.
+///
+/// This function:
+/// 1. Parses the file and collects parse-error diagnostics
+/// 2. Runs all enabled rules (respecting config overrides and file-type skipping)
+/// 3. Applies severity overrides from config
+/// 4. Filters out suppressed diagnostics
+/// 5. Sorts results by line, then column
+pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnostic> {
+    let (tree, mut diagnostics) = match parse_file(file, source) {
+        Ok(result) => result,
+        Err(e) => {
+            return vec![Diagnostic {
+                rule_id: "lint4d-error".to_string(),
+                severity: Severity::Error,
+                message: e,
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
+                help: None,
+            }];
+        }
+    };
+
+    let registry = RuleRegistry::new();
+    let mut ctx = LintContext::new();
+
+    for rule in registry.all_rules() {
+        let meta = rule.meta();
+
+        // Skip rules that are explicitly turned off.
+        if let Some(RuleSeverityOverride::Off) = config.rule_severity(meta.id) {
+            continue;
+        }
+
+        // Skip naming rules for .dpr/.dpk files (project/package files).
+        if matches!(file.file_type, FileType::Dpr | FileType::Dpk)
+            && matches!(meta.category, RuleCategory::NamingConvention)
+        {
+            continue;
+        }
+
+        rule.check(file, &tree, source, &mut ctx);
+    }
+
+    // Apply severity overrides from config.
+    for diag in &mut ctx.diagnostics {
+        if let Some(RuleSeverityOverride::Severity(s)) = config.rule_severity(&diag.rule_id) {
+            diag.severity = s;
+        }
+    }
+
+    // Merge parse-error diagnostics with rule diagnostics.
+    diagnostics.append(&mut ctx.diagnostics);
+
+    // Filter out suppressed diagnostics.
+    let suppressions = suppress::parse_suppressions(source);
+    diagnostics.retain(|diag| !suppressions.iter().any(|s| s.matches(&diag.rule_id, diag.line)));
+
+    // Sort by line, then column.
+    diagnostics.sort_by(|a, b| a.line.cmp(&b.line).then(a.column.cmp(&b.column)));
+
+    diagnostics
 }

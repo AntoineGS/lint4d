@@ -72,15 +72,7 @@ impl RuleRegistry {
     pub fn new() -> Self {
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(resource_leak::ResourceLeakUnprotectedRule::new()),
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "resource-leak-no-try",
-                    name: "Resource Leak: No Try Block",
-                    category: RuleCategory::ResourceManagement,
-                    default_severity: Severity::Warning,
-                    description: "Detects resources created without any try block.",
-                },
-            }),
+            Box::new(resource_leak::ResourceLeakNoTryRule::new()),
             Box::new(exception::EmptyExceptRule::new()),
             Box::new(exception::BareExceptRule::new()),
             Box::new(naming::TypePrefixRule::new()),

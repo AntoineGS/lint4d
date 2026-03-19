@@ -39,3 +39,21 @@ fn resource_leak_unprotected_passes_when_protected() {
         matches
     );
 }
+
+#[test]
+fn resource_leak_no_try_flags_missing_try_finally() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/bad_no_try.pas");
+    let matches: Vec<_> = diagnostics.iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(matches.len(), 1, "Expected 1 resource-leak-no-try, got: {:?}", matches);
+}
+
+#[test]
+fn resource_leak_no_try_skips_owned_objects() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_owned.pas");
+    let matches: Vec<_> = diagnostics.iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(matches.is_empty(), "Expected no resource-leak-no-try for owned objects, got: {:?}", matches);
+}

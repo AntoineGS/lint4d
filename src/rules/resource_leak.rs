@@ -218,3 +218,148 @@ fn node_text(node: Node, source: &[u8]) -> String {
         .unwrap_or("")
         .to_string()
 }
+
+// ─── resource-leak-no-try ────────────────────────────────────────────────────
+
+pub struct ResourceLeakNoTryRule {
+    meta: RuleMeta,
+}
+
+impl ResourceLeakNoTryRule {
+    pub fn new() -> Self {
+        ResourceLeakNoTryRule {
+            meta: RuleMeta {
+                id: "resource-leak-no-try",
+                name: "Resource Leak: No Try Block",
+                category: RuleCategory::ResourceManagement,
+                default_severity: Severity::Warning,
+                description: "Detects resources created without any try..finally block.",
+            },
+        }
+    }
+}
+
+impl Rule for ResourceLeakNoTryRule {
+    fn meta(&self) -> &RuleMeta {
+        &self.meta
+    }
+
+    fn check(&self, _file: &FileInfo, tree: &Tree, source: &[u8], ctx: &mut LintContext) {
+        visit_blocks_no_try(tree.root_node(), source, ctx);
+    }
+}
+
+/// Recursively walk the AST looking for block-like nodes and check for the
+/// no-try pattern.
+fn visit_blocks_no_try(node: Node, source: &[u8], ctx: &mut LintContext) {
+    if node.kind() == "block" {
+        check_block_no_try(node, source, ctx);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_blocks_no_try(child, source, ctx);
+    }
+}
+
+/// Check a block for constructor assignments that have no matching try..finally
+/// block anywhere in the same block that frees the variable.
+///
+/// Owner-managed objects are skipped: if the constructor call has arguments
+/// (i.e., `TFoo.Create(something)` where `something` is not empty), the object
+/// lifetime is delegated to the owner.
+fn check_block_no_try(block: Node, source: &[u8], ctx: &mut LintContext) {
+    let children: Vec<Node> = block.children(&mut block.walk()).collect();
+
+    for (i, child) in children.iter().enumerate() {
+        if child.kind() != "assignment" {
+            continue;
+        }
+
+        let (var_name, rhs_node) = match extract_constructor_assignment_with_rhs(*child, source) {
+            Some(pair) => pair,
+            None => continue,
+        };
+
+        // Skip owner-managed objects: constructor was called with arguments.
+        if constructor_has_owner_args(rhs_node, source) {
+            continue;
+        }
+
+        // Look ahead for any try..finally that frees this variable.
+        let has_protecting_try = children[(i + 1)..].iter().any(|sibling| {
+            sibling.kind() == "try" && finally_frees_variable(*sibling, source, &var_name)
+        });
+
+        if !has_protecting_try {
+            let start = child.start_position();
+            let end = child.end_position();
+            ctx.report(Diagnostic {
+                rule_id: "resource-leak-no-try".to_string(),
+                severity: Severity::Warning,
+                message: format!(
+                    "'{}' is created without a try..finally block. \
+                     If an exception occurs after construction, the object will leak.",
+                    var_name
+                ),
+                line: start.row + 1,
+                column: start.column + 1,
+                end_line: end.row + 1,
+                end_column: end.column + 1,
+                help: Some(
+                    "Wrap the usage in a try..finally block and free the object in the finally clause."
+                        .to_string(),
+                ),
+            });
+        }
+    }
+}
+
+/// Like `extract_constructor_assignment` but also returns the RHS node so
+/// we can inspect whether the constructor has arguments.
+fn extract_constructor_assignment_with_rhs<'a>(
+    node: Node<'a>,
+    source: &[u8],
+) -> Option<(String, Node<'a>)> {
+    let lhs = node.child_by_field_name("lhs")?;
+    let rhs = node.child_by_field_name("rhs")?;
+
+    if !is_constructor_call(rhs, source) {
+        return None;
+    }
+
+    Some((node_text(lhs, source), rhs))
+}
+
+/// Returns `true` when the constructor call has at least one real argument
+/// (i.e., the call is `TFoo.Create(something)` and `something` is not empty
+/// or `nil`).  A bare `TFoo.Create` or `TFoo.Create()` returns `false`.
+fn constructor_has_owner_args(rhs: Node, source: &[u8]) -> bool {
+    // Only `exprCall` nodes have arguments; a bare `exprDot` has none.
+    if rhs.kind() != "exprCall" {
+        return false;
+    }
+
+    // The text of the full call, e.g. "TButton.Create(Self)"
+    let call_text = node_text(rhs, source);
+
+    // Find the opening parenthesis to extract the argument list.
+    if let Some(paren_pos) = call_text.find('(') {
+        let after_paren = call_text[paren_pos + 1..].trim();
+        // Empty call `Create()` or call with only `)`.
+        if after_paren.is_empty() || after_paren == ")" {
+            return false;
+        }
+        // Strip closing paren and whitespace.
+        let args = after_paren
+            .trim_end_matches(')')
+            .trim();
+        // `nil` by itself is not an owner.
+        if args.eq_ignore_ascii_case("nil") || args.is_empty() {
+            return false;
+        }
+        return true;
+    }
+
+    false
+}

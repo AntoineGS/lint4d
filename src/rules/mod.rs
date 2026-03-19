@@ -87,15 +87,7 @@ impl RuleRegistry {
                 },
             }),
             Box::new(exception::EmptyExceptRule::new()),
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "bare-except",
-                    name: "Bare Except Block",
-                    category: RuleCategory::ExceptionHandling,
-                    default_severity: Severity::Warning,
-                    description: "Detects except blocks without a specific exception type.",
-                },
-            }),
+            Box::new(exception::BareExceptRule::new()),
             Box::new(StubRule {
                 meta: RuleMeta {
                     id: "type-prefix",

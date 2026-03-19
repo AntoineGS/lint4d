@@ -9,6 +9,7 @@ use lint4d::engine::{run_lint, Severity};
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;
 use lint4d::rules::RuleRegistry;
+use rayon::prelude::*;
 
 /// Exit codes
 const EXIT_OK: i32 = 0;
@@ -136,41 +137,37 @@ fn main() {
         process::exit(EXIT_OK);
     }
 
-    // Lint each file
+    // Process files in parallel
+    let mut file_results: Vec<_> = files
+        .par_iter()
+        .filter_map(|file| {
+            let source = fs::read(&file.path).ok()?;
+            let diagnostics = run_lint(file, &source, &config);
+            Some((file.path.to_string_lossy().to_string(), source, diagnostics))
+        })
+        .collect();
+
+    // Sort by file path for deterministic output
+    file_results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Check threshold and produce output
     let mut has_issues_above_threshold = false;
     let mut all_file_diagnostics: Vec<(String, Vec<lint4d::engine::Diagnostic>)> = Vec::new();
 
-    for file_info in &files {
-        let source = match fs::read(&file_info.path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "lint4d: failed to read '{}': {}",
-                    file_info.path.display(),
-                    e
-                );
-                continue;
-            }
-        };
-
-        let diagnostics = run_lint(file_info, &source, &config);
-
-        // Check threshold
-        for diag in &diagnostics {
+    for (file_path_str, source, diagnostics) in &file_results {
+        for diag in diagnostics {
             if diag.severity >= threshold {
                 has_issues_above_threshold = true;
             }
         }
 
-        let file_path_str = file_info.path.display().to_string();
-
         if cli.format == "text" {
-            let output = format_diagnostics(&file_path_str, &source, &diagnostics, false);
+            let output = format_diagnostics(file_path_str, source, diagnostics, false);
             if !output.is_empty() {
                 print!("{}", output);
             }
         } else {
-            all_file_diagnostics.push((file_path_str, diagnostics));
+            all_file_diagnostics.push((file_path_str.clone(), diagnostics.clone()));
         }
     }
 

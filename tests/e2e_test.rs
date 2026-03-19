@@ -47,3 +47,20 @@ fn e2e_fail_on_error_only() {
         .assert()
         .failure(); // resource-leak-unprotected is severity error
 }
+
+#[test]
+fn e2e_directory_scan_produces_deterministic_output() {
+    let output1 = Command::cargo_bin("lint4d")
+        .unwrap()
+        .arg("--format").arg("json")
+        .arg(fixture_path("project"))
+        .output().unwrap();
+
+    let output2 = Command::cargo_bin("lint4d")
+        .unwrap()
+        .arg("--format").arg("json")
+        .arg(fixture_path("project"))
+        .output().unwrap();
+
+    assert_eq!(output1.stdout, output2.stdout, "Output should be deterministic");
+}

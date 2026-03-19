@@ -92,15 +92,7 @@ impl RuleRegistry {
             Box::new(exception::BareExceptRule::new()),
             Box::new(naming::TypePrefixRule::new()),
             Box::new(naming::InterfacePrefixRule::new()),
-            Box::new(StubRule {
-                meta: RuleMeta {
-                    id: "constant-naming",
-                    name: "Constant Naming Convention",
-                    category: RuleCategory::NamingConvention,
-                    default_severity: Severity::Hint,
-                    description: "Enforces naming conventions for constants.",
-                },
-            }),
+            Box::new(naming::ConstantNamingRule::new()),
             Box::new(dangerous::WithStatementRule::new()),
         ];
 

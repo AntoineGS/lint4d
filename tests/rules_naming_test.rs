@@ -35,6 +35,20 @@ fn naming_passes_with_correct_prefixes() {
 }
 
 #[test]
+fn constant_naming_flags_lowercase_constants() {
+    let diagnostics = lint_fixture("tests/fixtures/naming/bad_constant_naming.pas");
+    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "constant-naming").collect();
+    assert_eq!(matches.len(), 2, "Expected 2 constant-naming diagnostics, got: {:?}", matches);
+}
+
+#[test]
+fn constant_naming_passes_upper_case() {
+    let diagnostics = lint_fixture("tests/fixtures/naming/good_constant_naming.pas");
+    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "constant-naming").collect();
+    assert!(matches.is_empty(), "Expected no constant-naming diagnostics, got: {:?}", matches);
+}
+
+#[test]
 fn naming_rules_skipped_for_dpr_files() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/naming/bad_type_prefix.pas");
     let source = fs::read(&path).unwrap();

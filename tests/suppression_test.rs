@@ -1,4 +1,4 @@
-use lint4d::engine::suppress::{parse_suppressions, Suppression};
+use lint4d::engine::suppress::parse_suppressions;
 
 #[test]
 fn parses_ignore_directive_on_own_line() {

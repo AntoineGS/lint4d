@@ -208,7 +208,7 @@ fn main() {
 }
 
 fn run_generate_baseline(
-    cwd: &PathBuf,
+    cwd: &std::path::Path,
     file_results: &[(String, Vec<u8>, Vec<lint4d::engine::Diagnostic>)],
 ) {
     let mut baseline = Baseline::new();
@@ -252,7 +252,7 @@ fn run_generate_baseline(
     );
 }
 
-fn load_baseline(cwd: &PathBuf) -> Option<Baseline> {
+fn load_baseline(cwd: &std::path::Path) -> Option<Baseline> {
     let baseline_path = cwd.join(BASELINE_FILENAME);
     if !baseline_path.exists() {
         return None;
@@ -319,7 +319,7 @@ exclude = ["**/test/**", "**/tests/**"]
 
 fn run_list_rules() {
     let registry = RuleRegistry::new();
-    println!("{:<30} {:<10} {}", "RULE ID", "SEVERITY", "DESCRIPTION");
+    println!("{:<30} {:<10} DESCRIPTION", "RULE ID", "SEVERITY");
     println!("{}", "-".repeat(80));
     for rule in registry.all_rules() {
         let meta = rule.meta();

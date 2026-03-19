@@ -6,7 +6,6 @@ pub use context::{Diagnostic, FileInfo, FileType, Severity};
 use crate::config::{Config, RuleSeverityOverride};
 use crate::rules::{LintContext, RuleCategory, RuleRegistry};
 use tree_sitter::Parser;
-use tree_sitter_language::LanguageFn;
 
 /// Parse Delphi source bytes and collect ERROR/MISSING nodes as diagnostics.
 ///
@@ -17,7 +16,7 @@ pub fn parse_file(
     source: &[u8],
 ) -> Result<(tree_sitter::Tree, Vec<Diagnostic>), String> {
     let mut parser = Parser::new();
-    let language = LanguageFn::from(tree_sitter_pascal::LANGUAGE);
+    let language = tree_sitter_pascal::LANGUAGE;
     parser
         .set_language(&language.into())
         .map_err(|e| format!("failed to set language: {e}"))?;

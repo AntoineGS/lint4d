@@ -65,9 +65,8 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
 
         // Step 2: Look ahead for a `try` node whose `finally` frees this variable.
         let mut try_index = None;
-        for j in (i + 1)..children.len() {
-            if children[j].kind() == "try" && finally_frees_variable(children[j], source, &var_name)
-            {
+        for (j, sibling) in children.iter().enumerate().skip(i + 1) {
+            if sibling.kind() == "try" && finally_frees_variable(*sibling, source, &var_name) {
                 try_index = Some(j);
                 break;
             }
@@ -80,8 +79,8 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
 
         // Step 3: Flag any statements between the assignment and the try
         // that reference the variable.
-        for j in (i + 1)..try_idx {
-            let stmt = children[j];
+        for sibling in children.iter().take(try_idx).skip(i + 1) {
+            let stmt = *sibling;
             let stmt_text = node_text(stmt, source);
             if text_references_variable(&stmt_text, &var_name) {
                 let start = stmt.start_position();

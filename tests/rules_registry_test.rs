@@ -1,4 +1,4 @@
-use lint4d::rules::{RuleRegistry, RuleMeta, RuleCategory};
+use lint4d::rules::{RuleRegistry, RuleCategory};
 use lint4d::engine::Severity;
 
 #[test]

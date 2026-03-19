@@ -50,20 +50,6 @@ pub trait Rule: Send + Sync {
     fn check(&self, file: &FileInfo, tree: &Tree, source: &[u8], ctx: &mut LintContext);
 }
 
-struct StubRule {
-    meta: RuleMeta,
-}
-
-impl Rule for StubRule {
-    fn meta(&self) -> &RuleMeta {
-        &self.meta
-    }
-
-    fn check(&self, _file: &FileInfo, _tree: &Tree, _source: &[u8], _ctx: &mut LintContext) {
-        // Stub: does nothing
-    }
-}
-
 pub struct RuleRegistry {
     rules: Vec<Box<dyn Rule>>,
 }

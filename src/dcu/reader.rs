@@ -88,6 +88,29 @@ impl<'a> DcuReader<'a> {
         Ok(val)
     }
 
+    /// Read a length-prefixed ANSI name string.
+    /// If the first byte is 0xFF, the following 4 bytes are a u32 length.
+    /// Otherwise the first byte is the length directly.
+    pub fn read_name(&mut self) -> Result<String, DcuError> {
+        let len_byte = self.read_byte()?;
+        let len = if len_byte == 0xFF {
+            self.read_u32()? as usize
+        } else {
+            len_byte as usize
+        };
+        if len == 0 {
+            return Ok(String::new());
+        }
+        if self.pos + len > self.data.len() {
+            return Err(DcuError::UnexpectedEof { context: "read_name" });
+        }
+        let bytes = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+        // ANSI bytes — treat as Latin-1 (superset of ASCII)
+        let s: String = bytes.iter().map(|&b| b as char).collect();
+        Ok(s)
+    }
+
     /// DCU variable-length signed integer encoding.
     /// Same byte structure as read_uindex but with arithmetic (sign-extending) shift.
     pub fn read_index(&mut self) -> Result<i32, DcuError> {

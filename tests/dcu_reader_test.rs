@@ -108,3 +108,27 @@ fn read_index_negative_2byte() {
     let mut r = DcuReader::new(&data);
     assert_eq!(r.read_index().unwrap(), -2);
 }
+
+#[test]
+fn read_name_short() {
+    let data = [0x06, b'S', b'y', b's', b't', b'e', b'm'];
+    let mut r = DcuReader::new(&data);
+    assert_eq!(r.read_name().unwrap(), "System");
+    assert_eq!(r.position(), 7);
+}
+
+#[test]
+fn read_name_empty() {
+    let data = [0x00];
+    let mut r = DcuReader::new(&data);
+    assert_eq!(r.read_name().unwrap(), "");
+    assert_eq!(r.position(), 1);
+}
+
+#[test]
+fn read_name_long_format() {
+    let data = [0xFF, 0x03, 0x00, 0x00, 0x00, b'F', b'o', b'o'];
+    let mut r = DcuReader::new(&data);
+    assert_eq!(r.read_name().unwrap(), "Foo");
+    assert_eq!(r.position(), 8);
+}

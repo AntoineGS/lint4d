@@ -1,5 +1,6 @@
 pub mod dangerous;
 pub mod exception;
+pub mod helpers;
 pub mod naming;
 pub mod resource_leak;
 

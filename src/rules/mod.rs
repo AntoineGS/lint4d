@@ -72,6 +72,7 @@ impl RuleRegistry {
             Box::new(naming::TypePrefixRule::new()),
             Box::new(naming::InterfacePrefixRule::new()),
             Box::new(naming::ConstantNamingRule::new()),
+            Box::new(naming::LocalVariableNamingRule::new()),
             Box::new(dangerous::WithStatementRule::new()),
         ];
 

@@ -95,3 +95,81 @@ fn engine_filters_suppressed_diagnostics() {
         parse_errors
     );
 }
+
+#[test]
+fn local_variable_naming_flags_pascal_case_in_camel_mode() {
+    let source = std::fs::read("tests/fixtures/naming/bad_local_variable_camel.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config =
+        Config::from_str("version = 1\n[rules.naming]\nlocal_variable_style = \"camelCase\"")
+            .unwrap();
+    let diagnostics = run_lint(&file, &source, &config);
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "local-variable-naming")
+        .collect();
+    assert_eq!(
+        hits.len(),
+        2,
+        "Should flag MyCounter and AnotherBadName but not x: {:?}",
+        hits
+    );
+}
+
+#[test]
+fn local_variable_naming_passes_camel_case() {
+    let source = std::fs::read("tests/fixtures/naming/good_local_variable_camel.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config =
+        Config::from_str("version = 1\n[rules.naming]\nlocal_variable_style = \"camelCase\"")
+            .unwrap();
+    let diagnostics = run_lint(&file, &source, &config);
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "local-variable-naming")
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "No local-variable-naming diagnostics expected: {:?}",
+        hits
+    );
+}
+
+#[test]
+fn local_variable_naming_flags_camel_case_in_pascal_mode() {
+    let source = std::fs::read("tests/fixtures/naming/bad_local_variable_pascal.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config =
+        Config::from_str("version = 1\n[rules.naming]\nlocal_variable_style = \"PascalCase\"")
+            .unwrap();
+    let diagnostics = run_lint(&file, &source, &config);
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "local-variable-naming")
+        .collect();
+    assert_eq!(
+        hits.len(),
+        2,
+        "Should flag myCounter and anotherBad but not x: {:?}",
+        hits
+    );
+}
+
+#[test]
+fn local_variable_naming_passes_pascal_case() {
+    let source = std::fs::read("tests/fixtures/naming/good_local_variable_pascal.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config =
+        Config::from_str("version = 1\n[rules.naming]\nlocal_variable_style = \"PascalCase\"")
+            .unwrap();
+    let diagnostics = run_lint(&file, &source, &config);
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "local-variable-naming")
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "No local-variable-naming diagnostics expected: {:?}",
+        hits
+    );
+}

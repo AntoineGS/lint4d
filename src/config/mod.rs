@@ -19,6 +19,7 @@ pub struct Config {
     pub exclude: Vec<String>,
     rule_overrides: HashMap<String, RuleSeverityOverride>,
     constant_style: String,
+    local_variable_style: String,
 }
 
 impl Config {
@@ -49,6 +50,13 @@ impl Config {
             .and_then(|n| n.constant_style.clone())
             .unwrap_or_else(|| "UPPER_CASE".to_string());
 
+        let local_variable_style = raw
+            .rules
+            .as_ref()
+            .and_then(|r| r.naming.as_ref())
+            .and_then(|n| n.local_variable_style.clone())
+            .unwrap_or_else(|| "camelCase".to_string());
+
         let lint4d = raw.lint4d.unwrap_or_default();
 
         Ok(Config {
@@ -57,6 +65,7 @@ impl Config {
             exclude: lint4d.exclude,
             rule_overrides,
             constant_style,
+            local_variable_style,
         })
     }
 
@@ -66,6 +75,10 @@ impl Config {
 
     pub fn constant_style(&self) -> &str {
         &self.constant_style
+    }
+
+    pub fn local_variable_style(&self) -> &str {
+        &self.local_variable_style
     }
 
     pub fn discover(start_dir: &Path) -> Result<(Config, PathBuf), String> {
@@ -89,6 +102,7 @@ impl Config {
                 exclude: Vec::new(),
                 rule_overrides: HashMap::new(),
                 constant_style: "UPPER_CASE".to_string(),
+                local_variable_style: "camelCase".to_string(),
             },
             start_dir.to_path_buf(),
         ))

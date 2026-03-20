@@ -34,4 +34,5 @@ pub struct RawRulesSection {
 #[derive(Debug, Deserialize, Default)]
 pub struct RawNamingSection {
     pub constant_style: Option<String>,
+    pub local_variable_style: Option<String>,
 }

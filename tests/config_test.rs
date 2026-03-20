@@ -72,3 +72,20 @@ fn discover_config_uses_cwd_when_missing() {
     assert_eq!(config.version, 1);
     assert_eq!(root, dir.path().to_path_buf());
 }
+
+#[test]
+fn config_parses_local_variable_style() {
+    let toml = r#"
+version = 1
+[rules.naming]
+local_variable_style = "PascalCase"
+"#;
+    let config = Config::from_str(toml).unwrap();
+    assert_eq!(config.local_variable_style(), "PascalCase");
+}
+
+#[test]
+fn config_defaults_local_variable_style_to_camel_case() {
+    let config = Config::from_str("version = 1").unwrap();
+    assert_eq!(config.local_variable_style(), "camelCase");
+}

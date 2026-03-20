@@ -132,3 +132,48 @@ fn read_name_long_format() {
     assert_eq!(r.read_name().unwrap(), "Foo");
     assert_eq!(r.position(), 8);
 }
+
+#[test]
+fn unread_moves_position_back() {
+    let data = [0x01, 0x02, 0x03, 0x04];
+    let mut r = DcuReader::new(&data);
+    r.read_byte().unwrap();
+    r.read_byte().unwrap();
+    assert_eq!(r.position(), 2);
+    r.unread(1);
+    assert_eq!(r.position(), 1);
+    assert_eq!(r.read_byte().unwrap(), 0x02);
+}
+
+#[test]
+fn unread_saturates_at_zero() {
+    let data = [0x01, 0x02];
+    let mut r = DcuReader::new(&data);
+    r.read_byte().unwrap();
+    r.unread(5);
+    assert_eq!(r.position(), 0);
+}
+
+#[test]
+fn peek_byte_does_not_advance() {
+    let data = [0xAB, 0xCD];
+    let r = DcuReader::new(&data);
+    assert_eq!(r.peek_byte().unwrap(), 0xAB);
+    assert_eq!(r.position(), 0);
+}
+
+#[test]
+fn peek_byte_eof() {
+    let data = [];
+    let r = DcuReader::new(&data);
+    assert!(r.peek_byte().is_err());
+}
+
+#[test]
+fn set_position_moves_reader() {
+    let data = [0x01, 0x02, 0x03, 0x04];
+    let mut r = DcuReader::new(&data);
+    r.set_position(2);
+    assert_eq!(r.position(), 2);
+    assert_eq!(r.read_byte().unwrap(), 0x03);
+}

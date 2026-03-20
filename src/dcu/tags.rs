@@ -49,6 +49,12 @@ pub const DR_IMP_TYPE_DEF: u8 = 0x6E;
 pub const DR_SRC: u8 = 0x70;
 pub const DR_OBJ: u8 = 0x71;
 pub const DR_RES: u8 = 0x72;
+pub const DR_ASM: u8 = 0x73;
+pub const DR_UNIT_INLINE_SRC: u8 = 0x76;
+
+// Structural tags used within uses clauses
+pub const DR_STOP2: u8 = 0x9F;
+pub const DR_CONST_ADD_INFO: u8 = 0x9C;
 
 // Declaration tags
 pub const DR_VAR: u8 = 0x20;

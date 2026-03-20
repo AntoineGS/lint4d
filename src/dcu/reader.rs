@@ -18,6 +18,21 @@ impl<'a> DcuReader<'a> {
         self.data.len() - self.pos
     }
 
+    pub fn set_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    pub fn unread(&mut self, n: usize) {
+        self.pos = self.pos.saturating_sub(n);
+    }
+
+    pub fn peek_byte(&self) -> Result<u8, DcuError> {
+        if self.pos >= self.data.len() {
+            return Err(DcuError::UnexpectedEof { context: "peek_byte" });
+        }
+        Ok(self.data[self.pos])
+    }
+
     pub fn read_byte(&mut self) -> Result<u8, DcuError> {
         if self.pos >= self.data.len() {
             return Err(DcuError::UnexpectedEof { context: "read_byte" });

@@ -1,6 +1,7 @@
 pub mod casing;
 pub mod dangerous;
 pub mod exception;
+pub mod field_leak;
 pub mod helpers;
 pub mod naming;
 pub mod resource_leak;
@@ -68,6 +69,8 @@ impl RuleRegistry {
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(resource_leak::ResourceLeakUnprotectedRule::new()),
             Box::new(resource_leak::ResourceLeakNoTryRule::new()),
+            Box::new(field_leak::FieldNotFreedRule::new()),
+            Box::new(field_leak::FieldReassignLeakRule::new()),
             Box::new(exception::EmptyExceptRule::new()),
             Box::new(exception::BareExceptRule::new()),
             Box::new(naming::TypePrefixRule::new()),

@@ -7,7 +7,7 @@ use lint4d::config::baseline::Baseline;
 use lint4d::config::Config;
 use lint4d::discovery::discover_files;
 use lint4d::discovery::dproj::parse_dproj;
-use lint4d::engine::{run_lint, Severity};
+use lint4d::engine::{run_lint_with_context, Severity};
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;
 use lint4d::rules::RuleRegistry;
@@ -112,6 +112,26 @@ fn main() {
         }
     };
 
+    // Build ProjectContext if dcu_paths are configured
+    let project_context = if !config.dcu_paths().is_empty() {
+        let dcu_dirs: Vec<std::path::PathBuf> = config.dcu_paths().iter().map(std::path::PathBuf::from).collect();
+        match lint4d::dcu::ProjectContext::from_dcu_paths(&dcu_dirs) {
+            Ok(ctx) => {
+                let count = ctx.unit_count();
+                if count > 0 {
+                    eprintln!("Loaded DCU type info from {} unit(s)", count);
+                }
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("lint4d: warning: failed to load DCU info: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build file list: --project uses dproj parser, otherwise glob discovery
     let files = if let Some(ref project_path) = cli.project {
         match parse_dproj(project_path) {
@@ -144,7 +164,7 @@ fn main() {
         .par_iter()
         .filter_map(|file| {
             let source = fs::read(&file.path).ok()?;
-            let diagnostics = run_lint(file, &source, &config);
+            let diagnostics = run_lint_with_context(file, &source, &config, project_context.as_ref());
             Some((file.path.to_string_lossy().to_string(), source, diagnostics))
         })
         .collect();
@@ -317,13 +337,18 @@ exclude = ["**/test/**", "**/tests/**"]
 
 fn run_list_rules() {
     let registry = RuleRegistry::new();
-    println!("{:<30} {:<10} DESCRIPTION", "RULE ID", "SEVERITY");
+    println!("{:<35} {:<10} DESCRIPTION", "RULE ID", "SEVERITY");
     println!("{}", "-".repeat(80));
     for rule in registry.all_rules() {
         let meta = rule.meta();
+        let id_display = if rule.requires_context() {
+            format!("{} [DCU]", meta.id)
+        } else {
+            meta.id.to_string()
+        };
         println!(
-            "{:<30} {:<10} {}",
-            meta.id, meta.default_severity, meta.description
+            "{:<35} {:<10} {}",
+            id_display, meta.default_severity, meta.description
         );
     }
 }

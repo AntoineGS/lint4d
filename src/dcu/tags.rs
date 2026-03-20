@@ -80,6 +80,11 @@ pub const AR_METHOD: u8 = 0x2D;
 pub const AR_CONSTR: u8 = 0x2E;
 pub const AR_DESTR: u8 = 0x2F;
 pub const AR_PROPERTY: u8 = 0x30;
+pub const AR_CLASS_VAR: u8 = 0x36;
+pub const AR_ABS_LOC_VAR: u8 = 0x24;
+pub const AR_LABEL: u8 = 0x2B;
+pub const AR_SET_DEFT: u8 = 0x9A;
+pub const AR_COPY_DECL: u8 = 0xA3;
 
 // Additional info tags (declaration list context)
 pub const DR_PROC_ADD_INFO: u8 = 0x9E;
@@ -113,6 +118,9 @@ pub const DR_INTERFACE_DEF: u8 = 0x54;
 pub const DR_WIDE_STR_DEF: u8 = 0x55;
 pub const DR_WIDE_RANGE_DEF: u8 = 0x56;
 pub const DR_META_CLASS_DEF: u8 = 0x57;
+
+// Dynamic array definition (D12+, separate from drArrayDef)
+pub const DR_DYN_ARRAY_DEF: u8 = 0x58;
 
 // Embedded / template tags
 pub const DR_EMBEDDED_PROC_START: u8 = 0x6A;

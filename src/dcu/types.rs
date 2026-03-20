@@ -1,7 +1,9 @@
 use crate::dcu::header::parse_unit_header;
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::*;
-use crate::dcu::{DcuUnit, TypeInfo, TypeKind};
+use crate::dcu::{
+    DcuUnit, FieldInfo, MethodInfo, MethodKind, TypeInfo, TypeKind, TypeRef, Visibility,
+};
 
 /// Parse a complete DCU file, extracting the unit name, version, platform,
 /// the list of imported unit names, and type declarations.
@@ -31,7 +33,13 @@ pub fn parse_dcu(data: &[u8]) -> Result<DcuUnit, DcuError> {
     skip_uses(&mut reader, &mut tag, DR_DLL)?;
 
     // Walk the declaration list to extract type names.
-    let types = read_decl_list(&mut reader, &mut tag)?;
+    let mut types = Vec::new();
+    // EOF is tolerated: the parser may read past the declaration section
+    // into data blocks or debug info, hitting EOF gracefully.
+    match read_decl_list_into(&mut reader, &mut tag, &mut types) {
+        Ok(()) | Err(DcuError::UnexpectedEof { .. }) => {}
+        Err(e) => return Err(e),
+    }
 
     Ok(DcuUnit {
         name: header.name,
@@ -42,11 +50,15 @@ pub fn parse_dcu(data: &[u8]) -> Result<DcuUnit, DcuError> {
     })
 }
 
-/// Apply the D2006+ tag fixup: raw tags in 0x2D..0x36 are decremented by 1
-/// to map back to the original pre-D2006 constant values.
+/// Apply the D2006+ tag fixup: raw tags in 0x2D..0x36 are remapped.
+/// Raw 0x2D wraps to 0x36 (arClassVar). All others decrement by 1.
 fn fix_tag(raw: u8) -> u8 {
     if raw >= 0x2D && raw <= 0x36 {
-        raw - 1
+        if raw == 0x2D {
+            0x36 // arClassVar: raw 0x2D wraps to technical value 0x36
+        } else {
+            raw - 1
+        }
     } else {
         raw
     }
@@ -61,6 +73,18 @@ fn read_decl_list(
     tag: &mut u8,
 ) -> Result<Vec<TypeInfo>, DcuError> {
     let mut types = Vec::new();
+    read_decl_list_into(reader, tag, &mut types)?;
+    Ok(types)
+}
+
+/// Inner declaration list reader that collects types into a shared Vec.
+/// This allows nested read_decl_list calls (e.g., inside proc args) to
+/// associate type definitions with type declarations from outer scopes.
+fn read_decl_list_into(
+    reader: &mut DcuReader,
+    tag: &mut u8,
+    types: &mut Vec<TypeInfo>,
+) -> Result<(), DcuError> {
 
     loop {
         let fixed = fix_tag(*tag);
@@ -80,7 +104,7 @@ fn read_decl_list(
             }
             // drUnitAddInfo: namespace segments with nested declaration lists.
             DR_UNIT_ADD_INFO => {
-                skip_unit_add_info(reader)?;
+                read_unit_add_info(reader, types)?;
                 *tag = reader.read_byte()?;
                 continue;
             }
@@ -124,7 +148,18 @@ fn read_decl_list(
                 continue;
             }
             // Stop / structural tags: end of declaration list.
-            DR_STOP | DR_STOP_A | DR_CBLOCK | DR_FIXUP => {
+            DR_STOP | DR_STOP_A => {
+                break;
+            }
+            // drCBlock: data block. Read size + data, then continue.
+            DR_CBLOCK => {
+                let data_bl_size = reader.read_uindex()?;
+                reader.skip(data_bl_size as usize)?;
+                *tag = reader.read_byte()?;
+                continue;
+            }
+            // drFixUp: fixup table. Skip until end of file or stop.
+            DR_FIXUP => {
                 break;
             }
             // drStop1: end of nested list.
@@ -133,21 +168,72 @@ fn read_decl_list(
             }
             // drEmbeddedProcStart: skip the entire embedded proc block.
             DR_EMBEDDED_PROC_START => {
-                skip_embedded_proc(reader)?;
+                skip_embedded_proc(reader, types)?;
+                *tag = reader.read_byte()?;
+                continue;
+            }
+            // drEmbeddedProcEnd: can appear in arg lists (D2009+).
+            DR_EMBEDDED_PROC_END => {
                 *tag = reader.read_byte()?;
                 continue;
             }
             // drProc: procedure declaration -- complex, try to skip it.
+            // If the name is "ClassName.MethodName", associate it as a
+            // method of the corresponding class type.
             DR_PROC => {
-                match skip_proc_decl(reader) {
-                    Ok(()) => {}
-                    Err(_) => break,
+                {
+                    let save_pos = reader.position();
+                    match skip_proc_decl(reader, types) {
+                        Ok(proc_name) => {
+                            associate_proc_with_class(
+                                &proc_name, types,
+                            );
+                        }
+                        Err(_e) => {
+                            reader.set_position(save_pos);
+                            break;
+                        }
+                    }
                 }
             }
             // drExport: TNameDecl + index.
             DR_EXPORT => {
                 let _name = reader.read_name()?;
                 let _idx = reader.read_uindex()?;
+            }
+            // Local variable / parameter tags (appear in proc arg lists, class bodies).
+            AR_VAL | AR_VAR | AR_RESULT | AR_ABS_LOC_VAR => {
+                skip_local_decl(reader, false)?;
+            }
+            // Field declaration (class/record member).
+            AR_FLD => {
+                skip_local_decl(reader, false)?;
+            }
+            // Method / constructor / destructor (class member).
+            AR_METHOD | AR_CONSTR | AR_DESTR => {
+                skip_method_decl(reader, fixed)?;
+            }
+            // Property declaration.
+            AR_PROPERTY => {
+                skip_property_decl(reader)?;
+            }
+            // Class variable (D2006+).
+            AR_CLASS_VAR => {
+                skip_local_decl(reader, false)?;
+            }
+            // Label declaration.
+            AR_LABEL => {
+                skip_local_decl(reader, false)?;
+            }
+            // arSetDeft: default set value.
+            AR_SET_DEFT => {
+                let _v = reader.read_u32()?;
+            }
+            // arCopyDecl: copy of a declaration from parent.
+            AR_COPY_DECL => {
+                let _name = reader.read_name()?;
+                let _nf = read_namef_fields(reader, true)?;
+                let _src = reader.read_uindex()?;
             }
             // Type definition tags (Rec entries). Skip to continue parsing.
             DR_ENUM_DEF => {
@@ -163,6 +249,10 @@ fn read_decl_list(
             DR_PTR_DEF => {
                 skip_ptr_def(reader)?;
             }
+            DR_DYN_ARRAY_DEF => {
+                // TDynArrayDef inherits from TPtrDef: type_def_header + hRefDT
+                skip_ptr_def(reader)?;
+            }
             DR_SET_DEF => {
                 skip_set_def(reader)?;
             }
@@ -173,13 +263,79 @@ fn read_decl_list(
                 skip_proc_type_def(reader)?;
             }
             DR_CLASS_DEF => {
-                skip_class_def(reader)?;
+                let members = parse_class_def(reader)?;
+                // Associate parsed members with the most recently declared type.
+                if let Some(last_type) = types.last_mut() {
+                    last_type.kind = TypeKind::Class;
+                    last_type.fields = members.0;
+                    last_type.methods = members.1;
+                }
             }
             DR_REC_DEF => {
                 skip_rec_def(reader)?;
             }
             DR_INTERFACE_DEF => {
                 skip_interface_def(reader)?;
+            }
+            DR_OBJ_VMT_DEF => {
+                skip_obj_vmt_def(reader)?;
+            }
+            DR_OBJ_DEF => {
+                skip_obj_def(reader)?;
+            }
+            DR_VOID => {
+                // TVoidDef: just the type_def_header
+                read_type_def_header(reader)?;
+            }
+            DR_META_CLASS_DEF => {
+                skip_meta_class_def(reader)?;
+            }
+            DR_VARIANT_DEF => {
+                // TVariantDef: type_def_header + 1 byte
+                read_type_def_header(reader)?;
+                let _b = reader.read_byte()?;
+            }
+            DR_SHORT_STR_DEF => {
+                // TShortStrDef: type_def_header + uindex
+                read_type_def_header(reader)?;
+                let _cp = reader.read_uindex()?;
+            }
+            DR_STRING_DEF | DR_WIDE_STR_DEF => {
+                // TStringDef: type_def_header + uindex
+                read_type_def_header(reader)?;
+                let _cp = reader.read_uindex()?;
+            }
+            DR_TEXT_DEF | DR_FILE_DEF => {
+                // TTextDef/TFileDef: type_def_header + uindex
+                read_type_def_header(reader)?;
+                let _h_base = reader.read_uindex()?;
+            }
+            DR_TEMPLATE_ARG_DEF => {
+                read_type_def_header(reader)?;
+            }
+            // DR_TEMPLATE_CALL: complex, but try to skip
+            DR_TEMPLATE_CALL => {
+                read_type_def_header(reader)?;
+                let _h_dt = reader.read_uindex()?;
+                let cnt = reader.read_uindex()?;
+                for _ in 0..cnt {
+                    let _v = reader.read_uindex()?;
+                }
+            }
+            // drSysProc: D8+
+            DR_SYS_PROC => {
+                let _name = reader.read_name()?;
+                let _nf = read_namef_fields(reader, false)?;
+                let _v = reader.read_uindex()?;
+            }
+            // drStrConstRec: D8+
+            DR_STR_CONST_REC => {
+                let _name = reader.read_name()?;
+                let _nf = read_namef_fields(reader, false)?;
+                let _h_dt = reader.read_uindex()?;
+                let _ofs = reader.read_uindex()?;
+                let _v = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
             }
             // Unknown or unhandled tag: stop gracefully.
             _ => {
@@ -189,7 +345,7 @@ fn read_decl_list(
         *tag = reader.read_byte()?;
     }
 
-    Ok(types)
+    Ok(())
 }
 
 /// Read a drType declaration (type declaration).
@@ -248,8 +404,8 @@ fn read_type_p_decl(
 
 /// Read TNameFDecl fields: F, F1, F4, optionally Inf and B2.
 struct NameFFields {
-    _f: u32,
-    _f1: u32,
+    pub _f: u32,
+    pub _f1: u32,
 }
 
 fn read_namef_fields(
@@ -301,19 +457,26 @@ fn skip_const_decl(reader: &mut DcuReader) -> Result<(), DcuError> {
     Ok(())
 }
 
-/// Skip a drUnitAddInfo record and its nested declaration list.
-fn skip_unit_add_info(reader: &mut DcuReader) -> Result<(), DcuError> {
+/// Read a drUnitAddInfo record and its nested declaration list.
+/// Types found inside are added to the shared types Vec.
+fn read_unit_add_info(
+    reader: &mut DcuReader,
+    types: &mut Vec<TypeInfo>,
+) -> Result<(), DcuError> {
     let _name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
     let _b = reader.read_uindex()?;
 
     let mut inner_tag = reader.read_byte()?;
-    let _inner_types = read_decl_list(reader, &mut inner_tag)?;
+    read_decl_list_into(reader, &mut inner_tag, types)?;
     Ok(())
 }
 
 /// Skip a drConstAddInfo record in the declaration list context.
 /// Uses a tag-based sub-protocol; for D2009+ the stop marker is 0xFF.
+///
+/// DCU32 reference: TUnit.ReadConstAddInfo
+/// For D13 (>= verD2009, >= verD_XE6): caiStop = 0xFF.
 fn skip_decl_const_add_info(reader: &mut DcuReader) -> Result<(), DcuError> {
     loop {
         let sub_tag = reader.read_byte()?;
@@ -322,42 +485,331 @@ fn skip_decl_const_add_info(reader: &mut DcuReader) -> Result<(), DcuError> {
         }
         match sub_tag {
             0x01 => {
-                let _h_def = reader.read_uindex()?;
-                let f = reader.read_uindex()?;
-                if (f & 0x0100_0000) != 0 {
-                    let _ip = reader.read_uindex()?;
-                }
+                skip_cai_tag_01(reader)?;
             }
             0x02 => {
+                // ReadNDXStr: length-prefixed string
                 let _msg = reader.read_name()?;
             }
-            0x03 | 0x04 => {
-                let _h_def = reader.read_uindex()?;
-            }
-            0x05 => {
-                let _h_def = reader.read_uindex()?;
+            0x03 => {
                 let _v = reader.read_uindex()?;
             }
-            0x06 | 0x07 => {
-                let _h_def = reader.read_uindex()?;
-                let _h_def2 = reader.read_uindex()?;
-            }
-            0x08 => {
-                let n = reader.read_uindex()?;
-                for _ in 0..n {
-                    skip_attribute_record(reader)?;
-                }
-            }
-            0x09 | 0x0B | 0x0C | 0x0D | 0x0E => {
-                let _v = reader.read_uindex()?;
-            }
-            0x0A => {
+            0x04 => {
+                // D2006+: two uindex values
                 let _v1 = reader.read_uindex()?;
                 let _v2 = reader.read_uindex()?;
+            }
+            0x05 => {
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+            }
+            0x06 => {
+                // Result, hDT, V, hDef1
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let _v3 = reader.read_uindex()?;
+                let _v4 = reader.read_uindex()?;
+            }
+            0x07 => {
+                // Result, hDef1, hDef2, V
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let _v3 = reader.read_uindex()?;
+                let _v4 = reader.read_uindex()?;
+            }
+            0x08 => {
+                // Result=ReadUIndex, V=ReadUIndex, SkipBlock(V)
+                let _result = reader.read_uindex()?;
+                let v = reader.read_uindex()?;
+                reader.skip(v as usize)?;
+            }
+            0x09 => {
+                // Result, hDT
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+            }
+            0x0A => {
+                skip_cai_tag_0a(reader)?;
+            }
+            0x0B => {
+                let _v = reader.read_uindex()?;
+            }
+            0x0C => {
+                // Result, V1, V2
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let _v3 = reader.read_uindex()?;
+            }
+            0x0D => {
+                // Result, ReadNDXStr
+                let _v = reader.read_uindex()?;
+                let _s = reader.read_name()?;
+            }
+            0x0E => {
+                let _v = reader.read_uindex()?;
+            }
+            0x10 => {
+                // D2009+: V1, V2, V3
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let _v3 = reader.read_uindex()?;
+            }
+            0x11 => {
+                // D_XE4+: V1, V2
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+            }
+            0x12 => {
+                // D2009+: V1, V2
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+            }
+            0x13 => {
+                // D2009+: V1, V2, V3, 3 strings
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let _v3 = reader.read_uindex()?;
+                let _s1 = reader.read_name()?;
+                let _s2 = reader.read_name()?;
+                let _s3 = reader.read_name()?;
+            }
+            0x14 => {
+                // D2009+: V1, V2, then list of (V, V, V, name)
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let n = reader.read_uindex()?;
+                for _ in 0..n {
+                    let _a = reader.read_uindex()?;
+                    let _b = reader.read_uindex()?;
+                    let _c = reader.read_uindex()?;
+                    let _s = reader.read_name()?;
+                }
+            }
+            0x15 => {
+                // D_XE2+: V, V1, V2
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let _v3 = reader.read_uindex()?;
+            }
+            0x16 => {
+                // Result, V, SkipBlock(V)
+                let _result = reader.read_uindex()?;
+                let v = reader.read_uindex()?;
+                reader.skip(v as usize)?;
+            }
+            0x17 => {
+                // D12+: Result, V, V1, V2
+                let _v1 = reader.read_uindex()?;
+                let _v2 = reader.read_uindex()?;
+                let _v3 = reader.read_uindex()?;
+                let _v4 = reader.read_uindex()?;
             }
             _ => break,
         }
     }
+    Ok(())
+}
+
+/// Skip ConstAddInfo sub-tag 0x01, which is the most complex sub-record.
+///
+/// DCU32 reference: ReadConstAddInfo tag $01 case for D13 (>= verD2009, >= verD_XE6).
+fn skip_cai_tag_01(reader: &mut DcuReader) -> Result<(), DcuError> {
+    let _h_def = reader.read_uindex()?;
+    let f = reader.read_uindex()?;
+
+    // D2006+: inline pointer
+    if (f & 0x0100_0000) != 0 {
+        let _ip = reader.read_uindex()?;
+    }
+
+    // D2009+: hUsedCl (attribute class)
+    if (f & 0x0080_0000) != 0 {
+        let _ip2 = reader.read_uindex()?;
+    }
+
+    // D2009+: deprecated message (if F & 0x01)
+    if (f & 0x01) != 0 {
+        // ReadNDXStrRef: reads a uindex (string reference)
+        let _depr_msg = reader.read_uindex()?;
+    }
+
+    // D_XE6+: attributes (if F & 0x80000000)
+    if (f & 0x8000_0000) != 0 {
+        let n = reader.read_uindex()?;
+        for _ in 0..n {
+            skip_attribute_record(reader)?;
+        }
+    }
+
+    // D2009+ inline check: cafInline = 0x40000 for D2009+
+    if (f & 0x0004_0000) != 0 {
+        skip_cai_inline_data(reader)?;
+    }
+
+    // D2005+: cafBigVal = 0x80000 for D2009+
+    if (f & 0x0008_0000) != 0 {
+        let _ip = reader.read_uindex()?;
+    }
+
+    Ok(())
+}
+
+/// Skip ConstAddInfo sub-tag 0x0A: complex flag-based record.
+///
+/// DCU32 reference: ReadConstAddInfo tag $0A for D13.
+fn skip_cai_tag_0a(reader: &mut DcuReader) -> Result<(), DcuError> {
+    let _result = reader.read_uindex()?;
+    let _v = reader.read_uindex()?;
+    let f = reader.read_uindex()?;
+
+    if (f & 0x01) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x02) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x04) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x08) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x10) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x20) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x40) != 0 {
+        // TExtraArgsDeclModifier.Read: len, then len * (name, uindex, uindex, uindex)
+        let len = reader.read_uindex()?;
+        for _ in 0..len {
+            let _s = reader.read_name()?;
+            let _a = reader.read_uindex()?;
+            let _b = reader.read_uindex()?;
+            let _c = reader.read_uindex()?;
+        }
+    }
+    if (f & 0x80) != 0 {
+        let _v1 = reader.read_uindex()?;
+        let _v2 = reader.read_uindex()?;
+        let _v3 = reader.read_uindex()?;
+    }
+    if (f & 0x100) != 0 {
+        // TGeneratedNameDeclModifier: ReadNDXStrRef
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x200) != 0 {
+        let _s = reader.read_name()?;
+    }
+    if (f & 0x400) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x800) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x1000) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x2000) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+    if (f & 0x4000) != 0 {
+        let _v = reader.read_uindex()?;
+    }
+
+    Ok(())
+}
+
+/// Skip the inline data structure in ConstAddInfo tag 0x01.
+///
+/// DCU32 reference: the cafInline branch in ReadConstAddInfo.
+fn skip_cai_inline_data(reader: &mut DcuReader) -> Result<(), DcuError> {
+    // D2006+: two uindexes
+    let _v1 = reader.read_uindex()?;
+    let _v2 = reader.read_uindex()?;
+
+    // Len bytes to skip
+    let len = reader.read_uindex()?;
+    reader.skip(len as usize)?;
+
+    // 5 uindexes
+    for _ in 0..5 {
+        let _v = reader.read_uindex()?;
+    }
+    // D_XE2+: extra uindex
+    let _v = reader.read_uindex()?;
+    // Another uindex
+    let _v = reader.read_uindex()?;
+
+    // Len1: entries
+    let len1 = reader.read_uindex()?;
+
+    // D2009+: extra reads
+    let _v = reader.read_uindex()?;
+    let _v = reader.read_uindex()?;
+    let len2 = reader.read_uindex()?;
+    reader.skip((len2 as usize) * 4)?; // SkipBlock(Len1 * SizeOf(LongInt))
+
+    for _ in 0..len1 {
+        let _v = reader.read_uindex()?;
+        // D2009+:
+        let _r = reader.read_uindex()?;
+        let _r2 = reader.read_uindex()?;
+        let _v2 = reader.read_uindex()?;
+        let z = reader.read_uindex()?;
+        // D2010+: extra
+        let _r3 = reader.read_uindex()?;
+        if z != 0 {
+            let _r4 = reader.read_uindex()?;
+        }
+    }
+
+    // Second list
+    let len3 = reader.read_uindex()?;
+    for _ in 0..len3 {
+        let v = reader.read_uindex()?;
+        // D2009+ value dispatch
+        let count = match v {
+            1 => {
+                let _v = reader.read_uindex()?;
+                // D_XE+: RefAddrDef. For D13 (>= XE), count = 2
+                2
+            }
+            2 => 1,
+            3 => 3,
+            4 => 2,
+            5 => 4,
+            6 => 1,
+            _ => 0,
+        };
+        for _ in 0..count {
+            let _v = reader.read_uindex()?;
+        }
+    }
+
+    // Unit references list
+    let len4 = reader.read_uindex()?;
+    for _ in 0..len4 {
+        let _h_unit = reader.read_uindex()?;
+        let cnt = reader.read_uindex()?;
+        for _ in 0..cnt {
+            let _v = reader.read_uindex()?;
+        }
+    }
+
+    // D2006+: additional list + D2009 extra
+    {
+        let len5 = reader.read_uindex()?;
+        for _ in 0..len5 {
+            let _v = reader.read_uindex()?;
+        }
+        // D2009+: three more uindexes
+        let _v1 = reader.read_uindex()?;
+        let _v2 = reader.read_uindex()?;
+        let _v3 = reader.read_uindex()?;
+    }
+
     Ok(())
 }
 
@@ -396,7 +848,12 @@ fn skip_attribute_record(reader: &mut DcuReader) -> Result<(), DcuError> {
 }
 
 /// Skip an embedded proc block (drEmbeddedProcStart .. drEmbeddedProcEnd).
-fn skip_embedded_proc(reader: &mut DcuReader) -> Result<(), DcuError> {
+/// Passes the shared types Vec so that type definitions inside embedded
+/// procs can be associated with type declarations from outer scopes.
+fn skip_embedded_proc(
+    reader: &mut DcuReader,
+    types: &mut Vec<TypeInfo>,
+) -> Result<(), DcuError> {
     let mut inner_tag = reader.read_byte()?;
     loop {
         let fixed = fix_tag(inner_tag);
@@ -404,12 +861,12 @@ fn skip_embedded_proc(reader: &mut DcuReader) -> Result<(), DcuError> {
             break;
         }
         if fixed == DR_EMBEDDED_PROC_START {
-            skip_embedded_proc(reader)?;
+            skip_embedded_proc(reader, types)?;
             inner_tag = reader.read_byte()?;
             continue;
         }
         let mut temp_tag = inner_tag;
-        let _inner_types = read_decl_list(reader, &mut temp_tag)?;
+        read_decl_list_into(reader, &mut temp_tag, types)?;
         if fix_tag(temp_tag) == DR_EMBEDDED_PROC_END {
             break;
         }
@@ -418,8 +875,13 @@ fn skip_embedded_proc(reader: &mut DcuReader) -> Result<(), DcuError> {
     Ok(())
 }
 
-/// Skip a procedure declaration (drProc).
-fn skip_proc_decl(reader: &mut DcuReader) -> Result<(), DcuError> {
+/// Skip a procedure declaration (drProc), returning the proc name.
+/// The `types` parameter allows type definitions found inside proc bodies
+/// to be associated with type declarations from the outer scope.
+fn skip_proc_decl(
+    reader: &mut DcuReader,
+    types: &mut Vec<TypeInfo>,
+) -> Result<String, DcuError> {
     let name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
 
@@ -456,7 +918,8 @@ fn skip_proc_decl(reader: &mut DcuReader) -> Result<(), DcuError> {
         }
 
         // ReadDeclList for args until stop tag.
-        let _args = read_decl_list(reader, &mut inner_tag)?;
+        // Pass the shared types list so nested class defs link to outer types.
+        read_decl_list_into(reader, &mut inner_tag, types)?;
 
         if fix_tag(inner_tag) != DR_STOP1 {
             return Err(DcuError::UnknownTag {
@@ -466,7 +929,7 @@ fn skip_proc_decl(reader: &mut DcuReader) -> Result<(), DcuError> {
         }
     }
 
-    Ok(())
+    Ok(name)
 }
 
 /// Skip a TA6Def (template parameter info).
@@ -479,16 +942,239 @@ fn skip_a6_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     Ok(())
 }
 
+/// Associate a procedure declaration with a class type based on naming convention.
+/// If the proc name is "ClassName.MethodName", add it as a method of ClassName.
+fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo]) {
+    if let Some(dot_pos) = proc_name.find('.') {
+        let class_name = &proc_name[..dot_pos];
+        let method_name = &proc_name[dot_pos + 1..];
+        if !method_name.is_empty() && !method_name.starts_with(':') {
+            if let Some(ti) = types.iter_mut().find(|t| t.name == class_name) {
+                ti.kind = TypeKind::Class;
+                let kind = if method_name == "Create" {
+                    MethodKind::Constructor
+                } else if method_name == "Destroy" {
+                    MethodKind::Destructor
+                } else {
+                    MethodKind::Procedure
+                };
+                ti.methods.push(MethodInfo {
+                    name: method_name.to_string(),
+                    kind,
+                    params: Vec::new(),
+                    return_type: None,
+                });
+            }
+        }
+    }
+}
+
+// --- Local / member declaration helpers ---
+
+/// Skip a TLocalDecl record (AR_VAL, AR_VAR, AR_RESULT, AR_FLD, AR_ABS_LOC_VAR, AR_LABEL).
+///
+/// TLocalDecl inherits from TNameDecl, NOT TNameFDecl.
+/// D13 layout:
+///   Name (ReadName) -- from TNameDecl
+///   LocFlags (ReadUIndex)
+///   LocFlagsX (ReadUIndex) -- D8+
+///   Extra (ReadUIndex) -- D2009+
+///   hDT (ReadUIndex for non-method, ReadIndex for method)
+///   Ndx (ReadIndex for non-method, ReadUIndex for method)
+fn skip_local_decl(
+    reader: &mut DcuReader,
+    is_method: bool,
+) -> Result<(), DcuError> {
+    let _name = reader.read_name()?;
+    let _loc_flags = reader.read_uindex()?; // LocFlags
+    let _loc_flags_x = reader.read_uindex()?; // LocFlagsX (D8+)
+    let _extra = reader.read_uindex()?; // D2009+
+    if is_method {
+        let _h_dt = reader.read_index()?;
+        let _ndx = reader.read_uindex()?;
+    } else {
+        let _h_dt = reader.read_uindex()?;
+        let _ndx = reader.read_index()?;
+    }
+    Ok(())
+}
+
+/// Read a TLocalDecl for a field, returning the name and type index.
+fn read_field_decl(
+    reader: &mut DcuReader,
+) -> Result<(String, u32), DcuError> {
+    let name = reader.read_name()?;
+    let _loc_flags = reader.read_uindex()?;
+    let _loc_flags_x = reader.read_uindex()?;
+    let _extra = reader.read_uindex()?;
+    let h_dt = reader.read_uindex()?;
+    let _ndx = reader.read_index()?;
+    Ok((name, h_dt))
+}
+
+/// Derive field/method visibility from LocFlags.
+#[allow(dead_code)]
+fn visibility_from_flags(flags: u32) -> Visibility {
+    // Visibility is encoded in bits 0..3 of LocFlagsX (or LocFlags for pre-D8).
+    // For D8+, LocFlagsX has adjusted bits. We use the raw F here.
+    // The exact encoding depends on version but commonly:
+    //   0x00 = private, 0x02 = public, 0x04 = protected, 0x0A = published
+    let vis_bits = flags & 0x0F;
+    match vis_bits {
+        0x00 => Visibility::Private,
+        0x02 => Visibility::Public,
+        0x04 => Visibility::Protected,
+        0x0A => Visibility::Published,
+        _ => Visibility::Public, // default to public for unknown
+    }
+}
+
+/// Skip a method declaration (AR_METHOD, AR_CONSTR, AR_DESTR) in a class body.
+///
+/// TMethodDecl inherits from TLocalDecl, then reads additional method-specific
+/// fields. The exact extra fields depend on the method kind and version.
+fn skip_method_decl(
+    reader: &mut DcuReader,
+    method_tag: u8,
+) -> Result<(), DcuError> {
+    let _name = reader.read_name()?;
+    // TLocalDecl fields
+    let _loc_flags = reader.read_uindex()?;
+    let _loc_flags_x = reader.read_uindex()?;
+    let _extra = reader.read_uindex()?;
+    // TLocalDecl for methods: hDT = ReadIndex, Ndx = ReadUIndex
+    let _h_dt = reader.read_index()?;
+    let _ndx = reader.read_uindex()?;
+
+    // TMethodDecl extra fields (for non-interface, D13):
+    // D2009+ and tag != arMethod: ReadByte
+    if method_tag != AR_METHOD {
+        let _b = reader.read_byte()?;
+    }
+
+    // D7+: hImport = ReadUIndex
+    let _h_import = reader.read_uindex()?;
+
+    // D2009+ and tag == arMethod: skip bytes from a version-dependent set.
+    // For D13 (>= D_XE7), read bytes while they match a known set.
+    if method_tag == AR_METHOD {
+        skip_method_extra_bytes(reader)?;
+    }
+
+    Ok(())
+}
+
+/// Skip the version-dependent extra bytes after a method declaration.
+/// For D13 (XE7+), reads bytes while they match a known set of values.
+fn skip_method_extra_bytes(reader: &mut DcuReader) -> Result<(), DcuError> {
+    // The set of acceptable bytes for D_XE7+ (nSkip=5 in DCU32):
+    // cS20 = [0,1,2,4,8,9,$10,$18,$20,$22,$28,$38,$42,$47,$4F,$60,$80,$84,
+    //          Ord(' ')=$20, Ord('!')=$21, Ord('a')=$61]
+    // Combined and deduplicated:
+    const METHOD_BYTE_SET: &[u8] = &[
+        0x00, 0x01, 0x02, 0x04, 0x08, 0x09, 0x10, 0x18,
+        0x20, 0x21, 0x22, 0x28, 0x38, 0x42, 0x47, 0x4F,
+        0x60, 0x61, 0x80, 0x84,
+    ];
+
+    loop {
+        let b = reader.read_byte()?;
+        if !METHOD_BYTE_SET.contains(&b) {
+            // Put back the byte that didn't match.
+            reader.unread(1);
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Read a method declaration, returning the name and kind.
+fn read_method_info(
+    reader: &mut DcuReader,
+    method_tag: u8,
+) -> Result<(String, MethodKind), DcuError> {
+    let name = reader.read_name()?;
+    // TLocalDecl fields
+    let _loc_flags = reader.read_uindex()?;
+    let _loc_flags_x = reader.read_uindex()?;
+    let _extra = reader.read_uindex()?;
+    // TLocalDecl: hDT = ReadIndex, Ndx = ReadUIndex for methods
+    let _h_dt = reader.read_index()?;
+    let _ndx = reader.read_uindex()?;
+
+    // TMethodDecl extra fields
+    if method_tag != AR_METHOD {
+        let _b = reader.read_byte()?;
+    }
+    let _h_import = reader.read_uindex()?;
+    if method_tag == AR_METHOD {
+        skip_method_extra_bytes(reader)?;
+    }
+
+    let kind = match method_tag {
+        AR_CONSTR => MethodKind::Constructor,
+        AR_DESTR => MethodKind::Destructor,
+        AR_METHOD => {
+            // Could be procedure or function. Without deeper analysis,
+            // default to Procedure. hDT != 0 would suggest Function.
+            if _h_dt != 0 {
+                MethodKind::Function
+            } else {
+                MethodKind::Procedure
+            }
+        }
+        _ => MethodKind::Procedure,
+    };
+
+    Ok((name, kind))
+}
+
+/// Skip a property declaration (AR_PROPERTY).
+///
+/// TPropDecl layout for D13:
+///   Name (ReadName)
+///   LocFlags (ReadIndex -- signed!)
+///   LocFlagsX (ReadUIndex) -- D8+
+///   Extra (ReadUIndex) -- D2009+
+///   hDT (ReadUIndex)
+///   NDX (ReadIndex)
+///   hIndex (ReadIndex)
+///   hRead (ReadUIndex)
+///   hWrite (ReadUIndex)
+///   hStored (ReadUIndex)
+///   hReadOrig (ReadUIndex) -- D8+
+///   hWriteOrig (ReadUIndex) -- D8+
+///   hDeft (ReadIndex)
+fn skip_property_decl(reader: &mut DcuReader) -> Result<(), DcuError> {
+    let _name = reader.read_name()?;
+    // Property reads LocFlags with ReadIndex (signed), not ReadUIndex.
+    let _loc_flags = reader.read_index()?;
+    let _loc_flags_x = reader.read_uindex()?; // D8+
+    let _extra = reader.read_uindex()?; // D2009+
+    let _h_dt = reader.read_uindex()?;
+    let _ndx = reader.read_index()?;
+    let _h_index = reader.read_index()?;
+    let _h_read = reader.read_uindex()?;
+    let _h_write = reader.read_uindex()?;
+    let _h_stored = reader.read_uindex()?;
+    let _h_read_orig = reader.read_uindex()?; // D8+
+    let _h_write_orig = reader.read_uindex()?; // D8+
+    let _h_deft = reader.read_index()?;
+    Ok(())
+}
+
 // --- Type definition skippers ---
 // Skip Rec entries (type definitions) in the declaration list.
 
-/// Read the common TTypeDef header: RTTISz, hAddrDef, RTTIOfs, Sz, hUnit.
+/// Read the common TTypeDef header (D13): RTTISz, Sz, hAddrDef, X.
+/// DCU32 reference: TTypeDef.Create reads exactly 4 values.
+/// Note: Sz is ReadIndex (signed) in DCU32, but read_uindex works for
+/// non-negative sizes since the encoding is compatible.
 fn read_type_def_header(reader: &mut DcuReader) -> Result<(), DcuError> {
     let _rtti_sz = reader.read_uindex()?;
+    let _sz = reader.read_index()?; // Signed in DCU32 (ReadIndex)
     let _h_addr_def = reader.read_uindex()?;
-    let _rtti_ofs = reader.read_uindex()?;
-    let _sz = reader.read_uindex()?;
-    let _h_unit = reader.read_uindex()?;
+    let _x = reader.read_uindex()?; // D2005+ extra field
     Ok(())
 }
 
@@ -549,33 +1235,282 @@ fn skip_proc_type_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     Ok(())
 }
 
-fn skip_class_def(reader: &mut DcuReader) -> Result<(), DcuError> {
+/// Skip an object VMT definition (DR_OBJ_VMT_DEF).
+/// DCU32 reference: TObjVMTDef.Create.
+fn skip_obj_vmt_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     read_type_def_header(reader)?;
+    let _h_obj_dt = reader.read_uindex()?;
+    let _vmt_sz = reader.read_uindex()?;
+    Ok(())
+}
+
+/// Skip an object definition (DR_OBJ_DEF).
+/// DCU32 reference: TObjDef.Create — inherits from TRecDef.
+fn skip_obj_def(reader: &mut DcuReader) -> Result<(), DcuError> {
+    // Same structure as TRecDef for D13
+    skip_rec_def(reader)
+}
+
+/// Skip a metaclass definition (DR_META_CLASS_DEF).
+/// DCU32 reference: TMetaClassDef.Create — inherits from TClassDef.
+fn skip_meta_class_def(reader: &mut DcuReader) -> Result<(), DcuError> {
+    // TMetaClassDef inherits TClassDef. Its Create reads:
+    //   inherited Create (= TClassDef.Create)
+    //   hCl = ReadUIndex
+    let _class_members = parse_class_def(reader)?;
+    let _h_cl = reader.read_uindex()?;
+    Ok(())
+}
+
+/// Parse a class definition, extracting fields and methods.
+///
+/// Returns (fields, methods) collected from the class member sub-list.
+/// DCU32 reference: TClassDef.Create (for D13/XE7+).
+fn parse_class_def(
+    reader: &mut DcuReader,
+) -> Result<(Vec<FieldInfo>, Vec<MethodInfo>), DcuError> {
+    read_type_def_header(reader)?;
+    // D2006+: BX byte (some flags)
+    let _bx = reader.read_byte()?;
+    // D_XE2+: extra byte
+    let _bx_xe2 = reader.read_byte()?;
+    // D2009+: extra byte (BX2)
+    let _bx2 = reader.read_byte()?;
     let _h_parent = reader.read_uindex()?;
     let _inst_base_rtti_sz = reader.read_uindex()?;
-    let _inst_base_sz = reader.read_uindex()?;
-    let _h_ndx3 = reader.read_uindex()?;
-    let _h_ndx4 = reader.read_uindex()?;
-    let mut inner_tag = reader.read_byte()?;
-    let _members = read_decl_list(reader, &mut inner_tag)?;
-    Ok(())
+    let _inst_base_sz = reader.read_index()?; // ReadIndex (signed)
+    let _inst_base_v = reader.read_uindex()?;
+    let _vm_cnt = reader.read_uindex()?;
+    let _ndx_fe = reader.read_uindex()?;
+    let _prop_cnt = reader.read_uindex()?;
+    let _b04 = reader.read_uindex()?; // D8+
+    // D2010+: BX3
+    let _bx3 = reader.read_uindex()?;
+    // ReadBeforeIntf: nothing for TClassDef (empty override)
+    // ReadClassInterfaces:
+    let i_cnt = reader.read_index()?;
+    if i_cnt > 0 {
+        for _ in 0..i_cnt {
+            let _h_intf = reader.read_uindex()?;
+            let _m_cnt = reader.read_uindex()?;
+            // D2006+ non-MSIL:
+            let _x1 = reader.read_uindex()?;
+            let _match_cnt = reader.read_uindex()?;
+            // D2010+:
+            let _x3 = reader.read_uindex()?;
+            let _x4 = reader.read_uindex()?;
+            for _ in 0.._match_cnt {
+                let _b = reader.read_byte()?;
+                let _m_name = reader.read_name()?;
+                let _n = reader.read_uindex()?;
+                let _h_member = reader.read_uindex()?;
+            }
+        }
+    }
+
+    // Read the class member sub-list, collecting fields and methods.
+    let mut fields = Vec::new();
+    let mut methods = Vec::new();
+    let mut tag = reader.read_byte()?;
+
+    loop {
+        let fixed = fix_tag(tag);
+        match fixed {
+            AR_FLD => {
+                match read_field_decl(reader) {
+                    Ok((name, h_dt)) => {
+                        if !name.is_empty() && !name.starts_with('.') {
+                            fields.push(FieldInfo {
+                                name,
+                                type_ref: TypeRef::Unresolved(h_dt),
+                                visibility: Visibility::Private,
+                            });
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            AR_METHOD | AR_CONSTR | AR_DESTR => {
+                match read_method_info(reader, fixed) {
+                    Ok((name, kind)) => {
+                        if !name.is_empty() {
+                            methods.push(MethodInfo {
+                                name,
+                                kind,
+                                params: Vec::new(),
+                                return_type: None,
+                            });
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            AR_PROPERTY => {
+                match skip_property_decl(reader) {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            AR_CLASS_VAR => {
+                match skip_local_decl(reader, false) {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            AR_VAL | AR_VAR | AR_RESULT | AR_ABS_LOC_VAR | AR_LABEL => {
+                match skip_local_decl(reader, false) {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            AR_SET_DEFT => {
+                let _v = reader.read_u32()?;
+            }
+            AR_COPY_DECL => {
+                let _name = reader.read_name()?;
+                let _nf = read_namef_fields(reader, true)?;
+                let _src = reader.read_uindex()?;
+            }
+            DR_TYPE => {
+                let _ti = read_type_decl(reader)?;
+            }
+            DR_TYPE_P => {
+                let _ti = read_type_p_decl(reader)?;
+            }
+            DR_PROC => {
+                let mut dummy_types = Vec::new();
+                match skip_proc_decl(reader, &mut dummy_types) {
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            DR_CONST => {
+                match skip_const_decl(reader) {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            // Type definition tags that can appear inside class bodies.
+            DR_ENUM_DEF => { skip_enum_def(reader)?; }
+            DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF
+            | DR_WCHAR_RANGE_DEF | DR_WIDE_RANGE_DEF => { skip_range_def(reader)?; }
+            DR_FLOAT_DEF => { skip_float_def(reader)?; }
+            DR_PTR_DEF => { skip_ptr_def(reader)?; }
+            DR_DYN_ARRAY_DEF => { skip_ptr_def(reader)?; }
+            DR_SET_DEF => { skip_set_def(reader)?; }
+            DR_ARRAY_DEF => { skip_array_def(reader)?; }
+            DR_PROC_TYPE_DEF => { skip_proc_type_def(reader)?; }
+            DR_CLASS_DEF => {
+                // Nested class def: parse but discard.
+                let _inner = parse_class_def(reader)?;
+            }
+            DR_REC_DEF => { skip_rec_def(reader)?; }
+            DR_INTERFACE_DEF => { skip_interface_def(reader)?; }
+            DR_OBJ_VMT_DEF => { skip_obj_vmt_def(reader)?; }
+            DR_OBJ_DEF => { skip_obj_def(reader)?; }
+            DR_VOID => { read_type_def_header(reader)?; }
+            DR_META_CLASS_DEF => { skip_meta_class_def(reader)?; }
+            DR_VARIANT_DEF => { read_type_def_header(reader)?; let _b = reader.read_byte()?; }
+            DR_SHORT_STR_DEF => { read_type_def_header(reader)?; let _cp = reader.read_uindex()?; }
+            DR_STRING_DEF | DR_WIDE_STR_DEF => { read_type_def_header(reader)?; let _cp = reader.read_uindex()?; }
+            DR_TEXT_DEF | DR_FILE_DEF => { read_type_def_header(reader)?; let _h_base = reader.read_uindex()?; }
+            DR_TEMPLATE_ARG_DEF => { read_type_def_header(reader)?; }
+            DR_TEMPLATE_CALL => {
+                read_type_def_header(reader)?;
+                let _h_dt = reader.read_uindex()?;
+                let cnt = reader.read_uindex()?;
+                for _ in 0..cnt {
+                    let _v = reader.read_uindex()?;
+                }
+            }
+            // Call kind tags: no data.
+            0x81..=0x84 => {
+                tag = reader.read_byte()?;
+                continue;
+            }
+            DR_STOP2 => {
+                let _l = reader.read_u32()?;
+                tag = reader.read_byte()?;
+                continue;
+            }
+            DR_CONST_ADD_INFO => {
+                skip_decl_const_add_info(reader)?;
+                tag = reader.read_byte()?;
+                continue;
+            }
+            DR_PROC_ADD_INFO => {
+                let _v = reader.read_index()?;
+                tag = reader.read_byte()?;
+                continue;
+            }
+            DR_EMBEDDED_PROC_START => {
+                let mut dummy_types = Vec::new();
+                skip_embedded_proc(reader, &mut dummy_types)?;
+                tag = reader.read_byte()?;
+                continue;
+            }
+            DR_EMBEDDED_PROC_END => {
+                tag = reader.read_byte()?;
+                continue;
+            }
+            DR_EXPORT => {
+                let _name = reader.read_name()?;
+                let _idx = reader.read_uindex()?;
+            }
+            DR_VAR | DR_VAR_C | DR_SPEC_VAR | DR_THREAD_VAR | DR_RES_STR => {
+                skip_var_decl(reader)?;
+            }
+            // Stop tags: end of class member list.
+            DR_STOP | DR_STOP1 | DR_STOP_A | DR_CBLOCK | DR_FIXUP => {
+                break;
+            }
+            // Unknown tag: stop gracefully.
+            _ => {
+            }
+        }
+        tag = reader.read_byte()?;
+    }
+
+    Ok((fields, methods))
 }
 
+/// Skip a record definition (DR_REC_DEF).
+/// DCU32 reference: TRecDef.Create (for D13/D_XE2+).
 fn skip_rec_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     read_type_def_header(reader)?;
-    let _h_ndx3 = reader.read_uindex()?;
-    let _h_ndx4 = reader.read_uindex()?;
+    // D2005+: extra bytes and uindex fields
+    let _b2 = reader.read_byte()?;
+    let _b1 = reader.read_byte()?; // D2006+
+    let _x0 = reader.read_byte()?; // D_XE2+ reads a byte (not uindex)
+    let _x = reader.read_uindex()?; // D2005+
+    // D2009+:
+    let _d1 = reader.read_uindex()?;
+    let _d2 = reader.read_uindex()?;
+    // D2010+:
+    let _d3 = reader.read_uindex()?;
+    // Read fields
     let mut inner_tag = reader.read_byte()?;
     let _members = read_decl_list(reader, &mut inner_tag)?;
     Ok(())
 }
 
+/// Skip an interface definition (DR_INTERFACE_DEF).
+/// DCU32 reference: TInterfaceDef.Create (for D13).
 fn skip_interface_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     read_type_def_header(reader)?;
+    let _bx = reader.read_byte()?; // D2009+
     let _h_parent = reader.read_uindex()?;
-    let _vm_cnt = reader.read_uindex()?;
-    let _h_ndx3 = reader.read_uindex()?;
-    reader.skip(16)?; // GUID
+    let _vm_cnt = reader.read_index()?; // ReadIndex (signed)
+    reader.skip(16)?; // GUID (16 bytes)
+    let _b = reader.read_byte()?;
+    // D2010+:
+    let _by = reader.read_uindex()?;
+    let cnt = reader.read_uindex()?;
+    for _ in 0..cnt {
+        let _x1 = reader.read_uindex()?;
+        let _x2 = reader.read_uindex()?;
+    }
+    // Read fields
     let mut inner_tag = reader.read_byte()?;
     let _members = read_decl_list(reader, &mut inner_tag)?;
     Ok(())

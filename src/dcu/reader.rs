@@ -30,6 +30,12 @@ impl<'a> DcuReader<'a> {
         }
     }
 
+    pub fn peek_bytes(&self, start: usize, end: usize) -> &[u8] {
+        let s = std::cmp::min(start, self.data.len());
+        let e = std::cmp::min(end, self.data.len());
+        &self.data[s..e]
+    }
+
     pub fn set_position(&mut self, pos: usize) {
         self.pos = pos;
     }

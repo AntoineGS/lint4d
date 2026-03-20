@@ -1,6 +1,6 @@
 use lint4d::dcu::header::parse_unit_header;
 use lint4d::dcu::types::parse_dcu;
-use lint4d::dcu::{DcuPlatform, DcuVersion};
+use lint4d::dcu::{DcuPlatform, DcuVersion, MethodKind, TypeKind};
 use std::fs;
 use std::path::PathBuf;
 
@@ -130,5 +130,57 @@ fn parse_dcu_extracts_types_from_data() {
     for ty in &unit.types {
         eprintln!("  Type: {} ({:?})", ty.name, ty.kind);
     }
+}
+
+#[test]
+fn parse_dcu_extracts_class_fields() {
+    let data = fs::read(fixture_path("CDAPI.Adapter.Data.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+
+    let class_types: Vec<_> = unit.types.iter()
+        .filter(|t| t.kind == TypeKind::Class)
+        .collect();
+
+    assert!(!class_types.is_empty(), "Expected at least one class type");
+
+    let has_fields = class_types.iter().any(|t| !t.fields.is_empty());
+    assert!(has_fields, "Expected at least one class with fields, classes: {:?}",
+        class_types.iter().map(|t| (&t.name, t.fields.len())).collect::<Vec<_>>());
+
+    // Print what we found for debugging
+    for ty in &class_types {
+        eprintln!("  Class: {} -- {} fields, {} methods", ty.name, ty.fields.len(), ty.methods.len());
+        for f in &ty.fields {
+            eprintln!("    field: {} ({:?})", f.name, f.type_ref);
+        }
+        for m in &ty.methods {
+            eprintln!("    method: {} ({:?})", m.name, m.kind);
+        }
+    }
+}
+
+#[test]
+fn parse_dcu_class_has_constructor_or_destructor() {
+    let data = fs::read(fixture_path("CDAPI.Adapter.Data.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+
+    // TDataAdapter is a class -- it should have a constructor
+    let adapter = unit.types.iter()
+        .find(|t| t.name == "TDataAdapter")
+        .expect("TDataAdapter not found");
+
+    assert_eq!(adapter.kind, TypeKind::Class);
+
+    let has_ctor_or_dtor = adapter.methods.iter()
+        .any(|m| m.kind == MethodKind::Constructor || m.kind == MethodKind::Destructor);
+
+    // Print methods for debugging even if assertion passes
+    for m in &adapter.methods {
+        eprintln!("  TDataAdapter method: {} ({:?})", m.name, m.kind);
+    }
+
+    assert!(has_ctor_or_dtor,
+        "Expected TDataAdapter to have a constructor or destructor, methods: {:?}",
+        adapter.methods.iter().map(|m| (&m.name, &m.kind)).collect::<Vec<_>>());
 }
 

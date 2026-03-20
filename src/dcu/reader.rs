@@ -1,6 +1,120 @@
 use crate::dcu::tags::DcuError;
 
 pub struct DcuReader<'a> {
-    pub(crate) data: &'a [u8],
-    pub(crate) pos: usize,
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DcuReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    pub fn read_byte(&mut self) -> Result<u8, DcuError> {
+        if self.pos >= self.data.len() {
+            return Err(DcuError::UnexpectedEof { context: "read_byte" });
+        }
+        let b = self.data[self.pos];
+        self.pos += 1;
+        Ok(b)
+    }
+
+    pub fn read_word(&mut self) -> Result<u16, DcuError> {
+        if self.pos + 2 > self.data.len() {
+            return Err(DcuError::UnexpectedEof { context: "read_word" });
+        }
+        let val = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        Ok(val)
+    }
+
+    pub fn read_u32(&mut self) -> Result<u32, DcuError> {
+        if self.pos + 4 > self.data.len() {
+            return Err(DcuError::UnexpectedEof { context: "read_u32" });
+        }
+        let val = u32::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(val)
+    }
+
+    pub fn skip(&mut self, n: usize) -> Result<(), DcuError> {
+        if self.pos + n > self.data.len() {
+            return Err(DcuError::UnexpectedEof { context: "skip" });
+        }
+        self.pos += n;
+        Ok(())
+    }
+
+    /// DCU variable-length unsigned integer encoding.
+    /// Low bits of first byte signal how many bytes follow.
+    pub fn read_uindex(&mut self) -> Result<u32, DcuError> {
+        let b0 = self.read_byte()? as u32;
+        if b0 & 1 == 0 {
+            return Ok(b0 >> 1);
+        }
+        if b0 & 2 == 0 {
+            let b1 = self.read_byte()? as u32;
+            let w = b0 | (b1 << 8);
+            return Ok(w >> 2);
+        }
+        if b0 & 4 == 0 {
+            let b1 = self.read_byte()? as u32;
+            let b2 = self.read_byte()? as u32;
+            let dw = b0 | (b1 << 8) | (b2 << 16);
+            return Ok(dw >> 3);
+        }
+        if b0 & 8 == 0 {
+            let b1 = self.read_byte()? as u32;
+            let b2 = self.read_byte()? as u32;
+            let b3 = self.read_byte()? as u32;
+            let dw = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            return Ok(dw >> 4);
+        }
+        // 5-byte form: next 4 bytes are the raw value
+        let val = self.read_u32()?;
+        Ok(val)
+    }
+
+    /// DCU variable-length signed integer encoding.
+    /// Same byte structure as read_uindex but with arithmetic (sign-extending) shift.
+    pub fn read_index(&mut self) -> Result<i32, DcuError> {
+        let b0 = self.read_byte()?;
+        if b0 & 1 == 0 {
+            return Ok((b0 as i8 as i32) >> 1);
+        }
+        if b0 & 2 == 0 {
+            let b1 = self.read_byte()?;
+            let w = (b0 as u16) | ((b1 as u16) << 8);
+            return Ok((w as i16 as i32) >> 2);
+        }
+        if b0 & 4 == 0 {
+            let b1 = self.read_byte()?;
+            let b2 = self.read_byte()?;
+            let dw = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as i8 as i32 as u32) << 16);
+            return Ok((dw as i32) >> 3);
+        }
+        if b0 & 8 == 0 {
+            let b1 = self.read_byte()?;
+            let b2 = self.read_byte()?;
+            let b3 = self.read_byte()?;
+            let dw = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
+            return Ok((dw as i32) >> 4);
+        }
+        // 5-byte form
+        let val = self.read_u32()? as i32;
+        Ok(val)
+    }
 }

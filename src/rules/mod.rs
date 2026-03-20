@@ -50,6 +50,11 @@ impl Default for LintContext {
 
 pub trait Rule: Send + Sync {
     fn meta(&self) -> &RuleMeta;
+
+    fn requires_context(&self) -> bool {
+        false
+    }
+
     fn check(
         &self,
         file: &FileInfo,
@@ -58,6 +63,18 @@ pub trait Rule: Send + Sync {
         config: &crate::config::Config,
         ctx: &mut LintContext,
     );
+
+    fn check_with_context(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        _project: &crate::dcu::ProjectContext,
+        ctx: &mut LintContext,
+    ) {
+        self.check(file, tree, source, config, ctx);
+    }
 }
 
 pub struct RuleRegistry {

@@ -98,13 +98,27 @@ fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
 
 /// Run all lint rules on a single file and return sorted, filtered diagnostics.
 ///
+/// This is a thin wrapper around [`run_lint_with_context`] with no project context.
+pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnostic> {
+    run_lint_with_context(file, source, config, None)
+}
+
+/// Run all lint rules on a single file with an optional project context.
+///
 /// This function:
 /// 1. Parses the file and collects parse-error diagnostics
 /// 2. Runs all enabled rules (respecting config overrides and file-type skipping)
-/// 3. Applies severity overrides from config
-/// 4. Filters out suppressed diagnostics
-/// 5. Sorts results by line, then column
-pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnostic> {
+/// 3. When `project` is `Some`, dispatches via `check_with_context`; otherwise
+///    skips rules that `requires_context()` and dispatches via `check`
+/// 4. Applies severity overrides from config
+/// 5. Filters out suppressed diagnostics
+/// 6. Sorts results by line, then column
+pub fn run_lint_with_context(
+    file: &FileInfo,
+    source: &[u8],
+    config: &Config,
+    project: Option<&crate::dcu::ProjectContext>,
+) -> Vec<Diagnostic> {
     let (tree, mut diagnostics) = match parse_file(file, source) {
         Ok(result) => result,
         Err(e) => {
@@ -139,7 +153,14 @@ pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnost
             continue;
         }
 
-        rule.check(file, &tree, source, config, &mut ctx);
+        match project {
+            Some(proj) => rule.check_with_context(file, &tree, source, config, proj, &mut ctx),
+            None => {
+                if !rule.requires_context() {
+                    rule.check(file, &tree, source, config, &mut ctx);
+                }
+            }
+        }
     }
 
     // Apply severity overrides from config.

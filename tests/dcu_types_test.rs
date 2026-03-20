@@ -101,3 +101,34 @@ fn parse_dcu_types_has_expected_imports() {
     );
 }
 
+#[test]
+fn parse_dcu_extracts_type_names() {
+    let data = fs::read(fixture_path("CDAPI.Adapter.Data.Types.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+    assert!(
+        !unit.types.is_empty(),
+        "Expected at least one type definition, got none"
+    );
+    for ty in &unit.types {
+        assert!(!ty.name.is_empty(), "Found type with empty name");
+    }
+    // Print what we found for debugging
+    for ty in &unit.types {
+        eprintln!("  Type: {} ({:?})", ty.name, ty.kind);
+    }
+}
+
+#[test]
+fn parse_dcu_extracts_types_from_data() {
+    let data = fs::read(fixture_path("CDAPI.Adapter.Data.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+    assert!(
+        !unit.types.is_empty(),
+        "Expected at least one type definition, got none"
+    );
+    // Print for debugging
+    for ty in &unit.types {
+        eprintln!("  Type: {} ({:?})", ty.name, ty.kind);
+    }
+}
+

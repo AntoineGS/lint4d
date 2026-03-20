@@ -18,6 +18,18 @@ impl<'a> DcuReader<'a> {
         self.data.len() - self.pos
     }
 
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn peek_at(&self, offset: usize) -> u8 {
+        if offset < self.data.len() {
+            self.data[offset]
+        } else {
+            0
+        }
+    }
+
     pub fn set_position(&mut self, pos: usize) {
         self.pos = pos;
     }

@@ -3,6 +3,58 @@ use lint4d::engine::{run_lint, FileInfo};
 use std::path::PathBuf;
 
 #[test]
+fn identifier_casing_flags_mismatched_casing() {
+    let source = std::fs::read("tests/fixtures/naming/bad_identifier_casing.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config = Config::from_str("version = 1").unwrap();
+    let diagnostics = run_lint(&file, &source, &config);
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "identifier-casing")
+        .collect();
+    // fvalue (should be FValue), localobj (should be LocalObj), counter (should be Counter), my_const (should be MY_CONST)
+    assert_eq!(hits.len(), 4, "Should flag 4 casing mismatches: {:?}", hits);
+}
+
+#[test]
+fn identifier_casing_passes_consistent_casing() {
+    let source = std::fs::read("tests/fixtures/naming/good_identifier_casing.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config = Config::from_str("version = 1").unwrap();
+    let diagnostics = run_lint(&file, &source, &config);
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "identifier-casing")
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "No identifier-casing diagnostics expected: {:?}",
+        hits
+    );
+}
+
+#[test]
+fn identifier_casing_scopes_fields_per_class() {
+    let source =
+        std::fs::read("tests/fixtures/naming/bad_identifier_casing_multiclass.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config = Config::from_str("version = 1").unwrap();
+    let diagnostics = run_lint(&file, &source, &config);
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "identifier-casing")
+        .collect();
+    // TClassA.Run: fdata should be FData (1 hit)
+    // TClassB.Run: Fdata should be fData (1 hit)
+    assert_eq!(
+        hits.len(),
+        2,
+        "Should flag 2 casing mismatches (one per class): {:?}",
+        hits
+    );
+}
+
+#[test]
 fn engine_runs_on_valid_file_with_no_issues() {
     let source = b"unit Clean;\ninterface\nimplementation\nend.\n";
     let file = FileInfo::new(PathBuf::from("Clean.pas"));

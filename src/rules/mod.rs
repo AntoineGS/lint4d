@@ -1,3 +1,4 @@
+pub mod casing;
 pub mod dangerous;
 pub mod exception;
 pub mod helpers;
@@ -73,6 +74,7 @@ impl RuleRegistry {
             Box::new(naming::InterfacePrefixRule::new()),
             Box::new(naming::ConstantNamingRule::new()),
             Box::new(naming::LocalVariableNamingRule::new()),
+            Box::new(casing::IdentifierCasingRule::new()),
             Box::new(dangerous::WithStatementRule::new()),
         ];
 

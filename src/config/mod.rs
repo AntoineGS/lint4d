@@ -17,6 +17,7 @@ pub struct Config {
     pub version: u32,
     pub paths: Vec<String>,
     pub exclude: Vec<String>,
+    dcu_paths: Vec<String>,
     rule_overrides: HashMap<String, RuleSeverityOverride>,
     constant_style: String,
     local_variable_style: String,
@@ -63,6 +64,7 @@ impl Config {
             version: raw.version,
             paths: lint4d.paths,
             exclude: lint4d.exclude,
+            dcu_paths: lint4d.dcu_paths,
             rule_overrides,
             constant_style,
             local_variable_style,
@@ -79,6 +81,10 @@ impl Config {
 
     pub fn local_variable_style(&self) -> &str {
         &self.local_variable_style
+    }
+
+    pub fn dcu_paths(&self) -> &[String] {
+        &self.dcu_paths
     }
 
     pub fn discover(start_dir: &Path) -> Result<(Config, PathBuf), String> {
@@ -100,6 +106,7 @@ impl Config {
                 version: 1,
                 paths: Vec::new(),
                 exclude: Vec::new(),
+                dcu_paths: Vec::new(),
                 rule_overrides: HashMap::new(),
                 constant_style: "UPPER_CASE".to_string(),
                 local_variable_style: "camelCase".to_string(),

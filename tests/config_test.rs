@@ -89,3 +89,19 @@ fn config_defaults_local_variable_style_to_camel_case() {
     let config = Config::from_str("version = 1").unwrap();
     assert_eq!(config.local_variable_style(), "camelCase");
 }
+
+#[test]
+fn config_parses_dcu_paths() {
+    let config = Config::from_str(r#"
+        version = 1
+        [lint4d]
+        dcu_paths = ["lib/Win64/Debug", "C:/Delphi/lib"]
+    "#).unwrap();
+    assert_eq!(config.dcu_paths(), &["lib/Win64/Debug", "C:/Delphi/lib"]);
+}
+
+#[test]
+fn config_dcu_paths_default_empty() {
+    let config = Config::from_str("version = 1").unwrap();
+    assert!(config.dcu_paths().is_empty());
+}

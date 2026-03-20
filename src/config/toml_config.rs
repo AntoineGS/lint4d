@@ -21,6 +21,8 @@ pub struct RawLint4dSection {
     pub paths: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub dcu_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

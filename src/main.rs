@@ -293,6 +293,7 @@ fn run_init() {
 [lint4d]
 paths = ["."]
 exclude = ["**/test/**", "**/tests/**"]
+# dcu_paths = []
 
 [rules]
 # Override rule severity: "error", "warning", "hint", or "off"

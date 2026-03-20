@@ -48,7 +48,14 @@ impl Default for LintContext {
 
 pub trait Rule: Send + Sync {
     fn meta(&self) -> &RuleMeta;
-    fn check(&self, file: &FileInfo, tree: &Tree, source: &[u8], ctx: &mut LintContext);
+    fn check(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        ctx: &mut LintContext,
+    );
 }
 
 pub struct RuleRegistry {

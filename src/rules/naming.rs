@@ -36,7 +36,14 @@ impl Rule for TypePrefixRule {
         &self.meta
     }
 
-    fn check(&self, _file: &FileInfo, tree: &Tree, source: &[u8], ctx: &mut LintContext) {
+    fn check(
+        &self,
+        _file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        _config: &crate::config::Config,
+        ctx: &mut LintContext,
+    ) {
         visit_type_prefix(tree.root_node(), source, ctx);
     }
 }
@@ -122,7 +129,14 @@ impl Rule for InterfacePrefixRule {
         &self.meta
     }
 
-    fn check(&self, _file: &FileInfo, tree: &Tree, source: &[u8], ctx: &mut LintContext) {
+    fn check(
+        &self,
+        _file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        _config: &crate::config::Config,
+        ctx: &mut LintContext,
+    ) {
         visit_interface_prefix(tree.root_node(), source, ctx);
     }
 }
@@ -204,7 +218,14 @@ impl Rule for ConstantNamingRule {
         &self.meta
     }
 
-    fn check(&self, _file: &FileInfo, tree: &Tree, source: &[u8], ctx: &mut LintContext) {
+    fn check(
+        &self,
+        _file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        _config: &crate::config::Config,
+        ctx: &mut LintContext,
+    ) {
         visit_constant_naming(tree.root_node(), source, ctx);
     }
 }

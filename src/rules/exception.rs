@@ -36,7 +36,14 @@ impl Rule for BareExceptRule {
         &self.meta
     }
 
-    fn check(&self, _file: &FileInfo, tree: &Tree, source: &[u8], ctx: &mut LintContext) {
+    fn check(
+        &self,
+        _file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        _config: &crate::config::Config,
+        ctx: &mut LintContext,
+    ) {
         visit_bare_except(tree.root_node(), source, ctx);
     }
 }
@@ -192,7 +199,14 @@ impl Rule for EmptyExceptRule {
         &self.meta
     }
 
-    fn check(&self, _file: &FileInfo, tree: &Tree, _source: &[u8], ctx: &mut LintContext) {
+    fn check(
+        &self,
+        _file: &FileInfo,
+        tree: &Tree,
+        _source: &[u8],
+        _config: &crate::config::Config,
+        ctx: &mut LintContext,
+    ) {
         visit_node(tree.root_node(), ctx);
     }
 }

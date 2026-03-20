@@ -139,7 +139,7 @@ pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnost
             continue;
         }
 
-        rule.check(file, &tree, source, &mut ctx);
+        rule.check(file, &tree, source, config, &mut ctx);
     }
 
     // Apply severity overrides from config.

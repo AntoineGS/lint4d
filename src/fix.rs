@@ -118,6 +118,7 @@ pub fn build_rename_map(
     map
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_declarations(
     node: Node,
     source: &[u8],

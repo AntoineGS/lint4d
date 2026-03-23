@@ -1,7 +1,8 @@
+use std::fs;
 use std::path::PathBuf;
 
 use lint4d::config::Config;
-use lint4d::engine::{parse_file, FileInfo};
+use lint4d::engine::{parse_file, run_lint, FileInfo};
 use lint4d::engine::suppress::parse_suppressions;
 use lint4d::fix::{build_rename_map, fix_file};
 
@@ -525,4 +526,124 @@ end."#;
     let file = FileInfo::new(PathBuf::from("test.pas"));
     let (_, count) = fix_file(&file, source.as_bytes(), &config).unwrap();
     assert_eq!(count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture-based integration tests
+// ---------------------------------------------------------------------------
+
+fn fix_fixture(fixture_path: &str) -> (String, usize) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
+    let source = fs::read(&path).unwrap();
+    let file = FileInfo::new(PathBuf::from(fixture_path));
+    let config = "version = 1".parse::<Config>().unwrap();
+    let (result, count) = fix_file(&file, &source, &config).unwrap();
+    (String::from_utf8(result).unwrap(), count)
+}
+
+fn lint_source(source: &str) -> Vec<lint4d::engine::Diagnostic> {
+    let config = "version = 1".parse::<Config>().unwrap();
+    let file = FileInfo::new(PathBuf::from("test.pas"));
+    run_lint(&file, source.as_bytes(), &config)
+}
+
+#[test]
+fn fixture_type_prefix_fix() {
+    let (fixed, count) = fix_fixture("tests/fixtures/fix/type_prefix.pas");
+    assert!(count > 0, "Expected fixes to be applied");
+    assert!(fixed.contains("TMyClass = class(TObject)"));
+    assert!(fixed.contains("Obj: TMyClass;"));
+    assert!(fixed.contains("procedure TMyClass.DoWork;"));
+}
+
+#[test]
+fn fixture_constant_naming_fix() {
+    let (fixed, count) = fix_fixture("tests/fixtures/fix/constant_naming.pas");
+    assert!(count > 0);
+    assert!(fixed.contains("MAX_SIZE = 100;"));
+    assert!(fixed.contains("HTTP_PORT = 8080;"));
+    assert!(fixed.contains("ALREADY_GOOD = 42;")); // unchanged
+}
+
+#[test]
+fn fixture_local_variable_fix() {
+    let (fixed, count) = fix_fixture("tests/fixtures/fix/local_variable.pas");
+    assert!(count > 0);
+    assert!(fixed.contains("myCounter: Integer;"));
+    assert!(fixed.contains("anotherBadName: string;"));
+    assert!(fixed.contains("x: Integer;")); // single-char exempt
+}
+
+#[test]
+fn fixture_interface_prefix_fix() {
+    let (fixed, count) = fix_fixture("tests/fixtures/fix/interface_prefix.pas");
+    assert!(count > 0);
+    assert!(fixed.contains("IPrintable = interface"));
+    assert!(fixed.contains("TDoc = class(TObject, IPrintable)"));
+}
+
+#[test]
+fn fixture_combined_fix() {
+    let (fixed, count) = fix_fixture("tests/fixtures/fix/combined.pas");
+    assert!(count > 0);
+    assert!(fixed.contains("TMyClass = class(TObject)"));
+    assert!(fixed.contains("MAX_RETRIES = 3;"));
+    assert!(fixed.contains("retryCount: Integer;"));
+}
+
+#[test]
+fn fixture_suppressed_not_fixed() {
+    let (fixed, count) = fix_fixture("tests/fixtures/fix/suppressed.pas");
+    // Both declarations are suppressed — nothing to fix
+    assert_eq!(count, 0);
+    assert!(fixed.contains("MyClass = class(TObject)"));
+    assert!(fixed.contains("maxSize = 100;"));
+}
+
+/// After fixing, linting should produce zero naming violations.
+#[test]
+fn fix_then_lint_produces_no_naming_violations() {
+    let source = r#"unit Test;
+
+interface
+
+type
+  MyClass = class(TObject)
+  public
+    procedure DoWork;
+  end;
+
+const
+  maxRetries = 3;
+
+implementation
+
+procedure MyClass.DoWork;
+var
+  RetryCount: Integer;
+begin
+  RetryCount := maxRetries;
+end;
+
+end."#;
+    let fixed = fix_source(source);
+    let diagnostics = lint_source(&fixed);
+    let naming_issues: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.rule_id.as_str(),
+                "type-prefix"
+                    | "interface-prefix"
+                    | "constant-naming"
+                    | "local-variable-naming"
+                    | "identifier-casing"
+            )
+        })
+        .collect();
+    assert!(
+        naming_issues.is_empty(),
+        "Expected zero naming violations after fix, got: {:?}",
+        naming_issues
+    );
 }

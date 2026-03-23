@@ -1,5 +1,6 @@
 use lint4d::config::Config;
 use lint4d::engine::{run_lint, FileInfo};
+use lint4d::rules::naming::{to_camel_case, to_pascal_case, to_upper_snake_case};
 use std::fs;
 use std::path::PathBuf;
 
@@ -95,4 +96,61 @@ fn naming_rules_skipped_for_dpr_files() {
         naming.is_empty(),
         "Naming rules should be skipped for .dpr files"
     );
+}
+
+#[test]
+fn to_camel_case_basic() {
+    assert_eq!(to_camel_case("MyVar"), "myVar");
+    assert_eq!(to_camel_case("AnotherName"), "anotherName");
+}
+
+#[test]
+fn to_camel_case_preserves_leading_underscores() {
+    assert_eq!(to_camel_case("_Count"), "_count");
+    assert_eq!(to_camel_case("__Foo"), "__foo");
+}
+
+#[test]
+fn to_camel_case_already_camel() {
+    assert_eq!(to_camel_case("myVar"), "myVar");
+}
+
+#[test]
+fn to_camel_case_single_char() {
+    assert_eq!(to_camel_case("X"), "x");
+}
+
+#[test]
+fn to_pascal_case_basic() {
+    assert_eq!(to_pascal_case("myVar"), "MyVar");
+    assert_eq!(to_pascal_case("httpPort"), "HttpPort");
+}
+
+#[test]
+fn to_pascal_case_underscore_separated() {
+    assert_eq!(to_pascal_case("my_const"), "MyConst");
+    assert_eq!(to_pascal_case("HTTP_PORT"), "HttpPort");
+    assert_eq!(to_pascal_case("foo_bar_baz"), "FooBarBaz");
+}
+
+#[test]
+fn to_pascal_case_preserves_leading_underscores() {
+    assert_eq!(to_pascal_case("_myVar"), "_MyVar");
+    assert_eq!(to_pascal_case("_my_const"), "_MyConst");
+}
+
+#[test]
+fn to_pascal_case_already_pascal() {
+    assert_eq!(to_pascal_case("MyVar"), "MyVar");
+}
+
+#[test]
+fn to_upper_snake_case_camel() {
+    assert_eq!(to_upper_snake_case("httpPort"), "HTTP_PORT");
+    assert_eq!(to_upper_snake_case("maxSize"), "MAX_SIZE");
+}
+
+#[test]
+fn to_upper_snake_case_acronym() {
+    assert_eq!(to_upper_snake_case("HTTPPort"), "HTTP_PORT");
 }

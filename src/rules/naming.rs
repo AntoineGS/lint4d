@@ -286,7 +286,7 @@ fn check_constant_name(decl_const: Node, source: &[u8], style: &str, ctx: &mut L
     });
 }
 
-fn to_upper_snake_case(name: &str) -> String {
+pub fn to_upper_snake_case(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
     let mut result = String::with_capacity(name.len() + 4);
     for (i, &ch) in chars.iter().enumerate() {
@@ -308,6 +308,69 @@ fn to_upper_snake_case(name: &str) -> String {
         result.push(ch.to_ascii_uppercase());
     }
     result
+}
+
+/// Convert a name to camelCase by lowercasing the first alphabetic character.
+/// Preserves leading underscores. `MyVar` → `myVar`, `_Count` → `_count`.
+pub fn to_camel_case(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut first_alpha_done = false;
+    for c in name.chars() {
+        if !first_alpha_done && c.is_alphabetic() {
+            result.push(c.to_ascii_lowercase());
+            first_alpha_done = true;
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Convert a name to PascalCase.
+///
+/// - If the name contains underscores: split on underscores, capitalize the first
+///   letter of each segment, lowercase the rest, join. `my_const` → `MyConst`.
+/// - If no underscores: uppercase the first alphabetic character. `httpPort` → `HttpPort`.
+/// - Leading underscores are preserved. `_myVar` → `_MyVar`.
+pub fn to_pascal_case(name: &str) -> String {
+    let leading_underscores: String = name.chars().take_while(|c| *c == '_').collect();
+    let rest = &name[leading_underscores.len()..];
+
+    if rest.is_empty() {
+        return name.to_string();
+    }
+
+    let transformed = if rest.contains('_') {
+        // Underscore-separated: capitalize each segment
+        rest.split('_')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let mut chars = s.chars();
+                match chars.next() {
+                    Some(c) => {
+                        let rest_lower: String = chars.map(|ch| ch.to_ascii_lowercase()).collect();
+                        format!("{}{}", c.to_ascii_uppercase(), rest_lower)
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<String>()
+    } else {
+        // No underscores: uppercase first alpha
+        let mut result = String::with_capacity(rest.len());
+        let mut first_alpha_done = false;
+        for c in rest.chars() {
+            if !first_alpha_done && c.is_alphabetic() {
+                result.push(c.to_ascii_uppercase());
+                first_alpha_done = true;
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    };
+
+    format!("{}{}", leading_underscores, transformed)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +508,7 @@ fn check_decl_var_names(decl_var: Node, source: &[u8], style: &str, ctx: &mut Li
 ///
 /// Single-character names are always exempt. Leading underscores are
 /// skipped when determining the effective first character.
-fn violates_naming_style(name: &str, style: &str) -> bool {
+pub fn violates_naming_style(name: &str, style: &str) -> bool {
     // Skip leading underscores to find the first alpha character.
     let first_alpha = name.chars().find(|c| c.is_alphabetic());
     let first = match first_alpha {

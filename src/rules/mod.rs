@@ -5,6 +5,7 @@ pub mod field_leak;
 pub mod helpers;
 pub mod naming;
 pub mod resource_leak;
+pub mod scope;
 
 use tree_sitter::Tree;
 

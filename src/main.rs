@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{CommandFactory, Parser};
@@ -53,6 +53,26 @@ struct Cli {
     /// Lint files from a .dproj project file
     #[arg(long)]
     project: Option<PathBuf>,
+
+    /// Explicit DCU directory path (repeatable)
+    #[arg(long = "dcu-path")]
+    dcu_paths: Vec<PathBuf>,
+
+    /// Override auto-detected target platform (e.g., Win64)
+    #[arg(long)]
+    platform: Option<String>,
+
+    /// Override build configuration (e.g., Debug, Release)
+    #[arg(long = "build-config")]
+    build_config: Option<String>,
+
+    /// Explicit RAD Studio (BDS) installation root
+    #[arg(long = "bds-path")]
+    bds_path: Option<PathBuf>,
+
+    /// Enable colored output
+    #[arg(long)]
+    color: bool,
 }
 
 fn main() {
@@ -112,9 +132,38 @@ fn main() {
         }
     };
 
-    // Build ProjectContext if dcu_paths are configured
-    let project_context = if !config.dcu_paths().is_empty() {
-        let dcu_dirs: Vec<std::path::PathBuf> = config.dcu_paths().iter().map(std::path::PathBuf::from).collect();
+    // MSBuild auto-discovery: only attempt if --project is provided
+    let discovered_paths = if cli.dcu_paths.is_empty()
+        && config.dcu_paths().is_empty()
+        && cli.project.is_some()
+    {
+        discover_dcu_paths_from_project(
+            cli.project.as_ref().unwrap(),
+            cli.bds_path.as_deref().or_else(|| config.bds_path().map(std::path::Path::new)),
+            cli.platform.as_deref().or(config.platform()),
+            cli.build_config.as_deref().or(config.build_config()),
+        )
+    } else {
+        Vec::new()
+    };
+
+    // Warn if BDS-related flags are provided without --project
+    if cli.project.is_none()
+        && (cli.bds_path.is_some() || cli.platform.is_some() || cli.build_config.is_some())
+    {
+        eprintln!(
+            "lint4d: warning: --bds-path/--platform/--build-config have no effect without --project"
+        );
+    }
+
+    // Resolve DCU paths using priority cascade
+    let dcu_dirs = lint4d::discovery::resolve_dcu_dirs(
+        &cli.dcu_paths,
+        config.dcu_paths(),
+        discovered_paths,
+    );
+
+    let project_context = if !dcu_dirs.is_empty() {
         match lint4d::dcu::ProjectContext::from_dcu_paths(&dcu_dirs) {
             Ok(ctx) => {
                 let count = ctx.unit_count();
@@ -159,12 +208,15 @@ fn main() {
         process::exit(EXIT_OK);
     }
 
+    // Build the rule registry once and share across all files.
+    let registry = RuleRegistry::new();
+
     // Process files in parallel
     let mut file_results: Vec<_> = files
         .par_iter()
         .filter_map(|file| {
             let source = fs::read(&file.path).ok()?;
-            let diagnostics = run_lint_with_context(file, &source, &config, project_context.as_ref());
+            let diagnostics = run_lint_with_context(file, &source, &config, project_context.as_ref(), &registry);
             Some((file.path.to_string_lossy().to_string(), source, diagnostics))
         })
         .collect();
@@ -206,7 +258,7 @@ fn main() {
         }
 
         if cli.format == "text" {
-            let output = format_diagnostics(file_path_str, source, diagnostics, false);
+            let output = format_diagnostics(file_path_str, source, diagnostics, cli.color);
             if !output.is_empty() {
                 print!("{}", output);
             }
@@ -351,6 +403,68 @@ fn run_list_rules() {
             id_display, meta.default_severity, meta.description
         );
     }
+}
+
+fn discover_dcu_paths_from_project(
+    dproj_path: &Path,
+    bds_path_override: Option<&Path>,
+    platform_override: Option<&str>,
+    config_override: Option<&str>,
+) -> Vec<PathBuf> {
+    use lint4d::discovery::bds;
+    use lint4d::discovery::dproj::parse_project_version;
+    use lint4d::discovery::msbuild;
+
+    // Extract ProjectVersion from dproj for BDS version lookup
+    let project_version = match parse_project_version(dproj_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lint4d: warning: failed to read ProjectVersion: {}", e);
+            None
+        }
+    };
+
+    // Discover BDS root
+    let bds_root = bds::discover_bds_root(
+        bds_path_override,
+        project_version.as_deref(),
+    );
+
+    let bds_root = match bds_root {
+        Some(root) => root,
+        None => {
+            eprintln!(
+                "lint4d: warning: RAD Studio installation not found — \
+                 skipping DCU auto-discovery. Use --bds-path or configure dcu_paths manually."
+            );
+            return Vec::new();
+        }
+    };
+
+    let rsvars = bds::rsvars_bat_path(&bds_root);
+    if !rsvars.is_file() {
+        eprintln!(
+            "lint4d: warning: rsvars.bat not found at {} — \
+             is RAD Studio installed correctly?",
+            rsvars.display()
+        );
+        return Vec::new();
+    }
+
+    let paths = msbuild::discover_dcu_paths_via_msbuild(
+        dproj_path,
+        &rsvars,
+        platform_override,
+        config_override,
+    );
+
+    if paths.is_empty() {
+        eprintln!("lint4d: warning: MSBuild auto-discovery found no DCU directories");
+    } else {
+        eprintln!("Auto-discovered {} DCU director{}", paths.len(), if paths.len() == 1 { "y" } else { "ies" });
+    }
+
+    paths
 }
 
 fn run_explain(rule_id: &str) {

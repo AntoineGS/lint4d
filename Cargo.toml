@@ -19,9 +19,12 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 globset = "0.4"
 walkdir = "2"
 quick-xml = "0.37"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 assert_cmd = "2"
 predicates = "3"
-tempfile = "3"

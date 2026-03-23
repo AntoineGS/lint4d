@@ -1,5 +1,9 @@
 use lint4d::config::Config;
-use lint4d::engine::{run_lint, FileInfo};
+use lint4d::dcu::{
+    DcuPlatform, DcuUnit, DcuVersion, ProjectContext, TypeInfo, TypeKind, TypeRef,
+};
+use lint4d::engine::{run_lint, run_lint_with_context, FileInfo};
+use lint4d::rules::RuleRegistry;
 use std::fs;
 use std::path::PathBuf;
 
@@ -162,6 +166,132 @@ fn resource_leak_no_try_skips_field_in_any_method() {
     assert!(
         matches.is_empty(),
         "Field assignments in any method should not flag resource-leak-no-try: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_skips_interface_refcounted() {
+    let diagnostics =
+        lint_fixture("tests/fixtures/resource_leak/good_interface_refcounted.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Interface-refcounted objects should not flag resource-leak-no-try: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_flags_no_refcount_object() {
+    let diagnostics =
+        lint_fixture("tests/fixtures/resource_leak/bad_no_refcount_object.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "TNoRefCountObject assigned to interface should still flag: {:?}",
+        matches
+    );
+}
+
+/// Helper: lint a fixture with a synthetic `ProjectContext` providing DCU type info.
+fn lint_fixture_with_context(
+    fixture_path: &str,
+    project: &ProjectContext,
+) -> Vec<lint4d::engine::Diagnostic> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
+    let source = fs::read(&path).unwrap();
+    let file = FileInfo::new(PathBuf::from(fixture_path));
+    let config = "version = 1".parse::<Config>().unwrap();
+    let registry = RuleRegistry::new();
+    run_lint_with_context(&file, &source, &config, Some(project), &registry)
+}
+
+#[test]
+fn resource_leak_no_try_dcu_flags_no_refcount_descendant() {
+    // Simulate a DCU where TMyNoRefObj descends from TNoRefCountObject.
+    let system_unit = DcuUnit {
+        name: "System".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![TypeInfo {
+            name: "TNoRefCountObject".to_string(),
+            kind: TypeKind::Class,
+            parent: Some(TypeRef::Resolved("TObject".to_string())),
+            fields: vec![],
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    let app_unit = DcuUnit {
+        name: "bad_no_refcount_object".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec!["System".to_string()],
+        types: vec![TypeInfo {
+            name: "TMyNoRefObj".to_string(),
+            kind: TypeKind::Class,
+            parent: Some(TypeRef::Resolved("TNoRefCountObject".to_string())),
+            fields: vec![],
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    let project = ProjectContext::from_units(vec![system_unit, app_unit]);
+
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_no_refcount_object.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        !matches.is_empty(),
+        "TNoRefCountObject descendants should still flag even with DCU context: {:?}",
+        diagnostics
+    );
+}
+
+#[test]
+fn resource_leak_no_try_dcu_skips_true_interface() {
+    // Simulate a DCU confirming IMyService is an interface.
+    let unit = DcuUnit {
+        name: "good_interface_refcounted".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![TypeInfo {
+            name: "IMyService".to_string(),
+            kind: TypeKind::Interface,
+            parent: None,
+            fields: vec![],
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    let project = ProjectContext::from_units(vec![unit]);
+
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_interface_refcounted.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "DCU-confirmed interface types should not flag: {:?}",
         matches
     );
 }

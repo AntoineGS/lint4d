@@ -230,4 +230,40 @@ impl ProjectContext {
         let ty = self.resolve_type(type_name, uses)?;
         ty.methods.into_iter().find(|m| m.kind == MethodKind::Constructor)
     }
+
+    /// Check whether `class_name` descends from `ancestor_name` by walking
+    /// the parent chain through resolved DCU types.
+    ///
+    /// Returns `Some(true)` if the ancestor is found, `Some(false)` if the
+    /// full chain was resolved without finding it, or `None` if the chain
+    /// could not be fully resolved (type or parent not in loaded DCUs).
+    pub fn descends_from(
+        &self,
+        class_name: &str,
+        ancestor_name: &str,
+        uses: &[String],
+    ) -> Option<bool> {
+        if class_name.eq_ignore_ascii_case(ancestor_name) {
+            return Some(true);
+        }
+
+        let mut current = self.resolve_type(class_name, uses)?;
+
+        // Walk up to 20 levels to avoid infinite loops from bad data.
+        for _ in 0..20 {
+            match &current.parent {
+                Some(TypeRef::Resolved(parent_name)) => {
+                    if parent_name.eq_ignore_ascii_case(ancestor_name) {
+                        return Some(true);
+                    }
+                    match self.resolve_type(parent_name, uses) {
+                        Some(parent_type) => current = parent_type,
+                        None => return None, // Parent not in loaded DCUs.
+                    }
+                }
+                _ => return Some(false), // No parent or unresolved — end of chain.
+            }
+        }
+        Some(false)
+    }
 }

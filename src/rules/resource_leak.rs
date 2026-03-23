@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+
 use tree_sitter::{Node, Tree};
 
+use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
     constructor_has_owner_args, is_constructor_call, node_text, statements_free_variable,
@@ -197,20 +200,45 @@ impl Rule for ResourceLeakNoTryRule {
         _config: &crate::config::Config,
         ctx: &mut LintContext,
     ) {
-        visit_blocks_no_try(tree.root_node(), source, ctx);
+        let uses = extract_uses_clauses(tree.root_node(), source);
+        visit_blocks_no_try(tree.root_node(), source, None, &uses, ctx);
+    }
+
+    fn check_with_context(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        project: &ProjectContext,
+        ctx: &mut LintContext,
+    ) {
+        if project.unit_count() == 0 {
+            // No DCU data loaded — fall back to heuristic-only path.
+            self.check(file, tree, source, config, ctx);
+            return;
+        }
+        let uses = extract_uses_clauses(tree.root_node(), source);
+        visit_blocks_no_try(tree.root_node(), source, Some(project), &uses, ctx);
     }
 }
 
 /// Recursively walk the AST looking for block-like nodes and check for the
 /// no-try pattern.
-fn visit_blocks_no_try(node: Node, source: &[u8], ctx: &mut LintContext) {
+fn visit_blocks_no_try(
+    node: Node,
+    source: &[u8],
+    project: Option<&ProjectContext>,
+    uses: &[String],
+    ctx: &mut LintContext,
+) {
     if node.kind() == "block" {
-        check_block_no_try(node, source, ctx);
+        check_block_no_try(node, source, project, uses, ctx);
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_blocks_no_try(child, source, ctx);
+        visit_blocks_no_try(child, source, project, uses, ctx);
     }
 }
 
@@ -221,8 +249,16 @@ fn visit_blocks_no_try(node: Node, source: &[u8], ctx: &mut LintContext) {
 /// - Owner-managed objects: constructor called with non-nil arguments
 /// - Field assignments in methods: fields are freed by the destructor
 /// - `Result` assignments: ownership transfers to the caller
-fn check_block_no_try(block: Node, source: &[u8], ctx: &mut LintContext) {
+/// - Reference-counted objects: assigned to interface-typed variables
+fn check_block_no_try(
+    block: Node,
+    source: &[u8],
+    project: Option<&ProjectContext>,
+    uses: &[String],
+    ctx: &mut LintContext,
+) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
+    let interface_vars = collect_interface_vars(block, source, project, uses);
 
     for (i, child) in children.iter().enumerate() {
         if child.kind() != "assignment" {
@@ -248,6 +284,24 @@ fn check_block_no_try(block: Node, source: &[u8], ctx: &mut LintContext) {
         // Skip `Result` assignments: a function returning a newly created
         // object transfers ownership to the caller.
         if var_name.eq_ignore_ascii_case("result") {
+            continue;
+        }
+
+        // Skip reference-counted objects: if the variable itself is
+        // interface-typed, or is later assigned to an interface-typed
+        // variable, reference counting manages the object's lifetime.
+        // However, some classes (e.g. TNoRefCountObject) implement
+        // IInterface with stub _AddRef/_Release that do NOT free the
+        // object, so those must still be flagged.
+        let ctor_class = extract_constructor_class_name(rhs_node, source);
+        let non_refcounting = ctor_class
+            .as_deref()
+            .is_some_and(|cn| is_non_refcounting_class(cn, project, uses));
+
+        if !non_refcounting
+            && (interface_vars.contains(&var_name)
+                || assigned_to_interface_var(&children, i, &var_name, &interface_vars, source))
+        {
             continue;
         }
 
@@ -279,6 +333,227 @@ fn check_block_no_try(block: Node, source: &[u8], ctx: &mut LintContext) {
         }
     }
 }
+
+// ─── Interface / reference-counting helpers ──────────────────────────────────
+
+/// Collect the names of all local variables whose declared type is an
+/// interface type.
+///
+/// When a `ProjectContext` is available, uses DCU metadata to definitively
+/// determine whether a type is an interface.  Falls back to the Delphi naming
+/// convention (`I` + uppercase) when no DCU data is present.
+fn collect_interface_vars(
+    block: Node,
+    source: &[u8],
+    project: Option<&ProjectContext>,
+    uses: &[String],
+) -> HashSet<String> {
+    let mut result = HashSet::new();
+
+    // The parent of a block inside a procedure is the defProc/lambda node.
+    let proc_node = match block.parent() {
+        Some(p) if p.kind() == "defProc" || p.kind() == "lambda" => p,
+        _ => return result,
+    };
+
+    let mut proc_cursor = proc_node.walk();
+    for child in proc_node.children(&mut proc_cursor) {
+        if child.kind() != "declVars" {
+            continue;
+        }
+        let mut vars_cursor = child.walk();
+        for decl_var in child.children(&mut vars_cursor) {
+            if decl_var.kind() != "declVar" {
+                continue;
+            }
+            let type_name = match extract_decl_var_type(decl_var, source) {
+                Some(tn) => tn,
+                None => continue,
+            };
+            if !is_interface_type(&type_name, project, uses) {
+                continue;
+            }
+            // Collect all identifier names in this declVar (handles `a, b: IFoo`).
+            let mut dv_cursor = decl_var.walk();
+            for dv_child in decl_var.children(&mut dv_cursor) {
+                if dv_child.kind() == "identifier" {
+                    result.insert(node_text(dv_child, source));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Determine whether a type name refers to an interface type.
+///
+/// Uses `ProjectContext` DCU metadata when available for a definitive answer.
+/// Falls back to the Delphi naming convention (`I` + uppercase letter) when
+/// the type is not found in any loaded DCU.
+fn is_interface_type(
+    type_name: &str,
+    project: Option<&ProjectContext>,
+    uses: &[String],
+) -> bool {
+    if let Some(proj) = project {
+        if let Some(is_intf) = proj.is_interface_type(type_name, uses) {
+            return is_intf;
+        }
+        // Type not found in any DCU — fall through to heuristic.
+    }
+    is_interface_type_by_name(type_name)
+}
+
+/// Heuristic: check whether a type name follows the Delphi interface naming
+/// convention (`I` + uppercase letter), excluding common non-interface types.
+fn is_interface_type_by_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'I' || !bytes[1].is_ascii_uppercase() {
+        return false;
+    }
+    !matches!(
+        name,
+        "Integer" | "Int8" | "Int16" | "Int32" | "Int64" | "IDispatch"
+    )
+}
+
+/// Extract the class name from a constructor call's RHS node.
+///
+/// For `TFoo.Create` (exprDot) returns `"TFoo"`.
+/// For `TFoo.Create(args)` (exprCall wrapping exprDot) returns `"TFoo"`.
+fn extract_constructor_class_name(rhs_node: Node, source: &[u8]) -> Option<String> {
+    let dot_node = match rhs_node.kind() {
+        "exprDot" => rhs_node,
+        "exprCall" => rhs_node.child_by_field_name("entity")?,
+        _ => return None,
+    };
+    if dot_node.kind() != "exprDot" {
+        return None;
+    }
+    let lhs = dot_node.child_by_field_name("lhs")?;
+    Some(node_text(lhs, source))
+}
+
+/// Known base classes whose `_AddRef`/`_Release` return -1, meaning
+/// they do NOT perform reference counting despite implementing IInterface.
+const NON_REFCOUNTING_CLASSES: &[&str] = &["TNoRefCountObject"];
+
+/// Check whether the constructor's class is known to not support
+/// reference counting.
+///
+/// When a `ProjectContext` is available, walks the class's parent chain
+/// via DCU metadata to check for `TNoRefCountObject` ancestry.  Falls
+/// back to a direct name match against the known list.
+fn is_non_refcounting_class(
+    class_name: &str,
+    project: Option<&ProjectContext>,
+    uses: &[String],
+) -> bool {
+    // Direct name match (works with or without DCU).
+    if NON_REFCOUNTING_CLASSES
+        .iter()
+        .any(|&c| c.eq_ignore_ascii_case(class_name))
+    {
+        return true;
+    }
+
+    // DCU ancestry check: does the class descend from a non-ref-counting base?
+    if let Some(proj) = project {
+        for &ancestor in NON_REFCOUNTING_CLASSES {
+            if let Some(true) = proj.descends_from(class_name, ancestor, uses) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Extract the type name string from a `declVar` node.
+///
+/// Expected structure: `declVar -> type -> typeref -> identifier`.
+fn extract_decl_var_type(decl_var: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = decl_var.walk();
+    for child in decl_var.children(&mut cursor) {
+        if child.kind() == "type" {
+            let mut type_cursor = child.walk();
+            for type_child in child.children(&mut type_cursor) {
+                if type_child.kind() == "typeref" {
+                    let mut ref_cursor = type_child.walk();
+                    for ref_child in type_child.children(&mut ref_cursor) {
+                        if ref_child.kind() == "identifier" {
+                            return Some(node_text(ref_child, source));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check whether the constructor-assigned variable is later assigned to an
+/// interface-typed variable in the same block, which means the interface
+/// reference counting will manage the object's lifetime.
+fn assigned_to_interface_var(
+    children: &[Node],
+    start_idx: usize,
+    var_name: &str,
+    interface_vars: &HashSet<String>,
+    source: &[u8],
+) -> bool {
+    if interface_vars.is_empty() {
+        return false;
+    }
+    let var_lower = var_name.to_lowercase();
+    for sibling in children.iter().skip(start_idx + 1) {
+        if sibling.kind() != "assignment" {
+            continue;
+        }
+        let lhs = match sibling.child_by_field_name("lhs") {
+            Some(l) => l,
+            None => continue,
+        };
+        let rhs = match sibling.child_by_field_name("rhs") {
+            Some(r) => r,
+            None => continue,
+        };
+        let lhs_text = node_text(lhs, source);
+        let rhs_text = node_text(rhs, source);
+        // RHS must reference the constructor variable, LHS must be an interface var.
+        if rhs_text.to_lowercase() == var_lower && interface_vars.contains(&lhs_text) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract all unit names from `declUses` nodes in the AST.
+///
+/// Collects unit names from both `interface` and `implementation` uses clauses.
+fn extract_uses_clauses(root: Node, source: &[u8]) -> Vec<String> {
+    let mut units = Vec::new();
+    collect_uses_recursive(root, source, &mut units);
+    units
+}
+
+fn collect_uses_recursive(node: Node, source: &[u8], units: &mut Vec<String>) {
+    if node.kind() == "declUses" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "moduleName" {
+                units.push(node_text(child, source));
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_uses_recursive(child, source, units);
+    }
+}
+
+// ─── Common helpers ──────────────────────────────────────────────────────────
 
 /// Check whether a variable name follows the Delphi field naming convention.
 ///

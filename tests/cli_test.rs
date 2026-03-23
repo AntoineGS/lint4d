@@ -204,3 +204,115 @@ fn project_flag_lints_dproj_files() {
         .assert()
         .success();
 }
+
+#[test]
+fn fix_fmt_renames_type_prefix_in_place() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("BadPrefix.pas"),
+        "unit BadPrefix;\n\ninterface\n\ntype\n  MyClass = class(TObject)\n  end;\n\nimplementation\n\nend.\n",
+    )
+    .unwrap();
+
+    lint4d()
+        .arg("--fix-fmt")
+        .arg(dir.path().join("BadPrefix.pas"))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Fixed"));
+
+    let content = fs::read_to_string(dir.path().join("BadPrefix.pas")).unwrap();
+    assert!(content.contains("TMyClass = class(TObject)"));
+    assert!(!content.contains(" MyClass"));
+}
+
+#[test]
+fn fix_fmt_no_output_for_clean_file() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Clean.pas"),
+        "unit Clean;\n\ninterface\n\ntype\n  TMyClass = class\n  end;\n\nimplementation\n\nend.\n",
+    )
+    .unwrap();
+
+    lint4d()
+        .arg("--fix-fmt")
+        .arg(dir.path().join("Clean.pas"))
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn fix_fmt_mutually_exclusive_with_format() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Test.pas"),
+        "unit Test;\ninterface\nimplementation\nend.\n",
+    )
+    .unwrap();
+
+    lint4d()
+        .arg("--fix-fmt")
+        .arg("--format")
+        .arg("json")
+        .arg(dir.path().join("Test.pas"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--fix-fmt"));
+}
+
+#[test]
+fn fix_fmt_mutually_exclusive_with_generate_baseline() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Test.pas"),
+        "unit Test;\ninterface\nimplementation\nend.\n",
+    )
+    .unwrap();
+
+    lint4d()
+        .arg("--fix-fmt")
+        .arg("--generate-baseline")
+        .arg(dir.path().join("Test.pas"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--fix-fmt"));
+}
+
+#[test]
+fn fix_fmt_renames_constant_and_usages() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Const.pas"),
+        r#"unit Const;
+
+interface
+
+const
+  maxSize = 100;
+
+implementation
+
+procedure DoWork;
+var
+  x: Integer;
+begin
+  x := maxSize;
+end;
+
+end.
+"#,
+    )
+    .unwrap();
+
+    lint4d()
+        .arg("--fix-fmt")
+        .arg(dir.path().join("Const.pas"))
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(dir.path().join("Const.pas")).unwrap();
+    assert!(content.contains("MAX_SIZE = 100;"));
+    assert!(content.contains("x := MAX_SIZE;"));
+}

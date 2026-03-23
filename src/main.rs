@@ -7,7 +7,8 @@ use lint4d::config::baseline::Baseline;
 use lint4d::config::Config;
 use lint4d::discovery::discover_files;
 use lint4d::discovery::dproj::parse_dproj;
-use lint4d::engine::{run_lint_with_context, Severity};
+use lint4d::engine::{run_lint_with_context, FileInfo, Severity};
+use lint4d::fix::fix_file;
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;
 use lint4d::rules::RuleRegistry;
@@ -73,6 +74,10 @@ struct Cli {
     /// Enable colored output
     #[arg(long)]
     color: bool,
+
+    /// Auto-fix naming convention violations in-place
+    #[arg(long)]
+    fix_fmt: bool,
 }
 
 fn main() {
@@ -133,6 +138,27 @@ fn real_main() {
             cli.format
         );
         process::exit(EXIT_ERROR);
+    }
+
+    // --fix-fmt: validate mutual exclusivity
+    if cli.fix_fmt {
+        let mut conflicts = Vec::new();
+        if cli.format != "text" {
+            conflicts.push("--format");
+        }
+        if cli.generate_baseline {
+            conflicts.push("--generate-baseline");
+        }
+        if cli.fail_on != "warning" {
+            conflicts.push("--fail-on");
+        }
+        if !conflicts.is_empty() {
+            eprintln!(
+                "lint4d: --fix-fmt cannot be combined with {}",
+                conflicts.join(", ")
+            );
+            process::exit(EXIT_ERROR);
+        }
     }
 
     // Discover config
@@ -206,6 +232,12 @@ fn real_main() {
             }
         }
     };
+
+    // --fix-fmt: run fix pipeline instead of lint pipeline
+    if cli.fix_fmt {
+        run_fix_fmt(&files, &config);
+        return;
+    }
 
     if files.is_empty() {
         // No Delphi files found -- not an error, just nothing to do
@@ -281,6 +313,49 @@ fn real_main() {
 
     if has_issues_above_threshold {
         process::exit(EXIT_ISSUES);
+    }
+}
+
+fn run_fix_fmt(files: &[FileInfo], config: &Config) {
+    use lint4d::engine::FileType;
+
+    let results: Vec<_> = files
+        .par_iter()
+        .filter_map(|file| {
+            if matches!(file.file_type, FileType::Dpr | FileType::Dpk) {
+                return None;
+            }
+            let source = fs::read(&file.path).ok()?;
+            match fix_file(file, &source, config) {
+                Ok((new_source, count)) => {
+                    if count > 0 {
+                        Some((file.path.clone(), new_source, count))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lint4d: warning: failed to fix {}: {}",
+                        file.path.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+
+    for (path, new_source, count) in &results {
+        if let Err(e) = fs::write(path, new_source) {
+            eprintln!("lint4d: error: failed to write {}: {}", path.display(), e);
+            process::exit(EXIT_ERROR);
+        }
+        eprintln!(
+            "Fixed {} identifier(s) in {}",
+            count,
+            path.display()
+        );
     }
 }
 

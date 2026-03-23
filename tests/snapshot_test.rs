@@ -9,7 +9,7 @@ fn lint_and_format_text(fixture_path: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
     let source = fs::read(&path).unwrap();
     let file = FileInfo::new(PathBuf::from(fixture_path));
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     let diagnostics = run_lint(&file, &source, &config);
     format_diagnostics(fixture_path, &source, &diagnostics, false)
 }
@@ -18,7 +18,7 @@ fn lint_and_format_json(fixture_path: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
     let source = fs::read(&path).unwrap();
     let file = FileInfo::new(PathBuf::from(fixture_path));
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     let diagnostics = run_lint(&file, &source, &config);
     format_json_output(&[(fixture_path.to_string(), diagnostics)])
 }

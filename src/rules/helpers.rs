@@ -70,16 +70,17 @@ pub fn statements_free_variable(statements: Node, source: &[u8], var_name: &str)
     let text = node_text(statements, source).to_lowercase();
     let var_lower = var_name.to_lowercase();
 
-    // Check for `variable.Free` or `variable.Destroy`
+    // Check for `variable.Free` / `variable.Free()` / `variable.Destroy` / `variable.Destroy()`
     let dot_free = format!("{}.free", var_lower);
     let dot_destroy = format!("{}.destroy", var_lower);
     if text.contains(&dot_free) || text.contains(&dot_destroy) {
         return true;
     }
 
-    // Check for `FreeAndNil(variable)`
+    // Check for `FreeAndNil(variable)` — tolerate optional whitespace inside parens
     let free_and_nil = format!("freeandnil({})", var_lower);
-    if text.contains(&free_and_nil) {
+    let free_and_nil_sp = format!("freeandnil( {}", var_lower);
+    if text.contains(&free_and_nil) || text.contains(&free_and_nil_sp) {
         return true;
     }
 
@@ -125,5 +126,6 @@ pub fn text_frees_variable(text: &str, var_name: &str) -> bool {
         return true;
     }
     let free_and_nil = format!("freeandnil({})", var_lower);
-    lower.contains(&free_and_nil)
+    let free_and_nil_sp = format!("freeandnil( {}", var_lower);
+    lower.contains(&free_and_nil) || lower.contains(&free_and_nil_sp)
 }

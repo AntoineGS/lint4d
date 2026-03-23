@@ -131,7 +131,7 @@ impl ProjectContext {
                 for entry in std::fs::read_dir(path).map_err(DcuError::Io)? {
                     let entry = entry.map_err(DcuError::Io)?;
                     let p = entry.path();
-                    if p.extension().map_or(false, |e| e.eq_ignore_ascii_case("dcu")) {
+                    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dcu")) {
                         let data = std::fs::read(&p).map_err(DcuError::Io)?;
                         match types::parse_dcu(&data) {
                             Ok(unit) => units.push(unit),

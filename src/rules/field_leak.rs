@@ -96,10 +96,10 @@ fn collect_fields(decl_class: Node, source: &[u8]) -> Vec<String> {
     fields
 }
 
-/// Extract the class name and method name from a `defProc` node.
+/// Extract class name and flags from a `defProc` node.
 ///
-/// Returns `(class_name, method_name, is_constructor, is_destructor)`.
-fn parse_def_proc(def_proc: Node, source: &[u8]) -> Option<(String, String, bool, bool)> {
+/// Returns `(class_name, is_constructor, is_destructor)`.
+fn parse_def_proc(def_proc: Node, source: &[u8]) -> Option<(String, bool, bool)> {
     let mut cursor = def_proc.walk();
     let decl_proc = def_proc
         .children(&mut cursor)
@@ -122,14 +122,13 @@ fn parse_def_proc(def_proc: Node, source: &[u8]) -> Option<(String, String, bool
         .filter(|c| c.kind() == "identifier")
         .collect();
 
-    if idents.len() < 2 {
+    if idents.is_empty() {
         return None;
     }
 
     let class_name = node_text(idents[0], source);
-    let method_name = node_text(idents[1], source);
 
-    Some((class_name, method_name, is_constructor, is_destructor))
+    Some((class_name, is_constructor, is_destructor))
 }
 
 /// Find the `block` child of a `defProc` node.
@@ -196,11 +195,6 @@ fn parse_field_creation(node: Node, source: &[u8], fields: &[String]) -> Option<
         end_line: end.row + 1,
         end_column: end.column + 1,
     })
-}
-
-/// Get the full source text of a block node.
-fn block_text(block: Node, source: &[u8]) -> String {
-    node_text(block, source)
 }
 
 /// Extract source text from the start of a block up to (but not including) a
@@ -293,7 +287,7 @@ fn check_field_not_freed(root: Node, source: &[u8], ctx: &mut LintContext) {
         let destructor_text = class_procs
             .iter()
             .filter(|p| p.is_destructor)
-            .filter_map(|p| p.block.map(|b| block_text(b, source)))
+            .filter_map(|p| p.block.map(|b| node_text(b, source)))
             .next();
 
         // Check each created field
@@ -507,7 +501,7 @@ fn collect_def_procs<'a>(root: Node<'a>, source: &[u8]) -> Vec<DefProcInfo<'a>> 
 
 fn collect_def_procs_recursive<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<DefProcInfo<'a>>) {
     if node.kind() == "defProc" {
-        if let Some((class_name, _method_name, is_constructor, is_destructor)) =
+        if let Some((class_name, is_constructor, is_destructor)) =
             parse_def_proc(node, source)
         {
             let block = get_method_block(node);

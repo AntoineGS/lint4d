@@ -7,7 +7,7 @@ fn lint_fixture(fixture_path: &str) -> Vec<lint4d::engine::Diagnostic> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
     let source = fs::read(&path).unwrap();
     let file = FileInfo::new(PathBuf::from(fixture_path));
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     run_lint(&file, &source, &config)
 }
 
@@ -85,7 +85,7 @@ fn naming_rules_skipped_for_dpr_files() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/naming/bad_type_prefix.pas");
     let source = fs::read(&path).unwrap();
     let file = FileInfo::new(PathBuf::from("Project.dpr"));
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     let diagnostics = run_lint(&file, &source, &config);
     let naming: Vec<_> = diagnostics
         .iter()

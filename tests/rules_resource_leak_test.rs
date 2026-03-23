@@ -7,7 +7,7 @@ fn lint_fixture(fixture_path: &str) -> Vec<lint4d::engine::Diagnostic> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
     let source = fs::read(&path).unwrap();
     let file = FileInfo::new(PathBuf::from(fixture_path));
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     run_lint(&file, &source, &config)
 }
 

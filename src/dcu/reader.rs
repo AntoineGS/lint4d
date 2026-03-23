@@ -22,6 +22,10 @@ impl<'a> DcuReader<'a> {
         self.data.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub fn peek_at(&self, offset: usize) -> u8 {
         if offset < self.data.len() {
             self.data[offset]
@@ -159,6 +163,8 @@ impl<'a> DcuReader<'a> {
         if b0 & 4 == 0 {
             let b1 = self.read_byte()?;
             let b2 = self.read_byte()?;
+            // Sign-extend b2 via i8→i32→u32 so bits 24-31 carry the sign
+            // before the arithmetic right-shift recovers the 21-bit signed value.
             let dw = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as i8 as i32 as u32) << 16);
             return Ok((dw as i32) >> 3);
         }

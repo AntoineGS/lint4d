@@ -351,9 +351,13 @@ fn is_declaration_position(node: Node) -> bool {
 
 fn check_usages(root: Node, source: &[u8], scopes: &Scopes, ctx: &mut LintContext) {
     // Walk the implementation section, visiting each defProc individually.
+    // Handles unit, program, and library root nodes.
     for child in root.children(&mut root.walk()) {
-        if child.kind() == "unit" {
-            check_unit_usages(child, source, scopes, ctx);
+        match child.kind() {
+            "unit" | "program" | "library" => {
+                check_unit_usages(child, source, scopes, ctx);
+            }
+            _ => {}
         }
     }
 }

@@ -53,7 +53,7 @@ pub fn parse_dcu(data: &[u8]) -> Result<DcuUnit, DcuError> {
 /// Apply the D2006+ tag fixup: raw tags in 0x2D..0x36 are remapped.
 /// Raw 0x2D wraps to 0x36 (arClassVar). All others decrement by 1.
 fn fix_tag(raw: u8) -> u8 {
-    if raw >= 0x2D && raw <= 0x36 {
+    if (0x2D..=0x36).contains(&raw) {
         if raw == 0x2D {
             0x36 // arClassVar: raw 0x2D wraps to technical value 0x36
         } else {
@@ -480,7 +480,7 @@ fn read_unit_add_info(
 fn skip_decl_const_add_info(reader: &mut DcuReader) -> Result<(), DcuError> {
     loop {
         let sub_tag = reader.read_byte()?;
-        if sub_tag >= 0xFF {
+        if sub_tag == 0xFF {
             break;
         }
         match sub_tag {
@@ -949,7 +949,7 @@ fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo]) {
         let class_name = &proc_name[..dot_pos];
         let method_name = &proc_name[dot_pos + 1..];
         if !method_name.is_empty() && !method_name.starts_with(':') {
-            if let Some(ti) = types.iter_mut().find(|t| t.name == class_name) {
+            if let Some(ti) = types.iter_mut().find(|t| t.name.eq_ignore_ascii_case(class_name)) {
                 ti.kind = TypeKind::Class;
                 let kind = if method_name == "Create" {
                     MethodKind::Constructor

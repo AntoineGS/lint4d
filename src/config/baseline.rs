@@ -54,7 +54,9 @@ impl Baseline {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap()
+        serde_json::to_string_pretty(self).unwrap_or_else(|e| {
+            format!("{{\"error\": \"failed to serialize baseline: {}\"}}", e)
+        })
     }
 
     pub fn from_json(json: &str) -> Result<Self, String> {

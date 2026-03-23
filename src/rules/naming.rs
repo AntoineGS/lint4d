@@ -223,27 +223,27 @@ impl Rule for ConstantNamingRule {
         _file: &FileInfo,
         tree: &Tree,
         source: &[u8],
-        _config: &crate::config::Config,
+        config: &crate::config::Config,
         ctx: &mut LintContext,
     ) {
-        visit_constant_naming(tree.root_node(), source, ctx);
+        visit_constant_naming(tree.root_node(), source, config.constant_style(), ctx);
     }
 }
 
-fn visit_constant_naming(node: Node, source: &[u8], ctx: &mut LintContext) {
+fn visit_constant_naming(node: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
     if node.kind() == "declConst" {
         // Skip typed constants — they have a "type" field (e.g., `TypedConst: Integer = 42`)
         if node.child_by_field_name("type").is_none() {
-            check_constant_name(node, source, ctx);
+            check_constant_name(node, source, style, ctx);
         }
     }
 
     for child in node.children(&mut node.walk()) {
-        visit_constant_naming(child, source, ctx);
+        visit_constant_naming(child, source, style, ctx);
     }
 }
 
-fn check_constant_name(decl_const: Node, source: &[u8], ctx: &mut LintContext) {
+fn check_constant_name(decl_const: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
     let name_node = match decl_const.child_by_field_name("name") {
         Some(n) => n,
         None => return,
@@ -254,11 +254,18 @@ fn check_constant_name(decl_const: Node, source: &[u8], ctx: &mut LintContext) {
         Err(_) => return,
     };
 
-    // UPPER_CASE: only uppercase letters, digits, and underscores
-    if name
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-    {
+    let (conforms, expected_label, suggestion) = if style == "PascalCase" {
+        let ok = name.chars().next().is_some_and(|c| c.is_uppercase());
+        (ok, "PascalCase", name.to_string())
+    } else {
+        // Default: UPPER_CASE
+        let ok = name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        (ok, "UPPER_CASE", to_upper_snake_case(name))
+    };
+
+    if conforms {
         return;
     }
 
@@ -268,28 +275,34 @@ fn check_constant_name(decl_const: Node, source: &[u8], ctx: &mut LintContext) {
         rule_id: "constant-naming".to_string(),
         severity: Severity::Hint,
         message: format!(
-            "Constant '{}' should use UPPER_CASE naming convention.",
-            name
+            "Constant '{}' should use {} naming convention.",
+            name, expected_label
         ),
         line: start.row + 1,
         column: start.column + 1,
         end_line: end.row + 1,
         end_column: end.column + 1,
-        help: Some(format!(
-            "Rename '{}' to '{}'.",
-            name,
-            to_upper_snake_case(name)
-        )),
+        help: Some(format!("Rename '{}' to '{}'.", name, suggestion)),
     });
 }
 
 fn to_upper_snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
     let mut result = String::with_capacity(name.len() + 4);
-    for (i, ch) in name.chars().enumerate() {
+    for (i, &ch) in chars.iter().enumerate() {
         if ch.is_ascii_uppercase() && i > 0 {
-            let prev = name.chars().nth(i - 1).unwrap_or('_');
+            let prev = chars[i - 1];
             if prev.is_ascii_lowercase() || prev.is_ascii_digit() {
+                // camelCase boundary: `fooBar` → `FOO_BAR`
                 result.push('_');
+            } else if prev.is_ascii_uppercase() {
+                // Consecutive uppercase: check if next char is lowercase
+                // to detect end of acronym: `HTTPPort` → `HTTP_PORT`
+                if let Some(&next) = chars.get(i + 1) {
+                    if next.is_ascii_lowercase() {
+                        result.push('_');
+                    }
+                }
             }
         }
         result.push(ch.to_ascii_uppercase());

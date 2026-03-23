@@ -366,6 +366,9 @@ fn run_init() {
 paths = ["."]
 exclude = ["**/test/**", "**/tests/**"]
 # dcu_paths = []
+# platform = "Win64"
+# build_config = "Debug"
+# bds_path = "C:/Program Files (x86)/Embarcadero/Studio/23.0"
 
 [rules]
 # Override rule severity: "error", "warning", "hint", or "off"

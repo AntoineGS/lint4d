@@ -80,7 +80,7 @@ fn main() {
     // deeply nested DCU parsing (e.g., large VCL units in debug builds).
     let builder = std::thread::Builder::new()
         .name("lint4d-main".to_string())
-        .stack_size(64 * 1024 * 1024);
+        .stack_size(16 * 1024 * 1024);
     let handler = builder.spawn(real_main).expect("failed to spawn main thread");
     let result = handler.join();
     if let Err(e) = result {
@@ -178,15 +178,9 @@ fn real_main() {
 
     let project_context = if !dcu_dirs.is_empty() {
         match lint4d::dcu::ProjectContext::from_dcu_paths(&dcu_dirs) {
-            Ok(ctx) => {
-                let count = ctx.unit_count();
-                if count > 0 {
-                    eprintln!("Loaded DCU type info from {} unit(s)", count);
-                }
-                Some(ctx)
-            }
+            Ok(ctx) => Some(ctx),
             Err(e) => {
-                eprintln!("lint4d: warning: failed to load DCU info: {}", e);
+                eprintln!("lint4d: warning: failed to index DCU paths: {}", e);
                 None
             }
         }

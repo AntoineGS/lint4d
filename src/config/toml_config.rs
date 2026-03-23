@@ -23,6 +23,12 @@ pub struct RawLint4dSection {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub dcu_paths: Vec<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub build_config: Option<String>,
+    #[serde(default)]
+    pub bds_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

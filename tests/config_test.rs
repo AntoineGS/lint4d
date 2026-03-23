@@ -6,7 +6,7 @@ use tempfile::TempDir;
 #[test]
 fn parses_minimal_config() {
     let toml = "version = 1\n";
-    let config = Config::from_str(toml).unwrap();
+    let config = toml.parse::<Config>().unwrap();
     assert_eq!(config.version, 1);
     assert!(config.paths.is_empty());
     assert!(config.exclude.is_empty());
@@ -28,7 +28,7 @@ with-statement = "off"
 [rules.naming]
 constant_style = "UPPER_CASE"
 "#;
-    let config = Config::from_str(toml).unwrap();
+    let config = toml.parse::<Config>().unwrap();
     assert_eq!(config.paths, vec!["src/", "lib/"]);
     assert_eq!(config.exclude, vec!["src/generated/**"]);
 
@@ -43,13 +43,13 @@ constant_style = "UPPER_CASE"
 
 #[test]
 fn default_constant_style_is_upper_case() {
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     assert_eq!(config.constant_style(), "UPPER_CASE");
 }
 
 #[test]
 fn unconfigured_rule_returns_none() {
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     assert_eq!(config.rule_severity("empty-except"), None);
 }
 
@@ -80,28 +80,64 @@ version = 1
 [rules.naming]
 local_variable_style = "PascalCase"
 "#;
-    let config = Config::from_str(toml).unwrap();
+    let config = toml.parse::<Config>().unwrap();
     assert_eq!(config.local_variable_style(), "PascalCase");
 }
 
 #[test]
 fn config_defaults_local_variable_style_to_camel_case() {
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     assert_eq!(config.local_variable_style(), "camelCase");
 }
 
 #[test]
 fn config_parses_dcu_paths() {
-    let config = Config::from_str(r#"
+    let config: Config = r#"
         version = 1
         [lint4d]
         dcu_paths = ["lib/Win64/Debug", "C:/Delphi/lib"]
-    "#).unwrap();
+    "#.parse().unwrap();
     assert_eq!(config.dcu_paths(), &["lib/Win64/Debug", "C:/Delphi/lib"]);
 }
 
 #[test]
 fn config_dcu_paths_default_empty() {
-    let config = Config::from_str("version = 1").unwrap();
+    let config = "version = 1".parse::<Config>().unwrap();
     assert!(config.dcu_paths().is_empty());
+}
+
+#[test]
+fn config_parses_platform() {
+    let config: Config = r#"
+        version = 1
+        [lint4d]
+        platform = "Win64"
+    "#.parse().unwrap();
+    assert_eq!(config.platform(), Some("Win64"));
+}
+
+#[test]
+fn config_platform_defaults_to_none() {
+    let config = "version = 1".parse::<Config>().unwrap();
+    assert_eq!(config.platform(), None);
+}
+
+#[test]
+fn config_parses_build_config() {
+    let config: Config = r#"
+        version = 1
+        [lint4d]
+        build_config = "Release"
+    "#.parse().unwrap();
+    assert_eq!(config.build_config(), Some("Release"));
+}
+
+#[test]
+fn config_parses_bds_path() {
+    let config: Config = r#"
+        version = 1
+        [lint4d]
+        bds_path = "C:/Embarcadero/Studio/23.0"
+    "#.parse().unwrap();
+    assert_eq!(config.bds_path(), Some("C:/Embarcadero/Studio/23.0"));
 }

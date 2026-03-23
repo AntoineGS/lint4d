@@ -76,6 +76,19 @@ struct Cli {
 }
 
 fn main() {
+    // Spawn the real main on a thread with a larger stack to handle
+    // deeply nested DCU parsing (e.g., large VCL units in debug builds).
+    let builder = std::thread::Builder::new()
+        .name("lint4d-main".to_string())
+        .stack_size(64 * 1024 * 1024);
+    let handler = builder.spawn(real_main).expect("failed to spawn main thread");
+    let result = handler.join();
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+fn real_main() {
     let cli = Cli::parse();
 
     // --init: create default config and exit

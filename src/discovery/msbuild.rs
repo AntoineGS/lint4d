@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 /// Keys in the MSBuild output that contain semicolon-separated DCU paths.
@@ -135,7 +137,7 @@ pub fn discover_dcu_paths_via_msbuild(
     config_override: Option<&str>,
 ) -> Vec<PathBuf> {
     let dproj_abs = match std::fs::canonicalize(dproj_path) {
-        Ok(p) => p,
+        Ok(p) => strip_unc_prefix(p),
         Err(e) => {
             eprintln!("lint4d: warning: cannot resolve dproj path {}: {}", dproj_path.display(), e);
             return Vec::new();
@@ -146,35 +148,27 @@ pub fn discover_dcu_paths_via_msbuild(
 
     let targets_xml = generate_targets_xml(&dproj_abs);
 
-    // Write temp .targets file
-    // Use system temp dir to avoid polluting the project directory
-    let temp_file = match tempfile::Builder::new()
-        .prefix("lint4d-")
-        .suffix(".targets")
-        .tempfile()
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("lint4d: warning: failed to create temp targets file: {}", e);
-            return Vec::new();
-        }
-    };
-
-    if let Err(e) = std::fs::write(temp_file.path(), &targets_xml) {
+    // Write temp .targets file to system temp dir.
+    // Use a plain file (not tempfile::NamedTempFile) because NamedTempFile
+    // holds the file handle open, which prevents MSBuild from reading it.
+    let temp_path = std::env::temp_dir().join(format!("lint4d-{}.targets", std::process::id()));
+    if let Err(e) = std::fs::write(&temp_path, &targets_xml) {
         eprintln!("lint4d: warning: failed to write temp targets file: {}", e);
         return Vec::new();
     }
 
     let cmd_str = build_msbuild_command(
         rsvars_path,
-        temp_file.path(),
+        &temp_path,
         platform_override,
         config_override,
     );
 
-    // Invoke MSBuild with 15-second timeout
+    // Invoke MSBuild with 15-second timeout.
+    // Use raw_arg to avoid Windows double-quoting the command string,
+    // which breaks `call "path with spaces"` inside cmd /c.
     let child = std::process::Command::new("cmd")
-        .args(["/c", &cmd_str])
+        .raw_arg(format!("/c {}", cmd_str))
         .current_dir(base_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -183,6 +177,7 @@ pub fn discover_dcu_paths_via_msbuild(
     let child = match child {
         Ok(c) => c,
         Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
             eprintln!("lint4d: warning: failed to launch MSBuild: {}", e);
             return Vec::new();
         }
@@ -191,17 +186,18 @@ pub fn discover_dcu_paths_via_msbuild(
     let output = match wait_with_timeout(child, std::time::Duration::from_secs(15)) {
         Ok(o) => o,
         Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
             eprintln!("lint4d: warning: MSBuild invocation failed: {}", e);
             return Vec::new();
         }
     };
 
+    // Clean up temp file after MSBuild completes
+    let _ = std::fs::remove_file(&temp_path);
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "lint4d: warning: MSBuild exited with status {}. stderr:\n{}",
-            output.status, stderr
-        );
+        eprintln!("lint4d: warning: MSBuild exited with status {}: {}", output.status, stderr.trim());
         return Vec::new();
     }
 
@@ -220,6 +216,18 @@ pub fn discover_dcu_paths_via_msbuild(
     _config_override: Option<&str>,
 ) -> Vec<PathBuf> {
     Vec::new()
+}
+
+/// Strip the `\\?\` extended-length prefix that `std::fs::canonicalize`
+/// adds on Windows. MSBuild and other tools cannot handle this prefix.
+#[cfg(target_os = "windows")]
+fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
 }
 
 /// Wait for a child process with a timeout. Returns an error if the timeout

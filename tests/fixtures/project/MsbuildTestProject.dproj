@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectVersion>19.5</ProjectVersion>
+    <Platform Condition="'$(Platform)'==''">Win64</Platform>
+    <Config Condition="'$(Config)'==''">Debug</Config>
+    <DCC_DcuOutput>.\$(Platform)\$(Config)</DCC_DcuOutput>
+    <DCC_UnitSearchPath>.\lib;.\shared\units</DCC_UnitSearchPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <DCCReference Include="src\Unit1.pas"/>
+  </ItemGroup>
+</Project>

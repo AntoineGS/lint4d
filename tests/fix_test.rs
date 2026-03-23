@@ -303,6 +303,201 @@ fn fix_skips_dpr_files() {
     assert_eq!(result, source);
 }
 
+// ---------------------------------------------------------------------------
+// Edge case tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fix_interface_prefix_renames_declaration_and_usages() {
+    let source = r#"unit InterfacePrefixFix;
+
+interface
+
+type
+  Printable = interface
+    procedure Print;
+  end;
+
+  TDoc = class(TObject, Printable)
+  public
+    procedure Print;
+  end;
+
+implementation
+
+procedure TDoc.Print;
+begin
+end;
+
+end."#;
+    let fixed = fix_source(source);
+    // Declaration renamed
+    assert!(fixed.contains("IPrintable = interface"), "ACTUAL:\n{fixed}");
+    // Usage in class inheritance list renamed
+    assert!(fixed.contains("TDoc = class(TObject, IPrintable)"), "ACTUAL:\n{fixed}");
+    // Old bare name gone (without 'I' prefix)
+    assert!(!fixed.contains("  Printable = interface"), "ACTUAL:\n{fixed}");
+}
+
+#[test]
+fn fix_combined_violations() {
+    let source = r#"unit CombinedFix;
+
+interface
+
+type
+  MyClass = class(TObject)
+  public
+    procedure DoWork;
+  end;
+
+const
+  maxRetries = 3;
+
+implementation
+
+procedure MyClass.DoWork;
+var
+  RetryCount: Integer;
+begin
+  RetryCount := maxRetries;
+end;
+
+end."#;
+    let fixed = fix_source(source);
+    // Type renamed
+    assert!(fixed.contains("TMyClass = class(TObject)"), "ACTUAL:\n{fixed}");
+    // Constant renamed
+    assert!(fixed.contains("MAX_RETRIES = 3;"), "ACTUAL:\n{fixed}");
+    // Local variable renamed
+    assert!(fixed.contains("retryCount: Integer;"), "ACTUAL:\n{fixed}");
+    // Usage of renamed local variable
+    assert!(fixed.contains("retryCount := MAX_RETRIES;"), "ACTUAL:\n{fixed}");
+    // Old names gone
+    assert!(!fixed.contains("maxRetries"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("RetryCount"), "ACTUAL:\n{fixed}");
+}
+
+#[test]
+fn fix_nested_procedure_outer_variable() {
+    // Outer procedure declares MyVar; inner procedure uses it.
+    // Both declaration and usage should be renamed to myVar.
+    let source = r#"unit Test;
+
+interface
+
+implementation
+
+procedure Outer;
+var
+  MyVar: Integer;
+
+  procedure Inner;
+  begin
+    MyVar := 1;
+  end;
+
+begin
+  MyVar := 2;
+end;
+
+end."#;
+    let fixed = fix_source(source);
+    // Outer proc declaration renamed
+    assert!(fixed.contains("myVar: Integer;"), "ACTUAL:\n{fixed}");
+    // Inner proc usage renamed
+    assert!(fixed.contains("myVar := 1;"), "ACTUAL:\n{fixed}");
+    // Outer proc usage renamed
+    assert!(fixed.contains("myVar := 2;"), "ACTUAL:\n{fixed}");
+    // Old name gone
+    assert!(!fixed.contains("MyVar"), "ACTUAL:\n{fixed}");
+}
+
+#[test]
+fn fix_suppressed_declaration_not_renamed() {
+    let source = r#"unit SuppressedFix;
+
+interface
+
+type
+  // lint4d:ignore type-prefix
+  MyClass = class(TObject)
+  end;
+
+const
+  maxSize = 100; // lint4d:ignore constant-naming
+
+implementation
+
+end."#;
+    let fixed = fix_source(source);
+    // Suppressed type declaration must not be renamed
+    assert!(fixed.contains("MyClass = class(TObject)"), "ACTUAL:\n{fixed}");
+    // Suppressed constant must not be renamed
+    assert!(fixed.contains("maxSize = 100;"), "ACTUAL:\n{fixed}");
+}
+
+#[test]
+fn fix_multi_name_declaration() {
+    // `MyA, MyB: Integer` — both names must be renamed to camelCase.
+    let source = r#"unit Test;
+
+interface
+
+implementation
+
+procedure DoWork;
+var
+  MyA, MyB: Integer;
+begin
+  MyA := 1;
+  MyB := 2;
+end;
+
+end."#;
+    let fixed = fix_source(source);
+    // Declaration renamed
+    assert!(fixed.contains("myA, myB: Integer;"), "ACTUAL:\n{fixed}");
+    // Usages renamed
+    assert!(fixed.contains("myA := 1;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("myB := 2;"), "ACTUAL:\n{fixed}");
+    // Old names gone
+    assert!(!fixed.contains("MyA"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("MyB"), "ACTUAL:\n{fixed}");
+}
+
+#[test]
+fn fix_preserves_clean_identifiers() {
+    // Already-conforming code should produce zero edits.
+    let source = r#"unit Clean;
+
+interface
+
+type
+  TMyClass = class(TObject)
+  public
+    procedure DoWork;
+  end;
+
+const
+  MY_CONST = 42;
+
+implementation
+
+procedure TMyClass.DoWork;
+var
+  myVar: Integer;
+begin
+  myVar := MY_CONST;
+end;
+
+end."#;
+    let config = "version = 1".parse::<Config>().unwrap();
+    let file = FileInfo::new(PathBuf::from("test.pas"));
+    let (_, count) = fix_file(&file, source.as_bytes(), &config).unwrap();
+    assert_eq!(count, 0, "Expected zero edits for already-clean code");
+}
+
 #[test]
 fn fix_no_changes_for_clean_file() {
     let source = r#"unit Clean;

@@ -1,1 +1,9 @@
 /target
+
+.claude/
+
+tests/fixtures/projects/TestProject1/__history/
+
+*.exe
+
+tests/fixtures/projects/TestProject1/TestProject1.dproj.local

@@ -48,13 +48,14 @@ pub fn parse_dproj(dproj_path: &Path) -> Result<Vec<FileInfo>, String> {
                             let file_type = file_path
                                 .extension()
                                 .and_then(|ext| ext.to_str())
-                                .and_then(FileType::from_extension)
-                                .unwrap_or(FileType::Pas);
+                                .and_then(FileType::from_extension);
 
-                            results.push(FileInfo {
-                                path: file_path,
-                                file_type,
-                            });
+                            if let Some(file_type) = file_type {
+                                results.push(FileInfo {
+                                    path: file_path,
+                                    file_type,
+                                });
+                            }
                         }
                     }
                 }
@@ -73,4 +74,43 @@ pub fn parse_dproj(dproj_path: &Path) -> Result<Vec<FileInfo>, String> {
 
     results.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(results)
+}
+
+/// Extract the `<ProjectVersion>` property from a `.dproj` file.
+///
+/// Returns `None` if the element is not found. This value maps to a
+/// BDS (RAD Studio) version for locating the correct IDE installation.
+pub fn parse_project_version(dproj_path: &Path) -> Result<Option<String>, String> {
+    let content = std::fs::read_to_string(dproj_path)
+        .map_err(|e| format!("Failed to read {}: {}", dproj_path.display(), e))?;
+
+    let mut reader = Reader::from_str(&content);
+    reader.config_mut().trim_text(true);
+
+    let mut in_project_version = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if e.local_name().as_ref() == b"ProjectVersion" {
+                    in_project_version = true;
+                }
+            }
+            Ok(Event::Text(e)) if in_project_version => {
+                let text = e.unescape().map_err(|err| {
+                    format!("Failed to unescape text in {}: {}", dproj_path.display(), err)
+                })?;
+                return Ok(Some(text.trim().to_string()));
+            }
+            Ok(Event::End(_)) if in_project_version => {
+                return Ok(None);
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(format!("XML parse error in {}: {}", dproj_path.display(), e));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }

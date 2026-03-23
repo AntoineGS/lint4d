@@ -359,12 +359,14 @@ fn branch_id(node: Node) -> Option<(usize, BranchSide)> {
 
 /// Check if `ancestor` is an ancestor of `descendant` (or equal).
 fn is_ancestor_of(ancestor: Node, descendant: Node) -> bool {
-    if ancestor.id() == descendant.id() {
-        return true;
+    let mut current = Some(descendant);
+    while let Some(n) = current {
+        if n.id() == ancestor.id() {
+            return true;
+        }
+        current = n.parent();
     }
-    let range = ancestor.byte_range();
-    let desc_range = descendant.byte_range();
-    range.start <= desc_range.start && desc_range.end <= range.end
+    false
 }
 
 // ─── field-not-freed rule ─────────────────────────────────────────────────────
@@ -677,7 +679,7 @@ fn check_method_reassigns(
 
                 // For 2nd+ assignments, only check for free BETWEEN the
                 // previous assignment and this one (not from block start).
-                let prev_end = byte_of_line(source, prev.creation.line + 1);
+                let prev_end = byte_of_line(source, prev.creation.end_line + 1);
                 let between_text = text_before_byte(source, prev_end, assign_start);
                 let has_free_between = text_frees_variable(&between_text, &creation.field_name);
 

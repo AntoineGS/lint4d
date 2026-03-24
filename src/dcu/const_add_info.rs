@@ -3,6 +3,20 @@
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::DcuError;
 
+// --- ConstAddInfo tag 0x01 flags ---
+/// cafInlinePointer: D2006+ inline pointer present.
+const CAF_INLINE_PTR: u32 = 0x0100_0000;
+/// cafUsedCl: D2009+ attribute class reference present.
+const CAF_USED_CL: u32 = 0x0080_0000;
+/// cafDeprecated: deprecated message present.
+const CAF_DEPRECATED: u32 = 0x01;
+/// cafAttributes: D_XE6+ attribute list present.
+const CAF_ATTRIBUTES: u32 = 0x8000_0000;
+/// cafInline: D2009+ inline data present.
+const CAF_INLINE: u32 = 0x0004_0000;
+/// cafBigVal: D2005+ big value pointer present.
+const CAF_BIG_VAL: u32 = 0x0008_0000;
+
 /// Skip a drConstAddInfo record in the declaration list context.
 /// Uses a tag-based sub-protocol; for D2009+ the stop marker is 0xFF.
 ///
@@ -149,36 +163,36 @@ fn skip_cai_tag_01(reader: &mut DcuReader) -> Result<(), DcuError> {
     let f = reader.read_uindex()?;
 
     // D2006+: inline pointer
-    if (f & 0x0100_0000) != 0 {
+    if (f & CAF_INLINE_PTR) != 0 {
         let _ip = reader.read_uindex()?;
     }
 
     // D2009+: hUsedCl (attribute class)
-    if (f & 0x0080_0000) != 0 {
+    if (f & CAF_USED_CL) != 0 {
         let _ip2 = reader.read_uindex()?;
     }
 
-    // D2009+: deprecated message (if F & 0x01)
-    if (f & 0x01) != 0 {
+    // D2009+: deprecated message (if F & cafDeprecated)
+    if (f & CAF_DEPRECATED) != 0 {
         // ReadNDXStrRef: reads a uindex (string reference)
         let _depr_msg = reader.read_uindex()?;
     }
 
-    // D_XE6+: attributes (if F & 0x80000000)
-    if (f & 0x8000_0000) != 0 {
+    // D_XE6+: attributes (if F & cafAttributes)
+    if (f & CAF_ATTRIBUTES) != 0 {
         let n = reader.read_uindex()?;
         for _ in 0..n {
             skip_attribute_record(reader)?;
         }
     }
 
-    // D2009+ inline check: cafInline = 0x40000 for D2009+
-    if (f & 0x0004_0000) != 0 {
+    // D2009+ inline check
+    if (f & CAF_INLINE) != 0 {
         skip_cai_inline_data(reader)?;
     }
 
-    // D2005+: cafBigVal = 0x80000 for D2009+
-    if (f & 0x0008_0000) != 0 {
+    // D2005+: big value pointer
+    if (f & CAF_BIG_VAL) != 0 {
         let _ip = reader.read_uindex()?;
     }
 

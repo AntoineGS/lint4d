@@ -348,6 +348,11 @@ fn read_type_p_decl(reader: &mut DcuReader) -> Result<Option<TypeInfo>, DcuError
     }))
 }
 
+/// Indicates an Inf field is present in TNameFDecl.
+const NF_INF: u32 = 0x40;
+/// Indicates a B2 field is present (D8+ LocFlagsX bit).
+const NF_B2: u32 = 0x80;
+
 /// Read TNameFDecl fields: F, F1, F4, optionally Inf and B2.
 struct NameFFields {
     pub _f: u32,
@@ -359,11 +364,11 @@ fn read_namef_fields(reader: &mut DcuReader, no_inf: bool) -> Result<NameFFields
     let f1 = reader.read_uindex()?; // D8+
     let _f4 = reader.read_uindex()?; // D2009+
 
-    if !no_inf && (f & 0x40) != 0 {
+    if !no_inf && (f & NF_INF) != 0 {
         let _inf = reader.read_u32()?;
     }
 
-    if (f1 & 0x80) != 0 {
+    if (f1 & NF_B2) != 0 {
         let _b2 = reader.read_uindex()?;
         // D8 exact also reads F3 if F & 0x08, but D13 is not D8.
     }

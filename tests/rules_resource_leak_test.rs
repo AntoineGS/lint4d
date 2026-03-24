@@ -1,7 +1,7 @@
 use lint4d::config::Config;
 use lint4d::dcu::{
-    DcuPlatform, DcuUnit, DcuVersion, FieldInfo, ProjectContext, TypeInfo, TypeKind, TypeRef,
-    Visibility,
+    DcuPlatform, DcuUnit, DcuVersion, FieldInfo, MethodInfo, MethodKind, ParamInfo, ParamModifier,
+    ProjectContext, TypeInfo, TypeKind, TypeRef, Visibility,
 };
 use lint4d::engine::{run_lint, run_lint_with_context, FileInfo};
 use lint4d::rules::RuleRegistry;
@@ -380,5 +380,59 @@ fn resource_leak_no_try_dcu_skips_true_interface() {
         matches.is_empty(),
         "DCU-confirmed interface types should not flag: {:?}",
         matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_flags_non_owner_constructor_args() {
+    let unit = DcuUnit {
+        name: "MyParsers".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![
+            TypeInfo {
+                name: "TParserConfig".to_string(),
+                kind: TypeKind::Class,
+                parent: Some(TypeRef::Resolved("TObject".to_string())),
+                fields: vec![],
+                methods: vec![],
+                interface_guid: None,
+            },
+            TypeInfo {
+                name: "TMyParser".to_string(),
+                kind: TypeKind::Class,
+                parent: Some(TypeRef::Resolved("TObject".to_string())),
+                fields: vec![],
+                methods: vec![MethodInfo {
+                    name: "Create".to_string(),
+                    kind: MethodKind::Constructor,
+                    params: vec![ParamInfo {
+                        name: "AConfig".to_string(),
+                        type_ref: TypeRef::Resolved("TParserConfig".to_string()),
+                        modifier: ParamModifier::ByValue,
+                    }],
+                    return_type: None,
+                }],
+                interface_guid: None,
+            },
+        ],
+    };
+    let project = ProjectContext::from_units(vec![unit]);
+
+    let source = b"unit test_owner;\nimplementation\nuses MyParsers;\nprocedure Foo;\nvar P: TMyParser;\nbegin\n  P := TMyParser.Create(SomeConfig);\n  P.Parse;\nend;\nend.";
+    let file = FileInfo::new(PathBuf::from("test.pas"));
+    let config = "version = 1".parse::<Config>().unwrap();
+    let registry = RuleRegistry::new();
+    let diagnostics = run_lint_with_context(
+        &file, source, &config, Some(&project), &registry,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        !matches.is_empty(),
+        "TMyParser.Create(SomeConfig) with non-owner param should flag leak"
     );
 }

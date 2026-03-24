@@ -113,6 +113,68 @@ pub fn text_references_variable(text: &str, var_name: &str) -> bool {
     false
 }
 
+/// DCU-enhanced owner detection: checks if the constructor's first parameter
+/// type descends from TComponent AND the call site passes a non-nil value.
+pub fn constructor_is_owner_managed(
+    rhs: Node,
+    source: &[u8],
+    class_name: Option<&str>,
+    project: &crate::dcu::ProjectContext,
+    uses: &[String],
+) -> bool {
+    use crate::dcu::TypeRef;
+
+    if rhs.kind() != "exprCall" {
+        return false;
+    }
+
+    if !call_has_non_nil_args(rhs, source) {
+        return false;
+    }
+
+    let Some(cn) = class_name else { return false };
+    let Some(ctor) = project.get_constructor(cn, uses) else {
+        // Constructor not found in DCU — conservatively treat as owner-managed
+        return true;
+    };
+    let Some(first_param) = ctor.params.first() else {
+        // No parameters — not owner-managed
+        return false;
+    };
+    match &first_param.type_ref {
+        TypeRef::Resolved(param_type) => {
+            // If we resolved the type but can't trace the full ancestry,
+            // assume NOT owner-managed: better to flag a potential leak
+            // (false positive) than to miss a real one (false negative).
+            project
+                .descends_from(param_type, "TComponent", uses)
+                .unwrap_or(false)
+        }
+        TypeRef::Unresolved(_) => true, // Can't resolve type at all -> conservative
+    }
+}
+
+/// AST-based check: does the exprCall have at least one non-nil argument?
+fn call_has_non_nil_args(call_node: Node, source: &[u8]) -> bool {
+    // Look for the args field on exprCall
+    if let Some(args) = call_node.child_by_field_name("args") {
+        let mut cursor = args.walk();
+        for child in args.children(&mut cursor) {
+            // Skip punctuation and whitespace nodes
+            match child.kind() {
+                "kOpen" | "kClose" | "kComma" | "(" | ")" | "," => continue,
+                _ => {}
+            }
+            let text = node_text(child, source);
+            let trimmed = text.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("nil") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check whether arbitrary text contains a free/destroy call for the variable.
 ///
 /// Similar to `statements_free_variable` but works on `&str` instead of a

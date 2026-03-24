@@ -4,9 +4,9 @@ use tree_sitter::{Node, Tree};
 
 use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
+use crate::rules::helpers;
 use crate::rules::helpers::{
-    constructor_has_owner_args, is_constructor_call, node_text, statements_free_variable,
-    text_references_variable,
+    is_constructor_call, node_text, statements_free_variable, text_references_variable,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
@@ -287,8 +287,16 @@ fn check_block_no_try(
             None => continue,
         };
 
-        // Skip owner-managed objects: constructor was called with arguments.
-        if constructor_has_owner_args(rhs_node, source) {
+        // Skip owner-managed objects: constructor's first param descends from
+        // TComponent and a non-nil argument was passed.
+        let ctor_class_for_owner = extract_constructor_class_name(rhs_node, source);
+        if helpers::constructor_is_owner_managed(
+            rhs_node,
+            source,
+            ctor_class_for_owner.as_deref(),
+            project,
+            uses,
+        ) {
             continue;
         }
 

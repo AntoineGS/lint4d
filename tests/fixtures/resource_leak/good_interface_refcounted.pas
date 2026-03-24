@@ -2,6 +2,9 @@ unit good_interface_refcounted;
 
 interface
 
+uses
+  MyServiceIntf;
+
 type
   IMyService = interface
     procedure DoWork;

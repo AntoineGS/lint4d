@@ -192,34 +192,33 @@ impl Rule for ResourceLeakNoTryRule {
         &self.meta
     }
 
+    fn requires_context(&self) -> bool {
+        true
+    }
+
     fn check(
+        &self,
+        _file: &FileInfo,
+        _tree: &Tree,
+        _source: &[u8],
+        _config: &crate::config::Config,
+        _ctx: &mut LintContext,
+    ) {
+        // Engine skips check() for rules where requires_context() == true.
+        // This method exists only to satisfy the trait.
+    }
+
+    fn check_with_context(
         &self,
         _file: &FileInfo,
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
-    ) {
-        let uses = extract_uses_clauses(tree.root_node(), source);
-        visit_blocks_no_try(tree.root_node(), source, None, &uses, ctx);
-    }
-
-    fn check_with_context(
-        &self,
-        file: &FileInfo,
-        tree: &Tree,
-        source: &[u8],
-        config: &crate::config::Config,
         project: &ProjectContext,
         ctx: &mut LintContext,
     ) {
-        if project.unit_count() == 0 {
-            // No DCU data loaded — fall back to heuristic-only path.
-            self.check(file, tree, source, config, ctx);
-            return;
-        }
         let uses = extract_uses_clauses(tree.root_node(), source);
-        visit_blocks_no_try(tree.root_node(), source, Some(project), &uses, ctx);
+        visit_blocks_no_try(tree.root_node(), source, project, &uses, ctx);
     }
 }
 
@@ -228,7 +227,7 @@ impl Rule for ResourceLeakNoTryRule {
 fn visit_blocks_no_try(
     node: Node,
     source: &[u8],
-    project: Option<&ProjectContext>,
+    project: &ProjectContext,
     uses: &[String],
     ctx: &mut LintContext,
 ) {
@@ -253,7 +252,7 @@ fn visit_blocks_no_try(
 fn check_block_no_try(
     block: Node,
     source: &[u8],
-    project: Option<&ProjectContext>,
+    project: &ProjectContext,
     uses: &[String],
     ctx: &mut LintContext,
 ) {
@@ -339,13 +338,12 @@ fn check_block_no_try(
 /// Collect the names of all local variables whose declared type is an
 /// interface type.
 ///
-/// When a `ProjectContext` is available, uses DCU metadata to definitively
-/// determine whether a type is an interface.  Falls back to the Delphi naming
-/// convention (`I` + uppercase) when no DCU data is present.
+/// Uses DCU metadata via `ProjectContext` to determine whether a type is an
+/// interface.
 fn collect_interface_vars(
     block: Node,
     source: &[u8],
-    project: Option<&ProjectContext>,
+    project: &ProjectContext,
     uses: &[String],
 ) -> HashSet<String> {
     let mut result = HashSet::new();
@@ -388,34 +386,9 @@ fn collect_interface_vars(
 
 /// Determine whether a type name refers to an interface type.
 ///
-/// Uses `ProjectContext` DCU metadata when available for a definitive answer.
-/// Falls back to the Delphi naming convention (`I` + uppercase letter) when
-/// the type is not found in any loaded DCU.
-fn is_interface_type(
-    type_name: &str,
-    project: Option<&ProjectContext>,
-    uses: &[String],
-) -> bool {
-    if let Some(proj) = project {
-        if let Some(is_intf) = proj.is_interface_type(type_name, uses) {
-            return is_intf;
-        }
-        // Type not found in any DCU — fall through to heuristic.
-    }
-    is_interface_type_by_name(type_name)
-}
-
-/// Heuristic: check whether a type name follows the Delphi interface naming
-/// convention (`I` + uppercase letter), excluding common non-interface types.
-fn is_interface_type_by_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'I' || !bytes[1].is_ascii_uppercase() {
-        return false;
-    }
-    !matches!(
-        name,
-        "Integer" | "Int8" | "Int16" | "Int32" | "Int64" | "IDispatch"
-    )
+/// Uses `ProjectContext` DCU metadata for a definitive answer.
+fn is_interface_type(type_name: &str, project: &ProjectContext, uses: &[String]) -> bool {
+    project.is_interface_type(type_name, uses).unwrap_or(false)
 }
 
 /// Extract the class name from a constructor call's RHS node.
@@ -442,31 +415,14 @@ const NON_REFCOUNTING_CLASSES: &[&str] = &["TNoRefCountObject"];
 /// Check whether the constructor's class is known to not support
 /// reference counting.
 ///
-/// When a `ProjectContext` is available, walks the class's parent chain
-/// via DCU metadata to check for `TNoRefCountObject` ancestry.  Falls
-/// back to a direct name match against the known list.
-fn is_non_refcounting_class(
-    class_name: &str,
-    project: Option<&ProjectContext>,
-    uses: &[String],
-) -> bool {
-    // Direct name match (works with or without DCU).
-    if NON_REFCOUNTING_CLASSES
-        .iter()
-        .any(|&c| c.eq_ignore_ascii_case(class_name))
-    {
-        return true;
-    }
-
-    // DCU ancestry check: does the class descend from a non-ref-counting base?
-    if let Some(proj) = project {
-        for &ancestor in NON_REFCOUNTING_CLASSES {
-            if let Some(true) = proj.descends_from(class_name, ancestor, uses) {
-                return true;
-            }
+/// Walks the class's parent chain via DCU metadata to check for
+/// `TNoRefCountObject` ancestry.
+fn is_non_refcounting_class(class_name: &str, project: &ProjectContext, uses: &[String]) -> bool {
+    for &ancestor in NON_REFCOUNTING_CLASSES {
+        if let Some(true) = project.descends_from(class_name, ancestor, uses) {
+            return true;
         }
     }
-
     false
 }
 

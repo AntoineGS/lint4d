@@ -1,6 +1,7 @@
 use lint4d::config::Config;
 use lint4d::dcu::{
-    DcuPlatform, DcuUnit, DcuVersion, ProjectContext, TypeInfo, TypeKind, TypeRef,
+    DcuPlatform, DcuUnit, DcuVersion, FieldInfo, ProjectContext, TypeInfo, TypeKind, TypeRef,
+    Visibility,
 };
 use lint4d::engine::{run_lint, run_lint_with_context, FileInfo};
 use lint4d::rules::RuleRegistry;
@@ -46,7 +47,8 @@ fn resource_leak_unprotected_passes_when_protected() {
 
 #[test]
 fn resource_leak_no_try_flags_missing_try_finally() {
-    let diagnostics = lint_fixture("tests/fixtures/resource_leak/bad_no_try.pas");
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/bad_no_try.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -61,7 +63,8 @@ fn resource_leak_no_try_flags_missing_try_finally() {
 
 #[test]
 fn resource_leak_no_try_skips_owned_objects() {
-    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_owned.pas");
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_owned.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -102,7 +105,8 @@ fn resource_leak_accepts_free_and_nil() {
 
 #[test]
 fn resource_leak_no_try_skips_constructor_field_assignments() {
-    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_constructor_field.pas");
+    let project = project_with_class_fields("TMyServer", &["FDatabase", "FAdapter", "FCache"]);
+    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_constructor_field.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -116,7 +120,8 @@ fn resource_leak_no_try_skips_constructor_field_assignments() {
 
 #[test]
 fn resource_leak_no_try_skips_factory_methods() {
-    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_factory_method.pas");
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_factory_method.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -130,7 +135,8 @@ fn resource_leak_no_try_skips_factory_methods() {
 
 #[test]
 fn resource_leak_no_try_skips_result_assignments() {
-    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_result_return.pas");
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_result_return.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -144,7 +150,8 @@ fn resource_leak_no_try_skips_result_assignments() {
 
 #[test]
 fn resource_leak_no_try_skips_try_except_with_free() {
-    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_try_except_raise.pas");
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_try_except_raise.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -158,7 +165,8 @@ fn resource_leak_no_try_skips_try_except_with_free() {
 
 #[test]
 fn resource_leak_no_try_skips_field_in_any_method() {
-    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_field_in_method.pas");
+    let project = project_with_class_fields("TMyClass", &["FConnection"]);
+    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_field_in_method.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -187,8 +195,25 @@ fn resource_leak_no_try_skips_interface_refcounted() {
 
 #[test]
 fn resource_leak_no_try_flags_no_refcount_object() {
-    let diagnostics =
-        lint_fixture("tests/fixtures/resource_leak/bad_no_refcount_object.pas");
+    let system_unit = DcuUnit {
+        name: "System".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![TypeInfo {
+            name: "TNoRefCountObject".to_string(),
+            kind: TypeKind::Class,
+            parent: Some(TypeRef::Resolved("TObject".to_string())),
+            fields: vec![],
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    let project = ProjectContext::from_units(vec![system_unit]);
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_no_refcount_object.pas",
+        &project,
+    );
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -226,6 +251,35 @@ fn lint_fixture_with_context(
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
     run_lint_with_context(&file, &source, &config, Some(project), &registry)
+}
+
+fn empty_project() -> ProjectContext {
+    ProjectContext::from_units(vec![])
+}
+
+fn project_with_class_fields(class_name: &str, fields: &[&str]) -> ProjectContext {
+    let unit = DcuUnit {
+        name: class_name.to_lowercase(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![TypeInfo {
+            name: class_name.to_string(),
+            kind: TypeKind::Class,
+            parent: Some(TypeRef::Resolved("TObject".to_string())),
+            fields: fields
+                .iter()
+                .map(|f| FieldInfo {
+                    name: f.to_string(),
+                    type_ref: TypeRef::Unresolved(0),
+                    visibility: Visibility::Private,
+                })
+                .collect(),
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    ProjectContext::from_units(vec![unit])
 }
 
 #[test]
@@ -280,7 +334,7 @@ fn resource_leak_no_try_dcu_flags_no_refcount_descendant() {
 fn resource_leak_no_try_dcu_skips_true_interface() {
     // Simulate a DCU confirming IMyService is an interface.
     let unit = DcuUnit {
-        name: "good_interface_refcounted".to_string(),
+        name: "MyServiceIntf".to_string(),
         version: DcuVersion::D13,
         platform: DcuPlatform::Win64,
         imported_units: vec![],

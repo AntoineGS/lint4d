@@ -74,8 +74,7 @@ fn project_context_get_constructor() {
 #[test]
 fn project_context_from_dcu_paths() {
     use std::path::PathBuf;
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dcu/d13_win64");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dcu/d13_win64/Win64/Debug");
     let ctx = ProjectContext::from_dcu_paths(&[path]).unwrap();
-    // Should have loaded at least the 2 fixture DCUs
-    assert!(ctx.unit_count() >= 2, "Expected at least 2 units, got {}", ctx.unit_count());
+    assert!(ctx.unit_count() >= 7, "Expected at least 7 units, got {}", ctx.unit_count());
 }

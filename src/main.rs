@@ -95,6 +95,11 @@ fn main() {
     }
 }
 
+fn exit_err(msg: &str, code: i32) -> ! {
+    eprintln!("lint4d: {}", msg);
+    std::process::exit(code);
+}
+
 fn real_main() {
     let cli = Cli::parse();
 
@@ -116,6 +121,30 @@ fn real_main() {
         return;
     }
 
+    let threshold = validate_cli(&cli);
+
+    // Discover config
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (config, _project_root) = match Config::discover(&cwd) {
+        Ok(result) => result,
+        Err(e) => exit_err(&format!("config error: {}", e), EXIT_ERROR),
+    };
+
+    let project_context = resolve_dcu_context(&cli, &config);
+    let files = discover_source_files(&cli, &config);
+
+    // --fix-fmt: run fix pipeline instead of lint pipeline
+    if cli.fix_fmt {
+        run_fix_fmt(&files, &config);
+        return;
+    }
+
+    run_lint_pipeline(&cli, &config, &cwd, files, project_context, threshold);
+}
+
+/// Validates CLI arguments and returns the parsed severity threshold.
+/// Exits with EXIT_ERROR if any argument is invalid.
+fn validate_cli(cli: &Cli) -> Severity {
     // Require at least one path (or --project)
     if cli.paths.is_empty() && cli.project.is_none() {
         let mut cmd = Cli::command();
@@ -127,19 +156,18 @@ fn real_main() {
     // Parse the fail-on threshold
     let threshold = match cli.fail_on.parse::<Severity>() {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("lint4d: invalid --fail-on value: {}", e);
-            process::exit(EXIT_ERROR);
-        }
+        Err(e) => exit_err(&format!("invalid --fail-on value: {}", e), EXIT_ERROR),
     };
 
     // Validate format
     if cli.format != "text" && cli.format != "json" {
-        eprintln!(
-            "lint4d: invalid --format value: '{}' (expected 'text' or 'json')",
-            cli.format
+        exit_err(
+            &format!(
+                "invalid --format value: '{}' (expected 'text' or 'json')",
+                cli.format
+            ),
+            EXIT_ERROR,
         );
-        process::exit(EXIT_ERROR);
     }
 
     // --fix-fmt: validate mutual exclusivity
@@ -155,24 +183,18 @@ fn real_main() {
             conflicts.push("--fail-on");
         }
         if !conflicts.is_empty() {
-            eprintln!(
-                "lint4d: --fix-fmt cannot be combined with {}",
-                conflicts.join(", ")
+            exit_err(
+                &format!("--fix-fmt cannot be combined with {}", conflicts.join(", ")),
+                EXIT_ERROR,
             );
-            process::exit(EXIT_ERROR);
         }
     }
 
-    // Discover config
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (config, _project_root) = match Config::discover(&cwd) {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("lint4d: config error: {}", e);
-            process::exit(EXIT_ERROR);
-        }
-    };
+    threshold
+}
 
+/// Resolves DCU paths and builds a ProjectContext if any DCU directories are found.
+fn resolve_dcu_context(cli: &Cli, config: &Config) -> Option<lint4d::dcu::ProjectContext> {
     // MSBuild auto-discovery: only attempt if --project is provided
     let discovered_paths =
         if cli.dcu_paths.is_empty() && config.dcu_paths().is_empty() && cli.project.is_some() {
@@ -201,7 +223,7 @@ fn real_main() {
     let dcu_dirs =
         lint4d::discovery::resolve_dcu_dirs(&cli.dcu_paths, config.dcu_paths(), discovered_paths);
 
-    let project_context = if !dcu_dirs.is_empty() {
+    if !dcu_dirs.is_empty() {
         match lint4d::dcu::ProjectContext::from_dcu_paths(&dcu_dirs) {
             Ok(ctx) => Some(ctx),
             Err(e) => {
@@ -211,33 +233,34 @@ fn real_main() {
         }
     } else {
         None
-    };
+    }
+}
 
-    // Build file list: --project uses dproj parser, otherwise glob discovery
-    let files = if let Some(ref project_path) = cli.project {
+/// Discovers source files to lint, either from a .dproj file or via glob discovery.
+/// Exits with EXIT_ERROR on failure.
+fn discover_source_files(cli: &Cli, config: &Config) -> Vec<FileInfo> {
+    if let Some(ref project_path) = cli.project {
         match parse_dproj(project_path) {
             Ok(f) => f,
-            Err(e) => {
-                eprintln!("lint4d: project file error: {}", e);
-                process::exit(EXIT_ERROR);
-            }
+            Err(e) => exit_err(&format!("project file error: {}", e), EXIT_ERROR),
         }
     } else {
         match discover_files(&cli.paths, &config.exclude) {
             Ok(f) => f,
-            Err(e) => {
-                eprintln!("lint4d: file discovery error: {}", e);
-                process::exit(EXIT_ERROR);
-            }
+            Err(e) => exit_err(&format!("file discovery error: {}", e), EXIT_ERROR),
         }
-    };
-
-    // --fix-fmt: run fix pipeline instead of lint pipeline
-    if cli.fix_fmt {
-        run_fix_fmt(&files, &config);
-        return;
     }
+}
 
+/// Runs the parallel lint pipeline: lints files, applies baseline, formats output, exits.
+fn run_lint_pipeline(
+    cli: &Cli,
+    config: &Config,
+    cwd: &Path,
+    files: Vec<FileInfo>,
+    project_context: Option<lint4d::dcu::ProjectContext>,
+    threshold: Severity,
+) {
     if files.is_empty() {
         // No Delphi files found -- not an error, just nothing to do
         if cli.format == "json" {
@@ -267,7 +290,7 @@ fn real_main() {
         .filter_map(|file| {
             let source = fs::read(&file.path).ok()?;
             let diagnostics =
-                run_lint_with_context(file, &source, &config, project_context.as_ref(), &registry);
+                run_lint_with_context(file, &source, config, project_context.as_ref(), &registry);
             Some((file.path.to_string_lossy().to_string(), source, diagnostics))
         })
         .collect();
@@ -277,12 +300,12 @@ fn real_main() {
 
     // --generate-baseline: collect all diagnostics, write baseline, and exit
     if cli.generate_baseline {
-        run_generate_baseline(&cwd, &file_results);
+        run_generate_baseline(cwd, &file_results);
         return;
     }
 
     // Load baseline if it exists
-    let baseline = load_baseline(&cwd);
+    let baseline = load_baseline(cwd);
 
     // Filter diagnostics against baseline
     if let Some(ref bl) = baseline {
@@ -401,8 +424,7 @@ fn run_generate_baseline(
     let baseline_path = cwd.join(BASELINE_FILENAME);
     let json = baseline.to_json();
     if let Err(e) = fs::write(&baseline_path, &json) {
-        eprintln!("lint4d: failed to write baseline: {}", e);
-        process::exit(EXIT_ERROR);
+        exit_err(&format!("failed to write baseline: {}", e), EXIT_ERROR);
     }
 
     eprintln!(
@@ -473,8 +495,7 @@ exclude = ["**/test/**", "**/tests/**"]
 "#;
 
     if let Err(e) = fs::write(&config_path, default_config) {
-        eprintln!("lint4d: failed to write .lint4d.toml: {}", e);
-        process::exit(EXIT_ERROR);
+        exit_err(&format!("failed to write .lint4d.toml: {}", e), EXIT_ERROR);
     }
 
     println!("Created .lint4d.toml");

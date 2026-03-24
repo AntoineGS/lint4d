@@ -168,32 +168,6 @@ pub fn ast_references_variable(node: Node, source: &[u8], var_name: &str) -> boo
     false
 }
 
-/// Check whether a source text references a variable name as a standalone word.
-pub fn text_references_variable(text: &str, var_name: &str) -> bool {
-    let lower = text.to_lowercase();
-    let var_lower = var_name.to_lowercase();
-    let var_bytes = var_lower.as_bytes();
-    let text_bytes = lower.as_bytes();
-    let len = var_bytes.len();
-
-    let mut i = 0;
-    while i + len <= text_bytes.len() {
-        if &text_bytes[i..i + len] == var_bytes {
-            let preceded_by_ident =
-                i > 0 && (text_bytes[i - 1].is_ascii_alphanumeric() || text_bytes[i - 1] == b'_');
-            let followed_by_ident = i + len < text_bytes.len()
-                && (text_bytes[i + len].is_ascii_alphanumeric() || text_bytes[i + len] == b'_');
-
-            if !preceded_by_ident && !followed_by_ident {
-                return true;
-            }
-        }
-        i += 1;
-    }
-
-    false
-}
-
 /// DCU-enhanced owner detection: checks if the constructor's first parameter
 /// type descends from TComponent AND the call site passes a non-nil value.
 pub fn constructor_is_owner_managed(
@@ -256,19 +230,3 @@ fn call_has_non_nil_args(call_node: Node, source: &[u8]) -> bool {
     false
 }
 
-/// Check whether arbitrary text contains a free/destroy call for the variable.
-///
-/// Similar to `statements_free_variable` but works on `&str` instead of a
-/// tree-sitter `Node`.
-pub fn text_frees_variable(text: &str, var_name: &str) -> bool {
-    let lower = text.to_lowercase();
-    let var_lower = var_name.to_lowercase();
-    let dot_free = format!("{}.free", var_lower);
-    let dot_destroy = format!("{}.destroy", var_lower);
-    if lower.contains(&dot_free) || lower.contains(&dot_destroy) {
-        return true;
-    }
-    let free_and_nil = format!("freeandnil({})", var_lower);
-    let free_and_nil_sp = format!("freeandnil( {}", var_lower);
-    lower.contains(&free_and_nil) || lower.contains(&free_and_nil_sp)
-}

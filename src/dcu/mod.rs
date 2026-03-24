@@ -193,7 +193,11 @@ impl ProjectContext {
                 self.units.lock().unwrap().insert(key, unit);
             }
             Err(e) => {
-                eprintln!("lint4d: warning: skipping {}: {}", path.display(), e);
+                let wrapped = DcuError::InUnit {
+                    unit: key.clone(),
+                    source: Box::new(e),
+                };
+                eprintln!("lint4d: warning: skipping {}: {}", path.display(), wrapped);
             }
         }
     }

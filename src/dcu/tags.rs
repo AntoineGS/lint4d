@@ -7,6 +7,8 @@ pub enum DcuError {
     UnknownTag { tag: u8, offset: usize },
     UnresolvedTypeRef { index: u32 },
     Io(std::io::Error),
+    /// Wraps an inner error with the unit name being parsed.
+    InUnit { unit: String, source: Box<DcuError> },
 }
 
 impl fmt::Display for DcuError {
@@ -23,6 +25,7 @@ impl fmt::Display for DcuError {
                 write!(f, "unresolved type reference: index {index}")
             }
             Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::InUnit { unit, source } => write!(f, "in unit '{}': {}", unit, source),
         }
     }
 }

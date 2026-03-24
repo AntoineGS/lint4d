@@ -5,7 +5,17 @@ pub use context::{Diagnostic, FileInfo, FileType, Severity};
 
 use crate::config::{Config, RuleSeverityOverride};
 use crate::rules::{LintContext, RuleCategory, RuleRegistry};
+use std::cell::RefCell;
 use tree_sitter::Parser;
+
+thread_local! {
+    static PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        let language = tree_sitter_pascal::LANGUAGE;
+        p.set_language(&language.into()).expect("failed to set pascal language");
+        p
+    });
+}
 
 /// Parse Delphi source bytes and collect ERROR/MISSING nodes as diagnostics.
 ///
@@ -15,14 +25,11 @@ pub fn parse_file(
     _info: &FileInfo,
     source: &[u8],
 ) -> Result<(tree_sitter::Tree, Vec<Diagnostic>), String> {
-    let mut parser = Parser::new();
-    let language = tree_sitter_pascal::LANGUAGE;
-    parser
-        .set_language(&language.into())
-        .map_err(|e| format!("failed to set language: {e}"))?;
-
-    let tree = parser
-        .parse(source, None)
+    let tree = PARSER
+        .with(|parser| {
+            let mut parser = parser.borrow_mut();
+            parser.parse(source, None)
+        })
         .ok_or_else(|| "parser returned no tree".to_string())?;
 
     let diagnostics = collect_parse_errors(&tree, source);

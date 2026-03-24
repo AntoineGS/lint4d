@@ -64,6 +64,38 @@ fn fix_tag(raw: u8) -> u8 {
     }
 }
 
+/// Try to skip a type definition tag. Returns Ok(true) if handled, Ok(false) if not recognized.
+fn try_skip_type_def(tag: u8, reader: &mut DcuReader) -> Result<bool, DcuError> {
+    match tag {
+        DR_ENUM_DEF => skip_enum_def(reader)?,
+        DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF
+        | DR_WCHAR_RANGE_DEF | DR_WIDE_RANGE_DEF => skip_range_def(reader)?,
+        DR_FLOAT_DEF => skip_float_def(reader)?,
+        DR_PTR_DEF | DR_DYN_ARRAY_DEF => skip_ptr_def(reader)?,
+        DR_SET_DEF => skip_set_def(reader)?,
+        DR_ARRAY_DEF => skip_array_def(reader)?,
+        DR_PROC_TYPE_DEF => skip_proc_type_def(reader)?,
+        DR_REC_DEF => skip_rec_def(reader)?,
+        DR_INTERFACE_DEF => skip_interface_def(reader)?,
+        DR_OBJ_VMT_DEF => skip_obj_vmt_def(reader)?,
+        DR_OBJ_DEF => skip_obj_def(reader)?,
+        DR_VOID | DR_TEMPLATE_ARG_DEF => { read_type_def_header(reader)?; }
+        DR_META_CLASS_DEF => skip_meta_class_def(reader)?,
+        DR_VARIANT_DEF => { read_type_def_header(reader)?; let _b = reader.read_byte()?; }
+        DR_SHORT_STR_DEF => { read_type_def_header(reader)?; let _cp = reader.read_uindex()?; }
+        DR_STRING_DEF | DR_WIDE_STR_DEF => { read_type_def_header(reader)?; let _cp = reader.read_uindex()?; }
+        DR_TEXT_DEF | DR_FILE_DEF => { read_type_def_header(reader)?; let _h = reader.read_uindex()?; }
+        DR_TEMPLATE_CALL => {
+            read_type_def_header(reader)?;
+            let _h_dt = reader.read_uindex()?;
+            let cnt = reader.read_uindex()?;
+            for _ in 0..cnt { let _v = reader.read_uindex()?; }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// Walk the main declaration list, extracting type declarations.
 ///
 /// Reads tags until a stop/structural tag or an unrecognized tag.
@@ -227,33 +259,7 @@ fn read_decl_list_into(
                 let _nf = read_namef_fields(reader, true)?;
                 let _src = reader.read_uindex()?;
             }
-            // Type definition tags (Rec entries). Skip to continue parsing.
-            DR_ENUM_DEF => {
-                skip_enum_def(reader)?;
-            }
-            DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF | DR_WCHAR_RANGE_DEF
-            | DR_WIDE_RANGE_DEF => {
-                skip_range_def(reader)?;
-            }
-            DR_FLOAT_DEF => {
-                skip_float_def(reader)?;
-            }
-            DR_PTR_DEF => {
-                skip_ptr_def(reader)?;
-            }
-            DR_DYN_ARRAY_DEF => {
-                // TDynArrayDef inherits from TPtrDef: type_def_header + hRefDT
-                skip_ptr_def(reader)?;
-            }
-            DR_SET_DEF => {
-                skip_set_def(reader)?;
-            }
-            DR_ARRAY_DEF => {
-                skip_array_def(reader)?;
-            }
-            DR_PROC_TYPE_DEF => {
-                skip_proc_type_def(reader)?;
-            }
+            // Class definition: parse and associate with the last type declaration.
             DR_CLASS_DEF => {
                 let members = parse_class_def(reader)?;
                 // Associate parsed members with the most recently declared type.
@@ -263,57 +269,8 @@ fn read_decl_list_into(
                     last_type.methods = members.1;
                 }
             }
-            DR_REC_DEF => {
-                skip_rec_def(reader)?;
-            }
-            DR_INTERFACE_DEF => {
-                skip_interface_def(reader)?;
-            }
-            DR_OBJ_VMT_DEF => {
-                skip_obj_vmt_def(reader)?;
-            }
-            DR_OBJ_DEF => {
-                skip_obj_def(reader)?;
-            }
-            DR_VOID => {
-                // TVoidDef: just the type_def_header
-                read_type_def_header(reader)?;
-            }
-            DR_META_CLASS_DEF => {
-                skip_meta_class_def(reader)?;
-            }
-            DR_VARIANT_DEF => {
-                // TVariantDef: type_def_header + 1 byte
-                read_type_def_header(reader)?;
-                let _b = reader.read_byte()?;
-            }
-            DR_SHORT_STR_DEF => {
-                // TShortStrDef: type_def_header + uindex
-                read_type_def_header(reader)?;
-                let _cp = reader.read_uindex()?;
-            }
-            DR_STRING_DEF | DR_WIDE_STR_DEF => {
-                // TStringDef: type_def_header + uindex
-                read_type_def_header(reader)?;
-                let _cp = reader.read_uindex()?;
-            }
-            DR_TEXT_DEF | DR_FILE_DEF => {
-                // TTextDef/TFileDef: type_def_header + uindex
-                read_type_def_header(reader)?;
-                let _h_base = reader.read_uindex()?;
-            }
-            DR_TEMPLATE_ARG_DEF => {
-                read_type_def_header(reader)?;
-            }
-            // DR_TEMPLATE_CALL: complex, but try to skip
-            DR_TEMPLATE_CALL => {
-                read_type_def_header(reader)?;
-                let _h_dt = reader.read_uindex()?;
-                let cnt = reader.read_uindex()?;
-                for _ in 0..cnt {
-                    let _v = reader.read_uindex()?;
-                }
-            }
+            // Try shared type-def handler for all other type definition tags.
+            _ if try_skip_type_def(fixed, reader)? => {}
             // drSysProc: D8+
             DR_SYS_PROC => {
                 let _name = reader.read_name()?;
@@ -1348,80 +1305,9 @@ fn parse_class_def(reader: &mut DcuReader) -> Result<(Vec<FieldInfo>, Vec<Method
                 Ok(()) => {}
                 Err(_) => break,
             },
-            // Type definition tags that can appear inside class bodies.
-            DR_ENUM_DEF => {
-                skip_enum_def(reader)?;
-            }
-            DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF | DR_WCHAR_RANGE_DEF
-            | DR_WIDE_RANGE_DEF => {
-                skip_range_def(reader)?;
-            }
-            DR_FLOAT_DEF => {
-                skip_float_def(reader)?;
-            }
-            DR_PTR_DEF => {
-                skip_ptr_def(reader)?;
-            }
-            DR_DYN_ARRAY_DEF => {
-                skip_ptr_def(reader)?;
-            }
-            DR_SET_DEF => {
-                skip_set_def(reader)?;
-            }
-            DR_ARRAY_DEF => {
-                skip_array_def(reader)?;
-            }
-            DR_PROC_TYPE_DEF => {
-                skip_proc_type_def(reader)?;
-            }
+            // Nested class def: parse but discard.
             DR_CLASS_DEF => {
-                // Nested class def: parse but discard.
                 let _inner = parse_class_def(reader)?;
-            }
-            DR_REC_DEF => {
-                skip_rec_def(reader)?;
-            }
-            DR_INTERFACE_DEF => {
-                skip_interface_def(reader)?;
-            }
-            DR_OBJ_VMT_DEF => {
-                skip_obj_vmt_def(reader)?;
-            }
-            DR_OBJ_DEF => {
-                skip_obj_def(reader)?;
-            }
-            DR_VOID => {
-                read_type_def_header(reader)?;
-            }
-            DR_META_CLASS_DEF => {
-                skip_meta_class_def(reader)?;
-            }
-            DR_VARIANT_DEF => {
-                read_type_def_header(reader)?;
-                let _b = reader.read_byte()?;
-            }
-            DR_SHORT_STR_DEF => {
-                read_type_def_header(reader)?;
-                let _cp = reader.read_uindex()?;
-            }
-            DR_STRING_DEF | DR_WIDE_STR_DEF => {
-                read_type_def_header(reader)?;
-                let _cp = reader.read_uindex()?;
-            }
-            DR_TEXT_DEF | DR_FILE_DEF => {
-                read_type_def_header(reader)?;
-                let _h_base = reader.read_uindex()?;
-            }
-            DR_TEMPLATE_ARG_DEF => {
-                read_type_def_header(reader)?;
-            }
-            DR_TEMPLATE_CALL => {
-                read_type_def_header(reader)?;
-                let _h_dt = reader.read_uindex()?;
-                let cnt = reader.read_uindex()?;
-                for _ in 0..cnt {
-                    let _v = reader.read_uindex()?;
-                }
             }
             // Call kind tags: no data.
             0x81..=0x84 => {
@@ -1464,8 +1350,14 @@ fn parse_class_def(reader: &mut DcuReader) -> Result<(Vec<FieldInfo>, Vec<Method
             DR_STOP | DR_STOP1 | DR_STOP_A | DR_CBLOCK | DR_FIXUP => {
                 break;
             }
-            // Unknown tag: stop gracefully.
-            _ => {}
+            // Try shared type-def handler; unknown tag stops gracefully.
+            _ => {
+                match try_skip_type_def(fixed, reader) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => break,
+                }
+            }
         }
         tag = reader.read_byte()?;
     }

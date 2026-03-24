@@ -2,7 +2,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
-    constructor_has_owner_args, is_constructor_call, node_text, text_frees_variable,
+    ast_frees_variable, constructor_has_owner_args, is_constructor_call, node_text,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 use std::collections::{HashMap, HashSet};
@@ -115,9 +115,8 @@ fn analyze_class(class: &ClassInfo, def_procs: &[DefProcInfo], source: &[u8]) ->
     for proc_info in &class_procs {
         if proc_info.is_destructor {
             if let Some(block) = proc_info.block {
-                let block_text = node_text(block, source);
                 for field in &class.fields {
-                    if text_frees_variable(&block_text, field) {
+                    if ast_frees_variable(block, source, field) {
                         destructor_frees.insert(field.to_lowercase());
                     }
                 }
@@ -304,17 +303,30 @@ fn parse_field_creation(node: Node, source: &[u8], fields: &[String]) -> Option<
     })
 }
 
-/// Extract source text from the start of a block up to (but not including) a
-/// given byte offset.
-fn text_before_byte(source: &[u8], from_byte: usize, to_byte: usize) -> String {
-    if from_byte >= to_byte {
-        return String::new();
+/// Check if any descendant of `node` within [start_byte..end_byte) frees the variable.
+fn ast_frees_variable_in_range(
+    node: Node,
+    source: &[u8],
+    var_name: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> bool {
+    // Skip nodes entirely outside the range
+    if node.end_byte() <= start_byte || node.start_byte() >= end_byte {
+        return false;
     }
-    let end = to_byte.min(source.len());
-    let start = from_byte.min(end);
-    std::str::from_utf8(&source[start..end])
-        .unwrap_or("")
-        .to_string()
+    // If node is fully inside the range, check it recursively
+    if node.start_byte() >= start_byte && node.end_byte() <= end_byte {
+        return ast_frees_variable(node, source, var_name);
+    }
+    // Partially overlapping — recurse into children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if ast_frees_variable_in_range(child, source, var_name, start_byte, end_byte) {
+            return true;
+        }
+    }
+    false
 }
 
 // ─── Branch detection ────────────────────────────────────────────────────────
@@ -581,8 +593,7 @@ fn check_constructor_reassigns(
             // This is a second (or later) assignment — check for preceding free
             let block_start = block.start_byte();
             let assign_start = byte_of_line(source, creation.line);
-            let preceding = text_before_byte(source, block_start, assign_start);
-            if !text_frees_variable(&preceding, &creation.field_name) {
+            if !ast_frees_variable_in_range(block, source, &creation.field_name, block_start, assign_start) {
                 ctx.report(Diagnostic {
                     rule_id: "field-reassign-leak".to_string(),
                     severity: Severity::Warning,
@@ -639,8 +650,9 @@ fn check_method_reassigns(
 
             let block_start = block.start_byte();
             let assign_start = byte_of_line(source, creation.line);
-            let preceding = text_before_byte(source, block_start, assign_start);
-            let has_preceding_free = text_frees_variable(&preceding, &creation.field_name);
+            let has_preceding_free = ast_frees_variable_in_range(
+                block, source, &creation.field_name, block_start, assign_start,
+            );
 
             if i == 0 {
                 // First assignment in this method.
@@ -680,8 +692,9 @@ fn check_method_reassigns(
                 // For 2nd+ assignments, only check for free BETWEEN the
                 // previous assignment and this one (not from block start).
                 let prev_end = byte_of_line(source, prev.creation.end_line + 1);
-                let between_text = text_before_byte(source, prev_end, assign_start);
-                let has_free_between = text_frees_variable(&between_text, &creation.field_name);
+                let has_free_between = ast_frees_variable_in_range(
+                    block, source, &creation.field_name, prev_end, assign_start,
+                );
 
                 if !mutually_exclusive && !has_free_between {
                     ctx.report(Diagnostic {

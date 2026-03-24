@@ -66,25 +66,84 @@ pub fn constructor_has_owner_args(rhs: Node, source: &[u8]) -> bool {
 }
 
 /// Check whether a `statements` node contains a free/destroy call for the variable.
+///
+/// Delegates to `ast_frees_variable` for AST-based detection that ignores
+/// matches inside comments and string literals.
 pub fn statements_free_variable(statements: Node, source: &[u8], var_name: &str) -> bool {
-    let text = node_text(statements, source).to_lowercase();
-    let var_lower = var_name.to_lowercase();
+    ast_frees_variable(statements, source, var_name)
+}
 
-    // Check for `variable.Free` / `variable.Free()` / `variable.Destroy` / `variable.Destroy()`
-    let dot_free = format!("{}.free", var_lower);
-    let dot_destroy = format!("{}.destroy", var_lower);
-    if text.contains(&dot_free) || text.contains(&dot_destroy) {
-        return true;
+/// AST-based check: does any descendant of `node` free the given variable?
+///
+/// Looks for:
+/// - `variable.Free` / `variable.Destroy` (exprDot, optionally wrapped in exprCall)
+/// - `FreeAndNil(variable)` (exprCall with identifier entity)
+///
+/// Unlike the text-based functions, this ignores matches inside comments and
+/// string literals (tree-sitter excludes them from the AST).
+pub fn ast_frees_variable(node: Node, source: &[u8], var_name: &str) -> bool {
+    match node.kind() {
+        "exprCall" => {
+            if let Some(entity) = node.child_by_field_name("entity") {
+                // Check for FreeAndNil(variable)
+                let entity_text = node_text(entity, source);
+                if entity_text.eq_ignore_ascii_case("freeandnil") {
+                    if let Some(args) = node.child_by_field_name("args") {
+                        let mut cursor = args.walk();
+                        for child in args.children(&mut cursor) {
+                            if child.kind() == "identifier" {
+                                let arg_text = node_text(child, source);
+                                if arg_text.eq_ignore_ascii_case(var_name) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Check for variable.Free() / variable.Destroy()
+                if is_free_or_destroy_call(entity, source, var_name) {
+                    return true;
+                }
+            }
+        }
+        "exprDot" => {
+            // Check for variable.Free / variable.Destroy (statement form without parens)
+            if is_free_or_destroy_call(node, source, var_name) {
+                return true;
+            }
+        }
+        _ => {}
     }
 
-    // Check for `FreeAndNil(variable)` — tolerate optional whitespace inside parens
-    let free_and_nil = format!("freeandnil({})", var_lower);
-    let free_and_nil_sp = format!("freeandnil( {}", var_lower);
-    if text.contains(&free_and_nil) || text.contains(&free_and_nil_sp) {
-        return true;
+    // Recurse into children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if ast_frees_variable(child, source, var_name) {
+            return true;
+        }
     }
 
     false
+}
+
+/// Check if an exprDot node is `variable.Free` or `variable.Destroy`.
+fn is_free_or_destroy_call(dot_node: Node, source: &[u8], var_name: &str) -> bool {
+    if dot_node.kind() != "exprDot" {
+        return false;
+    }
+    let lhs = match dot_node.child_by_field_name("lhs") {
+        Some(l) => l,
+        None => return false,
+    };
+    let rhs = match dot_node.child_by_field_name("rhs") {
+        Some(r) => r,
+        None => return false,
+    };
+    let lhs_text = node_text(lhs, source);
+    let rhs_text = node_text(rhs, source);
+
+    lhs_text.eq_ignore_ascii_case(var_name)
+        && (rhs_text.eq_ignore_ascii_case("free") || rhs_text.eq_ignore_ascii_case("destroy"))
 }
 
 /// Check whether a source text references a variable name as a standalone word.

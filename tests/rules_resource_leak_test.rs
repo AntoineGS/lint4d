@@ -436,3 +436,37 @@ fn resource_leak_no_try_flags_non_owner_constructor_args() {
         "TMyParser.Create(SomeConfig) with non-owner param should flag leak"
     );
 }
+
+#[test]
+fn resource_leak_no_try_flags_free_in_comment() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_free_in_comment.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(), 1,
+        "Free in a comment should NOT count as cleanup: {:?}", matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_flags_free_in_string() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_free_in_string.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(), 1,
+        "Free in a string literal should NOT count as cleanup: {:?}", matches
+    );
+}

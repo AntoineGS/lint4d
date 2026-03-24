@@ -7,6 +7,18 @@ use crate::rules::helpers::{
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 use std::collections::{HashMap, HashSet};
 
+/// Return the first `identifier` child that isn't a comment/extra node.
+fn first_identifier(node: Node) -> Option<Node> {
+    let count = node.child_count();
+    for i in 0..count {
+        let child = node.child(i)?;
+        if child.kind() == "identifier" && !child.is_extra() {
+            return Some(child);
+        }
+    }
+    None
+}
+
 // ─── Shared data structures ───────────────────────────────────────────────────
 
 /// Information about a class collected from the interface section.
@@ -158,11 +170,10 @@ fn collect_classes_recursive(node: Node, source: &[u8], out: &mut Vec<ClassInfo>
 
 /// Parse a `declType` node into a `ClassInfo` if it is a class declaration.
 fn parse_decl_type(node: Node, source: &[u8]) -> Option<ClassInfo> {
-    // First child should be the class name identifier.
-    let name_node = node.child(0)?;
-    if name_node.kind() != "identifier" {
-        return None;
-    }
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => first_identifier(node)?,
+    };
     let name = node_text(name_node, source);
 
     // Find the `declClass` child.
@@ -184,11 +195,8 @@ fn collect_fields(decl_class: Node, source: &[u8]) -> Vec<String> {
             let mut section_cursor = section.walk();
             for item in section.children(&mut section_cursor) {
                 if item.kind() == "declField" {
-                    // First child of declField is the identifier
-                    if let Some(id_node) = item.child(0) {
-                        if id_node.kind() == "identifier" {
-                            fields.push(node_text(id_node, source));
-                        }
+                    if let Some(id_node) = first_identifier(item) {
+                        fields.push(node_text(id_node, source));
                     }
                 }
             }

@@ -10,6 +10,18 @@ use crate::rules::helpers::{
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
+/// Return the first `identifier` child that isn't a comment/extra node.
+fn first_identifier(node: Node) -> Option<Node> {
+    let count = node.child_count();
+    for i in 0..count {
+        let child = node.child(i)?;
+        if child.kind() == "identifier" && !child.is_extra() {
+            return Some(child);
+        }
+    }
+    None
+}
+
 pub struct ResourceLeakUnprotectedRule {
     meta: RuleMeta,
 }
@@ -664,10 +676,10 @@ fn collect_ast_class_fields_recursive(
 
 /// Parse a `declType` node: if it declares a class, return (class_name, field_names).
 fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<String>)> {
-    let name_node = node.child(0)?;
-    if name_node.kind() != "identifier" {
-        return None;
-    }
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => first_identifier(node)?,
+    };
     let name = node_text(name_node, source);
 
     let mut cursor = node.walk();
@@ -682,10 +694,8 @@ fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<String>)
             let mut section_cursor = section.walk();
             for item in section.children(&mut section_cursor) {
                 if item.kind() == "declField" {
-                    if let Some(id_node) = item.child(0) {
-                        if id_node.kind() == "identifier" {
-                            fields.push(node_text(id_node, source));
-                        }
+                    if let Some(id_node) = first_identifier(item) {
+                        fields.push(node_text(id_node, source));
                     }
                 }
             }
@@ -710,10 +720,8 @@ fn collect_ast_interface_types_recursive(node: Node, source: &[u8], out: &mut Ha
             if type_node.kind() == "declIntf" {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     out.insert(node_text(name_node, source));
-                } else if let Some(first) = node.child(0) {
-                    if first.kind() == "identifier" {
-                        out.insert(node_text(first, source));
-                    }
+                } else if let Some(id) = first_identifier(node) {
+                    out.insert(node_text(id, source));
                 }
             }
         }

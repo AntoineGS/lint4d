@@ -1,0 +1,13 @@
+# Ignore all build output
+Win64/
+# Un-ignore intermediate directories so git traverses into them
+!Win64/
+!Win64/Debug/
+# Ignore everything in Debug, then allow only .dcu files
+Win64/Debug/*
+!Win64/Debug/*.dcu
+# Other Delphi IDE artifacts
+*.dproj.local
+__history/
+*.identcache
+*.res

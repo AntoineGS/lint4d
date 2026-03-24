@@ -38,12 +38,15 @@ fn unknown_project_version_returns_none() {
 
 #[test]
 fn rsvars_path_construction() {
-    use std::path::PathBuf;
     use lint4d::discovery::bds::rsvars_bat_path;
+    use std::path::PathBuf;
 
     let bds_root = PathBuf::from("C:/Program Files (x86)/Embarcadero/Studio/23.0");
     let rsvars = rsvars_bat_path(&bds_root);
-    assert_eq!(rsvars, PathBuf::from("C:/Program Files (x86)/Embarcadero/Studio/23.0/bin/rsvars.bat"));
+    assert_eq!(
+        rsvars,
+        PathBuf::from("C:/Program Files (x86)/Embarcadero/Studio/23.0/bin/rsvars.bat")
+    );
 }
 
 #[test]

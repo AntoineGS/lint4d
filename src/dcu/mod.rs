@@ -227,16 +227,20 @@ impl ProjectContext {
     }
 
     pub fn is_class_type(&self, name: &str, uses: &[String]) -> Option<bool> {
-        self.resolve_type(name, uses).map(|t| t.kind == TypeKind::Class)
+        self.resolve_type(name, uses)
+            .map(|t| t.kind == TypeKind::Class)
     }
 
     pub fn is_interface_type(&self, name: &str, uses: &[String]) -> Option<bool> {
-        self.resolve_type(name, uses).map(|t| t.kind == TypeKind::Interface)
+        self.resolve_type(name, uses)
+            .map(|t| t.kind == TypeKind::Interface)
     }
 
     pub fn get_constructor(&self, type_name: &str, uses: &[String]) -> Option<MethodInfo> {
         let ty = self.resolve_type(type_name, uses)?;
-        ty.methods.into_iter().find(|m| m.kind == MethodKind::Constructor)
+        ty.methods
+            .into_iter()
+            .find(|m| m.kind == MethodKind::Constructor)
     }
 
     /// Check whether `class_name` descends from `ancestor_name` by walking

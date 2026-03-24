@@ -119,7 +119,11 @@ pub fn collect_class_fields(class_node: Node, source: &[u8], fields: &mut HashMa
 }
 
 /// Collect all identifier names from a `declField` node.
-pub fn collect_decl_field_names(decl_field: Node, source: &[u8], map: &mut HashMap<String, String>) {
+pub fn collect_decl_field_names(
+    decl_field: Node,
+    source: &[u8],
+    map: &mut HashMap<String, String>,
+) {
     let count = decl_field.child_count();
     for i in 0..count {
         let child = match decl_field.child(i) {

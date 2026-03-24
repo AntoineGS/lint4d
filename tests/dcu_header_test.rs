@@ -1,6 +1,6 @@
 use lint4d::dcu::header::parse_magic;
-use lint4d::dcu::{DcuPlatform, DcuVersion};
 use lint4d::dcu::tags::DcuError;
+use lint4d::dcu::{DcuPlatform, DcuVersion};
 
 #[test]
 fn parse_magic_d13_win64() {

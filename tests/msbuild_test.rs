@@ -15,11 +15,19 @@ fn parses_key_value_lines() {
     let base_dir = PathBuf::from("C:\\MyProject");
     let result = parse_msbuild_output(output, &base_dir);
 
-    assert!(result.paths.contains(&PathBuf::from("C:\\MyProject\\Win64\\Debug")));
+    assert!(result
+        .paths
+        .contains(&PathBuf::from("C:\\MyProject\\Win64\\Debug")));
     assert!(result.paths.contains(&PathBuf::from("C:\\MyProject\\lib")));
     assert!(result.paths.contains(&PathBuf::from("C:\\Shared\\units")));
-    assert!(result.paths.iter().any(|p| p.to_string_lossy().contains("lib\\Win64\\release")));
-    assert!(result.paths.iter().any(|p| p.to_string_lossy().contains("lib\\Win64\\debug")));
+    assert!(result
+        .paths
+        .iter()
+        .any(|p| p.to_string_lossy().contains("lib\\Win64\\release")));
+    assert!(result
+        .paths
+        .iter()
+        .any(|p| p.to_string_lossy().contains("lib\\Win64\\debug")));
     assert_eq!(result.platform.as_deref(), Some("Win64"));
     assert_eq!(result.config.as_deref(), Some("Debug"));
 }
@@ -45,14 +53,21 @@ fn resolves_relative_paths_against_base_dir() {
     let output = "DCU_OUTPUT=Win64\\Debug\n";
     let base_dir = PathBuf::from("C:\\MyProject");
     let result = parse_msbuild_output(output, &base_dir);
-    assert_eq!(result.paths[0], PathBuf::from("C:\\MyProject\\Win64\\Debug"));
+    assert_eq!(
+        result.paths[0],
+        PathBuf::from("C:\\MyProject\\Win64\\Debug")
+    );
 }
 
 #[test]
 fn deduplicates_paths() {
     let output = "DCU_OUTPUT=C:\\path\\one\nUNIT_SEARCH=C:\\path\\one;C:\\path\\two\n";
     let result = parse_msbuild_output(output, &PathBuf::from("."));
-    let count = result.paths.iter().filter(|p| **p == PathBuf::from("C:\\path\\one")).count();
+    let count = result
+        .paths
+        .iter()
+        .filter(|p| **p == PathBuf::from("C:\\path\\one"))
+        .count();
     assert_eq!(count, 1);
 }
 

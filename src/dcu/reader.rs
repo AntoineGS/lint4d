@@ -50,14 +50,18 @@ impl<'a> DcuReader<'a> {
 
     pub fn peek_byte(&self) -> Result<u8, DcuError> {
         if self.pos >= self.data.len() {
-            return Err(DcuError::UnexpectedEof { context: "peek_byte" });
+            return Err(DcuError::UnexpectedEof {
+                context: "peek_byte",
+            });
         }
         Ok(self.data[self.pos])
     }
 
     pub fn read_byte(&mut self) -> Result<u8, DcuError> {
         if self.pos >= self.data.len() {
-            return Err(DcuError::UnexpectedEof { context: "read_byte" });
+            return Err(DcuError::UnexpectedEof {
+                context: "read_byte",
+            });
         }
         let b = self.data[self.pos];
         self.pos += 1;
@@ -66,7 +70,9 @@ impl<'a> DcuReader<'a> {
 
     pub fn read_word(&mut self) -> Result<u16, DcuError> {
         if self.pos + 2 > self.data.len() {
-            return Err(DcuError::UnexpectedEof { context: "read_word" });
+            return Err(DcuError::UnexpectedEof {
+                context: "read_word",
+            });
         }
         let val = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
@@ -75,7 +81,9 @@ impl<'a> DcuReader<'a> {
 
     pub fn read_u32(&mut self) -> Result<u32, DcuError> {
         if self.pos + 4 > self.data.len() {
-            return Err(DcuError::UnexpectedEof { context: "read_u32" });
+            return Err(DcuError::UnexpectedEof {
+                context: "read_u32",
+            });
         }
         let val = u32::from_le_bytes([
             self.data[self.pos],
@@ -139,7 +147,9 @@ impl<'a> DcuReader<'a> {
             return Ok(String::new());
         }
         if self.pos + len > self.data.len() {
-            return Err(DcuError::UnexpectedEof { context: "read_name" });
+            return Err(DcuError::UnexpectedEof {
+                context: "read_name",
+            });
         }
         let bytes = &self.data[self.pos..self.pos + len];
         self.pos += len;

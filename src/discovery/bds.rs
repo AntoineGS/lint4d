@@ -9,16 +9,44 @@ pub struct BdsInfo {
 /// Known ProjectVersion → BDS version mappings.
 /// Order matters: exact matches first, then ranges checked by prefix.
 const VERSION_TABLE: &[(&str, BdsInfo)] = &[
-    ("19.5", BdsInfo { bds_version: "23.0", product_name: "Delphi 12 Athens" }),
-    ("19.4", BdsInfo { bds_version: "22.0", product_name: "Delphi 11 Alexandria" }),
-    ("19.3", BdsInfo { bds_version: "21.0", product_name: "Delphi 10.4 Sydney" }),
-    ("18.8", BdsInfo { bds_version: "20.0", product_name: "Delphi 10.3 Rio" }),
+    (
+        "19.5",
+        BdsInfo {
+            bds_version: "23.0",
+            product_name: "Delphi 12 Athens",
+        },
+    ),
+    (
+        "19.4",
+        BdsInfo {
+            bds_version: "22.0",
+            product_name: "Delphi 11 Alexandria",
+        },
+    ),
+    (
+        "19.3",
+        BdsInfo {
+            bds_version: "21.0",
+            product_name: "Delphi 10.4 Sydney",
+        },
+    ),
+    (
+        "18.8",
+        BdsInfo {
+            bds_version: "20.0",
+            product_name: "Delphi 10.3 Rio",
+        },
+    ),
 ];
 
 /// Range fallbacks: major version prefix → BDS version.
-const VERSION_RANGE_TABLE: &[(&str, BdsInfo)] = &[
-    ("18.", BdsInfo { bds_version: "19.0", product_name: "Delphi 10.2 Tokyo" }),
-];
+const VERSION_RANGE_TABLE: &[(&str, BdsInfo)] = &[(
+    "18.",
+    BdsInfo {
+        bds_version: "19.0",
+        product_name: "Delphi 10.2 Tokyo",
+    },
+)];
 
 /// Map a dproj `<ProjectVersion>` value to BDS installation info.
 ///
@@ -91,16 +119,17 @@ pub fn find_any_bds_root() -> Option<PathBuf> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let bds_key = hkcu.open_subkey("Software\\Embarcadero\\BDS").ok()?;
 
-    let mut versions: Vec<String> = bds_key
-        .enum_keys()
-        .filter_map(|k| k.ok())
-        .collect();
+    let mut versions: Vec<String> = bds_key.enum_keys().filter_map(|k| k.ok()).collect();
     // Sort descending so highest version is first.
     versions.sort_by(|a, b| b.cmp(a));
 
     for ver in &versions {
-        let Ok(sub) = bds_key.open_subkey(ver) else { continue };
-        let Ok(root_dir) = sub.get_value::<String, _>("RootDir") else { continue };
+        let Ok(sub) = bds_key.open_subkey(ver) else {
+            continue;
+        };
+        let Ok(root_dir) = sub.get_value::<String, _>("RootDir") else {
+            continue;
+        };
         let root = PathBuf::from(&root_dir);
         if rsvars_bat_path(&root).is_file() {
             return Some(root);
@@ -117,7 +146,10 @@ pub fn find_any_bds_root() -> Option<PathBuf> {
 /// Scan common installation directories for a BDS version.
 fn find_bds_root_from_filesystem(bds_version: &str) -> Option<PathBuf> {
     let candidates = [
-        format!("C:\\Program Files (x86)\\Embarcadero\\Studio\\{}", bds_version),
+        format!(
+            "C:\\Program Files (x86)\\Embarcadero\\Studio\\{}",
+            bds_version
+        ),
         format!("C:\\Program Files\\Embarcadero\\Studio\\{}", bds_version),
     ];
     for candidate in &candidates {

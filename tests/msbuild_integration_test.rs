@@ -12,7 +12,10 @@ use std::path::PathBuf;
 fn finds_bds_root_from_registry() {
     // This test only passes on machines with RAD Studio installed.
     let root = bds::find_any_bds_root();
-    assert!(root.is_some(), "Expected to find a BDS installation in the registry");
+    assert!(
+        root.is_some(),
+        "Expected to find a BDS installation in the registry"
+    );
     let root = root.unwrap();
     assert!(bds::rsvars_bat_path(&root).is_file());
 }

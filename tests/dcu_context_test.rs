@@ -1,5 +1,5 @@
-use lint4d::dcu::{DcuUnit, DcuVersion, DcuPlatform, TypeInfo, TypeKind, MethodInfo, MethodKind};
 use lint4d::dcu::ProjectContext;
+use lint4d::dcu::{DcuPlatform, DcuUnit, DcuVersion, MethodInfo, MethodKind, TypeInfo, TypeKind};
 
 fn make_test_unit() -> DcuUnit {
     DcuUnit {
@@ -13,14 +13,12 @@ fn make_test_unit() -> DcuUnit {
                 kind: TypeKind::Class,
                 parent: None,
                 fields: vec![],
-                methods: vec![
-                    MethodInfo {
-                        name: "Create".to_string(),
-                        kind: MethodKind::Constructor,
-                        params: vec![],
-                        return_type: None,
-                    },
-                ],
+                methods: vec![MethodInfo {
+                    name: "Create".to_string(),
+                    kind: MethodKind::Constructor,
+                    params: vec![],
+                    return_type: None,
+                }],
                 interface_guid: None,
             },
             TypeInfo {
@@ -74,7 +72,12 @@ fn project_context_get_constructor() {
 #[test]
 fn project_context_from_dcu_paths() {
     use std::path::PathBuf;
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dcu/d13_win64/Win64/Debug");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dcu/d13_win64/Win64/Debug");
     let ctx = ProjectContext::from_dcu_paths(&[path]).unwrap();
-    assert!(ctx.unit_count() >= 7, "Expected at least 7 units, got {}", ctx.unit_count());
+    assert!(
+        ctx.unit_count() >= 7,
+        "Expected at least 7 units, got {}",
+        ctx.unit_count()
+    );
 }

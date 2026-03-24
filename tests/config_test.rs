@@ -96,7 +96,9 @@ fn config_parses_dcu_paths() {
         version = 1
         [lint4d]
         dcu_paths = ["lib/Win64/Debug", "C:/Delphi/lib"]
-    "#.parse().unwrap();
+    "#
+    .parse()
+    .unwrap();
     assert_eq!(config.dcu_paths(), &["lib/Win64/Debug", "C:/Delphi/lib"]);
 }
 
@@ -112,7 +114,9 @@ fn config_parses_platform() {
         version = 1
         [lint4d]
         platform = "Win64"
-    "#.parse().unwrap();
+    "#
+    .parse()
+    .unwrap();
     assert_eq!(config.platform(), Some("Win64"));
 }
 
@@ -128,7 +132,9 @@ fn config_parses_build_config() {
         version = 1
         [lint4d]
         build_config = "Release"
-    "#.parse().unwrap();
+    "#
+    .parse()
+    .unwrap();
     assert_eq!(config.build_config(), Some("Release"));
 }
 
@@ -138,6 +144,8 @@ fn config_parses_bds_path() {
         version = 1
         [lint4d]
         bds_path = "C:/Embarcadero/Studio/23.0"
-    "#.parse().unwrap();
+    "#
+    .parse()
+    .unwrap();
     assert_eq!(config.bds_path(), Some("C:/Embarcadero/Studio/23.0"));
 }

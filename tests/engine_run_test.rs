@@ -152,9 +152,9 @@ fn engine_filters_suppressed_diagnostics() {
 fn local_variable_naming_flags_pascal_case_in_camel_mode() {
     let source = std::fs::read("tests/fixtures/naming/bad_local_variable_camel.pas").unwrap();
     let file = FileInfo::new(PathBuf::from("Test.pas"));
-    let config =
-        "version = 1\n[rules.naming]\nlocal_variable_style = \"camelCase\"".parse::<Config>()
-            .unwrap();
+    let config = "version = 1\n[rules.naming]\nlocal_variable_style = \"camelCase\""
+        .parse::<Config>()
+        .unwrap();
     let diagnostics = run_lint(&file, &source, &config);
     let hits: Vec<_> = diagnostics
         .iter()
@@ -172,9 +172,9 @@ fn local_variable_naming_flags_pascal_case_in_camel_mode() {
 fn local_variable_naming_passes_camel_case() {
     let source = std::fs::read("tests/fixtures/naming/good_local_variable_camel.pas").unwrap();
     let file = FileInfo::new(PathBuf::from("Test.pas"));
-    let config =
-        "version = 1\n[rules.naming]\nlocal_variable_style = \"camelCase\"".parse::<Config>()
-            .unwrap();
+    let config = "version = 1\n[rules.naming]\nlocal_variable_style = \"camelCase\""
+        .parse::<Config>()
+        .unwrap();
     let diagnostics = run_lint(&file, &source, &config);
     let hits: Vec<_> = diagnostics
         .iter()
@@ -191,9 +191,9 @@ fn local_variable_naming_passes_camel_case() {
 fn local_variable_naming_flags_camel_case_in_pascal_mode() {
     let source = std::fs::read("tests/fixtures/naming/bad_local_variable_pascal.pas").unwrap();
     let file = FileInfo::new(PathBuf::from("Test.pas"));
-    let config =
-        "version = 1\n[rules.naming]\nlocal_variable_style = \"PascalCase\"".parse::<Config>()
-            .unwrap();
+    let config = "version = 1\n[rules.naming]\nlocal_variable_style = \"PascalCase\""
+        .parse::<Config>()
+        .unwrap();
     let diagnostics = run_lint(&file, &source, &config);
     let hits: Vec<_> = diagnostics
         .iter()
@@ -211,9 +211,9 @@ fn local_variable_naming_flags_camel_case_in_pascal_mode() {
 fn local_variable_naming_passes_pascal_case() {
     let source = std::fs::read("tests/fixtures/naming/good_local_variable_pascal.pas").unwrap();
     let file = FileInfo::new(PathBuf::from("Test.pas"));
-    let config =
-        "version = 1\n[rules.naming]\nlocal_variable_style = \"PascalCase\"".parse::<Config>()
-            .unwrap();
+    let config = "version = 1\n[rules.naming]\nlocal_variable_style = \"PascalCase\""
+        .parse::<Config>()
+        .unwrap();
     let diagnostics = run_lint(&file, &source, &config);
     let hits: Vec<_> = diagnostics
         .iter()

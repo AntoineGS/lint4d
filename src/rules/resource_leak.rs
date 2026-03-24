@@ -218,7 +218,14 @@ impl Rule for ResourceLeakNoTryRule {
     ) {
         let uses = extract_uses_clauses(tree.root_node(), source);
         let ast_intf_types = collect_ast_interface_types(tree.root_node(), source);
-        visit_blocks_no_try(tree.root_node(), source, project, &uses, &ast_intf_types, ctx);
+        visit_blocks_no_try(
+            tree.root_node(),
+            source,
+            project,
+            &uses,
+            &ast_intf_types,
+            ctx,
+        );
     }
 }
 
@@ -252,7 +259,15 @@ fn visit_blocks_no_try(
                 .cloned()
                 .unwrap_or_else(|| project.get_field_names(&proc_info.class_name, uses))
         };
-        check_block_no_try(block, source, project, uses, ast_intf_types, &field_names, ctx);
+        check_block_no_try(
+            block,
+            source,
+            project,
+            uses,
+            ast_intf_types,
+            &field_names,
+            ctx,
+        );
     }
 
     // 2. Check top-level blocks not inside any defProc
@@ -304,7 +319,10 @@ fn check_block_no_try(
 
         // Skip field assignments: fields are owned by the class and freed
         // in the destructor.
-        if field_names.iter().any(|f| f.eq_ignore_ascii_case(&var_name)) {
+        if field_names
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(&var_name))
+        {
             continue;
         }
 

@@ -229,4 +229,3 @@ fn call_has_non_nil_args(call_node: Node, source: &[u8]) -> bool {
     }
     false
 }
-

@@ -98,7 +98,11 @@ pub fn parse_project_version(dproj_path: &Path) -> Result<Option<String>, String
             }
             Ok(Event::Text(e)) if in_project_version => {
                 let text = e.unescape().map_err(|err| {
-                    format!("Failed to unescape text in {}: {}", dproj_path.display(), err)
+                    format!(
+                        "Failed to unescape text in {}: {}",
+                        dproj_path.display(),
+                        err
+                    )
                 })?;
                 return Ok(Some(text.trim().to_string()));
             }
@@ -107,7 +111,11 @@ pub fn parse_project_version(dproj_path: &Path) -> Result<Option<String>, String
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                return Err(format!("XML parse error in {}: {}", dproj_path.display(), e));
+                return Err(format!(
+                    "XML parse error in {}: {}",
+                    dproj_path.display(),
+                    e
+                ));
             }
             _ => {}
         }

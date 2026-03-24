@@ -193,8 +193,7 @@ fn field_not_freed_flags_once_for_multiple_methods() {
 
 #[test]
 fn field_not_freed_no_false_positive_on_good_field_in_method() {
-    let diagnostics =
-        lint_fixture("tests/fixtures/resource_leak/good_field_in_method.pas");
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_field_in_method.pas");
     let hits: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "field-not-freed")
@@ -210,8 +209,7 @@ fn field_not_freed_no_false_positive_on_good_field_in_method() {
 
 #[test]
 fn field_reassign_leak_no_false_positive_first_assignment_in_method() {
-    let diagnostics =
-        lint_fixture("tests/fixtures/resource_leak/good_field_in_method.pas");
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/good_field_in_method.pas");
     let hits: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "field-reassign-leak")
@@ -272,8 +270,7 @@ fn field_reassign_leak_skips_mutually_exclusive_branches() {
 
 #[test]
 fn mainform_fobj_no_reassign_leak() {
-    let diagnostics =
-        lint_fixture("tests/fixtures/projects/TestProject1/MainForm.pas");
+    let diagnostics = lint_fixture("tests/fixtures/projects/TestProject1/MainForm.pas");
     let hits: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "field-reassign-leak" && d.message.contains("FObj"))
@@ -287,8 +284,7 @@ fn mainform_fobj_no_reassign_leak() {
 
 #[test]
 fn mainform_fobj_field_not_freed() {
-    let diagnostics =
-        lint_fixture("tests/fixtures/projects/TestProject1/MainForm.pas");
+    let diagnostics = lint_fixture("tests/fixtures/projects/TestProject1/MainForm.pas");
     let hits: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "field-not-freed" && d.message.contains("FObj"))

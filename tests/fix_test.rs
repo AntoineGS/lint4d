@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use lint4d::config::Config;
-use lint4d::engine::{parse_file, run_lint, FileInfo};
 use lint4d::engine::suppress::parse_suppressions;
+use lint4d::engine::{parse_file, run_lint, FileInfo};
 use lint4d::fix::{build_rename_map, fix_file};
 
 fn build_map_from_source(source: &str) -> lint4d::fix::RenameMap {
@@ -122,10 +122,7 @@ end."#;
         .local
         .iter()
         .find(|((_, _, name), _)| name == "mycounter");
-    assert_eq!(
-        local_entry.map(|(_, v)| v.as_str()),
-        Some("myCounter"),
-    );
+    assert_eq!(local_entry.map(|(_, v)| v.as_str()), Some("myCounter"),);
     // Single-char 'x' should be exempt
     let x_entry = map.local.iter().find(|((_, _, name), _)| name == "x");
     assert!(x_entry.is_none());
@@ -335,9 +332,15 @@ end."#;
     // Declaration renamed
     assert!(fixed.contains("IPrintable = interface"), "ACTUAL:\n{fixed}");
     // Usage in class inheritance list renamed
-    assert!(fixed.contains("TDoc = class(TObject, IPrintable)"), "ACTUAL:\n{fixed}");
+    assert!(
+        fixed.contains("TDoc = class(TObject, IPrintable)"),
+        "ACTUAL:\n{fixed}"
+    );
     // Old bare name gone (without 'I' prefix)
-    assert!(!fixed.contains("  Printable = interface"), "ACTUAL:\n{fixed}");
+    assert!(
+        !fixed.contains("  Printable = interface"),
+        "ACTUAL:\n{fixed}"
+    );
 }
 
 #[test]
@@ -367,13 +370,19 @@ end;
 end."#;
     let fixed = fix_source(source);
     // Type renamed
-    assert!(fixed.contains("TMyClass = class(TObject)"), "ACTUAL:\n{fixed}");
+    assert!(
+        fixed.contains("TMyClass = class(TObject)"),
+        "ACTUAL:\n{fixed}"
+    );
     // Constant renamed
     assert!(fixed.contains("MAX_RETRIES = 3;"), "ACTUAL:\n{fixed}");
     // Local variable renamed
     assert!(fixed.contains("retryCount: Integer;"), "ACTUAL:\n{fixed}");
     // Usage of renamed local variable
-    assert!(fixed.contains("retryCount := MAX_RETRIES;"), "ACTUAL:\n{fixed}");
+    assert!(
+        fixed.contains("retryCount := MAX_RETRIES;"),
+        "ACTUAL:\n{fixed}"
+    );
     // Old names gone
     assert!(!fixed.contains("maxRetries"), "ACTUAL:\n{fixed}");
     assert!(!fixed.contains("RetryCount"), "ACTUAL:\n{fixed}");
@@ -433,7 +442,10 @@ implementation
 end."#;
     let fixed = fix_source(source);
     // Suppressed type declaration must not be renamed
-    assert!(fixed.contains("MyClass = class(TObject)"), "ACTUAL:\n{fixed}");
+    assert!(
+        fixed.contains("MyClass = class(TObject)"),
+        "ACTUAL:\n{fixed}"
+    );
     // Suppressed constant must not be renamed
     assert!(fixed.contains("maxSize = 100;"), "ACTUAL:\n{fixed}");
 }

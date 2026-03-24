@@ -23,7 +23,6 @@ pub fn format_json_output(file_diagnostics: &[(String, Vec<Diagnostic>)]) -> Str
         .collect();
 
     let output = JsonOutput { version: 1, files };
-    serde_json::to_string_pretty(&output).unwrap_or_else(|e| {
-        format!("{{\"error\": \"failed to serialize output: {}\"}}", e)
-    })
+    serde_json::to_string_pretty(&output)
+        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize output: {}\"}}", e))
 }

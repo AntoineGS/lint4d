@@ -139,7 +139,11 @@ pub fn discover_dcu_paths_via_msbuild(
     let dproj_abs = match std::fs::canonicalize(dproj_path) {
         Ok(p) => strip_unc_prefix(p),
         Err(e) => {
-            eprintln!("lint4d: warning: cannot resolve dproj path {}: {}", dproj_path.display(), e);
+            eprintln!(
+                "lint4d: warning: cannot resolve dproj path {}: {}",
+                dproj_path.display(),
+                e
+            );
             return Vec::new();
         }
     };
@@ -157,12 +161,8 @@ pub fn discover_dcu_paths_via_msbuild(
         return Vec::new();
     }
 
-    let cmd_str = build_msbuild_command(
-        rsvars_path,
-        &temp_path,
-        platform_override,
-        config_override,
-    );
+    let cmd_str =
+        build_msbuild_command(rsvars_path, &temp_path, platform_override, config_override);
 
     // Invoke MSBuild with 15-second timeout.
     // Use raw_arg to avoid Windows double-quoting the command string,
@@ -197,7 +197,11 @@ pub fn discover_dcu_paths_via_msbuild(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("lint4d: warning: MSBuild exited with status {}: {}", output.status, stderr.trim());
+        eprintln!(
+            "lint4d: warning: MSBuild exited with status {}: {}",
+            output.status,
+            stderr.trim()
+        );
         return Vec::new();
     }
 
@@ -251,7 +255,11 @@ fn wait_with_timeout(
                     std::io::Read::read_to_end(&mut s, &mut buf).unwrap_or(0);
                     buf
                 });
-                return Ok(std::process::Output { status, stdout, stderr });
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if start.elapsed() > timeout {

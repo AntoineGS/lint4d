@@ -200,7 +200,10 @@ fn collect_fields(decl_class: Node, source: &[u8]) -> Vec<String> {
 /// Extract class name, method name, and flags from a `defProc` node.
 ///
 /// Returns `(class_name, method_name, is_constructor, is_destructor)`.
-pub(crate) fn parse_def_proc(def_proc: Node, source: &[u8]) -> Option<(String, String, bool, bool)> {
+pub(crate) fn parse_def_proc(
+    def_proc: Node,
+    source: &[u8],
+) -> Option<(String, String, bool, bool)> {
     let mut cursor = def_proc.walk();
     let decl_proc = def_proc
         .children(&mut cursor)
@@ -401,8 +404,7 @@ impl FieldNotFreedRule {
                 name: "Field Not Freed",
                 category: RuleCategory::ResourceManagement,
                 default_severity: Severity::Warning,
-                description:
-                    "Detects object fields assigned via constructor calls that are never \
+                description: "Detects object fields assigned via constructor calls that are never \
                      freed in the destructor.",
             },
         }
@@ -559,13 +561,7 @@ fn check_field_reassign_leak(root: Node, source: &[u8], ctx: &mut LintContext) {
                 let creations = collect_field_creations(block, source, &class.fields);
                 check_constructor_reassigns(&creations, block, source, ctx);
             } else if !proc_info.is_destructor {
-                check_method_reassigns(
-                    block,
-                    source,
-                    &class.fields,
-                    &constructor_fields,
-                    ctx,
-                );
+                check_method_reassigns(block, source, &class.fields, &constructor_fields, ctx);
             }
         }
     }
@@ -593,7 +589,13 @@ fn check_constructor_reassigns(
             // This is a second (or later) assignment — check for preceding free
             let block_start = block.start_byte();
             let assign_start = byte_of_line(source, creation.line);
-            if !ast_frees_variable_in_range(block, source, &creation.field_name, block_start, assign_start) {
+            if !ast_frees_variable_in_range(
+                block,
+                source,
+                &creation.field_name,
+                block_start,
+                assign_start,
+            ) {
                 ctx.report(Diagnostic {
                     rule_id: "field-reassign-leak".to_string(),
                     severity: Severity::Warning,
@@ -630,8 +632,7 @@ fn check_method_reassigns(
 ) {
     let creations = collect_field_creations_with_nodes(block, source, fields);
 
-    let mut by_field: HashMap<String, Vec<&FieldCreationWithNode>> =
-        HashMap::new();
+    let mut by_field: HashMap<String, Vec<&FieldCreationWithNode>> = HashMap::new();
     for c in &creations {
         by_field
             .entry(c.creation.field_name.to_lowercase())
@@ -651,7 +652,11 @@ fn check_method_reassigns(
             let block_start = block.start_byte();
             let assign_start = byte_of_line(source, creation.line);
             let has_preceding_free = ast_frees_variable_in_range(
-                block, source, &creation.field_name, block_start, assign_start,
+                block,
+                source,
+                &creation.field_name,
+                block_start,
+                assign_start,
             );
 
             if i == 0 {
@@ -693,7 +698,11 @@ fn check_method_reassigns(
                 // previous assignment and this one (not from block start).
                 let prev_end = byte_of_line(source, prev.creation.end_line + 1);
                 let has_free_between = ast_frees_variable_in_range(
-                    block, source, &creation.field_name, prev_end, assign_start,
+                    block,
+                    source,
+                    &creation.field_name,
+                    prev_end,
+                    assign_start,
                 );
 
                 if !mutually_exclusive && !has_free_between {

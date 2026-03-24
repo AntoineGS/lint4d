@@ -48,7 +48,8 @@ fn resource_leak_unprotected_passes_when_protected() {
 #[test]
 fn resource_leak_no_try_flags_missing_try_finally() {
     let project = empty_project();
-    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/bad_no_try.pas", &project);
+    let diagnostics =
+        lint_fixture_with_context("tests/fixtures/resource_leak/bad_no_try.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -64,7 +65,8 @@ fn resource_leak_no_try_flags_missing_try_finally() {
 #[test]
 fn resource_leak_no_try_skips_owned_objects() {
     let project = empty_project();
-    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_owned.pas", &project);
+    let diagnostics =
+        lint_fixture_with_context("tests/fixtures/resource_leak/good_owned.pas", &project);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -106,7 +108,10 @@ fn resource_leak_accepts_free_and_nil() {
 #[test]
 fn resource_leak_no_try_skips_constructor_field_assignments() {
     let project = project_with_class_fields("TMyServer", &["FDatabase", "FAdapter", "FCache"]);
-    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_constructor_field.pas", &project);
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_constructor_field.pas",
+        &project,
+    );
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -121,7 +126,10 @@ fn resource_leak_no_try_skips_constructor_field_assignments() {
 #[test]
 fn resource_leak_no_try_skips_factory_methods() {
     let project = empty_project();
-    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_factory_method.pas", &project);
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_factory_method.pas",
+        &project,
+    );
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -136,7 +144,10 @@ fn resource_leak_no_try_skips_factory_methods() {
 #[test]
 fn resource_leak_no_try_skips_result_assignments() {
     let project = empty_project();
-    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_result_return.pas", &project);
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_result_return.pas",
+        &project,
+    );
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -151,7 +162,10 @@ fn resource_leak_no_try_skips_result_assignments() {
 #[test]
 fn resource_leak_no_try_skips_try_except_with_free() {
     let project = empty_project();
-    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_try_except_raise.pas", &project);
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_try_except_raise.pas",
+        &project,
+    );
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -166,7 +180,10 @@ fn resource_leak_no_try_skips_try_except_with_free() {
 #[test]
 fn resource_leak_no_try_skips_field_in_any_method() {
     let project = project_with_class_fields("TMyClass", &["FConnection"]);
-    let diagnostics = lint_fixture_with_context("tests/fixtures/resource_leak/good_field_in_method.pas", &project);
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_field_in_method.pas",
+        &project,
+    );
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -427,9 +444,7 @@ fn resource_leak_no_try_flags_non_owner_constructor_args() {
     let file = FileInfo::new(PathBuf::from("test.pas"));
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
-    let diagnostics = run_lint_with_context(
-        &file, source, &config, Some(&project), &registry,
-    );
+    let diagnostics = run_lint_with_context(&file, source, &config, Some(&project), &registry);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -452,8 +467,10 @@ fn resource_leak_no_try_flags_free_in_comment() {
         .filter(|d| d.rule_id == "resource-leak-no-try")
         .collect();
     assert_eq!(
-        matches.len(), 1,
-        "Free in a comment should NOT count as cleanup: {:?}", matches
+        matches.len(),
+        1,
+        "Free in a comment should NOT count as cleanup: {:?}",
+        matches
     );
 }
 
@@ -469,7 +486,9 @@ fn resource_leak_no_try_flags_free_in_string() {
         .filter(|d| d.rule_id == "resource-leak-no-try")
         .collect();
     assert_eq!(
-        matches.len(), 1,
-        "Free in a string literal should NOT count as cleanup: {:?}", matches
+        matches.len(),
+        1,
+        "Free in a string literal should NOT count as cleanup: {:?}",
+        matches
     );
 }

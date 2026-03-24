@@ -68,10 +68,7 @@ fn fix_tag(raw: u8) -> u8 {
 ///
 /// Reads tags until a stop/structural tag or an unrecognized tag.
 /// The `tag` parameter holds the current (already-read) raw tag byte.
-fn read_decl_list(
-    reader: &mut DcuReader,
-    tag: &mut u8,
-) -> Result<Vec<TypeInfo>, DcuError> {
+fn read_decl_list(reader: &mut DcuReader, tag: &mut u8) -> Result<Vec<TypeInfo>, DcuError> {
     let mut types = Vec::new();
     read_decl_list_into(reader, tag, &mut types)?;
     Ok(types)
@@ -85,7 +82,6 @@ fn read_decl_list_into(
     tag: &mut u8,
     types: &mut Vec<TypeInfo>,
 ) -> Result<(), DcuError> {
-
     loop {
         let fixed = fix_tag(*tag);
         match fixed {
@@ -181,18 +177,14 @@ fn read_decl_list_into(
             // If the name is "ClassName.MethodName", associate it as a
             // method of the corresponding class type.
             DR_PROC => {
-                {
-                    let save_pos = reader.position();
-                    match skip_proc_decl(reader, types) {
-                        Ok(proc_name) => {
-                            associate_proc_with_class(
-                                &proc_name, types,
-                            );
-                        }
-                        Err(_e) => {
-                            reader.set_position(save_pos);
-                            break;
-                        }
+                let save_pos = reader.position();
+                match skip_proc_decl(reader, types) {
+                    Ok(proc_name) => {
+                        associate_proc_with_class(&proc_name, types);
+                    }
+                    Err(_e) => {
+                        reader.set_position(save_pos);
+                        break;
                     }
                 }
             }
@@ -239,8 +231,8 @@ fn read_decl_list_into(
             DR_ENUM_DEF => {
                 skip_enum_def(reader)?;
             }
-            DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF
-            | DR_WCHAR_RANGE_DEF | DR_WIDE_RANGE_DEF => {
+            DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF | DR_WCHAR_RANGE_DEF
+            | DR_WIDE_RANGE_DEF => {
                 skip_range_def(reader)?;
             }
             DR_FLOAT_DEF => {
@@ -355,9 +347,7 @@ fn read_decl_list_into(
 ///   Name (ReadName)
 ///   TNameFDecl: F, F1, F4, [Inf], [B2]
 ///   hDef (ReadUIndex)
-fn read_type_decl(
-    reader: &mut DcuReader,
-) -> Result<Option<TypeInfo>, DcuError> {
+fn read_type_decl(reader: &mut DcuReader) -> Result<Option<TypeInfo>, DcuError> {
     let name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
     let _h_def = reader.read_uindex()?;
@@ -379,9 +369,7 @@ fn read_type_decl(
 /// Read a drTypeP (VMT pointer type) declaration.
 /// In D13, TTypePDecl has an extra ReadUIndex field after hDef
 /// that is not present in the DCU32 reference code.
-fn read_type_p_decl(
-    reader: &mut DcuReader,
-) -> Result<Option<TypeInfo>, DcuError> {
+fn read_type_p_decl(reader: &mut DcuReader) -> Result<Option<TypeInfo>, DcuError> {
     let name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
     let _h_def = reader.read_uindex()?;
@@ -408,10 +396,7 @@ struct NameFFields {
     pub _f1: u32,
 }
 
-fn read_namef_fields(
-    reader: &mut DcuReader,
-    no_inf: bool,
-) -> Result<NameFFields, DcuError> {
+fn read_namef_fields(reader: &mut DcuReader, no_inf: bool) -> Result<NameFFields, DcuError> {
     let f = reader.read_uindex()?;
     let f1 = reader.read_uindex()?; // D8+
     let _f4 = reader.read_uindex()?; // D2009+
@@ -459,10 +444,7 @@ fn skip_const_decl(reader: &mut DcuReader) -> Result<(), DcuError> {
 
 /// Read a drUnitAddInfo record and its nested declaration list.
 /// Types found inside are added to the shared types Vec.
-fn read_unit_add_info(
-    reader: &mut DcuReader,
-    types: &mut Vec<TypeInfo>,
-) -> Result<(), DcuError> {
+fn read_unit_add_info(reader: &mut DcuReader, types: &mut Vec<TypeInfo>) -> Result<(), DcuError> {
     let _name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
     let _b = reader.read_uindex()?;
@@ -850,10 +832,7 @@ fn skip_attribute_record(reader: &mut DcuReader) -> Result<(), DcuError> {
 /// Skip an embedded proc block (drEmbeddedProcStart .. drEmbeddedProcEnd).
 /// Passes the shared types Vec so that type definitions inside embedded
 /// procs can be associated with type declarations from outer scopes.
-fn skip_embedded_proc(
-    reader: &mut DcuReader,
-    types: &mut Vec<TypeInfo>,
-) -> Result<(), DcuError> {
+fn skip_embedded_proc(reader: &mut DcuReader, types: &mut Vec<TypeInfo>) -> Result<(), DcuError> {
     let mut inner_tag = reader.read_byte()?;
     loop {
         let fixed = fix_tag(inner_tag);
@@ -878,10 +857,7 @@ fn skip_embedded_proc(
 /// Skip a procedure declaration (drProc), returning the proc name.
 /// The `types` parameter allows type definitions found inside proc bodies
 /// to be associated with type declarations from the outer scope.
-fn skip_proc_decl(
-    reader: &mut DcuReader,
-    types: &mut Vec<TypeInfo>,
-) -> Result<String, DcuError> {
+fn skip_proc_decl(reader: &mut DcuReader, types: &mut Vec<TypeInfo>) -> Result<String, DcuError> {
     let name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
 
@@ -949,7 +925,10 @@ fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo]) {
         let class_name = &proc_name[..dot_pos];
         let method_name = &proc_name[dot_pos + 1..];
         if !method_name.is_empty() && !method_name.starts_with(':') {
-            if let Some(ti) = types.iter_mut().find(|t| t.name.eq_ignore_ascii_case(class_name)) {
+            if let Some(ti) = types
+                .iter_mut()
+                .find(|t| t.name.eq_ignore_ascii_case(class_name))
+            {
                 ti.kind = TypeKind::Class;
                 let kind = if method_name == "Create" {
                     MethodKind::Constructor
@@ -981,10 +960,7 @@ fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo]) {
 ///   Extra (ReadUIndex) -- D2009+
 ///   hDT (ReadUIndex for non-method, ReadIndex for method)
 ///   Ndx (ReadIndex for non-method, ReadUIndex for method)
-fn skip_local_decl(
-    reader: &mut DcuReader,
-    is_method: bool,
-) -> Result<(), DcuError> {
+fn skip_local_decl(reader: &mut DcuReader, is_method: bool) -> Result<(), DcuError> {
     let _name = reader.read_name()?;
     let _loc_flags = reader.read_uindex()?; // LocFlags
     let _loc_flags_x = reader.read_uindex()?; // LocFlagsX (D8+)
@@ -1000,9 +976,7 @@ fn skip_local_decl(
 }
 
 /// Read a TLocalDecl for a field, returning the name and type index.
-fn read_field_decl(
-    reader: &mut DcuReader,
-) -> Result<(String, u32), DcuError> {
+fn read_field_decl(reader: &mut DcuReader) -> Result<(String, u32), DcuError> {
     let name = reader.read_name()?;
     let _loc_flags = reader.read_uindex()?;
     let _loc_flags_x = reader.read_uindex()?;
@@ -1033,10 +1007,7 @@ fn visibility_from_flags(flags: u32) -> Visibility {
 ///
 /// TMethodDecl inherits from TLocalDecl, then reads additional method-specific
 /// fields. The exact extra fields depend on the method kind and version.
-fn skip_method_decl(
-    reader: &mut DcuReader,
-    method_tag: u8,
-) -> Result<(), DcuError> {
+fn skip_method_decl(reader: &mut DcuReader, method_tag: u8) -> Result<(), DcuError> {
     let _name = reader.read_name()?;
     // TLocalDecl fields
     let _loc_flags = reader.read_uindex()?;
@@ -1072,9 +1043,8 @@ fn skip_method_extra_bytes(reader: &mut DcuReader) -> Result<(), DcuError> {
     //          Ord(' ')=$20, Ord('!')=$21, Ord('a')=$61]
     // Combined and deduplicated:
     const METHOD_BYTE_SET: &[u8] = &[
-        0x00, 0x01, 0x02, 0x04, 0x08, 0x09, 0x10, 0x18,
-        0x20, 0x21, 0x22, 0x28, 0x38, 0x42, 0x47, 0x4F,
-        0x60, 0x61, 0x80, 0x84,
+        0x00, 0x01, 0x02, 0x04, 0x08, 0x09, 0x10, 0x18, 0x20, 0x21, 0x22, 0x28, 0x38, 0x42, 0x47,
+        0x4F, 0x60, 0x61, 0x80, 0x84,
     ];
 
     loop {
@@ -1266,9 +1236,7 @@ fn skip_meta_class_def(reader: &mut DcuReader) -> Result<(), DcuError> {
 ///
 /// Returns (fields, methods) collected from the class member sub-list.
 /// DCU32 reference: TClassDef.Create (for D13/XE7+).
-fn parse_class_def(
-    reader: &mut DcuReader,
-) -> Result<(Vec<FieldInfo>, Vec<MethodInfo>), DcuError> {
+fn parse_class_def(reader: &mut DcuReader) -> Result<(Vec<FieldInfo>, Vec<MethodInfo>), DcuError> {
     read_type_def_header(reader)?;
     // D2006+: BX byte (some flags)
     let _bx = reader.read_byte()?;
@@ -1284,7 +1252,7 @@ fn parse_class_def(
     let _ndx_fe = reader.read_uindex()?;
     let _prop_cnt = reader.read_uindex()?;
     let _b04 = reader.read_uindex()?; // D8+
-    // D2010+: BX3
+                                      // D2010+: BX3
     let _bx3 = reader.read_uindex()?;
     // ReadBeforeIntf: nothing for TClassDef (empty override)
     // ReadClassInterfaces:
@@ -1316,47 +1284,39 @@ fn parse_class_def(
     loop {
         let fixed = fix_tag(tag);
         match fixed {
-            AR_FLD => {
-                match read_field_decl(reader) {
-                    Ok((name, h_dt)) => {
-                        if !name.is_empty() && !name.starts_with('.') {
-                            fields.push(FieldInfo {
-                                name,
-                                type_ref: TypeRef::Unresolved(h_dt),
-                                visibility: Visibility::Private,
-                            });
-                        }
+            AR_FLD => match read_field_decl(reader) {
+                Ok((name, h_dt)) => {
+                    if !name.is_empty() && !name.starts_with('.') {
+                        fields.push(FieldInfo {
+                            name,
+                            type_ref: TypeRef::Unresolved(h_dt),
+                            visibility: Visibility::Private,
+                        });
                     }
-                    Err(_) => break,
                 }
-            }
-            AR_METHOD | AR_CONSTR | AR_DESTR => {
-                match read_method_info(reader, fixed) {
-                    Ok((name, kind)) => {
-                        if !name.is_empty() {
-                            methods.push(MethodInfo {
-                                name,
-                                kind,
-                                params: Vec::new(),
-                                return_type: None,
-                            });
-                        }
+                Err(_) => break,
+            },
+            AR_METHOD | AR_CONSTR | AR_DESTR => match read_method_info(reader, fixed) {
+                Ok((name, kind)) => {
+                    if !name.is_empty() {
+                        methods.push(MethodInfo {
+                            name,
+                            kind,
+                            params: Vec::new(),
+                            return_type: None,
+                        });
                     }
-                    Err(_) => break,
                 }
-            }
-            AR_PROPERTY => {
-                match skip_property_decl(reader) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-            }
-            AR_CLASS_VAR => {
-                match skip_local_decl(reader, false) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-            }
+                Err(_) => break,
+            },
+            AR_PROPERTY => match skip_property_decl(reader) {
+                Ok(()) => {}
+                Err(_) => break,
+            },
+            AR_CLASS_VAR => match skip_local_decl(reader, false) {
+                Ok(()) => {}
+                Err(_) => break,
+            },
             AR_VAL | AR_VAR | AR_RESULT | AR_ABS_LOC_VAR | AR_LABEL => {
                 match skip_local_decl(reader, false) {
                     Ok(()) => {}
@@ -1384,37 +1344,77 @@ fn parse_class_def(
                     Err(_) => break,
                 }
             }
-            DR_CONST => {
-                match skip_const_decl(reader) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-            }
+            DR_CONST => match skip_const_decl(reader) {
+                Ok(()) => {}
+                Err(_) => break,
+            },
             // Type definition tags that can appear inside class bodies.
-            DR_ENUM_DEF => { skip_enum_def(reader)?; }
-            DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF
-            | DR_WCHAR_RANGE_DEF | DR_WIDE_RANGE_DEF => { skip_range_def(reader)?; }
-            DR_FLOAT_DEF => { skip_float_def(reader)?; }
-            DR_PTR_DEF => { skip_ptr_def(reader)?; }
-            DR_DYN_ARRAY_DEF => { skip_ptr_def(reader)?; }
-            DR_SET_DEF => { skip_set_def(reader)?; }
-            DR_ARRAY_DEF => { skip_array_def(reader)?; }
-            DR_PROC_TYPE_DEF => { skip_proc_type_def(reader)?; }
+            DR_ENUM_DEF => {
+                skip_enum_def(reader)?;
+            }
+            DR_RANGE_DEF | DR_BOOL_RANGE_DEF | DR_CH_RANGE_DEF | DR_WCHAR_RANGE_DEF
+            | DR_WIDE_RANGE_DEF => {
+                skip_range_def(reader)?;
+            }
+            DR_FLOAT_DEF => {
+                skip_float_def(reader)?;
+            }
+            DR_PTR_DEF => {
+                skip_ptr_def(reader)?;
+            }
+            DR_DYN_ARRAY_DEF => {
+                skip_ptr_def(reader)?;
+            }
+            DR_SET_DEF => {
+                skip_set_def(reader)?;
+            }
+            DR_ARRAY_DEF => {
+                skip_array_def(reader)?;
+            }
+            DR_PROC_TYPE_DEF => {
+                skip_proc_type_def(reader)?;
+            }
             DR_CLASS_DEF => {
                 // Nested class def: parse but discard.
                 let _inner = parse_class_def(reader)?;
             }
-            DR_REC_DEF => { skip_rec_def(reader)?; }
-            DR_INTERFACE_DEF => { skip_interface_def(reader)?; }
-            DR_OBJ_VMT_DEF => { skip_obj_vmt_def(reader)?; }
-            DR_OBJ_DEF => { skip_obj_def(reader)?; }
-            DR_VOID => { read_type_def_header(reader)?; }
-            DR_META_CLASS_DEF => { skip_meta_class_def(reader)?; }
-            DR_VARIANT_DEF => { read_type_def_header(reader)?; let _b = reader.read_byte()?; }
-            DR_SHORT_STR_DEF => { read_type_def_header(reader)?; let _cp = reader.read_uindex()?; }
-            DR_STRING_DEF | DR_WIDE_STR_DEF => { read_type_def_header(reader)?; let _cp = reader.read_uindex()?; }
-            DR_TEXT_DEF | DR_FILE_DEF => { read_type_def_header(reader)?; let _h_base = reader.read_uindex()?; }
-            DR_TEMPLATE_ARG_DEF => { read_type_def_header(reader)?; }
+            DR_REC_DEF => {
+                skip_rec_def(reader)?;
+            }
+            DR_INTERFACE_DEF => {
+                skip_interface_def(reader)?;
+            }
+            DR_OBJ_VMT_DEF => {
+                skip_obj_vmt_def(reader)?;
+            }
+            DR_OBJ_DEF => {
+                skip_obj_def(reader)?;
+            }
+            DR_VOID => {
+                read_type_def_header(reader)?;
+            }
+            DR_META_CLASS_DEF => {
+                skip_meta_class_def(reader)?;
+            }
+            DR_VARIANT_DEF => {
+                read_type_def_header(reader)?;
+                let _b = reader.read_byte()?;
+            }
+            DR_SHORT_STR_DEF => {
+                read_type_def_header(reader)?;
+                let _cp = reader.read_uindex()?;
+            }
+            DR_STRING_DEF | DR_WIDE_STR_DEF => {
+                read_type_def_header(reader)?;
+                let _cp = reader.read_uindex()?;
+            }
+            DR_TEXT_DEF | DR_FILE_DEF => {
+                read_type_def_header(reader)?;
+                let _h_base = reader.read_uindex()?;
+            }
+            DR_TEMPLATE_ARG_DEF => {
+                read_type_def_header(reader)?;
+            }
             DR_TEMPLATE_CALL => {
                 read_type_def_header(reader)?;
                 let _h_dt = reader.read_uindex()?;
@@ -1465,8 +1465,7 @@ fn parse_class_def(
                 break;
             }
             // Unknown tag: stop gracefully.
-            _ => {
-            }
+            _ => {}
         }
         tag = reader.read_byte()?;
     }
@@ -1483,7 +1482,7 @@ fn skip_rec_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     let _b1 = reader.read_byte()?; // D2006+
     let _x0 = reader.read_byte()?; // D_XE2+ reads a byte (not uindex)
     let _x = reader.read_uindex()?; // D2005+
-    // D2009+:
+                                    // D2009+:
     let _d1 = reader.read_uindex()?;
     let _d2 = reader.read_uindex()?;
     // D2010+:
@@ -1542,11 +1541,7 @@ fn read_uses(
     Ok(())
 }
 
-fn skip_uses(
-    reader: &mut DcuReader,
-    tag: &mut u8,
-    tag_rq: u8,
-) -> Result<(), DcuError> {
+fn skip_uses(reader: &mut DcuReader, tag: &mut u8, tag_rq: u8) -> Result<(), DcuError> {
     while *tag == tag_rq {
         let _unit_name = reader.read_name()?;
 

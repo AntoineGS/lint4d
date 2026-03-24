@@ -13,9 +13,15 @@ impl fmt::Display for DcuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnexpectedEof { context } => write!(f, "unexpected EOF: {context}"),
-            Self::UnsupportedVersion { magic } => write!(f, "unsupported DCU version: magic 0x{magic:08X}"),
-            Self::UnknownTag { tag, offset } => write!(f, "unknown tag 0x{tag:02X} at offset {offset}"),
-            Self::UnresolvedTypeRef { index } => write!(f, "unresolved type reference: index {index}"),
+            Self::UnsupportedVersion { magic } => {
+                write!(f, "unsupported DCU version: magic 0x{magic:08X}")
+            }
+            Self::UnknownTag { tag, offset } => {
+                write!(f, "unknown tag 0x{tag:02X} at offset {offset}")
+            }
+            Self::UnresolvedTypeRef { index } => {
+                write!(f, "unresolved type reference: index {index}")
+            }
             Self::Io(e) => write!(f, "IO error: {e}"),
         }
     }

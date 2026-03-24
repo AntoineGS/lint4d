@@ -53,12 +53,7 @@ fn parse_dcu_classes_unit() {
     let unit = parse_dcu(&data).unwrap();
     assert_eq!(unit.name, "Lint4dFixture.Classes");
 
-    let expected = [
-        "System",
-        "SysInit",
-        "System.SysUtils",
-        "System.Classes",
-    ];
+    let expected = ["System", "SysInit", "System.SysUtils", "System.Classes"];
     for name in &expected {
         assert!(
             unit.imported_units.iter().any(|u| u == name),
@@ -125,15 +120,23 @@ fn parse_dcu_extracts_class_fields() {
     let data = fs::read(fixture_path("Lint4dFixture.Classes.dcu")).unwrap();
     let unit = parse_dcu(&data).unwrap();
 
-    let class_types: Vec<_> = unit.types.iter()
+    let class_types: Vec<_> = unit
+        .types
+        .iter()
         .filter(|t| t.kind == TypeKind::Class)
         .collect();
 
     assert!(!class_types.is_empty(), "Expected at least one class type");
 
     let has_fields = class_types.iter().any(|t| !t.fields.is_empty());
-    assert!(has_fields, "Expected at least one class with fields, classes: {:?}",
-        class_types.iter().map(|t| (&t.name, t.fields.len())).collect::<Vec<_>>());
+    assert!(
+        has_fields,
+        "Expected at least one class with fields, classes: {:?}",
+        class_types
+            .iter()
+            .map(|t| (&t.name, t.fields.len()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -141,18 +144,28 @@ fn parse_dcu_class_has_constructor_or_destructor() {
     let data = fs::read(fixture_path("Lint4dFixture.Classes.dcu")).unwrap();
     let unit = parse_dcu(&data).unwrap();
 
-    let adapter = unit.types.iter()
+    let adapter = unit
+        .types
+        .iter()
         .find(|t| t.name == "TDataAdapter")
         .expect("TDataAdapter not found");
 
     assert_eq!(adapter.kind, TypeKind::Class);
 
-    let has_ctor_or_dtor = adapter.methods.iter()
+    let has_ctor_or_dtor = adapter
+        .methods
+        .iter()
         .any(|m| m.kind == MethodKind::Constructor || m.kind == MethodKind::Destructor);
 
-    assert!(has_ctor_or_dtor,
+    assert!(
+        has_ctor_or_dtor,
         "Expected TDataAdapter to have a constructor or destructor, methods: {:?}",
-        adapter.methods.iter().map(|m| (&m.name, &m.kind)).collect::<Vec<_>>());
+        adapter
+            .methods
+            .iter()
+            .map(|m| (&m.name, &m.kind))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -160,7 +173,10 @@ fn parse_dcu_records_unit() {
     let data = fs::read(fixture_path("Lint4dFixture.Records.dcu")).unwrap();
     let unit = parse_dcu(&data).unwrap();
     assert_eq!(unit.name, "Lint4dFixture.Records");
-    assert!(!unit.types.is_empty(), "Expected type definitions in Records unit");
+    assert!(
+        !unit.types.is_empty(),
+        "Expected type definitions in Records unit"
+    );
 }
 
 #[test]
@@ -168,7 +184,10 @@ fn parse_dcu_enums_unit() {
     let data = fs::read(fixture_path("Lint4dFixture.Enums.dcu")).unwrap();
     let unit = parse_dcu(&data).unwrap();
     assert_eq!(unit.name, "Lint4dFixture.Enums");
-    assert!(!unit.types.is_empty(), "Expected type definitions in Enums unit");
+    assert!(
+        !unit.types.is_empty(),
+        "Expected type definitions in Enums unit"
+    );
 }
 
 #[test]
@@ -177,7 +196,10 @@ fn parse_dcu_generics_unit() {
     let data = fs::read(fixture_path("Lint4dFixture.Generics.dcu")).unwrap();
     let unit = parse_dcu(&data).unwrap();
     assert_eq!(unit.name, "Lint4dFixture.Generics");
-    assert!(!unit.types.is_empty(), "Expected type definitions in Generics unit");
+    assert!(
+        !unit.types.is_empty(),
+        "Expected type definitions in Generics unit"
+    );
 }
 
 #[test]
@@ -186,7 +208,9 @@ fn parse_dcu_inheritance_unit() {
     let unit = parse_dcu(&data).unwrap();
     assert_eq!(unit.name, "Lint4dFixture.Inheritance");
     assert!(
-        unit.imported_units.iter().any(|u| u == "Lint4dFixture.Classes"),
+        unit.imported_units
+            .iter()
+            .any(|u| u == "Lint4dFixture.Classes"),
         "Expected 'Lint4dFixture.Classes' in imports, got: {:?}",
         unit.imported_units
     );
@@ -199,13 +223,17 @@ fn parse_dcu_torture_many_fields() {
     let unit = parse_dcu(&data).unwrap();
     assert_eq!(unit.name, "Lint4dFixture.Torture");
 
-    let mega = unit.types.iter()
+    let mega = unit
+        .types
+        .iter()
         .find(|t| t.name == "TMegaClass")
         .expect("TMegaClass not found");
 
-    assert!(mega.fields.len() >= 20,
+    assert!(
+        mega.fields.len() >= 20,
         "Expected TMegaClass to have 20+ fields, got {}",
-        mega.fields.len());
+        mega.fields.len()
+    );
 }
 
 #[test]
@@ -213,17 +241,23 @@ fn parse_dcu_torture_overloaded_methods() {
     let data = fs::read(fixture_path("Lint4dFixture.Torture.dcu")).unwrap();
     let unit = parse_dcu(&data).unwrap();
 
-    let mega = unit.types.iter()
+    let mega = unit
+        .types
+        .iter()
         .find(|t| t.name == "TMegaClass")
         .expect("TMegaClass not found");
 
-    let overloaded_count = mega.methods.iter()
+    let overloaded_count = mega
+        .methods
+        .iter()
         .filter(|m| m.name == "Overloaded")
         .count();
 
-    assert!(overloaded_count >= 2,
+    assert!(
+        overloaded_count >= 2,
         "Expected multiple 'Overloaded' methods, got {}",
-        overloaded_count);
+        overloaded_count
+    );
 }
 
 #[test]
@@ -231,7 +265,11 @@ fn parse_dcu_torture_imports() {
     let data = fs::read(fixture_path("Lint4dFixture.Torture.dcu")).unwrap();
     let unit = parse_dcu(&data).unwrap();
 
-    let expected = ["Lint4dFixture.Classes", "Lint4dFixture.Interfaces", "Lint4dFixture.Enums"];
+    let expected = [
+        "Lint4dFixture.Classes",
+        "Lint4dFixture.Interfaces",
+        "Lint4dFixture.Enums",
+    ];
     for name in &expected {
         assert!(
             unit.imported_units.iter().any(|u| u == name),

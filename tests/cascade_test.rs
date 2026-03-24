@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use lint4d::discovery::resolve_dcu_dirs;
+use std::path::PathBuf;
 
 #[test]
 fn cli_paths_take_highest_priority() {

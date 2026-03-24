@@ -86,7 +86,9 @@ fn main() {
     let builder = std::thread::Builder::new()
         .name("lint4d-main".to_string())
         .stack_size(16 * 1024 * 1024);
-    let handler = builder.spawn(real_main).expect("failed to spawn main thread");
+    let handler = builder
+        .spawn(real_main)
+        .expect("failed to spawn main thread");
     let result = handler.join();
     if let Err(e) = result {
         std::panic::resume_unwind(e);
@@ -172,19 +174,19 @@ fn real_main() {
     };
 
     // MSBuild auto-discovery: only attempt if --project is provided
-    let discovered_paths = if cli.dcu_paths.is_empty()
-        && config.dcu_paths().is_empty()
-        && cli.project.is_some()
-    {
-        discover_dcu_paths_from_project(
-            cli.project.as_ref().unwrap(),
-            cli.bds_path.as_deref().or_else(|| config.bds_path().map(std::path::Path::new)),
-            cli.platform.as_deref().or(config.platform()),
-            cli.build_config.as_deref().or(config.build_config()),
-        )
-    } else {
-        Vec::new()
-    };
+    let discovered_paths =
+        if cli.dcu_paths.is_empty() && config.dcu_paths().is_empty() && cli.project.is_some() {
+            discover_dcu_paths_from_project(
+                cli.project.as_ref().unwrap(),
+                cli.bds_path
+                    .as_deref()
+                    .or_else(|| config.bds_path().map(std::path::Path::new)),
+                cli.platform.as_deref().or(config.platform()),
+                cli.build_config.as_deref().or(config.build_config()),
+            )
+        } else {
+            Vec::new()
+        };
 
     // Warn if BDS-related flags are provided without --project
     if cli.project.is_none()
@@ -196,11 +198,8 @@ fn real_main() {
     }
 
     // Resolve DCU paths using priority cascade
-    let dcu_dirs = lint4d::discovery::resolve_dcu_dirs(
-        &cli.dcu_paths,
-        config.dcu_paths(),
-        discovered_paths,
-    );
+    let dcu_dirs =
+        lint4d::discovery::resolve_dcu_dirs(&cli.dcu_paths, config.dcu_paths(), discovered_paths);
 
     let project_context = if !dcu_dirs.is_empty() {
         match lint4d::dcu::ProjectContext::from_dcu_paths(&dcu_dirs) {
@@ -267,7 +266,8 @@ fn real_main() {
         .par_iter()
         .filter_map(|file| {
             let source = fs::read(&file.path).ok()?;
-            let diagnostics = run_lint_with_context(file, &source, &config, project_context.as_ref(), &registry);
+            let diagnostics =
+                run_lint_with_context(file, &source, &config, project_context.as_ref(), &registry);
             Some((file.path.to_string_lossy().to_string(), source, diagnostics))
         })
         .collect();
@@ -363,11 +363,7 @@ fn run_fix_fmt(files: &[FileInfo], config: &Config) {
             eprintln!("lint4d: error: failed to write {}: {}", path.display(), e);
             process::exit(EXIT_ERROR);
         }
-        eprintln!(
-            "Fixed {} identifier(s) in {}",
-            count,
-            path.display()
-        );
+        eprintln!("Fixed {} identifier(s) in {}", count, path.display());
     }
 }
 
@@ -522,10 +518,7 @@ fn discover_dcu_paths_from_project(
     };
 
     // Discover BDS root
-    let bds_root = bds::discover_bds_root(
-        bds_path_override,
-        project_version.as_deref(),
-    );
+    let bds_root = bds::discover_bds_root(bds_path_override, project_version.as_deref());
 
     let bds_root = match bds_root {
         Some(root) => root,
@@ -558,7 +551,11 @@ fn discover_dcu_paths_from_project(
     if paths.is_empty() {
         eprintln!("lint4d: warning: MSBuild auto-discovery found no DCU directories");
     } else {
-        eprintln!("Auto-discovered {} DCU director{}", paths.len(), if paths.len() == 1 { "y" } else { "ies" });
+        eprintln!(
+            "Auto-discovered {} DCU director{}",
+            paths.len(),
+            if paths.len() == 1 { "y" } else { "ies" }
+        );
     }
 
     paths

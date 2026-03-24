@@ -6,7 +6,9 @@ use crate::config::{Config, RuleSeverityOverride};
 use crate::engine::suppress::{parse_suppressions, Suppression};
 use crate::engine::{parse_file, FileInfo, FileType};
 use crate::rules::helpers::node_text;
-use crate::rules::naming::{to_camel_case, to_pascal_case, to_upper_snake_case, violates_naming_style};
+use crate::rules::naming::{
+    to_camel_case, to_pascal_case, to_upper_snake_case, violates_naming_style,
+};
 use crate::rules::scope::{
     collect_file_scope, collect_method_scope, extract_class_name, is_declaration_position,
     is_dot_rhs, is_inside_inherited, is_inside_module_name, is_inside_typeref, Scopes,
@@ -48,7 +50,11 @@ struct ProcContext {
 ///
 /// Returns `(new_source_bytes, edit_count)` on success.
 /// Returns the original source unchanged (with count 0) for `.dpr`/`.dpk` files.
-pub fn fix_file(file: &FileInfo, source: &[u8], config: &Config) -> Result<(Vec<u8>, usize), String> {
+pub fn fix_file(
+    file: &FileInfo,
+    source: &[u8],
+    config: &Config,
+) -> Result<(Vec<u8>, usize), String> {
     if matches!(file.file_type, FileType::Dpr | FileType::Dpk) {
         return Ok((source.to_vec(), 0));
     }
@@ -294,10 +300,8 @@ fn check_local_var_naming(
                 } else {
                     to_pascal_case(&name)
                 };
-                map.local.insert(
-                    (proc_start, proc_end, name.to_lowercase()),
-                    new_name,
-                );
+                map.local
+                    .insert((proc_start, proc_end, name.to_lowercase()), new_name);
             }
         }
     }
@@ -316,7 +320,9 @@ fn update_scopes(scopes: &mut Scopes, rename_map: &RenameMap) {
         .collect();
     for (old_lower, new_name) in &file_updates {
         scopes.file.remove(old_lower);
-        scopes.file.insert(new_name.to_lowercase(), new_name.clone());
+        scopes
+            .file
+            .insert(new_name.to_lowercase(), new_name.clone());
     }
 
     // Update class keys if types were renamed
@@ -349,7 +355,15 @@ fn collect_edits(
         Some(RuleSeverityOverride::Off)
     );
     let mut edits = Vec::new();
-    walk_for_edits(root, source, rename_map, scopes, None, casing_enabled, &mut edits);
+    walk_for_edits(
+        root,
+        source,
+        rename_map,
+        scopes,
+        None,
+        casing_enabled,
+        &mut edits,
+    );
     edits
 }
 
@@ -363,7 +377,15 @@ fn walk_for_edits(
     edits: &mut Vec<TextEdit>,
 ) {
     if node.kind() == "identifier" {
-        resolve_and_emit(node, source, rename_map, scopes, proc_ctx, casing_enabled, edits);
+        resolve_and_emit(
+            node,
+            source,
+            rename_map,
+            scopes,
+            proc_ctx,
+            casing_enabled,
+            edits,
+        );
         return;
     }
 
@@ -403,14 +425,30 @@ fn walk_for_edits(
         };
 
         for child in node.children(&mut node.walk()) {
-            walk_for_edits(child, source, rename_map, scopes, Some(&ctx), casing_enabled, edits);
+            walk_for_edits(
+                child,
+                source,
+                rename_map,
+                scopes,
+                Some(&ctx),
+                casing_enabled,
+                edits,
+            );
         }
         return;
     }
 
     // Default: recurse into children
     for child in node.children(&mut node.walk()) {
-        walk_for_edits(child, source, rename_map, scopes, proc_ctx, casing_enabled, edits);
+        walk_for_edits(
+            child,
+            source,
+            rename_map,
+            scopes,
+            proc_ctx,
+            casing_enabled,
+            edits,
+        );
     }
 }
 
@@ -518,8 +556,7 @@ fn apply_edits(source: &[u8], mut edits: Vec<TextEdit>) -> Result<(Vec<u8>, usiz
         if window[1].end_byte > window[0].start_byte {
             return Err(format!(
                 "overlapping edits detected at byte offsets {}..{} and {}..{} — skipping file",
-                window[0].start_byte, window[0].end_byte,
-                window[1].start_byte, window[1].end_byte,
+                window[0].start_byte, window[0].end_byte, window[1].start_byte, window[1].end_byte,
             ));
         }
     }

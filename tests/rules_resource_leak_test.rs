@@ -510,3 +510,59 @@ fn resource_leak_no_try_flags_free_in_string() {
         matches
     );
 }
+
+#[test]
+fn resource_leak_no_try_flags_result_when_raise_follows() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_result_may_leak.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Result := TFoo.Create followed by raise without try should flag: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_skips_result_with_try_except() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_result_with_try_except.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Result with try..except protection should not flag: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_flags_result_raise_after_try() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_result_raise_after_try.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Result with raise after try..except should flag — protection must extend to end of function: {:?}",
+        matches
+    );
+}

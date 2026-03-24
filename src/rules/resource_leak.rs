@@ -338,9 +338,43 @@ fn check_block_no_try(
             continue;
         }
 
-        // Skip `Result` assignments: a function returning a newly created
-        // object transfers ownership to the caller.
+        // For `Result` assignments the function transfers ownership to the
+        // caller, so a simple `Result := TFoo.Create` is fine.  However, if
+        // any code after the constructor can raise and is NOT inside a
+        // protecting try block, the object leaks before the caller receives
+        // it.  Check that every raise-bearing sibling is a try node itself.
         if var_name.eq_ignore_ascii_case("result") {
+            let has_unprotected_raise = children[(i + 1)..]
+                .iter()
+                .any(|s| {
+                    s.is_named()
+                        && !s.is_extra()
+                        && s.kind() != "try"
+                        && ast_contains_raise(*s)
+                });
+            if has_unprotected_raise {
+                let start = child.start_position();
+                let end = child.end_position();
+                ctx.report(Diagnostic {
+                    rule_id: "resource-leak-no-try".to_string(),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "'{}' is assigned via constructor but a raise statement after it \
+                         is not protected by try..except. If the raise executes, the \
+                         object will leak.",
+                        var_name
+                    ),
+                    line: start.row + 1,
+                    column: start.column + 1,
+                    end_line: end.row + 1,
+                    end_column: end.column + 1,
+                    help: Some(
+                        "Wrap all code after the constructor in a try..except block \
+                         that frees Result and re-raises."
+                            .to_string(),
+                    ),
+                });
+            }
             continue;
         }
 
@@ -785,4 +819,18 @@ fn visit_non_proc_blocks(
     for child in node.children(&mut cursor) {
         visit_non_proc_blocks(child, source, project, uses, ast_intf_types, ctx);
     }
+}
+
+/// Check whether any descendant of `node` is a `raise` statement.
+fn ast_contains_raise(node: Node) -> bool {
+    if node.kind() == "raise" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if ast_contains_raise(child) {
+            return true;
+        }
+    }
+    false
 }

@@ -40,14 +40,14 @@ uses
 
 function CreateObject: TObject;
 begin
-  result := TObject.Create; // should not warn for leak
+  result := TObject.Create; // OK, should not warn for leak
 end;
 
 function CreateBadObject: TObject;
 begin
   result := TObject.Create;
 
-  if result.ClassName <> 'somestring' then // should warn for for leak, needs try..except..free
+  if result.ClassName <> 'somestring' then // WRONG, should warn for for leak, needs try..except..free
     raise Exception.Create('test');
 end;
 
@@ -62,24 +62,24 @@ begin
   TestCreateObjectInSubFunction;
   TestObjInSubFunctionMayLeak;
   TestFreeAfterCreate;
-  inherited; // should warn as inherited should typically be at the top in Create
+  inherited; // WRONG, should warn as inherited should typically be at the top in Create
 end;
 
 destructor TForm1.Destroy;
 begin
   inherited;
 
-  if FObj.ClassName = 'TObject' then // should warn for running code after inherited in Destroy
+  if FObj.ClassName = 'TObject' then // WRONG, should warn for running code after inherited in Destroy
     Exit
   else
-    Raise Exception.Create('uhoh'); // should warn as raising in a destructor is bad practice
+    Raise Exception.Create('uhoh'); // WRONG, should warn as raising in a destructor is bad practice
 end;
 
 procedure TForm1.TestFreeAfterCreate;
 var
   aObj: TObject;
 begin
-  aObj := TObject.Create; // should not warn for leak
+  aObj := TObject.Create; // WRONG, should not warn for leak
   aObj.Free;
 end;
 
@@ -87,7 +87,7 @@ procedure TForm1.TestObjInSubFunctionMayLeak;
 var
   aObj: TObject;
 begin
-  aObj := CreateBadObject; // should warn for leak inside this sub-function
+  aObj := CreateBadObject; // see subfunction
   try
   finally
     aObj.Free;
@@ -98,7 +98,7 @@ procedure TForm1.TestCreateObjectInSubFunction;
 var
   aObj: TObject;
 begin
-  aObj := CreateObject; // should warn for leak
+  aObj := CreateObject; // WRONG, should warn for leak here no try finally
 
   if aObj.ClassName <> 'TObject' then
     raise Exception.Create('some message');
@@ -112,7 +112,7 @@ begin
   try
   finally
     aObj.Free;
-    aObj.Free; // should warn Use after Free
+    aObj.Free; // WRONG, should warn Use after Free
   end;
 end;
 
@@ -120,7 +120,7 @@ procedure TForm1.TestNoFreeButHasTryFinally;
 var
   aObj: TObject;
 begin
-  aObj := TObject.Create; // should warn for leak
+  aObj := TObject.Create; // OK, should warn for leak
   try
   finally
   end;
@@ -135,7 +135,7 @@ var
 begin
   aObj := nil;
   try
-    aObj := TObject.Create;  // should not warn for leak
+    aObj := TObject.Create;  // OK, should not warn for leak
 
     if aObj.ClassName <> 'TObject' then
       raise Exception.Create('somemessage');
@@ -149,7 +149,7 @@ var
   aRefCountedObj: TRefCountedObject;
   aRefCountedItf: IInterface;
 begin
-  aRefCountedObj := TRefCountedObject.Create; // should not trigger warning for leak
+  aRefCountedObj := TRefCountedObject.Create; // OK, should not trigger warning for leak
   aRefCountedItf := aRefCountedObj;
 
   if aRefCountedObj.RefCount = 1 then
@@ -167,7 +167,7 @@ begin
     aObj.Free;
   end;
 
-  if aObj.ClassName = 'NOTACLASS' then // should warn for Use After Free
+  if aObj.ClassName = 'NOTACLASS' then // WRONG, should warn for Use After Free
     raise Exception.Create('Error Message');
 
   aObj := TObject.Create;
@@ -176,7 +176,7 @@ begin
     FreeAndNil(aObj);
   end;
 
-  if aObj.ClassName = 'NOTACLASS' then // should warn for Use After Free
+  if aObj.ClassName = 'NOTACLASS' then // WRONG, should warn for Use After Free
     raise Exception.Create('Error Message');
 end;
 

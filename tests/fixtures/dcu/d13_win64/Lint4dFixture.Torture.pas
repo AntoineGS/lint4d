@@ -4,6 +4,7 @@ interface
 
 uses
   System.SysUtils,
+  System.Variants,
   Lint4dFixture.Classes,
   Lint4dFixture.Interfaces,
   Lint4dFixture.Enums;

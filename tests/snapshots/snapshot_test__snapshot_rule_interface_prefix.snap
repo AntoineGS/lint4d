@@ -1,0 +1,17 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 79
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "interface-prefix",
+    "severity": "hint",
+    "message": "Interface 'Doable' should start with 'I' prefix.",
+    "line": 6,
+    "column": 3,
+    "end_line": 6,
+    "end_column": 9,
+    "help": "Rename to 'IDoable'."
+  }
+]

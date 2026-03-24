@@ -1,0 +1,17 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 55
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "bare-except",
+    "severity": "warning",
+    "message": "Bare except block catches all exceptions without specifying a type.",
+    "line": 11,
+    "column": 3,
+    "end_line": 11,
+    "end_column": 9,
+    "help": "Use 'on E: ExceptionType do' to catch specific exceptions, or add a 'raise' statement to re-raise after cleanup."
+  }
+]

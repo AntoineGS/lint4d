@@ -1,0 +1,17 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 49
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "empty-except",
+    "severity": "warning",
+    "message": "Empty except block silently swallows exceptions.",
+    "line": 11,
+    "column": 3,
+    "end_line": 11,
+    "end_column": 9,
+    "help": "Add an exception handler or log the error. Use 'on E: Exception do ...' to handle specific exceptions."
+  }
+]

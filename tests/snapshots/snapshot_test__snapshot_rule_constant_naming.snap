@@ -1,0 +1,27 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 85
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "constant-naming",
+    "severity": "hint",
+    "message": "Constant 'maxSize' should use UPPER_CASE naming convention.",
+    "line": 6,
+    "column": 3,
+    "end_line": 6,
+    "end_column": 10,
+    "help": "Rename 'maxSize' to 'MAX_SIZE'."
+  },
+  {
+    "rule_id": "constant-naming",
+    "severity": "hint",
+    "message": "Constant 'defaultName' should use UPPER_CASE naming convention.",
+    "line": 7,
+    "column": 3,
+    "end_line": 7,
+    "end_column": 14,
+    "help": "Rename 'defaultName' to 'DEFAULT_NAME'."
+  }
+]

@@ -1,0 +1,27 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 73
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "type-prefix",
+    "severity": "hint",
+    "message": "Type 'MyClass' should start with 'T' prefix (or 'E' for exception classes).",
+    "line": 6,
+    "column": 3,
+    "end_line": 6,
+    "end_column": 10,
+    "help": "Rename to 'TMyClass'."
+  },
+  {
+    "rule_id": "type-prefix",
+    "severity": "hint",
+    "message": "Type 'BadRecord' should start with 'T' prefix (or 'E' for exception classes).",
+    "line": 11,
+    "column": 3,
+    "end_line": 11,
+    "end_column": 12,
+    "help": "Rename to 'TBadRecord'."
+  }
+]

@@ -1,0 +1,17 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 97
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "with-statement",
+    "severity": "warning",
+    "message": "'with' statement obscures scope and can cause subtle bugs.",
+    "line": 15,
+    "column": 5,
+    "end_line": 15,
+    "end_column": 9,
+    "help": "Use explicit qualified access (e.g., 'obj.Field') instead of 'with obj do'."
+  }
+]

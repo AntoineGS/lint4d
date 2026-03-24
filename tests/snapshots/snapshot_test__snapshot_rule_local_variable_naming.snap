@@ -1,0 +1,27 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 91
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "local-variable-naming",
+    "severity": "hint",
+    "message": "Local variable 'MyCounter' should use camelCase naming convention.",
+    "line": 9,
+    "column": 3,
+    "end_line": 9,
+    "end_column": 12,
+    "help": "Rename 'MyCounter' to follow camelCase convention."
+  },
+  {
+    "rule_id": "local-variable-naming",
+    "severity": "hint",
+    "message": "Local variable 'AnotherBadName' should use camelCase naming convention.",
+    "line": 10,
+    "column": 3,
+    "end_line": 10,
+    "end_column": 17,
+    "help": "Rename 'AnotherBadName' to follow camelCase convention."
+  }
+]

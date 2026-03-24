@@ -1,0 +1,17 @@
+---
+source: tests/snapshot_test.rs
+assertion_line: 61
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "resource-leak-unprotected",
+    "severity": "error",
+    "message": "Statement uses 'obj' between constructor and try..finally block. If this line raises an exception, the object will leak.",
+    "line": 12,
+    "column": 3,
+    "end_line": 12,
+    "end_column": 16,
+    "help": "Move this statement inside the try block, immediately after the constructor assignment."
+  }
+]

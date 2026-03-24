@@ -1,4 +1,4 @@
-use lint4d::dcu::{DcuUnit, DcuVersion, DcuPlatform, TypeInfo, TypeKind, TypeRef, MethodInfo, MethodKind, FieldInfo, Visibility};
+use lint4d::dcu::{DcuUnit, DcuVersion, DcuPlatform, TypeInfo, TypeKind, MethodInfo, MethodKind};
 use lint4d::dcu::ProjectContext;
 
 fn make_test_unit() -> DcuUnit {

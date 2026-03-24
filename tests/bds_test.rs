@@ -1,4 +1,4 @@
-use lint4d::discovery::bds::{bds_version_for_project, BdsInfo};
+use lint4d::discovery::bds::bds_version_for_project;
 
 #[test]
 fn maps_project_version_19_5_to_bds_23() {
@@ -48,7 +48,7 @@ fn rsvars_path_construction() {
 
 #[test]
 fn discover_bds_root_uses_explicit_path() {
-    use lint4d::discovery::bds::{discover_bds_root, rsvars_bat_path};
+    use lint4d::discovery::bds::discover_bds_root;
 
     // Create a fake BDS root with bin/rsvars.bat
     let dir = tempfile::TempDir::new().unwrap();

@@ -19,7 +19,7 @@ pub fn parse_magic(data: &[u8]) -> Result<(DcuVersion, DcuPlatform), DcuError> {
 pub struct UnitHeader {
     pub version: DcuVersion,
     pub platform: DcuPlatform,
-    /// The fully-qualified unit name (e.g. `CDAPI.Adapter.Data.Types`).
+    /// The fully-qualified unit name (e.g. `Lint4dFixture.Classes`).
     pub name: String,
     /// Raw flags value from the header.
     pub flags: u32,
@@ -58,14 +58,14 @@ pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     // Skip compiler_stamp (4 bytes) + project_stamp (4 bytes) + flags_lo (1 byte) + flags_hi (1 byte).
     reader.skip(10)?;
 
-    // Read the namespace name (e.g. "CDAPI.Adapter.Data" for unit "CDAPI.Adapter.Data.Types").
+    // Read the namespace name (e.g. "Lint4dFixture" for unit "Lint4dFixture.Classes").
     // We don't use this value directly; we skip past it.
     let _namespace = reader.read_name()?;
 
     // Skip 10 bytes of intermediate fields between namespace and source filename.
     reader.skip(10)?;
 
-    // Read the source filename (e.g. "CDAPI.Adapter.Data.Types.pas").
+    // Read the source filename (e.g. "Lint4dFixture.Classes.pas").
     let source_file = reader.read_name()?;
 
     // Derive the unit name by stripping the ".pas" extension.

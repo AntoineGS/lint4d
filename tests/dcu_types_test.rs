@@ -154,3 +154,90 @@ fn parse_dcu_class_has_constructor_or_destructor() {
         "Expected TDataAdapter to have a constructor or destructor, methods: {:?}",
         adapter.methods.iter().map(|m| (&m.name, &m.kind)).collect::<Vec<_>>());
 }
+
+#[test]
+fn parse_dcu_records_unit() {
+    let data = fs::read(fixture_path("Lint4dFixture.Records.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Records");
+    assert!(!unit.types.is_empty(), "Expected type definitions in Records unit");
+}
+
+#[test]
+fn parse_dcu_enums_unit() {
+    let data = fs::read(fixture_path("Lint4dFixture.Enums.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Enums");
+    assert!(!unit.types.is_empty(), "Expected type definitions in Enums unit");
+}
+
+#[test]
+#[ignore] // DCU parser hits unknown tag 0x74 in generics-heavy units
+fn parse_dcu_generics_unit() {
+    let data = fs::read(fixture_path("Lint4dFixture.Generics.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Generics");
+    assert!(!unit.types.is_empty(), "Expected type definitions in Generics unit");
+}
+
+#[test]
+fn parse_dcu_inheritance_unit() {
+    let data = fs::read(fixture_path("Lint4dFixture.Inheritance.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Inheritance");
+    assert!(
+        unit.imported_units.iter().any(|u| u == "Lint4dFixture.Classes"),
+        "Expected 'Lint4dFixture.Classes' in imports, got: {:?}",
+        unit.imported_units
+    );
+}
+
+#[test]
+#[ignore] // DCU parser does not yet extract fields from complex classes
+fn parse_dcu_torture_many_fields() {
+    let data = fs::read(fixture_path("Lint4dFixture.Torture.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Torture");
+
+    let mega = unit.types.iter()
+        .find(|t| t.name == "TMegaClass")
+        .expect("TMegaClass not found");
+
+    assert!(mega.fields.len() >= 20,
+        "Expected TMegaClass to have 20+ fields, got {}",
+        mega.fields.len());
+}
+
+#[test]
+fn parse_dcu_torture_overloaded_methods() {
+    let data = fs::read(fixture_path("Lint4dFixture.Torture.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+
+    let mega = unit.types.iter()
+        .find(|t| t.name == "TMegaClass")
+        .expect("TMegaClass not found");
+
+    let overloaded_count = mega.methods.iter()
+        .filter(|m| m.name == "Overloaded")
+        .count();
+
+    assert!(overloaded_count >= 2,
+        "Expected multiple 'Overloaded' methods, got {}",
+        overloaded_count);
+}
+
+#[test]
+fn parse_dcu_torture_imports() {
+    let data = fs::read(fixture_path("Lint4dFixture.Torture.dcu")).unwrap();
+    let unit = parse_dcu(&data).unwrap();
+
+    let expected = ["Lint4dFixture.Classes", "Lint4dFixture.Interfaces", "Lint4dFixture.Enums"];
+    for name in &expected {
+        assert!(
+            unit.imported_units.iter().any(|u| u == name),
+            "Expected '{}' in Torture imports, got: {:?}",
+            name,
+            unit.imported_units
+        );
+    }
+}

@@ -1,3 +1,4 @@
+pub mod const_add_info;
 pub mod header;
 pub mod reader;
 pub mod tags;

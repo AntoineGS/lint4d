@@ -29,5 +29,13 @@ insta = { version = "1", features = ["json"] }
 assert_cmd = "2"
 predicates = "3"
 
+[dev-dependencies.criterion]
+version = "0.5"
+features = ["html_reports"]
+
+[[bench]]
+name = "lint_bench"
+harness = false
+
 [lints.rust]
 warnings = "deny"

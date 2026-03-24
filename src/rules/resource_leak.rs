@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Tree};
 
@@ -222,23 +222,40 @@ impl Rule for ResourceLeakNoTryRule {
     }
 }
 
-/// Recursively walk the AST looking for block-like nodes and check for the
-/// no-try pattern.
 fn visit_blocks_no_try(
-    node: Node,
+    root: Node,
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
     ctx: &mut LintContext,
 ) {
-    if node.kind() == "block" {
-        check_block_no_try(node, source, project, uses, ctx);
+    // Build a map of class name → field names from AST class declarations
+    // in the current file. This covers classes defined in the same unit
+    // (which won't be in the DCU search path).
+    let ast_fields = collect_ast_class_fields(root, source);
+
+    // 1. Check blocks inside defProc nodes (class methods + standalone procs)
+    let procs = collect_leak_check_procs(root, source);
+    for proc_info in &procs {
+        let block = match proc_info.block {
+            Some(b) => b,
+            None => continue,
+        };
+        let field_names: Vec<String> = if proc_info.class_name.is_empty() {
+            Vec::new()
+        } else {
+            // Try AST fields first (same-file class), then fall back to DCU.
+            let key = proc_info.class_name.to_lowercase();
+            ast_fields
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| project.get_field_names(&proc_info.class_name, uses))
+        };
+        check_block_no_try(block, source, project, uses, &field_names, ctx);
     }
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        visit_blocks_no_try(child, source, project, uses, ctx);
-    }
+    // 2. Check top-level blocks not inside any defProc
+    visit_non_proc_blocks(root, source, project, uses, ctx);
 }
 
 /// Check a block for constructor assignments that have no matching try block
@@ -254,6 +271,7 @@ fn check_block_no_try(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    field_names: &[String],
     ctx: &mut LintContext,
 ) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
@@ -276,7 +294,7 @@ fn check_block_no_try(
 
         // Skip field assignments: fields are owned by the class and freed
         // in the destructor.
-        if is_field_name(&var_name) {
+        if field_names.iter().any(|f| f.eq_ignore_ascii_case(&var_name)) {
             continue;
         }
 
@@ -511,15 +529,6 @@ fn collect_uses_recursive(node: Node, source: &[u8], units: &mut Vec<String>) {
 
 // ─── Common helpers ──────────────────────────────────────────────────────────
 
-/// Check whether a variable name follows the Delphi field naming convention.
-///
-/// Fields in Delphi conventionally start with 'F' followed by an uppercase
-/// letter (e.g., `FDatabase`, `FAdapter`).
-fn is_field_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    bytes.len() >= 2 && bytes[0] == b'F' && bytes[1].is_ascii_uppercase()
-}
-
 /// Check whether a `try` block (either finally or except) frees the given variable.
 fn try_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool {
     finally_frees_variable(try_node, source, var_name)
@@ -559,4 +568,118 @@ fn extract_constructor_assignment_with_rhs<'a>(
     }
 
     Some((node_text(lhs, source), rhs))
+}
+
+// ─── AST class field collector ────────────────────────────────────────────────
+
+/// Collect field names from class declarations in the AST (same file).
+///
+/// Returns a map from lowercase class name to its field names.
+fn collect_ast_class_fields(root: Node, source: &[u8]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    collect_ast_class_fields_recursive(root, source, &mut map);
+    map
+}
+
+fn collect_ast_class_fields_recursive(
+    node: Node,
+    source: &[u8],
+    out: &mut HashMap<String, Vec<String>>,
+) {
+    if node.kind() == "declType" {
+        if let Some((class_name, fields)) = parse_class_fields(node, source) {
+            out.insert(class_name.to_lowercase(), fields);
+            return;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_ast_class_fields_recursive(child, source, out);
+    }
+}
+
+/// Parse a `declType` node: if it declares a class, return (class_name, field_names).
+fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<String>)> {
+    let name_node = node.child(0)?;
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(name_node, source);
+
+    let mut cursor = node.walk();
+    let decl_class = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "declClass")?;
+
+    let mut fields = Vec::new();
+    let mut class_cursor = decl_class.walk();
+    for section in decl_class.children(&mut class_cursor) {
+        if section.kind() == "declSection" {
+            let mut section_cursor = section.walk();
+            for item in section.children(&mut section_cursor) {
+                if item.kind() == "declField" {
+                    if let Some(id_node) = item.child(0) {
+                        if id_node.kind() == "identifier" {
+                            fields.push(node_text(id_node, source));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some((name, fields))
+}
+
+// ─── Proc-aware block visitor ────────────────────────────────────────────────
+
+/// Info about a procedure for leak checking — includes standalone procs.
+struct LeakCheckProc<'a> {
+    class_name: String, // empty for standalone procedures
+    block: Option<Node<'a>>,
+}
+
+/// Collect all defProc nodes, including standalone procedures (empty class_name).
+fn collect_leak_check_procs<'a>(root: Node<'a>, source: &[u8]) -> Vec<LeakCheckProc<'a>> {
+    let mut result = Vec::new();
+    collect_leak_check_procs_recursive(root, source, &mut result);
+    result
+}
+
+fn collect_leak_check_procs_recursive<'a>(
+    node: Node<'a>,
+    source: &[u8],
+    out: &mut Vec<LeakCheckProc<'a>>,
+) {
+    if node.kind() == "defProc" {
+        let class_name = crate::rules::field_leak::parse_def_proc(node, source)
+            .map(|(cn, _, _, _)| cn)
+            .unwrap_or_default();
+        let block = crate::rules::field_leak::get_method_block(node);
+        out.push(LeakCheckProc { class_name, block });
+        return; // Don't recurse inside defProc
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_leak_check_procs_recursive(child, source, out);
+    }
+}
+
+/// Check blocks that are NOT inside any defProc (e.g., top-level program block).
+fn visit_non_proc_blocks(
+    node: Node,
+    source: &[u8],
+    project: &ProjectContext,
+    uses: &[String],
+    ctx: &mut LintContext,
+) {
+    if node.kind() == "defProc" {
+        return; // Skip — already handled by the defProc-based path
+    }
+    if node.kind() == "block" {
+        check_block_no_try(node, source, project, uses, &[], ctx);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_non_proc_blocks(child, source, project, uses, ctx);
+    }
 }

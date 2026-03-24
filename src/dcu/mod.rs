@@ -218,6 +218,14 @@ impl ProjectContext {
         None
     }
 
+    /// Get field names for a class type, searching across used units.
+    pub fn get_field_names(&self, class_name: &str, uses: &[String]) -> Vec<String> {
+        match self.resolve_type(class_name, uses) {
+            Some(ty) => ty.fields.iter().map(|f| f.name.clone()).collect(),
+            None => Vec::new(),
+        }
+    }
+
     pub fn is_class_type(&self, name: &str, uses: &[String]) -> Option<bool> {
         self.resolve_type(name, uses).map(|t| t.kind == TypeKind::Class)
     }

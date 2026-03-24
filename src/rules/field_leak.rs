@@ -201,7 +201,7 @@ fn collect_fields(decl_class: Node, source: &[u8]) -> Vec<String> {
 /// Extract class name, method name, and flags from a `defProc` node.
 ///
 /// Returns `(class_name, method_name, is_constructor, is_destructor)`.
-fn parse_def_proc(def_proc: Node, source: &[u8]) -> Option<(String, String, bool, bool)> {
+pub(crate) fn parse_def_proc(def_proc: Node, source: &[u8]) -> Option<(String, String, bool, bool)> {
     let mut cursor = def_proc.walk();
     let decl_proc = def_proc
         .children(&mut cursor)
@@ -239,7 +239,7 @@ fn parse_def_proc(def_proc: Node, source: &[u8]) -> Option<(String, String, bool
 }
 
 /// Find the `block` child of a `defProc` node.
-fn get_method_block(def_proc: Node) -> Option<Node> {
+pub(crate) fn get_method_block(def_proc: Node) -> Option<Node> {
     let mut cursor = def_proc.walk();
     let result = def_proc.children(&mut cursor).find(|c| c.kind() == "block");
     result

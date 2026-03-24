@@ -331,6 +331,25 @@ fn resource_leak_no_try_dcu_flags_no_refcount_descendant() {
 }
 
 #[test]
+fn resource_leak_no_try_flags_fvar_in_standalone_proc() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_fvar_standalone.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "F-prefixed local var in standalone proc should be flagged: {:?}",
+        matches
+    );
+}
+
+#[test]
 fn resource_leak_no_try_dcu_skips_true_interface() {
     // Simulate a DCU confirming IMyService is an interface.
     let unit = DcuUnit {

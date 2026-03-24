@@ -201,6 +201,20 @@ fn resource_leak_no_try_flags_no_refcount_object() {
     );
 }
 
+#[test]
+fn resource_leak_no_try_skipped_without_context() {
+    let diagnostics = lint_fixture("tests/fixtures/resource_leak/bad_no_try.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "resource-leak-no-try should be skipped without DCU context, got: {:?}",
+        matches
+    );
+}
+
 /// Helper: lint a fixture with a synthetic `ProjectContext` providing DCU type info.
 fn lint_fixture_with_context(
     fixture_path: &str,

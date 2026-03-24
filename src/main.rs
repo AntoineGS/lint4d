@@ -250,6 +250,18 @@ fn real_main() {
     // Build the rule registry once and share across all files.
     let registry = RuleRegistry::new();
 
+    if project_context.is_none() {
+        for rule in registry.all_rules() {
+            if rule.requires_context() {
+                eprintln!(
+                    "lint4d: info: rule '{}' skipped: no DCU paths configured \
+                     (use --dcu-path or --project)",
+                    rule.meta().id
+                );
+            }
+        }
+    }
+
     // Process files in parallel
     let mut file_results: Vec<_> = files
         .par_iter()

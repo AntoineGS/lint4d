@@ -217,7 +217,8 @@ impl Rule for ResourceLeakNoTryRule {
         ctx: &mut LintContext,
     ) {
         let uses = extract_uses_clauses(tree.root_node(), source);
-        visit_blocks_no_try(tree.root_node(), source, project, &uses, ctx);
+        let ast_intf_types = collect_ast_interface_types(tree.root_node(), source);
+        visit_blocks_no_try(tree.root_node(), source, project, &uses, &ast_intf_types, ctx);
     }
 }
 
@@ -226,6 +227,7 @@ fn visit_blocks_no_try(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    ast_intf_types: &HashSet<String>,
     ctx: &mut LintContext,
 ) {
     // Build a map of class name → field names from AST class declarations
@@ -250,11 +252,11 @@ fn visit_blocks_no_try(
                 .cloned()
                 .unwrap_or_else(|| project.get_field_names(&proc_info.class_name, uses))
         };
-        check_block_no_try(block, source, project, uses, &field_names, ctx);
+        check_block_no_try(block, source, project, uses, ast_intf_types, &field_names, ctx);
     }
 
     // 2. Check top-level blocks not inside any defProc
-    visit_non_proc_blocks(root, source, project, uses, ctx);
+    visit_non_proc_blocks(root, source, project, uses, ast_intf_types, ctx);
 }
 
 /// Check a block for constructor assignments that have no matching try block
@@ -270,11 +272,12 @@ fn check_block_no_try(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    ast_intf_types: &HashSet<String>,
     field_names: &[String],
     ctx: &mut LintContext,
 ) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
-    let interface_vars = collect_interface_vars(block, source, project, uses);
+    let interface_vars = collect_interface_vars(block, source, project, uses, ast_intf_types);
 
     for (i, child) in children.iter().enumerate() {
         if child.kind() != "assignment" {
@@ -370,6 +373,7 @@ fn collect_interface_vars(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    ast_intf_types: &HashSet<String>,
 ) -> HashSet<String> {
     let mut result = HashSet::new();
 
@@ -393,7 +397,7 @@ fn collect_interface_vars(
                 Some(tn) => tn,
                 None => continue,
             };
-            if !is_interface_type(&type_name, project, uses) {
+            if !is_interface_type(&type_name, project, uses, ast_intf_types) {
                 continue;
             }
             // Collect all identifier names in this declVar (handles `a, b: IFoo`).
@@ -409,10 +413,34 @@ fn collect_interface_vars(
     result
 }
 
+/// Well-known interface types from the implicit `System` unit.
+/// These are always available without a `uses` clause and may not be
+/// present in loaded DCUs (the `System` unit is often missing from
+/// configured DCU paths).
+const BUILTIN_INTERFACE_TYPES: &[&str] = &["IInterface", "IUnknown", "IInvokable"];
+
 /// Determine whether a type name refers to an interface type.
 ///
-/// Uses `ProjectContext` DCU metadata for a definitive answer.
-fn is_interface_type(type_name: &str, project: &ProjectContext, uses: &[String]) -> bool {
+/// Checks well-known built-in interface types first, then same-file AST
+/// declarations, then falls back to `ProjectContext` DCU metadata.
+fn is_interface_type(
+    type_name: &str,
+    project: &ProjectContext,
+    uses: &[String],
+    ast_intf_types: &HashSet<String>,
+) -> bool {
+    if BUILTIN_INTERFACE_TYPES
+        .iter()
+        .any(|&b| b.eq_ignore_ascii_case(type_name))
+    {
+        return true;
+    }
+    if ast_intf_types
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(type_name))
+    {
+        return true;
+    }
     project.is_interface_type(type_name, uses).unwrap_or(false)
 }
 
@@ -637,6 +665,36 @@ fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<String>)
     Some((name, fields))
 }
 
+/// Collect interface type names from `declType` nodes in the AST.
+///
+/// Recognises types like `IMyService = interface ... end;` so that
+/// same-file interface declarations are available even without DCU metadata.
+fn collect_ast_interface_types(root: Node, source: &[u8]) -> HashSet<String> {
+    let mut result = HashSet::new();
+    collect_ast_interface_types_recursive(root, source, &mut result);
+    result
+}
+
+fn collect_ast_interface_types_recursive(node: Node, source: &[u8], out: &mut HashSet<String>) {
+    if node.kind() == "declType" {
+        if let Some(type_node) = node.child_by_field_name("type") {
+            if type_node.kind() == "declIntf" {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    out.insert(node_text(name_node, source));
+                } else if let Some(first) = node.child(0) {
+                    if first.kind() == "identifier" {
+                        out.insert(node_text(first, source));
+                    }
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_ast_interface_types_recursive(child, source, out);
+    }
+}
+
 // ─── Proc-aware block visitor ────────────────────────────────────────────────
 
 /// Info about a procedure for leak checking — includes standalone procs.
@@ -677,16 +735,17 @@ fn visit_non_proc_blocks(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    ast_intf_types: &HashSet<String>,
     ctx: &mut LintContext,
 ) {
     if node.kind() == "defProc" {
         return; // Skip — already handled by the defProc-based path
     }
     if node.kind() == "block" {
-        check_block_no_try(node, source, project, uses, &[], ctx);
+        check_block_no_try(node, source, project, uses, ast_intf_types, &[], ctx);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_non_proc_blocks(child, source, project, uses, ctx);
+        visit_non_proc_blocks(child, source, project, uses, ast_intf_types, ctx);
     }
 }

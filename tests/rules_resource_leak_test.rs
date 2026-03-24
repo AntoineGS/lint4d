@@ -180,8 +180,11 @@ fn resource_leak_no_try_skips_field_in_any_method() {
 
 #[test]
 fn resource_leak_no_try_skips_interface_refcounted() {
-    let diagnostics =
-        lint_fixture("tests/fixtures/resource_leak/good_interface_refcounted.pas");
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_interface_refcounted.pas",
+        &project,
+    );
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")

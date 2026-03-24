@@ -6,7 +6,7 @@ use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers;
 use crate::rules::helpers::{
-    is_constructor_call, node_text, statements_free_variable, text_references_variable,
+    ast_references_variable, is_constructor_call, node_text, statements_free_variable,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
@@ -101,8 +101,7 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
         // that reference the variable.
         for sibling in children.iter().take(try_idx).skip(i + 1) {
             let stmt = *sibling;
-            let stmt_text = node_text(stmt, source);
-            if text_references_variable(&stmt_text, &var_name) {
+            if ast_references_variable(stmt, source, &var_name) {
                 let start = stmt.start_position();
                 let end = stmt.end_position();
                 ctx.report(Diagnostic {

@@ -146,6 +146,28 @@ fn is_free_or_destroy_call(dot_node: Node, source: &[u8], var_name: &str) -> boo
         && (rhs_text.eq_ignore_ascii_case("free") || rhs_text.eq_ignore_ascii_case("destroy"))
 }
 
+/// AST-based check: does any descendant of `node` reference the given variable?
+///
+/// Walks the AST for `identifier` nodes matching the variable name (case-insensitive).
+/// Tree-sitter excludes comments and string literals from identifier nodes.
+pub fn ast_references_variable(node: Node, source: &[u8], var_name: &str) -> bool {
+    if node.kind() == "identifier" {
+        let text = node_text(node, source);
+        if text.eq_ignore_ascii_case(var_name) {
+            return true;
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if ast_references_variable(child, source, var_name) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Check whether a source text references a variable name as a standalone word.
 pub fn text_references_variable(text: &str, var_name: &str) -> bool {
     let lower = text.to_lowercase();

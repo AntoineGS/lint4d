@@ -456,6 +456,24 @@ fn resource_leak_no_try_flags_non_owner_constructor_args() {
 }
 
 #[test]
+fn resource_leak_no_try_skips_immediate_free() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/good_free_after_create.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Immediate .Free after constructor should not flag resource-leak-no-try: {:?}",
+        matches
+    );
+}
+
+#[test]
 fn resource_leak_no_try_flags_free_in_comment() {
     let project = empty_project();
     let diagnostics = lint_fixture_with_context(

@@ -350,6 +350,17 @@ fn check_block_no_try(
             continue;
         }
 
+        // Skip when the very next statement frees the variable — no code can
+        // throw between the constructor and the cleanup.
+        let next_stmt = children[(i + 1)..]
+            .iter()
+            .find(|n| n.is_named() && !n.is_extra() && n.kind() != "kEnd");
+        if let Some(next) = next_stmt {
+            if helpers::ast_frees_variable(*next, source, &var_name) {
+                continue;
+            }
+        }
+
         // Look ahead for any try block (finally or except) that frees this variable.
         let has_protecting_try = children[(i + 1)..].iter().any(|sibling| {
             sibling.kind() == "try" && try_frees_variable(*sibling, source, &var_name)

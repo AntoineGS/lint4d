@@ -284,14 +284,35 @@ fn run_lint_pipeline(
         }
     }
 
-    // Process files in parallel
-    let mut file_results: Vec<_> = files
-        .par_iter()
+    // Pre-read all files for SourceContext and linting
+    let file_sources: Vec<(FileInfo, Vec<u8>)> = files
+        .iter()
         .filter_map(|file| {
             let source = fs::read(&file.path).ok()?;
-            let diagnostics =
-                run_lint_with_context(file, &source, config, project_context.as_ref(), None, &registry);
-            Some((file.path.to_string_lossy().to_string(), source, diagnostics))
+            Some((file.clone(), source))
+        })
+        .collect();
+
+    // Build SourceContext from all source files
+    let source_refs: Vec<(&FileInfo, &[u8])> = file_sources
+        .iter()
+        .map(|(f, s)| (f, s.as_slice()))
+        .collect();
+    let source_context = lint4d::source_context::SourceContext::build(&source_refs);
+
+    // Process files in parallel
+    let mut file_results: Vec<_> = file_sources
+        .par_iter()
+        .map(|(file, source)| {
+            let diagnostics = run_lint_with_context(
+                file,
+                source,
+                config,
+                project_context.as_ref(),
+                Some(&source_context),
+                &registry,
+            );
+            (file.path.to_string_lossy().to_string(), source.to_vec(), diagnostics)
         })
         .collect();
 

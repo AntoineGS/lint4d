@@ -1,7 +1,7 @@
 use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
-use crate::rules::field_leak::{get_method_block, parse_def_proc};
+use crate::rules::field_leak::parse_def_proc;
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
 // ---------------------------------------------------------------------------
@@ -334,17 +334,19 @@ fn check_destructor_raises(def_proc: Node, source: &[u8], ctx: &mut LintContext)
         return;
     }
 
-    let Some(block) = get_method_block(def_proc) else {
-        return;
-    };
-
-    find_unguarded_raises(block, source, &class_name, &method_name, ctx);
+    let mut cursor = def_proc.walk();
+    for child in def_proc.children(&mut cursor) {
+        // Skip the method declaration header
+        if child.kind() == "declProc" {
+            continue;
+        }
+        find_unguarded_raises(child, &class_name, &method_name, ctx);
+    }
 }
 
 /// Recursively scan for raise statements, skipping try..except subtrees.
 fn find_unguarded_raises(
     node: Node,
-    source: &[u8],
     class_name: &str,
     method_name: &str,
     ctx: &mut LintContext,
@@ -369,14 +371,15 @@ fn find_unguarded_raises(
     // Descend into all children (including try..finally, nested procs, etc.)
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        find_unguarded_raises(child, source, class_name, method_name, ctx);
+        find_unguarded_raises(child, class_name, method_name, ctx);
     }
 }
 
 /// Check if a try node has an except clause.
 fn try_has_except(node: Node) -> bool {
     node.children_by_field_name("except", &mut node.walk())
-        .any(|_| true)
+        .next()
+        .is_some()
 }
 
 /// Check if an ERROR node represents a bare `raise;`.

@@ -7,3 +7,5 @@ tests/fixtures/projects/TestProject1/__history/
 *.exe
 
 tests/fixtures/projects/TestProject1/TestProject1.dproj.local
+
+tests/fixtures/projects/TestProject1/__recovery/

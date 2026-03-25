@@ -640,3 +640,19 @@ fn resource_leak_no_try_skips_non_factory_function() {
         matches
     );
 }
+
+#[test]
+fn resource_leak_no_try_flags_indirect_factory() {
+    let path = "tests/fixtures/resource_leak/bad_factory_indirect.pas";
+    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Indirect factory (factory calling factory) should flag: {:?}",
+        matches
+    );
+}

@@ -6,7 +6,8 @@ use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers;
 use crate::rules::helpers::{
-    ast_references_variable, is_constructor_call, node_text, statements_free_variable,
+    ast_references_variable, extract_uses_clauses, is_constructor_call, node_text,
+    statements_free_variable,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
@@ -606,30 +607,6 @@ fn assigned_to_interface_var(
         }
     }
     false
-}
-
-/// Extract all unit names from `declUses` nodes in the AST.
-///
-/// Collects unit names from both `interface` and `implementation` uses clauses.
-fn extract_uses_clauses(root: Node, source: &[u8]) -> Vec<String> {
-    let mut units = Vec::new();
-    collect_uses_recursive(root, source, &mut units);
-    units
-}
-
-fn collect_uses_recursive(node: Node, source: &[u8], units: &mut Vec<String>) {
-    if node.kind() == "declUses" {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "moduleName" {
-                units.push(node_text(child, source));
-            }
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_uses_recursive(child, source, units);
-    }
 }
 
 // ─── Common helpers ──────────────────────────────────────────────────────────

@@ -209,6 +209,30 @@ pub fn constructor_is_owner_managed(
     }
 }
 
+/// Extract all unit names from `declUses` nodes in the AST.
+///
+/// Collects unit names from both `interface` and `implementation` uses clauses.
+pub fn extract_uses_clauses(root: Node, source: &[u8]) -> Vec<String> {
+    let mut units = Vec::new();
+    collect_uses_recursive(root, source, &mut units);
+    units
+}
+
+fn collect_uses_recursive(node: Node, source: &[u8], units: &mut Vec<String>) {
+    if node.kind() == "declUses" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "moduleName" {
+                units.push(node_text(child, source));
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_uses_recursive(child, source, units);
+    }
+}
+
 /// AST-based check: does the exprCall have at least one non-nil argument?
 fn call_has_non_nil_args(call_node: Node, source: &[u8]) -> bool {
     // Look for the args field on exprCall

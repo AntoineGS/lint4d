@@ -676,3 +676,19 @@ fn resource_leak_no_try_flags_cross_file_factory() {
         matches
     );
 }
+
+#[test]
+fn resource_leak_unprotected_flags_factory_call() {
+    let path = "tests/fixtures/resource_leak/bad_factory_unprotected.pas";
+    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-unprotected")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Factory call with code before try should flag resource-leak-unprotected: {:?}",
+        matches
+    );
+}

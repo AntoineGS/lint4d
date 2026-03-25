@@ -345,12 +345,7 @@ fn check_destructor_raises(def_proc: Node, source: &[u8], ctx: &mut LintContext)
 }
 
 /// Recursively scan for raise statements, skipping try..except subtrees.
-fn find_unguarded_raises(
-    node: Node,
-    class_name: &str,
-    method_name: &str,
-    ctx: &mut LintContext,
-) {
+fn find_unguarded_raises(node: Node, class_name: &str, method_name: &str, ctx: &mut LintContext) {
     // Normal raise statement
     if node.kind() == "raise" {
         report_raise(node, class_name, method_name, ctx);

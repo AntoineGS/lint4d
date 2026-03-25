@@ -5,7 +5,7 @@ use lint4d::rules::{RuleCategory, RuleRegistry};
 fn registry_returns_all_rules() {
     let registry = RuleRegistry::new();
     let rules = registry.all_rules();
-    assert_eq!(rules.len(), 14);
+    assert_eq!(rules.len(), 15);
 }
 
 #[test]

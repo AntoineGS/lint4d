@@ -1,0 +1,65 @@
+---
+source: tests/snapshot_test.rs
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "raise-in-destructor",
+    "severity": "warning",
+    "message": "Unguarded 'raise' in destructor TDirectRaise.Destroy may cause memory leaks or broken teardown",
+    "line": 31,
+    "column": 3,
+    "end_line": 31,
+    "end_column": 34,
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+  },
+  {
+    "rule_id": "raise-in-destructor",
+    "severity": "warning",
+    "message": "Unguarded 'raise' in destructor TRaiseInFinally.Destroy may cause memory leaks or broken teardown",
+    "line": 39,
+    "column": 5,
+    "end_line": 39,
+    "end_column": 45,
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+  },
+  {
+    "rule_id": "raise-in-destructor",
+    "severity": "warning",
+    "message": "Unguarded 'raise' in destructor TBareReraise.Destroy may cause memory leaks or broken teardown",
+    "line": 49,
+    "column": 3,
+    "end_line": 50,
+    "end_column": 13,
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+  },
+  {
+    "rule_id": "parse-error",
+    "severity": "warning",
+    "message": "unexpected token \";\"",
+    "line": 49,
+    "column": 8,
+    "end_line": 49,
+    "end_column": 9
+  },
+  {
+    "rule_id": "inherited-order",
+    "severity": "hint",
+    "message": "'inherited' should be the last statement in destructor TBareReraise.Destroy",
+    "line": 50,
+    "column": 3,
+    "end_line": 50,
+    "end_column": 12,
+    "help": "Move the 'inherited' call to the end of the destructor to ensure your cleanup runs before the parent class is destroyed"
+  },
+  {
+    "rule_id": "raise-in-destructor",
+    "severity": "warning",
+    "message": "Unguarded 'raise' in destructor TNestedProcRaise.Destroy may cause memory leaks or broken teardown",
+    "line": 58,
+    "column": 5,
+    "end_line": 58,
+    "end_column": 52,
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+  }
+]

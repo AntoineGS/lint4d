@@ -10,6 +10,7 @@ type
   TForm1 = class(TForm)
     procedure FormCreate(Sender: TObject);
   public
+    constructor Create; override;
     destructor Destroy; override;
   private
     FObj: TObject;
@@ -45,15 +46,23 @@ end;
 
 function CreateBadObject: TObject;
 begin
-  result := TObject.Create;
+  result := TObject.Create; // OK, should warn for for leak, needs try..except..free
 
-  if result.ClassName <> 'somestring' then // OK, should warn for for leak, needs try..except..free
+  if result.ClassName <> 'somestring' then 
     raise Exception.Create('test');
+end;
+
+constructor TForm1.Create;
+begin
+  if self.ClassName = 'SOMETHING' then
+    raise Exception.Create('someexception');
+
+  inherited Create(nil); // OK, should warn as issue
 end;
 
 procedure TForm1.FormCreate(Sender: TObject);
 begin
-  FObj := TObject.Create; // should warn as memory leak
+  FObj := TObject.Create; // OK, should warn as memory leak
   TestRefCounted;
   TestNilBeforeFree;
   TestNoFreeButHasTryFinally;
@@ -62,14 +71,13 @@ begin
   TestCreateObjectInSubFunction;
   TestObjInSubFunctionMayLeak;
   TestFreeAfterCreate;
-  inherited; // WRONG, should warn as inherited should typically be at the top in Create
 end;
 
 destructor TForm1.Destroy;
 begin
-  inherited;
+  inherited; // OK, should warn for running code after inherited in Destroy
 
-  if FObj.ClassName = 'TObject' then // WRONG, should warn for running code after inherited in Destroy
+  if FObj.ClassName = 'TObject' then 
     Exit
   else
     Raise Exception.Create('uhoh'); // WRONG, should warn as raising in a destructor is bad practice
@@ -79,7 +87,7 @@ procedure TForm1.TestFreeAfterCreate;
 var
   aObj: TObject;
 begin
-  aObj := TObject.Create; // WRONG, should not warn for leak
+  aObj := TObject.Create; // OK, should not warn for leak
   aObj.Free;
 end;
 

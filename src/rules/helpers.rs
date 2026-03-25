@@ -209,6 +209,31 @@ pub fn constructor_is_owner_managed(
     }
 }
 
+/// Extract the unit name from a parsed AST.
+///
+/// The tree-sitter-pascal grammar places the unit declaration as a direct child
+/// of the root node with kind `"unit"` (or `"program"`/`"library"` for other file
+/// types). The name itself is stored in a `moduleName` child of that node.
+///
+/// Returns `None` if no unit/program/library declaration is found.
+pub fn extract_unit_name(root: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "unit" | "program" | "library" => {
+                let mut inner = child.walk();
+                for grandchild in child.children(&mut inner) {
+                    if grandchild.kind() == "moduleName" {
+                        return Some(node_text(grandchild, source));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Extract all unit names from `declUses` nodes in the AST.
 ///
 /// Collects unit names from both `interface` and `implementation` uses clauses.

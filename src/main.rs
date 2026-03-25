@@ -312,7 +312,11 @@ fn run_lint_pipeline(
                 Some(&source_context),
                 &registry,
             );
-            (file.path.to_string_lossy().to_string(), source.to_vec(), diagnostics)
+            (
+                file.path.to_string_lossy().to_string(),
+                source.to_vec(),
+                diagnostics,
+            )
         })
         .collect();
 

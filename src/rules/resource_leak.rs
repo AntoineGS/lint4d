@@ -60,8 +60,7 @@ impl Rule for ResourceLeakUnprotectedRule {
         _config: &crate::config::Config,
         ctx: &mut LintContext<'_>,
     ) {
-        let unit_name = helpers::extract_unit_name(tree.root_node(), source)
-            .unwrap_or_default();
+        let unit_name = helpers::extract_unit_name(tree.root_node(), source).unwrap_or_default();
         let uses = extract_uses_clauses(tree.root_node(), source);
         visit_blocks(tree.root_node(), source, &unit_name, &uses, ctx);
     }
@@ -69,7 +68,13 @@ impl Rule for ResourceLeakUnprotectedRule {
 
 /// Recursively walk the AST looking for block-like nodes that contain
 /// sequential statements (e.g., `begin..end` blocks).
-fn visit_blocks(node: Node, source: &[u8], unit_name: &str, uses: &[String], ctx: &mut LintContext) {
+fn visit_blocks(
+    node: Node,
+    source: &[u8],
+    unit_name: &str,
+    uses: &[String],
+    ctx: &mut LintContext,
+) {
     if node.kind() == "block" {
         check_block_for_leaks(node, source, unit_name, uses, ctx);
     }
@@ -85,7 +90,13 @@ fn visit_blocks(node: Node, source: &[u8], unit_name: &str, uses: &[String], ctx
 ///
 /// If we find statements between the constructor/factory assignment and the `try`
 /// node whose `finally` clause frees the same variable, flag them.
-fn check_block_for_leaks(block: Node, source: &[u8], unit_name: &str, uses: &[String], ctx: &mut LintContext) {
+fn check_block_for_leaks(
+    block: Node,
+    source: &[u8],
+    unit_name: &str,
+    uses: &[String],
+    ctx: &mut LintContext,
+) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
 
     for (i, child) in children.iter().enumerate() {
@@ -240,8 +251,7 @@ impl Rule for ResourceLeakNoTryRule {
         ctx: &mut LintContext<'_>,
     ) {
         let uses = extract_uses_clauses(tree.root_node(), source);
-        let unit_name = helpers::extract_unit_name(tree.root_node(), source)
-            .unwrap_or_default();
+        let unit_name = helpers::extract_unit_name(tree.root_node(), source).unwrap_or_default();
         let ast_intf_types = collect_ast_interface_types(tree.root_node(), source);
         visit_blocks_no_try(
             tree.root_node(),
@@ -310,6 +320,7 @@ fn visit_blocks_no_try(
 /// - Field assignments in methods: fields are freed by the destructor
 /// - `Result` assignments: ownership transfers to the caller
 /// - Reference-counted objects: assigned to interface-typed variables
+#[allow(clippy::too_many_arguments)]
 fn check_block_no_try(
     block: Node,
     source: &[u8],
@@ -820,7 +831,16 @@ fn visit_non_proc_blocks(
         return; // Skip — already handled by the defProc-based path
     }
     if node.kind() == "block" {
-        check_block_no_try(node, source, project, uses, unit_name, ast_intf_types, &[], ctx);
+        check_block_no_try(
+            node,
+            source,
+            project,
+            uses,
+            unit_name,
+            ast_intf_types,
+            &[],
+            ctx,
+        );
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

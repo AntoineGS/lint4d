@@ -121,11 +121,14 @@ fn snapshot_rule_raise_in_destructor_clean() {
     insta::assert_json_snapshot!("snapshot_rule_raise_in_destructor_clean", diagnostics);
 }
 
-fn lint_diagnostics_with_source_ctx(fixture_paths: &[&str], lint_path: &str) -> Vec<lint4d::engine::Diagnostic> {
+fn lint_diagnostics_with_source_ctx(
+    fixture_paths: &[&str],
+    lint_path: &str,
+) -> Vec<lint4d::engine::Diagnostic> {
+    use lint4d::dcu::ProjectContext;
     use lint4d::engine::run_lint_with_context;
     use lint4d::rules::RuleRegistry;
     use lint4d::source_context::SourceContext;
-    use lint4d::dcu::ProjectContext;
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_data: Vec<(FileInfo, Vec<u8>)> = fixture_paths
@@ -145,7 +148,14 @@ fn lint_diagnostics_with_source_ctx(fixture_paths: &[&str], lint_path: &str) -> 
     let file = FileInfo::new(PathBuf::from(lint_path));
     let config = "version = 1".parse::<lint4d::config::Config>().unwrap();
     let registry = RuleRegistry::new();
-    run_lint_with_context(&file, &source, &config, Some(&project), Some(&source_ctx), &registry)
+    run_lint_with_context(
+        &file,
+        &source,
+        &config,
+        Some(&project),
+        Some(&source_ctx),
+        &registry,
+    )
 }
 
 #[test]

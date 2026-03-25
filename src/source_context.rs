@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use crate::engine::FileInfo;
-use crate::rules::helpers::{extract_unit_name, extract_uses_clauses, is_constructor_call, node_text};
+use crate::rules::helpers::{
+    extract_unit_name, extract_uses_clauses, is_constructor_call, node_text,
+};
 
 /// Registry of factory functions discovered by pre-pass source analysis.
 ///
@@ -155,7 +157,12 @@ fn extract_func_meta(
     let mut result_callees: Vec<String> = Vec::new();
 
     // Scan all assignments in the block for `Result := ...` patterns.
-    scan_assignments(block, source, &mut has_direct_constructor, &mut result_callees);
+    scan_assignments(
+        block,
+        source,
+        &mut has_direct_constructor,
+        &mut result_callees,
+    );
 
     Some(FuncMeta {
         unit: unit_name.to_string(),

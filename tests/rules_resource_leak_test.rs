@@ -445,7 +445,8 @@ fn resource_leak_no_try_flags_non_owner_constructor_args() {
     let file = FileInfo::new(PathBuf::from("test.pas"));
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
-    let diagnostics = run_lint_with_context(&file, source, &config, Some(&project), None, &registry);
+    let diagnostics =
+        run_lint_with_context(&file, source, &config, Some(&project), None, &registry);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -592,7 +593,14 @@ fn lint_fixture_with_source_ctx(
     let file = FileInfo::new(PathBuf::from(lint_path));
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
-    run_lint_with_context(&file, &source, &config, Some(&project), Some(&source_ctx), &registry)
+    run_lint_with_context(
+        &file,
+        &source,
+        &config,
+        Some(&project),
+        Some(&source_ctx),
+        &registry,
+    )
 }
 
 #[test]
@@ -661,10 +669,7 @@ fn resource_leak_no_try_flags_indirect_factory() {
 fn resource_leak_no_try_flags_cross_file_factory() {
     let factory_path = "tests/fixtures/resource_leak/factory_unit.pas";
     let consumer_path = "tests/fixtures/resource_leak/bad_factory_cross_file.pas";
-    let diagnostics = lint_fixture_with_source_ctx(
-        &[factory_path, consumer_path],
-        consumer_path,
-    );
+    let diagnostics = lint_fixture_with_source_ctx(&[factory_path, consumer_path], consumer_path);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")

@@ -1,5 +1,7 @@
 use tree_sitter::Node;
 
+use crate::source_context::SourceContext;
+
 /// Extract the UTF-8 text of a node from the source bytes.
 pub fn node_text(node: Node, source: &[u8]) -> String {
     std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
@@ -255,6 +257,63 @@ fn collect_uses_recursive(node: Node, source: &[u8], units: &mut Vec<String>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_uses_recursive(child, source, units);
+    }
+}
+
+/// Check whether a node represents a call to a registered factory function.
+/// Returns `Some(function_name)` if it is, `None` otherwise.
+pub fn is_factory_call(
+    node: Node,
+    source: &[u8],
+    unit_name: &str,
+    uses: &[String],
+    source_ctx: &SourceContext,
+) -> Option<String> {
+    let call_name = extract_simple_call_name(node, source)?;
+    let call_lower = call_name.to_lowercase();
+
+    // Check current unit first.
+    if source_ctx.is_factory(unit_name, &call_lower) {
+        return Some(call_name);
+    }
+
+    // Check uses clauses in reverse order (Delphi semantics).
+    for unit in uses.iter().rev() {
+        if source_ctx.is_factory(unit, &call_lower) {
+            return Some(call_name);
+        }
+    }
+
+    None
+}
+
+/// Extract a simple call name from a node, stripping call wrappers.
+///
+/// - `identifier` -> the identifier text
+/// - `exprCall` wrapping `identifier` -> the identifier text
+/// - `exprDot` with two identifiers -> the RHS identifier (but not `.Create`)
+/// - Anything else -> None
+fn extract_simple_call_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, source)),
+        "exprCall" => {
+            let entity = node.child_by_field_name("entity")?;
+            extract_simple_call_name(entity, source)
+        }
+        "exprDot" => {
+            let lhs = node.child_by_field_name("lhs")?;
+            let rhs = node.child_by_field_name("rhs")?;
+            if lhs.kind() == "identifier" && rhs.kind() == "identifier" {
+                let rhs_text = node_text(rhs, source);
+                if rhs_text.eq_ignore_ascii_case("create") {
+                    return None; // Constructor, not factory
+                }
+                Some(rhs_text)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

@@ -60,41 +60,61 @@ impl Rule for ResourceLeakUnprotectedRule {
         _config: &crate::config::Config,
         ctx: &mut LintContext<'_>,
     ) {
-        visit_blocks(tree.root_node(), source, ctx);
+        let unit_name = helpers::extract_unit_name(tree.root_node(), source)
+            .unwrap_or_default();
+        let uses = extract_uses_clauses(tree.root_node(), source);
+        visit_blocks(tree.root_node(), source, &unit_name, &uses, ctx);
     }
 }
 
 /// Recursively walk the AST looking for block-like nodes that contain
 /// sequential statements (e.g., `begin..end` blocks).
-fn visit_blocks(node: Node, source: &[u8], ctx: &mut LintContext) {
+fn visit_blocks(node: Node, source: &[u8], unit_name: &str, uses: &[String], ctx: &mut LintContext) {
     if node.kind() == "block" {
-        check_block_for_leaks(node, source, ctx);
+        check_block_for_leaks(node, source, unit_name, uses, ctx);
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_blocks(child, source, ctx);
+        visit_blocks(child, source, unit_name, uses, ctx);
     }
 }
 
 /// Check a `block` node for the pattern:
-///   assignment (constructor)  ->  statement(s)  ->  try..finally
+///   assignment (constructor/factory)  ->  statement(s)  ->  try..finally
 ///
-/// If we find statements between the constructor assignment and the `try`
+/// If we find statements between the constructor/factory assignment and the `try`
 /// node whose `finally` clause frees the same variable, flag them.
-fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
+fn check_block_for_leaks(block: Node, source: &[u8], unit_name: &str, uses: &[String], ctx: &mut LintContext) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
 
     for (i, child) in children.iter().enumerate() {
-        // Step 1: Is this an assignment whose RHS is a constructor call?
+        // Step 1: Is this an assignment whose RHS is a constructor or factory call?
         if child.kind() != "assignment" {
             continue;
         }
 
-        let var_name = match extract_constructor_assignment(*child, source) {
-            Some(name) => name,
+        let lhs = match child.child_by_field_name("lhs") {
+            Some(l) => l,
             None => continue,
         };
+        let rhs = match child.child_by_field_name("rhs") {
+            Some(r) => r,
+            None => continue,
+        };
+        let var_name = node_text(lhs, source);
+
+        let is_constructor = is_constructor_call(rhs, source);
+        let factory_name = if !is_constructor {
+            ctx.source_ctx
+                .and_then(|sc| helpers::is_factory_call(rhs, source, unit_name, uses, sc))
+        } else {
+            None
+        };
+
+        if !is_constructor && factory_name.is_none() {
+            continue;
+        }
 
         // Step 2: Look ahead for a `try` node whose `finally` frees this variable.
         let mut try_index = None;
@@ -112,6 +132,11 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
 
         // Step 3: Flag any statements between the assignment and the try
         // that reference the variable.
+        let label = if factory_name.is_some() {
+            "factory call"
+        } else {
+            "constructor"
+        };
         for sibling in children.iter().take(try_idx).skip(i + 1) {
             let stmt = *sibling;
             if ast_references_variable(stmt, source, &var_name) {
@@ -121,9 +146,9 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
                     rule_id: "resource-leak-unprotected".to_string(),
                     severity: Severity::Error,
                     message: format!(
-                        "Statement uses '{}' between constructor and try..finally block. \
+                        "Statement uses '{}' between {} and try..finally block. \
                          If this line raises an exception, the object will leak.",
-                        var_name
+                        var_name, label
                     ),
                     line: start.row + 1,
                     column: start.column + 1,
@@ -138,21 +163,6 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
             }
         }
     }
-}
-
-/// If `node` is an assignment whose RHS looks like a constructor call
-/// (`TFoo.Create` or `TFoo.Create(...)`), return the LHS variable name.
-fn extract_constructor_assignment<'a>(node: Node<'a>, source: &'a [u8]) -> Option<String> {
-    // node.kind() == "assignment"
-    // Fields: lhs (identifier), operator (kAssign), rhs (exprDot or exprCall)
-    let lhs = node.child_by_field_name("lhs")?;
-    let rhs = node.child_by_field_name("rhs")?;
-
-    if !is_constructor_call(rhs, source) {
-        return None;
-    }
-
-    Some(node_text(lhs, source))
 }
 
 /// Check whether the `finally` clause of a `try` node frees the given variable.
@@ -230,12 +240,15 @@ impl Rule for ResourceLeakNoTryRule {
         ctx: &mut LintContext<'_>,
     ) {
         let uses = extract_uses_clauses(tree.root_node(), source);
+        let unit_name = helpers::extract_unit_name(tree.root_node(), source)
+            .unwrap_or_default();
         let ast_intf_types = collect_ast_interface_types(tree.root_node(), source);
         visit_blocks_no_try(
             tree.root_node(),
             source,
             project,
             &uses,
+            &unit_name,
             &ast_intf_types,
             ctx,
         );
@@ -247,6 +260,7 @@ fn visit_blocks_no_try(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    unit_name: &str,
     ast_intf_types: &HashSet<String>,
     ctx: &mut LintContext<'_>,
 ) {
@@ -277,6 +291,7 @@ fn visit_blocks_no_try(
             source,
             project,
             uses,
+            unit_name,
             ast_intf_types,
             &field_names,
             ctx,
@@ -284,7 +299,7 @@ fn visit_blocks_no_try(
     }
 
     // 2. Check top-level blocks not inside any defProc
-    visit_non_proc_blocks(root, source, project, uses, ast_intf_types, ctx);
+    visit_non_proc_blocks(root, source, project, uses, unit_name, ast_intf_types, ctx);
 }
 
 /// Check a block for constructor assignments that have no matching try block
@@ -300,6 +315,7 @@ fn check_block_no_try(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    unit_name: &str,
     ast_intf_types: &HashSet<String>,
     field_names: &[String],
     ctx: &mut LintContext<'_>,
@@ -312,31 +328,51 @@ fn check_block_no_try(
             continue;
         }
 
-        let (var_name, rhs_node) = match extract_constructor_assignment_with_rhs(*child, source) {
-            Some(pair) => pair,
+        let lhs = match child.child_by_field_name("lhs") {
+            Some(l) => l,
             None => continue,
         };
+        let rhs = match child.child_by_field_name("rhs") {
+            Some(r) => r,
+            None => continue,
+        };
+        let var_name = node_text(lhs, source);
 
-        // Skip owner-managed objects: constructor's first param descends from
-        // TComponent and a non-nil argument was passed.
-        let ctor_class_for_owner = extract_constructor_class_name(rhs_node, source);
-        if helpers::constructor_is_owner_managed(
-            rhs_node,
-            source,
-            ctor_class_for_owner.as_deref(),
-            project,
-            uses,
-        ) {
+        let is_constructor = is_constructor_call(rhs, source);
+        let factory_name = if !is_constructor {
+            ctx.source_ctx
+                .and_then(|sc| helpers::is_factory_call(rhs, source, unit_name, uses, sc))
+        } else {
+            None
+        };
+
+        if !is_constructor && factory_name.is_none() {
             continue;
         }
 
-        // Skip field assignments: fields are owned by the class and freed
-        // in the destructor.
-        if field_names
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(&var_name))
-        {
-            continue;
+        // --- Constructor-specific skip logic (not applied to factory calls) ---
+        if is_constructor {
+            // Skip owner-managed objects: constructor's first param descends from
+            // TComponent and a non-nil argument was passed.
+            let ctor_class_for_owner = extract_constructor_class_name(rhs, source);
+            if helpers::constructor_is_owner_managed(
+                rhs,
+                source,
+                ctor_class_for_owner.as_deref(),
+                project,
+                uses,
+            ) {
+                continue;
+            }
+
+            // Skip field assignments: fields are owned by the class and freed
+            // in the destructor.
+            if field_names
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&var_name))
+            {
+                continue;
+            }
         }
 
         // For `Result` assignments the function transfers ownership to the
@@ -345,55 +381,60 @@ fn check_block_no_try(
         // protecting try block, the object leaks before the caller receives
         // it.  Check that every raise-bearing sibling is a try node itself.
         if var_name.eq_ignore_ascii_case("result") {
-            let has_unprotected_raise = children[(i + 1)..].iter().any(|s| {
-                s.is_named() && !s.is_extra() && s.kind() != "try" && ast_contains_raise(*s)
-            });
-            if has_unprotected_raise {
-                let start = child.start_position();
-                let end = child.end_position();
-                ctx.report(Diagnostic {
-                    rule_id: "resource-leak-no-try".to_string(),
-                    severity: Severity::Warning,
-                    message: format!(
-                        "'{}' is assigned via constructor but a raise statement after it \
-                         is not protected by try..except. If the raise executes, the \
-                         object will leak.",
-                        var_name
-                    ),
-                    line: start.row + 1,
-                    column: start.column + 1,
-                    end_line: end.row + 1,
-                    end_column: end.column + 1,
-                    help: Some(
-                        "Wrap all code after the constructor in a try..except block \
-                         that frees Result and re-raises."
-                            .to_string(),
-                    ),
+            if is_constructor {
+                let has_unprotected_raise = children[(i + 1)..].iter().any(|s| {
+                    s.is_named() && !s.is_extra() && s.kind() != "try" && ast_contains_raise(*s)
                 });
+                if has_unprotected_raise {
+                    let start = child.start_position();
+                    let end = child.end_position();
+                    ctx.report(Diagnostic {
+                        rule_id: "resource-leak-no-try".to_string(),
+                        severity: Severity::Warning,
+                        message: format!(
+                            "'{}' is assigned via constructor but a raise statement after it \
+                             is not protected by try..except. If the raise executes, the \
+                             object will leak.",
+                            var_name
+                        ),
+                        line: start.row + 1,
+                        column: start.column + 1,
+                        end_line: end.row + 1,
+                        end_column: end.column + 1,
+                        help: Some(
+                            "Wrap all code after the constructor in a try..except block \
+                             that frees Result and re-raises."
+                                .to_string(),
+                        ),
+                    });
+                }
             }
             continue;
         }
 
-        // Skip reference-counted objects: if the variable itself is
-        // interface-typed, or is later assigned to an interface-typed
-        // variable, reference counting manages the object's lifetime.
-        // However, some classes (e.g. TNoRefCountObject) implement
-        // IInterface with stub _AddRef/_Release that do NOT free the
-        // object, so those must still be flagged.
-        let ctor_class = extract_constructor_class_name(rhs_node, source);
-        let non_refcounting = ctor_class
-            .as_deref()
-            .is_some_and(|cn| is_non_refcounting_class(cn, project, uses));
+        // --- Constructor-specific skip logic: reference counting ---
+        if is_constructor {
+            // Skip reference-counted objects: if the variable itself is
+            // interface-typed, or is later assigned to an interface-typed
+            // variable, reference counting manages the object's lifetime.
+            // However, some classes (e.g. TNoRefCountObject) implement
+            // IInterface with stub _AddRef/_Release that do NOT free the
+            // object, so those must still be flagged.
+            let ctor_class = extract_constructor_class_name(rhs, source);
+            let non_refcounting = ctor_class
+                .as_deref()
+                .is_some_and(|cn| is_non_refcounting_class(cn, project, uses));
 
-        if !non_refcounting
-            && (interface_vars.contains(&var_name)
-                || assigned_to_interface_var(&children, i, &var_name, &interface_vars, source))
-        {
-            continue;
+            if !non_refcounting
+                && (interface_vars.contains(&var_name)
+                    || assigned_to_interface_var(&children, i, &var_name, &interface_vars, source))
+            {
+                continue;
+            }
         }
 
         // Skip when the very next statement frees the variable — no code can
-        // throw between the constructor and the cleanup.
+        // throw between the constructor/factory and the cleanup.
         let next_stmt = children[(i + 1)..]
             .iter()
             .find(|n| n.is_named() && !n.is_extra() && n.kind() != "kEnd");
@@ -411,14 +452,23 @@ fn check_block_no_try(
         if !has_protecting_try {
             let start = child.start_position();
             let end = child.end_position();
-            ctx.report(Diagnostic {
-                rule_id: "resource-leak-no-try".to_string(),
-                severity: Severity::Warning,
-                message: format!(
+            let message = if let Some(ref fname) = factory_name {
+                format!(
+                    "Factory function '{}' returns a newly-created object assigned to '{}' \
+                     without try..finally protection. If an exception occurs, the object will leak.",
+                    fname, var_name
+                )
+            } else {
+                format!(
                     "'{}' is created without a try..finally block. \
                      If an exception occurs after construction, the object will leak.",
                     var_name
-                ),
+                )
+            };
+            ctx.report(Diagnostic {
+                rule_id: "resource-leak-no-try".to_string(),
+                severity: Severity::Warning,
+                message,
                 line: start.row + 1,
                 column: start.column + 1,
                 end_line: end.row + 1,
@@ -636,22 +686,6 @@ fn except_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool 
     false
 }
 
-/// Like `extract_constructor_assignment` but also returns the RHS node so
-/// we can inspect whether the constructor has arguments.
-fn extract_constructor_assignment_with_rhs<'a>(
-    node: Node<'a>,
-    source: &[u8],
-) -> Option<(String, Node<'a>)> {
-    let lhs = node.child_by_field_name("lhs")?;
-    let rhs = node.child_by_field_name("rhs")?;
-
-    if !is_constructor_call(rhs, source) {
-        return None;
-    }
-
-    Some((node_text(lhs, source), rhs))
-}
-
 // ─── AST class field collector ────────────────────────────────────────────────
 
 /// Collect field names from class declarations in the AST (same file).
@@ -778,6 +812,7 @@ fn visit_non_proc_blocks(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
+    unit_name: &str,
     ast_intf_types: &HashSet<String>,
     ctx: &mut LintContext<'_>,
 ) {
@@ -785,11 +820,11 @@ fn visit_non_proc_blocks(
         return; // Skip — already handled by the defProc-based path
     }
     if node.kind() == "block" {
-        check_block_no_try(node, source, project, uses, ast_intf_types, &[], ctx);
+        check_block_no_try(node, source, project, uses, unit_name, ast_intf_types, &[], ctx);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_non_proc_blocks(child, source, project, uses, ast_intf_types, ctx);
+        visit_non_proc_blocks(child, source, project, uses, unit_name, ast_intf_types, ctx);
     }
 }
 

@@ -656,3 +656,23 @@ fn resource_leak_no_try_flags_indirect_factory() {
         matches
     );
 }
+
+#[test]
+fn resource_leak_no_try_flags_cross_file_factory() {
+    let factory_path = "tests/fixtures/resource_leak/factory_unit.pas";
+    let consumer_path = "tests/fixtures/resource_leak/bad_factory_cross_file.pas";
+    let diagnostics = lint_fixture_with_source_ctx(
+        &[factory_path, consumer_path],
+        consumer_path,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Cross-file factory call should flag resource-leak-no-try: {:?}",
+        matches
+    );
+}

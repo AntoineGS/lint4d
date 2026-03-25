@@ -57,7 +57,7 @@ impl Rule for ResourceLeakUnprotectedRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         visit_blocks(tree.root_node(), source, ctx);
     }
@@ -213,7 +213,7 @@ impl Rule for ResourceLeakNoTryRule {
         _tree: &Tree,
         _source: &[u8],
         _config: &crate::config::Config,
-        _ctx: &mut LintContext,
+        _ctx: &mut LintContext<'_>,
     ) {
         // Engine skips check() for rules where requires_context() == true.
         // This method exists only to satisfy the trait.
@@ -226,7 +226,7 @@ impl Rule for ResourceLeakNoTryRule {
         source: &[u8],
         _config: &crate::config::Config,
         project: &ProjectContext,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         let uses = extract_uses_clauses(tree.root_node(), source);
         let ast_intf_types = collect_ast_interface_types(tree.root_node(), source);
@@ -247,7 +247,7 @@ fn visit_blocks_no_try(
     project: &ProjectContext,
     uses: &[String],
     ast_intf_types: &HashSet<String>,
-    ctx: &mut LintContext,
+    ctx: &mut LintContext<'_>,
 ) {
     // Build a map of class name → field names from AST class declarations
     // in the current file. This covers classes defined in the same unit
@@ -301,7 +301,7 @@ fn check_block_no_try(
     uses: &[String],
     ast_intf_types: &HashSet<String>,
     field_names: &[String],
-    ctx: &mut LintContext,
+    ctx: &mut LintContext<'_>,
 ) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
     let interface_vars = collect_interface_vars(block, source, project, uses, ast_intf_types);
@@ -802,7 +802,7 @@ fn visit_non_proc_blocks(
     project: &ProjectContext,
     uses: &[String],
     ast_intf_types: &HashSet<String>,
-    ctx: &mut LintContext,
+    ctx: &mut LintContext<'_>,
 ) {
     if node.kind() == "defProc" {
         return; // Skip — already handled by the defProc-based path

@@ -55,7 +55,7 @@ impl Rule for IdentifierCasingRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         let root = tree.root_node();
         let scope = collect_file_scope(root, source);
@@ -116,7 +116,7 @@ fn walk_and_check<'a>(
     scopes: &Scopes,
     method_scope: &HashMap<String, String>,
     class_fields: Option<&HashMap<String, String>>,
-    ctx: &mut LintContext,
+    ctx: &mut LintContext<'_>,
 ) {
     if node.kind() == "identifier" {
         check_identifier_usage(node, source, scopes, method_scope, class_fields, ctx);
@@ -155,7 +155,7 @@ fn check_identifier_usage(
     scopes: &Scopes,
     method_scope: &HashMap<String, String>,
     class_fields: Option<&HashMap<String, String>>,
-    ctx: &mut LintContext,
+    ctx: &mut LintContext<'_>,
 ) {
     // Skip if this is a declaration position.
     if is_declaration_position(node) {

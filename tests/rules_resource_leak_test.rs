@@ -270,7 +270,7 @@ fn lint_fixture_with_context(
     let file = FileInfo::new(PathBuf::from(fixture_path));
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
-    run_lint_with_context(&file, &source, &config, Some(project), &registry)
+    run_lint_with_context(&file, &source, &config, Some(project), None, &registry)
 }
 
 fn empty_project() -> ProjectContext {
@@ -444,7 +444,7 @@ fn resource_leak_no_try_flags_non_owner_constructor_args() {
     let file = FileInfo::new(PathBuf::from("test.pas"));
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
-    let diagnostics = run_lint_with_context(&file, source, &config, Some(&project), &registry);
+    let diagnostics = run_lint_with_context(&file, source, &config, Some(&project), None, &registry);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")

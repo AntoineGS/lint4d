@@ -290,7 +290,7 @@ fn run_lint_pipeline(
         .filter_map(|file| {
             let source = fs::read(&file.path).ok()?;
             let diagnostics =
-                run_lint_with_context(file, &source, config, project_context.as_ref(), &registry);
+                run_lint_with_context(file, &source, config, project_context.as_ref(), None, &registry);
             Some((file.path.to_string_lossy().to_string(), source, diagnostics))
         })
         .collect();

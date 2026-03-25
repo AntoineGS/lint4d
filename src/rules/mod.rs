@@ -11,6 +11,7 @@ pub mod scope;
 use tree_sitter::Tree;
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
+use crate::source_context::SourceContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleCategory {
@@ -28,14 +29,23 @@ pub struct RuleMeta {
     pub description: &'static str,
 }
 
-pub struct LintContext {
+pub struct LintContext<'a> {
     pub diagnostics: Vec<Diagnostic>,
+    pub source_ctx: Option<&'a SourceContext>,
 }
 
-impl LintContext {
+impl<'a> LintContext<'a> {
     pub fn new() -> Self {
         LintContext {
             diagnostics: Vec::new(),
+            source_ctx: None,
+        }
+    }
+
+    pub fn with_source_ctx(source_ctx: &'a SourceContext) -> Self {
+        LintContext {
+            diagnostics: Vec::new(),
+            source_ctx: Some(source_ctx),
         }
     }
 
@@ -44,7 +54,7 @@ impl LintContext {
     }
 }
 
-impl Default for LintContext {
+impl Default for LintContext<'_> {
     fn default() -> Self {
         Self::new()
     }
@@ -63,7 +73,7 @@ pub trait Rule: Send + Sync {
         tree: &Tree,
         source: &[u8],
         config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     );
 
     fn check_with_context(
@@ -73,7 +83,7 @@ pub trait Rule: Send + Sync {
         source: &[u8],
         config: &crate::config::Config,
         _project: &crate::dcu::ProjectContext,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         self.check(file, tree, source, config, ctx);
     }

@@ -430,7 +430,7 @@ impl Rule for FieldNotFreedRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         check_field_not_freed(tree.root_node(), source, ctx);
     }
@@ -535,7 +535,7 @@ impl Rule for FieldReassignLeakRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         check_field_reassign_leak(tree.root_node(), source, ctx);
     }
@@ -583,7 +583,7 @@ fn check_constructor_reassigns(
     creations: &[FieldCreation],
     block: Node,
     source: &[u8],
-    ctx: &mut LintContext,
+    ctx: &mut LintContext<'_>,
 ) {
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -636,7 +636,7 @@ fn check_method_reassigns(
     source: &[u8],
     fields: &[String],
     constructor_fields: &HashSet<String>,
-    ctx: &mut LintContext,
+    ctx: &mut LintContext<'_>,
 ) {
     let creations = collect_field_creations_with_nodes(block, source, fields);
 

@@ -43,7 +43,7 @@ impl Rule for BareExceptRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         visit_bare_except(tree.root_node(), source, ctx);
     }
@@ -206,7 +206,7 @@ impl Rule for EmptyExceptRule {
         tree: &Tree,
         _source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         visit_node(tree.root_node(), ctx);
     }
@@ -307,7 +307,7 @@ impl Rule for RaiseInDestructorRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext,
+        ctx: &mut LintContext<'_>,
     ) {
         visit_destructor_raises(tree.root_node(), source, ctx);
     }

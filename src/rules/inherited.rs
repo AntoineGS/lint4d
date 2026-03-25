@@ -206,12 +206,215 @@ fn check_inherited_order(def_proc: Node, source: &[u8], ctx: &mut LintContext) {
     }
 }
 
-// Keep node_text in scope so it's available for Task 5 (inherited-missing)
-// when it imports from this module; suppress the dead-code warning in the
-// meantime.
-#[allow(dead_code)]
-fn _use_node_text_and_first_identifier() {
-    // These are used by inherited-missing (Task 5).
-    let _ = node_text as fn(_, _) -> _;
-    let _ = first_identifier as fn(_) -> _;
+// ─── Reintroduce detection helpers ──────────────────────────────────────────
+
+/// Check if a method is declared with `reintroduce` in the interface section.
+///
+/// Walks the AST root for `declType` nodes, finds matching class by name, and
+/// checks for `kReintroduce` inside a `procAttribute` child of the method.
+fn is_reintroduced(root: Node, class_name: &str, method_name: &str, source: &[u8]) -> bool {
+    find_reintroduce_recursive(root, class_name, method_name, source)
+}
+
+fn find_reintroduce_recursive(
+    node: Node,
+    class_name: &str,
+    method_name: &str,
+    source: &[u8],
+) -> bool {
+    if node.kind() == "declType" {
+        // Check if this is the class we're looking for.
+        // Use child_by_field_name("name") with first_identifier fallback
+        // (some grammar versions don't set the "name" field on declType).
+        let name_node = node
+            .child_by_field_name("name")
+            .or_else(|| first_identifier(node));
+        if let Some(name_node) = name_node {
+            let name = node_text(name_node, source);
+            if name.eq_ignore_ascii_case(class_name) {
+                // Find the declClass child
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "declClass" {
+                        return class_has_reintroduced_method(child, method_name, source);
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if find_reintroduce_recursive(child, class_name, method_name, source) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a `declClass` node contains a `declProc` for the given method
+/// with a `reintroduce` directive.
+fn class_has_reintroduced_method(decl_class: Node, method_name: &str, source: &[u8]) -> bool {
+    let mut cursor = decl_class.walk();
+    for child in decl_class.children(&mut cursor) {
+        // declProc can be direct child or inside declSection
+        if child.kind() == "declProc" {
+            if decl_proc_matches_and_reintroduced(child, method_name, source) {
+                return true;
+            }
+        } else if child.kind() == "declSection" {
+            let mut section_cursor = child.walk();
+            for section_child in child.children(&mut section_cursor) {
+                if section_child.kind() == "declProc" {
+                    if decl_proc_matches_and_reintroduced(section_child, method_name, source) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if a `declProc` node matches the method name and has `reintroduce`.
+fn decl_proc_matches_and_reintroduced(
+    decl_proc: Node,
+    method_name: &str,
+    source: &[u8],
+) -> bool {
+    // Get the method name from the declProc
+    let proc_name = if let Some(name_node) = decl_proc.child_by_field_name("name") {
+        node_text(name_node, source)
+    } else {
+        return false;
+    };
+
+    if !proc_name.eq_ignore_ascii_case(method_name) {
+        return false;
+    }
+
+    // Check for procAttribute > kReintroduce
+    let mut cursor = decl_proc.walk();
+    for child in decl_proc.children(&mut cursor) {
+        if child.kind() == "procAttribute" {
+            let mut attr_cursor = child.walk();
+            for attr_child in child.children(&mut attr_cursor) {
+                if attr_child.kind() == "kReintroduce" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ─── InheritedCallMissingRule ────────────────────────────────────────────────
+
+pub struct InheritedCallMissingRule {
+    meta: RuleMeta,
+}
+
+impl Default for InheritedCallMissingRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InheritedCallMissingRule {
+    pub fn new() -> Self {
+        InheritedCallMissingRule {
+            meta: RuleMeta {
+                id: "inherited-missing",
+                name: "Inherited Call Missing",
+                category: RuleCategory::DangerousPattern,
+                default_severity: Severity::Hint,
+                description: "Checks that constructors and destructors call 'inherited'.",
+            },
+        }
+    }
+}
+
+impl Rule for InheritedCallMissingRule {
+    fn meta(&self) -> &RuleMeta {
+        &self.meta
+    }
+
+    fn check(
+        &self,
+        _file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        _config: &crate::config::Config,
+        ctx: &mut LintContext,
+    ) {
+        visit_def_procs_missing(tree.root_node(), tree.root_node(), source, ctx);
+    }
+}
+
+fn visit_def_procs_missing(node: Node, root: Node, source: &[u8], ctx: &mut LintContext) {
+    if node.kind() == "defProc" {
+        check_inherited_missing(node, root, source, ctx);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_def_procs_missing(child, root, source, ctx);
+    }
+}
+
+fn check_inherited_missing(def_proc: Node, root: Node, source: &[u8], ctx: &mut LintContext) {
+    let Some((class_name, method_name, is_constructor, is_destructor)) =
+        parse_def_proc(def_proc, source)
+    else {
+        return;
+    };
+
+    if !is_constructor && !is_destructor {
+        return;
+    }
+
+    let Some(block) = get_method_block(def_proc) else {
+        return;
+    };
+
+    // Check if inherited exists anywhere in the block
+    if find_inherited(block).is_some() {
+        return; // Has inherited — all good
+    }
+
+    // Check if the method is reintroduced — if so, suppress
+    if is_reintroduced(root, &class_name, &method_name, source) {
+        return;
+    }
+
+    // Report on the declProc (header) node
+    let header = def_proc
+        .children(&mut def_proc.walk())
+        .find(|c| c.kind() == "declProc")
+        .unwrap_or(def_proc);
+    let start = header.start_position();
+    let end = header.end_position();
+
+    let kind = if is_constructor { "Constructor" } else { "Destructor" };
+
+    let help = if is_constructor {
+        "Add an 'inherited' call to ensure proper parent class initialization"
+    } else {
+        "Add an 'inherited' call to ensure proper parent class cleanup"
+    };
+
+    ctx.report(Diagnostic {
+        rule_id: "inherited-missing".to_string(),
+        severity: Severity::Hint,
+        message: format!(
+            "{} {}.{} does not call 'inherited'",
+            kind, class_name, method_name
+        ),
+        line: start.row + 1,
+        column: start.column + 1,
+        end_line: end.row + 1,
+        end_column: end.column + 1,
+        help: Some(help.to_string()),
+    });
 }

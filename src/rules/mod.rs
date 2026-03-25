@@ -99,6 +99,7 @@ impl RuleRegistry {
             Box::new(casing::IdentifierCasingRule::new()),
             Box::new(dangerous::WithStatementRule::new()),
             Box::new(inherited::InheritedCallOrderRule::new()),
+            Box::new(inherited::InheritedCallMissingRule::new()),
         ];
 
         RuleRegistry { rules }

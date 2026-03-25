@@ -71,3 +71,50 @@ fn inherited_order_nested_triggers_order_not_missing() {
         missing_matches
     );
 }
+
+// ─── inherited-missing ──────────────────────────────────────────────────────
+
+#[test]
+fn inherited_missing_bad() {
+    let diagnostics = lint_fixture("tests/fixtures/inherited/bad_inherited_missing.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "inherited-missing")
+        .collect();
+    // TMissingCtor.Create, TMissingDtor.Destroy, TMissingBoth.Create, TMissingBoth.Destroy
+    assert_eq!(
+        matches.len(),
+        4,
+        "Expected 4 inherited-missing diagnostics, got {}: {:?}",
+        matches.len(),
+        matches
+    );
+}
+
+#[test]
+fn inherited_missing_good_passes() {
+    let diagnostics = lint_fixture("tests/fixtures/inherited/good_inherited.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "inherited-missing")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Expected no inherited-missing diagnostics, got {:?}",
+        matches
+    );
+}
+
+#[test]
+fn inherited_missing_reintroduce_suppressed() {
+    let diagnostics = lint_fixture("tests/fixtures/inherited/good_inherited_reintroduce.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "inherited-missing")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Expected no inherited-missing diagnostics for reintroduced methods, got {:?}",
+        matches
+    );
+}

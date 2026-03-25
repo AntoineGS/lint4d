@@ -47,7 +47,7 @@ function CreateBadObject: TObject;
 begin
   result := TObject.Create;
 
-  if result.ClassName <> 'somestring' then // WRONG, should warn for for leak, needs try..except..free
+  if result.ClassName <> 'somestring' then // OK, should warn for for leak, needs try..except..free
     raise Exception.Create('test');
 end;
 
@@ -87,7 +87,7 @@ procedure TForm1.TestObjInSubFunctionMayLeak;
 var
   aObj: TObject;
 begin
-  aObj := CreateBadObject; // see subfunction
+  aObj := CreateBadObject; // OK, see subfunction
   try
   finally
     aObj.Free;

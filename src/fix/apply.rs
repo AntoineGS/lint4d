@@ -226,10 +226,7 @@ pub(crate) fn apply_edits(
         if window[1].end_byte > window[0].start_byte {
             return Err(format!(
                 "overlapping edits detected at byte offsets {}..{} and {}..{} — skipping file",
-                window[0].start_byte,
-                window[0].end_byte,
-                window[1].start_byte,
-                window[1].end_byte,
+                window[0].start_byte, window[0].end_byte, window[1].start_byte, window[1].end_byte,
             ));
         }
     }

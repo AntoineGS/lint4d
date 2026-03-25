@@ -2,13 +2,25 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum DcuError {
-    UnexpectedEof { context: &'static str },
-    UnsupportedVersion { magic: u32 },
-    UnknownTag { tag: u8, offset: usize },
-    UnresolvedTypeRef { index: u32 },
+    UnexpectedEof {
+        context: &'static str,
+    },
+    UnsupportedVersion {
+        magic: u32,
+    },
+    UnknownTag {
+        tag: u8,
+        offset: usize,
+    },
+    UnresolvedTypeRef {
+        index: u32,
+    },
     Io(std::io::Error),
     /// Wraps an inner error with the unit name being parsed.
-    InUnit { unit: String, source: Box<DcuError> },
+    InUnit {
+        unit: String,
+        source: Box<DcuError>,
+    },
 }
 
 impl fmt::Display for DcuError {

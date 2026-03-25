@@ -344,14 +344,9 @@ fn check_block_no_try(
         // protecting try block, the object leaks before the caller receives
         // it.  Check that every raise-bearing sibling is a try node itself.
         if var_name.eq_ignore_ascii_case("result") {
-            let has_unprotected_raise = children[(i + 1)..]
-                .iter()
-                .any(|s| {
-                    s.is_named()
-                        && !s.is_extra()
-                        && s.kind() != "try"
-                        && ast_contains_raise(*s)
-                });
+            let has_unprotected_raise = children[(i + 1)..].iter().any(|s| {
+                s.is_named() && !s.is_extra() && s.kind() != "try" && ast_contains_raise(*s)
+            });
             if has_unprotected_raise {
                 let start = child.start_position();
                 let end = child.end_position();

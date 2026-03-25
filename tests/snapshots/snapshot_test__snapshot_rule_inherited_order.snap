@@ -1,0 +1,36 @@
+---
+source: tests/snapshot_test.rs
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "inherited-order",
+    "severity": "hint",
+    "message": "'inherited' should be the first statement in constructor TOrderBadCtor.Create",
+    "line": 30,
+    "column": 3,
+    "end_line": 30,
+    "end_column": 12,
+    "help": "Move the 'inherited' call to the beginning of the constructor to ensure the parent class is fully initialized before accessing its members"
+  },
+  {
+    "rule_id": "inherited-order",
+    "severity": "hint",
+    "message": "'inherited' should be the last statement in destructor TOrderBadDtor.Destroy",
+    "line": 48,
+    "column": 3,
+    "end_line": 48,
+    "end_column": 12,
+    "help": "Move the 'inherited' call to the end of the destructor to ensure your cleanup runs before the parent class is destroyed"
+  },
+  {
+    "rule_id": "inherited-order",
+    "severity": "hint",
+    "message": "'inherited' should be the first statement in constructor TOrderBadCtorMiddle.Create",
+    "line": 56,
+    "column": 3,
+    "end_line": 56,
+    "end_column": 19,
+    "help": "Move the 'inherited' call to the beginning of the constructor to ensure the parent class is fully initialized before accessing its members"
+  }
+]

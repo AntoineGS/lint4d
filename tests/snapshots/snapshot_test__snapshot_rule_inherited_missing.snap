@@ -1,0 +1,46 @@
+---
+source: tests/snapshot_test.rs
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "inherited-missing",
+    "severity": "hint",
+    "message": "Constructor TMissingCtor.Create does not call 'inherited'",
+    "line": 27,
+    "column": 1,
+    "end_line": 27,
+    "end_column": 33,
+    "help": "Add an 'inherited' call to ensure proper parent class initialization"
+  },
+  {
+    "rule_id": "inherited-missing",
+    "severity": "hint",
+    "message": "Destructor TMissingDtor.Destroy does not call 'inherited'",
+    "line": 47,
+    "column": 1,
+    "end_line": 47,
+    "end_column": 33,
+    "help": "Add an 'inherited' call to ensure proper parent class cleanup"
+  },
+  {
+    "rule_id": "inherited-missing",
+    "severity": "hint",
+    "message": "Constructor TMissingBoth.Create does not call 'inherited'",
+    "line": 53,
+    "column": 1,
+    "end_line": 53,
+    "end_column": 33,
+    "help": "Add an 'inherited' call to ensure proper parent class initialization"
+  },
+  {
+    "rule_id": "inherited-missing",
+    "severity": "hint",
+    "message": "Destructor TMissingBoth.Destroy does not call 'inherited'",
+    "line": 58,
+    "column": 1,
+    "end_line": 58,
+    "end_column": 33,
+    "help": "Add an 'inherited' call to ensure proper parent class cleanup"
+  }
+]

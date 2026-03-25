@@ -96,3 +96,15 @@ fn snapshot_rule_with_statement() {
     let diagnostics = lint_diagnostics("tests/fixtures/dangerous/bad_with.pas");
     insta::assert_json_snapshot!("snapshot_rule_with_statement", diagnostics);
 }
+
+#[test]
+fn snapshot_rule_inherited_order() {
+    let diagnostics = lint_diagnostics("tests/fixtures/inherited/bad_inherited_order.pas");
+    insta::assert_json_snapshot!("snapshot_rule_inherited_order", diagnostics);
+}
+
+#[test]
+fn snapshot_rule_inherited_missing() {
+    let diagnostics = lint_diagnostics("tests/fixtures/inherited/bad_inherited_missing.pas");
+    insta::assert_json_snapshot!("snapshot_rule_inherited_missing", diagnostics);
+}

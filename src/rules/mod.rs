@@ -3,6 +3,7 @@ pub mod dangerous;
 pub mod exception;
 pub mod field_leak;
 pub mod helpers;
+pub mod inherited;
 pub mod naming;
 pub mod resource_leak;
 pub mod scope;
@@ -97,6 +98,7 @@ impl RuleRegistry {
             Box::new(naming::LocalVariableNamingRule::new()),
             Box::new(casing::IdentifierCasingRule::new()),
             Box::new(dangerous::WithStatementRule::new()),
+            Box::new(inherited::InheritedCallOrderRule::new()),
         ];
 
         RuleRegistry { rules }

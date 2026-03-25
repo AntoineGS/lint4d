@@ -5,6 +5,7 @@ use lint4d::dcu::{
 };
 use lint4d::engine::{run_lint, run_lint_with_context, FileInfo};
 use lint4d::rules::RuleRegistry;
+use lint4d::source_context::SourceContext;
 use std::fs;
 use std::path::PathBuf;
 
@@ -563,6 +564,79 @@ fn resource_leak_no_try_flags_result_raise_after_try() {
         matches.len(),
         1,
         "Result with raise after try..except should flag — protection must extend to end of function: {:?}",
+        matches
+    );
+}
+
+/// Lint a fixture file with a SourceContext built from the given files.
+/// Passes empty_project() so ResourceLeakNoTryRule runs (it requires context).
+fn lint_fixture_with_source_ctx(
+    fixture_paths: &[&str],
+    lint_path: &str,
+) -> Vec<lint4d::engine::Diagnostic> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let file_data: Vec<(FileInfo, Vec<u8>)> = fixture_paths
+        .iter()
+        .map(|p| {
+            let path = manifest.join(p);
+            let source = fs::read(&path).unwrap();
+            (FileInfo::new(PathBuf::from(p)), source)
+        })
+        .collect();
+    let refs: Vec<(&FileInfo, &[u8])> = file_data.iter().map(|(f, s)| (f, s.as_slice())).collect();
+    let source_ctx = SourceContext::build(&refs);
+
+    let project = empty_project();
+    let path = manifest.join(lint_path);
+    let source = fs::read(&path).unwrap();
+    let file = FileInfo::new(PathBuf::from(lint_path));
+    let config = "version = 1".parse::<Config>().unwrap();
+    let registry = RuleRegistry::new();
+    run_lint_with_context(&file, &source, &config, Some(&project), Some(&source_ctx), &registry)
+}
+
+#[test]
+fn resource_leak_no_try_flags_factory_call() {
+    let path = "tests/fixtures/resource_leak/bad_factory_no_try.pas";
+    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Factory call without try..finally should flag resource-leak-no-try: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_passes_factory_with_try() {
+    let path = "tests/fixtures/resource_leak/good_factory_protected.pas";
+    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Factory call with try..finally should not flag: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn resource_leak_no_try_skips_non_factory_function() {
+    let path = "tests/fixtures/resource_leak/good_not_factory.pas";
+    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "resource-leak-no-try")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Non-factory function should not flag resource-leak-no-try: {:?}",
         matches
     );
 }

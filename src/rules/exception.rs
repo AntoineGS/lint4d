@@ -1,6 +1,7 @@
 use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
+use crate::rules::field_leak::{get_method_block, parse_def_proc};
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
 // ---------------------------------------------------------------------------
@@ -264,4 +265,148 @@ fn check_try_node(node: Node, ctx: &mut LintContext) {
             });
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// RaiseInDestructorRule
+// ---------------------------------------------------------------------------
+
+pub struct RaiseInDestructorRule {
+    meta: RuleMeta,
+}
+
+impl Default for RaiseInDestructorRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RaiseInDestructorRule {
+    pub fn new() -> Self {
+        RaiseInDestructorRule {
+            meta: RuleMeta {
+                id: "raise-in-destructor",
+                name: "Raise In Destructor",
+                category: RuleCategory::ExceptionHandling,
+                default_severity: Severity::Warning,
+                description: "Detects unguarded 'raise' statements inside destructors \
+                              that can escape and cause memory leaks or broken teardown.",
+            },
+        }
+    }
+}
+
+impl Rule for RaiseInDestructorRule {
+    fn meta(&self) -> &RuleMeta {
+        &self.meta
+    }
+
+    fn check(
+        &self,
+        _file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        _config: &crate::config::Config,
+        ctx: &mut LintContext,
+    ) {
+        visit_destructor_raises(tree.root_node(), source, ctx);
+    }
+}
+
+fn visit_destructor_raises(node: Node, source: &[u8], ctx: &mut LintContext) {
+    if node.kind() == "defProc" {
+        check_destructor_raises(node, source, ctx);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_destructor_raises(child, source, ctx);
+    }
+}
+
+fn check_destructor_raises(def_proc: Node, source: &[u8], ctx: &mut LintContext) {
+    let Some((class_name, method_name, _is_constructor, is_destructor)) =
+        parse_def_proc(def_proc, source)
+    else {
+        return;
+    };
+
+    if !is_destructor {
+        return;
+    }
+
+    let Some(block) = get_method_block(def_proc) else {
+        return;
+    };
+
+    find_unguarded_raises(block, source, &class_name, &method_name, ctx);
+}
+
+/// Recursively scan for raise statements, skipping try..except subtrees.
+fn find_unguarded_raises(
+    node: Node,
+    source: &[u8],
+    class_name: &str,
+    method_name: &str,
+    ctx: &mut LintContext,
+) {
+    // Normal raise statement
+    if node.kind() == "raise" {
+        report_raise(node, class_name, method_name, ctx);
+        return;
+    }
+
+    // Bare re-raise: ERROR node with a single kRaise child
+    if node.is_error() && is_bare_raise(node) {
+        report_raise(node, class_name, method_name, ctx);
+        return;
+    }
+
+    // If this is a try node with an except clause, the raises inside are guarded
+    if node.kind() == "try" && try_has_except(node) {
+        return;
+    }
+
+    // Descend into all children (including try..finally, nested procs, etc.)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_unguarded_raises(child, source, class_name, method_name, ctx);
+    }
+}
+
+/// Check if a try node has an except clause.
+fn try_has_except(node: Node) -> bool {
+    node.children_by_field_name("except", &mut node.walk())
+        .any(|_| true)
+}
+
+/// Check if an ERROR node represents a bare `raise;`.
+fn is_bare_raise(node: Node) -> bool {
+    if node.child_count() == 1 {
+        if let Some(child) = node.child(0) {
+            return child.kind() == "kRaise";
+        }
+    }
+    false
+}
+
+fn report_raise(node: Node, class_name: &str, method_name: &str, ctx: &mut LintContext) {
+    let start = node.start_position();
+    let end = node.end_position();
+    ctx.report(Diagnostic {
+        rule_id: "raise-in-destructor".to_string(),
+        severity: Severity::Warning,
+        message: format!(
+            "Unguarded 'raise' in destructor {}.{} may cause memory leaks or broken teardown",
+            class_name, method_name
+        ),
+        line: start.row + 1,
+        column: start.column + 1,
+        end_line: end.row + 1,
+        end_column: end.column + 1,
+        help: Some(
+            "Wrap this code in a try..except block to prevent the exception \
+             from escaping the destructor"
+                .to_string(),
+        ),
+    });
 }

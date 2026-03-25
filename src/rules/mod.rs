@@ -92,6 +92,7 @@ impl RuleRegistry {
             Box::new(field_leak::FieldReassignLeakRule::new()),
             Box::new(exception::EmptyExceptRule::new()),
             Box::new(exception::BareExceptRule::new()),
+            Box::new(exception::RaiseInDestructorRule::new()),
             Box::new(naming::TypePrefixRule::new()),
             Box::new(naming::InterfacePrefixRule::new()),
             Box::new(naming::ConstantNamingRule::new()),

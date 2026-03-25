@@ -5,3 +5,4 @@ pub mod engine;
 pub mod fix;
 pub mod output;
 pub mod rules;
+pub mod source_context;

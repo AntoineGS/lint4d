@@ -108,3 +108,15 @@ fn snapshot_rule_inherited_missing() {
     let diagnostics = lint_diagnostics("tests/fixtures/inherited/bad_inherited_missing.pas");
     insta::assert_json_snapshot!("snapshot_rule_inherited_missing", diagnostics);
 }
+
+#[test]
+fn snapshot_rule_raise_in_destructor() {
+    let diagnostics = lint_diagnostics("tests/fixtures/exception/bad_raise_in_destructor.pas");
+    insta::assert_json_snapshot!("snapshot_rule_raise_in_destructor", diagnostics);
+}
+
+#[test]
+fn snapshot_rule_raise_in_destructor_clean() {
+    let diagnostics = lint_diagnostics("tests/fixtures/exception/good_raise_in_destructor.pas");
+    insta::assert_json_snapshot!("snapshot_rule_raise_in_destructor_clean", diagnostics);
+}

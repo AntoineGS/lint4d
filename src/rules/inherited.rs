@@ -95,8 +95,7 @@ impl InheritedCallOrderRule {
                 name: "Inherited Call Order",
                 category: RuleCategory::DangerousPattern,
                 default_severity: Severity::Hint,
-                description:
-                    "Checks that 'inherited' is the first statement in constructors \
+                description: "Checks that 'inherited' is the first statement in constructors \
                      and the last statement in destructors.",
             },
         }
@@ -259,17 +258,17 @@ fn class_has_reintroduced_method(decl_class: Node, method_name: &str, source: &[
     let mut cursor = decl_class.walk();
     for child in decl_class.children(&mut cursor) {
         // declProc can be direct child or inside declSection
-        if child.kind() == "declProc" {
-            if decl_proc_matches_and_reintroduced(child, method_name, source) {
-                return true;
-            }
+        if child.kind() == "declProc"
+            && decl_proc_matches_and_reintroduced(child, method_name, source)
+        {
+            return true;
         } else if child.kind() == "declSection" {
             let mut section_cursor = child.walk();
             for section_child in child.children(&mut section_cursor) {
-                if section_child.kind() == "declProc" {
-                    if decl_proc_matches_and_reintroduced(section_child, method_name, source) {
-                        return true;
-                    }
+                if section_child.kind() == "declProc"
+                    && decl_proc_matches_and_reintroduced(section_child, method_name, source)
+                {
+                    return true;
                 }
             }
         }
@@ -278,11 +277,7 @@ fn class_has_reintroduced_method(decl_class: Node, method_name: &str, source: &[
 }
 
 /// Check if a `declProc` node matches the method name and has `reintroduce`.
-fn decl_proc_matches_and_reintroduced(
-    decl_proc: Node,
-    method_name: &str,
-    source: &[u8],
-) -> bool {
+fn decl_proc_matches_and_reintroduced(decl_proc: Node, method_name: &str, source: &[u8]) -> bool {
     // Get the method name from the declProc
     let proc_name = if let Some(name_node) = decl_proc.child_by_field_name("name") {
         node_text(name_node, source)
@@ -396,7 +391,11 @@ fn check_inherited_missing(def_proc: Node, root: Node, source: &[u8], ctx: &mut 
     let start = header.start_position();
     let end = header.end_position();
 
-    let kind = if is_constructor { "Constructor" } else { "Destructor" };
+    let kind = if is_constructor {
+        "Constructor"
+    } else {
+        "Destructor"
+    };
 
     let help = if is_constructor {
         "Add an 'inherited' call to ensure proper parent class initialization"

@@ -1,0 +1,16 @@
+---
+source: tests/snapshot_test.rs
+expression: diagnostics
+---
+[
+  {
+    "rule_id": "resource-leak-no-try",
+    "severity": "warning",
+    "message": "Factory function 'CreateObject' returns a newly-created object assigned to 'aObj' without try..finally protection. If an exception occurs, the object will leak.",
+    "line": 16,
+    "column": 3,
+    "end_line": 16,
+    "end_column": 23,
+    "help": "Wrap the usage in a try..finally block and free the object in the finally clause."
+  }
+]

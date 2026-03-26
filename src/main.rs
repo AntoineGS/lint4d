@@ -123,9 +123,15 @@ fn real_main() {
 
     let threshold = validate_cli(&cli);
 
-    // Discover config
+    // Discover config: start from the .dproj directory when --project is given,
+    // so that a .lint4d.toml next to the project file is found automatically.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (config, _project_root) = match Config::discover(&cwd) {
+    let config_start = cli
+        .project
+        .as_ref()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.clone());
+    let (config, _project_root) = match Config::discover(&config_start) {
         Ok(result) => result,
         Err(e) => exit_err(&format!("config error: {}", e), EXIT_ERROR),
     };

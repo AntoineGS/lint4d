@@ -78,10 +78,7 @@ fn extract_proc_name(def_proc: Node, source: &[u8]) -> Option<String> {
         let found = def_proc
             .children(&mut cursor)
             .find(|c| c.kind() == "declProc");
-        match found {
-            Some(n) => n,
-            None => return None,
-        }
+        found?
     };
 
     // Try genericDot first (for method implementations like TClass.Method)

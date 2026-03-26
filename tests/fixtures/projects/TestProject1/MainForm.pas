@@ -80,7 +80,7 @@ begin
   if FObj.ClassName = 'TObject' then 
     Exit
   else
-    Raise Exception.Create('uhoh'); // WRONG, should warn as raising in a destructor is bad practice
+    Raise Exception.Create('uhoh'); // OK, should warn as raising in a destructor is bad practice
 end;
 
 procedure TForm1.TestFreeAfterCreate;
@@ -106,7 +106,7 @@ procedure TForm1.TestCreateObjectInSubFunction;
 var
   aObj: TObject;
 begin
-  aObj := CreateObject; // WRONG, should warn for leak here no try finally
+  aObj := CreateObject; // OK, should warn for leak here no try finally
 
   if aObj.ClassName <> 'TObject' then
     raise Exception.Create('some message');

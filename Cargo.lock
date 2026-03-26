@@ -138,7 +138,6 @@ name = "cfg-core"
 version = "0.1.0"
 dependencies = [
  "petgraph",
- "serde",
 ]
 
 [[package]]
@@ -626,8 +625,6 @@ checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
 dependencies = [
  "fixedbitset",
  "indexmap",
- "serde",
- "serde_derive",
 ]
 
 [[package]]

@@ -450,9 +450,7 @@ end.
         let tree = parse(source);
         let factories = detect_factories(&[("myunit", &tree, source)]);
         // The qualified name "tmyclass.create" should NOT appear as a factory.
-        let has_method = factories
-            .iter()
-            .any(|(_, name)| name.contains('.'));
+        let has_method = factories.iter().any(|(_, name)| name.contains('.'));
         assert!(
             !has_method,
             "class methods should not be registered as factories; got: {:?}",

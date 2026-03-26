@@ -14,41 +14,87 @@ fn lint_fixture(fixture_path: &str) -> Vec<lint4d::engine::Diagnostic> {
 #[test]
 fn use_after_free_flags_method_call_after_free() {
     let diagnostics = lint_fixture("tests/fixtures/use_after_free/bad_use_after_free.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "use-after-free").collect();
-    assert_eq!(matches.len(), 1, "Expected 1 use-after-free, got: {:?}", matches);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "use-after-free")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 use-after-free, got: {:?}",
+        matches
+    );
 }
 
 #[test]
 fn use_after_free_flags_after_freeandnil() {
     let diagnostics = lint_fixture("tests/fixtures/use_after_free/bad_use_after_freeandnil.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "use-after-free").collect();
-    assert_eq!(matches.len(), 1, "Expected 1 use-after-free after FreeAndNil, got: {:?}", matches);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "use-after-free")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 use-after-free after FreeAndNil, got: {:?}",
+        matches
+    );
 }
 
 #[test]
 fn use_after_free_flags_double_free() {
     let diagnostics = lint_fixture("tests/fixtures/use_after_free/bad_double_free.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "use-after-free").collect();
-    assert_eq!(matches.len(), 1, "Expected 1 use-after-free for double free, got: {:?}", matches);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "use-after-free")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 use-after-free for double free, got: {:?}",
+        matches
+    );
 }
 
 #[test]
 fn use_after_free_flags_passing_freed_as_param() {
     let diagnostics = lint_fixture("tests/fixtures/use_after_free/bad_pass_freed_as_param.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "use-after-free").collect();
-    assert_eq!(matches.len(), 1, "Expected 1 use-after-free for passing freed param, got: {:?}", matches);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "use-after-free")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 use-after-free for passing freed param, got: {:?}",
+        matches
+    );
 }
 
 #[test]
 fn use_after_free_allows_reassigned_variable() {
     let diagnostics = lint_fixture("tests/fixtures/use_after_free/good_reassign_after_free.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "use-after-free").collect();
-    assert!(matches.is_empty(), "Reassigned variable should not flag: {:?}", matches);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "use-after-free")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Reassigned variable should not flag: {:?}",
+        matches
+    );
 }
 
 #[test]
 fn use_after_free_allows_normal_usage() {
     let diagnostics = lint_fixture("tests/fixtures/use_after_free/good_no_use_after_free.pas");
-    let matches: Vec<_> = diagnostics.iter().filter(|d| d.rule_id == "use-after-free").collect();
-    assert!(matches.is_empty(), "Normal usage before free should not flag: {:?}", matches);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "use-after-free")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Normal usage before free should not flag: {:?}",
+        matches
+    );
 }

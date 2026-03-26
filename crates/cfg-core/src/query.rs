@@ -81,7 +81,10 @@ impl Cfg {
             }
         }
 
-        forward.intersection(&backward).map(|&n| BlockId(n)).collect()
+        forward
+            .intersection(&backward)
+            .map(|&n| BlockId(n))
+            .collect()
     }
 }
 
@@ -111,9 +114,14 @@ mod tests {
 
     /// entry -> then / else -> join -> exit  (5 nodes, 5 edges)
     #[allow(clippy::type_complexity)]
-    fn build_diamond_cfg()
-    -> (crate::types::Cfg, BlockId, BlockId, BlockId, BlockId, BlockId)
-    {
+    fn build_diamond_cfg() -> (
+        crate::types::Cfg,
+        BlockId,
+        BlockId,
+        BlockId,
+        BlockId,
+        BlockId,
+    ) {
         let mut b = DefaultCfgBuilder::new("Diamond".to_string(), 0..200);
         let entry = b.new_block(BasicBlockKind::Entry);
         let then_blk = b.new_block(BasicBlockKind::Normal);

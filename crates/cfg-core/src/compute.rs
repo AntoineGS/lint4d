@@ -53,9 +53,8 @@ impl SummaryComputer {
                             let callee_summaries = collect_callee_summaries(proc_id, call_graph);
                             let new_summary = analyzer.analyze(proc_id, cfg, &callee_summaries);
                             let old_summary = call_graph.get_summary(proc_id).cloned();
-                            let is_different = old_summary
-                                .map(|old| old != new_summary)
-                                .unwrap_or(true);
+                            let is_different =
+                                old_summary.map(|old| old != new_summary).unwrap_or(true);
                             if is_different {
                                 changed = true;
                                 call_graph.set_summary(new_summary);

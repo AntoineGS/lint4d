@@ -45,11 +45,7 @@ impl CallGraph {
     pub fn callees(&self, caller: &ProcId) -> Vec<&ProcId> {
         match self.node_map.get(caller) {
             None => vec![],
-            Some(&idx) => self
-                .graph
-                .neighbors(idx)
-                .map(|n| &self.graph[n])
-                .collect(),
+            Some(&idx) => self.graph.neighbors(idx).map(|n| &self.graph[n]).collect(),
         }
     }
 
@@ -66,7 +62,10 @@ impl CallGraph {
 
     pub fn to_dot(&self) -> String {
         use petgraph::dot::{Config, Dot};
-        format!("{:?}", Dot::with_config(&self.graph, &[Config::EdgeNoLabel]))
+        format!(
+            "{:?}",
+            Dot::with_config(&self.graph, &[Config::EdgeNoLabel])
+        )
     }
 }
 
@@ -137,7 +136,10 @@ mod tests {
         cg.add_call(site);
 
         let dot = cg.to_dot();
-        assert!(dot.contains("digraph"), "DOT output should contain 'digraph'");
+        assert!(
+            dot.contains("digraph"),
+            "DOT output should contain 'digraph'"
+        );
         assert!(dot.contains("->"), "DOT output should contain '->'");
     }
 }

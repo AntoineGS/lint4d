@@ -26,7 +26,7 @@ type
       // and TList does not free them
     // TODO: Add defensive coding pattern checks (no use of passed variables without a 
       // null check)
-    // Constructor/Destructors should include FormCreate and FormDestroy
+    // Replicate Create/Free logic with StartTransaction/EndTransaction
   end;
 
 var

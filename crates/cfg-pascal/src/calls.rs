@@ -69,14 +69,10 @@ fn classify_expr_call(node: Node, source: &[u8]) -> Option<CallKind> {
                 });
             }
             if method.eq_ignore_ascii_case("free") {
-                return Some(CallKind::Free {
-                    var_name: receiver,
-                });
+                return Some(CallKind::Free { var_name: receiver });
             }
             if method.eq_ignore_ascii_case("destroy") {
-                return Some(CallKind::Destroy {
-                    var_name: receiver,
-                });
+                return Some(CallKind::Destroy { var_name: receiver });
             }
             Some(CallKind::MethodCall { receiver, method })
         }
@@ -97,14 +93,10 @@ fn classify_bare_expr_dot(node: Node, source: &[u8]) -> Option<CallKind> {
     let method = node_text(rhs, source);
 
     if method.eq_ignore_ascii_case("free") {
-        return Some(CallKind::Free {
-            var_name: receiver,
-        });
+        return Some(CallKind::Free { var_name: receiver });
     }
     if method.eq_ignore_ascii_case("destroy") {
-        return Some(CallKind::Destroy {
-            var_name: receiver,
-        });
+        return Some(CallKind::Destroy { var_name: receiver });
     }
     if method.eq_ignore_ascii_case("create") {
         return Some(CallKind::Constructor {

@@ -141,7 +141,11 @@ mod tests {
 
         assert_eq!(cfg.graph.node_count(), 5, "expected 5 nodes");
         assert_eq!(cfg.graph.edge_count(), 5, "expected 5 edges");
-        assert_eq!(cfg.graph[entry.0].stmts.len(), 1, "entry should have 1 stmt");
+        assert_eq!(
+            cfg.graph[entry.0].stmts.len(),
+            1,
+            "entry should have 1 stmt"
+        );
         assert_eq!(cfg.graph[then_block.0].stmts.len(), 1);
         assert_eq!(cfg.graph[else_block.0].stmts.len(), 1);
         assert_eq!(cfg.graph[join.0].stmts.len(), 0, "join has no stmts");

@@ -285,6 +285,12 @@ fn handle_if_else(ctx: &mut BuildContext, node: Node, current: BlockId) -> Optio
 ///
 /// Returns `Some(join)` always since the false branch always falls through.
 fn handle_if_only(ctx: &mut BuildContext, node: Node, current: BlockId) -> Option<BlockId> {
+    // Add the if condition as a statement on the current block so that
+    // dataflow analysis sees variable references in the condition expression.
+    if let Some(cond) = node.child_by_field_name("condition") {
+        add_stmt_ref(ctx, current, cond);
+    }
+
     let then_block = ctx.builder.new_block(BasicBlockKind::Normal);
     let join = ctx.builder.new_block(BasicBlockKind::Normal);
 

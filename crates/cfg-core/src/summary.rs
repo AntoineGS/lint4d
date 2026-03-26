@@ -32,13 +32,13 @@ pub enum FieldAction {
     FreedConditionally,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldEffect {
     pub field_name: String,
     pub effect: FieldAction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcSummary {
     pub id: ProcId,
     pub param_effects: Vec<ParamEffect>,

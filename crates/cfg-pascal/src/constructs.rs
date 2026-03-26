@@ -94,7 +94,6 @@ pub(crate) fn is_continue_call(node: Node, source: &[u8]) -> bool {
 
 /// Context for exception handling: tracks the target blocks when an
 /// exception is raised or a `finally` needs to be entered.
-#[allow(dead_code)]
 pub(crate) struct ExceptionFrame {
     pub finally_entry: Option<BlockId>,
     pub except_entry: Option<BlockId>,

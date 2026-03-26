@@ -21,17 +21,12 @@ fn find_cfg_by_name<'a>(cfgs: &'a [cfg_core::Cfg], name: &str) -> &'a cfg_core::
         .find(|c| c.proc_name == name)
         .unwrap_or_else(|| {
             let names: Vec<&str> = cfgs.iter().map(|c| c.proc_name.as_str()).collect();
-            panic!(
-                "CFG for '{}' not found. Available: {:?}",
-                name, names
-            )
+            panic!("CFG for '{}' not found. Available: {:?}", name, names)
         })
 }
 
 fn has_edge_kind(cfg: &cfg_core::Cfg, kind: &EdgeKind) -> bool {
-    cfg.graph
-        .edge_indices()
-        .any(|e| cfg.graph[e] == *kind)
+    cfg.graph.edge_indices().any(|e| cfg.graph[e] == *kind)
 }
 
 #[test]
@@ -172,11 +167,7 @@ fn all_four_procs_found() {
     let tree = parse(&source);
     let cfgs = build_file_cfgs(&tree, &source);
 
-    assert_eq!(
-        cfgs.len(),
-        4,
-        "should find 4 procedures in simple_proc.pas"
-    );
+    assert_eq!(cfgs.len(), 4, "should find 4 procedures in simple_proc.pas");
 
     let names: Vec<&str> = cfgs.iter().map(|c| c.proc_name.as_str()).collect();
     assert!(names.contains(&"SimpleLinear"));
@@ -260,5 +251,112 @@ fn break_in_loop_reaches_exit() {
     assert!(
         cfg.is_reachable(cfg.entry, cfg.exit),
         "entry should reach exit via break in loop"
+    );
+}
+
+#[test]
+fn try_finally_has_exception_and_finally_edges() {
+    let source = load_fixture("try_blocks.pas");
+    let tree = parse(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+
+    let cfg = find_cfg_by_name(&cfgs, "TestTryFinally");
+
+    // Should have a FinallyHandler block
+    let has_finally_handler = cfg
+        .graph
+        .node_indices()
+        .any(|idx| cfg.graph[idx].kind == BasicBlockKind::FinallyHandler);
+    assert!(
+        has_finally_handler,
+        "TestTryFinally should have a FinallyHandler block"
+    );
+
+    // Should have FinallyEntry edge (normal path into finally)
+    assert!(
+        has_edge_kind(cfg, &EdgeKind::FinallyEntry),
+        "TestTryFinally should have FinallyEntry edge"
+    );
+
+    // Should have FinallyExit edge (finally block exits to after)
+    assert!(
+        has_edge_kind(cfg, &EdgeKind::FinallyExit),
+        "TestTryFinally should have FinallyExit edge"
+    );
+
+    // Should have ExceptionThrow edge (exception path into finally)
+    assert!(
+        has_edge_kind(cfg, &EdgeKind::ExceptionThrow),
+        "TestTryFinally should have ExceptionThrow edge"
+    );
+
+    // Entry reaches exit
+    assert!(
+        cfg.is_reachable(cfg.entry, cfg.exit),
+        "entry should reach exit in try/finally"
+    );
+}
+
+#[test]
+fn try_except_has_exception_handler() {
+    let source = load_fixture("try_blocks.pas");
+    let tree = parse(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+
+    let cfg = find_cfg_by_name(&cfgs, "TestTryExcept");
+
+    // Should have an ExceptHandler block
+    let has_except_handler = cfg
+        .graph
+        .node_indices()
+        .any(|idx| cfg.graph[idx].kind == BasicBlockKind::ExceptHandler);
+    assert!(
+        has_except_handler,
+        "TestTryExcept should have an ExceptHandler block"
+    );
+
+    // Should have ExceptionThrow edge (raise in try body -> except handler)
+    assert!(
+        has_edge_kind(cfg, &EdgeKind::ExceptionThrow),
+        "TestTryExcept should have ExceptionThrow edge"
+    );
+
+    // Entry reaches exit
+    assert!(
+        cfg.is_reachable(cfg.entry, cfg.exit),
+        "entry should reach exit in try/except"
+    );
+}
+
+#[test]
+fn nested_try_reachable() {
+    let source = load_fixture("try_blocks.pas");
+    let tree = parse(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+
+    let cfg = find_cfg_by_name(&cfgs, "TestNestedTryFinallyExcept");
+
+    // Should have both FinallyHandler and ExceptHandler blocks
+    let has_finally_handler = cfg
+        .graph
+        .node_indices()
+        .any(|idx| cfg.graph[idx].kind == BasicBlockKind::FinallyHandler);
+    let has_except_handler = cfg
+        .graph
+        .node_indices()
+        .any(|idx| cfg.graph[idx].kind == BasicBlockKind::ExceptHandler);
+    assert!(
+        has_finally_handler,
+        "nested try should have a FinallyHandler block"
+    );
+    assert!(
+        has_except_handler,
+        "nested try should have an ExceptHandler block"
+    );
+
+    // Entry reaches exit
+    assert!(
+        cfg.is_reachable(cfg.entry, cfg.exit),
+        "entry should reach exit in nested try"
     );
 }

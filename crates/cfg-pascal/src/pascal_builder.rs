@@ -1,9 +1,9 @@
-use cfg_core::{
-    BasicBlockKind, BlockId, CfgBuildSink, Cfg, DefaultCfgBuilder, EdgeKind, StmtRef,
-};
+use cfg_core::{BasicBlockKind, BlockId, Cfg, CfgBuildSink, DefaultCfgBuilder, EdgeKind, StmtRef};
 use tree_sitter::Node;
 
-use crate::constructs::{is_break_call, is_continue_call, is_exit_call, node_text, LoopFrame};
+use crate::constructs::{
+    is_break_call, is_continue_call, is_exit_call, node_text, ExceptionFrame, LoopFrame,
+};
 
 /// Build CFGs for all procedure/function definitions in a parsed Pascal file.
 ///
@@ -53,6 +53,7 @@ fn build_proc_cfg(def_proc: Node, source: &[u8]) -> Option<Cfg> {
         exit,
         source,
         loop_stack: Vec::new(),
+        exception_stack: Vec::new(),
     };
 
     let final_block = walk_block_stmts(&mut ctx, block, body);
@@ -128,6 +129,7 @@ struct BuildContext<'a> {
     exit: BlockId,
     source: &'a [u8],
     loop_stack: Vec<LoopFrame>,
+    exception_stack: Vec<ExceptionFrame>,
 }
 
 /// Walk the children of a `block` node, building CFG blocks and edges.
@@ -141,46 +143,42 @@ fn walk_block_stmts(ctx: &mut BuildContext, block: Node, mut current: BlockId) -
             // Skip structural tokens
             "kBegin" | "kEnd" | ";" | "declVars" | "declConsts" | "declTypes" => continue,
 
-            "ifElse" => {
-                match handle_if_else(ctx, child, current) {
-                    Some(join) => current = join,
-                    None => return None,
-                }
-            }
+            "ifElse" => match handle_if_else(ctx, child, current) {
+                Some(join) => current = join,
+                None => return None,
+            },
 
-            "if" => {
-                match handle_if_only(ctx, child, current) {
-                    Some(join) => current = join,
-                    None => return None,
-                }
-            }
+            "if" => match handle_if_only(ctx, child, current) {
+                Some(join) => current = join,
+                None => return None,
+            },
 
             "raise" => {
                 handle_raise(ctx, child, current);
                 return None;
             }
 
-            "for" | "while" => {
-                match handle_for_or_while(ctx, child, current) {
-                    Some(after) => current = after,
-                    None => return None,
-                }
-            }
+            "try" => match handle_try(ctx, child, current) {
+                Some(after) => current = after,
+                None => return None,
+            },
 
-            "repeat" => {
-                match handle_repeat(ctx, child, current) {
-                    Some(after) => current = after,
-                    None => return None,
-                }
-            }
+            "for" | "while" => match handle_for_or_while(ctx, child, current) {
+                Some(after) => current = after,
+                None => return None,
+            },
+
+            "repeat" => match handle_repeat(ctx, child, current) {
+                Some(after) => current = after,
+                None => return None,
+            },
 
             "statement" => {
                 // A `statement` node can wrap Exit, Break, Continue, or other calls.
                 if is_exit_call(child, ctx.source) {
                     // Exit terminates the current block and goes to the exit block.
                     add_stmt_ref(ctx, current, child);
-                    ctx.builder
-                        .add_edge(current, ctx.exit, EdgeKind::Normal);
+                    ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
                     return None;
                 }
                 if is_break_call(child, ctx.source) {
@@ -216,8 +214,7 @@ fn walk_block_stmts(ctx: &mut BuildContext, block: Node, mut current: BlockId) -
                 // Check if it's an exit call at the top level
                 if is_exit_call(child, ctx.source) {
                     add_stmt_ref(ctx, current, child);
-                    ctx.builder
-                        .add_edge(current, ctx.exit, EdgeKind::Normal);
+                    ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
                     return None;
                 }
                 add_stmt_ref(ctx, current, child);
@@ -341,8 +338,7 @@ fn process_if_then_children(
             }
             "statement" if is_exit_call(child, ctx.source) => {
                 add_stmt_ref(ctx, current, child);
-                ctx.builder
-                    .add_edge(current, ctx.exit, EdgeKind::Normal);
+                ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
                 return None;
             }
             "block" => {
@@ -357,8 +353,7 @@ fn process_if_then_children(
             _ => {
                 if is_exit_call(child, ctx.source) {
                     add_stmt_ref(ctx, current, child);
-                    ctx.builder
-                        .add_edge(current, ctx.exit, EdgeKind::Normal);
+                    ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
                     return None;
                 }
                 add_stmt_ref(ctx, current, child);
@@ -393,8 +388,7 @@ fn process_branch_child(
             }
             "statement" if is_exit_call(child, ctx.source) => {
                 add_stmt_ref(ctx, current, child);
-                ctx.builder
-                    .add_edge(current, ctx.exit, EdgeKind::Normal);
+                ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
                 return None;
             }
             "block" => {
@@ -409,8 +403,7 @@ fn process_branch_child(
             _ => {
                 if is_exit_call(child, ctx.source) {
                     add_stmt_ref(ctx, current, child);
-                    ctx.builder
-                        .add_edge(current, ctx.exit, EdgeKind::Normal);
+                    ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
                     return None;
                 }
                 add_stmt_ref(ctx, current, child);
@@ -429,11 +422,7 @@ fn process_branch_child(
 ///   body_block -> cond_block (LoopBack)
 ///
 /// Returns `Some(after_block)` always since the loop can exit via LoopExit.
-fn handle_for_or_while(
-    ctx: &mut BuildContext,
-    node: Node,
-    current: BlockId,
-) -> Option<BlockId> {
+fn handle_for_or_while(ctx: &mut BuildContext, node: Node, current: BlockId) -> Option<BlockId> {
     let cond_block = ctx.builder.new_block(BasicBlockKind::Normal);
     let body_block = ctx.builder.new_block(BasicBlockKind::Normal);
     let after_block = ctx.builder.new_block(BasicBlockKind::Normal);
@@ -444,8 +433,7 @@ fn handle_for_or_while(
     add_stmt_ref(ctx, cond_block, node);
 
     // current -> cond_block
-    ctx.builder
-        .add_edge(current, cond_block, EdgeKind::Normal);
+    ctx.builder.add_edge(current, cond_block, EdgeKind::Normal);
     // cond_block -> body_block (loop enters)
     ctx.builder
         .add_edge(cond_block, body_block, EdgeKind::ConditionalTrue);
@@ -485,8 +473,7 @@ fn handle_repeat(ctx: &mut BuildContext, node: Node, current: BlockId) -> Option
     let after_block = ctx.builder.new_block(BasicBlockKind::Normal);
 
     // current -> body_block
-    ctx.builder
-        .add_edge(current, body_block, EdgeKind::Normal);
+    ctx.builder.add_edge(current, body_block, EdgeKind::Normal);
 
     // Push loop frame for break/continue
     ctx.loop_stack.push(LoopFrame {
@@ -587,11 +574,7 @@ fn process_repeat_body(
 /// Process a single statement node in a loop body or similar context.
 ///
 /// Handles block, if, ifElse, raise, exit, break, continue, and other statements.
-fn process_single_stmt(
-    ctx: &mut BuildContext,
-    child: Node,
-    current: BlockId,
-) -> Option<BlockId> {
+fn process_single_stmt(ctx: &mut BuildContext, child: Node, current: BlockId) -> Option<BlockId> {
     match child.kind() {
         "block" => walk_block_stmts(ctx, child, current),
         "ifElse" => handle_if_else(ctx, child, current),
@@ -600,12 +583,12 @@ fn process_single_stmt(
             handle_raise(ctx, child, current);
             None
         }
+        "try" => handle_try(ctx, child, current),
         "for" | "while" => handle_for_or_while(ctx, child, current),
         "repeat" => handle_repeat(ctx, child, current),
         "statement" if is_exit_call(child, ctx.source) => {
             add_stmt_ref(ctx, current, child);
-            ctx.builder
-                .add_edge(current, ctx.exit, EdgeKind::Normal);
+            ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
             None
         }
         "statement" if is_break_call(child, ctx.source) => {
@@ -627,8 +610,7 @@ fn process_single_stmt(
         _ => {
             if is_exit_call(child, ctx.source) {
                 add_stmt_ref(ctx, current, child);
-                ctx.builder
-                    .add_edge(current, ctx.exit, EdgeKind::Normal);
+                ctx.builder.add_edge(current, ctx.exit, EdgeKind::Normal);
                 return None;
             }
             add_stmt_ref(ctx, current, child);
@@ -637,14 +619,282 @@ fn process_single_stmt(
     }
 }
 
+/// Handle a `try` node (try..finally or try..except).
+///
+/// Determines whether the try block has a `finally` or `except` section
+/// by scanning children for `kFinally` or `kExcept`, then delegates
+/// to the appropriate handler.
+fn handle_try(ctx: &mut BuildContext, node: Node, current: BlockId) -> Option<BlockId> {
+    let mut has_finally = false;
+    let mut has_except = false;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "kFinally" => has_finally = true,
+            "kExcept" => has_except = true,
+            _ => {}
+        }
+    }
+
+    if has_finally {
+        handle_try_finally(ctx, node, current)
+    } else if has_except {
+        handle_try_except(ctx, node, current)
+    } else {
+        // Malformed try block — treat as a plain block
+        Some(current)
+    }
+}
+
+/// Handle a `try..finally` block.
+///
+/// CFG pattern:
+///   current -> [try body] --FinallyEntry--> finally_block --FinallyExit--> after
+///   (any raise in try body) --ExceptionThrow--> finally_block
+fn handle_try_finally(ctx: &mut BuildContext, node: Node, current: BlockId) -> Option<BlockId> {
+    let finally_block = ctx.builder.new_block(BasicBlockKind::FinallyHandler);
+    let after_block = ctx.builder.new_block(BasicBlockKind::Normal);
+
+    // Implicit exception edge: any statement in the try body could throw,
+    // so add an ExceptionThrow edge from the current block to finally.
+    ctx.builder
+        .add_edge(current, finally_block, EdgeKind::ExceptionThrow);
+
+    // Push exception frame so raise routes to finally
+    ctx.exception_stack.push(ExceptionFrame {
+        finally_entry: Some(finally_block),
+        except_entry: None,
+    });
+
+    // Walk the try body (the `statements` node between kTry and kFinally)
+    let try_body_end = walk_try_body(ctx, node, current);
+
+    ctx.exception_stack.pop();
+
+    // Normal path: try body falls through to finally
+    if let Some(tb) = try_body_end {
+        ctx.builder
+            .add_edge(tb, finally_block, EdgeKind::FinallyEntry);
+    }
+
+    // Walk the finally body (the `statements` node after kFinally)
+    let finally_end = walk_finally_body(ctx, node, finally_block);
+
+    // Finally exits to the after block
+    if let Some(fb) = finally_end {
+        ctx.builder.add_edge(fb, after_block, EdgeKind::FinallyExit);
+    }
+
+    Some(after_block)
+}
+
+/// Handle a `try..except` block.
+///
+/// CFG pattern:
+///   current -> [try body] --Normal--> after (no exception)
+///   (any raise in try body) --ExceptionThrow--> except_block
+///   except_block -> [handler body] --Normal--> after
+fn handle_try_except(ctx: &mut BuildContext, node: Node, current: BlockId) -> Option<BlockId> {
+    let except_block = ctx.builder.new_block(BasicBlockKind::ExceptHandler);
+    let after_block = ctx.builder.new_block(BasicBlockKind::Normal);
+
+    // Implicit exception edge: any statement in the try body could throw,
+    // so add an ExceptionThrow edge from the current block to except handler.
+    ctx.builder
+        .add_edge(current, except_block, EdgeKind::ExceptionThrow);
+
+    // Push exception frame so raise routes to except handler
+    ctx.exception_stack.push(ExceptionFrame {
+        finally_entry: None,
+        except_entry: Some(except_block),
+    });
+
+    // Walk the try body (the `statements` node between kTry and kExcept)
+    let try_body_end = walk_try_body(ctx, node, current);
+
+    ctx.exception_stack.pop();
+
+    // Normal path: try body falls through to after (no exception raised)
+    if let Some(tb) = try_body_end {
+        ctx.builder.add_edge(tb, after_block, EdgeKind::Normal);
+    }
+
+    // Walk the except handler bodies
+    let except_end = walk_except_handlers(ctx, node, except_block);
+
+    // Except handler falls through to after
+    if let Some(eb) = except_end {
+        ctx.builder.add_edge(eb, after_block, EdgeKind::Normal);
+    }
+
+    Some(after_block)
+}
+
+/// Walk the try body: the `statements` node that appears between kTry and kFinally/kExcept.
+///
+/// Continues from `current`, which is the block before or at the try statement.
+fn walk_try_body(ctx: &mut BuildContext, try_node: Node, current: BlockId) -> Option<BlockId> {
+    let mut cursor = try_node.walk();
+    let mut past_try = false;
+
+    for child in try_node.children(&mut cursor) {
+        match child.kind() {
+            "kTry" => {
+                past_try = true;
+                continue;
+            }
+            "kFinally" | "kExcept" => break,
+            _ if !past_try => continue,
+            _ => {}
+        }
+
+        if child.kind() == "statements" {
+            return walk_statements_node(ctx, child, current);
+        }
+    }
+
+    Some(current)
+}
+
+/// Walk a `statements` node, processing each child statement.
+fn walk_statements_node(
+    ctx: &mut BuildContext,
+    statements_node: Node,
+    mut current: BlockId,
+) -> Option<BlockId> {
+    let mut cursor = statements_node.walk();
+    for child in statements_node.children(&mut cursor) {
+        match child.kind() {
+            ";" => continue,
+            _ => match process_single_stmt(ctx, child, current) {
+                Some(next) => current = next,
+                None => return None,
+            },
+        }
+    }
+    Some(current)
+}
+
+/// Walk the finally body: the `statements` node that appears after kFinally.
+fn walk_finally_body(
+    ctx: &mut BuildContext,
+    try_node: Node,
+    finally_block: BlockId,
+) -> Option<BlockId> {
+    let mut cursor = try_node.walk();
+    let mut past_finally = false;
+
+    for child in try_node.children(&mut cursor) {
+        match child.kind() {
+            "kFinally" => {
+                past_finally = true;
+                continue;
+            }
+            "kEnd" | ";" => continue,
+            _ if !past_finally => continue,
+            _ => {}
+        }
+
+        if child.kind() == "statements" {
+            return walk_statements_node(ctx, child, finally_block);
+        }
+    }
+
+    Some(finally_block)
+}
+
+/// Walk the except handlers: `exceptionHandler` nodes after kExcept.
+///
+/// Each `exceptionHandler` has: kOn, identifier, `:`, typeref, kDo, statement/block.
+fn walk_except_handlers(
+    ctx: &mut BuildContext,
+    try_node: Node,
+    except_block: BlockId,
+) -> Option<BlockId> {
+    let mut cursor = try_node.walk();
+    let mut past_except = false;
+    let mut current = except_block;
+
+    for child in try_node.children(&mut cursor) {
+        match child.kind() {
+            "kExcept" => {
+                past_except = true;
+                continue;
+            }
+            "kEnd" | ";" => continue,
+            _ if !past_except => continue,
+            _ => {}
+        }
+
+        if child.kind() == "exceptionHandler" {
+            // Process the handler body: find the statement/block after kDo
+            match walk_exception_handler_body(ctx, child, current) {
+                Some(next) => current = next,
+                None => return None,
+            }
+        }
+    }
+
+    Some(current)
+}
+
+/// Walk the body of a single `exceptionHandler` node.
+///
+/// Structure: kOn, identifier, `:`, typeref, kDo, statement/block
+fn walk_exception_handler_body(
+    ctx: &mut BuildContext,
+    handler_node: Node,
+    current: BlockId,
+) -> Option<BlockId> {
+    let mut past_do = false;
+    let mut cursor = handler_node.walk();
+
+    for child in handler_node.children(&mut cursor) {
+        match child.kind() {
+            "kDo" => {
+                past_do = true;
+                continue;
+            }
+            _ if !past_do => continue,
+            ";" => continue,
+            _ => {}
+        }
+
+        return process_single_stmt(ctx, child, current);
+    }
+
+    Some(current)
+}
+
 /// Handle a `raise` statement: adds the statement to the current block and
-/// creates an edge to the exit (or exception handler, when implemented).
+/// creates an edge to the appropriate exception target.
+///
+/// If inside a try/except, routes to the except handler.
+/// If inside a try/finally, routes to the finally handler.
+/// Otherwise, routes to exit.
 fn handle_raise(ctx: &mut BuildContext, node: Node, current: BlockId) {
     add_stmt_ref(ctx, current, node);
-    // For now, raise always goes to exit. When try/except is implemented,
-    // this will route to the exception handler instead.
+    let target = exception_target(ctx);
     ctx.builder
-        .add_edge(current, ctx.exit, EdgeKind::ExceptionThrow);
+        .add_edge(current, target, EdgeKind::ExceptionThrow);
+}
+
+/// Determine the target block for an exception throw.
+///
+/// Walks the exception stack from innermost to outermost:
+/// - If the frame has an `except_entry`, that's the target.
+/// - If the frame has a `finally_entry`, that's the target.
+/// - Otherwise, falls through to the procedure exit block.
+fn exception_target(ctx: &BuildContext) -> BlockId {
+    for frame in ctx.exception_stack.iter().rev() {
+        if let Some(except) = frame.except_entry {
+            return except;
+        }
+        if let Some(finally) = frame.finally_entry {
+            return finally;
+        }
+    }
+    ctx.exit
 }
 
 /// Add a `StmtRef` for a node to a block.

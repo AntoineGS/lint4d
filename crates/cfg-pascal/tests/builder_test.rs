@@ -184,3 +184,81 @@ fn all_four_procs_found() {
     assert!(names.contains(&"SimpleRaise"));
     assert!(names.contains(&"SimpleExit"));
 }
+
+#[test]
+fn for_loop_has_back_edge() {
+    let source = load_fixture("loops.pas");
+    let tree = parse(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+
+    let cfg = find_cfg_by_name(&cfgs, "TestForLoop");
+
+    // A for loop should produce a LoopBack edge (body -> condition)
+    assert!(
+        has_edge_kind(cfg, &EdgeKind::LoopBack),
+        "for loop should have a LoopBack edge"
+    );
+
+    // Entry should reach exit (loop can exit via LoopExit)
+    assert!(
+        cfg.is_reachable(cfg.entry, cfg.exit),
+        "entry should reach exit through for loop"
+    );
+}
+
+#[test]
+fn while_loop_has_back_edge() {
+    let source = load_fixture("loops.pas");
+    let tree = parse(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+
+    let cfg = find_cfg_by_name(&cfgs, "TestWhileLoop");
+
+    // A while loop should produce a LoopBack edge (body -> condition)
+    assert!(
+        has_edge_kind(cfg, &EdgeKind::LoopBack),
+        "while loop should have a LoopBack edge"
+    );
+
+    // Entry should reach exit
+    assert!(
+        cfg.is_reachable(cfg.entry, cfg.exit),
+        "entry should reach exit through while loop"
+    );
+}
+
+#[test]
+fn repeat_until_has_back_edge() {
+    let source = load_fixture("loops.pas");
+    let tree = parse(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+
+    let cfg = find_cfg_by_name(&cfgs, "TestRepeatUntil");
+
+    // A repeat..until loop should produce a LoopBack edge (condition -> body)
+    assert!(
+        has_edge_kind(cfg, &EdgeKind::LoopBack),
+        "repeat..until should have a LoopBack edge"
+    );
+
+    // Entry should reach exit
+    assert!(
+        cfg.is_reachable(cfg.entry, cfg.exit),
+        "entry should reach exit through repeat..until loop"
+    );
+}
+
+#[test]
+fn break_in_loop_reaches_exit() {
+    let source = load_fixture("loops.pas");
+    let tree = parse(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+
+    let cfg = find_cfg_by_name(&cfgs, "TestBreakInLoop");
+
+    // Entry should reach exit (break provides a path out of the loop)
+    assert!(
+        cfg.is_reachable(cfg.entry, cfg.exit),
+        "entry should reach exit via break in loop"
+    );
+}

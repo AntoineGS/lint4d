@@ -47,7 +47,6 @@ pub(crate) fn is_exit_call(node: Node, source: &[u8]) -> bool {
 }
 
 /// Check whether a node represents a call to `Break`.
-#[allow(dead_code)]
 pub(crate) fn is_break_call(node: Node, source: &[u8]) -> bool {
     match node.kind() {
         "statement" => {
@@ -71,7 +70,6 @@ pub(crate) fn is_break_call(node: Node, source: &[u8]) -> bool {
 }
 
 /// Check whether a node represents a call to `Continue`.
-#[allow(dead_code)]
 pub(crate) fn is_continue_call(node: Node, source: &[u8]) -> bool {
     match node.kind() {
         "statement" => {
@@ -103,7 +101,6 @@ pub(crate) struct ExceptionFrame {
 }
 
 /// Context for loop constructs: tracks where `break` and `continue` jump to.
-#[allow(dead_code)]
 pub(crate) struct LoopFrame {
     pub continue_target: BlockId,
     pub break_target: BlockId,

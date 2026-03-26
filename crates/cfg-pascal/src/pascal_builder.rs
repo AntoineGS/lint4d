@@ -3,7 +3,7 @@ use cfg_core::{
 };
 use tree_sitter::Node;
 
-use crate::constructs::{is_exit_call, node_text};
+use crate::constructs::{is_break_call, is_continue_call, is_exit_call, node_text, LoopFrame};
 
 /// Build CFGs for all procedure/function definitions in a parsed Pascal file.
 ///
@@ -52,6 +52,7 @@ fn build_proc_cfg(def_proc: Node, source: &[u8]) -> Option<Cfg> {
         builder: &mut builder,
         exit,
         source,
+        loop_stack: Vec::new(),
     };
 
     let final_block = walk_block_stmts(&mut ctx, block, body);
@@ -126,6 +127,7 @@ struct BuildContext<'a> {
     builder: &'a mut DefaultCfgBuilder,
     exit: BlockId,
     source: &'a [u8],
+    loop_stack: Vec<LoopFrame>,
 }
 
 /// Walk the children of a `block` node, building CFG blocks and edges.
@@ -158,6 +160,20 @@ fn walk_block_stmts(ctx: &mut BuildContext, block: Node, mut current: BlockId) -
                 return None;
             }
 
+            "for" | "while" => {
+                match handle_for_or_while(ctx, child, current) {
+                    Some(after) => current = after,
+                    None => return None,
+                }
+            }
+
+            "repeat" => {
+                match handle_repeat(ctx, child, current) {
+                    Some(after) => current = after,
+                    None => return None,
+                }
+            }
+
             "statement" => {
                 // A `statement` node can wrap Exit, Break, Continue, or other calls.
                 if is_exit_call(child, ctx.source) {
@@ -165,6 +181,22 @@ fn walk_block_stmts(ctx: &mut BuildContext, block: Node, mut current: BlockId) -
                     add_stmt_ref(ctx, current, child);
                     ctx.builder
                         .add_edge(current, ctx.exit, EdgeKind::Normal);
+                    return None;
+                }
+                if is_break_call(child, ctx.source) {
+                    add_stmt_ref(ctx, current, child);
+                    if let Some(frame) = ctx.loop_stack.last() {
+                        ctx.builder
+                            .add_edge(current, frame.break_target, EdgeKind::Normal);
+                    }
+                    return None;
+                }
+                if is_continue_call(child, ctx.source) {
+                    add_stmt_ref(ctx, current, child);
+                    if let Some(frame) = ctx.loop_stack.last() {
+                        ctx.builder
+                            .add_edge(current, frame.continue_target, EdgeKind::Normal);
+                    }
                     return None;
                 }
                 // Regular statement
@@ -387,6 +419,222 @@ fn process_branch_child(
     }
 
     Some(current)
+}
+
+/// Handle a `for` or `while` loop node.
+///
+/// CFG pattern:
+///   current -> cond_block --ConditionalTrue-->  body_block
+///                         --LoopExit-->         after_block
+///   body_block -> cond_block (LoopBack)
+///
+/// Returns `Some(after_block)` always since the loop can exit via LoopExit.
+fn handle_for_or_while(
+    ctx: &mut BuildContext,
+    node: Node,
+    current: BlockId,
+) -> Option<BlockId> {
+    let cond_block = ctx.builder.new_block(BasicBlockKind::Normal);
+    let body_block = ctx.builder.new_block(BasicBlockKind::Normal);
+    let after_block = ctx.builder.new_block(BasicBlockKind::Normal);
+
+    // Add the condition expression as a statement on the cond_block.
+    // For `for`: the init assignment and limit are the "condition" concept.
+    // For `while`: the condition expression precedes kDo.
+    add_stmt_ref(ctx, cond_block, node);
+
+    // current -> cond_block
+    ctx.builder
+        .add_edge(current, cond_block, EdgeKind::Normal);
+    // cond_block -> body_block (loop enters)
+    ctx.builder
+        .add_edge(cond_block, body_block, EdgeKind::ConditionalTrue);
+    // cond_block -> after_block (loop exits)
+    ctx.builder
+        .add_edge(cond_block, after_block, EdgeKind::LoopExit);
+
+    // Push loop frame for break/continue
+    ctx.loop_stack.push(LoopFrame {
+        continue_target: cond_block,
+        break_target: after_block,
+    });
+
+    // Find and process the body (the statement/block after kDo)
+    let body_end = process_loop_body_after_kdo(ctx, node, body_block);
+
+    ctx.loop_stack.pop();
+
+    // body -> cond_block (LoopBack)
+    if let Some(be) = body_end {
+        ctx.builder.add_edge(be, cond_block, EdgeKind::LoopBack);
+    }
+
+    Some(after_block)
+}
+
+/// Handle a `repeat..until` loop node.
+///
+/// CFG pattern:
+///   current -> body_block -> cond_block --LoopBack-->  body_block
+///                                       --LoopExit-->  after_block
+///
+/// Returns `Some(after_block)`.
+fn handle_repeat(ctx: &mut BuildContext, node: Node, current: BlockId) -> Option<BlockId> {
+    let body_block = ctx.builder.new_block(BasicBlockKind::Normal);
+    let cond_block = ctx.builder.new_block(BasicBlockKind::Normal);
+    let after_block = ctx.builder.new_block(BasicBlockKind::Normal);
+
+    // current -> body_block
+    ctx.builder
+        .add_edge(current, body_block, EdgeKind::Normal);
+
+    // Push loop frame for break/continue
+    ctx.loop_stack.push(LoopFrame {
+        continue_target: cond_block,
+        break_target: after_block,
+    });
+
+    // Process the body: children between kRepeat and kUntil.
+    // The body is in a `statements` child node.
+    let body_end = process_repeat_body(ctx, node, body_block);
+
+    ctx.loop_stack.pop();
+
+    let body_final = body_end.unwrap_or(body_block);
+
+    // body -> cond_block
+    ctx.builder
+        .add_edge(body_final, cond_block, EdgeKind::Normal);
+
+    // Add the until condition as a statement on the cond_block
+    add_stmt_ref(ctx, cond_block, node);
+
+    // cond_block -> body_block (LoopBack, condition false = keep looping)
+    ctx.builder
+        .add_edge(cond_block, body_block, EdgeKind::LoopBack);
+    // cond_block -> after_block (LoopExit, condition true = exit)
+    ctx.builder
+        .add_edge(cond_block, after_block, EdgeKind::LoopExit);
+
+    Some(after_block)
+}
+
+/// Process the body of a for/while loop: finds the statement after kDo and walks it.
+fn process_loop_body_after_kdo(
+    ctx: &mut BuildContext,
+    loop_node: Node,
+    body_block: BlockId,
+) -> Option<BlockId> {
+    let mut past_do = false;
+    let mut cursor = loop_node.walk();
+
+    for child in loop_node.children(&mut cursor) {
+        if child.kind() == "kDo" {
+            past_do = true;
+            continue;
+        }
+        if !past_do {
+            continue;
+        }
+        // Skip semicolons
+        if child.kind() == ";" {
+            continue;
+        }
+
+        // Process the body statement
+        return process_single_stmt(ctx, child, body_block);
+    }
+
+    Some(body_block)
+}
+
+/// Process the body of a repeat..until loop: walks the `statements` child.
+fn process_repeat_body(
+    ctx: &mut BuildContext,
+    repeat_node: Node,
+    body_block: BlockId,
+) -> Option<BlockId> {
+    let mut current = body_block;
+    let mut cursor = repeat_node.walk();
+
+    for child in repeat_node.children(&mut cursor) {
+        match child.kind() {
+            "kRepeat" | "kUntil" | ";" => continue,
+            "statements" => {
+                // Walk the statements inside the repeat body
+                let mut inner_cursor = child.walk();
+                for stmt in child.children(&mut inner_cursor) {
+                    match stmt.kind() {
+                        ";" => continue,
+                        _ => match process_single_stmt(ctx, stmt, current) {
+                            Some(next) => current = next,
+                            None => return None,
+                        },
+                    }
+                }
+                return Some(current);
+            }
+            _ => {
+                // If the condition or other node types appear, skip them
+                // (they come after kUntil)
+            }
+        }
+    }
+
+    Some(current)
+}
+
+/// Process a single statement node in a loop body or similar context.
+///
+/// Handles block, if, ifElse, raise, exit, break, continue, and other statements.
+fn process_single_stmt(
+    ctx: &mut BuildContext,
+    child: Node,
+    current: BlockId,
+) -> Option<BlockId> {
+    match child.kind() {
+        "block" => walk_block_stmts(ctx, child, current),
+        "ifElse" => handle_if_else(ctx, child, current),
+        "if" => handle_if_only(ctx, child, current),
+        "raise" => {
+            handle_raise(ctx, child, current);
+            None
+        }
+        "for" | "while" => handle_for_or_while(ctx, child, current),
+        "repeat" => handle_repeat(ctx, child, current),
+        "statement" if is_exit_call(child, ctx.source) => {
+            add_stmt_ref(ctx, current, child);
+            ctx.builder
+                .add_edge(current, ctx.exit, EdgeKind::Normal);
+            None
+        }
+        "statement" if is_break_call(child, ctx.source) => {
+            add_stmt_ref(ctx, current, child);
+            if let Some(frame) = ctx.loop_stack.last() {
+                ctx.builder
+                    .add_edge(current, frame.break_target, EdgeKind::Normal);
+            }
+            None
+        }
+        "statement" if is_continue_call(child, ctx.source) => {
+            add_stmt_ref(ctx, current, child);
+            if let Some(frame) = ctx.loop_stack.last() {
+                ctx.builder
+                    .add_edge(current, frame.continue_target, EdgeKind::Normal);
+            }
+            None
+        }
+        _ => {
+            if is_exit_call(child, ctx.source) {
+                add_stmt_ref(ctx, current, child);
+                ctx.builder
+                    .add_edge(current, ctx.exit, EdgeKind::Normal);
+                return None;
+            }
+            add_stmt_ref(ctx, current, child);
+            Some(current)
+        }
+    }
 }
 
 /// Handle a `raise` statement: adds the statement to the current block and

@@ -134,10 +134,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfg-core"
+version = "0.1.0"
+dependencies = [
+ "petgraph",
+ "serde",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg-pascal"
+version = "0.1.0"
+dependencies = [
+ "cfg-core",
+ "tree-sitter",
+ "tree-sitter-pascal",
+]
 
 [[package]]
 name = "ciborium"
@@ -338,6 +355,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "float-cmp"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -512,6 +535,8 @@ name = "lint4d"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "cfg-core",
+ "cfg-pascal",
  "clap",
  "criterion",
  "globset",
@@ -591,6 +616,18 @@ checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
 dependencies = [
  "supports-color 2.1.0",
  "supports-color 3.0.2",
+]
+
+[[package]]
+name = "petgraph"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
+dependencies = [
+ "fixedbitset",
+ "indexmap",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

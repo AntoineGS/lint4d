@@ -7,6 +7,7 @@ pub mod inherited;
 pub mod naming;
 pub mod resource_leak;
 pub mod scope;
+pub mod use_after_free;
 
 use tree_sitter::Tree;
 
@@ -129,6 +130,7 @@ impl RuleRegistry {
             Box::new(dangerous::WithStatementRule::new()),
             Box::new(inherited::InheritedCallOrderRule::new()),
             Box::new(inherited::InheritedCallMissingRule::new()),
+            Box::new(use_after_free::UseAfterFreeRule::new()),
         ];
 
         RuleRegistry { rules }

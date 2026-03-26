@@ -63,11 +63,9 @@ impl Rule for ResourceLeakUnprotectedRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
-        let unit_name = helpers::extract_unit_name(tree.root_node(), source).unwrap_or_default();
-        let uses = extract_uses_clauses(tree.root_node(), source);
-        visit_blocks(tree.root_node(), source, &unit_name, &uses, ctx);
+        visit_blocks(tree.root_node(), source, ctx);
     }
 
     fn check_cfg(
@@ -77,7 +75,7 @@ impl Rule for ResourceLeakUnprotectedRule {
         source: &[u8],
         config: &crate::config::Config,
         _analysis: &AnalysisContext<'_>,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         self.check(file, tree, source, config, ctx);
     }
@@ -85,35 +83,23 @@ impl Rule for ResourceLeakUnprotectedRule {
 
 /// Recursively walk the AST looking for block-like nodes that contain
 /// sequential statements (e.g., `begin..end` blocks).
-fn visit_blocks(
-    node: Node,
-    source: &[u8],
-    unit_name: &str,
-    uses: &[String],
-    ctx: &mut LintContext,
-) {
+fn visit_blocks(node: Node, source: &[u8], ctx: &mut LintContext) {
     if node.kind() == "block" {
-        check_block_for_leaks(node, source, unit_name, uses, ctx);
+        check_block_for_leaks(node, source, ctx);
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_blocks(child, source, unit_name, uses, ctx);
+        visit_blocks(child, source, ctx);
     }
 }
 
 /// Check a `block` node for the pattern:
-///   assignment (constructor/factory)  ->  statement(s)  ->  try..finally
+///   assignment (constructor)  ->  statement(s)  ->  try..finally
 ///
-/// If we find statements between the constructor/factory assignment and the `try`
+/// If we find statements between the constructor assignment and the `try`
 /// node whose `finally` clause frees the same variable, flag them.
-fn check_block_for_leaks(
-    block: Node,
-    source: &[u8],
-    unit_name: &str,
-    uses: &[String],
-    ctx: &mut LintContext,
-) {
+fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
 
     for (i, child) in children.iter().enumerate() {
@@ -132,15 +118,7 @@ fn check_block_for_leaks(
         };
         let var_name = node_text(lhs, source);
 
-        let is_constructor = is_constructor_call(rhs, source);
-        let factory_name = if !is_constructor {
-            ctx.source_ctx
-                .and_then(|sc| helpers::is_factory_call(rhs, source, unit_name, uses, sc))
-        } else {
-            None
-        };
-
-        if !is_constructor && factory_name.is_none() {
+        if !is_constructor_call(rhs, source) {
             continue;
         }
 
@@ -160,11 +138,7 @@ fn check_block_for_leaks(
 
         // Step 3: Flag any statements between the assignment and the try
         // that reference the variable.
-        let label = if factory_name.is_some() {
-            "factory call"
-        } else {
-            "constructor"
-        };
+        let label = "constructor";
         for sibling in children.iter().take(try_idx).skip(i + 1) {
             let stmt = *sibling;
             if ast_references_variable(stmt, source, &var_name) {
@@ -252,7 +226,7 @@ impl Rule for ResourceLeakNoTryRule {
         _tree: &Tree,
         _source: &[u8],
         _config: &crate::config::Config,
-        _ctx: &mut LintContext<'_>,
+        _ctx: &mut LintContext,
     ) {
         // Engine skips check() for rules where requires_context() == true.
         // This method exists only to satisfy the trait.
@@ -265,17 +239,15 @@ impl Rule for ResourceLeakNoTryRule {
         source: &[u8],
         _config: &crate::config::Config,
         project: &ProjectContext,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         let uses = extract_uses_clauses(tree.root_node(), source);
-        let unit_name = helpers::extract_unit_name(tree.root_node(), source).unwrap_or_default();
         let ast_intf_types = collect_ast_interface_types(tree.root_node(), source);
         visit_blocks_no_try(
             tree.root_node(),
             source,
             project,
             &uses,
-            &unit_name,
             &ast_intf_types,
             ctx,
         );
@@ -288,7 +260,7 @@ impl Rule for ResourceLeakNoTryRule {
         source: &[u8],
         config: &crate::config::Config,
         analysis: &AnalysisContext<'_>,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         self.check_with_context(file, tree, source, config, analysis.project, ctx);
     }
@@ -299,9 +271,8 @@ fn visit_blocks_no_try(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
-    unit_name: &str,
     ast_intf_types: &HashSet<String>,
-    ctx: &mut LintContext<'_>,
+    ctx: &mut LintContext,
 ) {
     // Build a map of class name → field names from AST class declarations
     // in the current file. This covers classes defined in the same unit
@@ -330,7 +301,6 @@ fn visit_blocks_no_try(
             source,
             project,
             uses,
-            unit_name,
             ast_intf_types,
             &field_names,
             ctx,
@@ -338,7 +308,7 @@ fn visit_blocks_no_try(
     }
 
     // 2. Check top-level blocks not inside any defProc
-    visit_non_proc_blocks(root, source, project, uses, unit_name, ast_intf_types, ctx);
+    visit_non_proc_blocks(root, source, project, uses, ast_intf_types, ctx);
 }
 
 /// Check a block for constructor assignments that have no matching try block
@@ -355,10 +325,9 @@ fn check_block_no_try(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
-    unit_name: &str,
     ast_intf_types: &HashSet<String>,
     field_names: &[String],
-    ctx: &mut LintContext<'_>,
+    ctx: &mut LintContext,
 ) {
     let children: Vec<Node> = block.children(&mut block.walk()).collect();
     let interface_vars = collect_interface_vars(block, source, project, uses, ast_intf_types);
@@ -378,20 +347,12 @@ fn check_block_no_try(
         };
         let var_name = node_text(lhs, source);
 
-        let is_constructor = is_constructor_call(rhs, source);
-        let factory_name = if !is_constructor {
-            ctx.source_ctx
-                .and_then(|sc| helpers::is_factory_call(rhs, source, unit_name, uses, sc))
-        } else {
-            None
-        };
-
-        if !is_constructor && factory_name.is_none() {
+        if !is_constructor_call(rhs, source) {
             continue;
         }
 
-        // --- Constructor-specific skip logic (not applied to factory calls) ---
-        if is_constructor {
+        // --- Constructor-specific skip logic ---
+        {
             // Skip owner-managed objects: constructor's first param descends from
             // TComponent and a non-nil argument was passed.
             let ctor_class_for_owner = extract_constructor_class_name(rhs, source);
@@ -421,39 +382,37 @@ fn check_block_no_try(
         // protecting try block, the object leaks before the caller receives
         // it.  Check that every raise-bearing sibling is a try node itself.
         if var_name.eq_ignore_ascii_case("result") {
-            if is_constructor {
-                let has_unprotected_raise = children[(i + 1)..].iter().any(|s| {
-                    s.is_named() && !s.is_extra() && s.kind() != "try" && ast_contains_raise(*s)
+            let has_unprotected_raise = children[(i + 1)..].iter().any(|s| {
+                s.is_named() && !s.is_extra() && s.kind() != "try" && ast_contains_raise(*s)
+            });
+            if has_unprotected_raise {
+                let start = child.start_position();
+                let end = child.end_position();
+                ctx.report(Diagnostic {
+                    rule_id: "resource-leak-no-try".to_string(),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "'{}' is assigned via constructor but a raise statement after it \
+                         is not protected by try..except. If the raise executes, the \
+                         object will leak.",
+                        var_name
+                    ),
+                    line: start.row + 1,
+                    column: start.column + 1,
+                    end_line: end.row + 1,
+                    end_column: end.column + 1,
+                    help: Some(
+                        "Wrap all code after the constructor in a try..except block \
+                         that frees Result and re-raises."
+                            .to_string(),
+                    ),
                 });
-                if has_unprotected_raise {
-                    let start = child.start_position();
-                    let end = child.end_position();
-                    ctx.report(Diagnostic {
-                        rule_id: "resource-leak-no-try".to_string(),
-                        severity: Severity::Warning,
-                        message: format!(
-                            "'{}' is assigned via constructor but a raise statement after it \
-                             is not protected by try..except. If the raise executes, the \
-                             object will leak.",
-                            var_name
-                        ),
-                        line: start.row + 1,
-                        column: start.column + 1,
-                        end_line: end.row + 1,
-                        end_column: end.column + 1,
-                        help: Some(
-                            "Wrap all code after the constructor in a try..except block \
-                             that frees Result and re-raises."
-                                .to_string(),
-                        ),
-                    });
-                }
             }
             continue;
         }
 
-        // --- Constructor-specific skip logic: reference counting ---
-        if is_constructor {
+        // --- Reference counting skip logic ---
+        {
             // Skip reference-counted objects: if the variable itself is
             // interface-typed, or is later assigned to an interface-typed
             // variable, reference counting manages the object's lifetime.
@@ -474,7 +433,7 @@ fn check_block_no_try(
         }
 
         // Skip when the very next statement frees the variable — no code can
-        // throw between the constructor/factory and the cleanup.
+        // throw between the constructor and the cleanup.
         let next_stmt = children[(i + 1)..]
             .iter()
             .find(|n| n.is_named() && !n.is_extra() && n.kind() != "kEnd");
@@ -492,19 +451,11 @@ fn check_block_no_try(
         if !has_protecting_try {
             let start = child.start_position();
             let end = child.end_position();
-            let message = if let Some(ref fname) = factory_name {
-                format!(
-                    "Factory function '{}' returns a newly-created object assigned to '{}' \
-                     without try..finally protection. If an exception occurs, the object will leak.",
-                    fname, var_name
-                )
-            } else {
-                format!(
-                    "'{}' is created without a try..finally block. \
-                     If an exception occurs after construction, the object will leak.",
-                    var_name
-                )
-            };
+            let message = format!(
+                "'{}' is created without a try..finally block. \
+                 If an exception occurs after construction, the object will leak.",
+                var_name
+            );
             ctx.report(Diagnostic {
                 rule_id: "resource-leak-no-try".to_string(),
                 severity: Severity::Warning,
@@ -852,28 +803,18 @@ fn visit_non_proc_blocks(
     source: &[u8],
     project: &ProjectContext,
     uses: &[String],
-    unit_name: &str,
     ast_intf_types: &HashSet<String>,
-    ctx: &mut LintContext<'_>,
+    ctx: &mut LintContext,
 ) {
     if node.kind() == "defProc" {
         return; // Skip — already handled by the defProc-based path
     }
     if node.kind() == "block" {
-        check_block_no_try(
-            node,
-            source,
-            project,
-            uses,
-            unit_name,
-            ast_intf_types,
-            &[],
-            ctx,
-        );
+        check_block_no_try(node, source, project, uses, ast_intf_types, &[], ctx);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_non_proc_blocks(child, source, project, uses, unit_name, ast_intf_types, ctx);
+        visit_non_proc_blocks(child, source, project, uses, ast_intf_types, ctx);
     }
 }
 

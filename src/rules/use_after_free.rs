@@ -45,7 +45,7 @@ impl Rule for UseAfterFreeRule {
         _tree: &Tree,
         _source: &[u8],
         _config: &crate::config::Config,
-        _ctx: &mut LintContext<'_>,
+        _ctx: &mut LintContext,
     ) {
         // CFG-based rule; analysis happens in check_cfg.
     }
@@ -57,9 +57,9 @@ impl Rule for UseAfterFreeRule {
         source: &[u8],
         _config: &crate::config::Config,
         analysis: &AnalysisContext<'_>,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
-        for (_proc_id, cfg) in &analysis.cfgs {
+        for cfg in analysis.cfgs.values() {
             analyze_cfg(cfg, source, ctx);
         }
     }
@@ -116,9 +116,7 @@ fn analyze_cfg(cfg: &cfg_core::types::Cfg, source: &[u8], ctx: &mut LintContext)
                 None => state.clone(),
             };
 
-            let changed = existing
-                .map(|e| e != &merged)
-                .unwrap_or(true);
+            let changed = existing.map(|e| e != &merged).unwrap_or(true);
 
             if changed || !visited.contains(&successor) {
                 block_entry_state.insert(successor, merged);
@@ -136,10 +134,7 @@ fn analyze_cfg(cfg: &cfg_core::types::Cfg, source: &[u8], ctx: &mut LintContext)
 /// Merge two freed-state maps. A variable is freed if it is freed in ANY
 /// predecessor (conservative for use-after-free: if any path frees it, we
 /// flag subsequent use).
-fn merge_states(
-    a: &HashMap<String, bool>,
-    b: &HashMap<String, bool>,
-) -> HashMap<String, bool> {
+fn merge_states(a: &HashMap<String, bool>, b: &HashMap<String, bool>) -> HashMap<String, bool> {
     let mut merged = a.clone();
     for (var, &freed) in b {
         if freed {
@@ -166,20 +161,19 @@ fn process_statement(
         if state.get(&var).copied().unwrap_or(false) {
             // Double free via FreeAndNil
             let (line, col) = byte_offset_to_line_col(source, byte_offset);
-            let (end_line, end_col) =
-                byte_offset_to_line_col(source, byte_offset + trimmed.len());
+            let (end_line, end_col) = byte_offset_to_line_col(source, byte_offset + trimmed.len());
             ctx.report(Diagnostic {
                 rule_id: "use-after-free".to_string(),
                 severity: Severity::Error,
-                message: format!(
-                    "Double free: '{}' has already been freed",
-                    var
-                ),
+                message: format!("Double free: '{}' has already been freed", var),
                 line,
                 column: col,
                 end_line,
                 end_column: end_col,
-                help: Some("Remove the duplicate free call or check if the variable was reassigned.".to_string()),
+                help: Some(
+                    "Remove the duplicate free call or check if the variable was reassigned."
+                        .to_string(),
+                ),
             });
         }
         state.insert(var, true);
@@ -191,20 +185,19 @@ fn process_statement(
         if state.get(&var).copied().unwrap_or(false) {
             // Double free
             let (line, col) = byte_offset_to_line_col(source, byte_offset);
-            let (end_line, end_col) =
-                byte_offset_to_line_col(source, byte_offset + trimmed.len());
+            let (end_line, end_col) = byte_offset_to_line_col(source, byte_offset + trimmed.len());
             ctx.report(Diagnostic {
                 rule_id: "use-after-free".to_string(),
                 severity: Severity::Error,
-                message: format!(
-                    "Double free: '{}' has already been freed",
-                    var
-                ),
+                message: format!("Double free: '{}' has already been freed", var),
                 line,
                 column: col,
                 end_line,
                 end_column: end_col,
-                help: Some("Remove the duplicate free call or check if the variable was reassigned.".to_string()),
+                help: Some(
+                    "Remove the duplicate free call or check if the variable was reassigned."
+                        .to_string(),
+                ),
             });
         }
         state.insert(var, true);
@@ -265,8 +258,7 @@ fn parse_assignment(lower: &str) -> Option<String> {
 /// Check if a string is a valid Delphi identifier (letters, digits, underscores).
 fn is_identifier(s: &str) -> bool {
     !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !s.chars().next().unwrap().is_ascii_digit()
 }
 
@@ -290,10 +282,7 @@ fn check_freed_references(
             ctx.report(Diagnostic {
                 rule_id: "use-after-free".to_string(),
                 severity: Severity::Error,
-                message: format!(
-                    "Use after free: '{}' is used after being freed",
-                    var
-                ),
+                message: format!("Use after free: '{}' is used after being freed", var),
                 line,
                 column: col,
                 end_line,
@@ -321,8 +310,7 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
     let mut i = 0;
     while i + n.len() <= h.len() {
         if &h[i..i + n.len()] == n {
-            let before_ok =
-                i == 0 || !(h[i - 1].is_ascii_alphanumeric() || h[i - 1] == b'_');
+            let before_ok = i == 0 || !(h[i - 1].is_ascii_alphanumeric() || h[i - 1] == b'_');
             let after_ok = i + n.len() == h.len()
                 || !(h[i + n.len()].is_ascii_alphanumeric() || h[i + n.len()] == b'_');
             if before_ok && after_ok {
@@ -368,10 +356,7 @@ mod tests {
     #[test]
     fn parse_free_call_basic() {
         assert_eq!(parse_free_call("aobj.free;"), Some("aobj".to_string()));
-        assert_eq!(
-            parse_free_call("myobj.destroy;"),
-            Some("myobj".to_string())
-        );
+        assert_eq!(parse_free_call("myobj.destroy;"), Some("myobj".to_string()));
         assert_eq!(parse_free_call("something.else;"), None);
     }
 

@@ -121,46 +121,5 @@ fn snapshot_rule_raise_in_destructor_clean() {
     insta::assert_json_snapshot!("snapshot_rule_raise_in_destructor_clean", diagnostics);
 }
 
-fn lint_diagnostics_with_source_ctx(
-    fixture_paths: &[&str],
-    lint_path: &str,
-) -> Vec<lint4d::engine::Diagnostic> {
-    use lint4d::dcu::ProjectContext;
-    use lint4d::engine::run_lint_with_context;
-    use lint4d::rules::RuleRegistry;
-    use lint4d::source_context::SourceContext;
-
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let file_data: Vec<(FileInfo, Vec<u8>)> = fixture_paths
-        .iter()
-        .map(|p| {
-            let path = manifest.join(p);
-            let source = fs::read(&path).unwrap();
-            (FileInfo::new(PathBuf::from(p)), source)
-        })
-        .collect();
-    let refs: Vec<(&FileInfo, &[u8])> = file_data.iter().map(|(f, s)| (f, s.as_slice())).collect();
-    let source_ctx = SourceContext::build(&refs);
-    let project = ProjectContext::from_units(vec![]);
-
-    let path = manifest.join(lint_path);
-    let source = fs::read(&path).unwrap();
-    let file = FileInfo::new(PathBuf::from(lint_path));
-    let config = "version = 1".parse::<lint4d::config::Config>().unwrap();
-    let registry = RuleRegistry::new();
-    run_lint_with_context(
-        &file,
-        &source,
-        &config,
-        Some(&project),
-        Some(&source_ctx),
-        &registry,
-    )
-}
-
-#[test]
-fn snapshot_rule_factory_leak_no_try() {
-    let path = "tests/fixtures/resource_leak/bad_factory_no_try.pas";
-    let diagnostics = lint_diagnostics_with_source_ctx(&[path], path);
-    insta::assert_json_snapshot!("snapshot_rule_factory_leak_no_try", diagnostics);
-}
+// Factory snapshot tests removed — factory detection has been migrated to
+// cfg-pascal and will be re-wired in a future task.

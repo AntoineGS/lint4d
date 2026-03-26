@@ -113,7 +113,7 @@ impl Rule for InheritedCallOrderRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         visit_def_procs_order(tree.root_node(), source, ctx);
     }
@@ -341,7 +341,7 @@ impl Rule for InheritedCallMissingRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         visit_def_procs_missing(tree.root_node(), tree.root_node(), source, ctx);
     }

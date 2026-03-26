@@ -116,7 +116,7 @@ fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
 /// delegates to [`run_lint_with_context`] with no project context.
 pub fn run_lint(file: &FileInfo, source: &[u8], config: &Config) -> Vec<Diagnostic> {
     let registry = RuleRegistry::new();
-    run_lint_with_context(file, source, config, None, None, &registry)
+    run_lint_with_context(file, source, config, None, &registry)
 }
 
 /// Run all lint rules on a single file with an optional project context.
@@ -134,7 +134,6 @@ pub fn run_lint_with_context(
     source: &[u8],
     config: &Config,
     project: Option<&crate::dcu::ProjectContext>,
-    source_ctx: Option<&crate::source_context::SourceContext>,
     registry: &RuleRegistry,
 ) -> Vec<Diagnostic> {
     let (tree, mut diagnostics) = match parse_file(file, source) {
@@ -168,10 +167,7 @@ pub fn run_lint_with_context(
     let proj_ref = project.unwrap_or(&default_project);
     let analysis = AnalysisContext::new(cfg_map, CallGraph::new(), proj_ref);
 
-    let mut ctx = match source_ctx {
-        Some(sc) => LintContext::with_source_ctx(sc),
-        None => LintContext::new(),
-    };
+    let mut ctx = LintContext::new();
 
     for rule in registry.all_rules() {
         let meta = rule.meta();

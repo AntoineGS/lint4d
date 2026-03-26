@@ -5,7 +5,6 @@ use lint4d::dcu::{
 };
 use lint4d::engine::{run_lint, run_lint_with_context, FileInfo};
 use lint4d::rules::RuleRegistry;
-use lint4d::source_context::SourceContext;
 use std::fs;
 use std::path::PathBuf;
 
@@ -271,7 +270,7 @@ fn lint_fixture_with_context(
     let file = FileInfo::new(PathBuf::from(fixture_path));
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
-    run_lint_with_context(&file, &source, &config, Some(project), None, &registry)
+    run_lint_with_context(&file, &source, &config, Some(project), &registry)
 }
 
 fn empty_project() -> ProjectContext {
@@ -445,8 +444,7 @@ fn resource_leak_no_try_flags_non_owner_constructor_args() {
     let file = FileInfo::new(PathBuf::from("test.pas"));
     let config = "version = 1".parse::<Config>().unwrap();
     let registry = RuleRegistry::new();
-    let diagnostics =
-        run_lint_with_context(&file, source, &config, Some(&project), None, &registry);
+    let diagnostics = run_lint_with_context(&file, source, &config, Some(&project), &registry);
     let matches: Vec<_> = diagnostics
         .iter()
         .filter(|d| d.rule_id == "resource-leak-no-try")
@@ -569,131 +567,5 @@ fn resource_leak_no_try_flags_result_raise_after_try() {
     );
 }
 
-/// Lint a fixture file with a SourceContext built from the given files.
-/// Passes empty_project() so ResourceLeakNoTryRule runs (it requires context).
-fn lint_fixture_with_source_ctx(
-    fixture_paths: &[&str],
-    lint_path: &str,
-) -> Vec<lint4d::engine::Diagnostic> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let file_data: Vec<(FileInfo, Vec<u8>)> = fixture_paths
-        .iter()
-        .map(|p| {
-            let path = manifest.join(p);
-            let source = fs::read(&path).unwrap();
-            (FileInfo::new(PathBuf::from(p)), source)
-        })
-        .collect();
-    let refs: Vec<(&FileInfo, &[u8])> = file_data.iter().map(|(f, s)| (f, s.as_slice())).collect();
-    let source_ctx = SourceContext::build(&refs);
-
-    let project = empty_project();
-    let path = manifest.join(lint_path);
-    let source = fs::read(&path).unwrap();
-    let file = FileInfo::new(PathBuf::from(lint_path));
-    let config = "version = 1".parse::<Config>().unwrap();
-    let registry = RuleRegistry::new();
-    run_lint_with_context(
-        &file,
-        &source,
-        &config,
-        Some(&project),
-        Some(&source_ctx),
-        &registry,
-    )
-}
-
-#[test]
-fn resource_leak_no_try_flags_factory_call() {
-    let path = "tests/fixtures/resource_leak/bad_factory_no_try.pas";
-    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
-    let matches: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.rule_id == "resource-leak-no-try")
-        .collect();
-    assert_eq!(
-        matches.len(),
-        1,
-        "Factory call without try..finally should flag resource-leak-no-try: {:?}",
-        matches
-    );
-}
-
-#[test]
-fn resource_leak_no_try_passes_factory_with_try() {
-    let path = "tests/fixtures/resource_leak/good_factory_protected.pas";
-    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
-    let matches: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.rule_id == "resource-leak-no-try")
-        .collect();
-    assert!(
-        matches.is_empty(),
-        "Factory call with try..finally should not flag: {:?}",
-        matches
-    );
-}
-
-#[test]
-fn resource_leak_no_try_skips_non_factory_function() {
-    let path = "tests/fixtures/resource_leak/good_not_factory.pas";
-    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
-    let matches: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.rule_id == "resource-leak-no-try")
-        .collect();
-    assert!(
-        matches.is_empty(),
-        "Non-factory function should not flag resource-leak-no-try: {:?}",
-        matches
-    );
-}
-
-#[test]
-fn resource_leak_no_try_flags_indirect_factory() {
-    let path = "tests/fixtures/resource_leak/bad_factory_indirect.pas";
-    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
-    let matches: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.rule_id == "resource-leak-no-try")
-        .collect();
-    assert_eq!(
-        matches.len(),
-        1,
-        "Indirect factory (factory calling factory) should flag: {:?}",
-        matches
-    );
-}
-
-#[test]
-fn resource_leak_no_try_flags_cross_file_factory() {
-    let factory_path = "tests/fixtures/resource_leak/factory_unit.pas";
-    let consumer_path = "tests/fixtures/resource_leak/bad_factory_cross_file.pas";
-    let diagnostics = lint_fixture_with_source_ctx(&[factory_path, consumer_path], consumer_path);
-    let matches: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.rule_id == "resource-leak-no-try")
-        .collect();
-    assert_eq!(
-        matches.len(),
-        1,
-        "Cross-file factory call should flag resource-leak-no-try: {:?}",
-        matches
-    );
-}
-
-#[test]
-fn resource_leak_unprotected_flags_factory_call() {
-    let path = "tests/fixtures/resource_leak/bad_factory_unprotected.pas";
-    let diagnostics = lint_fixture_with_source_ctx(&[path], path);
-    let matches: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.rule_id == "resource-leak-unprotected")
-        .collect();
-    assert_eq!(
-        matches.len(),
-        1,
-        "Factory call with code before try should flag resource-leak-unprotected: {:?}",
-        matches
-    );
-}
+// Factory detection tests removed — factory detection has been migrated to
+// cfg-pascal and will be re-wired in a future task.

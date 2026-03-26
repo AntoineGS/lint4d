@@ -13,7 +13,6 @@ use tree_sitter::Tree;
 
 use crate::cfg::analysis::AnalysisContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
-use crate::source_context::SourceContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleCategory {
@@ -31,23 +30,14 @@ pub struct RuleMeta {
     pub description: &'static str,
 }
 
-pub struct LintContext<'a> {
+pub struct LintContext {
     pub diagnostics: Vec<Diagnostic>,
-    pub source_ctx: Option<&'a SourceContext>,
 }
 
-impl<'a> LintContext<'a> {
+impl LintContext {
     pub fn new() -> Self {
         LintContext {
             diagnostics: Vec::new(),
-            source_ctx: None,
-        }
-    }
-
-    pub fn with_source_ctx(source_ctx: &'a SourceContext) -> Self {
-        LintContext {
-            diagnostics: Vec::new(),
-            source_ctx: Some(source_ctx),
         }
     }
 
@@ -56,7 +46,7 @@ impl<'a> LintContext<'a> {
     }
 }
 
-impl Default for LintContext<'_> {
+impl Default for LintContext {
     fn default() -> Self {
         Self::new()
     }
@@ -75,7 +65,7 @@ pub trait Rule: Send + Sync {
         tree: &Tree,
         source: &[u8],
         config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     );
 
     fn check_with_context(
@@ -85,7 +75,7 @@ pub trait Rule: Send + Sync {
         source: &[u8],
         config: &crate::config::Config,
         _project: &crate::dcu::ProjectContext,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         self.check(file, tree, source, config, ctx);
     }
@@ -97,7 +87,7 @@ pub trait Rule: Send + Sync {
         _source: &[u8],
         _config: &crate::config::Config,
         _analysis: &AnalysisContext<'_>,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         // Default no-op: rules override this when they need CFG-based analysis.
         let _ = ctx;

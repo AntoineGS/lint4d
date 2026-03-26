@@ -42,7 +42,7 @@ impl Rule for TypePrefixRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         visit_type_prefix(tree.root_node(), source, ctx);
     }
@@ -135,7 +135,7 @@ impl Rule for InterfacePrefixRule {
         tree: &Tree,
         source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         visit_interface_prefix(tree.root_node(), source, ctx);
     }
@@ -224,7 +224,7 @@ impl Rule for ConstantNamingRule {
         tree: &Tree,
         source: &[u8],
         config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         visit_constant_naming(tree.root_node(), source, config.constant_style(), ctx);
     }
@@ -412,7 +412,7 @@ impl Rule for LocalVariableNamingRule {
         tree: &Tree,
         source: &[u8],
         config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         let style = config.local_variable_style();
         visit_local_variable_naming(tree.root_node(), source, style, ctx);

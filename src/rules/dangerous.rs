@@ -42,7 +42,7 @@ impl Rule for WithStatementRule {
         tree: &Tree,
         _source: &[u8],
         _config: &crate::config::Config,
-        ctx: &mut LintContext<'_>,
+        ctx: &mut LintContext,
     ) {
         visit_with(tree.root_node(), ctx);
     }

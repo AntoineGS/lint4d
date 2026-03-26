@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Tree};
 
+use crate::cfg::analysis::AnalysisContext;
 use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers;
@@ -52,6 +53,10 @@ impl Rule for ResourceLeakUnprotectedRule {
         &self.meta
     }
 
+    fn requires_cfg(&self) -> bool {
+        true
+    }
+
     fn check(
         &self,
         _file: &FileInfo,
@@ -63,6 +68,18 @@ impl Rule for ResourceLeakUnprotectedRule {
         let unit_name = helpers::extract_unit_name(tree.root_node(), source).unwrap_or_default();
         let uses = extract_uses_clauses(tree.root_node(), source);
         visit_blocks(tree.root_node(), source, &unit_name, &uses, ctx);
+    }
+
+    fn check_cfg(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        _analysis: &AnalysisContext<'_>,
+        ctx: &mut LintContext<'_>,
+    ) {
+        self.check(file, tree, source, config, ctx);
     }
 }
 
@@ -262,6 +279,18 @@ impl Rule for ResourceLeakNoTryRule {
             &ast_intf_types,
             ctx,
         );
+    }
+
+    fn check_cfg(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        analysis: &AnalysisContext<'_>,
+        ctx: &mut LintContext<'_>,
+    ) {
+        self.check_with_context(file, tree, source, config, analysis.project, ctx);
     }
 }
 

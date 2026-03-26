@@ -1,5 +1,6 @@
 use tree_sitter::{Node, Tree};
 
+use crate::cfg::analysis::AnalysisContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::field_leak::parse_def_proc;
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
@@ -301,6 +302,10 @@ impl Rule for RaiseInDestructorRule {
         &self.meta
     }
 
+    fn requires_cfg(&self) -> bool {
+        true
+    }
+
     fn check(
         &self,
         _file: &FileInfo,
@@ -310,6 +315,18 @@ impl Rule for RaiseInDestructorRule {
         ctx: &mut LintContext<'_>,
     ) {
         visit_destructor_raises(tree.root_node(), source, ctx);
+    }
+
+    fn check_cfg(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        _analysis: &AnalysisContext<'_>,
+        ctx: &mut LintContext<'_>,
+    ) {
+        self.check(file, tree, source, config, ctx);
     }
 }
 

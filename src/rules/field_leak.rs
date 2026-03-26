@@ -1,5 +1,6 @@
 use tree_sitter::{Node, Tree};
 
+use crate::cfg::analysis::AnalysisContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
     ast_frees_variable, constructor_has_owner_args, is_constructor_call, node_text,
@@ -424,6 +425,10 @@ impl Rule for FieldNotFreedRule {
         &self.meta
     }
 
+    fn requires_cfg(&self) -> bool {
+        true
+    }
+
     fn check(
         &self,
         _file: &FileInfo,
@@ -433,6 +438,18 @@ impl Rule for FieldNotFreedRule {
         ctx: &mut LintContext<'_>,
     ) {
         check_field_not_freed(tree.root_node(), source, ctx);
+    }
+
+    fn check_cfg(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        _analysis: &AnalysisContext<'_>,
+        ctx: &mut LintContext<'_>,
+    ) {
+        self.check(file, tree, source, config, ctx);
     }
 }
 
@@ -529,6 +546,10 @@ impl Rule for FieldReassignLeakRule {
         &self.meta
     }
 
+    fn requires_cfg(&self) -> bool {
+        true
+    }
+
     fn check(
         &self,
         _file: &FileInfo,
@@ -538,6 +559,18 @@ impl Rule for FieldReassignLeakRule {
         ctx: &mut LintContext<'_>,
     ) {
         check_field_reassign_leak(tree.root_node(), source, ctx);
+    }
+
+    fn check_cfg(
+        &self,
+        file: &FileInfo,
+        tree: &Tree,
+        source: &[u8],
+        config: &crate::config::Config,
+        _analysis: &AnalysisContext<'_>,
+        ctx: &mut LintContext<'_>,
+    ) {
+        self.check(file, tree, source, config, ctx);
     }
 }
 

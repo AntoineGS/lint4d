@@ -10,6 +10,7 @@ pub mod scope;
 
 use tree_sitter::Tree;
 
+use crate::cfg::analysis::AnalysisContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::source_context::SourceContext;
 
@@ -86,6 +87,23 @@ pub trait Rule: Send + Sync {
         ctx: &mut LintContext<'_>,
     ) {
         self.check(file, tree, source, config, ctx);
+    }
+
+    fn check_cfg(
+        &self,
+        _file: &FileInfo,
+        _tree: &Tree,
+        _source: &[u8],
+        _config: &crate::config::Config,
+        _analysis: &AnalysisContext<'_>,
+        ctx: &mut LintContext<'_>,
+    ) {
+        // Default no-op: rules override this when they need CFG-based analysis.
+        let _ = ctx;
+    }
+
+    fn requires_cfg(&self) -> bool {
+        false
     }
 }
 

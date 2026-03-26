@@ -3,9 +3,16 @@ pub mod suppress;
 
 pub use context::{Diagnostic, FileInfo, FileType, Severity};
 
+use crate::cfg::analysis::AnalysisContext;
 use crate::config::{Config, RuleSeverityOverride};
+use crate::dcu::ProjectContext;
+use crate::rules::helpers::extract_unit_name;
 use crate::rules::{LintContext, RuleCategory, RuleRegistry};
+use cfg_core::call_graph::CallGraph;
+use cfg_core::summary::ProcId;
+use cfg_pascal::build_file_cfgs;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use tree_sitter::Parser;
 
 thread_local! {
@@ -146,6 +153,21 @@ pub fn run_lint_with_context(
         }
     };
 
+    // Build per-method CFGs from the parsed tree.
+    let unit_name = extract_unit_name(tree.root_node(), source).unwrap_or_default();
+    let file_cfgs = build_file_cfgs(&tree, source);
+    let cfg_map: HashMap<ProcId, _> = file_cfgs
+        .into_iter()
+        .map(|cfg| {
+            let proc_id = ProcId::new(&unit_name, &cfg.proc_name);
+            (proc_id, cfg)
+        })
+        .collect();
+
+    let default_project = ProjectContext::from_units(vec![]);
+    let proj_ref = project.unwrap_or(&default_project);
+    let analysis = AnalysisContext::new(cfg_map, CallGraph::new(), proj_ref);
+
     let mut ctx = match source_ctx {
         Some(sc) => LintContext::with_source_ctx(sc),
         None => LintContext::new(),
@@ -166,13 +188,19 @@ pub fn run_lint_with_context(
             continue;
         }
 
-        match project {
-            Some(proj) => rule.check_with_context(file, &tree, source, config, proj, &mut ctx),
-            None => {
-                if !rule.requires_context() {
-                    rule.check(file, &tree, source, config, &mut ctx);
+        if rule.requires_cfg() {
+            rule.check_cfg(file, &tree, source, config, &analysis, &mut ctx);
+        } else if rule.requires_context() {
+            match project {
+                Some(proj) => {
+                    rule.check_with_context(file, &tree, source, config, proj, &mut ctx);
+                }
+                None => {
+                    // Skip context-dependent rules when no project context is available.
                 }
             }
+        } else {
+            rule.check(file, &tree, source, config, &mut ctx);
         }
     }
 

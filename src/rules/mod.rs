@@ -5,6 +5,7 @@ pub mod field_leak;
 pub mod helpers;
 pub mod inherited;
 pub mod naming;
+pub mod nil_check;
 pub mod resource_leak;
 pub mod scope;
 pub mod transaction;
@@ -21,6 +22,7 @@ pub enum RuleCategory {
     ExceptionHandling,
     NamingConvention,
     DangerousPattern,
+    NullSafety,
 }
 
 pub struct RuleMeta {
@@ -124,6 +126,7 @@ impl RuleRegistry {
             Box::new(inherited::InheritedCallMissingRule::new()),
             Box::new(use_after_free::UseAfterFreeRule::new()),
             Box::new(transaction::TransactionRule::new()),
+            Box::new(nil_check::UncheckedNilRule::new()),
         ];
 
         RuleRegistry { rules }

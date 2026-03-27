@@ -10,7 +10,7 @@ use crate::dcu::{
 /// the list of imported unit names, and type declarations.
 pub fn parse_dcu(data: &[u8]) -> Result<DcuUnit, DcuError> {
     let header = parse_unit_header(data)?;
-    let mut reader = DcuReader::new(data);
+    let mut reader = DcuReader::new(data, header.version);
     reader.set_position(header.body_offset);
 
     // Finish reading the first source file entry (header consumed the tag + name).

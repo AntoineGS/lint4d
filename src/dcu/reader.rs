@@ -1,13 +1,15 @@
 use crate::dcu::tags::DcuError;
+use crate::dcu::DcuVersion;
 
 pub struct DcuReader<'a> {
     data: &'a [u8],
     pos: usize,
+    pub ver: DcuVersion,
 }
 
 impl<'a> DcuReader<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+    pub fn new(data: &'a [u8], ver: DcuVersion) -> Self {
+        Self { data, pos: 0, ver }
     }
 
     pub fn position(&self) -> usize {

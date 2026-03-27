@@ -60,7 +60,7 @@ static MAGIC_TABLE: &[(u32, DcuVersion, DcuPlatform)] = &[
 ];
 
 pub fn parse_magic(data: &[u8]) -> Result<(DcuVersion, DcuPlatform), DcuError> {
-    let mut reader = DcuReader::new(data);
+    let mut reader = DcuReader::new(data, DcuVersion::D13);
     let magic = reader.read_u32()?;
     for &(m, ver, plat) in MAGIC_TABLE {
         if m == magic {
@@ -102,7 +102,7 @@ pub struct UnitHeader {
 /// The unit name is derived from the source filename by stripping the trailing `.pas` suffix.
 pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     let (version, platform) = parse_magic(data)?;
-    let mut reader = DcuReader::new(data);
+    let mut reader = DcuReader::new(data, DcuVersion::D13);
 
     // Skip magic (4 bytes already parsed by parse_magic).
     reader.skip(4)?;

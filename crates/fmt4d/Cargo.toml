@@ -1,0 +1,20 @@
+[package]
+name = "fmt4d"
+version = "0.1.0"
+edition = "2021"
+description = "An opinionated Delphi/Object Pascal code formatter"
+
+[dependencies]
+pascal-core = { path = "../pascal-core" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rayon = "1"
+owo-colors = { version = "4", features = ["supports-colors"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[lints.rust]
+warnings = "deny"

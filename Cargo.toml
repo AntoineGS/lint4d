@@ -2,5 +2,6 @@
 members = [
     "crates/pascal-core",
     "crates/lint4d",
+    "crates/fmt4d",
 ]
 resolver = "2"

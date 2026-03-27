@@ -540,6 +540,7 @@ dependencies = [
  "globset",
  "insta",
  "owo-colors",
+ "pascal-core",
  "petgraph",
  "predicates",
  "quick-xml",

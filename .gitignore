@@ -4,9 +4,12 @@
 .claude/
 
 tests/fixtures/projects/TestProject1/__history/
+crates/lint4d/tests/fixtures/projects/TestProject1/__history/
 
 *.exe
 
 tests/fixtures/projects/TestProject1/TestProject1.dproj.local
+crates/lint4d/tests/fixtures/projects/TestProject1/TestProject1.dproj.local
 
 tests/fixtures/projects/TestProject1/__recovery/
+crates/lint4d/tests/fixtures/projects/TestProject1/__recovery/

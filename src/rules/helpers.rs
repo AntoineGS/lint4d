@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use tree_sitter::Node;
 
 /// Extract the UTF-8 text of a node from the source bytes.
@@ -277,4 +278,57 @@ fn call_has_non_nil_args(call_node: Node, source: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Build a mapping of variable name (lowercase) -> declared type name
+/// from the `var` section of a defProc node.
+pub fn build_var_type_map(proc_node: Node, source: &[u8]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut proc_cursor = proc_node.walk();
+    for child in proc_node.children(&mut proc_cursor) {
+        if child.kind() != "declVars" {
+            continue;
+        }
+        let mut vars_cursor = child.walk();
+        for decl_var in child.children(&mut vars_cursor) {
+            if decl_var.kind() != "declVar" {
+                continue;
+            }
+            let type_name = match extract_type_from_decl_var(decl_var, source) {
+                Some(t) => t,
+                None => continue,
+            };
+            let mut dv_cursor = decl_var.walk();
+            for dv_child in decl_var.children(&mut dv_cursor) {
+                if dv_child.kind() == "identifier" {
+                    let var_name = node_text(dv_child, source);
+                    map.insert(var_name.to_lowercase(), type_name.clone());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Extract the type name from a `declVar` AST node.
+///
+/// Walks `declVar -> type -> typeref -> identifier` to get the type name.
+fn extract_type_from_decl_var(decl_var: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = decl_var.walk();
+    for child in decl_var.children(&mut cursor) {
+        if child.kind() == "type" {
+            let mut type_cursor = child.walk();
+            for type_child in child.children(&mut type_cursor) {
+                if type_child.kind() == "typeref" {
+                    let mut ref_cursor = type_child.walk();
+                    for ref_child in type_child.children(&mut ref_cursor) {
+                        if ref_child.kind() == "identifier" {
+                            return Some(node_text(ref_child, source));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }

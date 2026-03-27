@@ -2,6 +2,7 @@ pub mod blank_lines;
 mod config;
 pub mod indent;
 pub mod spacing;
+pub mod uses;
 
 use clap::{CommandFactory, Parser};
 use std::path::PathBuf;

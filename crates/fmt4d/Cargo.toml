@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 rayon = "1"
 owo-colors = { version = "4", features = ["supports-colors"] }
+tree-sitter = "0.24"
 
 [dev-dependencies]
 assert_cmd = "2"

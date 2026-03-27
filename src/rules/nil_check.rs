@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use cfg_core::summary::ProcId;
 use cfg_core::types::Cfg;
 use cfg_core::BlockId;
 use petgraph::visit::EdgeRef;
@@ -14,6 +16,12 @@ use crate::rules::helpers::{
     node_text,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
+
+// ─── Thread-local cache ───────────────────────────────────────────────────────
+
+thread_local! {
+    static FN_RETURN_CACHE: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+}
 
 // ─── Rule definition ─────────────────────────────────────────────────────────
 
@@ -72,6 +80,12 @@ impl Rule for UncheckedNilRule {
         ctx: &mut LintContext,
     ) {
         let uses = extract_uses_clauses(tree.root_node(), source);
+        let unit_name =
+            crate::rules::helpers::extract_unit_name(tree.root_node(), source).unwrap_or_default();
+
+        // Clear function return cache for each file
+        FN_RETURN_CACHE.with(|cache| cache.borrow_mut().clear());
+
         for cfg in analysis.cfgs.values() {
             let def_proc = match find_def_proc_at(tree.root_node(), cfg.byte_range.start) {
                 Some(n) => n,
@@ -81,7 +95,15 @@ impl Rule for UncheckedNilRule {
             if nillable_vars.is_empty() {
                 continue;
             }
-            analyze_cfg(cfg, source, &nillable_vars, ctx);
+            analyze_cfg(
+                cfg,
+                source,
+                &nillable_vars,
+                tree.root_node(),
+                &analysis.cfgs,
+                &unit_name,
+                ctx,
+            );
         }
     }
 }
@@ -226,6 +248,9 @@ fn analyze_cfg(
     cfg: &Cfg,
     source: &[u8],
     nillable_vars: &HashMap<String, VarInfo>,
+    root: Node,
+    all_cfgs: &HashMap<ProcId, Cfg>,
+    unit_name: &str,
     ctx: &mut LintContext,
 ) {
     let graph = &cfg.graph;
@@ -267,6 +292,9 @@ fn analyze_cfg(
                 &mut state,
                 nillable_vars,
                 &mut reported,
+                root,
+                all_cfgs,
+                unit_name,
                 ctx,
             );
         }
@@ -337,6 +365,7 @@ fn merge_nil_states(a: &NilState, b: &NilState) -> NilState {
 // ─── Statement processing ────────────────────────────────────────────────────
 
 /// Process a single statement to detect nil-relevant patterns and flag uses.
+#[allow(clippy::too_many_arguments)]
 fn process_statement(
     text: &str,
     byte_offset: usize,
@@ -344,6 +373,9 @@ fn process_statement(
     state: &mut NilState,
     nillable_vars: &HashMap<String, VarInfo>,
     reported: &mut HashSet<(String, usize)>,
+    root: Node,
+    all_cfgs: &HashMap<ProcId, Cfg>,
+    unit_name: &str,
     ctx: &mut LintContext,
 ) {
     let trimmed = text.trim();
@@ -382,9 +414,19 @@ fn process_statement(
             } else if is_constructor_pattern(rhs_trimmed) {
                 state.insert(var.clone(), true);
             } else {
-                // Non-constructor assignment: treat as safe for now.
-                // Function return analysis added in Task 10.
-                state.insert(var.clone(), true);
+                // Check if RHS is a function call that can return nil
+                let func_name = extract_function_name(rhs_trimmed);
+                if let Some(ref fname) = func_name {
+                    if let Some(true) =
+                        can_function_return_nil(fname, root, source, all_cfgs, unit_name)
+                    {
+                        state.insert(var.clone(), false); // Function can return nil
+                    } else {
+                        state.insert(var.clone(), true); // Safe or can't be analyzed
+                    }
+                } else {
+                    state.insert(var.clone(), true);
+                }
             }
         }
         check_uses_in_text(
@@ -462,6 +504,146 @@ fn check_uses_in_text(
             }
         }
     }
+}
+
+// ─── Function return nil analysis ────────────────────────────────────────────
+
+/// Extract function name from a call expression like `somefunc(args)` or `somefunc`.
+fn extract_function_name(rhs: &str) -> Option<String> {
+    let rhs = rhs.trim_end_matches(';').trim();
+    // Skip constructor calls and dot expressions (method calls)
+    if rhs.contains('.') {
+        return None;
+    }
+    let name = rhs.split('(').next()?.trim();
+    if is_identifier(name) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Analyze whether a function defined in the current file can return nil.
+fn can_function_return_nil(
+    func_name: &str,
+    root: Node,
+    source: &[u8],
+    cfgs: &HashMap<ProcId, Cfg>,
+    unit_name: &str,
+) -> Option<bool> {
+    let func_lower = func_name.to_lowercase();
+
+    // Check cache
+    let cached = FN_RETURN_CACHE.with(|cache| cache.borrow().get(&func_lower).copied());
+    if let Some(result) = cached {
+        return Some(result);
+    }
+
+    // Insert sentinel to break recursion (assume can return nil)
+    FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower.clone(), true));
+
+    // Find the function's CFG by matching proc name (case-insensitive)
+    // qualified_name may be just "FuncName" or "TClass.MethodName"
+    let cfg = cfgs
+        .iter()
+        .find(|(pid, _)| {
+            // Only consider functions from the same unit
+            pid.unit_name.eq_ignore_ascii_case(unit_name)
+                && pid.qualified_name.eq_ignore_ascii_case(func_name)
+        })
+        .map(|(_, c)| c)?;
+
+    // Verify it's a function (has return type) by checking the AST
+    let def_proc = find_def_proc_at(root, cfg.byte_range.start)?;
+    if !is_function_def(def_proc, source) {
+        return None; // Procedures don't have return values
+    }
+
+    let result = analyze_return_nil(cfg, source);
+
+    // Update cache
+    FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower, result));
+
+    Some(result)
+}
+
+/// Check if a `defProc` is a function (has a return type).
+fn is_function_def(def_proc: Node, source: &[u8]) -> bool {
+    if let Some(header) = def_proc.child_by_field_name("header") {
+        let header_text = node_text(header, source).to_lowercase();
+        header_text.starts_with("function")
+    } else {
+        false
+    }
+}
+
+/// Analyze a function's CFG to determine if it can return nil.
+///
+/// Returns true if any path to the exit block has Result potentially nil.
+fn analyze_return_nil(cfg: &Cfg, source: &[u8]) -> bool {
+    let graph = &cfg.graph;
+    let entry = cfg.entry;
+    let exit = cfg.exit;
+
+    // Track Result state: false = potentially nil, true = assigned non-nil
+    let mut block_result_state: HashMap<BlockId, bool> = HashMap::new();
+    let mut worklist: VecDeque<BlockId> = VecDeque::new();
+
+    block_result_state.insert(entry, false); // Result starts as nil
+    worklist.push_back(entry);
+
+    while let Some(block_id) = worklist.pop_front() {
+        let result_safe = block_result_state.get(&block_id).copied().unwrap_or(false);
+
+        let block = &graph[block_id.index()];
+        let mut state = result_safe;
+
+        for stmt in &block.stmts {
+            let start = stmt.byte_range.start;
+            let end = stmt.byte_range.end.min(source.len());
+            if start >= end {
+                continue;
+            }
+            let text = match std::str::from_utf8(&source[start..end]) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let lower = text.trim().to_lowercase();
+
+            if let Some((var, rhs)) = parse_assignment_parts(&lower) {
+                if var == "result" {
+                    let rhs_trimmed = rhs.trim().trim_end_matches(';').trim();
+                    if rhs_trimmed == "nil" {
+                        state = false;
+                    } else if is_constructor_pattern(rhs_trimmed) {
+                        state = true;
+                    } else {
+                        state = true; // Other assignments conservatively non-nil
+                    }
+                }
+            }
+        }
+
+        for edge in graph.edges_directed(block_id.index(), Direction::Outgoing) {
+            let successor = BlockId::from(edge.target());
+            let existing = block_result_state.get(&successor);
+
+            // Conservative: Result is safe only if ALL paths agree
+            let merged = match existing {
+                Some(&existing_safe) => existing_safe && state,
+                None => state,
+            };
+
+            let changed = existing.map(|&e| e != merged).unwrap_or(true);
+            if changed {
+                block_result_state.insert(successor, merged);
+                worklist.push_back(successor);
+            }
+        }
+    }
+
+    let exit_safe = block_result_state.get(&exit).copied().unwrap_or(false);
+    !exit_safe // Returns true if Result can be nil
 }
 
 // ─── Pattern matching helpers ────────────────────────────────────────────────

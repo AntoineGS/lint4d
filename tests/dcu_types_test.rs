@@ -10,6 +10,18 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn d2010_fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dcu/d2010_win32/Win32/Debug")
+        .join(name)
+}
+
+fn xe3_fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dcu/xe3_win32/Win32/Debug")
+        .join(name)
+}
+
 #[test]
 fn parse_header_reads_unit_name_interfaces() {
     let data = fs::read(fixture_path("Lint4dFixture.Interfaces.dcu")).unwrap();
@@ -278,4 +290,146 @@ fn parse_dcu_torture_imports() {
             unit.imported_units
         );
     }
+}
+
+// ── D2010 (Win32) multi-version tests ──────────────────────────────────────
+
+#[test]
+fn parse_dcu_d2010_classes() {
+    let data = fs::read(d2010_fixture_path("Lint4dFixture.Classes.dcu"))
+        .expect("D2010 fixture not found — run make in d2010_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Classes");
+    assert_eq!(unit.version, DcuVersion::D2010);
+    assert_eq!(unit.platform, DcuPlatform::Win32);
+    assert!(
+        !unit.types.is_empty(),
+        "Expected types in D2010 Classes unit"
+    );
+    let classes: Vec<_> = unit
+        .types
+        .iter()
+        .filter(|t| t.kind == TypeKind::Class)
+        .collect();
+    assert!(
+        !classes.is_empty(),
+        "Expected class types in D2010 Classes unit"
+    );
+}
+
+#[test]
+fn parse_dcu_d2010_interfaces() {
+    let data = fs::read(d2010_fixture_path("Lint4dFixture.Interfaces.dcu"))
+        .expect("D2010 fixture not found — run make in d2010_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Interfaces");
+    assert_eq!(unit.version, DcuVersion::D2010);
+}
+
+#[test]
+fn parse_dcu_d2010_records() {
+    let data = fs::read(d2010_fixture_path("Lint4dFixture.Records.dcu"))
+        .expect("D2010 fixture not found — run make in d2010_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Records");
+    assert_eq!(unit.version, DcuVersion::D2010);
+}
+
+#[test]
+fn parse_dcu_d2010_inheritance() {
+    let data = fs::read(d2010_fixture_path("Lint4dFixture.Inheritance.dcu"))
+        .expect("D2010 fixture not found — run make in d2010_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Inheritance");
+    assert!(
+        unit.imported_units
+            .iter()
+            .any(|u| u == "Lint4dFixture.Classes"),
+        "Expected 'Lint4dFixture.Classes' in imports"
+    );
+}
+
+#[test]
+fn parse_dcu_d2010_class_has_fields() {
+    let data = fs::read(d2010_fixture_path("Lint4dFixture.Classes.dcu"))
+        .expect("D2010 fixture not found — run make in d2010_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    let class_types: Vec<_> = unit
+        .types
+        .iter()
+        .filter(|t| t.kind == TypeKind::Class)
+        .collect();
+    let has_fields = class_types.iter().any(|t| !t.fields.is_empty());
+    assert!(
+        has_fields,
+        "Expected at least one D2010 class with fields, classes: {:?}",
+        class_types
+            .iter()
+            .map(|t| (&t.name, t.fields.len()))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── XE3 (Win32) multi-version tests ───────────────────────────────────────
+
+#[test]
+fn parse_dcu_xe3_classes() {
+    let data = fs::read(xe3_fixture_path("Lint4dFixture.Classes.dcu"))
+        .expect("XE3 fixture not found — run make in xe3_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Classes");
+    assert_eq!(unit.version, DcuVersion::DXE3);
+    assert_eq!(unit.platform, DcuPlatform::Win32);
+    assert!(
+        !unit.types.is_empty(),
+        "Expected types in XE3 Classes unit"
+    );
+    let classes: Vec<_> = unit
+        .types
+        .iter()
+        .filter(|t| t.kind == TypeKind::Class)
+        .collect();
+    assert!(
+        !classes.is_empty(),
+        "Expected class types in XE3 Classes unit"
+    );
+}
+
+#[test]
+fn parse_dcu_xe3_interfaces() {
+    let data = fs::read(xe3_fixture_path("Lint4dFixture.Interfaces.dcu"))
+        .expect("XE3 fixture not found — run make in xe3_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Interfaces");
+    assert_eq!(unit.version, DcuVersion::DXE3);
+}
+
+#[test]
+fn parse_dcu_xe3_records() {
+    let data = fs::read(xe3_fixture_path("Lint4dFixture.Records.dcu"))
+        .expect("XE3 fixture not found — run make in xe3_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    assert_eq!(unit.name, "Lint4dFixture.Records");
+    assert_eq!(unit.version, DcuVersion::DXE3);
+}
+
+#[test]
+fn parse_dcu_xe3_class_has_constructor() {
+    let data = fs::read(xe3_fixture_path("Lint4dFixture.Classes.dcu"))
+        .expect("XE3 fixture not found — run make in xe3_win32/");
+    let unit = parse_dcu(&data).unwrap();
+    let adapter = unit
+        .types
+        .iter()
+        .find(|t| t.name == "TDataAdapter")
+        .expect("TDataAdapter not found in XE3 fixture");
+    assert_eq!(adapter.kind, TypeKind::Class);
+    let has_ctor = adapter
+        .methods
+        .iter()
+        .any(|m| m.kind == MethodKind::Constructor);
+    assert!(
+        has_ctor,
+        "Expected TDataAdapter to have a constructor in XE3"
+    );
 }

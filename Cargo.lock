@@ -368,6 +368,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fmt4d"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "owo-colors",
+ "pascal-core",
+ "predicates",
+ "rayon",
+ "serde",
+ "toml",
+ "tree-sitter",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

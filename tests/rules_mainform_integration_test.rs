@@ -11,9 +11,9 @@ use std::path::PathBuf;
 ///
 /// | Line | Pattern                                    | Detected? |
 /// |------|--------------------------------------------|-----------|
-/// | 125  | `aObj.Free; aObj.Free;` (double free)       | YES       |
-/// | 180  | `if aObj.ClassName = ...` after Free        | YES       |
-/// | 189  | `if aObj.ClassName = ...` after FreeAndNil  | YES       |
+/// | 124  | `aObj.Free; aObj.Free;` (double free)       | YES       |
+/// | 179  | `if aObj.ClassName = ...` after Free        | YES       |
+/// | 188  | `if aObj.ClassName = ...` after FreeAndNil  | YES       |
 #[test]
 fn mainform_detects_use_after_free() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -41,20 +41,20 @@ fn mainform_detects_use_after_free() {
     );
 
     assert!(
-        detected_lines.contains(&125),
-        "Expected use-after-free on line 125 (double free in TestDoubleFree), \
+        detected_lines.contains(&124),
+        "Expected use-after-free on line 124 (double free in TestDoubleFree), \
          but detected lines were: {:?}",
         detected_lines
     );
     assert!(
-        detected_lines.contains(&180),
-        "Expected use-after-free on line 180 (use after Free in TestUseAfterFree), \
+        detected_lines.contains(&179),
+        "Expected use-after-free on line 179 (use after Free in TestUseAfterFree), \
          but detected lines were: {:?}",
         detected_lines
     );
     assert!(
-        detected_lines.contains(&189),
-        "Expected use-after-free on line 189 (use after FreeAndNil in TestUseAfterFree), \
+        detected_lines.contains(&188),
+        "Expected use-after-free on line 188 (use after FreeAndNil in TestUseAfterFree), \
          but detected lines were: {:?}",
         detected_lines
     );

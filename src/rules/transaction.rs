@@ -715,61 +715,35 @@ fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Emit diagnostics from findings, filtering by rule_id.
-fn emit_findings(
-    findings: &[TrxFinding],
-    rule_id: &str,
-    source: &[u8],
-    ctx: &mut LintContext,
-) {
-    for finding in findings {
-        if finding.rule_id != rule_id {
-            continue;
-        }
-        let (line, col) = byte_offset_to_line_col(source, finding.byte_range.start);
-        let (end_line, end_col) = byte_offset_to_line_col(source, finding.byte_range.end);
-        ctx.report(Diagnostic {
-            rule_id: finding.rule_id.to_string(),
-            severity: finding.severity,
-            message: finding.message.clone(),
-            line,
-            column: col,
-            end_line,
-            end_column: end_col,
-            help: Some(finding.help.clone()),
-        });
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════
-// Rule 1: transaction-no-rollback
+// Umbrella rule: transaction
 // ═══════════════════════════════════════════════════════════════
 
-pub struct TransactionNoRollbackRule {
+pub struct TransactionRule {
     meta: RuleMeta,
 }
 
-impl Default for TransactionNoRollbackRule {
+impl Default for TransactionRule {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TransactionNoRollbackRule {
+impl TransactionRule {
     pub fn new() -> Self {
         Self {
             meta: RuleMeta {
-                id: "transaction-no-rollback",
-                name: "Transaction No Rollback",
+                id: "transaction",
+                name: "Transaction Management",
                 category: RuleCategory::ResourceManagement,
                 default_severity: Severity::Error,
-                description: "Detects transactions started without rollback protection.",
+                description: "Detects incorrect transaction management patterns.",
             },
         }
     }
 }
 
-impl Rule for TransactionNoRollbackRule {
+impl Rule for TransactionRule {
     fn meta(&self) -> &RuleMeta {
         &self.meta
     }
@@ -799,194 +773,19 @@ impl Rule for TransactionNoRollbackRule {
         ctx: &mut LintContext,
     ) {
         let findings = run_transaction_analysis(tree, source, analysis);
-        emit_findings(&findings, "transaction-no-rollback", source, ctx);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Rule 2: transaction-ownership-violation
-// ═══════════════════════════════════════════════════════════════
-
-pub struct TransactionOwnershipViolationRule {
-    meta: RuleMeta,
-}
-
-impl Default for TransactionOwnershipViolationRule {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TransactionOwnershipViolationRule {
-    pub fn new() -> Self {
-        Self {
-            meta: RuleMeta {
-                id: "transaction-ownership-violation",
-                name: "Transaction Ownership Violation",
-                category: RuleCategory::ResourceManagement,
-                default_severity: Severity::Error,
-                description:
-                    "Detects commit/rollback of transactions not owned by the current scope.",
-            },
+        for finding in &findings {
+            let (line, col) = byte_offset_to_line_col(source, finding.byte_range.start);
+            let (end_line, end_col) = byte_offset_to_line_col(source, finding.byte_range.end);
+            ctx.report(Diagnostic {
+                rule_id: finding.rule_id.to_string(),
+                severity: finding.severity,
+                message: finding.message.clone(),
+                line,
+                column: col,
+                end_line,
+                end_column: end_col,
+                help: Some(finding.help.clone()),
+            });
         }
-    }
-}
-
-impl Rule for TransactionOwnershipViolationRule {
-    fn meta(&self) -> &RuleMeta {
-        &self.meta
-    }
-
-    fn requires_cfg(&self) -> bool {
-        true
-    }
-
-    fn check(
-        &self,
-        _file: &FileInfo,
-        _tree: &Tree,
-        _source: &[u8],
-        _config: &crate::config::Config,
-        _ctx: &mut LintContext,
-    ) {
-        // CFG-based rule; analysis happens in check_cfg.
-    }
-
-    fn check_cfg(
-        &self,
-        _file: &FileInfo,
-        tree: &Tree,
-        source: &[u8],
-        _config: &crate::config::Config,
-        analysis: &AnalysisContext<'_>,
-        ctx: &mut LintContext,
-    ) {
-        let findings = run_transaction_analysis(tree, source, analysis);
-        emit_findings(&findings, "transaction-ownership-violation", source, ctx);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Rule 3: transaction-no-commit
-// ═══════════════════════════════════════════════════════════════
-
-pub struct TransactionNoCommitRule {
-    meta: RuleMeta,
-}
-
-impl Default for TransactionNoCommitRule {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TransactionNoCommitRule {
-    pub fn new() -> Self {
-        Self {
-            meta: RuleMeta {
-                id: "transaction-no-commit",
-                name: "Transaction No Commit",
-                category: RuleCategory::ResourceManagement,
-                default_severity: Severity::Warning,
-                description: "Detects transactions started but never committed.",
-            },
-        }
-    }
-}
-
-impl Rule for TransactionNoCommitRule {
-    fn meta(&self) -> &RuleMeta {
-        &self.meta
-    }
-
-    fn requires_cfg(&self) -> bool {
-        true
-    }
-
-    fn check(
-        &self,
-        _file: &FileInfo,
-        _tree: &Tree,
-        _source: &[u8],
-        _config: &crate::config::Config,
-        _ctx: &mut LintContext,
-    ) {
-        // CFG-based rule; analysis happens in check_cfg.
-    }
-
-    fn check_cfg(
-        &self,
-        _file: &FileInfo,
-        tree: &Tree,
-        source: &[u8],
-        _config: &crate::config::Config,
-        analysis: &AnalysisContext<'_>,
-        ctx: &mut LintContext,
-    ) {
-        let findings = run_transaction_analysis(tree, source, analysis);
-        emit_findings(&findings, "transaction-no-commit", source, ctx);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Rule 4: transaction-nested-start
-// ═══════════════════════════════════════════════════════════════
-
-pub struct TransactionNestedStartRule {
-    meta: RuleMeta,
-}
-
-impl Default for TransactionNestedStartRule {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TransactionNestedStartRule {
-    pub fn new() -> Self {
-        Self {
-            meta: RuleMeta {
-                id: "transaction-nested-start",
-                name: "Transaction Nested Start",
-                category: RuleCategory::ResourceManagement,
-                default_severity: Severity::Warning,
-                description:
-                    "Detects StartTransaction called when a transaction may already be active.",
-            },
-        }
-    }
-}
-
-impl Rule for TransactionNestedStartRule {
-    fn meta(&self) -> &RuleMeta {
-        &self.meta
-    }
-
-    fn requires_cfg(&self) -> bool {
-        true
-    }
-
-    fn check(
-        &self,
-        _file: &FileInfo,
-        _tree: &Tree,
-        _source: &[u8],
-        _config: &crate::config::Config,
-        _ctx: &mut LintContext,
-    ) {
-        // CFG-based rule; analysis happens in check_cfg.
-    }
-
-    fn check_cfg(
-        &self,
-        _file: &FileInfo,
-        tree: &Tree,
-        source: &[u8],
-        _config: &crate::config::Config,
-        analysis: &AnalysisContext<'_>,
-        ctx: &mut LintContext,
-    ) {
-        let findings = run_transaction_analysis(tree, source, analysis);
-        emit_findings(&findings, "transaction-nested-start", source, ctx);
     }
 }

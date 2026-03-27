@@ -122,10 +122,7 @@ impl RuleRegistry {
             Box::new(inherited::InheritedCallOrderRule::new()),
             Box::new(inherited::InheritedCallMissingRule::new()),
             Box::new(use_after_free::UseAfterFreeRule::new()),
-            Box::new(transaction::TransactionNoRollbackRule::new()),
-            Box::new(transaction::TransactionOwnershipViolationRule::new()),
-            Box::new(transaction::TransactionNoCommitRule::new()),
-            Box::new(transaction::TransactionNestedStartRule::new()),
+            Box::new(transaction::TransactionRule::new()),
         ];
 
         RuleRegistry { rules }

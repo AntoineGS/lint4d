@@ -1016,15 +1016,14 @@ fn parse_class_def(reader: &mut DcuReader) -> Result<(Vec<FieldInfo>, Vec<Method
 /// DCU32 reference: TRecDef.Create (for D13/D_XE2+).
 fn skip_rec_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     read_type_def_header(reader)?;
-    // D2005+: extra bytes and uindex fields
     let _b2 = reader.read_byte()?;
-    let _b1 = reader.read_byte()?; // D2006+
-    let _x0 = reader.read_byte()?; // D_XE2+ reads a byte (not uindex)
-    let _x = reader.read_uindex()?; // D2005+
-                                    // D2009+:
+    let _b1 = reader.read_byte()?;
+    if reader.ver >= DcuVersion::DXE2 {
+        let _x0 = reader.read_byte()?;
+    }
+    let _x = reader.read_uindex()?;
     let _d1 = reader.read_uindex()?;
     let _d2 = reader.read_uindex()?;
-    // D2010+:
     let _d3 = reader.read_uindex()?;
     // Read fields
     let mut inner_tag = reader.read_byte()?;
@@ -1041,8 +1040,9 @@ fn skip_interface_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     let _vm_cnt = reader.read_index()?; // ReadIndex (signed)
     reader.skip(16)?; // GUID (16 bytes)
     let _b = reader.read_byte()?;
-    // D2010+:
-    let _by = reader.read_uindex()?;
+    if reader.ver >= DcuVersion::D2010 {
+        let _by = reader.read_uindex()?;
+    }
     let cnt = reader.read_uindex()?;
     for _ in 0..cnt {
         let _x1 = reader.read_uindex()?;

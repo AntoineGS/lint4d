@@ -432,9 +432,25 @@ fn visit_local_variable_naming(node: Node, source: &[u8], style: &str, ctx: &mut
     }
 }
 
-/// Find all `declVars` children under a `defProc` or `lambda` and check
-/// each variable name against the configured style.
+/// Find all `declVars` children and parameter declarations under a
+/// `defProc` or `lambda` and check each name against the configured style.
 fn check_proc_local_vars(proc_node: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
+    // Check parameters from the header's declArgs.
+    if let Some(header) = proc_node.child_by_field_name("header") {
+        let mut hcursor = header.walk();
+        for header_child in header.children(&mut hcursor) {
+            if header_child.kind() == "declArgs" {
+                let mut acursor = header_child.walk();
+                for arg in header_child.children(&mut acursor) {
+                    if arg.kind() == "declArg" {
+                        check_decl_var_names(arg, source, style, ctx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check local variable declarations.
     let mut cursor = proc_node.walk();
     for child in proc_node.children(&mut cursor) {
         if child.kind() == "declVars" {
@@ -454,9 +470,16 @@ fn check_decl_vars(decl_vars: Node, source: &[u8], style: &str, ctx: &mut LintCo
     }
 }
 
-/// Check all identifier names in a single `declVar` node (handles
-/// multi-name declarations like `a, b: Integer`).
+/// Check all identifier names in a single `declVar` or `declArg` node
+/// (handles multi-name declarations like `a, b: Integer`).
 fn check_decl_var_names(decl_var: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
+    let is_param = decl_var.kind() == "declArg";
+    let label = if is_param {
+        "Parameter"
+    } else {
+        "Local variable"
+    };
+
     let child_count = decl_var.child_count();
     for i in 0..child_count {
         let child = match decl_var.child(i) {
@@ -489,8 +512,8 @@ fn check_decl_var_names(decl_var: Node, source: &[u8], style: &str, ctx: &mut Li
             rule_id: "local-variable-naming".to_string(),
             severity: Severity::Hint,
             message: format!(
-                "Local variable '{}' should use {} naming convention.",
-                name, expected
+                "{} '{}' should use {} naming convention.",
+                label, name, expected
             ),
             line: start.row + 1,
             column: start.column + 1,

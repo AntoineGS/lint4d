@@ -129,6 +129,31 @@ end."#;
 }
 
 #[test]
+fn pass1_parameter_camel_case() {
+    let source = r#"unit Test;
+interface
+implementation
+procedure DoWork(BadParam: Integer; const AnotherParam: string; x: Integer);
+begin
+end;
+end."#;
+    let map = build_map_from_source(source);
+    let bad_entry = map
+        .local
+        .iter()
+        .find(|((_, _, name), _)| name == "badparam");
+    assert_eq!(bad_entry.map(|(_, v)| v.as_str()), Some("badParam"));
+    let another_entry = map
+        .local
+        .iter()
+        .find(|((_, _, name), _)| name == "anotherparam");
+    assert_eq!(another_entry.map(|(_, v)| v.as_str()), Some("anotherParam"));
+    // Single-char 'x' should be exempt
+    let x_entry = map.local.iter().find(|((_, _, name), _)| name == "x");
+    assert!(x_entry.is_none());
+}
+
+#[test]
 fn pass1_skips_suppressed_declarations() {
     let source = r#"unit Test;
 interface
@@ -265,6 +290,45 @@ end."#;
     assert!(fixed.contains("myCounter: Integer;"));
     assert!(fixed.contains("myCounter := 1;"));
     assert!(!fixed.contains("MyCounter"));
+}
+
+#[test]
+fn fix_parameter_renames_within_procedure() {
+    let source = r#"unit Test;
+
+interface
+
+implementation
+
+procedure DoWork(BadParam: Integer; const AnotherParam: string);
+var
+  MyCounter: Integer;
+begin
+  MyCounter := BadParam + 1;
+  if AnotherParam = '' then
+    MyCounter := 0;
+end;
+
+end."#;
+    let fixed = fix_source(source);
+    // Parameters renamed
+    assert!(fixed.contains("badParam: Integer"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("anotherParam: string"), "ACTUAL:\n{fixed}");
+    // Usages renamed
+    assert!(
+        fixed.contains("myCounter := badParam + 1;"),
+        "ACTUAL:\n{fixed}"
+    );
+    assert!(
+        fixed.contains("if anotherParam = '' then"),
+        "ACTUAL:\n{fixed}"
+    );
+    // Local var also renamed
+    assert!(fixed.contains("myCounter: Integer;"));
+    // Old names gone
+    assert!(!fixed.contains("BadParam"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("AnotherParam"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("MyCounter"), "ACTUAL:\n{fixed}");
 }
 
 #[test]
@@ -584,6 +648,15 @@ fn fixture_local_variable_fix() {
     assert!(fixed.contains("myCounter: Integer;"));
     assert!(fixed.contains("anotherBadName: string;"));
     assert!(fixed.contains("x: Integer;")); // single-char exempt
+                                            // Parameters should also be renamed
+    assert!(fixed.contains("badParam: Integer"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("anotherParam: string"), "ACTUAL:\n{fixed}");
+    // Usages of renamed parameters should also be updated
+    assert!(fixed.contains("myCounter := badParam;"), "ACTUAL:\n{fixed}");
+    assert!(
+        fixed.contains("anotherBadName := anotherParam;"),
+        "ACTUAL:\n{fixed}"
+    );
 }
 
 #[test]

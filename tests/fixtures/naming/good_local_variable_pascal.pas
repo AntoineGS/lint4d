@@ -4,15 +4,15 @@ interface
 
 implementation
 
-procedure DoWork;
+procedure DoWork(GoodParam: Integer; const AnotherParam: string);
 var
   MyCounter: Integer;
   AnotherName: string;
   X: Integer;
   I: Integer;
 begin
-  MyCounter := 1;
-  AnotherName := 'test';
+  MyCounter := GoodParam;
+  AnotherName := AnotherParam;
   for I := 0 to 10 do
     X := I;
 end;

@@ -162,8 +162,8 @@ fn local_variable_naming_flags_pascal_case_in_camel_mode() {
         .collect();
     assert_eq!(
         hits.len(),
-        2,
-        "Should flag MyCounter and AnotherBadName but not x: {:?}",
+        4,
+        "Should flag BadParam, AnotherParam, MyCounter and AnotherBadName but not x: {:?}",
         hits
     );
 }
@@ -201,8 +201,8 @@ fn local_variable_naming_flags_camel_case_in_pascal_mode() {
         .collect();
     assert_eq!(
         hits.len(),
-        2,
-        "Should flag myCounter and anotherBad but not x: {:?}",
+        4,
+        "Should flag badParam, anotherParam, myCounter and anotherBad but not x: {:?}",
         hits
     );
 }

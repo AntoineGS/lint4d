@@ -148,10 +148,7 @@ pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     let filename = source_file
         .rsplit_once('\\')
         .map_or(source_file.as_str(), |(_, f)| f);
-    let name = filename
-        .strip_suffix(".pas")
-        .unwrap_or(filename)
-        .to_owned();
+    let name = filename.strip_suffix(".pas").unwrap_or(filename).to_owned();
 
     Ok(UnitHeader {
         version,

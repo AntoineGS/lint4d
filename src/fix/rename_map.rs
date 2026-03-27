@@ -170,6 +170,28 @@ fn check_local_var_naming(
     let proc_start = proc_node.start_byte();
     let proc_end = proc_node.end_byte();
 
+    // Check parameters from the header's declArgs.
+    if let Some(header) = proc_node.child_by_field_name("header") {
+        for header_child in header.children(&mut header.walk()) {
+            if header_child.kind() == "declArgs" {
+                for arg in header_child.children(&mut header_child.walk()) {
+                    if arg.kind() == "declArg" {
+                        check_decl_names(
+                            &arg,
+                            source,
+                            style,
+                            suppressions,
+                            proc_start,
+                            proc_end,
+                            map,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Check local variable declarations.
     for child in proc_node.children(&mut proc_node.walk()) {
         if child.kind() != "declVars" {
             continue;
@@ -178,34 +200,56 @@ fn check_local_var_naming(
             if var_child.kind() != "declVar" {
                 continue;
             }
-            let count = var_child.child_count();
-            for i in 0..count {
-                let id_node = match var_child.child(i) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                if id_node.kind() != "identifier"
-                    || var_child.field_name_for_child(i as u32) != Some("name")
-                {
-                    continue;
-                }
-                let name = node_text(id_node, source);
-                if !violates_naming_style(&name, style) {
-                    continue;
-                }
-                let line = id_node.start_position().row + 1;
-                if is_suppressed(suppressions, "local-variable-naming", line) {
-                    continue;
-                }
-                let new_name = if style == "camelCase" {
-                    to_camel_case(&name)
-                } else {
-                    to_pascal_case(&name)
-                };
-                map.local
-                    .insert((proc_start, proc_end, name.to_lowercase()), new_name);
-            }
+            check_decl_names(
+                &var_child,
+                source,
+                style,
+                suppressions,
+                proc_start,
+                proc_end,
+                map,
+            );
         }
+    }
+}
+
+/// Check identifier names in a `declVar` or `declArg` node and add
+/// violations to the rename map.
+fn check_decl_names(
+    decl_node: &Node,
+    source: &[u8],
+    style: &str,
+    suppressions: &[Suppression],
+    proc_start: usize,
+    proc_end: usize,
+    map: &mut RenameMap,
+) {
+    let count = decl_node.child_count();
+    for i in 0..count {
+        let id_node = match decl_node.child(i) {
+            Some(c) => c,
+            None => continue,
+        };
+        if id_node.kind() != "identifier"
+            || decl_node.field_name_for_child(i as u32) != Some("name")
+        {
+            continue;
+        }
+        let name = node_text(id_node, source);
+        if !violates_naming_style(&name, style) {
+            continue;
+        }
+        let line = id_node.start_position().row + 1;
+        if is_suppressed(suppressions, "local-variable-naming", line) {
+            continue;
+        }
+        let new_name = if style == "camelCase" {
+            to_camel_case(&name)
+        } else {
+            to_pascal_case(&name)
+        };
+        map.local
+            .insert((proc_start, proc_end, name.to_lowercase()), new_name);
     }
 }
 

@@ -326,7 +326,12 @@ fn collect_transaction_ops(
     ops
 }
 
-fn collect_ops_recursive(node: Node, is_guarded: bool, ctx: &AnalysisCtx<'_>, out: &mut Vec<TrxOp>) {
+fn collect_ops_recursive(
+    node: Node,
+    is_guarded: bool,
+    ctx: &AnalysisCtx<'_>,
+    out: &mut Vec<TrxOp>,
+) {
     // Check if this is a transaction call
     if let Some(call) =
         classify_transaction_call(node, ctx.source, ctx.var_types, ctx.project, ctx.uses)
@@ -360,8 +365,14 @@ fn collect_ops_recursive(node: Node, is_guarded: bool, ctx: &AnalysisCtx<'_>, ou
             .child_by_field_name("cond")
             .or_else(|| node.child_by_field_name("condition"))
         {
-            let cond_is_guard =
-                condition_is_guard(cond, ctx.source, ctx.guards, ctx.var_types, ctx.project, ctx.uses);
+            let cond_is_guard = condition_is_guard(
+                cond,
+                ctx.source,
+                ctx.guards,
+                ctx.var_types,
+                ctx.project,
+                ctx.uses,
+            );
 
             let mut cursor = node.walk();
             let mut saw_cond = false;
@@ -487,9 +498,9 @@ fn check_ownership_violation(ops: &[TrxOp], findings: &mut Vec<TrxFinding>) {
 fn check_no_commit(ops: &[TrxOp], findings: &mut Vec<TrxFinding>) {
     let receivers = unique_receivers(ops);
     for recv in &receivers {
-        let has_start = ops.iter().any(|o| {
-            o.receiver.eq_ignore_ascii_case(recv) && o.op == TransactionOp::Start
-        });
+        let has_start = ops
+            .iter()
+            .any(|o| o.receiver.eq_ignore_ascii_case(recv) && o.op == TransactionOp::Start);
         let has_commit_outside_handler = ops.iter().any(|o| {
             o.receiver.eq_ignore_ascii_case(recv)
                 && o.op == TransactionOp::Commit
@@ -499,9 +510,7 @@ fn check_no_commit(ops: &[TrxOp], findings: &mut Vec<TrxFinding>) {
         if has_start && !has_commit_outside_handler {
             let start = ops
                 .iter()
-                .find(|o| {
-                    o.receiver.eq_ignore_ascii_case(recv) && o.op == TransactionOp::Start
-                })
+                .find(|o| o.receiver.eq_ignore_ascii_case(recv) && o.op == TransactionOp::Start)
                 .unwrap();
             findings.push(TrxFinding {
                 rule_id: "transaction-no-commit",
@@ -644,11 +653,7 @@ fn extract_defproc_name(def_proc: Node, source: &[u8]) -> Option<String> {
 }
 
 /// Find defProc nodes in the AST and match them to CFGs by proc_name.
-fn find_proc_node_for_cfg<'a>(
-    tree: &'a Tree,
-    source: &[u8],
-    cfg: &Cfg,
-) -> Option<Node<'a>> {
+fn find_proc_node_for_cfg<'a>(tree: &'a Tree, source: &[u8], cfg: &Cfg) -> Option<Node<'a>> {
     fn walk<'a>(node: Node<'a>, source: &[u8], target_name: &str) -> Option<Node<'a>> {
         if node.kind() == "defProc" {
             if let Some(name) = extract_defproc_name(node, source) {

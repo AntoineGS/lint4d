@@ -380,10 +380,7 @@ fn parse_dcu_xe3_classes() {
     assert_eq!(unit.name, "Lint4dFixture.Classes");
     assert_eq!(unit.version, DcuVersion::DXE3);
     assert_eq!(unit.platform, DcuPlatform::Win32);
-    assert!(
-        !unit.types.is_empty(),
-        "Expected types in XE3 Classes unit"
-    );
+    assert!(!unit.types.is_empty(), "Expected types in XE3 Classes unit");
     let classes: Vec<_> = unit
         .types
         .iter()

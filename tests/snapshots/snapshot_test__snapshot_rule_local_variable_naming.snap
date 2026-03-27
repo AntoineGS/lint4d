@@ -1,9 +1,28 @@
 ---
 source: tests/snapshot_test.rs
-assertion_line: 91
 expression: diagnostics
 ---
 [
+  {
+    "rule_id": "local-variable-naming",
+    "severity": "hint",
+    "message": "Parameter 'BadParam' should use camelCase naming convention.",
+    "line": 7,
+    "column": 18,
+    "end_line": 7,
+    "end_column": 26,
+    "help": "Rename 'BadParam' to follow camelCase convention."
+  },
+  {
+    "rule_id": "local-variable-naming",
+    "severity": "hint",
+    "message": "Parameter 'AnotherParam' should use camelCase naming convention.",
+    "line": 7,
+    "column": 43,
+    "end_line": 7,
+    "end_column": 55,
+    "help": "Rename 'AnotherParam' to follow camelCase convention."
+  },
   {
     "rule_id": "local-variable-naming",
     "severity": "hint",

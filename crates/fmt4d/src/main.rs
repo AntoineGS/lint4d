@@ -1,3 +1,5 @@
+mod config;
+
 use clap::{CommandFactory, Parser};
 use std::path::PathBuf;
 use std::process;

@@ -86,49 +86,72 @@ pub struct UnitHeader {
 
 /// Parse the unit header from a raw DCU byte slice.
 ///
-/// Layout (D13):
+/// Layout (D2010+):
 /// ```text
 /// [0..4]   magic          (u32 LE)
-/// [4..8]   stamp          (u32 LE)  — per-unit compilation counter
-/// [8..12]  compiler_stamp (u32 LE)  — same for all units in one build
-/// [12..16] project_stamp  (u32 LE)  — same for all units in one build
-/// [16]     flags_lo       (raw byte)
-/// [17]     flags_hi       (raw byte)
-/// [18..]   namespace      (read_name: 1-byte length then ANSI bytes)
-/// [+10]    <intermediate> (10 bytes skipped)
-/// [+1+n]   source_file    (read_name: 1-byte length then ANSI bytes, includes ".pas")
+/// [4..8]   file_size      (u32 LE)
+/// [8..12]  file_time      (u32 LE)
+/// [12..16] file_stamp     (u32 LE)
+/// [16]     header_byte_1  (raw byte)
+/// [17]     header_byte_2  (raw byte, D7+)
+/// [18..]   unit_name_pfx  (read_name: namespace prefix)
+/// [+]      L1             (uindex, D2009+)
+/// [+]      L2             (uindex, D2009+)
+/// [+]      flags          (read_index, signed)
+/// [+]      flags1         (uindex, D2006+)
+/// [+]      unit_prior     (uindex, D3+)
+/// [+]      ...            (version-dependent extra fields)
+/// [+]      drSrc tag      (0x70)
+/// [+]      source_file    (read_name, includes ".pas")
 /// ```
 ///
-/// The unit name is derived from the source filename by stripping the trailing `.pas` suffix.
+/// The unit name is derived from the source filename by stripping the `.pas` suffix.
 pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     let (version, platform) = parse_magic(data)?;
-    let mut reader = DcuReader::new(data, DcuVersion::D13);
+    let mut reader = DcuReader::new(data, version);
 
     // Skip magic (4 bytes already parsed by parse_magic).
     reader.skip(4)?;
 
-    // Read stamp (per-unit compilation counter).
+    // Read file_size (called "stamp" historically).
     let stamp = reader.read_u32()?;
 
-    // Skip compiler_stamp (4 bytes) + project_stamp (4 bytes) + flags_lo (1 byte) + flags_hi (1 byte).
+    // Skip file_time (4) + file_stamp (4) + header_byte_1 (1) + header_byte_2 (1).
     reader.skip(10)?;
 
-    // Read the namespace name (e.g. "Lint4dFixture" for unit "Lint4dFixture.Classes").
-    // We don't use this value directly; we skip past it.
+    // Read namespace prefix (D2005+; always present for D2010+).
     let _namespace = reader.read_name()?;
 
-    // Skip 10 bytes of intermediate fields between namespace and source filename.
-    reader.skip(10)?;
+    // D2009+ intermediate fields (always present for D2010+).
+    let _l1 = reader.read_uindex()?;
+    let _l2 = reader.read_uindex()?;
+
+    // drUnitFlags: Flags (signed index) + Flags1 (D2006+) + FUnitPrior (D3+).
+    let _flags_val = reader.read_index()?;
+    let _flags1 = reader.read_uindex()?;
+    let _unit_prior = reader.read_uindex()?;
+
+    // Scan forward to the first drSrc tag (0x70) which holds the source filename.
+    // Between drUnitFlags and drSrc there may be version-dependent extra fields.
+    loop {
+        let b = reader.read_byte()?;
+        if b == 0x70 {
+            break;
+        }
+    }
 
     // Read the source filename (e.g. "Lint4dFixture.Classes.pas").
     let source_file = reader.read_name()?;
 
-    // Derive the unit name by stripping the ".pas" extension.
-    let name = if source_file.ends_with(".pas") {
-        source_file[..source_file.len() - 4].to_owned()
-    } else {
-        source_file
-    };
+    // Derive the unit name: strip directory prefix (D2010 stores full relative
+    // paths like "..\src\Lint4dFixture.Classes.pas") and the ".pas" extension.
+    let filename = source_file
+        .rsplit_once('\\')
+        .map_or(source_file.as_str(), |(_, f)| f);
+    let name = filename
+        .strip_suffix(".pas")
+        .unwrap_or(filename)
+        .to_owned();
 
     Ok(UnitHeader {
         version,

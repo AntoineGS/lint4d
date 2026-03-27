@@ -1,3 +1,4 @@
+pub mod blank_lines;
 mod config;
 pub mod indent;
 pub mod spacing;

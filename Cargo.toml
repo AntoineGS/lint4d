@@ -2,7 +2,7 @@
 name = "lint4d"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license-file = "LICENSE"
 description = "An open-source Delphi linter powered by tree-sitter"
 
 [dependencies]

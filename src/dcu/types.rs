@@ -1146,7 +1146,7 @@ fn skip_import_records(reader: &mut DcuReader) -> Result<(), DcuError> {
                 let _l = reader.read_u32()?;
             }
             DR_CONST_ADD_INFO => {
-                skip_const_add_info(reader)?;
+                skip_decl_const_add_info(reader)?;
             }
             DR_STOP1 => break,
             _ => {
@@ -1157,12 +1157,5 @@ fn skip_import_records(reader: &mut DcuReader) -> Result<(), DcuError> {
             }
         }
     }
-    Ok(())
-}
-
-/// Skip a drConstAddInfo record in the uses clause context.
-fn skip_const_add_info(reader: &mut DcuReader) -> Result<(), DcuError> {
-    let _ndx = reader.read_uindex()?;
-    let _val = reader.read_u32()?;
     Ok(())
 }

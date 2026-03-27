@@ -16,6 +16,7 @@ toml = "0.8"
 rayon = "1"
 cfg-core = { git = "https://github.com/AntoineGS/cfg-core.git" }
 cfg-pascal = { git = "https://github.com/AntoineGS/cfg-pascal.git" }
+petgraph = "0.7"
 owo-colors = { version = "4", features = ["supports-colors"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 globset = "0.4"

@@ -1,0 +1,53 @@
+use lint4d::config::Config;
+use lint4d::dcu::{DcuPlatform, DcuUnit, DcuVersion, ProjectContext, TypeInfo, TypeKind};
+use lint4d::engine::{run_lint_with_context, FileInfo};
+use lint4d::rules::RuleRegistry;
+use std::fs;
+use std::path::PathBuf;
+
+/// Helper: create a ProjectContext with TObject as a class type in System unit.
+fn project_with_tobject() -> ProjectContext {
+    let system_unit = DcuUnit {
+        name: "System".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![TypeInfo {
+            name: "TObject".to_string(),
+            kind: TypeKind::Class,
+            parent: None,
+            fields: vec![],
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    ProjectContext::from_units(vec![system_unit])
+}
+
+/// Helper: lint a fixture with unchecked-nil enabled and a ProjectContext.
+fn lint_nil_check(fixture_path: &str, project: &ProjectContext) -> Vec<lint4d::engine::Diagnostic> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
+    let source = fs::read(&path).unwrap();
+    let file = FileInfo::new(PathBuf::from(fixture_path));
+    let config = "version = 1\n[rules]\nunchecked-nil = \"warning\""
+        .parse::<Config>()
+        .unwrap();
+    let registry = RuleRegistry::new();
+    run_lint_with_context(&file, &source, &config, Some(project), &registry)
+}
+
+#[test]
+fn unchecked_nil_flags_param_without_check() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/bad_param_no_check.pas", &project);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 unchecked-nil for parameter used without check, got: {:?}",
+        matches
+    );
+}

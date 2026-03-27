@@ -541,6 +541,7 @@ dependencies = [
  "globset",
  "insta",
  "owo-colors",
+ "petgraph",
  "predicates",
  "quick-xml",
  "rayon",

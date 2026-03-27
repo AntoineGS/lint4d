@@ -1,4 +1,5 @@
 mod config;
+pub mod indent;
 
 use clap::{CommandFactory, Parser};
 use std::path::PathBuf;

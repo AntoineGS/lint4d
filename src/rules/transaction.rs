@@ -16,6 +16,16 @@ use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 // Data types
 // ═══════════════════════════════════════════════════════════════
 
+/// Immutable context threaded through the recursive AST walkers.
+struct AnalysisCtx<'a> {
+    source: &'a [u8],
+    var_types: &'a HashMap<String, String>,
+    project: &'a ProjectContext,
+    uses: &'a [String],
+    guards: &'a [GuardBinding],
+    protected_ranges: &'a [Range<usize>],
+}
+
 /// A transaction operation found in the procedure body.
 struct TrxOp {
     op: TransactionOp,
@@ -23,8 +33,8 @@ struct TrxOp {
     byte_range: Range<usize>,
     /// True if the operation is inside an `if guardVar then` block.
     is_guarded: bool,
-    /// True if the operation is inside an ExceptHandler or BareExceptHandler block.
-    in_except_handler: bool,
+    /// True if the operation is inside an except or finally handler block.
+    in_protected_handler: bool,
 }
 
 /// A guard binding: `guardVar := not receiver.InTransaction`.
@@ -235,42 +245,52 @@ fn condition_is_guard(
 // Transaction operation collection
 // ═══════════════════════════════════════════════════════════════
 
-/// Collect all byte ranges that represent except handler sections in the AST.
+/// Collect all byte ranges that represent protected handler sections in the AST.
 ///
-/// Walks the tree looking for `try` nodes with an `except:` field, and
-/// collects the byte ranges of those except sections. This includes both
-/// bare except blocks (`except ... end`) and typed handlers (`on E: Ex do`).
-fn collect_except_ranges(proc_node: Node) -> Vec<Range<usize>> {
+/// Walks the tree looking for `try` nodes and collects the byte ranges of:
+/// - `except` sections (between `kExcept` and `kEnd`) — exception path only
+/// - `finally` sections (between `kFinally` and `kEnd`) — both success and exception paths
+///
+/// A rollback in either section satisfies the "has rollback protection" check
+/// because both guarantee the rollback will run on failure.
+fn collect_protected_ranges(proc_node: Node) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
-    collect_except_ranges_recursive(proc_node, &mut ranges);
+    collect_protected_ranges_recursive(proc_node, &mut ranges);
     ranges
 }
 
-fn collect_except_ranges_recursive(node: Node, out: &mut Vec<Range<usize>>) {
+fn collect_protected_ranges_recursive(node: Node, out: &mut Vec<Range<usize>>) {
     if node.kind() == "try" {
-        // The tree-sitter-pascal `try` node has `except:` field children.
-        // When there's a bare `except ... end`, the statements appear as
-        // `except:` field children. We need the byte range of the whole
-        // except section: from the `kExcept` token to `kEnd`.
-        let mut past_except = false;
-        let mut except_start: Option<usize> = None;
-        let mut except_end: Option<usize> = None;
+        // Collect ranges for both `except` and `finally` sections within this try node.
+        // Each section starts at the keyword token (`kExcept` or `kFinally`) and extends
+        // to the closing `kEnd` token of this try block.
+        let mut section_start: Option<usize> = None;
+        let mut in_section = false;
+        let mut end_byte: Option<usize> = None;
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
-                "kExcept" => {
-                    past_except = true;
-                    except_start = Some(child.start_byte());
+                "kExcept" | "kFinally" => {
+                    // Flush any previous section that didn't find its end yet
+                    if in_section {
+                        if let (Some(start), Some(end)) = (section_start, end_byte) {
+                            out.push(start..end);
+                        }
+                    }
+                    section_start = Some(child.start_byte());
+                    in_section = true;
+                    end_byte = None;
                 }
-                "kEnd" if past_except => {
-                    except_end = Some(child.end_byte());
+                "kEnd" if in_section => {
+                    end_byte = Some(child.end_byte());
                 }
                 _ => {}
             }
         }
 
-        if let (Some(start), Some(end)) = (except_start, except_end) {
+        // Push the last section found (except or finally before kEnd)
+        if let (Some(start), Some(end)) = (section_start, end_byte) {
             out.push(start..end);
         }
     }
@@ -278,12 +298,12 @@ fn collect_except_ranges_recursive(node: Node, out: &mut Vec<Range<usize>>) {
     // Recurse into all children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_except_ranges_recursive(child, out);
+        collect_protected_ranges_recursive(child, out);
     }
 }
 
 /// Collect all transaction operations from a procedure, annotated with
-/// guard status and exception handler context.
+/// guard status and protected handler context.
 fn collect_transaction_ops(
     proc_node: Node,
     source: &[u8],
@@ -292,35 +312,25 @@ fn collect_transaction_ops(
     uses: &[String],
     guards: &[GuardBinding],
 ) -> Vec<TrxOp> {
-    let except_ranges = collect_except_ranges(proc_node);
-    let mut ops = Vec::new();
-    collect_ops_recursive(
-        proc_node,
+    let protected_ranges = collect_protected_ranges(proc_node);
+    let ctx = AnalysisCtx {
         source,
         var_types,
         project,
         uses,
         guards,
-        false,
-        &except_ranges,
-        &mut ops,
-    );
+        protected_ranges: &protected_ranges,
+    };
+    let mut ops = Vec::new();
+    collect_ops_recursive(proc_node, false, &ctx, &mut ops);
     ops
 }
 
-fn collect_ops_recursive(
-    node: Node,
-    source: &[u8],
-    var_types: &HashMap<String, String>,
-    project: &ProjectContext,
-    uses: &[String],
-    guards: &[GuardBinding],
-    is_guarded: bool,
-    except_ranges: &[Range<usize>],
-    out: &mut Vec<TrxOp>,
-) {
+fn collect_ops_recursive(node: Node, is_guarded: bool, ctx: &AnalysisCtx<'_>, out: &mut Vec<TrxOp>) {
     // Check if this is a transaction call
-    if let Some(call) = classify_transaction_call(node, source, var_types, project, uses) {
+    if let Some(call) =
+        classify_transaction_call(node, ctx.source, ctx.var_types, ctx.project, ctx.uses)
+    {
         let (op, receiver) = match call {
             TransactionCallKind::Start { receiver } => (TransactionOp::Start, receiver),
             TransactionCallKind::Commit { receiver } => (TransactionOp::Commit, receiver),
@@ -332,25 +342,26 @@ fn collect_ops_recursive(
         };
 
         let byte_range = node.start_byte()..node.end_byte();
-        let in_except_handler = is_in_except_handler(&byte_range, except_ranges);
+        let in_protected_handler = is_in_protected_handler(&byte_range, ctx.protected_ranges);
 
         out.push(TrxOp {
             op,
             receiver,
             byte_range,
             is_guarded,
-            in_except_handler,
+            in_protected_handler,
         });
         return;
     }
 
     // Check for `if guardVar then` — children on the then-branch are guarded
     if node.kind() == "ifElse" || node.kind() == "if" {
-        if let Some(cond) = node.child_by_field_name("cond")
+        if let Some(cond) = node
+            .child_by_field_name("cond")
             .or_else(|| node.child_by_field_name("condition"))
         {
             let cond_is_guard =
-                condition_is_guard(cond, source, guards, var_types, project, uses);
+                condition_is_guard(cond, ctx.source, ctx.guards, ctx.var_types, ctx.project, ctx.uses);
 
             let mut cursor = node.walk();
             let mut saw_cond = false;
@@ -372,17 +383,7 @@ fn collect_ops_recursive(
                 } else {
                     is_guarded
                 };
-                collect_ops_recursive(
-                    child,
-                    source,
-                    var_types,
-                    project,
-                    uses,
-                    guards,
-                    child_guarded,
-                    except_ranges,
-                    out,
-                );
+                collect_ops_recursive(child, child_guarded, ctx, out);
             }
             return;
         }
@@ -391,23 +392,13 @@ fn collect_ops_recursive(
     // Default: recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_ops_recursive(
-            child,
-            source,
-            var_types,
-            project,
-            uses,
-            guards,
-            is_guarded,
-            except_ranges,
-            out,
-        );
+        collect_ops_recursive(child, is_guarded, ctx, out);
     }
 }
 
-/// Check whether a byte range falls within any except handler section.
-fn is_in_except_handler(byte_range: &Range<usize>, except_ranges: &[Range<usize>]) -> bool {
-    except_ranges
+/// Check whether a byte range falls within any protected handler section (except or finally).
+fn is_in_protected_handler(byte_range: &Range<usize>, protected_ranges: &[Range<usize>]) -> bool {
+    protected_ranges
         .iter()
         .any(|r| r.start <= byte_range.start && byte_range.end <= r.end)
 }
@@ -424,13 +415,13 @@ fn check_no_rollback(ops: &[TrxOp], findings: &mut Vec<TrxFinding>) {
             .iter()
             .filter(|o| o.receiver.eq_ignore_ascii_case(recv) && o.op == TransactionOp::Start)
             .collect();
-        let has_rollback_in_except = ops.iter().any(|o| {
+        let has_rollback_in_handler = ops.iter().any(|o| {
             o.receiver.eq_ignore_ascii_case(recv)
                 && o.op == TransactionOp::Rollback
-                && o.in_except_handler
+                && o.in_protected_handler
         });
 
-        if !starts.is_empty() && !has_rollback_in_except {
+        if !starts.is_empty() && !has_rollback_in_handler {
             for start in &starts {
                 findings.push(TrxFinding {
                     rule_id: "transaction-no-rollback",
@@ -499,13 +490,13 @@ fn check_no_commit(ops: &[TrxOp], findings: &mut Vec<TrxFinding>) {
         let has_start = ops.iter().any(|o| {
             o.receiver.eq_ignore_ascii_case(recv) && o.op == TransactionOp::Start
         });
-        let has_commit_outside_except = ops.iter().any(|o| {
+        let has_commit_outside_handler = ops.iter().any(|o| {
             o.receiver.eq_ignore_ascii_case(recv)
                 && o.op == TransactionOp::Commit
-                && !o.in_except_handler
+                && !o.in_protected_handler
         });
 
-        if has_start && !has_commit_outside_except {
+        if has_start && !has_commit_outside_handler {
             let start = ops
                 .iter()
                 .find(|o| {
@@ -795,6 +786,7 @@ impl Rule for TransactionNoRollbackRule {
         _config: &crate::config::Config,
         _ctx: &mut LintContext,
     ) {
+        // CFG-based rule; analysis happens in check_cfg.
     }
 
     fn check_cfg(
@@ -857,6 +849,7 @@ impl Rule for TransactionOwnershipViolationRule {
         _config: &crate::config::Config,
         _ctx: &mut LintContext,
     ) {
+        // CFG-based rule; analysis happens in check_cfg.
     }
 
     fn check_cfg(
@@ -918,6 +911,7 @@ impl Rule for TransactionNoCommitRule {
         _config: &crate::config::Config,
         _ctx: &mut LintContext,
     ) {
+        // CFG-based rule; analysis happens in check_cfg.
     }
 
     fn check_cfg(
@@ -980,6 +974,7 @@ impl Rule for TransactionNestedStartRule {
         _config: &crate::config::Config,
         _ctx: &mut LintContext,
     ) {
+        // CFG-based rule; analysis happens in check_cfg.
     }
 
     fn check_cfg(

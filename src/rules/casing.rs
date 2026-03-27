@@ -203,6 +203,7 @@ fn check_identifier_usage(
                 end_line: end.row + 1,
                 end_column: end.column + 1,
                 help: Some(format!("Rename usage to '{}'.", declared_name)),
+                scope: None,
             });
         }
     }

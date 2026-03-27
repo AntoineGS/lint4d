@@ -508,6 +508,7 @@ fn check_field_not_freed(root: Node, source: &[u8], ctx: &mut LintContext) {
                         "Add '{}.Free;' (or 'FreeAndNil({});') to the destructor.",
                         creation.field_name, creation.field_name
                     )),
+                    scope: None,
                 });
             }
         }
@@ -653,6 +654,7 @@ fn check_constructor_reassigns(
                         "Add '{}.Free;' (or 'FreeAndNil({});') before reassigning.",
                         creation.field_name, creation.field_name
                     )),
+                    scope: None,
                 });
             }
         } else {
@@ -720,6 +722,7 @@ fn check_method_reassigns(
                             "Add '{}.Free;' (or 'FreeAndNil({});') before reassigning.",
                             creation.field_name, creation.field_name
                         )),
+                        scope: None,
                     });
                 }
             } else {
@@ -763,6 +766,7 @@ fn check_method_reassigns(
                             "Add '{}.Free;' (or 'FreeAndNil({});') before reassigning.",
                             creation.field_name, creation.field_name
                         )),
+                        scope: None,
                     });
                 }
             }

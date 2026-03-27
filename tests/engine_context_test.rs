@@ -42,6 +42,7 @@ fn diagnostic_display() {
         end_line: 10,
         end_column: 6,
         help: Some("add error handling".to_string()),
+        scope: None,
     };
     assert_eq!(diag.rule_id, "empty-except");
     assert_eq!(diag.line, 10);

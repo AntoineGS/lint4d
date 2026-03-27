@@ -1,6 +1,5 @@
 ---
 source: tests/snapshot_test.rs
-assertion_line: 61
 expression: diagnostics
 ---
 [
@@ -12,6 +11,7 @@ expression: diagnostics
     "column": 3,
     "end_line": 12,
     "end_column": 16,
-    "help": "Move this statement inside the try block, immediately after the constructor assignment."
+    "help": "Move this statement inside the try block, immediately after the constructor assignment.",
+    "scope": "TestLeak"
   }
 ]

@@ -85,6 +85,7 @@ fn visit_node(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>)
             end_line: end.row + 1,
             end_column: end.column + 1,
             help: None,
+            scope: None,
         });
 
         // Don't descend into error nodes to avoid duplicate diagnostics.
@@ -148,6 +149,7 @@ pub fn run_lint_with_context(
                 end_line: 1,
                 end_column: 1,
                 help: None,
+                scope: None,
             }];
         }
     };
@@ -218,6 +220,14 @@ pub fn run_lint_with_context(
     // Merge parse-error diagnostics with rule diagnostics.
     diagnostics.append(&mut ctx.diagnostics);
 
+    // Enrich diagnostics with the enclosing procedure/function scope.
+    let scopes = collect_proc_scopes(tree.root_node(), source);
+    for diag in &mut diagnostics {
+        if diag.scope.is_none() {
+            diag.scope = find_enclosing_scope(&scopes, diag.line);
+        }
+    }
+
     // Filter out suppressed diagnostics.
     let suppressions = suppress::parse_suppressions(source);
     diagnostics.retain(|diag| {
@@ -230,4 +240,102 @@ pub fn run_lint_with_context(
     diagnostics.sort_by(|a, b| a.line.cmp(&b.line).then(a.column.cmp(&b.column)));
 
     diagnostics
+}
+
+// ─── Scope enrichment ────────────────────────────────────────────────────────
+
+struct ProcScope {
+    start_line: usize,
+    end_line: usize,
+    name: String,
+}
+
+/// Walk the AST and collect all `defProc` nodes with their line ranges and names.
+fn collect_proc_scopes(root: tree_sitter::Node, source: &[u8]) -> Vec<ProcScope> {
+    let mut scopes = Vec::new();
+    collect_proc_scopes_recursive(root, source, &mut scopes);
+    scopes.sort_by_key(|s| s.start_line);
+    scopes
+}
+
+fn collect_proc_scopes_recursive(node: tree_sitter::Node, source: &[u8], out: &mut Vec<ProcScope>) {
+    if node.kind() == "defProc" {
+        if let Some(name) = extract_proc_display_name(node, source) {
+            out.push(ProcScope {
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                name,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_proc_scopes_recursive(child, source, out);
+    }
+}
+
+/// Extract display name from a `defProc` node.
+///
+/// Methods: `TClassName.MethodName` (from `genericDot`).
+/// Standalone: just the identifier name.
+fn extract_proc_display_name(def_proc: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = def_proc.walk();
+    let decl_proc = def_proc
+        .children(&mut cursor)
+        .find(|c| c.kind() == "declProc")?;
+
+    let mut decl_cursor = decl_proc.walk();
+    if let Some(generic_dot) = decl_proc
+        .children(&mut decl_cursor)
+        .find(|c| c.kind() == "genericDot")
+    {
+        let idents: Vec<tree_sitter::Node> = generic_dot
+            .children(&mut generic_dot.walk())
+            .filter(|c| c.kind() == "identifier")
+            .collect();
+        if idents.len() >= 2 {
+            return Some(format!(
+                "{}.{}",
+                node_text(idents[0], source),
+                node_text(idents[1], source)
+            ));
+        }
+        if !idents.is_empty() {
+            return Some(node_text(idents[0], source));
+        }
+    }
+
+    if let Some(name_node) = decl_proc.child_by_field_name("name") {
+        return Some(node_text(name_node, source));
+    }
+
+    let mut cursor2 = decl_proc.walk();
+    for child in decl_proc.children(&mut cursor2) {
+        if child.kind() == "identifier" {
+            return Some(node_text(child, source));
+        }
+    }
+
+    None
+}
+
+/// Find the innermost enclosing procedure scope for a 1-based line number.
+fn find_enclosing_scope(scopes: &[ProcScope], line: usize) -> Option<String> {
+    let mut best: Option<&ProcScope> = None;
+    for scope in scopes {
+        if line >= scope.start_line && line <= scope.end_line {
+            match best {
+                Some(prev) if scope.start_line > prev.start_line => best = Some(scope),
+                None => best = Some(scope),
+                _ => {}
+            }
+        }
+    }
+    best.map(|s| s.name.clone())
+}
+
+fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
+    std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
+        .unwrap_or("")
+        .to_string()
 }

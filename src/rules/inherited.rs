@@ -177,6 +177,7 @@ fn check_inherited_order(def_proc: Node, source: &[u8], ctx: &mut LintContext) {
                      accessing its members"
                         .to_string(),
                 ),
+                scope: None,
             });
         }
     } else {
@@ -200,6 +201,7 @@ fn check_inherited_order(def_proc: Node, source: &[u8], ctx: &mut LintContext) {
                      to ensure your cleanup runs before the parent class is destroyed"
                         .to_string(),
                 ),
+                scope: None,
             });
         }
     }
@@ -415,5 +417,6 @@ fn check_inherited_missing(def_proc: Node, root: Node, source: &[u8], ctx: &mut 
         end_line: end.row + 1,
         end_column: end.column + 1,
         help: Some(help.to_string()),
+        scope: None,
     });
 }

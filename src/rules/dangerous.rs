@@ -68,6 +68,7 @@ fn visit_with(node: Node, ctx: &mut LintContext) {
                     "Use explicit qualified access (e.g., 'obj.Field') instead of 'with obj do'."
                         .to_string(),
                 ),
+                scope: None,
             });
         }
     }

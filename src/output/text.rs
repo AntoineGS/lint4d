@@ -41,11 +41,18 @@ pub fn format_diagnostics(
             out.push('\n');
         }
 
-        // ---- Arrow line: --> file:line:col ----
-        out.push_str(&format!(
-            "  --> {}:{}:{}\n",
-            file_path, diag.line, diag.column
-        ));
+        // ---- Arrow line: --> file:line:col [in Scope] ----
+        if let Some(ref scope) = diag.scope {
+            out.push_str(&format!(
+                "  --> {}:{}:{} in {}\n",
+                file_path, diag.line, diag.column, scope
+            ));
+        } else {
+            out.push_str(&format!(
+                "  --> {}:{}:{}\n",
+                file_path, diag.line, diag.column
+            ));
+        }
 
         // ---- Source context ----
         // Show previous line, the diagnostic line, and next line.

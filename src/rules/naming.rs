@@ -93,6 +93,7 @@ fn check_type_name(decl_type: Node, source: &[u8], ctx: &mut LintContext) {
         end_line: end.row + 1,
         end_column: end.column + 1,
         help: Some(format!("Rename to 'T{}'.", name)),
+        scope: None,
     });
 }
 
@@ -182,6 +183,7 @@ fn check_interface_name(decl_type: Node, source: &[u8], ctx: &mut LintContext) {
         end_line: end.row + 1,
         end_column: end.column + 1,
         help: Some(format!("Rename to 'I{}'.", name)),
+        scope: None,
     });
 }
 
@@ -283,6 +285,7 @@ fn check_constant_name(decl_const: Node, source: &[u8], style: &str, ctx: &mut L
         end_line: end.row + 1,
         end_column: end.column + 1,
         help: Some(format!("Rename '{}' to '{}'.", name, suggestion)),
+        scope: None,
     });
 }
 
@@ -523,6 +526,7 @@ fn check_decl_var_names(decl_var: Node, source: &[u8], style: &str, ctx: &mut Li
                 "Rename '{}' to follow {} convention.",
                 name, expected
             )),
+            scope: None,
         });
     }
 }

@@ -168,6 +168,7 @@ fn check_try_bare_except(node: Node, source: &[u8], ctx: &mut LintContext) {
                  or add a 'raise' statement to re-raise after cleanup."
                     .to_string(),
             ),
+            scope: None,
         });
     }
 }
@@ -263,6 +264,7 @@ fn check_try_node(node: Node, ctx: &mut LintContext) {
                      Use 'on E: Exception do ...' to handle specific exceptions."
                         .to_string(),
                 ),
+                scope: None,
             });
         }
     }
@@ -423,5 +425,6 @@ fn report_raise(node: Node, class_name: &str, method_name: &str, ctx: &mut LintC
              from escaping the destructor"
                 .to_string(),
         ),
+        scope: None,
     });
 }

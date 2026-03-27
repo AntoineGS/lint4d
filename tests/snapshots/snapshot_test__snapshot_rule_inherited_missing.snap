@@ -11,7 +11,8 @@ expression: diagnostics
     "column": 1,
     "end_line": 27,
     "end_column": 33,
-    "help": "Add an 'inherited' call to ensure proper parent class initialization"
+    "help": "Add an 'inherited' call to ensure proper parent class initialization",
+    "scope": "TMissingCtor.Create"
   },
   {
     "rule_id": "inherited-missing",
@@ -21,7 +22,8 @@ expression: diagnostics
     "column": 1,
     "end_line": 47,
     "end_column": 33,
-    "help": "Add an 'inherited' call to ensure proper parent class cleanup"
+    "help": "Add an 'inherited' call to ensure proper parent class cleanup",
+    "scope": "TMissingDtor.Destroy"
   },
   {
     "rule_id": "inherited-missing",
@@ -31,7 +33,8 @@ expression: diagnostics
     "column": 1,
     "end_line": 53,
     "end_column": 33,
-    "help": "Add an 'inherited' call to ensure proper parent class initialization"
+    "help": "Add an 'inherited' call to ensure proper parent class initialization",
+    "scope": "TMissingBoth.Create"
   },
   {
     "rule_id": "inherited-missing",
@@ -41,6 +44,7 @@ expression: diagnostics
     "column": 1,
     "end_line": 58,
     "end_column": 33,
-    "help": "Add an 'inherited' call to ensure proper parent class cleanup"
+    "help": "Add an 'inherited' call to ensure proper parent class cleanup",
+    "scope": "TMissingBoth.Destroy"
   }
 ]

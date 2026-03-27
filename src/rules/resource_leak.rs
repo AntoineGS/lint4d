@@ -161,6 +161,7 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
                          the constructor assignment."
                             .to_string(),
                     ),
+                    scope: None,
                 });
             }
         }
@@ -406,6 +407,7 @@ fn check_block_no_try(
                          that frees Result and re-raises."
                             .to_string(),
                     ),
+                    scope: None,
                 });
             }
             continue;
@@ -468,6 +470,7 @@ fn check_block_no_try(
                     "Wrap the usage in a try..finally block and free the object in the finally clause."
                         .to_string(),
                 ),
+                scope: None,
             });
         }
     }

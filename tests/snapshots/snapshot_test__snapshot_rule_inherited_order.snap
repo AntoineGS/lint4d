@@ -11,7 +11,8 @@ expression: diagnostics
     "column": 3,
     "end_line": 30,
     "end_column": 12,
-    "help": "Move the 'inherited' call to the beginning of the constructor to ensure the parent class is fully initialized before accessing its members"
+    "help": "Move the 'inherited' call to the beginning of the constructor to ensure the parent class is fully initialized before accessing its members",
+    "scope": "TOrderBadCtor.Create"
   },
   {
     "rule_id": "inherited-order",
@@ -21,7 +22,8 @@ expression: diagnostics
     "column": 3,
     "end_line": 48,
     "end_column": 12,
-    "help": "Move the 'inherited' call to the end of the destructor to ensure your cleanup runs before the parent class is destroyed"
+    "help": "Move the 'inherited' call to the end of the destructor to ensure your cleanup runs before the parent class is destroyed",
+    "scope": "TOrderBadDtor.Destroy"
   },
   {
     "rule_id": "inherited-order",
@@ -31,6 +33,7 @@ expression: diagnostics
     "column": 3,
     "end_line": 56,
     "end_column": 19,
-    "help": "Move the 'inherited' call to the beginning of the constructor to ensure the parent class is fully initialized before accessing its members"
+    "help": "Move the 'inherited' call to the beginning of the constructor to ensure the parent class is fully initialized before accessing its members",
+    "scope": "TOrderBadCtorMiddle.Create"
   }
 ]

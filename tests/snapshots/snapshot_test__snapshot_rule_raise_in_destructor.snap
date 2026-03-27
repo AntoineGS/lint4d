@@ -11,7 +11,8 @@ expression: diagnostics
     "column": 3,
     "end_line": 31,
     "end_column": 34,
-    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor",
+    "scope": "TDirectRaise.Destroy"
   },
   {
     "rule_id": "raise-in-destructor",
@@ -21,7 +22,8 @@ expression: diagnostics
     "column": 5,
     "end_line": 39,
     "end_column": 45,
-    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor",
+    "scope": "TRaiseInFinally.Destroy"
   },
   {
     "rule_id": "raise-in-destructor",
@@ -31,7 +33,8 @@ expression: diagnostics
     "column": 3,
     "end_line": 50,
     "end_column": 13,
-    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor",
+    "scope": "TBareReraise.Destroy"
   },
   {
     "rule_id": "parse-error",
@@ -40,7 +43,8 @@ expression: diagnostics
     "line": 49,
     "column": 8,
     "end_line": 49,
-    "end_column": 9
+    "end_column": 9,
+    "scope": "TBareReraise.Destroy"
   },
   {
     "rule_id": "inherited-order",
@@ -50,7 +54,8 @@ expression: diagnostics
     "column": 3,
     "end_line": 50,
     "end_column": 12,
-    "help": "Move the 'inherited' call to the end of the destructor to ensure your cleanup runs before the parent class is destroyed"
+    "help": "Move the 'inherited' call to the end of the destructor to ensure your cleanup runs before the parent class is destroyed",
+    "scope": "TBareReraise.Destroy"
   },
   {
     "rule_id": "raise-in-destructor",
@@ -60,6 +65,7 @@ expression: diagnostics
     "column": 5,
     "end_line": 58,
     "end_column": 52,
-    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor"
+    "help": "Wrap this code in a try..except block to prevent the exception from escaping the destructor",
+    "scope": "CleanupHelper"
   }
 ]

@@ -790,6 +790,7 @@ impl Rule for TransactionRule {
                 end_line,
                 end_column: end_col,
                 help: Some(finding.help.clone()),
+                scope: None,
             });
         }
     }

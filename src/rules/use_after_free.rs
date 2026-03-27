@@ -174,6 +174,7 @@ fn process_statement(
                     "Remove the duplicate free call or check if the variable was reassigned."
                         .to_string(),
                 ),
+                scope: None,
             });
         }
         state.insert(var, true);
@@ -198,6 +199,7 @@ fn process_statement(
                     "Remove the duplicate free call or check if the variable was reassigned."
                         .to_string(),
                 ),
+                scope: None,
             });
         }
         state.insert(var, true);
@@ -292,6 +294,7 @@ fn check_freed_references(
                      Reassign it first or restructure the code."
                         .to_string(),
                 ),
+                scope: None,
             });
             // Only report once per statement even if multiple freed vars match.
             return;

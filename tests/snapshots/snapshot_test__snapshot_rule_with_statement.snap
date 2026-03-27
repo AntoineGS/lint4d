@@ -1,6 +1,5 @@
 ---
 source: tests/snapshot_test.rs
-assertion_line: 97
 expression: diagnostics
 ---
 [
@@ -12,6 +11,7 @@ expression: diagnostics
     "column": 5,
     "end_line": 15,
     "end_column": 9,
-    "help": "Use explicit qualified access (e.g., 'obj.Field') instead of 'with obj do'."
+    "help": "Use explicit qualified access (e.g., 'obj.Field') instead of 'with obj do'.",
+    "scope": "TestWith"
   }
 ]

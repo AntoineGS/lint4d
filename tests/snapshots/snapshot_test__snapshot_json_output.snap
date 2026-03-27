@@ -16,7 +16,8 @@ expression: output
           "column": 3,
           "end_line": 11,
           "end_column": 9,
-          "help": "Add an exception handler or log the error. Use 'on E: Exception do ...' to handle specific exceptions."
+          "help": "Add an exception handler or log the error. Use 'on E: Exception do ...' to handle specific exceptions.",
+          "scope": "DoRisky"
         }
       ]
     }

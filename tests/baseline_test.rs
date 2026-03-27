@@ -12,6 +12,7 @@ fn baseline_suppresses_matching_violation() {
         end_line: 11,
         end_column: 6,
         help: None,
+        scope: None,
     };
 
     let source_line = "  except  ";
@@ -30,6 +31,7 @@ fn baseline_does_not_suppress_new_violation() {
         end_line: 10,
         end_column: 6,
         help: None,
+        scope: None,
     };
 
     let new_diag = Diagnostic {
@@ -41,6 +43,7 @@ fn baseline_does_not_suppress_new_violation() {
         end_line: 20,
         end_column: 6,
         help: None,
+        scope: None,
     };
 
     let baseline = Baseline::from_diagnostics("src/MyUnit.pas", &[&old_diag], &["except"]);
@@ -58,6 +61,7 @@ fn baseline_serialization_roundtrip() {
         end_line: 5,
         end_column: 10,
         help: None,
+        scope: None,
     };
 
     let baseline = Baseline::from_diagnostics("src/Test.pas", &[&diag], &["with sl do"]);
@@ -77,6 +81,7 @@ fn baseline_trims_whitespace_for_hash() {
         end_line: 10,
         end_column: 6,
         help: None,
+        scope: None,
     };
 
     let baseline = Baseline::from_diagnostics("src/Test.pas", &[&diag], &["  except  "]);

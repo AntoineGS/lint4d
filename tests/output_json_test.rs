@@ -15,6 +15,7 @@ fn formats_json_output_structure() {
             end_line: 11,
             end_column: 6,
             help: Some("add error handling".to_string()),
+            scope: None,
         }],
     )];
 

@@ -1,6 +1,5 @@
 ---
 source: tests/snapshot_test.rs
-assertion_line: 55
 expression: diagnostics
 ---
 [
@@ -12,6 +11,7 @@ expression: diagnostics
     "column": 3,
     "end_line": 11,
     "end_column": 9,
-    "help": "Use 'on E: ExceptionType do' to catch specific exceptions, or add a 'raise' statement to re-raise after cleanup."
+    "help": "Use 'on E: ExceptionType do' to catch specific exceptions, or add a 'raise' statement to re-raise after cleanup.",
+    "scope": "DoRisky"
   }
 ]

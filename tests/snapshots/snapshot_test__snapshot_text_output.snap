@@ -3,7 +3,7 @@ source: tests/snapshot_test.rs
 expression: output
 ---
 warning[empty-except]: Empty except block silently swallows exceptions.
-  --> tests/fixtures/exception/bad_empty_except.pas:11:3
+  --> tests/fixtures/exception/bad_empty_except.pas:11:3 in DoRisky
    |
 10 |     WriteLn('risky');
 11 |   except

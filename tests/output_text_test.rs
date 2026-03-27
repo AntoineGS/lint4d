@@ -13,6 +13,7 @@ fn formats_single_diagnostic() {
         end_line: 4,
         end_column: 13,
         help: Some("move this call inside the try block".to_string()),
+        scope: None,
     };
 
     let output = format_diagnostics("src/MyUnit.pas", source.as_bytes(), &[diag], false);

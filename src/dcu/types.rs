@@ -843,11 +843,12 @@ fn skip_meta_class_def(reader: &mut DcuReader) -> Result<(), DcuError> {
 /// DCU32 reference: TClassDef.Create (for D13/XE7+).
 fn parse_class_def(reader: &mut DcuReader) -> Result<(Vec<FieldInfo>, Vec<MethodInfo>), DcuError> {
     read_type_def_header(reader)?;
-    // D2006+: BX byte (some flags)
     let _bx = reader.read_byte()?;
-    // D_XE2+: extra byte
-    let _bx_xe2 = reader.read_byte()?;
-    // D2009+: extra byte (BX2)
+    if reader.ver >= DcuVersion::DXE2 {
+        let _bx_xe2 = reader.read_byte()?;
+    } else {
+        let _bx_pre_xe2 = reader.read_uindex()?;
+    }
     let _bx2 = reader.read_byte()?;
     let _h_parent = reader.read_uindex()?;
     let _inst_base_rtti_sz = reader.read_uindex()?;

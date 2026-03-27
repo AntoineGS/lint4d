@@ -26,9 +26,6 @@ type
       // and TList does not free them
     // TODO: Add defensive coding pattern checks (no use of passed variables without a 
       // null check)
-    // Replicate Create/Free logic with StartTransaction/EndTransaction
-    // Method variables are not included in the camelCase/PascalCase logic
-    // Add method names to output
   end;
 
 var

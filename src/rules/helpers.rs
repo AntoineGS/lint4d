@@ -310,10 +310,40 @@ pub fn build_var_type_map(proc_node: Node, source: &[u8]) -> HashMap<String, Str
     map
 }
 
+/// Extract the type name from a `declArg` AST node.
+///
+/// Walks `declArg -> type -> typeref -> identifier` to get the type name.
+pub fn extract_type_from_decl_arg(decl_arg: Node, source: &[u8]) -> Option<String> {
+    let type_node = decl_arg.child_by_field_name("type")?;
+    let mut type_cursor = type_node.walk();
+    for type_child in type_node.children(&mut type_cursor) {
+        if type_child.kind() == "typeref" {
+            let mut ref_cursor = type_child.walk();
+            for ref_child in type_child.children(&mut ref_cursor) {
+                if ref_child.kind() == "identifier" {
+                    return Some(node_text(ref_child, source));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if a `declArg` node has an `out` modifier.
+pub fn has_out_modifier(decl_arg: Node) -> bool {
+    let mut cursor = decl_arg.walk();
+    for child in decl_arg.children(&mut cursor) {
+        if child.kind() == "kOut" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract the type name from a `declVar` AST node.
 ///
 /// Walks `declVar -> type -> typeref -> identifier` to get the type name.
-fn extract_type_from_decl_var(decl_var: Node, source: &[u8]) -> Option<String> {
+pub fn extract_type_from_decl_var(decl_var: Node, source: &[u8]) -> Option<String> {
     let mut cursor = decl_var.walk();
     for child in decl_var.children(&mut cursor) {
         if child.kind() == "type" {

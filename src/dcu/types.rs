@@ -640,22 +640,36 @@ fn skip_method_decl(reader: &mut DcuReader, method_tag: u8) -> Result<(), DcuErr
     Ok(())
 }
 
-/// Skip the version-dependent extra bytes after a method declaration.
-/// For D13 (XE7+), reads bytes while they match a known set of values.
-fn skip_method_extra_bytes(reader: &mut DcuReader) -> Result<(), DcuError> {
-    // The set of acceptable bytes for D_XE7+ (nSkip=5 in DCU32):
-    // cS20 = [0,1,2,4,8,9,$10,$18,$20,$22,$28,$38,$42,$47,$4F,$60,$80,$84,
-    //          Ord(' ')=$20, Ord('!')=$21, Ord('a')=$61]
-    // Combined and deduplicated:
-    const METHOD_BYTE_SET: &[u8] = &[
-        0x00, 0x01, 0x02, 0x04, 0x08, 0x09, 0x10, 0x18, 0x20, 0x21, 0x22, 0x28, 0x38, 0x42, 0x47,
-        0x4F, 0x60, 0x61, 0x80, 0x84,
-    ];
+/// Return the version-dependent set of bytes to skip after a method declaration.
+/// CnWizards sSkip array: cumulative byte sets per version level.
+fn method_skip_set(ver: DcuVersion) -> &'static [u8] {
+    if ver >= DcuVersion::DXE7 {
+        &[0x00, 0x01, 0x02, 0x04, 0x08, 0x09, 0x10, 0x18, 0x20, 0x21,
+          0x22, 0x28, 0x38, 0x42, 0x47, 0x4F, 0x60, 0x61, 0x80, 0x84]
+    } else if ver >= DcuVersion::DXE4 {
+        &[0x00, 0x01, 0x02, 0x04, 0x08, 0x09, 0x10, 0x18, 0x20, 0x21,
+          0x22, 0x28, 0x38, 0x42, 0x47, 0x4F, 0x61, 0x80, 0x84]
+    } else if ver >= DcuVersion::DXE3 {
+        &[0x00, 0x01, 0x02, 0x04, 0x08, 0x09, 0x10, 0x18, 0x20, 0x21,
+          0x22, 0x28, 0x38, 0x42, 0x61, 0x80, 0x84]
+    } else if ver >= DcuVersion::DXE2 {
+        &[0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x18, 0x20, 0x21,
+          0x28, 0x38, 0x61, 0x80, 0x84]
+    } else if ver >= DcuVersion::D2010 {
+        &[0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x18, 0x20, 0x21,
+          0x61, 0x80, 0x84]
+    } else {
+        &[0x00, 0x02, 0x04, 0x08, 0x10, 0x18, 0x20, 0x21,
+          0x61, 0x80, 0x84]
+    }
+}
 
+/// Skip the version-dependent extra bytes after a method declaration.
+fn skip_method_extra_bytes(reader: &mut DcuReader) -> Result<(), DcuError> {
+    let allowed = method_skip_set(reader.ver);
     loop {
         let b = reader.read_byte()?;
-        if !METHOD_BYTE_SET.contains(&b) {
-            // Put back the byte that didn't match.
+        if !allowed.contains(&b) {
             reader.unread(1);
             break;
         }

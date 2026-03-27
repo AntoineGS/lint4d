@@ -6,21 +6,31 @@ pub mod types;
 
 pub use tags::DcuError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DcuVersion {
+    D2010,
+    DXE,
+    DXE2,
+    DXE3,
+    DXE4,
+    DXE5,
+    DXE6,
+    DXE7,
+    DXE8,
+    D10S,
+    D101B,
+    D102T,
+    D103R,
+    D104S,
+    D11A,
+    D12A,
     D13,
-    Unknown(u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DcuPlatform {
     Win32,
     Win64,
-    Osx32,
-    IOSSimulator,
-    IOSDevice,
-    Android,
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

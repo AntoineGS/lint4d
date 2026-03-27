@@ -7,4 +7,5 @@ pub mod discovery_msbuild;
 pub mod parser;
 pub mod types;
 
+pub use directives::FormatOffRegion;
 pub use types::{Diagnostic, FileInfo, FileType, Severity};

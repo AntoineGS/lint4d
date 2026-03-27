@@ -3,6 +3,7 @@ use crate::config::FmtConfig;
 use crate::indent::IndentContext;
 use crate::spacing;
 use crate::uses;
+use pascal_core::FormatOffRegion;
 use tree_sitter::Node;
 
 /// AST-walking printer that emits formatted Delphi source.
@@ -11,6 +12,7 @@ pub struct Printer<'a> {
     config: &'a FmtConfig,
     indent: IndentContext,
     comments: &'a CommentMap,
+    format_regions: Vec<FormatOffRegion>,
     output: String,
     /// True if we are at the start of a new line (need indent on next token).
     at_line_start: bool,
@@ -19,12 +21,18 @@ pub struct Printer<'a> {
 }
 
 impl<'a> Printer<'a> {
-    pub fn new(source: &'a [u8], config: &'a FmtConfig, comments: &'a CommentMap) -> Self {
+    pub fn new(
+        source: &'a [u8],
+        config: &'a FmtConfig,
+        comments: &'a CommentMap,
+        format_regions: Vec<FormatOffRegion>,
+    ) -> Self {
         Printer {
             source,
             config,
             indent: IndentContext::new(config.indent_size, config.indent_style),
             comments,
+            format_regions,
             output: String::new(),
             at_line_start: true,
             last_token_kind: String::new(),
@@ -38,6 +46,12 @@ impl<'a> Printer<'a> {
     // ── Main dispatch ────────────────────────────────────────────
 
     pub fn print_node(&mut self, node: Node) {
+        // If the node falls entirely within a format-off region, emit verbatim.
+        if self.is_in_format_off_region(node) {
+            self.emit_verbatim(node);
+            return;
+        }
+
         // Emit leading comments for this node.
         self.emit_leading_comments(node);
 
@@ -540,6 +554,29 @@ impl<'a> Printer<'a> {
         std::str::from_utf8(&self.source[node.start_byte()..node.end_byte()])
             .unwrap_or("")
             .to_string()
+    }
+
+    /// Check if a node falls entirely within a format-off region.
+    fn is_in_format_off_region(&self, node: Node) -> bool {
+        let node_start = node.start_position().row + 1; // 1-based
+        let node_end = node.end_position().row + 1; // 1-based
+        self.format_regions
+            .iter()
+            .any(|r| node_start >= r.start_line && node_end <= r.end_line)
+    }
+
+    /// Emit the original source text for a node verbatim (no formatting).
+    fn emit_verbatim(&mut self, node: Node) {
+        let text = self.node_text(node);
+        self.output.push_str(&text);
+        // Update state: check if text ends with a newline
+        self.at_line_start = text.ends_with('\n');
+        if let Some(last_line) = text.lines().last() {
+            // crude: pick up the last "word" as last_token_kind
+            if let Some(word) = last_line.split_whitespace().last() {
+                self.last_token_kind = word.to_string();
+            }
+        }
     }
 }
 

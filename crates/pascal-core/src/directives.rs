@@ -122,6 +122,56 @@ pub fn find_line_comment(line: &str) -> Option<usize> {
     None
 }
 
+/// A region of source where formatting is disabled via `{$FMT.OFF}` / `{$FMT.ON}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormatOffRegion {
+    /// 1-based start line (the line containing `{$FMT.OFF}`).
+    pub start_line: usize,
+    /// 1-based end line (the line containing `{$FMT.ON}`, or last line of file).
+    pub end_line: usize,
+}
+
+/// Parse `{$FMT.OFF}` / `{$FMT.ON}` directive pairs from source bytes.
+///
+/// Case-insensitive matching. If `{$FMT.OFF}` appears without a matching
+/// `{$FMT.ON}`, the region extends to the end of the file.
+pub fn parse_format_regions(source: &[u8]) -> Vec<FormatOffRegion> {
+    let text = match std::str::from_utf8(source) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let total_lines = lines.len();
+    let mut regions = Vec::new();
+    let mut off_line: Option<usize> = None;
+
+    for (idx, &line) in lines.iter().enumerate() {
+        let line_number = idx + 1; // 1-based
+        let upper = line.to_uppercase();
+
+        if off_line.is_none() && upper.contains("{$FMT.OFF}") {
+            off_line = Some(line_number);
+        } else if off_line.is_some() && upper.contains("{$FMT.ON}") {
+            regions.push(FormatOffRegion {
+                start_line: off_line.unwrap(),
+                end_line: line_number,
+            });
+            off_line = None;
+        }
+    }
+
+    // Unclosed {$FMT.OFF} — close at end of file
+    if let Some(start) = off_line {
+        regions.push(FormatOffRegion {
+            start_line: start,
+            end_line: total_lines,
+        });
+    }
+
+    regions
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -166,5 +216,72 @@ mod unit_tests {
     fn extract_rule_id_strips_em_dash_reason() {
         let input = format!(" my-rule \u{2014} some reason");
         assert_eq!(extract_rule_id(&input), Some("my-rule".to_string()));
+    }
+
+    // ── Format region tests ────────────────────────────────────────
+
+    #[test]
+    fn format_regions_simple_pair() {
+        let source = b"line1\n{$FMT.OFF}\nline3\n{$FMT.ON}\nline5\n";
+        let regions = parse_format_regions(source);
+        assert_eq!(
+            regions,
+            vec![FormatOffRegion {
+                start_line: 2,
+                end_line: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn format_regions_case_insensitive() {
+        let source = b"line1\n{$fmt.off}\nline3\n{$Fmt.On}\nline5\n";
+        let regions = parse_format_regions(source);
+        assert_eq!(
+            regions,
+            vec![FormatOffRegion {
+                start_line: 2,
+                end_line: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn format_regions_unclosed_off_extends_to_eof() {
+        let source = b"line1\nline2\n{$FMT.OFF}\nline4\nline5\n";
+        let regions = parse_format_regions(source);
+        assert_eq!(
+            regions,
+            vec![FormatOffRegion {
+                start_line: 3,
+                end_line: 5
+            }]
+        );
+    }
+
+    #[test]
+    fn format_regions_multiple_pairs() {
+        let source = b"line1\n{$FMT.OFF}\nline3\n{$FMT.ON}\nline5\n{$FMT.OFF}\nline7\n{$FMT.ON}\n";
+        let regions = parse_format_regions(source);
+        assert_eq!(
+            regions,
+            vec![
+                FormatOffRegion {
+                    start_line: 2,
+                    end_line: 4
+                },
+                FormatOffRegion {
+                    start_line: 6,
+                    end_line: 8
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn format_regions_no_directives() {
+        let source = b"line1\nline2\nline3\n";
+        let regions = parse_format_regions(source);
+        assert!(regions.is_empty());
     }
 }

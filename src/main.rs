@@ -210,10 +210,10 @@ fn validate_cli(cli: &Cli) -> Severity {
 /// Resolves DCU paths and builds a ProjectContext if any DCU directories are found.
 fn resolve_dcu_context(cli: &Cli, config: &Config) -> Option<lint4d::dcu::ProjectContext> {
     // MSBuild auto-discovery: only attempt if --project is provided
-    let discovered_paths =
-        if cli.dcu_paths.is_empty() && config.dcu_paths().is_empty() && cli.project.is_some() {
+    let discovered_paths = if cli.dcu_paths.is_empty() && config.dcu_paths().is_empty() {
+        if let Some(project) = cli.project.as_ref() {
             discover_dcu_paths_from_project(
-                cli.project.as_ref().unwrap(),
+                project,
                 cli.bds_path
                     .as_deref()
                     .or_else(|| config.bds_path().map(std::path::Path::new)),
@@ -222,7 +222,10 @@ fn resolve_dcu_context(cli: &Cli, config: &Config) -> Option<lint4d::dcu::Projec
             )
         } else {
             Vec::new()
-        };
+        }
+    } else {
+        Vec::new()
+    };
 
     // Warn if BDS-related flags are provided without --project
     if cli.project.is_none()

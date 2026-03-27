@@ -140,7 +140,7 @@ impl<'a> DcuReader<'a> {
     /// Otherwise the first byte is the length directly.
     pub fn read_name(&mut self) -> Result<String, DcuError> {
         let len_byte = self.read_byte()?;
-        let len = if len_byte == 0xFF {
+        let len = if len_byte == 0xFF && self.ver >= DcuVersion::DXE2 {
             self.read_u32()? as usize
         } else {
             len_byte as usize

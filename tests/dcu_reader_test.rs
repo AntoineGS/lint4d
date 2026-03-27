@@ -129,9 +129,19 @@ fn read_name_empty() {
 #[test]
 fn read_name_long_format() {
     let data = [0xFF, 0x03, 0x00, 0x00, 0x00, b'F', b'o', b'o'];
-    let mut r = DcuReader::new(&data, DcuVersion::D13);
+    let mut r = DcuReader::new(&data, DcuVersion::DXE2);
     assert_eq!(r.read_name().unwrap(), "Foo");
     assert_eq!(r.position(), 8);
+}
+
+#[test]
+fn read_name_0xff_pre_xe2_is_literal_length() {
+    let mut data = vec![0xFF];
+    data.extend(std::iter::repeat(b'A').take(255));
+    let mut r = DcuReader::new(&data, DcuVersion::D2010);
+    let name = r.read_name().unwrap();
+    assert_eq!(name.len(), 255);
+    assert_eq!(r.position(), 256);
 }
 
 #[test]

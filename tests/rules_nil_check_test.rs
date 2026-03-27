@@ -51,3 +51,118 @@ fn unchecked_nil_flags_param_without_check() {
         matches
     );
 }
+
+#[test]
+fn unchecked_nil_passes_with_not_nil_check() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/good_comparison.pas", &project);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Should not flag when nil check exists: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn unchecked_nil_passes_with_raiseifnil() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/good_raiseifnil.pas", &project);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Should not flag after RaiseIfNil: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn unchecked_nil_passes_with_early_exit_guard() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/good_early_exit.pas", &project);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Should not flag after early exit guard: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn unchecked_nil_passes_with_constructor_assignment() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/good_constructor.pas", &project);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Should not flag after constructor assignment: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn unchecked_nil_flags_local_without_check() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/bad_local_no_check.pas", &project);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 unchecked-nil for local used without check, got: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn unchecked_nil_flags_unchecked_branch() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/bad_branch_unsafe.pas", &project);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 unchecked-nil for use on unchecked branch, got: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn unchecked_nil_skipped_when_not_enabled() {
+    let project = project_with_tobject();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/nil_check/bad_param_no_check.pas");
+    let source = fs::read(&path).unwrap();
+    let file = FileInfo::new(PathBuf::from(
+        "tests/fixtures/nil_check/bad_param_no_check.pas",
+    ));
+    let config = "version = 1".parse::<Config>().unwrap();
+    let registry = RuleRegistry::new();
+    let diagnostics = run_lint_with_context(&file, &source, &config, Some(&project), &registry);
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "Rule should not fire when not explicitly enabled: {:?}",
+        matches
+    );
+}

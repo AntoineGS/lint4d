@@ -26,6 +26,8 @@ type
       // and TList does not free them
     // TODO: Add defensive coding pattern checks (no use of passed variables without a 
       // null check)
+    // TODO: implement sub-class and interface support, by analyzing the project to see 
+      // possibe objects/implementations
   end;
 
 var

@@ -203,3 +203,101 @@ fn unchecked_nil_flags_nil_function_return() {
         matches
     );
 }
+
+#[test]
+fn unchecked_nil_flags_use_after_freeandnil() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check(
+        "tests/fixtures/nil_check/bad_use_after_freeandnil.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Should flag use after FreeAndNil resets state: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn unchecked_nil_diagnostic_format() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check("tests/fixtures/nil_check/bad_param_no_check.pas", &project);
+    let diag = diagnostics
+        .iter()
+        .find(|d| d.rule_id == "unchecked-nil")
+        .expect("Should have an unchecked-nil diagnostic");
+
+    assert!(
+        diag.message.contains("Parameter"),
+        "Message should mention 'Parameter': {}",
+        diag.message
+    );
+    assert!(
+        diag.message.contains("AObj"),
+        "Message should mention variable name: {}",
+        diag.message
+    );
+    assert!(diag.help.is_some(), "Should have help text");
+    assert!(
+        diag.help.as_ref().unwrap().contains("RaiseIfNil"),
+        "Help should suggest RaiseIfNil: {}",
+        diag.help.as_ref().unwrap()
+    );
+    assert!(diag.scope.is_some(), "Should have enclosing scope");
+}
+
+fn project_with_interface() -> ProjectContext {
+    let system_unit = DcuUnit {
+        name: "System".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![TypeInfo {
+            name: "TObject".to_string(),
+            kind: TypeKind::Class,
+            parent: None,
+            fields: vec![],
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    let intf_unit = DcuUnit {
+        name: "MyIntf".to_string(),
+        version: DcuVersion::D13,
+        platform: DcuPlatform::Win64,
+        imported_units: vec![],
+        types: vec![TypeInfo {
+            name: "IMyInterface".to_string(),
+            kind: TypeKind::Interface,
+            parent: None,
+            fields: vec![],
+            methods: vec![],
+            interface_guid: None,
+        }],
+    };
+    ProjectContext::from_units(vec![system_unit, intf_unit])
+}
+
+#[test]
+fn unchecked_nil_flags_interface_without_check() {
+    let project = project_with_interface();
+    let diagnostics = lint_nil_check(
+        "tests/fixtures/nil_check/bad_interface_no_check.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Expected 1 unchecked-nil for interface used without check, got: {:?}",
+        matches
+    );
+}

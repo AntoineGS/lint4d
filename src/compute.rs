@@ -134,6 +134,7 @@ mod tests {
                 field_effects: vec![],
                 returns_new_object: false,
                 can_raise: false,
+                transaction_effects: vec![],
             }
         }
     }

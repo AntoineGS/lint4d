@@ -39,12 +39,29 @@ pub struct FieldEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionEffect {
+    /// Always starts a transaction (unconditional StartTransaction).
+    Starts,
+    /// Starts only when not already in transaction (guarded).
+    StartsConditionally,
+    /// Always commits.
+    Commits,
+    /// Commits only if transaction was started here (guarded).
+    CommitsConditionally,
+    /// Always rolls back.
+    Rollbacks,
+    /// Rolls back only if transaction was started here (guarded).
+    RollbacksConditionally,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcSummary {
     pub id: ProcId,
     pub param_effects: Vec<ParamEffect>,
     pub field_effects: Vec<FieldEffect>,
     pub returns_new_object: bool,
     pub can_raise: bool,
+    pub transaction_effects: Vec<TransactionEffect>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,8 +1,18 @@
 use clap::{CommandFactory, Parser};
+use fmt4d::config::FmtConfig;
+use fmt4d::formatter::format_source;
+use pascal_core::discovery::discover_files;
+use pascal_core::FileInfo;
+use rayon::prelude::*;
+use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const EXIT_OK: i32 = 0;
+const EXIT_FORMAT_NEEDED: i32 = 1;
+const EXIT_ERROR: i32 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -46,11 +56,152 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    if cli.paths.is_empty() && cli.project.is_none() && !cli.stdin {
+    if cli.stdin {
+        process::exit(run_stdin(&cli));
+    }
+
+    if cli.paths.is_empty() && cli.project.is_none() {
         Cli::command().print_help().ok();
         println!();
         process::exit(EXIT_OK);
     }
 
-    process::exit(EXIT_OK);
+    process::exit(run_files(&cli));
+}
+
+fn run_stdin(cli: &Cli) -> i32 {
+    let mut input = String::new();
+    if let Err(e) = io::stdin().read_to_string(&mut input) {
+        eprintln!("Error reading stdin: {}", e);
+        return EXIT_ERROR;
+    }
+
+    let info = FileInfo::new(PathBuf::from("stdin.pas"));
+    let config = FmtConfig::default().with_overrides(cli.indent_size, cli.max_line_length);
+
+    match format_source(input.as_bytes(), &info, &config) {
+        Ok(formatted) => {
+            print!("{}", formatted);
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("Error formatting stdin: {}", e);
+            EXIT_ERROR
+        }
+    }
+}
+
+fn run_files(cli: &Cli) -> i32 {
+    let files = match discover_files(&cli.paths, &[]) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error discovering files: {}", e);
+            return EXIT_ERROR;
+        }
+    };
+
+    if files.is_empty() {
+        eprintln!("No Delphi source files found.");
+        return EXIT_OK;
+    }
+
+    // Discover config from the first path's directory
+    let config_dir = cli
+        .paths
+        .first()
+        .and_then(|p| {
+            if p.is_dir() {
+                Some(p.clone())
+            } else {
+                p.parent().map(|pp| pp.to_path_buf())
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let config =
+        FmtConfig::discover(&config_dir).with_overrides(cli.indent_size, cli.max_line_length);
+
+    let had_changes = AtomicBool::new(false);
+    let had_errors = AtomicBool::new(false);
+
+    files.par_iter().for_each(|file_info| {
+        let source = match fs::read(&file_info.path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error reading {}: {}", file_info.path.display(), e);
+                had_errors.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let formatted = match format_source(&source, file_info, &config) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Error formatting {}: {}", file_info.path.display(), e);
+                had_errors.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let original = String::from_utf8_lossy(&source);
+        if formatted == original.as_ref() {
+            return; // No changes needed
+        }
+
+        had_changes.store(true, Ordering::Relaxed);
+
+        if cli.check {
+            println!("Would reformat: {}", file_info.path.display());
+        } else if cli.diff {
+            print_diff(&file_info.path, &original, &formatted);
+        } else {
+            // Write formatted output back to the file
+            if let Err(e) = fs::write(&file_info.path, &formatted) {
+                eprintln!("Error writing {}: {}", file_info.path.display(), e);
+                had_errors.store(true, Ordering::Relaxed);
+                return;
+            }
+            println!("Formatted: {}", file_info.path.display());
+        }
+    });
+
+    if had_errors.load(Ordering::Relaxed) {
+        return EXIT_ERROR;
+    }
+
+    if cli.check && had_changes.load(Ordering::Relaxed) {
+        return EXIT_FORMAT_NEEDED;
+    }
+
+    EXIT_OK
+}
+
+fn print_diff(path: &std::path::Path, original: &str, formatted: &str) {
+    println!("--- {}", path.display());
+    println!("+++ {}", path.display());
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let fmt_lines: Vec<&str> = formatted.lines().collect();
+
+    let max_len = orig_lines.len().max(fmt_lines.len());
+    for i in 0..max_len {
+        let orig_line = orig_lines.get(i).copied();
+        let fmt_line = fmt_lines.get(i).copied();
+        match (orig_line, fmt_line) {
+            (Some(o), Some(f)) if o == f => {
+                println!(" {}", o);
+            }
+            (Some(o), Some(f)) => {
+                println!("-{}", o);
+                println!("+{}", f);
+            }
+            (Some(o), None) => {
+                println!("-{}", o);
+            }
+            (None, Some(f)) => {
+                println!("+{}", f);
+            }
+            (None, None) => {}
+        }
+    }
 }

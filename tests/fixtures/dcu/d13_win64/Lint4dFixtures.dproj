@@ -74,13 +74,13 @@
         <DelphiCompile Include="$(MainSource)">
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
-        <DCCReference Include="Lint4dFixture.Classes.pas"/>
-        <DCCReference Include="Lint4dFixture.Interfaces.pas"/>
-        <DCCReference Include="Lint4dFixture.Records.pas"/>
-        <DCCReference Include="Lint4dFixture.Enums.pas"/>
-        <DCCReference Include="Lint4dFixture.Generics.pas"/>
-        <DCCReference Include="Lint4dFixture.Inheritance.pas"/>
-        <DCCReference Include="Lint4dFixture.Torture.pas"/>
+        <DCCReference Include="..\src\Lint4dFixture.Classes.pas"/>
+        <DCCReference Include="..\src\Lint4dFixture.Interfaces.pas"/>
+        <DCCReference Include="..\src\Lint4dFixture.Records.pas"/>
+        <DCCReference Include="..\src\Lint4dFixture.Enums.pas"/>
+        <DCCReference Include="..\src\Lint4dFixture.Generics.pas"/>
+        <DCCReference Include="..\src\Lint4dFixture.Inheritance.pas"/>
+        <DCCReference Include="..\src\Lint4dFixture.Torture.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

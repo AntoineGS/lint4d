@@ -3,8 +3,8 @@ unit Lint4dFixture.Torture;
 interface
 
 uses
-  System.SysUtils,
-  System.Variants,
+  SysUtils,
+  Variants,
   Lint4dFixture.Classes,
   Lint4dFixture.Interfaces,
   Lint4dFixture.Enums;

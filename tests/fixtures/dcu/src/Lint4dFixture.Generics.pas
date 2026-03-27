@@ -3,7 +3,7 @@ unit Lint4dFixture.Generics;
 interface
 
 uses
-  System.Generics.Collections;
+  Generics.Collections;
 
 type
   IGenericInterface<T> = interface

@@ -1,0 +1,9 @@
+Win32/
+!Win32/
+!Win32/Debug/
+Win32/Debug/*
+!Win32/Debug/*.dcu
+*.dproj.local
+__history/
+*.identcache
+*.res

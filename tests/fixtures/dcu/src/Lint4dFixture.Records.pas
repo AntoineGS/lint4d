@@ -23,7 +23,7 @@ type
 implementation
 
 uses
-  System.Math;
+  Math;
 
 { TAdvancedRecord }
 

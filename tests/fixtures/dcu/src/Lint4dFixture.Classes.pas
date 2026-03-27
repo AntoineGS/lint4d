@@ -3,8 +3,8 @@ unit Lint4dFixture.Classes;
 interface
 
 uses
-  System.SysUtils,
-  System.Classes;
+  SysUtils,
+  Classes;
 
 type
   TSimpleClass = class

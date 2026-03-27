@@ -3,7 +3,7 @@ use crate::dcu::header::parse_unit_header;
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::*;
 use crate::dcu::{
-    DcuUnit, FieldInfo, MethodInfo, MethodKind, TypeInfo, TypeKind, TypeRef, Visibility,
+    DcuUnit, DcuVersion, FieldInfo, MethodInfo, MethodKind, TypeInfo, TypeKind, TypeRef, Visibility,
 };
 
 /// Parse a complete DCU file, extracting the unit name, version, platform,
@@ -467,8 +467,9 @@ fn skip_proc_decl(reader: &mut DcuReader, types: &mut Vec<TypeInfo>) -> Result<S
 
     let _b0 = reader.read_uindex()?;
     let _sz = reader.read_uindex()?;
-    // XE+ extra byte
-    let _xe_byte = reader.read_byte()?;
+    if reader.ver >= DcuVersion::DXE {
+        let _xe_byte = reader.read_byte()?;
+    }
 
     let is_unnamed = name.is_empty()
         || name == "."

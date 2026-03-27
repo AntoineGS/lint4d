@@ -81,6 +81,14 @@ struct Cli {
 }
 
 fn main() {
+    // Configure rayon worker threads with larger stacks. The default OS
+    // stack (1 MB on Windows) is too small for the combined recursion of
+    // AST walking, CFG building, and lazy DCU parsing on worker threads.
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(16 * 1024 * 1024)
+        .build_global()
+        .expect("failed to build rayon thread pool");
+
     // Spawn the real main on a thread with a larger stack to handle
     // deeply nested DCU parsing (e.g., large VCL units in debug builds).
     let builder = std::thread::Builder::new()

@@ -11,6 +11,30 @@ fn parse_magic_d13_win64() {
 }
 
 #[test]
+fn parse_magic_d2010_win32() {
+    let data = 0x1500_0045_u32.to_le_bytes();
+    let (version, platform) = parse_magic(&data).unwrap();
+    assert_eq!(version, DcuVersion::D2010);
+    assert_eq!(platform, DcuPlatform::Win32);
+}
+
+#[test]
+fn parse_magic_xe3_win32() {
+    let data = 0x1800_034B_u32.to_le_bytes();
+    let (version, platform) = parse_magic(&data).unwrap();
+    assert_eq!(version, DcuVersion::DXE3);
+    assert_eq!(platform, DcuPlatform::Win32);
+}
+
+#[test]
+fn parse_magic_xe2_win64() {
+    let data = 0x1700_234B_u32.to_le_bytes();
+    let (version, platform) = parse_magic(&data).unwrap();
+    assert_eq!(version, DcuVersion::DXE2);
+    assert_eq!(platform, DcuPlatform::Win64);
+}
+
+#[test]
 fn parse_magic_unknown() {
     let data = [0x00, 0x00, 0x00, 0x00];
     let result = parse_magic(&data);

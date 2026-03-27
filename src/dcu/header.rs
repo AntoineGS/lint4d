@@ -2,17 +2,72 @@ use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::DcuError;
 use crate::dcu::{DcuPlatform, DcuVersion};
 
-const MAGIC_D13_WIN32: u32 = 0x2500_034D;
-const MAGIC_D13_WIN64: u32 = 0x2500_234D;
+use DcuPlatform::{Win32, Win64};
+use DcuVersion::*;
+
+/// Magic-number lookup table: (raw LE u32, version, platform).
+/// 17 Win32 entries + 14 Win64 entries = 31 total (D2010 and XE have no Win64).
+static MAGIC_TABLE: &[(u32, DcuVersion, DcuPlatform)] = &[
+    // D2010
+    (0x1500_0045, D2010, Win32),
+    // XE
+    (0x1600_034B, DXE, Win32),
+    // XE2
+    (0x1700_034B, DXE2, Win32),
+    (0x1700_234B, DXE2, Win64),
+    // XE3
+    (0x1800_034B, DXE3, Win32),
+    (0x1800_234B, DXE3, Win64),
+    // XE4
+    (0x1900_034B, DXE4, Win32),
+    (0x1900_234B, DXE4, Win64),
+    // XE5
+    (0x1A00_034B, DXE5, Win32),
+    (0x1A00_234B, DXE5, Win64),
+    // XE6
+    (0x1B00_034D, DXE6, Win32),
+    (0x1B00_234D, DXE6, Win64),
+    // XE7
+    (0x1C00_034D, DXE7, Win32),
+    (0x1C00_234D, DXE7, Win64),
+    // XE8
+    (0x1D00_034D, DXE8, Win32),
+    (0x1D00_234D, DXE8, Win64),
+    // 10 Seattle
+    (0x1E00_034D, D10S, Win32),
+    (0x1E00_234D, D10S, Win64),
+    // 10.1 Berlin
+    (0x1F00_034D, D101B, Win32),
+    (0x1F00_234D, D101B, Win64),
+    // 10.2 Tokyo
+    (0x2000_034D, D102T, Win32),
+    (0x2000_234D, D102T, Win64),
+    // 10.3 Rio
+    (0x2100_034D, D103R, Win32),
+    (0x2100_234D, D103R, Win64),
+    // 10.4 Sydney
+    (0x2200_034D, D104S, Win32),
+    (0x2200_234D, D104S, Win64),
+    // 11 Alexandria
+    (0x2300_034D, D11A, Win32),
+    (0x2300_234D, D11A, Win64),
+    // 12 Athens
+    (0x2400_034D, D12A, Win32),
+    (0x2400_234D, D12A, Win64),
+    // 13
+    (0x2500_034D, D13, Win32),
+    (0x2500_234D, D13, Win64),
+];
 
 pub fn parse_magic(data: &[u8]) -> Result<(DcuVersion, DcuPlatform), DcuError> {
     let mut reader = DcuReader::new(data);
     let magic = reader.read_u32()?;
-    match magic {
-        MAGIC_D13_WIN32 => Ok((DcuVersion::D13, DcuPlatform::Win32)),
-        MAGIC_D13_WIN64 => Ok((DcuVersion::D13, DcuPlatform::Win64)),
-        _ => Err(DcuError::UnsupportedVersion { magic }),
+    for &(m, ver, plat) in MAGIC_TABLE {
+        if m == magic {
+            return Ok((ver, plat));
+        }
     }
+    Err(DcuError::UnsupportedVersion { magic })
 }
 
 /// Parsed DCU unit header containing identity and version information.

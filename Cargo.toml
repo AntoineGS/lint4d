@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    ".",
+    "crates/pascal-core",
+]
+resolver = "2"
+
 [package]
 name = "lint4d"
 version = "0.1.0"

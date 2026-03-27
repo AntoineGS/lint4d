@@ -618,6 +618,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pascal-core"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "quick-xml",
+ "serde",
+ "tree-sitter",
+ "tree-sitter-language",
+ "tree-sitter-pascal",
+ "walkdir",
+ "winreg",
+]
+
+[[package]]
 name = "petgraph"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

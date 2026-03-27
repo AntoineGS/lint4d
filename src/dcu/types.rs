@@ -37,7 +37,7 @@ pub fn parse_dcu(data: &[u8]) -> Result<DcuUnit, DcuError> {
     let mut types = Vec::new();
     // EOF is tolerated: the parser may read past the declaration section
     // into data blocks or debug info, hitting EOF gracefully.
-    match read_decl_list_into(&mut reader, &mut tag, &mut types) {
+    match read_decl_list_into(&mut reader, &mut tag, &mut types, false) {
         Ok(()) | Err(DcuError::UnexpectedEof { .. }) => {}
         Err(e) => return Err(e),
     }
@@ -117,9 +117,9 @@ fn try_skip_type_def(tag: u8, reader: &mut DcuReader) -> Result<bool, DcuError> 
 ///
 /// Reads tags until a stop/structural tag or an unrecognized tag.
 /// The `tag` parameter holds the current (already-read) raw tag byte.
-fn read_decl_list(reader: &mut DcuReader, tag: &mut u8) -> Result<Vec<TypeInfo>, DcuError> {
+fn read_decl_list(reader: &mut DcuReader, tag: &mut u8, in_args: bool) -> Result<Vec<TypeInfo>, DcuError> {
     let mut types = Vec::new();
-    read_decl_list_into(reader, tag, &mut types)?;
+    read_decl_list_into(reader, tag, &mut types, in_args)?;
     Ok(types)
 }
 
@@ -130,6 +130,7 @@ fn read_decl_list_into(
     reader: &mut DcuReader,
     tag: &mut u8,
     types: &mut Vec<TypeInfo>,
+    in_args: bool,
 ) -> Result<(), DcuError> {
     loop {
         let fixed = fix_tag(*tag);
@@ -244,11 +245,11 @@ fn read_decl_list_into(
             }
             // Local variable / parameter tags (appear in proc arg lists, class bodies).
             AR_VAL | AR_VAR | AR_RESULT | AR_ABS_LOC_VAR => {
-                skip_local_decl(reader, false)?;
+                skip_local_decl(reader, false, in_args)?;
             }
             // Field declaration (class/record member).
             AR_FLD => {
-                skip_local_decl(reader, false)?;
+                skip_local_decl(reader, false, in_args)?;
             }
             // Method / constructor / destructor (class member).
             AR_METHOD | AR_CONSTR | AR_DESTR => {
@@ -260,11 +261,11 @@ fn read_decl_list_into(
             }
             // Class variable (D2006+).
             AR_CLASS_VAR => {
-                skip_local_decl(reader, false)?;
+                skip_local_decl(reader, false, in_args)?;
             }
             // Label declaration.
             AR_LABEL => {
-                skip_local_decl(reader, false)?;
+                skip_local_decl(reader, false, in_args)?;
             }
             // arSetDeft: default set value.
             AR_SET_DEFT => {
@@ -429,7 +430,7 @@ fn read_unit_add_info(reader: &mut DcuReader, types: &mut Vec<TypeInfo>) -> Resu
     let _b = reader.read_uindex()?;
 
     let mut inner_tag = reader.read_byte()?;
-    read_decl_list_into(reader, &mut inner_tag, types)?;
+    read_decl_list_into(reader, &mut inner_tag, types, false)?;
     Ok(())
 }
 
@@ -449,7 +450,7 @@ fn skip_embedded_proc(reader: &mut DcuReader, types: &mut Vec<TypeInfo>) -> Resu
             continue;
         }
         let mut temp_tag = inner_tag;
-        read_decl_list_into(reader, &mut temp_tag, types)?;
+        read_decl_list_into(reader, &mut temp_tag, types, false)?;
         if fix_tag(temp_tag) == DR_EMBEDDED_PROC_END {
             break;
         }
@@ -500,7 +501,7 @@ fn skip_proc_decl(reader: &mut DcuReader, types: &mut Vec<TypeInfo>) -> Result<S
 
         // ReadDeclList for args until stop tag.
         // Pass the shared types list so nested class defs link to outer types.
-        read_decl_list_into(reader, &mut inner_tag, types)?;
+        read_decl_list_into(reader, &mut inner_tag, types, true)?;
 
         if fix_tag(inner_tag) != DR_STOP1 {
             return Err(DcuError::UnknownTag {
@@ -565,11 +566,14 @@ fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo]) {
 ///   Extra (ReadUIndex) -- D2009+
 ///   hDT (ReadUIndex for non-method, ReadIndex for method)
 ///   Ndx (ReadIndex for non-method, ReadUIndex for method)
-fn skip_local_decl(reader: &mut DcuReader, is_method: bool) -> Result<(), DcuError> {
+fn skip_local_decl(reader: &mut DcuReader, is_method: bool, in_args: bool) -> Result<(), DcuError> {
     let _name = reader.read_name()?;
-    let _loc_flags = reader.read_uindex()?; // LocFlags
+    let loc_flags = reader.read_uindex()?; // LocFlags
     let _loc_flags_x = reader.read_uindex()?; // LocFlagsX (D8+)
     let _extra = reader.read_uindex()?; // D2009+
+    if reader.ver >= DcuVersion::DXE4 && in_args && (loc_flags & 0x40 != 0) {
+        reader.skip(4)?;
+    }
     if is_method {
         let _h_dt = reader.read_index()?;
         let _ndx = reader.read_uindex()?;
@@ -820,7 +824,7 @@ fn skip_proc_type_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     if fix_tag(inner_tag) >= 0x81 && fix_tag(inner_tag) <= 0x84 {
         inner_tag = reader.read_byte()?;
     }
-    let _args = read_decl_list(reader, &mut inner_tag)?;
+    let _args = read_decl_list(reader, &mut inner_tag, true)?;
     Ok(())
 }
 
@@ -933,12 +937,12 @@ fn parse_class_def(reader: &mut DcuReader) -> Result<(Vec<FieldInfo>, Vec<Method
                 Ok(()) => {}
                 Err(_) => break,
             },
-            AR_CLASS_VAR => match skip_local_decl(reader, false) {
+            AR_CLASS_VAR => match skip_local_decl(reader, false, false) {
                 Ok(()) => {}
                 Err(_) => break,
             },
             AR_VAL | AR_VAR | AR_RESULT | AR_ABS_LOC_VAR | AR_LABEL => {
-                match skip_local_decl(reader, false) {
+                match skip_local_decl(reader, false, false) {
                     Ok(()) => {}
                     Err(_) => break,
                 }
@@ -1041,7 +1045,7 @@ fn skip_rec_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     let _d3 = reader.read_uindex()?;
     // Read fields
     let mut inner_tag = reader.read_byte()?;
-    let _members = read_decl_list(reader, &mut inner_tag)?;
+    let _members = read_decl_list(reader, &mut inner_tag, false)?;
     Ok(())
 }
 
@@ -1064,7 +1068,7 @@ fn skip_interface_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     }
     // Read fields
     let mut inner_tag = reader.read_byte()?;
-    let _members = read_decl_list(reader, &mut inner_tag)?;
+    let _members = read_decl_list(reader, &mut inner_tag, false)?;
     Ok(())
 }
 

@@ -39,6 +39,7 @@ impl IdentifierCasingRule {
                 category: RuleCategory::NamingConvention,
                 default_severity: Severity::Hint,
                 description: "Enforces that every usage of an identifier matches the exact casing of its declaration.",
+                enabled_by_default: true,
             },
         }
     }

@@ -97,6 +97,7 @@ impl InheritedCallOrderRule {
                 default_severity: Severity::Hint,
                 description: "Checks that 'inherited' is the first statement in constructors \
                      and the last statement in destructors.",
+                enabled_by_default: true,
             },
         }
     }
@@ -327,6 +328,7 @@ impl InheritedCallMissingRule {
                 category: RuleCategory::DangerousPattern,
                 default_severity: Severity::Hint,
                 description: "Checks that constructors and destructors call 'inherited'.",
+                enabled_by_default: true,
             },
         }
     }

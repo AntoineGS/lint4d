@@ -25,6 +25,7 @@ impl UseAfterFreeRule {
                 category: RuleCategory::ResourceManagement,
                 default_severity: Severity::Error,
                 description: "Detects variables used after being freed.",
+                enabled_by_default: true,
             },
         }
     }

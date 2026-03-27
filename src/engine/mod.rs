@@ -174,6 +174,11 @@ pub fn run_lint_with_context(
     for rule in registry.all_rules() {
         let meta = rule.meta();
 
+        // Skip rules that are off by default and not explicitly enabled in config.
+        if !meta.enabled_by_default && config.rule_severity(meta.id).is_none() {
+            continue;
+        }
+
         // Skip rules that are explicitly turned off.
         if let Some(RuleSeverityOverride::Off) = config.rule_severity(meta.id) {
             continue;

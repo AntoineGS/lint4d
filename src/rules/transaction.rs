@@ -743,6 +743,7 @@ impl TransactionRule {
                 category: RuleCategory::ResourceManagement,
                 default_severity: Severity::Error,
                 description: "Detects incorrect transaction management patterns.",
+                enabled_by_default: true,
             },
         }
     }

@@ -26,6 +26,7 @@ impl TypePrefixRule {
                 category: RuleCategory::NamingConvention,
                 default_severity: Severity::Hint,
                 description: "Enforces 'T' prefix on type declarations.",
+                enabled_by_default: true,
             },
         }
     }
@@ -120,6 +121,7 @@ impl InterfacePrefixRule {
                 category: RuleCategory::NamingConvention,
                 default_severity: Severity::Hint,
                 description: "Enforces 'I' prefix on interface declarations.",
+                enabled_by_default: true,
             },
         }
     }
@@ -210,6 +212,7 @@ impl ConstantNamingRule {
                 category: RuleCategory::NamingConvention,
                 default_severity: Severity::Hint,
                 description: "Enforces UPPER_CASE naming for untyped constants.",
+                enabled_by_default: true,
             },
         }
     }
@@ -399,6 +402,7 @@ impl LocalVariableNamingRule {
                 category: RuleCategory::NamingConvention,
                 default_severity: Severity::Hint,
                 description: "Enforces camelCase or PascalCase naming for local variables.",
+                enabled_by_default: true,
             },
         }
     }

@@ -29,6 +29,7 @@ pub struct RuleMeta {
     pub category: RuleCategory,
     pub default_severity: Severity,
     pub description: &'static str,
+    pub enabled_by_default: bool,
 }
 
 pub struct LintContext {

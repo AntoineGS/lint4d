@@ -415,6 +415,7 @@ impl FieldNotFreedRule {
                 default_severity: Severity::Warning,
                 description: "Detects object fields assigned via constructor calls that are never \
                      freed in the destructor.",
+                enabled_by_default: true,
             },
         }
     }
@@ -537,6 +538,7 @@ impl FieldReassignLeakRule {
                 default_severity: Severity::Warning,
                 description: "Detects object fields reassigned with a constructor call without \
                      freeing the old value first.",
+                enabled_by_default: true,
             },
         }
     }

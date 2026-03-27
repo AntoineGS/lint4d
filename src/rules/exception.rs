@@ -28,6 +28,7 @@ impl BareExceptRule {
                 category: RuleCategory::ExceptionHandling,
                 default_severity: Severity::Warning,
                 description: "Detects except blocks without a specific exception type.",
+                enabled_by_default: true,
             },
         }
     }
@@ -192,6 +193,7 @@ impl EmptyExceptRule {
                 category: RuleCategory::ExceptionHandling,
                 default_severity: Severity::Warning,
                 description: "Detects empty except blocks that silently swallow exceptions.",
+                enabled_by_default: true,
             },
         }
     }
@@ -294,6 +296,7 @@ impl RaiseInDestructorRule {
                 default_severity: Severity::Warning,
                 description: "Detects unguarded 'raise' statements inside destructors \
                               that can escape and cause memory leaks or broken teardown.",
+                enabled_by_default: true,
             },
         }
     }

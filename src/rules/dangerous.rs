@@ -26,6 +26,7 @@ impl WithStatementRule {
                 category: RuleCategory::DangerousPattern,
                 default_severity: Severity::Warning,
                 description: "Detects use of 'with' statements which can cause subtle bugs.",
+                enabled_by_default: true,
             },
         }
     }

@@ -43,6 +43,7 @@ impl ResourceLeakUnprotectedRule {
                 category: RuleCategory::ResourceManagement,
                 default_severity: Severity::Error,
                 description: "Detects resources created without try..finally protection.",
+                enabled_by_default: true,
             },
         }
     }
@@ -207,6 +208,7 @@ impl ResourceLeakNoTryRule {
                 category: RuleCategory::ResourceManagement,
                 default_severity: Severity::Warning,
                 description: "Detects resources created without any try..finally block.",
+                enabled_by_default: true,
             },
         }
     }

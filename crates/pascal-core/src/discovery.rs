@@ -1,4 +1,4 @@
-use crate::engine::{FileInfo, FileType};
+use crate::types::{FileInfo, FileType};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::path::PathBuf;
 use walkdir::WalkDir;

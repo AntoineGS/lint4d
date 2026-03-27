@@ -102,7 +102,7 @@ fn extract_rule_id(rest: &str) -> Option<String> {
 ///
 /// Delphi strings are delimited by single-quotes (`'`). A doubled quote (`''`)
 /// inside a string is an escaped quote, NOT the end of the string.
-fn find_line_comment(line: &str) -> Option<usize> {
+pub fn find_line_comment(line: &str) -> Option<usize> {
     let mut in_string = false;
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;

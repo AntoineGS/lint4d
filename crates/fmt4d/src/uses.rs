@@ -84,16 +84,57 @@ fn legacy_namespace(name: &str) -> Option<&'static str> {
     }
 }
 
-pub fn group_units(units: &[String], config: &UsesConfig) -> Vec<Vec<String>> {
-    let mut sorted = units.to_vec();
-    if config.sort {
-        sorted.sort_by_key(|a: &String| a.to_lowercase());
+pub fn group_units(
+    units: &[String],
+    config: &UsesConfig,
+    external_units: &HashSet<String>,
+) -> Vec<Vec<String>> {
+    if !config.group {
+        let mut sorted = units.to_vec();
+        if config.sort {
+            sorted.sort_by_key(|a: &String| a.to_lowercase());
+        }
+        return vec![sorted];
     }
-    vec![sorted]
+
+    let mut core: Vec<String> = Vec::new();
+    let mut external: Vec<String> = Vec::new();
+    let mut project: Vec<String> = Vec::new();
+
+    for unit in units {
+        match classify_unit(unit, config, external_units) {
+            UnitSection::Core => core.push(unit.clone()),
+            UnitSection::External => external.push(unit.clone()),
+            UnitSection::Project => project.push(unit.clone()),
+        }
+    }
+
+    if config.sort {
+        core.sort_by_key(|a: &String| a.to_lowercase());
+        external.sort_by_key(|a: &String| a.to_lowercase());
+        project.sort_by_key(|a: &String| a.to_lowercase());
+    }
+
+    let mut result: Vec<Vec<String>> = Vec::new();
+    if !core.is_empty() {
+        result.push(core);
+    }
+    if !external.is_empty() {
+        result.push(external);
+    }
+    if !project.is_empty() {
+        result.push(project);
+    }
+    result
 }
 
-pub fn format_uses(units: &[String], config: &UsesConfig, indent: &str) -> String {
-    let groups = group_units(units, config);
+pub fn format_uses(
+    units: &[String],
+    config: &UsesConfig,
+    indent: &str,
+    external_units: &HashSet<String>,
+) -> String {
+    let groups = group_units(units, config, external_units);
     let mut output = String::new();
 
     for (group_idx, group) in groups.iter().enumerate() {
@@ -319,5 +360,68 @@ mod tests {
             classify_unit("System.SysUtils", &config, &external_units),
             UnitSection::Core
         );
+    }
+
+    #[test]
+    fn group_units_three_sections() {
+        let mut config = default_config();
+        config.external_prefixes = vec!["Spring".to_string()];
+        let units = vec![
+            "MyApp.MainForm".to_string(),
+            "System.SysUtils".to_string(),
+            "Spring.Container".to_string(),
+            "System.Classes".to_string(),
+            "MyApp.Utils".to_string(),
+            "Spring.Collections".to_string(),
+            "Vcl.Forms".to_string(),
+        ];
+        let groups = group_units(&units, &config, &HashSet::new());
+        assert_eq!(groups.len(), 3);
+        // Core: alphabetical
+        assert_eq!(
+            groups[0],
+            vec!["System.Classes", "System.SysUtils", "Vcl.Forms"]
+        );
+        // External: alphabetical
+        assert_eq!(groups[1], vec!["Spring.Collections", "Spring.Container"]);
+        // Project: alphabetical
+        assert_eq!(groups[2], vec!["MyApp.MainForm", "MyApp.Utils"]);
+    }
+
+    #[test]
+    fn group_units_skips_empty_sections() {
+        let config = default_config();
+        let units = vec!["System.SysUtils".to_string(), "MyApp.MainForm".to_string()];
+        let groups = group_units(&units, &config, &HashSet::new());
+        // No external configured, so only 2 sections
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec!["System.SysUtils"]);
+        assert_eq!(groups[1], vec!["MyApp.MainForm"]);
+    }
+
+    #[test]
+    fn group_units_no_grouping() {
+        let mut config = default_config();
+        config.group = false;
+        let units = vec!["B".to_string(), "A".to_string()];
+        let groups = group_units(&units, &config, &HashSet::new());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], vec!["A", "B"]);
+    }
+
+    #[test]
+    fn format_uses_three_sections() {
+        let mut config = default_config();
+        config.external_prefixes = vec!["Spring".to_string()];
+        let units = vec![
+            "Vcl.Forms".to_string(),
+            "System.SysUtils".to_string(),
+            "Spring.Container".to_string(),
+            "MyApp.Utils".to_string(),
+        ];
+        let output = format_uses(&units, &config, "  ", &HashSet::new());
+        let expected =
+            "  System.SysUtils,\n  Vcl.Forms,\n\n  Spring.Container,\n\n  MyApp.Utils;\n";
+        assert_eq!(output, expected);
     }
 }

@@ -271,6 +271,241 @@ end.
     assert_idempotent_with_max(src, 80);
 }
 
+// ── If Condition Breaking (before and/or) ───────────────────────
+
+#[test]
+fn long_if_breaks_before_and() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (SomeCondition = True) and (AnotherCondition > 10) and (YetAnother <> '') and (FourthCheck = 1) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+    let and_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("and "))
+        .collect();
+    assert!(
+        !and_lines.is_empty(),
+        "`and` should lead continuation lines:\n{}",
+        result
+    );
+}
+
+#[test]
+fn long_if_breaks_before_or() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (SomeCondition = True) or (AnotherCondition > 10) or (YetAnother <> '') or (FourthCheck = 1) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+    let or_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("or "))
+        .collect();
+    assert!(
+        !or_lines.is_empty(),
+        "`or` should lead continuation lines:\n{}",
+        result
+    );
+}
+
+#[test]
+fn mixed_and_or_breaks_correctly() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (SomeCondition = True) and (AnotherCondition > 10) or (YetAnother <> '') and (FourthCheck = 1) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn nested_paren_groups_stay_atomic() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if ((A = 1) and (B = 2)) or ((C = 3) and (D = 4)) or ((E = 5) and (F = 6)) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 70);
+    assert_no_long_lines(&result, 70);
+    assert_idempotent_with_max(src, 70);
+}
+
+#[test]
+fn deeply_nested_conditions() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (((A = 1) and (B = 2)) or (C = 3)) and (D = 4) and (E = 5) or (F = 6) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 70);
+    assert_no_long_lines(&result, 70);
+    assert_idempotent_with_max(src, 70);
+}
+
+#[test]
+fn function_calls_inside_conditions() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (GetValue(Param1, Param2, Param3) > 0) and (Foo(Bar, Baz) = True) and (Check(X) <> 0) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn bare_and_or_without_parens() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if LongConditionA and LongConditionB and LongConditionC and LongConditionD and LongConditionE then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 70);
+    assert_no_long_lines(&result, 70);
+    assert_idempotent_with_max(src, 70);
+}
+
+#[test]
+fn short_if_no_break() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (A = 1) and (B = 2) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source(src);
+    let if_line = result
+        .lines()
+        .find(|l| l.trim_start().starts_with("if "))
+        .unwrap();
+    assert!(
+        if_line.contains("then"),
+        "short if should stay on one line with then:\n{}",
+        result
+    );
+}
+
+#[test]
+fn if_condition_join_then_reflow() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (A = 1)
+    and (B = 2)
+    and (C = 3) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    let if_line = result
+        .lines()
+        .find(|l| l.trim_start().starts_with("if "))
+        .unwrap();
+    assert!(
+        if_line.contains("(C = 3) then"),
+        "condition should be joined at width 120:\n{}",
+        result
+    );
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn else_if_chain_breaks_correctly() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (A = 1) and (B = 2) and (C = 3) and (D = 4) then
+    DoFirst
+  else if (E = 5) or (F = 6) or (G = 7) or (H = 8) then
+    DoSecond;
+end;
+end.
+";
+    let result = format_source_with_max(src, 60);
+    assert_no_long_lines(&result, 60);
+    assert_idempotent_with_max(src, 60);
+}
+
+#[test]
+fn if_condition_idempotent() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (SomeCondition = True) and (AnotherCondition > 10) and (YetAnother <> '') and (FourthCheck = 1) then
+    DoSomething;
+end;
+end.
+";
+    assert_idempotent_with_max(src, 80);
+}
+
 // ── Column Tracking Validation ──────────────────────────────────
 
 #[test]

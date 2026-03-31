@@ -827,6 +827,20 @@ impl<'a> Printer<'a> {
 
     fn print_if(&mut self, node: Node) {
         self.emit_leading_comments(node);
+
+        // Measure the entire if node. If it overflows, delegate to the
+        // breaking path which splits the condition at and/or operators.
+        let (width, _, _) = self.measure_node(
+            node,
+            &self.last_token_kind.clone(),
+            &self.last_token_parent_kind.clone(),
+        );
+        if self.current_column + width > self.max_line_length {
+            self.print_if_breaking(node);
+            return;
+        }
+
+        // ── Short path: everything fits on one line ─────────────
         let children: Vec<Node> = node
             .children(&mut node.walk())
             .filter(|c| !c.is_extra())
@@ -949,7 +963,7 @@ impl<'a> Printer<'a> {
 
     // ── Output helpers ───────────────────────────────────────────
 
-    fn emit_indented(&mut self, text: &str) {
+    pub(crate) fn emit_indented(&mut self, text: &str) {
         if self.at_line_start {
             let indent_str = self.indent.current();
             self.current_column = indent_str.len() + text.len();
@@ -966,7 +980,7 @@ impl<'a> Printer<'a> {
         self.output.push_str(text);
     }
 
-    fn ensure_newline(&mut self) {
+    pub(crate) fn ensure_newline(&mut self) {
         if !self.at_line_start {
             self.output.push('\n');
             self.at_line_start = true;

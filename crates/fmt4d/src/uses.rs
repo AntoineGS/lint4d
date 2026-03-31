@@ -26,7 +26,17 @@ const CORE_PREFIXES: &[&str] = &[
     "Macapi",
     "iOSapi",
     "Androidapi",
+    "Bde",
+    "Box2D",
+    "EMS",
+    "EMSHosting",
     "Generics",
+    "Linuxapi",
+    "MetropolisUI",
+    "RSConfig",
+    "RSConsole",
+    "RSSetUp",
+    "ToolsAPI",
 ];
 
 fn is_core_prefix(prefix: &str) -> bool {

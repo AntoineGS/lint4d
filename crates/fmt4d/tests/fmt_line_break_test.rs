@@ -57,6 +57,51 @@ fn assert_idempotent_with_max(source: &str, max_line_length: usize) {
     );
 }
 
+// ── Measurement Validation ───────────────────────────────────────
+
+#[test]
+fn short_procedure_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+  procedure Foo(A: Integer; B: string);
+implementation
+end.
+";
+    let result = format_source(src);
+    let proc_line = result.lines().find(|l| l.contains("procedure Foo"));
+    assert!(proc_line.is_some(), "procedure not found:\n{}", result);
+    let line = proc_line.unwrap();
+    assert!(
+        line.contains("(A: Integer; B: string)"),
+        "params should be on one line:\n{}",
+        line
+    );
+}
+
+#[test]
+fn short_if_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (A = 1) and (B = 2) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source(src);
+    let if_line = result.lines().find(|l| l.trim_start().starts_with("if "));
+    assert!(if_line.is_some(), "if not found:\n{}", result);
+    assert!(
+        if_line.unwrap().contains("and"),
+        "short if should stay on one line:\n{}",
+        if_line.unwrap()
+    );
+}
+
 // ── Column Tracking Validation ──────────────────────────────────
 
 #[test]

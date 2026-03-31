@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +76,8 @@ pub struct FmtConfig {
     pub end_of_line: EndOfLine,
     pub blank_lines: BlankLineConfig,
     pub uses: UsesConfig,
+    #[serde(skip)]
+    pub project_root: Option<PathBuf>,
 }
 
 impl Default for FmtConfig {
@@ -88,6 +90,7 @@ impl Default for FmtConfig {
             end_of_line: EndOfLine::Crlf,
             blank_lines: BlankLineConfig::default(),
             uses: UsesConfig::default(),
+            project_root: None,
         }
     }
 }
@@ -106,8 +109,15 @@ impl FmtConfig {
 
     pub fn discover(start_dir: &Path) -> FmtConfig {
         match pascal_core::config_discovery::find_config_file(start_dir, ".fmt4d.toml") {
-            Some((content, _dir)) => Self::from_toml(&content).unwrap_or_default(),
-            None => FmtConfig::default(),
+            Some((content, dir)) => {
+                let mut config = Self::from_toml(&content).unwrap_or_default();
+                config.project_root = Some(dir);
+                config
+            }
+            None => FmtConfig {
+                project_root: Some(start_dir.to_path_buf()),
+                ..FmtConfig::default()
+            },
         }
     }
 
@@ -190,5 +200,12 @@ external_prefixes = ["Spring", "Neon"]
     fn empty_toml_uses_defaults() {
         let config = FmtConfig::from_toml("").unwrap();
         assert_eq!(config.indent_size, 2);
+    }
+
+    #[test]
+    fn discover_stores_project_root() {
+        // FmtConfig::default() should have project_root as None
+        let config = FmtConfig::default();
+        assert!(config.project_root.is_none());
     }
 }

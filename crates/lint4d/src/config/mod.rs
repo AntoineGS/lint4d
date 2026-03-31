@@ -72,7 +72,7 @@ impl FromStr for Config {
             .as_ref()
             .and_then(|r| r.naming.as_ref())
             .and_then(|n| n.local_variable_style.clone())
-            .unwrap_or_else(|| "camelCase".to_string());
+            .unwrap_or_else(|| "PascalCase".to_string());
 
         if !VALID_LOCAL_VARIABLE_STYLES.contains(&local_variable_style.as_str()) {
             return Err(format!(
@@ -153,7 +153,7 @@ impl Config {
                 bds_path: None,
                 rule_overrides: HashMap::new(),
                 constant_style: "UPPER_CASE".to_string(),
-                local_variable_style: "camelCase".to_string(),
+                local_variable_style: "PascalCase".to_string(),
             },
             start_dir.to_path_buf(),
         ))

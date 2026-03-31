@@ -87,7 +87,7 @@ local_variable_style = "PascalCase"
 #[test]
 fn config_defaults_local_variable_style_to_camel_case() {
     let config = "version = 1".parse::<Config>().unwrap();
-    assert_eq!(config.local_variable_style(), "camelCase");
+    assert_eq!(config.local_variable_style(), "PascalCase");
 }
 
 #[test]

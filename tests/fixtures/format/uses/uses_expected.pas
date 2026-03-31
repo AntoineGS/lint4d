@@ -3,15 +3,12 @@ unit UsesTest;
 interface
 
 uses
+  DB,
+  Forms,
+  MyUnit,
   System.Classes,
   System.SysUtils,
-
-  Forms,
-  Vcl.Controls,
-
-  DB,
-
-  MyUnit;
+  Vcl.Controls;
 
 implementation
 

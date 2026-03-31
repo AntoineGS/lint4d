@@ -118,16 +118,17 @@ fn uses_roundtrip_safe() {
 fn uses_groups_system_units() {
     let result = format_source(&"unit T;\ninterface\nuses\n  Forms, System.SysUtils, System.Classes;\nimplementation\nend.\n");
     let lines: Vec<&str> = result.lines().collect();
-    // System units should appear before Vcl units
+    // All units are present (grouping will be reintroduced in a later task)
     let sys_classes_pos = lines.iter().position(|l| l.contains("System.Classes"));
     let forms_pos = lines.iter().position(|l| l.contains("Forms"));
     assert!(
         sys_classes_pos.is_some() && forms_pos.is_some(),
         "both units should be present"
     );
+    // Units are sorted alphabetically within the single group
     assert!(
-        sys_classes_pos.unwrap() < forms_pos.unwrap(),
-        "System units should appear before Vcl units"
+        forms_pos.unwrap() < sys_classes_pos.unwrap(),
+        "units should be sorted alphabetically (Forms before System.Classes)"
     );
 }
 

@@ -1,6 +1,7 @@
 use crate::config::UsesConfig;
-use std::collections::HashMap;
 
+// Used by classify_unit (Task 3) for non-dotted legacy unit classification.
+#[allow(dead_code)]
 fn legacy_namespace(name: &str) -> Option<&'static str> {
     match name {
         "SysUtils" | "Classes" | "Types" | "Variants" | "SysConst" | "Math" | "StrUtils"
@@ -20,69 +21,12 @@ fn legacy_namespace(name: &str) -> Option<&'static str> {
     }
 }
 
-fn unit_group<'a>(unit_name: &str, config: &'a UsesConfig) -> Option<&'a str> {
-    if let Some(dot_pos) = unit_name.find('.') {
-        let prefix = &unit_name[..dot_pos];
-        for group in &config.group_order {
-            if prefix.eq_ignore_ascii_case(group) {
-                return Some(group);
-            }
-        }
-        return None;
-    }
-    if let Some(namespace) = legacy_namespace(unit_name) {
-        for group in &config.group_order {
-            if namespace.eq_ignore_ascii_case(group) {
-                return Some(group);
-            }
-        }
-    }
-    None
-}
-
 pub fn group_units(units: &[String], config: &UsesConfig) -> Vec<Vec<String>> {
-    if !config.group {
-        let mut sorted = units.to_vec();
-        if config.sort {
-            sorted.sort_by_key(|a: &String| a.to_lowercase());
-        }
-        return vec![sorted];
-    }
-
-    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-    let mut other: Vec<String> = Vec::new();
-
-    for unit in units {
-        match unit_group(unit, config) {
-            Some(group) => {
-                groups
-                    .entry(group.to_string())
-                    .or_default()
-                    .push(unit.clone());
-            }
-            None => other.push(unit.clone()),
-        }
-    }
-
+    let mut sorted = units.to_vec();
     if config.sort {
-        for group in groups.values_mut() {
-            group.sort_by_key(|a: &String| a.to_lowercase());
-        }
-        other.sort_by_key(|a: &String| a.to_lowercase());
+        sorted.sort_by_key(|a: &String| a.to_lowercase());
     }
-
-    let mut result: Vec<Vec<String>> = Vec::new();
-    for group_name in &config.group_order {
-        if let Some(units) = groups.remove(group_name) {
-            if !units.is_empty() {
-                result.push(units);
-            }
-        }
-    }
-    if !other.is_empty() {
-        result.push(other);
-    }
-    result
+    vec![sorted]
 }
 
 pub fn format_uses(units: &[String], config: &UsesConfig, indent: &str) -> String {
@@ -119,65 +63,4 @@ pub fn extract_uses_units(node: tree_sitter::Node, source: &[u8]) -> Vec<String>
         }
     }
     units
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn group_units_by_namespace() {
-        let config = UsesConfig::default();
-        let units = vec![
-            "MyUnit".to_string(),
-            "System.SysUtils".to_string(),
-            "Vcl.Forms".to_string(),
-            "System.Classes".to_string(),
-            "Data.DB".to_string(),
-        ];
-        let groups = group_units(&units, &config);
-        assert_eq!(groups.len(), 4);
-        assert_eq!(groups[0], vec!["System.Classes", "System.SysUtils"]);
-        assert_eq!(groups[1], vec!["Vcl.Forms"]);
-        assert_eq!(groups[2], vec!["Data.DB"]);
-        assert_eq!(groups[3], vec!["MyUnit"]);
-    }
-
-    #[test]
-    fn legacy_units_mapped_to_groups() {
-        let config = UsesConfig::default();
-        let units = vec![
-            "SysUtils".to_string(),
-            "Classes".to_string(),
-            "Forms".to_string(),
-            "DB".to_string(),
-        ];
-        let groups = group_units(&units, &config);
-        assert_eq!(groups[0], vec!["Classes", "SysUtils"]);
-        assert_eq!(groups[1], vec!["Forms"]);
-        assert_eq!(groups[2], vec!["DB"]);
-    }
-
-    #[test]
-    fn format_uses_clause() {
-        let config = UsesConfig::default();
-        let units = vec![
-            "Vcl.Forms".to_string(),
-            "System.SysUtils".to_string(),
-            "System.Classes".to_string(),
-        ];
-        let output = format_uses(&units, &config, "  ");
-        let expected = "  System.Classes,\n  System.SysUtils,\n\n  Vcl.Forms;\n";
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn no_grouping_when_disabled() {
-        let mut config = UsesConfig::default();
-        config.group = false;
-        let units = vec!["B".to_string(), "A".to_string()];
-        let groups = group_units(&units, &config);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0], vec!["A", "B"]);
-    }
 }

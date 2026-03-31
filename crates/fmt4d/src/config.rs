@@ -51,7 +51,8 @@ impl Default for BlankLineConfig {
 pub struct UsesConfig {
     pub sort: bool,
     pub group: bool,
-    pub group_order: Vec<String>,
+    pub external_paths: Vec<String>,
+    pub external_prefixes: Vec<String>,
 }
 
 impl Default for UsesConfig {
@@ -59,13 +60,8 @@ impl Default for UsesConfig {
         UsesConfig {
             sort: true,
             group: true,
-            group_order: vec![
-                "System".to_string(),
-                "Vcl".to_string(),
-                "Fmx".to_string(),
-                "Data".to_string(),
-                "Winapi".to_string(),
-            ],
+            external_paths: Vec::new(),
+            external_prefixes: Vec::new(),
         }
     }
 }
@@ -144,6 +140,8 @@ mod tests {
         assert_eq!(config.blank_lines.between_procedures, 1);
         assert!(config.uses.sort);
         assert!(config.uses.group);
+        assert!(config.uses.external_paths.is_empty());
+        assert!(config.uses.external_prefixes.is_empty());
     }
 
     #[test]
@@ -162,6 +160,23 @@ sort = false
         assert!(!config.uses.sort);
         assert_eq!(config.indent_style, IndentStyle::Space);
         assert!(config.uses.group);
+    }
+
+    #[test]
+    fn parse_toml_external_config() {
+        let toml = r#"
+[format.uses]
+sort = true
+group = true
+external_paths = ["vendor", "lib/third-party"]
+external_prefixes = ["Spring", "Neon"]
+"#;
+        let config = FmtConfig::from_toml(toml).unwrap();
+        assert_eq!(
+            config.uses.external_paths,
+            vec!["vendor", "lib/third-party"]
+        );
+        assert_eq!(config.uses.external_prefixes, vec!["Spring", "Neon"]);
     }
 
     #[test]

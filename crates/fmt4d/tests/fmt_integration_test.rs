@@ -183,6 +183,75 @@ fn comments_preserves_leading_comment() {
     );
 }
 
+// ── External config integration tests ────────────────────────────
+
+#[test]
+fn uses_groups_with_external_prefixes() {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.external_prefixes = vec!["Spring".to_string()];
+
+    let source = "unit T;\ninterface\nuses\n  MyUnit, Spring.Container, System.SysUtils, Spring.Collections;\nimplementation\nend.\n";
+    let result = fmt4d::formatter::format_source(source.as_bytes(), &info, &config).unwrap();
+
+    // Core section
+    assert!(
+        result.contains("  System.SysUtils,\n"),
+        "Core unit should be present. Got:\n{}",
+        result
+    );
+    // External section (blank line before)
+    assert!(
+        result.contains("\n\n  Spring.Collections,\n  Spring.Container,\n"),
+        "External section should be present. Got:\n{}",
+        result
+    );
+    // Project section (blank line before)
+    assert!(
+        result.contains("\n\n  MyUnit;\n"),
+        "Project section should be present. Got:\n{}",
+        result
+    );
+}
+
+#[test]
+fn uses_groups_with_external_paths() {
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let vendor = dir.path().join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(vendor.join("SuperObject.pas"), "unit SuperObject;").unwrap();
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.external_paths = vec!["vendor".to_string()];
+    config.project_root = Some(dir.path().to_path_buf());
+
+    let source =
+        "unit T;\ninterface\nuses\n  MyUnit, SuperObject, System.SysUtils;\nimplementation\nend.\n";
+    let result = fmt4d::formatter::format_source(source.as_bytes(), &info, &config).unwrap();
+
+    // Core
+    assert!(
+        result.contains("  System.SysUtils,\n"),
+        "Core unit missing. Got:\n{}",
+        result
+    );
+    // External (blank line before)
+    assert!(
+        result.contains("\n\n  SuperObject,\n"),
+        "External unit missing. Got:\n{}",
+        result
+    );
+    // Project (blank line before)
+    assert!(
+        result.contains("\n\n  MyUnit;\n"),
+        "Project unit missing. Got:\n{}",
+        result
+    );
+}
+
 // ── Cross-cutting integration tests ──────────────────────────────
 
 #[test]

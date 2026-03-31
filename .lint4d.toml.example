@@ -1,0 +1,126 @@
+# Example configuration file for lint4d
+# Copy this file to .lint4d.toml and customize as needed
+
+# Configuration version (required)
+version = 1
+
+[lint4d]
+# Paths to lint (files or directories)
+# Default: ["."]
+paths = ["."]
+
+# Exclude patterns (glob patterns)
+# Default: ["**/test/**", "**/tests/**"]
+exclude = ["**/test/**", "**/tests/**"]
+
+# DCU (Delphi Compiled Unit) paths for type-aware analysis
+# Required for rules: field-not-freed, field-reassign-leak
+# Default: []
+# dcu_paths = ["build/dcu/Win64/Release", "lib/dcu"]
+
+# Target platform for DCU resolution
+# Possible values: "Win32", "Win64", "OSX32", "OSX64", "Linux64", "Android", "Android64", "iOSDevice64", etc.
+# Default: none (auto-detected from .dproj)
+# platform = "Win64"
+
+# Build configuration for DCU resolution
+# Possible values: "Debug", "Release", or custom configurations
+# Default: none (auto-detected from .dproj)
+# build_config = "Debug"
+
+# BDS (RAD Studio) installation path
+# Default: auto-detected from registry/environment
+# bds_path = "C:/Program Files (x86)/Embarcadero/Studio/23.0"
+
+[rules]
+# Override rule severity or disable rules entirely
+# Possible values: "error", "warning", "hint", or "off"
+# Below are all available rules with their default severities
+
+# --- Resource Management Rules ---
+# Detects resources created without try..finally protection
+# Default: "error"
+# resource-leak-unprotected = "error"
+
+# Detects resources not freed in finally block
+# Default: "warning"
+# resource-leak-no-try = "warning"
+
+# Detects class fields not freed in destructor [requires DCU]
+# Default: "warning"
+# field-not-freed = "warning"
+
+# Detects field reassignment without freeing prior value [requires DCU]
+# Default: "warning"
+# field-reassign-leak = "warning"
+
+# Detects potential use-after-free scenarios
+# Default: "error"
+# use-after-free = "error"
+
+# Ensures transaction management best practices
+# Default: "error"
+# transaction = "error"
+
+# --- Exception Handling Rules ---
+# Detects empty exception handlers
+# Default: "warning"
+# empty-except = "warning"
+
+# Detects bare except blocks without re-raising
+# Default: "warning"
+# bare-except = "warning"
+
+# Detects raise statements in destructors
+# Default: "warning"
+# raise-in-destructor = "warning"
+
+# --- Naming Convention Rules ---
+# Enforces T prefix for types
+# Default: "hint"
+# type-prefix = "hint"
+
+# Enforces I prefix for interfaces
+# Default: "hint"
+# interface-prefix = "hint"
+
+# Enforces constant naming conventions
+# Default: "hint"
+# constant-naming = "hint"
+
+# Enforces local variable naming conventions
+# Default: "hint"
+# local-variable-naming = "hint"
+
+# Enforces consistent identifier casing
+# Default: "hint"
+# identifier-casing = "hint"
+
+# --- Dangerous Pattern Rules ---
+# Warns against use of with statements
+# Default: "warning"
+# with-statement = "warning"
+
+# Ensures inherited calls are in correct order
+# Default: "hint"
+# inherited-order = "hint"
+
+# Detects missing inherited calls in overridden methods
+# Default: "hint"
+# inherited-missing = "hint"
+
+# --- Null Safety Rules ---
+# Detects unchecked nil dereferences (disabled by default, enable to use)
+# Default: "warning" (but disabled by default)
+# unchecked-nil = "warning"
+
+[rules.naming]
+# Constant naming style
+# Possible values: "UPPER_CASE", "PascalCase"
+# Default: "UPPER_CASE"
+constant_style = "UPPER_CASE"
+
+# Local variable naming style
+# Possible values: "camelCase", "PascalCase"
+# Default: "camelCase"
+local_variable_style = "camelCase"

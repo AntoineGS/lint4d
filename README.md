@@ -2,7 +2,11 @@
 
 A fast, configurable static analysis tool (linter) for Delphi (Object Pascal), powered by tree-sitter.
 
+This repository also includes **fmt4d**, an opinionated code formatter for Delphi/Object Pascal.
+
 ## Features
+
+### lint4d
 
 - 12 built-in rules covering resource management, exception handling, naming conventions, and dangerous patterns
 - DCU-aware analysis for type-level checks (field leaks, reassignment leaks)
@@ -15,6 +19,15 @@ A fast, configurable static analysis tool (linter) for Delphi (Object Pascal), p
 - Output in text or JSON format
 - Configurable severity thresholds and per-rule overrides
 
+### fmt4d
+
+- Consistent code formatting with configurable style options
+- Support for indentation, line length, and begin/end placement
+- Smart uses clause sorting and grouping
+- Blank line management between sections and procedures
+- `.dproj` project file support
+- Parallel file processing
+
 ## Installation
 
 ```sh
@@ -24,6 +37,8 @@ cargo install --path .
 Requires Rust 2021 edition or later.
 
 ## Quick Start
+
+### lint4d
 
 Lint a single file or directory:
 
@@ -62,7 +77,36 @@ Fail the process only on errors (ignore warnings and hints):
 lint4d --fail-on error src/
 ```
 
+### fmt4d
+
+Format a single file or directory:
+
+```sh
+fmt4d src/
+fmt4d MyUnit.pas
+```
+
+Format from a Delphi project file:
+
+```sh
+fmt4d --project MyApp.dproj
+```
+
+Check if files are formatted without modifying them:
+
+```sh
+fmt4d --check src/
+```
+
+Generate a default configuration file:
+
+```sh
+fmt4d --init
+```
+
 ## Configuration
+
+### lint4d
 
 Generate a default configuration file:
 
@@ -70,20 +114,53 @@ Generate a default configuration file:
 lint4d --init
 ```
 
-This creates `.lint4d.toml` in the current directory. Example configuration:
+This creates `.lint4d.toml` in the current directory with all available options documented. For a complete reference with all configuration options and their default values, see [.lint4d.toml.example](.lint4d.toml.example).
+
+Example configuration:
 
 ```toml
+version = 1
+
+[lint4d]
+paths = ["."]
+exclude = ["**/test/**", "**/tests/**"]
+dcu_paths = ["build/dcu/Win64/Release"]
+
 [rules]
 # Override severity for a rule, or disable it entirely
 bare-except = "error"
 type-prefix = "off"
 
-[dcu]
-paths = ["build/dcu/Win64/Release"]
+[rules.naming]
+constant_style = "UPPER_CASE"
+local_variable_style = "camelCase"
+```
 
-[output]
-format = "text"
-color = true
+### fmt4d
+
+Generate a default configuration file:
+
+```sh
+fmt4d --init
+```
+
+This creates `.fmt4d.toml` in the current directory with all available options documented. For a complete reference with all configuration options and their default values, see [.fmt4d.toml.example](.fmt4d.toml.example).
+
+Example configuration:
+
+```toml
+[format]
+indent_size = 4
+max_line_length = 100
+begin_style = "next_line"
+
+[format.blank_lines]
+between_procedures = 2
+
+[format.uses]
+sort = true
+group = true
+external_prefixes = ["Spring", "Neon"]
 ```
 
 ## Rules

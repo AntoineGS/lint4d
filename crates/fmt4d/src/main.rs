@@ -55,6 +55,10 @@ struct Cli {
     /// Enable colored output
     #[arg(long)]
     color: bool,
+
+    /// Create a default .fmt4d.toml in the current directory
+    #[arg(long)]
+    init: bool,
 }
 
 fn parse_end_of_line(s: &str) -> Result<EndOfLine, String> {
@@ -71,6 +75,10 @@ fn parse_end_of_line(s: &str) -> Result<EndOfLine, String> {
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.init {
+        process::exit(run_init());
+    }
 
     if cli.stdin {
         process::exit(run_stdin(&cli));
@@ -221,6 +229,77 @@ fn run_files(cli: &Cli) -> i32 {
         return EXIT_FORMAT_NEEDED;
     }
 
+    EXIT_OK
+}
+
+fn run_init() -> i32 {
+    let config_path = PathBuf::from(".fmt4d.toml");
+    if config_path.exists() {
+        eprintln!("fmt4d: .fmt4d.toml already exists");
+        return EXIT_ERROR;
+    }
+
+    let default_config = r#"# Configuration for fmt4d - Delphi/Object Pascal formatter
+
+[format]
+# Number of spaces or tabs per indentation level
+# Default: 2
+indent_size = 2
+
+# Indentation style
+# Possible values: "space", "tab"
+# Default: "space"
+indent_style = "space"
+
+# Maximum line length before wrapping
+# Default: 120
+max_line_length = 120
+
+# Style for begin keyword placement
+# Possible values: "next_line", "same_line"
+# Default: "next_line"
+begin_style = "next_line"
+
+# Line ending style
+# Possible values: "auto" (preserve original), "crlf" (Windows), "lf" (Unix/Mac)
+# Default: "auto"
+end_of_line = "auto"
+
+[format.blank_lines]
+# Number of blank lines between procedures/functions
+# Default: 1
+between_procedures = 1
+
+# Number of blank lines between sections (interface/implementation/etc)
+# Default: 1
+between_sections = 1
+
+# Maximum consecutive blank lines allowed
+# Default: 1
+max_consecutive = 1
+
+[format.uses]
+# Sort uses clause alphabetically
+# Default: true
+sort = true
+
+# Group uses clause by internal/external units
+# Default: true
+group = true
+
+# Paths that should be considered external (for grouping)
+# external_paths = ["vendor", "lib/third-party"]
+
+# Prefixes that should be considered external (for grouping)
+# external_prefixes = ["Spring", "Neon", "DevExpress"]
+"#;
+
+    if let Err(e) = fs::write(&config_path, default_config) {
+        eprintln!("fmt4d: failed to write .fmt4d.toml: {}", e);
+        return EXIT_ERROR;
+    }
+
+    println!("Created .fmt4d.toml");
     EXIT_OK
 }
 

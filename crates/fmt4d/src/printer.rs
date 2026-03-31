@@ -120,9 +120,39 @@ impl<'a> Printer<'a> {
                 self.print_leaf(node);
             }
             _ => {
+                if node.child_count() > 0 && Self::has_breakable_operators(node) {
+                    let (width, _, _) = self.measure_node(
+                        node,
+                        &self.last_token_kind.clone(),
+                        &self.last_token_parent_kind.clone(),
+                    );
+                    if self.current_column + width > self.max_line_length {
+                        self.print_expression_breaking(node);
+                        return;
+                    }
+                }
                 self.recurse_children(node);
             }
         }
+    }
+
+    /// Return `true` if `node` has any immediate leaf children that are
+    /// breakable binary operators (arithmetic, logical, or bitwise).
+    ///
+    /// Only leaf children are checked (child_count == 0) so that operators
+    /// buried inside sub-expressions (e.g. inside parentheses) are ignored —
+    /// those will be handled when their own sub-expression is visited.
+    fn has_breakable_operators(node: Node) -> bool {
+        for child in node.children(&mut node.walk()) {
+            if child.child_count() == 0 {
+                match child.kind() {
+                    "kAdd" | "kSub" | "kMul" | "kDiv" | "kMod" | "kAnd" | "kOr" | "kXor"
+                    | "kShl" | "kShr" => return true,
+                    _ => {}
+                }
+            }
+        }
+        false
     }
 
     // ── Recursion helper ─────────────────────────────────────────

@@ -1208,11 +1208,11 @@ end.
         "string concatenation line exceeds 120 chars and was not broken:\n{}",
         result
     );
-    // The continuation line should be indented deeper than the const name
-    let cont_line = result.lines().find(|l| l.trim_start().starts_with("',AVG"));
+    // The operator should lead the continuation line (break BEFORE operator).
+    let cont_line = result.lines().find(|l| l.trim_start().starts_with("+ '"));
     assert!(
         cont_line.is_some(),
-        "continuation of string concat should start on a new line:\n{}",
+        "continuation of string concat should start with `+` on a new line:\n{}",
         result
     );
 }

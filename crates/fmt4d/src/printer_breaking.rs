@@ -275,6 +275,92 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Emit an expression with line breaks before binary operators when the
+    /// expression would overflow `max_line_length`.
+    ///
+    /// Flattens the left-recursive `exprBinary` chain and emits each segment
+    /// on a new continuation-indented line when it would overflow. The operator
+    /// leads the continuation line (break BEFORE the operator).
+    ///
+    /// Unlike `emit_condition_with_breaks`, this applies to ALL binary operators
+    /// (arithmetic, logical, bitwise), not just `kAnd`/`kOr`.
+    pub(crate) fn print_expression_breaking(&mut self, node: Node) {
+        // Flatten the binary chain at any operator level.
+        let segments = if node.kind() == "exprBinary" {
+            flatten_binary_chain_any_op(node)
+        } else {
+            // Not a direct exprBinary — try to find one inside.
+            // Look for an exprBinary child.
+            let binary_child = node
+                .children(&mut node.walk())
+                .find(|c| c.kind() == "exprBinary");
+            if let Some(bin) = binary_child {
+                flatten_binary_chain_any_op(bin)
+            } else {
+                // No breakable chain found — just recurse normally.
+                self.recurse_children(node);
+                return;
+            }
+        };
+
+        // If flattening found no break points (single segment), just recurse.
+        if segments.len() <= 1 {
+            self.recurse_children(node);
+            return;
+        }
+
+        // Continuation indent = current indent + one indent_size.
+        let cont_indent = self.indent.current().len() + self.config.indent_size;
+        let cont_indent_str = " ".repeat(cont_indent);
+
+        // If node is not exprBinary itself, we need to emit the parts before and
+        // after the binary expression. But for the common case (assignment),
+        // the node passed in is the exprBinary directly (called from the catch-all).
+        // We just emit the segments with breaks.
+        for (idx, seg) in segments.iter().enumerate() {
+            if idx == 0 {
+                // First segment: emit normally.
+                for n in &seg.operand {
+                    self.print_node(*n);
+                }
+            } else {
+                // Subsequent segments: measure operator + operand width.
+                let op_node = seg.operator.unwrap();
+                let mut width = 0usize;
+                let mut cur_kind = self.last_token_kind.clone();
+                let mut cur_parent = self.last_token_parent_kind.clone();
+
+                // Measure the operator.
+                let (w, k, p) = self.measure_node(op_node, &cur_kind, &cur_parent);
+                width += w;
+                cur_kind = k;
+                cur_parent = p;
+
+                // Measure each operand node.
+                for n in &seg.operand {
+                    let (w, k, p) = self.measure_node(*n, &cur_kind, &cur_parent);
+                    width += w;
+                    cur_kind = k;
+                    cur_parent = p;
+                }
+
+                if self.current_column + width > self.max_line_length {
+                    // Break before the operator: newline + continuation indent.
+                    self.output.push('\n');
+                    self.output.push_str(&cont_indent_str);
+                    self.at_line_start = false;
+                    self.current_column = cont_indent;
+                }
+
+                // Emit operator + operand nodes.
+                self.print_node(op_node);
+                for n in &seg.operand {
+                    self.print_node(*n);
+                }
+            }
+        }
+    }
+
     /// Emit an `exprCall` function call with line breaks at `,` separators
     /// when the call would overflow `max_line_length`.
     ///
@@ -416,6 +502,57 @@ fn split_at_semicolons<'a>(nodes: &[Node<'a>]) -> Vec<Vec<Node<'a>>> {
     }
 
     groups
+}
+
+/// Flatten a left-recursive `exprBinary` chain into [`ConditionSegment`]s,
+/// breaking at ANY binary operator (arithmetic, logical, bitwise).
+///
+/// Like `flatten_binary_chain` but treats all operator kinds as break-points,
+/// not just `kAnd`/`kOr`. Used for assignment expression breaking.
+fn flatten_binary_chain_any_op<'a>(node: Node<'a>) -> Vec<ConditionSegment<'a>> {
+    let mut segments: Vec<ConditionSegment<'a>> = Vec::new();
+    flatten_binary_chain_any_op_inner(node, &mut segments);
+    segments
+}
+
+fn flatten_binary_chain_any_op_inner<'a>(node: Node<'a>, segments: &mut Vec<ConditionSegment<'a>>) {
+    debug_assert_eq!(node.kind(), "exprBinary");
+
+    let children: Vec<Node<'a>> = node
+        .children(&mut node.walk())
+        .filter(|c| !c.is_extra())
+        .collect();
+
+    // An exprBinary has 3 children: [left, operator, right].
+    if children.len() != 3 {
+        // Unexpected shape — treat entire node as one atomic segment.
+        segments.push(ConditionSegment {
+            operator: None,
+            operand: vec![node],
+        });
+        return;
+    }
+
+    let left = children[0];
+    let op = children[1];
+    let right = children[2];
+
+    // Recurse into the left child if it's another bare exprBinary
+    // (not wrapped in parens). We always recurse for any operator type.
+    if left.kind() == "exprBinary" {
+        flatten_binary_chain_any_op_inner(left, segments);
+    } else {
+        segments.push(ConditionSegment {
+            operator: None,
+            operand: vec![left],
+        });
+    }
+
+    // The operator + right operand form a new segment.
+    segments.push(ConditionSegment {
+        operator: Some(op),
+        operand: vec![right],
+    });
 }
 
 /// Flatten a left-recursive `exprBinary` chain into [`ConditionSegment`]s.

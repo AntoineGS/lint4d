@@ -506,6 +506,104 @@ end.
     assert_idempotent_with_max(src, 80);
 }
 
+// ── Assignment Expression Breaking (before operators) ───────────
+
+#[test]
+fn long_assignment_breaks_before_operator() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := VeryLongExpression + AnotherLongExpression + YetMoreStuffHere + FinalPartOfExpression;
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+    // Operator should lead continuation line
+    let cont_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("+ "))
+        .collect();
+    assert!(
+        !cont_lines.is_empty(),
+        "`+` should lead continuation lines:\n{}",
+        result
+    );
+}
+
+#[test]
+fn short_assignment_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := A + B + C;
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert!(
+        result.lines().any(|l| l.contains("A + B + C")),
+        "short assignment should stay on one line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn string_concat_breaks_before_plus() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Msg := 'First long part of the string ' + 'Second long part of the string ' + 'Third long part ' + 'Fourth part';
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn mixed_operators_in_expression() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := LongValue1 + LongValue2 - LongValue3 * LongValue4 div LongValue5 + LongValue6;
+end;
+end.
+";
+    let result = format_source_with_max(src, 70);
+    assert_no_long_lines(&result, 70);
+    assert_idempotent_with_max(src, 70);
+}
+
+#[test]
+fn expression_idempotent() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := VeryLongExpression + AnotherLongExpression + YetMoreStuffHere + FinalPartOfExpression;
+end;
+end.
+";
+    assert_idempotent_with_max(src, 80);
+}
+
 // ── Column Tracking Validation ──────────────────────────────────
 
 #[test]

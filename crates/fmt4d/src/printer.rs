@@ -10,24 +10,22 @@ use tree_sitter::Node;
 /// AST-walking printer that emits formatted Delphi source.
 pub struct Printer<'a> {
     source: &'a [u8],
-    config: &'a FmtConfig,
-    indent: IndentContext,
+    pub(crate) config: &'a FmtConfig,
+    pub(crate) indent: IndentContext,
     comments: &'a CommentMap,
     format_regions: Vec<FormatOffRegion>,
     external_units: HashSet<String>,
-    output: String,
+    pub(crate) output: String,
     /// True if we are at the start of a new line (need indent on next token).
-    at_line_start: bool,
+    pub(crate) at_line_start: bool,
     /// The kind of the last emitted leaf token.
-    last_token_kind: String,
+    pub(crate) last_token_kind: String,
     /// The parent kind of the last emitted leaf token.
-    last_token_parent_kind: String,
+    pub(crate) last_token_parent_kind: String,
     /// Current column position (number of chars since last newline).
-    current_column: usize,
+    pub(crate) current_column: usize,
     /// Maximum allowed line length (from config).
-    /// Stored for future use by line-breaking logic.
-    #[allow(dead_code)]
-    max_line_length: usize,
+    pub(crate) max_line_length: usize,
 }
 
 impl<'a> Printer<'a> {
@@ -94,6 +92,18 @@ impl<'a> Printer<'a> {
             // Emit literalChar / literalString as verbatim text (children don't
             // cover the full text, e.g. `#0` has child `#` but not `0`).
             "literalChar" | "literalString" => self.print_verbatim_leaf(node),
+            "declArgs" => {
+                let (width, _, _) = self.measure_node(
+                    node,
+                    &self.last_token_kind.clone(),
+                    &self.last_token_parent_kind.clone(),
+                );
+                if self.current_column + width > self.max_line_length {
+                    self.print_args_breaking(node);
+                } else {
+                    self.recurse_children(node);
+                }
+            }
             _ if node.child_count() == 0 && !node.is_extra() => {
                 self.print_leaf(node);
             }
@@ -105,7 +115,7 @@ impl<'a> Printer<'a> {
 
     // ── Recursion helper ─────────────────────────────────────────
 
-    fn recurse_children(&mut self, node: Node) {
+    pub(crate) fn recurse_children(&mut self, node: Node) {
         for child in node.children(&mut node.walk()) {
             if !child.is_extra() {
                 self.print_node(child);

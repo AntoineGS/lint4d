@@ -102,6 +102,98 @@ end.
     );
 }
 
+// ── Method Signature Breaking (declArgs at ;) ───────────────────
+
+#[test]
+fn long_param_list_breaks_at_semicolons() {
+    let src = "\
+unit T;
+interface
+  procedure DoSomething(const AParam1: string; const AParam2: Integer; const AParam3: Boolean; const AParam4: TObject; const AParam5: TList);
+implementation
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+    let lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.contains("const A") || l.contains("const "))
+        .collect();
+    assert!(
+        lines.len() > 1,
+        "long param list should be broken across lines:\n{}",
+        result
+    );
+}
+
+#[test]
+fn short_param_list_stays_on_one_line_at_80() {
+    let src = "\
+unit T;
+interface
+  procedure Foo(A: Integer; B: string);
+implementation
+end.
+";
+    let result = format_source_with_max(src, 80);
+    let proc_line = result.lines().find(|l| l.contains("procedure Foo"));
+    assert!(
+        proc_line.unwrap().contains("(A: Integer; B: string)"),
+        "short param list should stay on one line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn param_list_join_then_reflow() {
+    let src = "\
+unit T;
+interface
+  procedure DoSomething(
+    const A: string;
+    const B: Integer;
+    const C: Boolean);
+implementation
+end.
+";
+    let result = format_source_with_max(src, 120);
+    let proc_line = result.lines().find(|l| l.contains("procedure DoSomething"));
+    assert!(proc_line.is_some(), "procedure not found:\n{}", result);
+    assert!(
+        proc_line.unwrap().contains("const C: Boolean"),
+        "params should be joined onto one line at width 120:\n{}",
+        result
+    );
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn param_list_with_generics_breaks_correctly() {
+    let src = "\
+unit T;
+interface
+  procedure Foo(const A: TList<TPair<string, Integer>>; const B: TDictionary<string, TList<Integer>>; const C: TObject);
+implementation
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn param_list_idempotent() {
+    let src = "\
+unit T;
+interface
+  procedure DoSomething(const AParam1: string; const AParam2: Integer; const AParam3: Boolean; const AParam4: TObject; const AParam5: TList);
+implementation
+end.
+";
+    assert_idempotent_with_max(src, 80);
+}
+
 // ── Column Tracking Validation ──────────────────────────────────
 
 #[test]

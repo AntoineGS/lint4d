@@ -5,5 +5,6 @@ pub mod formatter;
 pub mod indent;
 pub mod line_break;
 pub mod printer;
+pub mod printer_breaking;
 pub mod spacing;
 pub mod uses;

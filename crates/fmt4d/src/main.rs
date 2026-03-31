@@ -66,6 +66,18 @@ fn main() {
         process::exit(EXIT_OK);
     }
 
+    // Auto-detect .dproj files passed as positional args
+    let mut cli = cli;
+    if cli.project.is_none() {
+        if let Some(pos) = cli.paths.iter().position(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map_or(false, |e| e.eq_ignore_ascii_case("dproj"))
+        }) {
+            cli.project = Some(cli.paths.remove(pos));
+        }
+    }
+
     process::exit(run_files(&cli));
 }
 
@@ -92,7 +104,7 @@ fn run_stdin(cli: &Cli) -> i32 {
 }
 
 fn run_files(cli: &Cli) -> i32 {
-    let files = match discover_files(&cli.paths, &[]) {
+    let mut files = match discover_files(&cli.paths, &[]) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error discovering files: {}", e);
@@ -100,21 +112,37 @@ fn run_files(cli: &Cli) -> i32 {
         }
     };
 
+    // If --project is specified, discover files from the .dproj
+    if let Some(ref dproj_path) = cli.project {
+        match pascal_core::discovery_dproj::parse_dproj(dproj_path) {
+            Ok(project_files) => {
+                files.extend(project_files);
+            }
+            Err(e) => {
+                eprintln!("Error parsing {}: {}", dproj_path.display(), e);
+                return EXIT_ERROR;
+            }
+        }
+    }
+
     if files.is_empty() {
         eprintln!("No Delphi source files found.");
         return EXIT_OK;
     }
 
-    // Discover config from the first path's directory
+    // Discover config from the project dir or first path's directory
     let config_dir = cli
-        .paths
-        .first()
-        .and_then(|p| {
-            if p.is_dir() {
-                Some(p.clone())
-            } else {
-                p.parent().map(|pp| pp.to_path_buf())
-            }
+        .project
+        .as_ref()
+        .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
+        .or_else(|| {
+            cli.paths.first().and_then(|p| {
+                if p.is_dir() {
+                    Some(p.clone())
+                } else {
+                    p.parent().map(|pp| pp.to_path_buf())
+                }
+            })
         })
         .unwrap_or_else(|| PathBuf::from("."));
 

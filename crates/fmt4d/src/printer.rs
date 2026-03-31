@@ -4,6 +4,7 @@ use crate::indent::IndentContext;
 use crate::spacing;
 use crate::uses;
 use pascal_core::FormatOffRegion;
+use std::collections::HashSet;
 use tree_sitter::Node;
 
 /// AST-walking printer that emits formatted Delphi source.
@@ -13,6 +14,7 @@ pub struct Printer<'a> {
     indent: IndentContext,
     comments: &'a CommentMap,
     format_regions: Vec<FormatOffRegion>,
+    external_units: HashSet<String>,
     output: String,
     /// True if we are at the start of a new line (need indent on next token).
     at_line_start: bool,
@@ -26,6 +28,7 @@ impl<'a> Printer<'a> {
         config: &'a FmtConfig,
         comments: &'a CommentMap,
         format_regions: Vec<FormatOffRegion>,
+        external_units: HashSet<String>,
     ) -> Self {
         Printer {
             source,
@@ -33,6 +36,7 @@ impl<'a> Printer<'a> {
             indent: IndentContext::new(config.indent_size, config.indent_style),
             comments,
             format_regions,
+            external_units,
             output: String::new(),
             at_line_start: true,
             last_token_kind: String::new(),
@@ -428,7 +432,8 @@ impl<'a> Printer<'a> {
         self.ensure_newline();
         self.indent.indent();
         let indent_str = self.indent.current();
-        let formatted = uses::format_uses(&units, &self.config.uses, &indent_str);
+        let formatted =
+            uses::format_uses(&units, &self.config.uses, &indent_str, &self.external_units);
         self.output.push_str(&formatted);
         self.at_line_start = true;
         self.last_token_kind = ";".to_string();

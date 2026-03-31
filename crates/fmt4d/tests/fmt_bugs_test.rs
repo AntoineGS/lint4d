@@ -1186,3 +1186,90 @@ end.
         result
     );
 }
+
+// ── Bug 17: Long string concatenation not broken ───────────────
+// A const string built via `+` that exceeds max_line_length should
+// be broken across multiple lines at the `+` operators.
+
+#[test]
+fn long_string_concat_broken_at_plus() {
+    let src = "\
+unit T;
+interface
+implementation
+const
+  Keywords = 'ACTION,ACTIVE,ADD,ADMIN,AFTER,ALL,ALTER,AND,ANY,AS,ASC,ASCENDING,AT,AUTO' + ',AVG,BASE_NAME,BASED,BASENAME,BEFORE,BEGIN,BETWEEN,BLOB,BLOBEDIT,BUFFER,BY,CACHE';
+end.
+";
+    let result = format_source(src);
+    let long_lines: Vec<&str> = result.lines().filter(|l| l.len() > 120).collect();
+    assert!(
+        long_lines.is_empty(),
+        "string concatenation line exceeds 120 chars and was not broken:\n{}",
+        result
+    );
+    // The continuation line should be indented deeper than the const name
+    let cont_line = result.lines().find(|l| l.trim_start().starts_with("',AVG"));
+    assert!(
+        cont_line.is_some(),
+        "continuation of string concat should start on a new line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn long_string_concat_idempotent() {
+    let src = "\
+unit T;
+interface
+implementation
+const
+  Keywords = 'ACTION,ACTIVE,ADD,ADMIN,AFTER,ALL,ALTER,AND,ANY,AS,ASC,ASCENDING,AT,AUTO' + ',AVG,BASE_NAME,BASED,BASENAME,BEFORE,BEGIN,BETWEEN,BLOB,BLOBEDIT,BUFFER,BY,CACHE';
+end.
+";
+    let first = format_source(src);
+    let second = format_source(&first);
+    assert_eq!(
+        first, second,
+        "string concatenation formatting is not idempotent.\nFirst:\n{}\nSecond:\n{}",
+        first, second
+    );
+}
+
+#[test]
+fn short_string_concat_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+implementation
+const
+  Greeting = 'Hello,' +
+    'World';
+end.
+";
+    let result = format_source(src);
+    // Short enough to fit on one line — should not be split
+    assert!(
+        result.contains("'Hello,' + 'World'"),
+        "short string concat should stay on one line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn string_with_plus_inside_not_broken() {
+    let src = "\
+unit T;
+interface
+implementation
+const
+  Msg = 'Use operator + for addition';
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("'Use operator + for addition'"),
+        "plus inside string literal was treated as break point:\n{}",
+        result
+    );
+}

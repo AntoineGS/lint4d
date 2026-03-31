@@ -44,8 +44,9 @@ pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Resu
 
 /// Post-processing pass: break lines that exceed `max_length`.
 ///
-/// For each long line, finds the best break point (after `;` or `,` inside
-/// parentheses) and splits the line, adding continuation indent.
+/// For each long line, finds the best break point (after `;`/`,` inside
+/// parentheses, or after `+` outside string literals) and splits the line,
+/// adding continuation indent.
 fn break_long_lines(source: &str, max_length: usize, indent_size: usize) -> String {
     let mut result = Vec::new();
     for line in source.lines() {
@@ -65,80 +66,35 @@ fn break_long_lines(source: &str, max_length: usize, indent_size: usize) -> Stri
     output
 }
 
-/// Break a single long line into multiple lines.
-fn break_single_line(line: &str, max_length: usize, indent_size: usize) -> Vec<String> {
-    let base_indent = line.len() - line.trim_start().len();
-    let continuation_indent = base_indent + indent_size;
-    let cont_prefix: String = " ".repeat(continuation_indent);
-
-    // Find break points: positions after `;` or `,` that are inside parens
-    let mut break_positions = Vec::new();
+/// Scan `bytes` for valid break positions — places where a long line can be
+/// split.  Returns byte offsets that point just past the break token and any
+/// trailing spaces (i.e. the start of the next segment).
+///
+/// Valid break tokens:
+/// - `;` or `,` inside parentheses
+/// - `+` outside string literals (string concatenation)
+fn scan_break_positions(bytes: &[u8]) -> Vec<usize> {
+    let mut positions = Vec::new();
     let mut paren_depth = 0i32;
-    let bytes = line.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'(' => paren_depth += 1,
-            b')' => paren_depth -= 1,
-            b';' | b',' if paren_depth > 0 => {
-                // Break after this char (+ any trailing space)
-                let mut end = i + 1;
-                while end < bytes.len() && bytes[end] == b' ' {
-                    end += 1;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            if in_string {
+                // '' is an escaped quote — stay in the string
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
                 }
-                break_positions.push(end);
-            }
-            _ => {}
-        }
-    }
-
-    if break_positions.is_empty() {
-        return vec![line.to_string()];
-    }
-
-    // Greedily split: take as much as fits within max_length
-    let mut lines = Vec::new();
-    let mut start = 0;
-    let mut is_first = true;
-    for &bp in &break_positions {
-        let prefix_len = if is_first { 0 } else { continuation_indent };
-        let candidate = if is_first {
-            &line[start..bp]
-        } else {
-            // Would be: cont_prefix + line[start..bp]
-            &line[start..bp]
-        };
-        let total_len = prefix_len + candidate.trim_start().len();
-        if total_len > max_length && start < bp && !is_first {
-            // Current segment already too long — emit what we have so far
-            // Actually, we need to emit up to previous break point
-        }
-        if is_first {
-            if line[start..bp].len() <= max_length {
-                // First segment fits
-                continue;
+                in_string = false;
             } else {
-                // Need to break here
-                lines.push(line[start..bp].trim_end().to_string());
-                start = bp;
-                is_first = false;
+                in_string = true;
             }
+            i += 1;
+            continue;
         }
-    }
-
-    // Simpler approach: break at the best position that keeps first part ≤ max_length
-    lines.clear();
-    let mut remaining = line.to_string();
-    loop {
-        if remaining.len() <= max_length {
-            lines.push(remaining);
-            break;
-        }
-
-        // Find break points in remaining
-        let mut best_bp: Option<usize> = None;
-        let mut paren_depth = 0i32;
-        let bytes = remaining.as_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
+        if !in_string {
             match b {
                 b'(' => paren_depth += 1,
                 b')' => paren_depth -= 1,
@@ -147,14 +103,47 @@ fn break_single_line(line: &str, max_length: usize, indent_size: usize) -> Vec<S
                     while end < bytes.len() && bytes[end] == b' ' {
                         end += 1;
                     }
-                    // Check if breaking here keeps the first part ≤ max_length
-                    if i < max_length {
-                        best_bp = Some(end);
+                    positions.push(end);
+                }
+                b'+' => {
+                    let mut end = i + 1;
+                    while end < bytes.len() && bytes[end] == b' ' {
+                        end += 1;
                     }
+                    positions.push(end);
                 }
                 _ => {}
             }
         }
+        i += 1;
+    }
+    positions
+}
+
+/// Break a single long line into multiple lines.
+fn break_single_line(line: &str, max_length: usize, indent_size: usize) -> Vec<String> {
+    let base_indent = line.len() - line.trim_start().len();
+    let continuation_indent = base_indent + indent_size;
+    let cont_prefix: String = " ".repeat(continuation_indent);
+
+    let break_positions = scan_break_positions(line.as_bytes());
+
+    if break_positions.is_empty() {
+        return vec![line.to_string()];
+    }
+
+    // Greedily split: keep taking as much as fits within max_length
+    let mut lines = Vec::new();
+    let mut remaining = line.to_string();
+    loop {
+        if remaining.len() <= max_length {
+            lines.push(remaining);
+            break;
+        }
+
+        // Find the rightmost break point that keeps the first part ≤ max_length
+        let positions = scan_break_positions(remaining.as_bytes());
+        let best_bp = positions.iter().copied().rev().find(|&bp| bp <= max_length);
 
         if let Some(bp) = best_bp {
             let first_part = remaining[..bp].trim_end().to_string();

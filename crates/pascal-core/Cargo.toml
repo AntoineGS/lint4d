@@ -16,5 +16,8 @@ quick-xml = "0.37"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints.rust]
 warnings = "deny"

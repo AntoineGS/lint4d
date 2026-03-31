@@ -641,6 +641,7 @@ dependencies = [
  "globset",
  "quick-xml",
  "serde",
+ "tempfile",
  "tree-sitter",
  "tree-sitter-language",
  "tree-sitter-pascal",

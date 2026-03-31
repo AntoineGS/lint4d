@@ -23,9 +23,38 @@ pub enum BeginStyle {
 #[serde(rename_all = "snake_case")]
 pub enum EndOfLine {
     #[default]
+    Auto,
     Crlf,
     Lf,
-    Auto,
+}
+
+impl EndOfLine {
+    /// Detect the dominant line ending in the source bytes.
+    /// Returns `Crlf` if any `\r\n` is found, otherwise `Lf`.
+    pub fn detect(source: &[u8]) -> EndOfLine {
+        if source.windows(2).any(|w| w == b"\r\n") {
+            EndOfLine::Crlf
+        } else {
+            EndOfLine::Lf
+        }
+    }
+
+    /// Resolve `Auto` into a concrete line ending by detecting from source.
+    pub fn resolve(self, source: &[u8]) -> EndOfLine {
+        match self {
+            EndOfLine::Auto => EndOfLine::detect(source),
+            other => other,
+        }
+    }
+
+    /// Convert all `\n` in the output to the target line ending.
+    /// Assumes the input only contains `\n` (no `\r\n`).
+    pub fn apply(self, output: &str) -> String {
+        match self {
+            EndOfLine::Crlf => output.replace('\n', "\r\n"),
+            EndOfLine::Lf | EndOfLine::Auto => output.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,7 +116,7 @@ impl Default for FmtConfig {
             indent_style: IndentStyle::Space,
             max_line_length: 120,
             begin_style: BeginStyle::NextLine,
-            end_of_line: EndOfLine::Crlf,
+            end_of_line: EndOfLine::Auto,
             blank_lines: BlankLineConfig::default(),
             uses: UsesConfig::default(),
             project_root: None,
@@ -125,12 +154,16 @@ impl FmtConfig {
         mut self,
         indent_size: Option<usize>,
         max_line_length: Option<usize>,
+        end_of_line: Option<EndOfLine>,
     ) -> Self {
         if let Some(size) = indent_size {
             self.indent_size = size;
         }
         if let Some(len) = max_line_length {
             self.max_line_length = len;
+        }
+        if let Some(eol) = end_of_line {
+            self.end_of_line = eol;
         }
         self
     }
@@ -147,11 +180,63 @@ mod tests {
         assert_eq!(config.indent_style, IndentStyle::Space);
         assert_eq!(config.max_line_length, 120);
         assert_eq!(config.begin_style, BeginStyle::NextLine);
+        assert_eq!(config.end_of_line, EndOfLine::Auto);
         assert_eq!(config.blank_lines.between_procedures, 1);
         assert!(config.uses.sort);
         assert!(config.uses.group);
         assert!(config.uses.external_paths.is_empty());
         assert!(config.uses.external_prefixes.is_empty());
+    }
+
+    #[test]
+    fn detect_crlf_in_source() {
+        assert_eq!(
+            EndOfLine::detect(b"unit Test;\r\ninterface\r\n"),
+            EndOfLine::Crlf
+        );
+    }
+
+    #[test]
+    fn detect_lf_in_source() {
+        assert_eq!(EndOfLine::detect(b"unit Test;\ninterface\n"), EndOfLine::Lf);
+    }
+
+    #[test]
+    fn detect_defaults_to_lf_for_empty() {
+        assert_eq!(EndOfLine::detect(b""), EndOfLine::Lf);
+    }
+
+    #[test]
+    fn resolve_auto_detects_from_source() {
+        assert_eq!(EndOfLine::Auto.resolve(b"foo\r\nbar\r\n"), EndOfLine::Crlf);
+        assert_eq!(EndOfLine::Auto.resolve(b"foo\nbar\n"), EndOfLine::Lf);
+    }
+
+    #[test]
+    fn resolve_explicit_ignores_source() {
+        assert_eq!(EndOfLine::Lf.resolve(b"foo\r\nbar\r\n"), EndOfLine::Lf);
+        assert_eq!(EndOfLine::Crlf.resolve(b"foo\nbar\n"), EndOfLine::Crlf);
+    }
+
+    #[test]
+    fn apply_lf_passes_through() {
+        assert_eq!(EndOfLine::Lf.apply("a\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn apply_crlf_converts() {
+        assert_eq!(EndOfLine::Crlf.apply("a\nb\n"), "a\r\nb\r\n");
+    }
+
+    #[test]
+    fn apply_auto_passes_through() {
+        assert_eq!(EndOfLine::Auto.apply("a\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn with_overrides_end_of_line() {
+        let config = FmtConfig::default().with_overrides(None, None, Some(EndOfLine::Lf));
+        assert_eq!(config.end_of_line, EndOfLine::Lf);
     }
 
     #[test]
@@ -191,7 +276,7 @@ external_prefixes = ["Spring", "Neon"]
 
     #[test]
     fn with_overrides() {
-        let config = FmtConfig::default().with_overrides(Some(4), Some(80));
+        let config = FmtConfig::default().with_overrides(Some(4), Some(80), None);
         assert_eq!(config.indent_size, 4);
         assert_eq!(config.max_line_length, 80);
     }

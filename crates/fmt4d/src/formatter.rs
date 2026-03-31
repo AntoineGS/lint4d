@@ -21,6 +21,9 @@ pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Resu
         return Ok(original.to_string());
     }
 
+    // Resolve EOL: Auto detects from source, otherwise uses the configured value.
+    let resolved_eol = config.end_of_line.resolve(source);
+
     let comment_map = CommentMap::build(tree.root_node(), source);
     let format_regions = parse_format_regions(source);
 
@@ -36,7 +39,7 @@ pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Resu
     let normalized = normalize_blank_lines(&raw_output, &config.blank_lines);
     let broken = break_long_lines(&normalized, config.max_line_length, config.indent_size);
 
-    Ok(broken)
+    Ok(resolved_eol.apply(&broken))
 }
 
 /// Post-processing pass: break lines that exceed `max_length`.

@@ -929,7 +929,7 @@ impl<'a> Printer<'a> {
     fn node_text(&self, node: Node) -> String {
         std::str::from_utf8(&self.source[node.start_byte()..node.end_byte()])
             .unwrap_or("")
-            .to_string()
+            .replace('\r', "")
     }
 
     /// Check if there is a blank line (empty or whitespace-only row) in the

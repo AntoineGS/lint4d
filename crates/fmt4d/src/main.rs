@@ -1,5 +1,5 @@
 use clap::{CommandFactory, Parser};
-use fmt4d::config::FmtConfig;
+use fmt4d::config::{EndOfLine, FmtConfig};
 use fmt4d::formatter::format_source;
 use pascal_core::discovery::discover_files;
 use pascal_core::FileInfo;
@@ -48,9 +48,25 @@ struct Cli {
     #[arg(long)]
     max_line_length: Option<usize>,
 
+    /// Line ending style: auto (preserve original), crlf, lf
+    #[arg(long, value_parser = parse_end_of_line)]
+    end_of_line: Option<EndOfLine>,
+
     /// Enable colored output
     #[arg(long)]
     color: bool,
+}
+
+fn parse_end_of_line(s: &str) -> Result<EndOfLine, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(EndOfLine::Auto),
+        "crlf" => Ok(EndOfLine::Crlf),
+        "lf" => Ok(EndOfLine::Lf),
+        _ => Err(format!(
+            "invalid end_of_line value '{}': expected auto, crlf, or lf",
+            s
+        )),
+    }
 }
 
 fn main() {
@@ -89,7 +105,8 @@ fn run_stdin(cli: &Cli) -> i32 {
     }
 
     let info = FileInfo::new(PathBuf::from("stdin.pas"));
-    let config = FmtConfig::default().with_overrides(cli.indent_size, cli.max_line_length);
+    let config =
+        FmtConfig::default().with_overrides(cli.indent_size, cli.max_line_length, cli.end_of_line);
 
     match format_source(input.as_bytes(), &info, &config) {
         Ok(formatted) => {
@@ -146,8 +163,11 @@ fn run_files(cli: &Cli) -> i32 {
         })
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let config =
-        FmtConfig::discover(&config_dir).with_overrides(cli.indent_size, cli.max_line_length);
+    let config = FmtConfig::discover(&config_dir).with_overrides(
+        cli.indent_size,
+        cli.max_line_length,
+        cli.end_of_line,
+    );
 
     let had_changes = AtomicBool::new(false);
     let had_errors = AtomicBool::new(false);

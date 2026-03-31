@@ -78,7 +78,7 @@ fn collect_comments<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>, 
     if node.is_extra() && node.kind() == "comment" {
         let text = std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
             .unwrap_or("")
-            .to_string();
+            .replace('\r', "");
         out.push((node, text));
         return;
     }

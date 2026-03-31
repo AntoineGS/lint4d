@@ -72,7 +72,7 @@ fn main() {
         if let Some(pos) = cli.paths.iter().position(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
-                .map_or(false, |e| e.eq_ignore_ascii_case("dproj"))
+                .is_some_and(|e| e.eq_ignore_ascii_case("dproj"))
         }) {
             cli.project = Some(cli.paths.remove(pos));
         }

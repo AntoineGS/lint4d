@@ -8,6 +8,8 @@ pub struct AttachedComment {
     pub text: String,
     /// True if the comment appeared on the same line as code (trailing).
     pub trailing: bool,
+    /// The source row (0-based) where the comment starts.
+    pub source_row: usize,
 }
 
 /// Maps node IDs to their attached comments.
@@ -41,6 +43,7 @@ impl CommentMap {
                         .push(AttachedComment {
                             text: text.clone(),
                             trailing: true,
+                            source_row: comment_line,
                         });
                     continue;
                 }
@@ -51,6 +54,7 @@ impl CommentMap {
                 leading.entry(next.id()).or_default().push(AttachedComment {
                     text: text.clone(),
                     trailing: false,
+                    source_row: comment_line,
                 });
             }
         }

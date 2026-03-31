@@ -20,6 +20,8 @@ pub struct Printer<'a> {
     at_line_start: bool,
     /// The kind of the last emitted leaf token.
     last_token_kind: String,
+    /// The parent kind of the last emitted leaf token.
+    last_token_parent_kind: String,
 }
 
 impl<'a> Printer<'a> {
@@ -40,6 +42,7 @@ impl<'a> Printer<'a> {
             output: String::new(),
             at_line_start: true,
             last_token_kind: String::new(),
+            last_token_parent_kind: String::new(),
         }
     }
 
@@ -63,17 +66,22 @@ impl<'a> Printer<'a> {
             "unit" => self.print_unit(node),
             "interface" => self.print_interface_section(node),
             "implementation" => self.print_implementation_section(node),
+            "initialization" | "finalization" => self.print_init_final_section(node),
             "declUses" => self.print_uses(node),
-            "block" => self.print_block(node),
+            "block" | "statements" => self.print_block(node),
             "declClass" | "declRecord" | "declIntf" => self.print_type_body(node),
             "declSection" => self.print_decl_section(node),
             "declVars" | "declConsts" | "declTypes" => self.print_section(node),
             "defProc" => self.print_def_proc(node),
+            "declProc" => self.print_decl_proc(node),
             "try" => self.print_try(node),
             "case" => self.print_case(node),
             "repeat" => self.print_repeat(node),
             "if" | "ifElse" => self.print_if(node),
             "for" | "foreach" | "while" | "with" => self.print_loop(node),
+            // Emit literalChar / literalString as verbatim text (children don't
+            // cover the full text, e.g. `#0` has child `#` but not `0`).
+            "literalChar" | "literalString" => self.print_verbatim_leaf(node),
             _ if node.child_count() == 0 && !node.is_extra() => {
                 self.print_leaf(node);
             }
@@ -95,6 +103,21 @@ impl<'a> Printer<'a> {
 
     // ── Leaf token emission ──────────────────────────────────────
 
+    /// Emit a node's full source text as a single token, ignoring children.
+    /// Used for nodes like `literalChar` where the children don't cover
+    /// all source text (e.g. `#0` has child `#` but the `0` is not a child).
+    fn print_verbatim_leaf(&mut self, node: Node) {
+        let kind = node.kind();
+        let text = self.node_text(node);
+        let parent_kind = node
+            .parent()
+            .map(|p| p.kind().to_string())
+            .unwrap_or_default();
+        self.emit_token(kind, &text, &parent_kind);
+        self.set_last_token(kind, &parent_kind);
+        self.emit_trailing_comments(node);
+    }
+
     fn print_leaf(&mut self, node: Node) {
         let kind = node.kind();
         let text = self.node_text(node);
@@ -105,15 +128,24 @@ impl<'a> Printer<'a> {
 
         match kind {
             ";" => {
+                // Inside a parameter list (declArgs), `;` separates params
+                // but should NOT force a newline.  If line-breaking is needed,
+                // the line_break pass handles it with continuation indent.
+                let in_param_list = Self::is_ancestor(node, "declArgs");
                 self.emit_raw(";");
-                self.last_token_kind = ";".to_string();
+                self.set_last_token(";", &parent_kind);
                 self.emit_trailing_comments(node);
-                self.ensure_newline();
+                if in_param_list {
+                    // Space instead of newline — params continue on same line
+                    self.output.push(' ');
+                } else {
+                    self.ensure_newline();
+                }
             }
             "kBegin" | "kTry" | "kRepeat" | "kAsm" => {
                 self.ensure_newline();
                 self.emit_indented(&text);
-                self.last_token_kind = kind.to_string();
+                self.set_last_token(kind, &parent_kind);
                 self.ensure_newline();
                 self.indent.indent();
             }
@@ -121,19 +153,19 @@ impl<'a> Printer<'a> {
                 self.indent.dedent();
                 self.ensure_newline();
                 self.emit_indented(&text);
-                self.last_token_kind = kind.to_string();
+                self.set_last_token(kind, &parent_kind);
             }
             "kExcept" | "kFinally" => {
                 self.indent.dedent();
                 self.ensure_newline();
                 self.emit_indented(&text);
-                self.last_token_kind = kind.to_string();
+                self.set_last_token(kind, &parent_kind);
                 self.ensure_newline();
                 self.indent.indent();
             }
             _ => {
                 self.emit_token(kind, &text, &parent_kind);
-                self.last_token_kind = kind.to_string();
+                self.set_last_token(kind, &parent_kind);
                 self.emit_trailing_comments(node);
             }
         }
@@ -170,18 +202,44 @@ impl<'a> Printer<'a> {
         if kind == "," {
             return false;
         }
-        // No space before `(`  in call/args context
-        if kind == "("
-            && (parent_kind == "exprCall"
-                || parent_kind == "declArgs"
-                || parent_kind == "exprParens")
+        // No space before `[` in subscript context (array/string indexing)
+        if kind == "[" && parent_kind == "exprSubscript" {
+            return false;
+        }
+        // No space before `(` in call/args context (but NOT exprParens —
+        // `if (x)` must keep the space between keyword and `(`).
+        if kind == "(" && (parent_kind == "exprCall" || parent_kind == "declArgs") {
+            return false;
+        }
+        // No spaces inside generic angle brackets: TList<Integer> not TList < Integer >
+        if (kind == "kLt" || kind == "<")
+            && (parent_kind == "typerefTpl"
+                || parent_kind == "genericTpl"
+                || parent_kind == "genericArgs"
+                || parent_kind == "typerefArgs"
+                || parent_kind == "exprTpl")
         {
             return false;
         }
-        // No space before `:` in declarations (declField, declVar, declArg)
-        // But do space before `:` in ternary-like contexts — Delphi doesn't have those,
-        // so always no space before `:` is fine.
+        if (kind == "kGt" || kind == ">")
+            && (parent_kind == "typerefTpl"
+                || parent_kind == "genericTpl"
+                || parent_kind == "genericArgs"
+                || parent_kind == "typerefArgs"
+                || parent_kind == "exprTpl")
+        {
+            return false;
+        }
+        // No space after `<` in generic context only
+        if self.last_token_kind == "kLt" && is_generic_parent(&self.last_token_parent_kind) {
+            return false;
+        }
+        // No space before `:` in declarations
         if kind == ":" {
+            return false;
+        }
+        // No space around `..` in range expressions
+        if kind == ".." || self.last_token_kind == ".." {
             return false;
         }
         // kDot / `.` inside genericDot
@@ -225,8 +283,12 @@ impl<'a> Printer<'a> {
                 continue;
             }
             let kind = child.kind().to_string();
-            // Blank line before interface, implementation, and final kEnd
-            if (kind == "interface" || kind == "implementation" || kind == "kEnd")
+            // Blank line before interface, implementation, initialization, finalization, and final kEnd
+            if (kind == "interface"
+                || kind == "implementation"
+                || kind == "initialization"
+                || kind == "finalization"
+                || kind == "kEnd")
                 && !prev_kind.is_empty()
             {
                 self.ensure_newline();
@@ -240,6 +302,7 @@ impl<'a> Printer<'a> {
     fn print_interface_section(&mut self, node: Node) {
         // Children: kInterface, then declUses/declTypes/declVars/declConsts etc.
         let mut after_header = false;
+        let mut prev_child_kind = String::new();
         for child in node.children(&mut node.walk()) {
             if child.is_extra() {
                 continue;
@@ -252,11 +315,24 @@ impl<'a> Printer<'a> {
                     after_header = true;
                 }
                 _ => {
+                    let kind = child.kind().to_string();
                     if after_header {
                         self.emit_newline();
                         after_header = false;
+                    } else if !prev_child_kind.is_empty() {
+                        // Add blank line between sections (uses→types, types→vars, etc.)
+                        let blanks = crate::blank_lines::needs_blank_line_between(
+                            &prev_child_kind,
+                            &kind,
+                            &self.config.blank_lines,
+                        );
+                        for _ in 0..blanks {
+                            self.ensure_newline();
+                            self.emit_newline();
+                        }
                     }
                     self.print_node(child);
+                    prev_child_kind = kind;
                 }
             }
         }
@@ -301,15 +377,68 @@ impl<'a> Printer<'a> {
         }
     }
 
-    // ── Block printing ───────────────────────────────────────────
-
-    fn print_block(&mut self, node: Node) {
-        self.emit_leading_comments(node);
+    fn print_init_final_section(&mut self, node: Node) {
+        // Children: kInitialization/kFinalization, then statement(s)
+        let mut after_header = false;
         for child in node.children(&mut node.walk()) {
             if child.is_extra() {
                 continue;
             }
-            self.print_node(child);
+            match child.kind() {
+                "kInitialization" | "kFinalization" => {
+                    let text = self.node_text(child);
+                    self.emit_indented(&text);
+                    self.last_token_kind = child.kind().to_string();
+                    self.ensure_newline();
+                    self.indent.indent();
+                    after_header = true;
+                }
+                _ => {
+                    self.print_node(child);
+                }
+            }
+        }
+        if after_header {
+            self.indent.dedent();
+        }
+    }
+
+    // ── Block printing ───────────────────────────────────────────
+
+    fn print_block(&mut self, node: Node) {
+        self.emit_leading_comments(node);
+        self.print_children_preserving_blank_lines(node);
+    }
+
+    /// Print children of a node while preserving single blank lines from the
+    /// source between consecutive children.  Blank lines immediately after
+    /// block openers (begin/try/repeat) or before closers (end) are stripped.
+    fn print_children_preserving_blank_lines(&mut self, node: Node) {
+        let children: Vec<Node> = node
+            .children(&mut node.walk())
+            .filter(|c| !c.is_extra())
+            .collect();
+        let mut prev_end_row: Option<usize> = None;
+        let mut prev_kind: &str = "";
+        for (i, child) in children.iter().enumerate() {
+            let kind = child.kind();
+            if let Some(prev_end) = prev_end_row {
+                // Don't insert blank line right after begin/try/repeat
+                let after_opener = is_block_opener(prev_kind);
+                // Don't insert blank line right before end/except/finally
+                let before_closer = is_block_closer(kind);
+                if !after_opener
+                    && !before_closer
+                    && self.has_blank_line_between(prev_end, child.start_position().row)
+                {
+                    self.ensure_newline();
+                    self.emit_newline();
+                }
+            }
+            self.print_node(*child);
+            prev_end_row = Some(child.end_position().row);
+            prev_kind = kind;
+            let _ = i;
         }
     }
 
@@ -317,31 +446,88 @@ impl<'a> Printer<'a> {
 
     fn print_type_body(&mut self, node: Node) {
         // The opening keyword (class/record/interface) comes first.
-        // Then body children, then kEnd.
-        for child in node.children(&mut node.walk()) {
-            if child.is_extra() {
-                continue;
-            }
+        // Then optionally an ancestor list `(...)`, then body children, then kEnd.
+        let children: Vec<Node> = node
+            .children(&mut node.walk())
+            .filter(|c| !c.is_extra())
+            .collect();
+
+        // Detect whether this type body has declSection children (visibility
+        // sections like private/public). If not, we need to indent the body
+        // fields ourselves (e.g. plain records without visibility).
+        let has_visibility_sections = children.iter().any(|c| c.kind() == "declSection");
+        let mut body_indented = false;
+        // Track whether we're still in the ancestor list portion (before
+        // the first body child or kEnd).
+        let mut in_ancestor_list = false;
+
+        for child in &children {
             match child.kind() {
                 "kClass" | "kRecord" | "kInterface" | "kObject" => {
                     // Emit the keyword on same line as `= class`
-                    self.emit_token(child.kind(), &self.node_text(child), "");
+                    self.emit_token(child.kind(), &self.node_text(*child), "");
                     self.last_token_kind = child.kind().to_string();
+                    in_ancestor_list = true;
+                    // DON'T newline yet — ancestor list `(...)` may follow
+                }
+                // Ancestor list tokens: `(`, `)`, `,`, typeref — keep on same line
+                "(" if in_ancestor_list => {
+                    self.emit_raw("(");
+                    self.last_token_kind = "(".to_string();
+                }
+                ")" if in_ancestor_list => {
+                    self.emit_raw(")");
+                    self.last_token_kind = ")".to_string();
+                    in_ancestor_list = false;
                     self.ensure_newline();
-                    // Don't indent here — declSection handles its own indent
+                }
+                "," if in_ancestor_list => {
+                    self.emit_raw(",");
+                    self.output.push(' ');
+                    self.last_token_kind = ",".to_string();
+                }
+                "typeref" if in_ancestor_list => {
+                    let text = self.node_text(*child);
+                    self.output.push_str(&text);
+                    self.last_token_kind = "identifier".to_string();
                 }
                 "kEnd" => {
+                    // End ancestor list if still in it (e.g. empty class with no ancestors)
+                    if in_ancestor_list {
+                        in_ancestor_list = false;
+                        self.ensure_newline();
+                    }
+                    if body_indented {
+                        self.indent.dedent();
+                        body_indented = false;
+                    }
                     self.ensure_newline();
                     self.emit_indented("end");
                     self.last_token_kind = "kEnd".to_string();
                 }
                 "declSection" => {
-                    self.print_decl_section(child);
+                    if in_ancestor_list {
+                        in_ancestor_list = false;
+                        self.ensure_newline();
+                    }
+                    self.print_decl_section(*child);
                 }
                 _ => {
-                    self.print_node(child);
+                    if in_ancestor_list {
+                        in_ancestor_list = false;
+                        self.ensure_newline();
+                    }
+                    // For records/types without visibility sections, indent body fields
+                    if !has_visibility_sections && !body_indented && child.kind() != ";" {
+                        self.indent.indent();
+                        body_indented = true;
+                    }
+                    self.print_node(*child);
                 }
             }
+        }
+        if body_indented {
+            self.indent.dedent();
         }
     }
 
@@ -349,6 +535,7 @@ impl<'a> Printer<'a> {
 
     fn print_decl_section(&mut self, node: Node) {
         let mut first = true;
+        let mut prev_end_row: Option<usize> = None;
         for child in node.children(&mut node.walk()) {
             if child.is_extra() {
                 continue;
@@ -370,9 +557,18 @@ impl<'a> Printer<'a> {
                         self.ensure_newline();
                         self.indent.indent();
                     }
+                    prev_end_row = Some(child.end_position().row);
                 }
                 _ => {
+                    // Preserve blank lines between members
+                    if let Some(prev_end) = prev_end_row {
+                        if self.has_blank_line_between(prev_end, child.start_position().row) {
+                            self.ensure_newline();
+                            self.emit_newline();
+                        }
+                    }
                     self.print_node(child);
+                    prev_end_row = Some(child.end_position().row);
                 }
             }
         }
@@ -386,6 +582,7 @@ impl<'a> Printer<'a> {
     fn print_section(&mut self, node: Node) {
         self.emit_leading_comments(node);
         let mut indented = false;
+        let mut prev_child_kind = String::new();
         for child in node.children(&mut node.walk()) {
             if child.is_extra() {
                 continue;
@@ -400,7 +597,14 @@ impl<'a> Printer<'a> {
                     indented = true;
                 }
                 _ => {
+                    let kind = child.kind().to_string();
+                    // Insert blank line between type declarations in a type section
+                    if kind == "declType" && prev_child_kind == "declType" {
+                        self.ensure_newline();
+                        self.emit_newline();
+                    }
                     self.print_node(child);
+                    prev_child_kind = kind;
                 }
             }
         }
@@ -418,6 +622,49 @@ impl<'a> Printer<'a> {
                 continue;
             }
             self.print_node(child);
+        }
+    }
+
+    // ── Procedure/function declaration ──────────────────────────
+    // Handles `declProc` so that method directives (override, virtual,
+    // abstract, reintroduce, etc.) stay on the same line as the method
+    // signature instead of being split across lines.
+
+    fn print_decl_proc(&mut self, node: Node) {
+        self.emit_leading_comments(node);
+        let children: Vec<Node> = node
+            .children(&mut node.walk())
+            .filter(|c| !c.is_extra())
+            .collect();
+        let mut i = 0;
+        while i < children.len() {
+            let child = children[i];
+            match child.kind() {
+                ";" => {
+                    // Check if next sibling is a procAttribute — if so, emit
+                    // the semicolon WITHOUT a newline to keep directives on
+                    // the same line.
+                    let next = children.get(i + 1);
+                    if next.map(|n| n.kind()) == Some("procAttribute") {
+                        self.emit_raw(";");
+                        self.last_token_kind = ";".to_string();
+                        self.emit_trailing_comments(child);
+                        // Emit a space instead of newline before the directive
+                        self.output.push(' ');
+                        self.at_line_start = false;
+                    } else {
+                        // Normal semicolon — emit with newline
+                        self.emit_raw(";");
+                        self.last_token_kind = ";".to_string();
+                        self.emit_trailing_comments(child);
+                        self.ensure_newline();
+                    }
+                }
+                _ => {
+                    self.print_node(child);
+                }
+            }
+            i += 1;
         }
     }
 
@@ -456,6 +703,60 @@ impl<'a> Printer<'a> {
 
     fn print_case(&mut self, node: Node) {
         self.emit_leading_comments(node);
+        let mut after_of = false;
+        for child in node.children(&mut node.walk()) {
+            if child.is_extra() {
+                continue;
+            }
+            match child.kind() {
+                "kCase" => {
+                    self.emit_indented("case");
+                    self.last_token_kind = "kCase".to_string();
+                }
+                "kOf" => {
+                    self.output.push(' ');
+                    self.output.push_str("of");
+                    self.last_token_kind = "kOf".to_string();
+                    self.ensure_newline();
+                    self.indent.indent();
+                    after_of = true;
+                }
+                "caseCase" => {
+                    self.print_case_branch(child);
+                }
+                "kElse" => {
+                    // `else` aligns with `case`, not with the branches
+                    self.indent.dedent();
+                    self.emit_leading_comments(child);
+                    self.ensure_newline();
+                    self.emit_indented("else");
+                    self.last_token_kind = "kElse".to_string();
+                    self.ensure_newline();
+                    self.indent.indent();
+                    // after_of stays true — kEnd will do the final dedent
+                }
+                "kEnd" => {
+                    if after_of {
+                        self.indent.dedent();
+                        after_of = false;
+                    }
+                    self.emit_leading_comments(child);
+                    self.ensure_newline();
+                    self.emit_indented("end");
+                    self.last_token_kind = "kEnd".to_string();
+                }
+                _ => {
+                    self.print_node(child);
+                }
+            }
+        }
+        if after_of {
+            self.indent.dedent();
+        }
+    }
+
+    fn print_case_branch(&mut self, node: Node) {
+        self.emit_leading_comments(node);
         for child in node.children(&mut node.walk()) {
             if child.is_extra() {
                 continue;
@@ -480,21 +781,54 @@ impl<'a> Printer<'a> {
 
     fn print_if(&mut self, node: Node) {
         self.emit_leading_comments(node);
-        for child in node.children(&mut node.walk()) {
-            if child.is_extra() {
-                continue;
-            }
+        let children: Vec<Node> = node
+            .children(&mut node.walk())
+            .filter(|c| !c.is_extra())
+            .collect();
+        let mut i = 0;
+        while i < children.len() {
+            let child = children[i];
             match child.kind() {
+                "kThen" | "kDo" => {
+                    // Emit the keyword on the same line
+                    self.print_node(child);
+                    // If the NEXT child is a single statement (not begin..end),
+                    // put it on its own indented line.
+                    if let Some(next) = children.get(i + 1) {
+                        if next.kind() != "block" && next.kind() != "kElse" {
+                            self.ensure_newline();
+                            self.indent.indent();
+                            self.print_node(*next);
+                            self.indent.dedent();
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
                 "kElse" => {
                     // `else` aligns with `if` — no extra indent
                     self.ensure_newline();
                     self.emit_indented("else");
                     self.last_token_kind = "kElse".to_string();
+                    // If next child is a single statement (not begin..end or another if),
+                    // put it on its own indented line.
+                    if let Some(next) = children.get(i + 1) {
+                        if next.kind() != "block" && next.kind() != "if" && next.kind() != "ifElse"
+                        {
+                            self.ensure_newline();
+                            self.indent.indent();
+                            self.print_node(*next);
+                            self.indent.dedent();
+                            i += 2;
+                            continue;
+                        }
+                    }
                 }
                 _ => {
                     self.print_node(child);
                 }
             }
+            i += 1;
         }
     }
 
@@ -502,11 +836,35 @@ impl<'a> Printer<'a> {
 
     fn print_loop(&mut self, node: Node) {
         self.emit_leading_comments(node);
-        for child in node.children(&mut node.walk()) {
-            if child.is_extra() {
-                continue;
+        let children: Vec<Node> = node
+            .children(&mut node.walk())
+            .filter(|c| !c.is_extra())
+            .collect();
+        let mut i = 0;
+        while i < children.len() {
+            let child = children[i];
+            match child.kind() {
+                "kDo" => {
+                    // Emit `do` on the same line
+                    self.print_node(child);
+                    // If next child is a single statement (not begin..end),
+                    // put it on its own indented line.
+                    if let Some(next) = children.get(i + 1) {
+                        if next.kind() != "block" {
+                            self.ensure_newline();
+                            self.indent.indent();
+                            self.print_node(*next);
+                            self.indent.dedent();
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    self.print_node(child);
+                }
             }
-            self.print_node(child);
+            i += 1;
         }
     }
 
@@ -514,10 +872,23 @@ impl<'a> Printer<'a> {
 
     fn emit_leading_comments(&mut self, node: Node) {
         let comments = self.comments.leading_comments(node.id());
+        if comments.is_empty() {
+            return;
+        }
         for comment in comments {
             self.ensure_newline();
             self.emit_indented(&comment.text);
             self.ensure_newline();
+        }
+        // If there was a blank line in the source between the last comment
+        // and the node itself, preserve it.
+        let last_comment = &comments[comments.len() - 1];
+        // Comment may span multiple lines; estimate its end row
+        let comment_end_row =
+            last_comment.source_row + last_comment.text.lines().count().saturating_sub(1);
+        let node_start_row = node.start_position().row;
+        if self.has_blank_line_between(comment_end_row, node_start_row) {
+            self.emit_newline();
         }
     }
 
@@ -561,6 +932,42 @@ impl<'a> Printer<'a> {
             .to_string()
     }
 
+    /// Check if there is a blank line (empty or whitespace-only row) in the
+    /// source between `start_row` (exclusive) and `end_row` (exclusive).
+    fn has_blank_line_between(&self, start_row: usize, end_row: usize) -> bool {
+        if end_row <= start_row + 1 {
+            return false;
+        }
+        let source_str = std::str::from_utf8(self.source).unwrap_or("");
+        for (row_idx, line) in source_str.lines().enumerate() {
+            if row_idx > start_row && row_idx < end_row && line.trim().is_empty() {
+                return true;
+            }
+            if row_idx >= end_row {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Update last-token tracking fields.
+    fn set_last_token(&mut self, kind: &str, parent_kind: &str) {
+        self.last_token_kind = kind.to_string();
+        self.last_token_parent_kind = parent_kind.to_string();
+    }
+
+    /// Check if any ancestor of `node` has the given kind.
+    fn is_ancestor(node: Node, ancestor_kind: &str) -> bool {
+        let mut current = node.parent();
+        while let Some(p) = current {
+            if p.kind() == ancestor_kind {
+                return true;
+            }
+            current = p.parent();
+        }
+        false
+    }
+
     /// Check if a node falls entirely within a format-off region.
     fn is_in_format_off_region(&self, node: Node) -> bool {
         let node_start = node.start_position().row + 1; // 1-based
@@ -583,6 +990,24 @@ impl<'a> Printer<'a> {
             }
         }
     }
+}
+
+/// Block-opening keywords after which blank lines should be stripped.
+fn is_block_opener(kind: &str) -> bool {
+    matches!(kind, "kBegin" | "kTry" | "kRepeat" | "kAsm")
+}
+
+/// Block-closing keywords before which blank lines should be stripped.
+fn is_block_closer(kind: &str) -> bool {
+    matches!(kind, "kEnd" | "kExcept" | "kFinally")
+}
+
+/// Parent kinds that indicate a generic type context (not comparison).
+fn is_generic_parent(parent_kind: &str) -> bool {
+    matches!(
+        parent_kind,
+        "typerefTpl" | "genericTpl" | "genericArgs" | "typerefArgs" | "exprTpl"
+    )
 }
 
 /// Keywords after which a space is always needed.

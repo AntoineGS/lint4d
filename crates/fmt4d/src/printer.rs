@@ -104,6 +104,18 @@ impl<'a> Printer<'a> {
                     self.recurse_children(node);
                 }
             }
+            "exprCall" => {
+                let (width, _, _) = self.measure_node(
+                    node,
+                    &self.last_token_kind.clone(),
+                    &self.last_token_parent_kind.clone(),
+                );
+                if self.current_column + width > self.max_line_length {
+                    self.print_call_args_breaking(node);
+                } else {
+                    self.recurse_children(node);
+                }
+            }
             _ if node.child_count() == 0 && !node.is_extra() => {
                 self.print_leaf(node);
             }

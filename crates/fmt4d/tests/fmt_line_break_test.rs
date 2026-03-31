@@ -194,6 +194,83 @@ end.
     assert_idempotent_with_max(src, 80);
 }
 
+// ── Function Call Arguments Breaking (exprCall at ,) ────────────
+
+#[test]
+fn long_call_args_break_at_commas() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := DoSomething(LongArgument1, LongArgument2, LongArgument3, LongArgument4, LongArgument5);
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn short_call_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := Foo(A, B, C);
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert!(
+        result.lines().any(|l| l.contains("Foo(A, B, C)")),
+        "short call should stay on one line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn nested_calls_break_outer_first() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := Outer(Inner1(A, B, C), Inner2(D, E, F), SimpleArg, AnotherArg, MoreArgs);
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+    // The inner calls should stay intact if they fit
+    assert!(
+        result.contains("Inner1(A, B, C)"),
+        "inner call should stay on one line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn call_args_idempotent() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := DoSomething(LongArgument1, LongArgument2, LongArgument3, LongArgument4, LongArgument5);
+end;
+end.
+";
+    assert_idempotent_with_max(src, 80);
+}
+
 // ── Column Tracking Validation ──────────────────────────────────
 
 #[test]

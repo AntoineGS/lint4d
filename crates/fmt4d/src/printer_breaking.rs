@@ -115,6 +115,126 @@ impl<'a> Printer<'a> {
             self.print_node(*child);
         }
     }
+
+    /// Emit an `exprCall` function call with line breaks at `,` separators
+    /// when the call would overflow `max_line_length`.
+    ///
+    /// Groups arguments by `,`-separated chunks, then greedily packs them
+    /// onto lines respecting `max_line_length`. The commas are emitted by
+    /// this method (not taken from the AST), so spacing is handled correctly.
+    pub(crate) fn print_call_args_breaking(&mut self, call_node: Node) {
+        let children: Vec<Node> = call_node
+            .children(&mut call_node.walk())
+            .filter(|c| !c.is_extra())
+            .collect();
+
+        // Find the positions of `(` and `)` tokens.
+        let open_idx = children.iter().position(|c| c.kind() == "(");
+        let close_idx = children.iter().rposition(|c| c.kind() == ")");
+
+        let (open_idx, close_idx) = match (open_idx, close_idx) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                // Fallback: no parens found, just recurse normally.
+                self.recurse_children(call_node);
+                return;
+            }
+        };
+
+        // Emit everything up to and including `(` (the entity / function name).
+        for child in &children[..=open_idx] {
+            self.print_node(*child);
+        }
+
+        // Collect the inner children (between `(` and `)`), excluding the `,` separators.
+        let inner = &children[open_idx + 1..close_idx];
+
+        if inner.is_empty() {
+            // Empty argument list — just emit `)`.
+            self.print_node(children[close_idx]);
+            for child in &children[close_idx + 1..] {
+                self.print_node(*child);
+            }
+            return;
+        }
+
+        // Split inner children into argument groups, excluding the `,` nodes.
+        let groups = split_at_commas(inner);
+
+        // Continuation indent = current indent + one extra indent_size.
+        let cont_indent = self.indent.current().len() + self.config.indent_size;
+        let cont_indent_str = " ".repeat(cont_indent);
+
+        let mut first_group = true;
+
+        for group in &groups {
+            let (width, _last_kind, _last_parent) = self.measure_group(group);
+
+            if first_group {
+                // First group starts right after `(`.
+                // Check if it fits; if not, break to continuation line.
+                if self.current_column + width > self.max_line_length {
+                    self.output.push('\n');
+                    self.output.push_str(&cont_indent_str);
+                    self.at_line_start = false;
+                    self.current_column = cont_indent;
+                }
+                for child in group {
+                    self.print_node(*child);
+                }
+                first_group = false;
+            } else {
+                // Subsequent group: we need to emit `, ` or `,\n<indent>`.
+                // Check if `, ` + group fits on the current line.
+                if self.current_column + 2 + width <= self.max_line_length {
+                    // Fits on same line: emit `, ` then group.
+                    self.output.push_str(", ");
+                    self.current_column += 2;
+                } else {
+                    // Doesn't fit: emit `,\n<continuation indent>`.
+                    self.output.push(',');
+                    self.output.push('\n');
+                    self.output.push_str(&cont_indent_str);
+                    self.at_line_start = false;
+                    self.current_column = cont_indent;
+                }
+                for child in group {
+                    self.print_node(*child);
+                }
+            }
+        }
+
+        // Emit the closing `)`.
+        self.print_node(children[close_idx]);
+
+        // Emit anything after `)` (unlikely but safe).
+        for child in &children[close_idx + 1..] {
+            self.print_node(*child);
+        }
+    }
+}
+
+/// Split a slice of nodes into groups separated by `,` tokens.
+/// The `,` nodes are excluded from all groups (the caller emits them).
+fn split_at_commas<'a>(nodes: &[Node<'a>]) -> Vec<Vec<Node<'a>>> {
+    let mut groups: Vec<Vec<Node>> = Vec::new();
+    let mut current_group: Vec<Node> = Vec::new();
+
+    for node in nodes {
+        if node.kind() == "," {
+            groups.push(current_group);
+            current_group = Vec::new();
+        } else {
+            current_group.push(*node);
+        }
+    }
+
+    // Last group (after the last `,` or if there's no `,`).
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+
+    groups
 }
 
 /// Split a slice of nodes into groups separated by `;` tokens.

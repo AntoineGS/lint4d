@@ -495,11 +495,11 @@ version = 1
 [lint4d]
 # Paths to lint (files or directories)
 # Default: ["."]
-paths = ["."]
+# paths = ["."]
 
 # Exclude patterns (glob patterns)
 # Default: ["**/test/**", "**/tests/**"]
-exclude = ["**/test/**", "**/tests/**"]
+# exclude = ["**/test/**", "**/tests/**"]
 
 # DCU (Delphi Compiled Unit) paths for type-aware analysis
 # Required for rules: field-not-freed, field-reassign-leak
@@ -605,12 +605,12 @@ exclude = ["**/test/**", "**/tests/**"]
 # Constant naming style
 # Possible values: "UPPER_CASE", "PascalCase"
 # Default: "UPPER_CASE"
-constant_style = "UPPER_CASE"
+# constant_style = "UPPER_CASE"
 
 # Local variable naming style
 # Possible values: "camelCase", "PascalCase"
-# Default: "camelCase"
-local_variable_style = "camelCase"
+# Default: "PascalCase"
+# local_variable_style = "PascalCase"
 "#;
 
     if let Err(e) = fs::write(&config_path, default_config) {

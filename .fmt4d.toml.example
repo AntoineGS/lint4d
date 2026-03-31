@@ -4,48 +4,48 @@
 [format]
 # Number of spaces or tabs per indentation level
 # Default: 2
-indent_size = 2
+# indent_size = 2
 
 # Indentation style
 # Possible values: "space", "tab"
 # Default: "space"
-indent_style = "space"
+# indent_style = "space"
 
 # Maximum line length before wrapping
 # Default: 120
-max_line_length = 120
+# max_line_length = 120
 
 # Style for begin keyword placement
 # Possible values: "next_line", "same_line"
 # Default: "next_line"
-begin_style = "next_line"
+# begin_style = "next_line"
 
 # Line ending style
 # Possible values: "auto" (preserve original), "crlf" (Windows), "lf" (Unix/Mac)
 # Default: "auto"
-end_of_line = "auto"
+# end_of_line = "auto"
 
 [format.blank_lines]
 # Number of blank lines between procedures/functions
 # Default: 1
-between_procedures = 1
+# between_procedures = 1
 
 # Number of blank lines between sections (interface/implementation/etc)
 # Default: 1
-between_sections = 1
+# between_sections = 1
 
 # Maximum consecutive blank lines allowed
 # Default: 1
-max_consecutive = 1
+# max_consecutive = 1
 
 [format.uses]
 # Sort uses clause alphabetically
 # Default: true
-sort = true
+# sort = true
 
 # Group uses clause by internal/external units
 # Default: true
-group = true
+# group = true
 
 # Paths that should be considered external (for grouping)
 # Default: []

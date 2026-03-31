@@ -649,3 +649,112 @@ end.
         result
     );
 }
+
+// ── Cross-Context Integration Tests ─────────────────────────────
+
+#[test]
+fn call_inside_condition_breaks_correctly() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (GetValue(VeryLongParam1, VeryLongParam2, VeryLongParam3) > Threshold) and (AnotherCheck(LongArg1, LongArg2) <> '') then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn method_chain_call_breaks() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := Self.Factory.CreateInstance(Param1, Param2, Param3).Initialize(Config1, Config2, Config3);
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn assignment_with_call_breaks_outer_first() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := Foo(LongArg1 + LongArg2, AnotherArg + MoreStuff, ThirdArg + Extra, FourthArg);
+end;
+end.
+";
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_with_max(src, 80);
+}
+
+#[test]
+fn no_regression_on_existing_formatting() {
+    let src = "\
+unit T;
+interface
+
+type
+  TMyClass = class
+  public
+    procedure Short(A: Integer);
+    function GetValue: string;
+  end;
+
+implementation
+
+procedure TMyClass.Short(A: Integer);
+begin
+  if A > 0 then
+    WriteLn('positive');
+end;
+
+function TMyClass.GetValue: string;
+begin
+  Result := 'hello';
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent(src);
+}
+
+#[test]
+fn all_contexts_idempotent() {
+    let src = "\
+unit T;
+interface
+  procedure VeryLongProcedureName(const FirstParam: string; const SecondParam: Integer; const ThirdParam: Boolean; const FourthParam: TObject);
+implementation
+procedure VeryLongProcedureName(const FirstParam: string; const SecondParam: Integer; const ThirdParam: Boolean; const FourthParam: TObject);
+begin
+  if (SomeCondition = True) and (AnotherCondition > 10) and (YetAnother <> '') and (FourthCheck = 1) then
+  begin
+    Result := DoSomething(LongArgument1, LongArgument2, LongArgument3, LongArgument4, Arg5);
+    Value := VeryLongExpression + AnotherLongExpression + YetMoreStuff + FinalPartHere;
+  end;
+end;
+end.
+";
+    assert_idempotent_with_max(src, 80);
+    let result = format_source_with_max(src, 80);
+    assert_no_long_lines(&result, 80);
+}

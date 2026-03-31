@@ -1,5 +1,6 @@
 use crate::config::UsesConfig;
 use std::collections::HashSet;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitSection {
@@ -127,6 +128,37 @@ pub fn extract_uses_units(node: tree_sitter::Node, source: &[u8]) -> Vec<String>
     units
 }
 
+/// Recursively scan directories for `.pas` files and collect unit names (lowercased).
+pub fn scan_external_paths(project_root: &Path, external_paths: &[String]) -> HashSet<String> {
+    let mut units = HashSet::new();
+    for rel_path in external_paths {
+        let dir = project_root.join(rel_path);
+        if dir.is_dir() {
+            scan_dir_recursive(&dir, &mut units);
+        }
+    }
+    units
+}
+
+fn scan_dir_recursive(dir: &Path, units: &mut HashSet<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_recursive(&path, units);
+        } else if let Some(ext) = path.extension() {
+            if ext.eq_ignore_ascii_case("pas") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    units.insert(stem.to_lowercase());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +268,45 @@ mod tests {
             classify_unit("SuperObject", &config, &external_units),
             UnitSection::External
         );
+    }
+
+    #[test]
+    fn scan_external_paths_finds_pas_files() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let vendor = dir.path().join("vendor");
+        fs::create_dir_all(vendor.join("sub")).unwrap();
+        fs::write(
+            vendor.join("Spring.Container.pas"),
+            "unit Spring.Container;",
+        )
+        .unwrap();
+        fs::write(vendor.join("sub").join("Neon.JSON.pas"), "unit Neon.JSON;").unwrap();
+        fs::write(vendor.join("README.md"), "not a pascal file").unwrap();
+
+        let result = scan_external_paths(dir.path(), &["vendor".to_string()]);
+        assert!(result.contains("spring.container"));
+        assert!(result.contains("neon.json"));
+        assert!(!result.contains("readme"));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn scan_external_paths_empty_config() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let result = scan_external_paths(dir.path(), &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_external_paths_missing_dir() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let result = scan_external_paths(dir.path(), &["nonexistent".to_string()]);
+        assert!(result.is_empty());
     }
 
     #[test]

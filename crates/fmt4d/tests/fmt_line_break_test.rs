@@ -623,3 +623,29 @@ end.
     let second = format_source(&result);
     assert_eq!(result, second, "column tracking broke idempotency");
 }
+
+// ── Uses Clause Wrapping ────────────────────────────────────────
+
+#[test]
+fn uses_clause_already_wraps() {
+    let src = "\
+unit T;
+interface
+uses Unit1, Unit2, Unit3, Unit4, Unit5, Unit6, Unit7, Unit8, Unit9, Unit10;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent(src);
+    // Each unit should be on its own line (format_uses puts one per line)
+    let unit_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("Unit"))
+        .collect();
+    assert!(
+        unit_lines.len() >= 2,
+        "uses units should be on separate lines:\n{}",
+        result
+    );
+}

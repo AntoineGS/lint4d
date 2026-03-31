@@ -117,19 +117,8 @@ fn uses_roundtrip_safe() {
 #[test]
 fn uses_groups_system_units() {
     let result = format_source(&"unit T;\ninterface\nuses\n  Forms, System.SysUtils, System.Classes;\nimplementation\nend.\n");
-    let lines: Vec<&str> = result.lines().collect();
-    // All units are present (grouping will be reintroduced in a later task)
-    let sys_classes_pos = lines.iter().position(|l| l.contains("System.Classes"));
-    let forms_pos = lines.iter().position(|l| l.contains("Forms"));
-    assert!(
-        sys_classes_pos.is_some() && forms_pos.is_some(),
-        "both units should be present"
-    );
-    // Units are sorted alphabetically within the single group
-    assert!(
-        forms_pos.unwrap() < sys_classes_pos.unwrap(),
-        "units should be sorted alphabetically (Forms before System.Classes)"
-    );
+    // All are core units — should be in one group, alphabetically sorted
+    assert!(result.contains("  Forms,\n  System.Classes,\n  System.SysUtils;\n"));
 }
 
 #[test]
@@ -137,13 +126,8 @@ fn uses_sorts_within_groups() {
     let result = format_source(
         &"unit T;\ninterface\nuses\n  System.SysUtils, System.Classes;\nimplementation\nend.\n",
     );
-    let lines: Vec<&str> = result.lines().collect();
-    let classes_pos = lines.iter().position(|l| l.contains("System.Classes"));
-    let sysutils_pos = lines.iter().position(|l| l.contains("System.SysUtils"));
-    assert!(
-        classes_pos.unwrap() < sysutils_pos.unwrap(),
-        "System.Classes should come before System.SysUtils (alphabetical)"
-    );
+    // Both are core units, sorted alphabetically
+    assert!(result.contains("  System.Classes,\n  System.SysUtils;\n"));
 }
 
 // ── Comments fixture tests ───────────────────────────────────────

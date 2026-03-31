@@ -5,10 +5,11 @@ interface
 uses
   DB,
   Forms,
-  MyUnit,
   System.Classes,
   System.SysUtils,
-  Vcl.Controls;
+  Vcl.Controls,
+
+  MyUnit;
 
 implementation
 

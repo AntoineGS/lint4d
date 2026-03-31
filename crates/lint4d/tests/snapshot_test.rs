@@ -87,7 +87,7 @@ fn snapshot_rule_constant_naming() {
 
 #[test]
 fn snapshot_rule_local_variable_naming() {
-    let diagnostics = lint_diagnostics("tests/fixtures/naming/bad_local_variable_camel.pas");
+    let diagnostics = lint_diagnostics("tests/fixtures/naming/bad_local_variable_pascal.pas");
     insta::assert_json_snapshot!("snapshot_rule_local_variable_naming", diagnostics);
 }
 

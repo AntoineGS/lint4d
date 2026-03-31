@@ -1,12 +1,13 @@
 ---
-source: tests/snapshot_test.rs
+source: crates/lint4d/tests/snapshot_test.rs
+assertion_line: 61
 expression: diagnostics
 ---
 [
   {
     "rule_id": "resource-leak-unprotected",
     "severity": "error",
-    "message": "Statement uses 'obj' between constructor and try..finally block. If this line raises an exception, the object will leak.",
+    "message": "Statement uses 'Obj' between constructor and try..finally block. If this line raises an exception, the object will leak.",
     "line": 12,
     "column": 3,
     "end_line": 12,

@@ -6,14 +6,14 @@ implementation
 
 procedure TestLeak;
 var
-  obj: TObject;
+  Obj: TObject;
 begin
-  obj := TObject.Create;
-  obj.ToString;
+  Obj := TObject.Create;
+  Obj.ToString;
   try
     WriteLn('work');
   finally
-    obj.Free;
+    Obj.Free;
   end;
 end;
 

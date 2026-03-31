@@ -6,11 +6,11 @@ implementation
 
 procedure TestNoTry;
 var
-  obj: TObject;
+  Obj: TObject;
 begin
-  obj := TObject.Create;
-  obj.ToString;
-  obj.Free;
+  Obj := TObject.Create;
+  Obj.ToString;
+  Obj.Free;
 end;
 
 end.

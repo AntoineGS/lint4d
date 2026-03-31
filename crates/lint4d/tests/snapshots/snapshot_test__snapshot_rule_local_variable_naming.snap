@@ -1,50 +1,51 @@
 ---
-source: tests/snapshot_test.rs
+source: crates/lint4d/tests/snapshot_test.rs
+assertion_line: 91
 expression: diagnostics
 ---
 [
   {
     "rule_id": "local-variable-naming",
     "severity": "hint",
-    "message": "Parameter 'BadParam' should use camelCase naming convention.",
+    "message": "Parameter 'badParam' should use PascalCase naming convention.",
     "line": 7,
     "column": 18,
     "end_line": 7,
     "end_column": 26,
-    "help": "Rename 'BadParam' to follow camelCase convention.",
+    "help": "Rename 'badParam' to follow PascalCase convention.",
     "scope": "DoWork"
   },
   {
     "rule_id": "local-variable-naming",
     "severity": "hint",
-    "message": "Parameter 'AnotherParam' should use camelCase naming convention.",
+    "message": "Parameter 'anotherParam' should use PascalCase naming convention.",
     "line": 7,
     "column": 43,
     "end_line": 7,
     "end_column": 55,
-    "help": "Rename 'AnotherParam' to follow camelCase convention.",
+    "help": "Rename 'anotherParam' to follow PascalCase convention.",
     "scope": "DoWork"
   },
   {
     "rule_id": "local-variable-naming",
     "severity": "hint",
-    "message": "Local variable 'MyCounter' should use camelCase naming convention.",
+    "message": "Local variable 'myCounter' should use PascalCase naming convention.",
     "line": 9,
     "column": 3,
     "end_line": 9,
     "end_column": 12,
-    "help": "Rename 'MyCounter' to follow camelCase convention.",
+    "help": "Rename 'myCounter' to follow PascalCase convention.",
     "scope": "DoWork"
   },
   {
     "rule_id": "local-variable-naming",
     "severity": "hint",
-    "message": "Local variable 'AnotherBadName' should use camelCase naming convention.",
+    "message": "Local variable 'anotherBad' should use PascalCase naming convention.",
     "line": 10,
     "column": 3,
     "end_line": 10,
-    "end_column": 17,
-    "help": "Rename 'AnotherBadName' to follow camelCase convention.",
+    "end_column": 13,
+    "help": "Rename 'anotherBad' to follow PascalCase convention.",
     "scope": "DoWork"
   }
 ]

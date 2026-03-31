@@ -4,14 +4,14 @@ interface
 
 implementation
 
-procedure DoWork(BadParam: Integer; const AnotherParam: string);
+procedure DoWork(badParam: Integer; const anotherParam: string);
 var
-  MyCounter: Integer;
-  AnotherBadName: string;
+  myCounter: Integer;
+  anotherBadName: string;
   x: Integer;
 begin
-  MyCounter := BadParam;
-  AnotherBadName := AnotherParam;
+  myCounter := badParam;
+  anotherBadName := anotherParam;
   x := 2;
 end;
 

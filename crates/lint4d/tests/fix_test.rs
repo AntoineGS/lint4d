@@ -8,11 +8,15 @@ use lint4d::fix::{build_rename_map, fix_file};
 
 fn build_map_from_source(source: &str) -> lint4d::fix::RenameMap {
     let config = "version = 1".parse::<Config>().unwrap();
+    build_map_with_config(source, &config)
+}
+
+fn build_map_with_config(source: &str, config: &Config) -> lint4d::fix::RenameMap {
     let file = FileInfo::new(PathBuf::from("test.pas"));
     let source_bytes = source.as_bytes();
     let (tree, _) = parse_file(&file, source_bytes).unwrap();
     let suppressions = parse_suppressions(source_bytes);
-    build_rename_map(tree.root_node(), source_bytes, &config, &suppressions)
+    build_rename_map(tree.root_node(), source_bytes, config, &suppressions)
 }
 
 #[test]
@@ -105,6 +109,11 @@ end."#;
 
 #[test]
 fn pass1_local_variable_camel_case() {
+    let config = r#"version = 1
+[rules.naming]
+local_variable_style = "camelCase""#
+        .parse::<Config>()
+        .unwrap();
     let source = r#"unit Test;
 interface
 implementation
@@ -115,7 +124,7 @@ var
 begin
 end;
 end."#;
-    let map = build_map_from_source(source);
+    let map = build_map_with_config(source, &config);
     assert!(map.file.is_empty());
     // Find the local rename — key is (proc_start, proc_end, "mycounter")
     let local_entry = map
@@ -130,6 +139,11 @@ end."#;
 
 #[test]
 fn pass1_parameter_camel_case() {
+    let config = r#"version = 1
+[rules.naming]
+local_variable_style = "camelCase""#
+        .parse::<Config>()
+        .unwrap();
     let source = r#"unit Test;
 interface
 implementation
@@ -137,7 +151,7 @@ procedure DoWork(BadParam: Integer; const AnotherParam: string; x: Integer);
 begin
 end;
 end."#;
-    let map = build_map_from_source(source);
+    let map = build_map_with_config(source, &config);
     let bad_entry = map
         .local
         .iter()
@@ -239,8 +253,8 @@ end."#;
     assert!(fixed.contains("Obj: TMyClass;"));
     // genericDot header renamed
     assert!(fixed.contains("procedure TMyClass.DoWork;"));
-    // Local var type renamed (variable itself renamed to camelCase "local")
-    assert!(fixed.contains("local: TMyClass;"));
+    // Local var type renamed (variable stays PascalCase)
+    assert!(fixed.contains("Local: TMyClass;"));
     // Old name gone
     assert!(!fixed.contains(" MyClass"));
 }
@@ -280,16 +294,16 @@ implementation
 
 procedure DoWork;
 var
-  MyCounter: Integer;
+  myCounter: Integer;
 begin
-  MyCounter := 1;
+  myCounter := 1;
 end;
 
 end."#;
     let fixed = fix_source(source);
-    assert!(fixed.contains("myCounter: Integer;"));
-    assert!(fixed.contains("myCounter := 1;"));
-    assert!(!fixed.contains("MyCounter"));
+    assert!(fixed.contains("MyCounter: Integer;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyCounter := 1;"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("myCounter"), "ACTUAL:\n{fixed}");
 }
 
 #[test]
@@ -300,35 +314,35 @@ interface
 
 implementation
 
-procedure DoWork(BadParam: Integer; const AnotherParam: string);
+procedure DoWork(badParam: Integer; const anotherParam: string);
 var
-  MyCounter: Integer;
+  myCounter: Integer;
 begin
-  MyCounter := BadParam + 1;
-  if AnotherParam = '' then
-    MyCounter := 0;
+  myCounter := badParam + 1;
+  if anotherParam = '' then
+    myCounter := 0;
 end;
 
 end."#;
     let fixed = fix_source(source);
     // Parameters renamed
-    assert!(fixed.contains("badParam: Integer"), "ACTUAL:\n{fixed}");
-    assert!(fixed.contains("anotherParam: string"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("BadParam: Integer"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("AnotherParam: string"), "ACTUAL:\n{fixed}");
     // Usages renamed
     assert!(
-        fixed.contains("myCounter := badParam + 1;"),
+        fixed.contains("MyCounter := BadParam + 1;"),
         "ACTUAL:\n{fixed}"
     );
     assert!(
-        fixed.contains("if anotherParam = '' then"),
+        fixed.contains("if AnotherParam = '' then"),
         "ACTUAL:\n{fixed}"
     );
     // Local var also renamed
-    assert!(fixed.contains("myCounter: Integer;"));
+    assert!(fixed.contains("MyCounter: Integer;"), "ACTUAL:\n{fixed}");
     // Old names gone
-    assert!(!fixed.contains("BadParam"), "ACTUAL:\n{fixed}");
-    assert!(!fixed.contains("AnotherParam"), "ACTUAL:\n{fixed}");
-    assert!(!fixed.contains("MyCounter"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("badParam"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("anotherParam"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("myCounter"), "ACTUAL:\n{fixed}");
 }
 
 #[test]
@@ -351,8 +365,8 @@ end;
 
 end."#;
     let fixed = fix_source(source);
-    // Casing should match declarations
-    assert!(fixed.contains("counter := MY_CONST;"), "ACTUAL:\n{fixed}");
+    // Casing should match declarations; counter → Counter (PascalCase default)
+    assert!(fixed.contains("Counter := MY_CONST;"), "ACTUAL:\n{fixed}");
 }
 
 #[test]
@@ -440,22 +454,21 @@ end."#;
     );
     // Constant renamed
     assert!(fixed.contains("MAX_RETRIES = 3;"), "ACTUAL:\n{fixed}");
-    // Local variable renamed
-    assert!(fixed.contains("retryCount: Integer;"), "ACTUAL:\n{fixed}");
-    // Usage of renamed local variable
+    // Local variable already PascalCase — stays as-is
+    assert!(fixed.contains("RetryCount: Integer;"), "ACTUAL:\n{fixed}");
+    // Usage of local variable with renamed constant
     assert!(
-        fixed.contains("retryCount := MAX_RETRIES;"),
+        fixed.contains("RetryCount := MAX_RETRIES;"),
         "ACTUAL:\n{fixed}"
     );
-    // Old names gone
+    // Old constant name gone
     assert!(!fixed.contains("maxRetries"), "ACTUAL:\n{fixed}");
-    assert!(!fixed.contains("RetryCount"), "ACTUAL:\n{fixed}");
 }
 
 #[test]
 fn fix_nested_procedure_outer_variable() {
-    // Outer procedure declares MyVar; inner procedure uses it.
-    // Both declaration and usage should be renamed to myVar.
+    // Outer procedure declares myVar; inner procedure uses it.
+    // Both declaration and usage should be renamed to MyVar (PascalCase).
     let source = r#"unit Test;
 
 interface
@@ -464,27 +477,27 @@ implementation
 
 procedure Outer;
 var
-  MyVar: Integer;
+  myVar: Integer;
 
   procedure Inner;
   begin
-    MyVar := 1;
+    myVar := 1;
   end;
 
 begin
-  MyVar := 2;
+  myVar := 2;
 end;
 
 end."#;
     let fixed = fix_source(source);
     // Outer proc declaration renamed
-    assert!(fixed.contains("myVar: Integer;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyVar: Integer;"), "ACTUAL:\n{fixed}");
     // Inner proc usage renamed
-    assert!(fixed.contains("myVar := 1;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyVar := 1;"), "ACTUAL:\n{fixed}");
     // Outer proc usage renamed
-    assert!(fixed.contains("myVar := 2;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyVar := 2;"), "ACTUAL:\n{fixed}");
     // Old name gone
-    assert!(!fixed.contains("MyVar"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("myVar"), "ACTUAL:\n{fixed}");
 }
 
 #[test]
@@ -516,7 +529,7 @@ end."#;
 
 #[test]
 fn fix_multi_name_declaration() {
-    // `MyA, MyB: Integer` — both names must be renamed to camelCase.
+    // `myA, myB: Integer` — both names must be renamed to PascalCase.
     let source = r#"unit Test;
 
 interface
@@ -525,22 +538,22 @@ implementation
 
 procedure DoWork;
 var
-  MyA, MyB: Integer;
+  myA, myB: Integer;
 begin
-  MyA := 1;
-  MyB := 2;
+  myA := 1;
+  myB := 2;
 end;
 
 end."#;
     let fixed = fix_source(source);
     // Declaration renamed
-    assert!(fixed.contains("myA, myB: Integer;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyA, MyB: Integer;"), "ACTUAL:\n{fixed}");
     // Usages renamed
-    assert!(fixed.contains("myA := 1;"), "ACTUAL:\n{fixed}");
-    assert!(fixed.contains("myB := 2;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyA := 1;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyB := 2;"), "ACTUAL:\n{fixed}");
     // Old names gone
-    assert!(!fixed.contains("MyA"), "ACTUAL:\n{fixed}");
-    assert!(!fixed.contains("MyB"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("myA"), "ACTUAL:\n{fixed}");
+    assert!(!fixed.contains("myB"), "ACTUAL:\n{fixed}");
 }
 
 #[test]
@@ -563,9 +576,9 @@ implementation
 
 procedure TMyClass.DoWork;
 var
-  myVar: Integer;
+  MyVar: Integer;
 begin
-  myVar := MY_CONST;
+  MyVar := MY_CONST;
 end;
 
 end."#;
@@ -592,9 +605,9 @@ implementation
 
 procedure DoWork;
 var
-  myVar: Integer;
+  MyVar: Integer;
 begin
-  myVar := MY_CONST;
+  MyVar := MY_CONST;
 end;
 
 end."#;
@@ -644,17 +657,20 @@ fn fixture_constant_naming_fix() {
 #[test]
 fn fixture_local_variable_fix() {
     let (fixed, count) = fix_fixture("tests/fixtures/fix/local_variable.pas");
-    assert!(count > 0);
-    assert!(fixed.contains("myCounter: Integer;"));
-    assert!(fixed.contains("anotherBadName: string;"));
+    assert!(count > 0, "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyCounter: Integer;"), "ACTUAL:\n{fixed}");
+    assert!(
+        fixed.contains("AnotherBadName: string;"),
+        "ACTUAL:\n{fixed}"
+    );
     assert!(fixed.contains("x: Integer;")); // single-char exempt
                                             // Parameters should also be renamed
-    assert!(fixed.contains("badParam: Integer"), "ACTUAL:\n{fixed}");
-    assert!(fixed.contains("anotherParam: string"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("BadParam: Integer"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("AnotherParam: string"), "ACTUAL:\n{fixed}");
     // Usages of renamed parameters should also be updated
-    assert!(fixed.contains("myCounter := badParam;"), "ACTUAL:\n{fixed}");
+    assert!(fixed.contains("MyCounter := BadParam;"), "ACTUAL:\n{fixed}");
     assert!(
-        fixed.contains("anotherBadName := anotherParam;"),
+        fixed.contains("AnotherBadName := AnotherParam;"),
         "ACTUAL:\n{fixed}"
     );
 }
@@ -673,7 +689,8 @@ fn fixture_combined_fix() {
     assert!(count > 0);
     assert!(fixed.contains("TMyClass = class(TObject)"));
     assert!(fixed.contains("MAX_RETRIES = 3;"));
-    assert!(fixed.contains("retryCount: Integer;"));
+    // RetryCount is already PascalCase — stays as-is
+    assert!(fixed.contains("RetryCount: Integer;"), "ACTUAL:\n{fixed}");
 }
 
 #[test]

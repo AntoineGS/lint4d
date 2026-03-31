@@ -8,16 +8,16 @@ uses SysUtils;
 
 procedure TestWith;
 var
-  sl: TStringList;
+  Sl: TStringList;
 begin
-  sl := TStringList.Create;
+  Sl := TStringList.Create;
   try
-    with sl do
+    with Sl do
     begin
       Add('hello');
     end;
   finally
-    sl.Free;
+    Sl.Free;
   end;
 end;
 

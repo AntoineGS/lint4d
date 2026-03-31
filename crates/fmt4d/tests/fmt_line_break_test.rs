@@ -1,7 +1,5 @@
 //! Tests for AST-aware line breaking (smart line splitting).
 
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 fn format_source(source: &str) -> String {

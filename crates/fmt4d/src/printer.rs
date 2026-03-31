@@ -1058,7 +1058,6 @@ impl<'a> Printer<'a> {
 
     /// Measure the single-line width a subtree would produce.
     /// Returns `(width, last_kind, last_parent_kind)` so callers can chain measurements.
-    #[allow(dead_code)]
     pub(crate) fn measure_node(
         &self,
         node: Node,
@@ -1111,7 +1110,6 @@ impl<'a> Printer<'a> {
     }
 
     /// Measure a single leaf token.
-    #[allow(dead_code)]
     pub(crate) fn measure_leaf(
         &self,
         node: Node,
@@ -1134,7 +1132,6 @@ impl<'a> Printer<'a> {
 
     /// Pure spacing check — mirrors `needs_space_before` but takes explicit
     /// parameters instead of reading `self.last_token_kind`.
-    #[allow(dead_code)]
     pub(crate) fn would_need_space(
         &self,
         prev_kind: &str,
@@ -1230,7 +1227,6 @@ impl<'a> Printer<'a> {
 
     /// Measure the combined single-line width of a slice of nodes.
     /// Starts from `self.last_token_kind` / `self.last_token_parent_kind`.
-    #[allow(dead_code)]
     pub(crate) fn measure_group(&self, nodes: &[Node]) -> (usize, String, String) {
         let mut total = 0usize;
         let mut cur_kind = self.last_token_kind.clone();

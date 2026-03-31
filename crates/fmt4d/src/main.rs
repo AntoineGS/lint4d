@@ -284,8 +284,8 @@ fn run_init() -> i32 {
 # sort = true
 
 # Group uses clause by internal/external units
-# Default: true
-# group = true
+# Default: false
+# group = false
 
 # Paths that should be considered external (for grouping)
 # Default: []

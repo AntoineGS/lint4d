@@ -217,7 +217,9 @@ mod tests {
     use crate::config::UsesConfig;
 
     fn default_config() -> UsesConfig {
-        UsesConfig::default()
+        let mut cfg = UsesConfig::default();
+        cfg.group = true;
+        cfg
     }
 
     #[test]

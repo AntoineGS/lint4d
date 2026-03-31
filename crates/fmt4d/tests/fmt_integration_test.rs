@@ -3,13 +3,15 @@ use std::path::PathBuf;
 
 fn format_source(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let config = fmt4d::config::FmtConfig::default();
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.group = true;
     fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
 }
 
 fn idempotency_check(source: &str) {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let config = fmt4d::config::FmtConfig::default();
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.group = true;
     let first =
         fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("first failed");
     let second =
@@ -19,7 +21,8 @@ fn idempotency_check(source: &str) {
 
 fn roundtrip_ast_check(source: &str) {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let config = fmt4d::config::FmtConfig::default();
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.group = true;
     let formatted =
         fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("format failed");
 
@@ -189,6 +192,7 @@ fn comments_preserves_leading_comment() {
 fn uses_groups_with_external_prefixes() {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.group = true;
     config.uses.external_prefixes = vec!["Spring".to_string()];
 
     let source = "unit T;\ninterface\nuses\n  MyUnit, Spring.Container, System.SysUtils, Spring.Collections;\nimplementation\nend.\n";
@@ -225,6 +229,7 @@ fn uses_groups_with_external_paths() {
 
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.group = true;
     config.uses.external_paths = vec!["vendor".to_string()];
     config.project_root = Some(dir.path().to_path_buf());
 

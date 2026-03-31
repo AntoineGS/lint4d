@@ -88,7 +88,7 @@ impl Default for UsesConfig {
     fn default() -> Self {
         UsesConfig {
             sort: true,
-            group: true,
+            group: false,
             external_paths: Vec::new(),
             external_prefixes: Vec::new(),
         }
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(config.end_of_line, EndOfLine::Auto);
         assert_eq!(config.blank_lines.between_procedures, 1);
         assert!(config.uses.sort);
-        assert!(config.uses.group);
+        assert!(!config.uses.group);
         assert!(config.uses.external_paths.is_empty());
         assert!(config.uses.external_prefixes.is_empty());
     }
@@ -254,7 +254,7 @@ sort = false
         assert_eq!(config.max_line_length, 80);
         assert!(!config.uses.sort);
         assert_eq!(config.indent_style, IndentStyle::Space);
-        assert!(config.uses.group);
+        assert!(!config.uses.group);
     }
 
     #[test]

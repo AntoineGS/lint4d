@@ -22,6 +22,12 @@ pub struct Printer<'a> {
     last_token_kind: String,
     /// The parent kind of the last emitted leaf token.
     last_token_parent_kind: String,
+    /// Current column position (number of chars since last newline).
+    current_column: usize,
+    /// Maximum allowed line length (from config).
+    /// Stored for future use by line-breaking logic.
+    #[allow(dead_code)]
+    max_line_length: usize,
 }
 
 impl<'a> Printer<'a> {
@@ -43,11 +49,17 @@ impl<'a> Printer<'a> {
             at_line_start: true,
             last_token_kind: String::new(),
             last_token_parent_kind: String::new(),
+            current_column: 0,
+            max_line_length: config.max_line_length,
         }
     }
 
     pub fn result(self) -> String {
         self.output
+    }
+
+    pub fn current_column(&self) -> usize {
+        self.current_column
     }
 
     // ── Main dispatch ────────────────────────────────────────────
@@ -138,6 +150,7 @@ impl<'a> Printer<'a> {
                 if in_param_list {
                     // Space instead of newline — params continue on same line
                     self.output.push(' ');
+                    self.current_column += 1;
                 } else {
                     self.ensure_newline();
                 }
@@ -179,7 +192,9 @@ impl<'a> Printer<'a> {
             let needs_space = self.needs_space_before(kind, parent_kind);
             if needs_space {
                 self.output.push(' ');
+                self.current_column += 1;
             }
+            self.current_column += text.len();
             self.output.push_str(text);
         }
     }
@@ -484,10 +499,12 @@ impl<'a> Printer<'a> {
                 "," if in_ancestor_list => {
                     self.emit_raw(",");
                     self.output.push(' ');
+                    self.current_column += 1;
                     self.last_token_kind = ",".to_string();
                 }
                 "typeref" if in_ancestor_list => {
                     let text = self.node_text(*child);
+                    self.current_column += text.len();
                     self.output.push_str(&text);
                     self.last_token_kind = "identifier".to_string();
                 }
@@ -551,8 +568,11 @@ impl<'a> Printer<'a> {
                         first = false;
                     } else {
                         // Strict private/protected: emit space then the keyword
+                        let kw_text = self.node_text(child);
                         self.output.push(' ');
-                        self.output.push_str(&self.node_text(child));
+                        self.current_column += 1;
+                        self.current_column += kw_text.len();
+                        self.output.push_str(&kw_text);
                         self.last_token_kind = child.kind().to_string();
                         self.ensure_newline();
                         self.indent.indent();
@@ -651,6 +671,7 @@ impl<'a> Printer<'a> {
                         self.emit_trailing_comments(child);
                         // Emit a space instead of newline before the directive
                         self.output.push(' ');
+                        self.current_column += 1;
                         self.at_line_start = false;
                     } else {
                         // Normal semicolon — emit with newline
@@ -683,6 +704,7 @@ impl<'a> Printer<'a> {
             uses::format_uses(&units, &self.config.uses, &indent_str, &self.external_units);
         self.output.push_str(&formatted);
         self.at_line_start = true;
+        self.current_column = 0;
         self.last_token_kind = ";".to_string();
         self.indent.dedent();
     }
@@ -715,7 +737,9 @@ impl<'a> Printer<'a> {
                 }
                 "kOf" => {
                     self.output.push(' ');
+                    self.current_column += 1;
                     self.output.push_str("of");
+                    self.current_column += "of".len();
                     self.last_token_kind = "kOf".to_string();
                     self.ensure_newline();
                     self.indent.indent();
@@ -897,6 +921,7 @@ impl<'a> Printer<'a> {
         for comment in comments {
             self.output.push(' ');
             self.output.push_str(&comment.text);
+            self.current_column += 1 + comment.text.len();
         }
     }
 
@@ -904,13 +929,18 @@ impl<'a> Printer<'a> {
 
     fn emit_indented(&mut self, text: &str) {
         if self.at_line_start {
-            self.output.push_str(&self.indent.current());
+            let indent_str = self.indent.current();
+            self.current_column = indent_str.len() + text.len();
+            self.output.push_str(&indent_str);
             self.at_line_start = false;
+        } else {
+            self.current_column += text.len();
         }
         self.output.push_str(text);
     }
 
     fn emit_raw(&mut self, text: &str) {
+        self.current_column += text.len();
         self.output.push_str(text);
     }
 
@@ -918,12 +948,14 @@ impl<'a> Printer<'a> {
         if !self.at_line_start {
             self.output.push('\n');
             self.at_line_start = true;
+            self.current_column = 0;
         }
     }
 
     fn emit_newline(&mut self) {
         self.output.push('\n');
         self.at_line_start = true;
+        self.current_column = 0;
     }
 
     fn node_text(&self, node: Node) -> String {
@@ -983,9 +1015,15 @@ impl<'a> Printer<'a> {
         self.output.push_str(&text);
         // Update state: check if text ends with a newline
         self.at_line_start = text.ends_with('\n');
-        if let Some(last_line) = text.lines().last() {
+        let last_line = text.lines().last();
+        if self.at_line_start {
+            self.current_column = 0;
+        } else if let Some(ll) = last_line {
+            self.current_column = ll.len();
+        }
+        if let Some(ll) = last_line {
             // crude: pick up the last "word" as last_token_kind
-            if let Some(word) = last_line.split_whitespace().last() {
+            if let Some(word) = ll.split_whitespace().last() {
                 self.last_token_kind = word.to_string();
             }
         }

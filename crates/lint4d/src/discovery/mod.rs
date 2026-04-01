@@ -1,9 +1,8 @@
-pub mod bds;
-pub mod dproj;
-pub mod msbuild;
-
-// Re-export from pascal-core
+// Re-export from pascal-core — single source of truth for discovery logic.
 pub use pascal_core::discovery::discover_files;
+pub use pascal_core::discovery_bds as bds;
+pub use pascal_core::discovery_dproj as dproj;
+pub use pascal_core::discovery_msbuild as msbuild;
 
 use std::path::PathBuf;
 

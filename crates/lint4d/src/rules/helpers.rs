@@ -356,6 +356,62 @@ pub fn first_identifier(node: Node) -> Option<Node> {
     None
 }
 
+/// Collect field names from class declarations in the AST (same file).
+///
+/// Returns a map from lowercase class name to its field names.
+pub fn collect_ast_class_fields(root: Node, source: &[u8]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    collect_ast_class_fields_recursive(root, source, &mut map);
+    map
+}
+
+fn collect_ast_class_fields_recursive(
+    node: Node,
+    source: &[u8],
+    out: &mut HashMap<String, Vec<String>>,
+) {
+    if node.kind() == K::DECL_TYPE {
+        if let Some((class_name, fields)) = parse_class_fields(node, source) {
+            out.insert(class_name.to_lowercase(), fields);
+            return;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_ast_class_fields_recursive(child, source, out);
+    }
+}
+
+/// Parse a `declType` node: if it declares a class, return (class_name, field_names).
+pub fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<String>)> {
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => first_identifier(node)?,
+    };
+    let name = node_text(name_node, source);
+
+    let mut cursor = node.walk();
+    let decl_class = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == K::DECL_CLASS)?;
+
+    let mut fields = Vec::new();
+    let mut class_cursor = decl_class.walk();
+    for section in decl_class.children(&mut class_cursor) {
+        if section.kind() == K::DECL_SECTION {
+            let mut section_cursor = section.walk();
+            for item in section.children(&mut section_cursor) {
+                if item.kind() == K::DECL_FIELD {
+                    if let Some(id_node) = first_identifier(item) {
+                        fields.push(node_text(id_node, source));
+                    }
+                }
+            }
+        }
+    }
+    Some((name, fields))
+}
+
 /// Convert a byte offset to 1-based (line, column).
 pub fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
     let offset = offset.min(source.len());

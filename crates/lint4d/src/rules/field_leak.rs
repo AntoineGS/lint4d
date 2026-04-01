@@ -4,8 +4,7 @@ use tree_sitter::{Node, Tree};
 use crate::cfg::analysis::AnalysisContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
-    ast_frees_variable, constructor_has_owner_args, first_identifier, is_constructor_call,
-    node_text,
+    self as helpers, ast_frees_variable, constructor_has_owner_args, is_constructor_call, node_text,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 use std::collections::{HashMap, HashSet};
@@ -140,60 +139,10 @@ fn analyze_class(class: &ClassInfo, def_procs: &[DefProcInfo], source: &[u8]) ->
 
 /// Collect all class declarations from the interface section.
 fn collect_classes(root: Node, source: &[u8]) -> Vec<ClassInfo> {
-    let mut classes = Vec::new();
-    collect_classes_recursive(root, source, &mut classes);
-    classes
-}
-
-fn collect_classes_recursive(node: Node, source: &[u8], out: &mut Vec<ClassInfo>) {
-    if node.kind() == K::DECL_TYPE {
-        if let Some(info) = parse_decl_type(node, source) {
-            out.push(info);
-            return; // Don't recurse into a type decl
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_classes_recursive(child, source, out);
-    }
-}
-
-/// Parse a `declType` node into a `ClassInfo` if it is a class declaration.
-fn parse_decl_type(node: Node, source: &[u8]) -> Option<ClassInfo> {
-    let name_node = match node.child_by_field_name("name") {
-        Some(n) => n,
-        None => first_identifier(node)?,
-    };
-    let name = node_text(name_node, source);
-
-    // Find the `declClass` child.
-    let mut cursor = node.walk();
-    let decl_class = node
-        .children(&mut cursor)
-        .find(|c| c.kind() == K::DECL_CLASS)?;
-
-    let fields = collect_fields(decl_class, source);
-    Some(ClassInfo { name, fields })
-}
-
-/// Collect all field names from a `declClass` node.
-fn collect_fields(decl_class: Node, source: &[u8]) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut cursor = decl_class.walk();
-    for section in decl_class.children(&mut cursor) {
-        if section.kind() == K::DECL_SECTION {
-            let mut section_cursor = section.walk();
-            for item in section.children(&mut section_cursor) {
-                if item.kind() == K::DECL_FIELD {
-                    if let Some(id_node) = first_identifier(item) {
-                        fields.push(node_text(id_node, source));
-                    }
-                }
-            }
-        }
-    }
-    fields
+    helpers::collect_ast_class_fields(root, source)
+        .into_iter()
+        .map(|(name, fields)| ClassInfo { name, fields })
+        .collect()
 }
 
 /// Extract class name, method name, and flags from a `defProc` node.

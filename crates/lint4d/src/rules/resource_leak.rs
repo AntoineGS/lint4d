@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
@@ -8,8 +8,8 @@ use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers;
 use crate::rules::helpers::{
-    ast_references_variable, extract_uses_clauses, first_identifier, is_constructor_call,
-    node_text, statements_free_variable,
+    ast_references_variable, collect_ast_class_fields, extract_uses_clauses, first_identifier,
+    is_constructor_call, node_text, statements_free_variable,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
@@ -669,64 +669,6 @@ fn except_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool 
         }
     }
     false
-}
-
-// ─── AST class field collector ────────────────────────────────────────────────
-
-/// Collect field names from class declarations in the AST (same file).
-///
-/// Returns a map from lowercase class name to its field names.
-fn collect_ast_class_fields(root: Node, source: &[u8]) -> HashMap<String, Vec<String>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    collect_ast_class_fields_recursive(root, source, &mut map);
-    map
-}
-
-fn collect_ast_class_fields_recursive(
-    node: Node,
-    source: &[u8],
-    out: &mut HashMap<String, Vec<String>>,
-) {
-    if node.kind() == K::DECL_TYPE {
-        if let Some((class_name, fields)) = parse_class_fields(node, source) {
-            out.insert(class_name.to_lowercase(), fields);
-            return;
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_ast_class_fields_recursive(child, source, out);
-    }
-}
-
-/// Parse a `declType` node: if it declares a class, return (class_name, field_names).
-fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<String>)> {
-    let name_node = match node.child_by_field_name("name") {
-        Some(n) => n,
-        None => first_identifier(node)?,
-    };
-    let name = node_text(name_node, source);
-
-    let mut cursor = node.walk();
-    let decl_class = node
-        .children(&mut cursor)
-        .find(|c| c.kind() == K::DECL_CLASS)?;
-
-    let mut fields = Vec::new();
-    let mut class_cursor = decl_class.walk();
-    for section in decl_class.children(&mut class_cursor) {
-        if section.kind() == K::DECL_SECTION {
-            let mut section_cursor = section.walk();
-            for item in section.children(&mut section_cursor) {
-                if item.kind() == K::DECL_FIELD {
-                    if let Some(id_node) = first_identifier(item) {
-                        fields.push(node_text(id_node, source));
-                    }
-                }
-            }
-        }
-    }
-    Some((name, fields))
 }
 
 /// Collect interface type names from `declType` nodes in the AST.

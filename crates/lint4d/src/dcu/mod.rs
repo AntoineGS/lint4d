@@ -1,7 +1,10 @@
+pub(crate) mod class_parser;
 pub mod const_add_info;
+pub(crate) mod decl_parser;
 pub mod header;
 pub mod reader;
 pub mod tags;
+pub(crate) mod type_defs;
 pub mod types;
 
 pub use tags::DcuError;

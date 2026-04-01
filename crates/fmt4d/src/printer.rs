@@ -250,7 +250,9 @@ impl<'a> Printer<'a> {
         if self.at_line_start {
             self.emit_indented(text);
         } else {
-            let needs_space = self.needs_space_before(kind, parent_kind);
+            let prev_kind = self.last_token_kind.clone();
+            let prev_parent = self.last_token_parent_kind.clone();
+            let needs_space = self.would_need_space(&prev_kind, &prev_parent, kind, parent_kind);
             if needs_space {
                 self.output.push(' ');
                 self.current_column += 1;
@@ -258,97 +260,6 @@ impl<'a> Printer<'a> {
             self.current_column += text.len();
             self.output.push_str(text);
         }
-    }
-
-    fn needs_space_before(&self, kind: &str, parent_kind: &str) -> bool {
-        // No space before `)`, `]`, or `.`
-        if kind == K::CLOSE_PAREN || kind == K::CLOSE_BRACKET || kind == K::DOT {
-            return false;
-        }
-        // No space after `(`, `[`, or `.`
-        if self.last_token_kind == K::OPEN_PAREN
-            || self.last_token_kind == K::OPEN_BRACKET
-            || self.last_token_kind == K::DOT
-        {
-            return false;
-        }
-        // No space before `;`
-        if kind == K::SEMICOLON {
-            return false;
-        }
-        // No space before `,`
-        if kind == K::COMMA {
-            return false;
-        }
-        // No space before `[` in subscript context (array/string indexing)
-        if kind == K::OPEN_BRACKET && parent_kind == K::EXPR_SUBSCRIPT {
-            return false;
-        }
-        // No space before `(` in call/args context (but NOT exprParens —
-        // `if (x)` must keep the space between keyword and `(`).
-        if kind == K::OPEN_PAREN && (parent_kind == K::EXPR_CALL || parent_kind == K::DECL_ARGS) {
-            return false;
-        }
-        // No spaces inside generic angle brackets: TList<Integer> not TList < Integer >
-        if (kind == K::K_LT || kind == K::LESS_THAN)
-            && (parent_kind == K::TYPEREF_TPL
-                || parent_kind == K::GENERIC_TPL
-                || parent_kind == K::GENERIC_ARGS
-                || parent_kind == K::TYPEREF_ARGS
-                || parent_kind == K::EXPR_TPL)
-        {
-            return false;
-        }
-        if (kind == K::K_GT || kind == K::GREATER_THAN)
-            && (parent_kind == K::TYPEREF_TPL
-                || parent_kind == K::GENERIC_TPL
-                || parent_kind == K::GENERIC_ARGS
-                || parent_kind == K::TYPEREF_ARGS
-                || parent_kind == K::EXPR_TPL)
-        {
-            return false;
-        }
-        // No space after `<` in generic context only
-        if self.last_token_kind == K::K_LT && is_generic_parent(&self.last_token_parent_kind) {
-            return false;
-        }
-        // No space before `:` in declarations
-        if kind == K::COLON {
-            return false;
-        }
-        // No space around `..` in range expressions
-        if kind == K::DOTDOT || self.last_token_kind == K::DOTDOT {
-            return false;
-        }
-        // kDot / `.` inside genericDot
-        if kind == K::K_DOT {
-            return false;
-        }
-        // After kDot, no space
-        if self.last_token_kind == K::K_DOT || self.last_token_kind == K::DOT {
-            return false;
-        }
-        // Use spacing module for known operators
-        if spacing::space_before(kind) {
-            return true;
-        }
-        // Space after operator-like tokens
-        if spacing::space_after(&self.last_token_kind) {
-            return true;
-        }
-        // Space after keywords that expect an expression/identifier
-        if is_keyword_needing_space_after(&self.last_token_kind) {
-            return true;
-        }
-        // Default: space between two identifiers/keywords/literals
-        if !self.last_token_kind.is_empty()
-            && self.last_token_kind != K::SEMICOLON
-            && self.last_token_kind != K::OPEN_PAREN
-            && self.last_token_kind != K::OPEN_BRACKET
-        {
-            return true;
-        }
-        false
     }
 
     // ── Unit structure ─────────────────────────────────────────

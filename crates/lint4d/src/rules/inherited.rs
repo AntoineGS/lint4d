@@ -1,3 +1,4 @@
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
@@ -12,7 +13,7 @@ fn first_identifier(node: Node) -> Option<Node> {
     let count = node.child_count();
     for i in 0..count {
         let child = node.child(i)?;
-        if child.kind() == "identifier" && !child.is_extra() {
+        if child.kind() == K::IDENTIFIER && !child.is_extra() {
             return Some(child);
         }
     }
@@ -32,8 +33,8 @@ fn block_statements(block: Node) -> Vec<Node> {
                 && !c.is_extra()
                 && !c.is_error()
                 && !c.is_missing()
-                && c.kind() != "kBegin"
-                && c.kind() != "kEnd"
+                && c.kind() != K::K_BEGIN
+                && c.kind() != K::K_END
         })
         .collect()
 }
@@ -45,7 +46,7 @@ fn block_statements(block: Node) -> Vec<Node> {
 /// Intentionally does NOT recurse into control-flow nodes (if/try/for/while)
 /// so that `inherited` nested inside a branch is NOT considered a direct call.
 fn statement_is_direct_inherited(node: Node) -> bool {
-    if node.kind() == "inherited" {
+    if node.kind() == K::INHERITED {
         return true;
     }
     // Check the first named, non-extra child of this statement node
@@ -54,7 +55,7 @@ fn statement_is_direct_inherited(node: Node) -> bool {
         .children(&mut cursor)
         .find(|c| c.is_named() && !c.is_extra());
     if let Some(child) = first_child {
-        if child.kind() == "inherited" {
+        if child.kind() == K::INHERITED {
             return true;
         }
     }
@@ -63,7 +64,7 @@ fn statement_is_direct_inherited(node: Node) -> bool {
 
 /// Find the first `inherited` node anywhere inside `node` (recursive).
 fn find_inherited(node: Node) -> Option<Node> {
-    if node.kind() == "inherited" {
+    if node.kind() == K::INHERITED {
         return Some(node);
     }
     let mut cursor = node.walk();
@@ -121,7 +122,7 @@ impl Rule for InheritedCallOrderRule {
 }
 
 fn visit_def_procs_order(node: Node, source: &[u8], ctx: &mut LintContext) {
-    if node.kind() == "defProc" {
+    if node.kind() == K::DEF_PROC {
         check_inherited_order(node, source, ctx);
     }
 
@@ -224,7 +225,7 @@ fn find_reintroduce_recursive(
     method_name: &str,
     source: &[u8],
 ) -> bool {
-    if node.kind() == "declType" {
+    if node.kind() == K::DECL_TYPE {
         // Check if this is the class we're looking for.
         // Use child_by_field_name("name") with first_identifier fallback
         // (some grammar versions don't set the "name" field on declType).
@@ -237,7 +238,7 @@ fn find_reintroduce_recursive(
                 // Find the declClass child
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    if child.kind() == "declClass" {
+                    if child.kind() == K::DECL_CLASS {
                         return class_has_reintroduced_method(child, method_name, source);
                     }
                 }
@@ -261,14 +262,14 @@ fn class_has_reintroduced_method(decl_class: Node, method_name: &str, source: &[
     let mut cursor = decl_class.walk();
     for child in decl_class.children(&mut cursor) {
         // declProc can be direct child or inside declSection
-        if child.kind() == "declProc"
+        if child.kind() == K::DECL_PROC
             && decl_proc_matches_and_reintroduced(child, method_name, source)
         {
             return true;
-        } else if child.kind() == "declSection" {
+        } else if child.kind() == K::DECL_SECTION {
             let mut section_cursor = child.walk();
             for section_child in child.children(&mut section_cursor) {
-                if section_child.kind() == "declProc"
+                if section_child.kind() == K::DECL_PROC
                     && decl_proc_matches_and_reintroduced(section_child, method_name, source)
                 {
                     return true;
@@ -295,10 +296,10 @@ fn decl_proc_matches_and_reintroduced(decl_proc: Node, method_name: &str, source
     // Check for procAttribute > kReintroduce
     let mut cursor = decl_proc.walk();
     for child in decl_proc.children(&mut cursor) {
-        if child.kind() == "procAttribute" {
+        if child.kind() == K::PROC_ATTRIBUTE {
             let mut attr_cursor = child.walk();
             for attr_child in child.children(&mut attr_cursor) {
-                if attr_child.kind() == "kReintroduce" {
+                if attr_child.kind() == K::K_REINTRODUCE {
                     return true;
                 }
             }
@@ -352,7 +353,7 @@ impl Rule for InheritedCallMissingRule {
 }
 
 fn visit_def_procs_missing(node: Node, root: Node, source: &[u8], ctx: &mut LintContext) {
-    if node.kind() == "defProc" {
+    if node.kind() == K::DEF_PROC {
         check_inherited_missing(node, root, source, ctx);
     }
 
@@ -390,7 +391,7 @@ fn check_inherited_missing(def_proc: Node, root: Node, source: &[u8], ctx: &mut 
     // Report on the declProc (header) node
     let header = def_proc
         .children(&mut def_proc.walk())
-        .find(|c| c.kind() == "declProc")
+        .find(|c| c.kind() == K::DECL_PROC)
         .unwrap_or(def_proc);
     let start = header.start_position();
     let end = header.end_position();

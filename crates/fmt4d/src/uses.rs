@@ -1,4 +1,5 @@
 use crate::config::UsesConfig;
+use pascal_core::node_kind as K;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -168,7 +169,7 @@ pub fn format_uses(
 pub fn extract_uses_units(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut units = Vec::new();
     for child in node.children(&mut node.walk()) {
-        if child.kind() == "moduleName" {
+        if child.kind() == K::MODULE_NAME {
             let text = std::str::from_utf8(&source[child.start_byte()..child.end_byte()])
                 .unwrap_or("")
                 .to_string();

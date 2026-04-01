@@ -1,3 +1,4 @@
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
@@ -50,10 +51,10 @@ impl Rule for WithStatementRule {
 }
 
 fn visit_with(node: Node, ctx: &mut LintContext) {
-    if node.kind() == "with" {
+    if node.kind() == K::WITH {
         if let Some(kw) = node
             .children(&mut node.walk())
-            .find(|c| c.kind() == "kWith")
+            .find(|c| c.kind() == K::K_WITH)
         {
             let start = kw.start_position();
             let end = kw.end_position();

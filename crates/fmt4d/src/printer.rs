@@ -3,6 +3,7 @@ use crate::config::FmtConfig;
 use crate::indent::IndentContext;
 use crate::spacing;
 use crate::uses;
+use pascal_core::node_kind as K;
 use pascal_core::FormatOffRegion;
 use std::collections::HashSet;
 use tree_sitter::Node;
@@ -73,26 +74,26 @@ impl<'a> Printer<'a> {
         self.emit_leading_comments(node);
 
         match node.kind() {
-            "unit" => self.print_unit(node),
-            "interface" => self.print_interface_section(node),
-            "implementation" => self.print_implementation_section(node),
-            "initialization" | "finalization" => self.print_init_final_section(node),
-            "declUses" => self.print_uses(node),
-            "block" | "statements" => self.print_block(node),
-            "declClass" | "declRecord" | "declIntf" => self.print_type_body(node),
-            "declSection" => self.print_decl_section(node),
-            "declVars" | "declConsts" | "declTypes" => self.print_section(node),
-            "defProc" => self.print_def_proc(node),
-            "declProc" => self.print_decl_proc(node),
-            "try" => self.print_try(node),
-            "case" => self.print_case(node),
-            "repeat" => self.print_repeat(node),
-            "if" | "ifElse" => self.print_if(node),
-            "for" | "foreach" | "while" | "with" => self.print_loop(node),
+            K::UNIT => self.print_unit(node),
+            K::INTERFACE => self.print_interface_section(node),
+            K::IMPLEMENTATION => self.print_implementation_section(node),
+            K::INITIALIZATION | K::FINALIZATION => self.print_init_final_section(node),
+            K::DECL_USES => self.print_uses(node),
+            K::BLOCK | K::STATEMENTS => self.print_block(node),
+            K::DECL_CLASS | K::DECL_RECORD | K::DECL_INTF => self.print_type_body(node),
+            K::DECL_SECTION => self.print_decl_section(node),
+            K::DECL_VARS | K::DECL_CONSTS | K::DECL_TYPES => self.print_section(node),
+            K::DEF_PROC => self.print_def_proc(node),
+            K::DECL_PROC => self.print_decl_proc(node),
+            K::TRY => self.print_try(node),
+            K::CASE => self.print_case(node),
+            K::REPEAT => self.print_repeat(node),
+            K::IF | K::IF_ELSE => self.print_if(node),
+            K::FOR | K::FOREACH | K::WHILE | K::WITH => self.print_loop(node),
             // Emit literalChar / literalString as verbatim text (children don't
             // cover the full text, e.g. `#0` has child `#` but not `0`).
-            "literalChar" | "literalString" => self.print_verbatim_leaf(node),
-            "declArgs" => {
+            K::LITERAL_CHAR | K::LITERAL_STRING => self.print_verbatim_leaf(node),
+            K::DECL_ARGS => {
                 let (width, _, _) = self.measure_node(
                     node,
                     &self.last_token_kind.clone(),
@@ -104,7 +105,7 @@ impl<'a> Printer<'a> {
                     self.recurse_children(node);
                 }
             }
-            "exprCall" => {
+            K::EXPR_CALL => {
                 let (width, _, _) = self.measure_node(
                     node,
                     &self.last_token_kind.clone(),
@@ -146,8 +147,16 @@ impl<'a> Printer<'a> {
         for child in node.children(&mut node.walk()) {
             if child.child_count() == 0 {
                 match child.kind() {
-                    "kAdd" | "kSub" | "kMul" | "kDiv" | "kMod" | "kAnd" | "kOr" | "kXor"
-                    | "kShl" | "kShr" => return true,
+                    K::K_ADD
+                    | K::K_SUB
+                    | K::K_MUL
+                    | K::K_DIV
+                    | K::K_MOD
+                    | K::K_AND
+                    | K::K_OR
+                    | K::K_XOR
+                    | K::K_SHL
+                    | K::K_SHR => return true,
                     _ => {}
                 }
             }
@@ -191,13 +200,13 @@ impl<'a> Printer<'a> {
             .unwrap_or_default();
 
         match kind {
-            ";" => {
+            K::SEMICOLON => {
                 // Inside a parameter list (declArgs), `;` separates params
                 // but should NOT force a newline.  If line-breaking is needed,
                 // the line_break pass handles it with continuation indent.
-                let in_param_list = Self::is_ancestor(node, "declArgs");
+                let in_param_list = Self::is_ancestor(node, K::DECL_ARGS);
                 self.emit_raw(";");
-                self.set_last_token(";", &parent_kind);
+                self.set_last_token(K::SEMICOLON, &parent_kind);
                 self.emit_trailing_comments(node);
                 if in_param_list {
                     // Space instead of newline — params continue on same line
@@ -207,20 +216,20 @@ impl<'a> Printer<'a> {
                     self.ensure_newline();
                 }
             }
-            "kBegin" | "kTry" | "kRepeat" | "kAsm" => {
+            K::K_BEGIN | K::K_TRY | K::K_REPEAT | K::K_ASM => {
                 self.ensure_newline();
                 self.emit_indented(&text);
                 self.set_last_token(kind, &parent_kind);
                 self.ensure_newline();
                 self.indent.indent();
             }
-            "kEnd" => {
+            K::K_END => {
                 self.indent.dedent();
                 self.ensure_newline();
                 self.emit_indented(&text);
                 self.set_last_token(kind, &parent_kind);
             }
-            "kExcept" | "kFinally" => {
+            K::K_EXCEPT | K::K_FINALLY => {
                 self.indent.dedent();
                 self.ensure_newline();
                 self.emit_indented(&text);
@@ -253,68 +262,70 @@ impl<'a> Printer<'a> {
 
     fn needs_space_before(&self, kind: &str, parent_kind: &str) -> bool {
         // No space before `)`, `]`, or `.`
-        if kind == ")" || kind == "]" || kind == "." {
+        if kind == K::CLOSE_PAREN || kind == K::CLOSE_BRACKET || kind == K::DOT {
             return false;
         }
         // No space after `(`, `[`, or `.`
-        if self.last_token_kind == "(" || self.last_token_kind == "[" || self.last_token_kind == "."
+        if self.last_token_kind == K::OPEN_PAREN
+            || self.last_token_kind == K::OPEN_BRACKET
+            || self.last_token_kind == K::DOT
         {
             return false;
         }
         // No space before `;`
-        if kind == ";" {
+        if kind == K::SEMICOLON {
             return false;
         }
         // No space before `,`
-        if kind == "," {
+        if kind == K::COMMA {
             return false;
         }
         // No space before `[` in subscript context (array/string indexing)
-        if kind == "[" && parent_kind == "exprSubscript" {
+        if kind == K::OPEN_BRACKET && parent_kind == K::EXPR_SUBSCRIPT {
             return false;
         }
         // No space before `(` in call/args context (but NOT exprParens —
         // `if (x)` must keep the space between keyword and `(`).
-        if kind == "(" && (parent_kind == "exprCall" || parent_kind == "declArgs") {
+        if kind == K::OPEN_PAREN && (parent_kind == K::EXPR_CALL || parent_kind == K::DECL_ARGS) {
             return false;
         }
         // No spaces inside generic angle brackets: TList<Integer> not TList < Integer >
-        if (kind == "kLt" || kind == "<")
-            && (parent_kind == "typerefTpl"
-                || parent_kind == "genericTpl"
-                || parent_kind == "genericArgs"
-                || parent_kind == "typerefArgs"
-                || parent_kind == "exprTpl")
+        if (kind == K::K_LT || kind == K::LESS_THAN)
+            && (parent_kind == K::TYPEREF_TPL
+                || parent_kind == K::GENERIC_TPL
+                || parent_kind == K::GENERIC_ARGS
+                || parent_kind == K::TYPEREF_ARGS
+                || parent_kind == K::EXPR_TPL)
         {
             return false;
         }
-        if (kind == "kGt" || kind == ">")
-            && (parent_kind == "typerefTpl"
-                || parent_kind == "genericTpl"
-                || parent_kind == "genericArgs"
-                || parent_kind == "typerefArgs"
-                || parent_kind == "exprTpl")
+        if (kind == K::K_GT || kind == K::GREATER_THAN)
+            && (parent_kind == K::TYPEREF_TPL
+                || parent_kind == K::GENERIC_TPL
+                || parent_kind == K::GENERIC_ARGS
+                || parent_kind == K::TYPEREF_ARGS
+                || parent_kind == K::EXPR_TPL)
         {
             return false;
         }
         // No space after `<` in generic context only
-        if self.last_token_kind == "kLt" && is_generic_parent(&self.last_token_parent_kind) {
+        if self.last_token_kind == K::K_LT && is_generic_parent(&self.last_token_parent_kind) {
             return false;
         }
         // No space before `:` in declarations
-        if kind == ":" {
+        if kind == K::COLON {
             return false;
         }
         // No space around `..` in range expressions
-        if kind == ".." || self.last_token_kind == ".." {
+        if kind == K::DOTDOT || self.last_token_kind == K::DOTDOT {
             return false;
         }
         // kDot / `.` inside genericDot
-        if kind == "kDot" {
+        if kind == K::K_DOT {
             return false;
         }
         // After kDot, no space
-        if self.last_token_kind == "kDot" || self.last_token_kind == "." {
+        if self.last_token_kind == K::K_DOT || self.last_token_kind == K::DOT {
             return false;
         }
         // Use spacing module for known operators
@@ -331,9 +342,9 @@ impl<'a> Printer<'a> {
         }
         // Default: space between two identifiers/keywords/literals
         if !self.last_token_kind.is_empty()
-            && self.last_token_kind != ";"
-            && self.last_token_kind != "("
-            && self.last_token_kind != "["
+            && self.last_token_kind != K::SEMICOLON
+            && self.last_token_kind != K::OPEN_PAREN
+            && self.last_token_kind != K::OPEN_BRACKET
         {
             return true;
         }
@@ -351,11 +362,11 @@ impl<'a> Printer<'a> {
             }
             let kind = child.kind().to_string();
             // Blank line before interface, implementation, initialization, finalization, and final kEnd
-            if (kind == "interface"
-                || kind == "implementation"
-                || kind == "initialization"
-                || kind == "finalization"
-                || kind == "kEnd")
+            if (kind == K::INTERFACE
+                || kind == K::IMPLEMENTATION
+                || kind == K::INITIALIZATION
+                || kind == K::FINALIZATION
+                || kind == K::K_END)
                 && !prev_kind.is_empty()
             {
                 self.ensure_newline();
@@ -375,9 +386,9 @@ impl<'a> Printer<'a> {
                 continue;
             }
             match child.kind() {
-                "kInterface" => {
+                K::K_INTERFACE => {
                     self.emit_indented("interface");
-                    self.last_token_kind = "kInterface".to_string();
+                    self.last_token_kind = K::K_INTERFACE.to_string();
                     self.ensure_newline();
                     after_header = true;
                 }
@@ -414,9 +425,9 @@ impl<'a> Printer<'a> {
                 continue;
             }
             match child.kind() {
-                "kImplementation" => {
+                K::K_IMPLEMENTATION => {
                     self.emit_indented("implementation");
-                    self.last_token_kind = "kImplementation".to_string();
+                    self.last_token_kind = K::K_IMPLEMENTATION.to_string();
                     self.ensure_newline();
                     after_header = true;
                 }
@@ -452,7 +463,7 @@ impl<'a> Printer<'a> {
                 continue;
             }
             match child.kind() {
-                "kInitialization" | "kFinalization" => {
+                K::K_INITIALIZATION | K::K_FINALIZATION => {
                     let text = self.node_text(child);
                     self.emit_indented(&text);
                     self.last_token_kind = child.kind().to_string();
@@ -522,7 +533,7 @@ impl<'a> Printer<'a> {
         // Detect whether this type body has declSection children (visibility
         // sections like private/public). If not, we need to indent the body
         // fields ourselves (e.g. plain records without visibility).
-        let has_visibility_sections = children.iter().any(|c| c.kind() == "declSection");
+        let has_visibility_sections = children.iter().any(|c| c.kind() == K::DECL_SECTION);
         let mut body_indented = false;
         // Track whether we're still in the ancestor list portion (before
         // the first body child or kEnd).
@@ -530,7 +541,7 @@ impl<'a> Printer<'a> {
 
         for child in &children {
             match child.kind() {
-                "kClass" | "kRecord" | "kInterface" | "kObject" => {
+                K::K_CLASS | K::K_RECORD | K::K_INTERFACE | K::K_OBJECT => {
                     // Emit the keyword on same line as `= class`
                     self.emit_token(child.kind(), &self.node_text(*child), "");
                     self.last_token_kind = child.kind().to_string();
@@ -538,29 +549,29 @@ impl<'a> Printer<'a> {
                     // DON'T newline yet — ancestor list `(...)` may follow
                 }
                 // Ancestor list tokens: `(`, `)`, `,`, typeref — keep on same line
-                "(" if in_ancestor_list => {
+                K::OPEN_PAREN if in_ancestor_list => {
                     self.emit_raw("(");
-                    self.last_token_kind = "(".to_string();
+                    self.last_token_kind = K::OPEN_PAREN.to_string();
                 }
-                ")" if in_ancestor_list => {
+                K::CLOSE_PAREN if in_ancestor_list => {
                     self.emit_raw(")");
-                    self.last_token_kind = ")".to_string();
+                    self.last_token_kind = K::CLOSE_PAREN.to_string();
                     in_ancestor_list = false;
                     self.ensure_newline();
                 }
-                "," if in_ancestor_list => {
+                K::COMMA if in_ancestor_list => {
                     self.emit_raw(",");
                     self.output.push(' ');
                     self.current_column += 1;
-                    self.last_token_kind = ",".to_string();
+                    self.last_token_kind = K::COMMA.to_string();
                 }
-                "typeref" if in_ancestor_list => {
+                K::TYPEREF if in_ancestor_list => {
                     let text = self.node_text(*child);
                     self.current_column += text.len();
                     self.output.push_str(&text);
-                    self.last_token_kind = "identifier".to_string();
+                    self.last_token_kind = K::IDENTIFIER.to_string();
                 }
-                "kEnd" => {
+                K::K_END => {
                     // End ancestor list if still in it (e.g. empty class with no ancestors)
                     if in_ancestor_list {
                         in_ancestor_list = false;
@@ -572,9 +583,9 @@ impl<'a> Printer<'a> {
                     }
                     self.ensure_newline();
                     self.emit_indented("end");
-                    self.last_token_kind = "kEnd".to_string();
+                    self.last_token_kind = K::K_END.to_string();
                 }
-                "declSection" => {
+                K::DECL_SECTION => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
                         self.ensure_newline();
@@ -587,7 +598,7 @@ impl<'a> Printer<'a> {
                         self.ensure_newline();
                     }
                     // For records/types without visibility sections, indent body fields
-                    if !has_visibility_sections && !body_indented && child.kind() != ";" {
+                    if !has_visibility_sections && !body_indented && child.kind() != K::SEMICOLON {
                         self.indent.indent();
                         body_indented = true;
                     }
@@ -610,7 +621,7 @@ impl<'a> Printer<'a> {
                 continue;
             }
             match child.kind() {
-                "kPublic" | "kPrivate" | "kProtected" | "kPublished" | "kStrict" => {
+                K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED | K::K_STRICT => {
                     if first {
                         self.ensure_newline();
                         self.emit_indented(&self.node_text(child));
@@ -660,7 +671,7 @@ impl<'a> Printer<'a> {
                 continue;
             }
             match child.kind() {
-                "kVar" | "kConst" | "kType" => {
+                K::K_VAR | K::K_CONST | K::K_TYPE => {
                     self.ensure_newline();
                     self.emit_indented(&self.node_text(child));
                     self.last_token_kind = child.kind().to_string();
@@ -671,7 +682,7 @@ impl<'a> Printer<'a> {
                 _ => {
                     let kind = child.kind().to_string();
                     // Insert blank line between type declarations in a type section
-                    if kind == "declType" && prev_child_kind == "declType" {
+                    if kind == K::DECL_TYPE && prev_child_kind == K::DECL_TYPE {
                         self.ensure_newline();
                         self.emit_newline();
                     }
@@ -712,14 +723,14 @@ impl<'a> Printer<'a> {
         while i < children.len() {
             let child = children[i];
             match child.kind() {
-                ";" => {
+                K::SEMICOLON => {
                     // Check if next sibling is a procAttribute — if so, emit
                     // the semicolon WITHOUT a newline to keep directives on
                     // the same line.
                     let next = children.get(i + 1);
-                    if next.map(|n| n.kind()) == Some("procAttribute") {
+                    if next.map(|n| n.kind()) == Some(K::PROC_ATTRIBUTE) {
                         self.emit_raw(";");
-                        self.last_token_kind = ";".to_string();
+                        self.last_token_kind = K::SEMICOLON.to_string();
                         self.emit_trailing_comments(child);
                         // Emit a space instead of newline before the directive
                         self.output.push(' ');
@@ -728,7 +739,7 @@ impl<'a> Printer<'a> {
                     } else {
                         // Normal semicolon — emit with newline
                         self.emit_raw(";");
-                        self.last_token_kind = ";".to_string();
+                        self.last_token_kind = K::SEMICOLON.to_string();
                         self.emit_trailing_comments(child);
                         self.ensure_newline();
                     }
@@ -748,7 +759,7 @@ impl<'a> Printer<'a> {
         let units = uses::extract_uses_units(node, self.source);
         self.ensure_newline();
         self.emit_indented("uses");
-        self.last_token_kind = "kUses".to_string();
+        self.last_token_kind = K::K_USES.to_string();
         self.ensure_newline();
         self.indent.indent();
         let indent_str = self.indent.current();
@@ -757,7 +768,7 @@ impl<'a> Printer<'a> {
         self.output.push_str(&formatted);
         self.at_line_start = true;
         self.current_column = 0;
-        self.last_token_kind = ";".to_string();
+        self.last_token_kind = K::SEMICOLON.to_string();
         self.indent.dedent();
     }
 
@@ -783,35 +794,35 @@ impl<'a> Printer<'a> {
                 continue;
             }
             match child.kind() {
-                "kCase" => {
+                K::K_CASE => {
                     self.emit_indented("case");
-                    self.last_token_kind = "kCase".to_string();
+                    self.last_token_kind = K::K_CASE.to_string();
                 }
-                "kOf" => {
+                K::K_OF => {
                     self.output.push(' ');
                     self.current_column += 1;
                     self.output.push_str("of");
                     self.current_column += "of".len();
-                    self.last_token_kind = "kOf".to_string();
+                    self.last_token_kind = K::K_OF.to_string();
                     self.ensure_newline();
                     self.indent.indent();
                     after_of = true;
                 }
-                "caseCase" => {
+                K::CASE_CASE => {
                     self.print_case_branch(child);
                 }
-                "kElse" => {
+                K::K_ELSE => {
                     // `else` aligns with `case`, not with the branches
                     self.indent.dedent();
                     self.emit_leading_comments(child);
                     self.ensure_newline();
                     self.emit_indented("else");
-                    self.last_token_kind = "kElse".to_string();
+                    self.last_token_kind = K::K_ELSE.to_string();
                     self.ensure_newline();
                     self.indent.indent();
                     // after_of stays true — kEnd will do the final dedent
                 }
-                "kEnd" => {
+                K::K_END => {
                     if after_of {
                         self.indent.dedent();
                         after_of = false;
@@ -819,7 +830,7 @@ impl<'a> Printer<'a> {
                     self.emit_leading_comments(child);
                     self.ensure_newline();
                     self.emit_indented("end");
-                    self.last_token_kind = "kEnd".to_string();
+                    self.last_token_kind = K::K_END.to_string();
                 }
                 _ => {
                     self.print_node(child);
@@ -879,13 +890,13 @@ impl<'a> Printer<'a> {
         while i < children.len() {
             let child = children[i];
             match child.kind() {
-                "kThen" | "kDo" => {
+                K::K_THEN | K::K_DO => {
                     // Emit the keyword on the same line
                     self.print_node(child);
                     // If the NEXT child is a single statement (not begin..end),
                     // put it on its own indented line.
                     if let Some(next) = children.get(i + 1) {
-                        if next.kind() != "block" && next.kind() != "kElse" {
+                        if next.kind() != K::BLOCK && next.kind() != K::K_ELSE {
                             self.ensure_newline();
                             self.indent.indent();
                             self.print_node(*next);
@@ -895,15 +906,17 @@ impl<'a> Printer<'a> {
                         }
                     }
                 }
-                "kElse" => {
+                K::K_ELSE => {
                     // `else` aligns with `if` — no extra indent
                     self.ensure_newline();
                     self.emit_indented("else");
-                    self.last_token_kind = "kElse".to_string();
+                    self.last_token_kind = K::K_ELSE.to_string();
                     // If next child is a single statement (not begin..end or another if),
                     // put it on its own indented line.
                     if let Some(next) = children.get(i + 1) {
-                        if next.kind() != "block" && next.kind() != "if" && next.kind() != "ifElse"
+                        if next.kind() != K::BLOCK
+                            && next.kind() != K::IF
+                            && next.kind() != K::IF_ELSE
                         {
                             self.ensure_newline();
                             self.indent.indent();
@@ -934,13 +947,13 @@ impl<'a> Printer<'a> {
         while i < children.len() {
             let child = children[i];
             match child.kind() {
-                "kDo" => {
+                K::K_DO => {
                     // Emit `do` on the same line
                     self.print_node(child);
                     // If next child is a single statement (not begin..end),
                     // put it on its own indented line.
                     if let Some(next) = children.get(i + 1) {
-                        if next.kind() != "block" {
+                        if next.kind() != K::BLOCK {
                             self.ensure_newline();
                             self.indent.indent();
                             self.print_node(*next);
@@ -1074,7 +1087,7 @@ impl<'a> Printer<'a> {
         let kind = node.kind();
 
         // Verbatim leaf nodes (literalChar / literalString) — treat as single token.
-        if kind == "literalChar" || kind == "literalString" {
+        if kind == K::LITERAL_CHAR || kind == K::LITERAL_STRING {
             let text = self.node_text(node);
             let parent_kind = node
                 .parent()
@@ -1144,65 +1157,65 @@ impl<'a> Printer<'a> {
             return false;
         }
         // 2. No space before `)`, `]`, `.`
-        if kind == ")" || kind == "]" || kind == "." {
+        if kind == K::CLOSE_PAREN || kind == K::CLOSE_BRACKET || kind == K::DOT {
             return false;
         }
         // 3. No space after `(`, `[`, `.`
-        if prev_kind == "(" || prev_kind == "[" || prev_kind == "." {
+        if prev_kind == K::OPEN_PAREN || prev_kind == K::OPEN_BRACKET || prev_kind == K::DOT {
             return false;
         }
         // 4. No space before `;`
-        if kind == ";" {
+        if kind == K::SEMICOLON {
             return false;
         }
         // 5. No space before `,`
-        if kind == "," {
+        if kind == K::COMMA {
             return false;
         }
         // 6. No space before `[` in subscript context
-        if kind == "[" && parent_kind == "exprSubscript" {
+        if kind == K::OPEN_BRACKET && parent_kind == K::EXPR_SUBSCRIPT {
             return false;
         }
         // 7. No space before `(` in call/args context
-        if kind == "(" && (parent_kind == "exprCall" || parent_kind == "declArgs") {
+        if kind == K::OPEN_PAREN && (parent_kind == K::EXPR_CALL || parent_kind == K::DECL_ARGS) {
             return false;
         }
         // 8. No spaces inside generic angle brackets
-        if (kind == "kLt" || kind == "<")
-            && (parent_kind == "typerefTpl"
-                || parent_kind == "genericTpl"
-                || parent_kind == "genericArgs"
-                || parent_kind == "typerefArgs"
-                || parent_kind == "exprTpl")
+        if (kind == K::K_LT || kind == K::LESS_THAN)
+            && (parent_kind == K::TYPEREF_TPL
+                || parent_kind == K::GENERIC_TPL
+                || parent_kind == K::GENERIC_ARGS
+                || parent_kind == K::TYPEREF_ARGS
+                || parent_kind == K::EXPR_TPL)
         {
             return false;
         }
-        if (kind == "kGt" || kind == ">")
-            && (parent_kind == "typerefTpl"
-                || parent_kind == "genericTpl"
-                || parent_kind == "genericArgs"
-                || parent_kind == "typerefArgs"
-                || parent_kind == "exprTpl")
+        if (kind == K::K_GT || kind == K::GREATER_THAN)
+            && (parent_kind == K::TYPEREF_TPL
+                || parent_kind == K::GENERIC_TPL
+                || parent_kind == K::GENERIC_ARGS
+                || parent_kind == K::TYPEREF_ARGS
+                || parent_kind == K::EXPR_TPL)
         {
             return false;
         }
         // 9. No space after `<` in generic context
-        if prev_kind == "kLt" && is_generic_parent(prev_parent_kind) {
+        if prev_kind == K::K_LT && is_generic_parent(prev_parent_kind) {
             return false;
         }
         // 10. No space before `:`
-        if kind == ":" {
+        if kind == K::COLON {
             return false;
         }
         // 11. No space around `..`
-        if kind == ".." || prev_kind == ".." {
+        if kind == K::DOTDOT || prev_kind == K::DOTDOT {
             return false;
         }
         // 12. No space before/after `kDot` or `.`
-        if kind == "kDot" {
+        if kind == K::K_DOT {
             return false;
         }
-        if prev_kind == "kDot" || prev_kind == "." {
+        if prev_kind == K::K_DOT || prev_kind == K::DOT {
             return false;
         }
         // 13. spacing::space_before
@@ -1218,7 +1231,11 @@ impl<'a> Printer<'a> {
             return true;
         }
         // 16. Default: space between two identifiers/keywords/literals
-        if !prev_kind.is_empty() && prev_kind != ";" && prev_kind != "(" && prev_kind != "[" {
+        if !prev_kind.is_empty()
+            && prev_kind != K::SEMICOLON
+            && prev_kind != K::OPEN_PAREN
+            && prev_kind != K::OPEN_BRACKET
+        {
             return true;
         }
         // 17. Otherwise
@@ -1284,19 +1301,19 @@ impl<'a> Printer<'a> {
 
 /// Block-opening keywords after which blank lines should be stripped.
 fn is_block_opener(kind: &str) -> bool {
-    matches!(kind, "kBegin" | "kTry" | "kRepeat" | "kAsm")
+    matches!(kind, K::K_BEGIN | K::K_TRY | K::K_REPEAT | K::K_ASM)
 }
 
 /// Block-closing keywords before which blank lines should be stripped.
 fn is_block_closer(kind: &str) -> bool {
-    matches!(kind, "kEnd" | "kExcept" | "kFinally")
+    matches!(kind, K::K_END | K::K_EXCEPT | K::K_FINALLY)
 }
 
 /// Parent kinds that indicate a generic type context (not comparison).
 fn is_generic_parent(parent_kind: &str) -> bool {
     matches!(
         parent_kind,
-        "typerefTpl" | "genericTpl" | "genericArgs" | "typerefArgs" | "exprTpl"
+        K::TYPEREF_TPL | K::GENERIC_TPL | K::GENERIC_ARGS | K::TYPEREF_ARGS | K::EXPR_TPL
     )
 }
 
@@ -1304,29 +1321,29 @@ fn is_generic_parent(parent_kind: &str) -> bool {
 fn is_keyword_needing_space_after(kind: &str) -> bool {
     matches!(
         kind,
-        "kProcedure"
-            | "kFunction"
-            | "kConstructor"
-            | "kDestructor"
-            | "kClass"
-            | "kRecord"
-            | "kProperty"
-            | "kRaise"
-            | "kInherited"
-            | "kWith"
-            | "kArray"
-            | "kSet"
-            | "kFile"
-            | "kString"
-            | "kProgram"
-            | "kLibrary"
-            | "kUnit"
-            | "kUses"
-            | "kOf"
-            | "kThen"
-            | "kDo"
-            | "kTo"
-            | "kDownto"
-            | "kElse"
+        K::K_PROCEDURE
+            | K::K_FUNCTION
+            | K::K_CONSTRUCTOR
+            | K::K_DESTRUCTOR
+            | K::K_CLASS
+            | K::K_RECORD
+            | K::K_PROPERTY
+            | K::K_RAISE
+            | K::K_INHERITED
+            | K::K_WITH
+            | K::K_ARRAY
+            | K::K_SET
+            | K::K_FILE
+            | K::K_STRING
+            | K::K_PROGRAM
+            | K::K_LIBRARY
+            | K::K_UNIT
+            | K::K_USES
+            | K::K_OF
+            | K::K_THEN
+            | K::K_DO
+            | K::K_TO
+            | K::K_DOWNTO
+            | K::K_ELSE
     )
 }

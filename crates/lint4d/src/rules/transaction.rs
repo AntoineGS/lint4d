@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use cfg_core::types::Cfg;
@@ -88,9 +89,9 @@ fn classify_transaction_call(
 
 fn extract_dot_call(node: Node, source: &[u8]) -> Option<(String, String)> {
     match node.kind() {
-        "exprCall" => {
+        K::EXPR_CALL => {
             let entity = node.child_by_field_name("entity")?;
-            if entity.kind() == "exprDot" {
+            if entity.kind() == K::EXPR_DOT {
                 let lhs = entity.child_by_field_name("lhs")?;
                 let rhs = entity.child_by_field_name("rhs")?;
                 Some((node_text(lhs, source), node_text(rhs, source)))
@@ -98,7 +99,7 @@ fn extract_dot_call(node: Node, source: &[u8]) -> Option<(String, String)> {
                 None
             }
         }
-        "exprDot" => {
+        K::EXPR_DOT => {
             let lhs = node.child_by_field_name("lhs")?;
             let rhs = node.child_by_field_name("rhs")?;
             Some((node_text(lhs, source), node_text(rhs, source)))
@@ -142,7 +143,7 @@ fn collect_guards_recursive(
     out: &mut Vec<GuardBinding>,
 ) {
     // Look for assignment: guardVar := not receiver.InTransaction
-    if node.kind() == "assignment" {
+    if node.kind() == K::ASSIGNMENT {
         if let Some(binding) = try_parse_guard_assignment(node, source, var_types, project, uses) {
             out.push(binding);
         }
@@ -167,7 +168,7 @@ fn try_parse_guard_assignment(
     let guard_var = node_text(lhs, source);
 
     // RHS must be `not <expr>` — check for exprUnary with `not` or `kNot`
-    if rhs.kind() != "exprUnary" {
+    if rhs.kind() != K::EXPR_UNARY {
         return None;
     }
     let mut rhs_cursor = rhs.walk();
@@ -176,7 +177,7 @@ fn try_parse_guard_assignment(
     for child in rhs.children(&mut rhs_cursor) {
         let kind = child.kind();
         let text_lower = node_text(child, source).to_lowercase();
-        if kind == "kNot" || text_lower == "not" {
+        if kind == K::K_NOT || text_lower == "not" {
             found_not = true;
         } else if child.is_named() {
             inner_expr = Some(child);
@@ -215,14 +216,14 @@ fn condition_is_guard(
         return true;
     }
     // Check inline `not receiver.InTransaction` pattern
-    if node.kind() == "exprUnary" {
+    if node.kind() == K::EXPR_UNARY {
         let mut cursor = node.walk();
         let mut found_not = false;
         let mut inner_expr: Option<Node> = None;
         for child in node.children(&mut cursor) {
             let kind = child.kind();
             let text_lower = node_text(child, source).to_lowercase();
-            if kind == "kNot" || text_lower == "not" {
+            if kind == K::K_NOT || text_lower == "not" {
                 found_not = true;
             } else if child.is_named() {
                 inner_expr = Some(child);
@@ -260,7 +261,7 @@ fn collect_protected_ranges(proc_node: Node) -> Vec<Range<usize>> {
 }
 
 fn collect_protected_ranges_recursive(node: Node, out: &mut Vec<Range<usize>>) {
-    if node.kind() == "try" {
+    if node.kind() == K::TRY {
         // Collect ranges for both `except` and `finally` sections within this try node.
         // Each section starts at the keyword token (`kExcept` or `kFinally`) and extends
         // to the closing `kEnd` token of this try block.
@@ -271,7 +272,7 @@ fn collect_protected_ranges_recursive(node: Node, out: &mut Vec<Range<usize>>) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
-                "kExcept" | "kFinally" => {
+                K::K_EXCEPT | K::K_FINALLY => {
                     // Flush any previous section that didn't find its end yet
                     if in_section {
                         if let (Some(start), Some(end)) = (section_start, end_byte) {
@@ -282,7 +283,7 @@ fn collect_protected_ranges_recursive(node: Node, out: &mut Vec<Range<usize>>) {
                     in_section = true;
                     end_byte = None;
                 }
-                "kEnd" if in_section => {
+                K::K_END if in_section => {
                     end_byte = Some(child.end_byte());
                 }
                 _ => {}
@@ -360,7 +361,7 @@ fn collect_ops_recursive(
     }
 
     // Check for `if guardVar then` — children on the then-branch are guarded
-    if node.kind() == "ifElse" || node.kind() == "if" {
+    if node.kind() == K::IF_ELSE || node.kind() == K::IF {
         if let Some(cond) = node
             .child_by_field_name("cond")
             .or_else(|| node.child_by_field_name("condition"))
@@ -382,11 +383,11 @@ fn collect_ops_recursive(
                     saw_cond = true;
                     continue;
                 }
-                if saw_cond && child.kind() == "kThen" {
+                if saw_cond && child.kind() == K::K_THEN {
                     in_then = true;
                     continue;
                 }
-                if child.kind() == "kElse" {
+                if child.kind() == K::K_ELSE {
                     in_then = false;
                 }
                 let child_guarded = if cond_is_guard && in_then {
@@ -609,7 +610,7 @@ fn extract_defproc_name(def_proc: Node, source: &[u8]) -> Option<String> {
         let mut cursor = def_proc.walk();
         let found = def_proc
             .children(&mut cursor)
-            .find(|c| c.kind() == "declProc");
+            .find(|c| c.kind() == K::DECL_PROC);
         drop(cursor);
         found?
     };
@@ -618,11 +619,11 @@ fn extract_defproc_name(def_proc: Node, source: &[u8]) -> Option<String> {
     let mut cursor = decl_proc.walk();
     if let Some(generic_dot) = decl_proc
         .children(&mut cursor)
-        .find(|c| c.kind() == "genericDot")
+        .find(|c| c.kind() == K::GENERIC_DOT)
     {
         let idents: Vec<Node> = generic_dot
             .children(&mut generic_dot.walk())
-            .filter(|c| c.kind() == "identifier")
+            .filter(|c| c.kind() == K::IDENTIFIER)
             .collect();
         if idents.len() >= 2 {
             return Some(format!(
@@ -644,7 +645,7 @@ fn extract_defproc_name(def_proc: Node, source: &[u8]) -> Option<String> {
     // Fallback: first direct `identifier` child of `declProc`
     let mut cursor2 = decl_proc.walk();
     for child in decl_proc.children(&mut cursor2) {
-        if child.kind() == "identifier" {
+        if child.kind() == K::IDENTIFIER {
             return Some(node_text(child, source));
         }
     }
@@ -655,7 +656,7 @@ fn extract_defproc_name(def_proc: Node, source: &[u8]) -> Option<String> {
 /// Find defProc nodes in the AST and match them to CFGs by proc_name.
 fn find_proc_node_for_cfg<'a>(tree: &'a Tree, source: &[u8], cfg: &Cfg) -> Option<Node<'a>> {
     fn walk<'a>(node: Node<'a>, source: &[u8], target_name: &str) -> Option<Node<'a>> {
-        if node.kind() == "defProc" {
+        if node.kind() == K::DEF_PROC {
             if let Some(name) = extract_defproc_name(node, source) {
                 if name.eq_ignore_ascii_case(target_name) {
                     return Some(node);

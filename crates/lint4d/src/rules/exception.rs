@@ -1,3 +1,4 @@
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use crate::cfg::analysis::AnalysisContext;
@@ -52,7 +53,7 @@ impl Rule for BareExceptRule {
 }
 
 fn visit_bare_except(node: Node, source: &[u8], ctx: &mut LintContext) {
-    if node.kind() == "try" {
+    if node.kind() == K::TRY {
         check_try_bare_except(node, source, ctx);
     }
 
@@ -112,7 +113,7 @@ fn check_try_bare_except(node: Node, source: &[u8], ctx: &mut LintContext) {
     // clauses — that is fine.
     let has_on_clause = except_children
         .iter()
-        .any(|child| child.kind() == "exceptionHandler");
+        .any(|child| child.kind() == K::EXCEPTION_HANDLER);
 
     if has_on_clause {
         return;
@@ -122,7 +123,7 @@ fn check_try_bare_except(node: Node, source: &[u8], ctx: &mut LintContext) {
     // except block handled by empty-except, not this rule.
     let has_statements = except_children
         .iter()
-        .any(|child| child.kind() == "statements");
+        .any(|child| child.kind() == K::STATEMENTS);
 
     if !has_statements {
         return;
@@ -152,7 +153,7 @@ fn check_try_bare_except(node: Node, source: &[u8], ctx: &mut LintContext) {
     }
 
     // Find the kExcept keyword node for location reporting.
-    if let Some(except_kw) = except_children.iter().find(|c| c.kind() == "kExcept") {
+    if let Some(except_kw) = except_children.iter().find(|c| c.kind() == K::K_EXCEPT) {
         let start = except_kw.start_position();
         let end = except_kw.end_position();
         ctx.report(Diagnostic {
@@ -217,7 +218,7 @@ impl Rule for EmptyExceptRule {
 }
 
 fn visit_node(node: Node, ctx: &mut LintContext) {
-    if node.kind() == "try" {
+    if node.kind() == K::TRY {
         check_try_node(node, ctx);
     }
 
@@ -246,11 +247,11 @@ fn check_try_node(node: Node, ctx: &mut LintContext) {
     // Check if any except child is a handler or statements (not just the keyword).
     let has_body = except_children
         .iter()
-        .any(|child| child.kind() != "kExcept");
+        .any(|child| child.kind() != K::K_EXCEPT);
 
     if !has_body {
         // Find the kExcept keyword for precise location reporting.
-        if let Some(except_kw) = except_children.iter().find(|c| c.kind() == "kExcept") {
+        if let Some(except_kw) = except_children.iter().find(|c| c.kind() == K::K_EXCEPT) {
             let start = except_kw.start_position();
             let end = except_kw.end_position();
             ctx.report(Diagnostic {
@@ -336,7 +337,7 @@ impl Rule for RaiseInDestructorRule {
 }
 
 fn visit_destructor_raises(node: Node, source: &[u8], ctx: &mut LintContext) {
-    if node.kind() == "defProc" {
+    if node.kind() == K::DEF_PROC {
         check_destructor_raises(node, source, ctx);
     }
     let mut cursor = node.walk();
@@ -359,7 +360,7 @@ fn check_destructor_raises(def_proc: Node, source: &[u8], ctx: &mut LintContext)
     let mut cursor = def_proc.walk();
     for child in def_proc.children(&mut cursor) {
         // Skip the method declaration header
-        if child.kind() == "declProc" {
+        if child.kind() == K::DECL_PROC {
             continue;
         }
         find_unguarded_raises(child, &class_name, &method_name, ctx);
@@ -369,7 +370,7 @@ fn check_destructor_raises(def_proc: Node, source: &[u8], ctx: &mut LintContext)
 /// Recursively scan for raise statements, skipping try..except subtrees.
 fn find_unguarded_raises(node: Node, class_name: &str, method_name: &str, ctx: &mut LintContext) {
     // Normal raise statement
-    if node.kind() == "raise" {
+    if node.kind() == K::RAISE {
         report_raise(node, class_name, method_name, ctx);
         return;
     }
@@ -381,7 +382,7 @@ fn find_unguarded_raises(node: Node, class_name: &str, method_name: &str, ctx: &
     }
 
     // If this is a try node with an except clause, the raises inside are guarded
-    if node.kind() == "try" && try_has_except(node) {
+    if node.kind() == K::TRY && try_has_except(node) {
         return;
     }
 
@@ -403,7 +404,7 @@ fn try_has_except(node: Node) -> bool {
 fn is_bare_raise(node: Node) -> bool {
     if node.child_count() == 1 {
         if let Some(child) = node.child(0) {
-            return child.kind() == "kRaise";
+            return child.kind() == K::K_RAISE;
         }
     }
     false

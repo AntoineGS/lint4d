@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
 use crate::rules::helpers::node_text;
@@ -43,7 +44,7 @@ fn walk_for_edits(
     casing_enabled: bool,
     edits: &mut Vec<TextEdit>,
 ) {
-    if node.kind() == "identifier" {
+    if node.kind() == K::IDENTIFIER {
         resolve_and_emit(
             node,
             source,
@@ -57,7 +58,7 @@ fn walk_for_edits(
     }
 
     // Enter a new procedure scope
-    if node.kind() == "defProc" || node.kind() == "lambda" {
+    if node.kind() == K::DEF_PROC || node.kind() == K::LAMBDA {
         // Inherit outer method scope for nested procs (captures outer locals)
         let mut method_scope = match proc_ctx {
             Some(ctx) => ctx.method_scope.clone(),

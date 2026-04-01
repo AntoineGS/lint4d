@@ -1,3 +1,4 @@
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
@@ -51,9 +52,9 @@ impl Rule for TypePrefixRule {
 
 fn visit_type_prefix(node: Node, source: &[u8], ctx: &mut LintContext) {
     // Look for declType nodes whose type child is a declClass (class or record).
-    if node.kind() == "declType" {
+    if node.kind() == K::DECL_TYPE {
         if let Some(type_node) = node.child_by_field_name("type") {
-            if type_node.kind() == "declClass" {
+            if type_node.kind() == K::DECL_CLASS {
                 check_type_name(node, source, ctx);
             }
         }
@@ -146,9 +147,9 @@ impl Rule for InterfacePrefixRule {
 
 fn visit_interface_prefix(node: Node, source: &[u8], ctx: &mut LintContext) {
     // Look for declType nodes whose type child is a declIntf.
-    if node.kind() == "declType" {
+    if node.kind() == K::DECL_TYPE {
         if let Some(type_node) = node.child_by_field_name("type") {
-            if type_node.kind() == "declIntf" {
+            if type_node.kind() == K::DECL_INTF {
                 check_interface_name(node, source, ctx);
             }
         }
@@ -236,7 +237,7 @@ impl Rule for ConstantNamingRule {
 }
 
 fn visit_constant_naming(node: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
-    if node.kind() == "declConst" {
+    if node.kind() == K::DECL_CONST {
         // Skip typed constants — they have a "type" field (e.g., `TypedConst: Integer = 42`)
         if node.child_by_field_name("type").is_none() {
             check_constant_name(node, source, style, ctx);
@@ -429,7 +430,7 @@ impl Rule for LocalVariableNamingRule {
 /// Walk the AST looking for `defProc` and `lambda` nodes, then check
 /// their local variable declarations.
 fn visit_local_variable_naming(node: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
-    if node.kind() == "defProc" || node.kind() == "lambda" {
+    if node.kind() == K::DEF_PROC || node.kind() == K::LAMBDA {
         check_proc_local_vars(node, source, style, ctx);
     }
 
@@ -446,10 +447,10 @@ fn check_proc_local_vars(proc_node: Node, source: &[u8], style: &str, ctx: &mut 
     if let Some(header) = proc_node.child_by_field_name("header") {
         let mut hcursor = header.walk();
         for header_child in header.children(&mut hcursor) {
-            if header_child.kind() == "declArgs" {
+            if header_child.kind() == K::DECL_ARGS {
                 let mut acursor = header_child.walk();
                 for arg in header_child.children(&mut acursor) {
-                    if arg.kind() == "declArg" {
+                    if arg.kind() == K::DECL_ARG {
                         check_decl_var_names(arg, source, style, ctx);
                     }
                 }
@@ -460,7 +461,7 @@ fn check_proc_local_vars(proc_node: Node, source: &[u8], style: &str, ctx: &mut 
     // Check local variable declarations.
     let mut cursor = proc_node.walk();
     for child in proc_node.children(&mut cursor) {
-        if child.kind() == "declVars" {
+        if child.kind() == K::DECL_VARS {
             check_decl_vars(child, source, style, ctx);
         }
     }
@@ -471,7 +472,7 @@ fn check_proc_local_vars(proc_node: Node, source: &[u8], style: &str, ctx: &mut 
 fn check_decl_vars(decl_vars: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
     let mut cursor = decl_vars.walk();
     for child in decl_vars.children(&mut cursor) {
-        if child.kind() == "declVar" {
+        if child.kind() == K::DECL_VAR {
             check_decl_var_names(child, source, style, ctx);
         }
     }
@@ -480,7 +481,7 @@ fn check_decl_vars(decl_vars: Node, source: &[u8], style: &str, ctx: &mut LintCo
 /// Check all identifier names in a single `declVar` or `declArg` node
 /// (handles multi-name declarations like `a, b: Integer`).
 fn check_decl_var_names(decl_var: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
-    let is_param = decl_var.kind() == "declArg";
+    let is_param = decl_var.kind() == K::DECL_ARG;
     let label = if is_param {
         "Parameter"
     } else {
@@ -495,7 +496,7 @@ fn check_decl_var_names(decl_var: Node, source: &[u8], style: &str, ctx: &mut Li
         };
         // Only process children that are identifiers in the "name" field.
         let field = decl_var.field_name_for_child(i as u32);
-        if child.kind() != "identifier" || field != Some("name") {
+        if child.kind() != K::IDENTIFIER || field != Some("name") {
             continue;
         }
 

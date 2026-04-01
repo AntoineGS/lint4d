@@ -3,6 +3,8 @@
 //! Provides functions that the printer can use to decide when to break long
 //! lines and where valid break points exist in a token sequence.
 
+use pascal_core::node_kind as K;
+
 /// Check if a line exceeds `max_length` and should be broken.
 pub fn should_break_line(line: &str, max_length: usize) -> bool {
     line.len() > max_length
@@ -19,7 +21,7 @@ pub fn find_break_points(tokens: &[(&str, &str)]) -> Vec<usize> {
     let mut points = Vec::new();
     for (i, &(_text, kind)) in tokens.iter().enumerate() {
         // Break after commas
-        if kind == "," {
+        if kind == K::COMMA {
             points.push(i);
             continue;
         }
@@ -79,35 +81,35 @@ pub fn best_break_point(tokens: &[(&str, &str)], max_length: usize) -> Option<us
 fn is_binary_operator(kind: &str) -> bool {
     matches!(
         kind,
-        "kAdd"
-            | "kSub"
-            | "kMul"
-            | "kDiv"
-            | "kMod"
-            | "kAnd"
-            | "kOr"
-            | "kXor"
-            | "kShl"
-            | "kShr"
-            | "kAssign"
-            | "kAssignAdd"
-            | "kAssignSub"
-            | "kAssignMul"
-            | "kAssignDiv"
-            | "="
-            | "<>"
-            | "<"
-            | ">"
-            | "<="
-            | ">="
-            | "kIn"
-            | "kIs"
-            | "kAs"
+        K::K_ADD
+            | K::K_SUB
+            | K::K_MUL
+            | K::K_DIV
+            | K::K_MOD
+            | K::K_AND
+            | K::K_OR
+            | K::K_XOR
+            | K::K_SHL
+            | K::K_SHR
+            | K::K_ASSIGN
+            | K::K_ASSIGN_ADD
+            | K::K_ASSIGN_SUB
+            | K::K_ASSIGN_MUL
+            | K::K_ASSIGN_DIV
+            | K::EQUALS
+            | K::NOT_EQUALS
+            | K::LESS_THAN
+            | K::GREATER_THAN
+            | K::LESS_EQUAL
+            | K::GREATER_EQUAL
+            | K::K_IN
+            | K::K_IS
+            | K::K_AS
     )
 }
 
 fn is_break_before_keyword(kind: &str) -> bool {
-    matches!(kind, "kThen" | "kDo" | "kOf")
+    matches!(kind, K::K_THEN | K::K_DO | K::K_OF)
 }
 
 #[cfg(test)]
@@ -132,14 +134,14 @@ mod tests {
 
     #[test]
     fn find_break_after_comma() {
-        let tokens = vec![("x", "ident"), (",", ","), ("y", "ident")];
+        let tokens = vec![("x", "ident"), (",", K::COMMA), ("y", "ident")];
         let points = find_break_points(&tokens);
         assert_eq!(points, vec![1]);
     }
 
     #[test]
     fn find_break_after_binary_operator() {
-        let tokens = vec![("x", "ident"), ("+", "kAdd"), ("y", "ident")];
+        let tokens = vec![("x", "ident"), ("+", K::K_ADD), ("y", "ident")];
         let points = find_break_points(&tokens);
         assert_eq!(points, vec![1]);
     }
@@ -147,11 +149,11 @@ mod tests {
     #[test]
     fn find_break_before_then() {
         let tokens = vec![
-            ("if", "kIf"),
+            ("if", K::K_IF),
             ("x", "ident"),
-            (">", ">"),
+            (">", K::GREATER_THAN),
             ("0", "litInt"),
-            ("then", "kThen"),
+            ("then", K::K_THEN),
         ];
         let points = find_break_points(&tokens);
         // Break after `>` (binary op at index 2) and before `then` (after index 3)
@@ -162,13 +164,13 @@ mod tests {
     #[test]
     fn find_break_before_do() {
         let tokens = vec![
-            ("for", "kFor"),
+            ("for", K::K_FOR),
             ("i", "ident"),
-            (":=", "kAssign"),
+            (":=", K::K_ASSIGN),
             ("0", "litInt"),
-            ("to", "kTo"),
+            ("to", K::K_TO),
             ("10", "litInt"),
-            ("do", "kDo"),
+            ("do", K::K_DO),
         ];
         let points = find_break_points(&tokens);
         // Break after `:=` (index 2) and before `do` (after index 5)
@@ -188,9 +190,9 @@ mod tests {
         // Tokens: "aaaa" "," "bbbb" "," "cccc" -> columns: 4, 6, 11, 13, 18
         let tokens = vec![
             ("aaaa", "ident"),
-            (",", ","),
+            (",", K::COMMA),
             ("bbbb", "ident"),
-            (",", ","),
+            (",", K::COMMA),
             ("cccc", "ident"),
         ];
         // max_length 12: break after second comma (index 3) would be col 13 > 12,
@@ -203,7 +205,7 @@ mod tests {
     fn best_break_returns_first_when_none_fit() {
         let tokens = vec![
             ("very_long_identifier", "ident"),
-            (",", ","),
+            (",", K::COMMA),
             ("another", "ident"),
         ];
         // max_length 5: comma is at col 22, so nothing fits — use first break point
@@ -222,9 +224,9 @@ mod tests {
     fn multiple_operators_multiple_break_points() {
         let tokens = vec![
             ("a", "ident"),
-            ("and", "kAnd"),
+            ("and", K::K_AND),
             ("b", "ident"),
-            ("or", "kOr"),
+            ("or", K::K_OR),
             ("c", "ident"),
         ];
         let points = find_break_points(&tokens);

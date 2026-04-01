@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
@@ -73,7 +74,7 @@ fn check_usages(root: Node, source: &[u8], scopes: &Scopes, ctx: &mut LintContex
     // Handles unit, program, and library root nodes.
     for child in root.children(&mut root.walk()) {
         match child.kind() {
-            "unit" | "program" | "library" => {
+            K::UNIT | K::PROGRAM | K::LIBRARY => {
                 check_unit_usages(child, source, scopes, ctx);
             }
             _ => {}
@@ -83,9 +84,9 @@ fn check_usages(root: Node, source: &[u8], scopes: &Scopes, ctx: &mut LintContex
 
 fn check_unit_usages(unit: Node, source: &[u8], scopes: &Scopes, ctx: &mut LintContext) {
     for child in unit.children(&mut unit.walk()) {
-        if child.kind() == "implementation" {
+        if child.kind() == K::IMPLEMENTATION {
             for impl_child in child.children(&mut child.walk()) {
-                if impl_child.kind() == "defProc" {
+                if impl_child.kind() == K::DEF_PROC {
                     check_proc_usages(impl_child, source, scopes, ctx);
                 }
             }
@@ -119,14 +120,14 @@ fn walk_and_check<'a>(
     class_fields: Option<&HashMap<String, String>>,
     ctx: &mut LintContext,
 ) {
-    if node.kind() == "identifier" {
+    if node.kind() == K::IDENTIFIER {
         check_identifier_usage(node, source, scopes, method_scope, class_fields, ctx);
         return;
     }
 
     // For nested lambdas/defProcs, build a fresh method scope that merges
     // outer method scope with the nested one.
-    if node.kind() == "defProc" || node.kind() == "lambda" {
+    if node.kind() == K::DEF_PROC || node.kind() == K::LAMBDA {
         // Collect nested method scope (params + locals of the nested proc).
         let mut nested_method_scope = method_scope.clone();
         collect_method_scope(node, source, &mut nested_method_scope);

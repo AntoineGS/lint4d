@@ -1,3 +1,4 @@
+use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
 use crate::config::Config;
@@ -41,25 +42,25 @@ fn walk_declarations(
     map: &mut RenameMap,
 ) {
     match node.kind() {
-        "declType" => {
+        K::DECL_TYPE => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 match type_node.kind() {
-                    "declClass" if fix_config.type_prefix => {
+                    K::DECL_CLASS if fix_config.type_prefix => {
                         check_type_prefix(node, source, suppressions, map);
                     }
-                    "declIntf" if fix_config.intf_prefix => {
+                    K::DECL_INTF if fix_config.intf_prefix => {
                         check_interface_prefix(node, source, suppressions, map);
                     }
                     _ => {}
                 }
             }
         }
-        "declConst" if fix_config.const_naming => {
+        K::DECL_CONST if fix_config.const_naming => {
             if node.child_by_field_name("type").is_none() {
                 check_constant_naming(node, source, config, suppressions, map);
             }
         }
-        "defProc" | "lambda" if fix_config.local_var => {
+        K::DEF_PROC | K::LAMBDA if fix_config.local_var => {
             check_local_var_naming(node, source, config, suppressions, map);
             // Still recurse to find nested procs
         }
@@ -173,9 +174,9 @@ fn check_local_var_naming(
     // Check parameters from the header's declArgs.
     if let Some(header) = proc_node.child_by_field_name("header") {
         for header_child in header.children(&mut header.walk()) {
-            if header_child.kind() == "declArgs" {
+            if header_child.kind() == K::DECL_ARGS {
                 for arg in header_child.children(&mut header_child.walk()) {
-                    if arg.kind() == "declArg" {
+                    if arg.kind() == K::DECL_ARG {
                         check_decl_names(
                             &arg,
                             source,
@@ -193,11 +194,11 @@ fn check_local_var_naming(
 
     // Check local variable declarations.
     for child in proc_node.children(&mut proc_node.walk()) {
-        if child.kind() != "declVars" {
+        if child.kind() != K::DECL_VARS {
             continue;
         }
         for var_child in child.children(&mut child.walk()) {
-            if var_child.kind() != "declVar" {
+            if var_child.kind() != K::DECL_VAR {
                 continue;
             }
             check_decl_names(
@@ -230,7 +231,7 @@ fn check_decl_names(
             Some(c) => c,
             None => continue,
         };
-        if id_node.kind() != "identifier"
+        if id_node.kind() != K::IDENTIFIER
             || decl_node.field_name_for_child(i as u32) != Some("name")
         {
             continue;

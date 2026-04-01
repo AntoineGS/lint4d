@@ -1,3 +1,4 @@
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use crate::cfg::analysis::AnalysisContext;
@@ -13,7 +14,7 @@ fn first_identifier(node: Node) -> Option<Node> {
     let count = node.child_count();
     for i in 0..count {
         let child = node.child(i)?;
-        if child.kind() == "identifier" && !child.is_extra() {
+        if child.kind() == K::IDENTIFIER && !child.is_extra() {
             return Some(child);
         }
     }
@@ -69,7 +70,7 @@ fn collect_field_creations_with_nodes_recursive<'a>(
     fields: &[String],
     out: &mut Vec<FieldCreationWithNode<'a>>,
 ) {
-    if node.kind() == "assignment" {
+    if node.kind() == K::ASSIGNMENT {
         if let Some(creation) = parse_field_creation(node, source, fields) {
             out.push(FieldCreationWithNode { creation, node });
         }
@@ -156,7 +157,7 @@ fn collect_classes(root: Node, source: &[u8]) -> Vec<ClassInfo> {
 }
 
 fn collect_classes_recursive(node: Node, source: &[u8], out: &mut Vec<ClassInfo>) {
-    if node.kind() == "declType" {
+    if node.kind() == K::DECL_TYPE {
         if let Some(info) = parse_decl_type(node, source) {
             out.push(info);
             return; // Don't recurse into a type decl
@@ -181,7 +182,7 @@ fn parse_decl_type(node: Node, source: &[u8]) -> Option<ClassInfo> {
     let mut cursor = node.walk();
     let decl_class = node
         .children(&mut cursor)
-        .find(|c| c.kind() == "declClass")?;
+        .find(|c| c.kind() == K::DECL_CLASS)?;
 
     let fields = collect_fields(decl_class, source);
     Some(ClassInfo { name, fields })
@@ -192,10 +193,10 @@ fn collect_fields(decl_class: Node, source: &[u8]) -> Vec<String> {
     let mut fields = Vec::new();
     let mut cursor = decl_class.walk();
     for section in decl_class.children(&mut cursor) {
-        if section.kind() == "declSection" {
+        if section.kind() == K::DECL_SECTION {
             let mut section_cursor = section.walk();
             for item in section.children(&mut section_cursor) {
-                if item.kind() == "declField" {
+                if item.kind() == K::DECL_FIELD {
                     if let Some(id_node) = first_identifier(item) {
                         fields.push(node_text(id_node, source));
                     }
@@ -216,23 +217,23 @@ pub(crate) fn parse_def_proc(
     let mut cursor = def_proc.walk();
     let decl_proc = def_proc
         .children(&mut cursor)
-        .find(|c| c.kind() == "declProc")?;
+        .find(|c| c.kind() == K::DECL_PROC)?;
 
     let is_constructor = decl_proc
         .children(&mut decl_proc.walk())
-        .any(|c| c.kind() == "kConstructor");
+        .any(|c| c.kind() == K::K_CONSTRUCTOR);
     let is_destructor = decl_proc
         .children(&mut decl_proc.walk())
-        .any(|c| c.kind() == "kDestructor");
+        .any(|c| c.kind() == K::K_DESTRUCTOR);
 
     // Find the genericDot which contains class_name.method_name
     let generic_dot = decl_proc
         .children(&mut decl_proc.walk())
-        .find(|c| c.kind() == "genericDot")?;
+        .find(|c| c.kind() == K::GENERIC_DOT)?;
 
     let idents: Vec<Node> = generic_dot
         .children(&mut generic_dot.walk())
-        .filter(|c| c.kind() == "identifier")
+        .filter(|c| c.kind() == K::IDENTIFIER)
         .collect();
 
     if idents.is_empty() {
@@ -252,7 +253,9 @@ pub(crate) fn parse_def_proc(
 /// Find the `block` child of a `defProc` node.
 pub(crate) fn get_method_block(def_proc: Node) -> Option<Node> {
     let mut cursor = def_proc.walk();
-    let result = def_proc.children(&mut cursor).find(|c| c.kind() == "block");
+    let result = def_proc
+        .children(&mut cursor)
+        .find(|c| c.kind() == K::BLOCK);
     result
 }
 
@@ -273,7 +276,7 @@ fn collect_field_creations_recursive(
     fields: &[String],
     out: &mut Vec<FieldCreation>,
 ) {
-    if node.kind() == "assignment" {
+    if node.kind() == K::ASSIGNMENT {
         if let Some(creation) = parse_field_creation(node, source, fields) {
             out.push(creation);
         }
@@ -359,7 +362,7 @@ fn branch_id(node: Node) -> Option<(usize, BranchSide)> {
     let mut current = node.parent();
 
     while let Some(parent) = current {
-        if parent.kind() == "ifElse" {
+        if parent.kind() == K::IF_ELSE {
             // Check if child is in the "then" field or "else" field.
             if let Some(then_node) = parent.child_by_field_name("then") {
                 if then_node.id() == child.id() || is_ancestor_of(then_node, child) {
@@ -810,7 +813,7 @@ fn collect_def_procs<'a>(root: Node<'a>, source: &[u8]) -> Vec<DefProcInfo<'a>> 
 }
 
 fn collect_def_procs_recursive<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<DefProcInfo<'a>>) {
-    if node.kind() == "defProc" {
+    if node.kind() == K::DEF_PROC {
         if let Some((class_name, method_name, is_constructor, is_destructor)) =
             parse_def_proc(node, source)
         {

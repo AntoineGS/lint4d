@@ -1,3 +1,4 @@
+use pascal_core::node_kind as K;
 use std::collections::HashMap;
 use tree_sitter::Node;
 
@@ -75,7 +76,7 @@ impl CommentMap {
 
 /// Collect all `comment` (extra) nodes from the tree.
 fn collect_comments<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>, String)>) {
-    if node.is_extra() && node.kind() == "comment" {
+    if node.is_extra() && node.kind() == K::COMMENT {
         let text = std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
             .unwrap_or("")
             .replace('\r', "");

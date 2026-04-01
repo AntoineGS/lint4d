@@ -1,4 +1,5 @@
 use crate::config::BlankLineConfig;
+use pascal_core::node_kind as K;
 
 /// Post-process formatted output to normalize blank lines.
 pub fn normalize_blank_lines(source: &str, config: &BlankLineConfig) -> String {
@@ -36,16 +37,21 @@ pub fn needs_blank_line_between(
     next_kind: &str,
     config: &BlankLineConfig,
 ) -> usize {
-    let is_section = |k: &str| matches!(k, "declVars" | "declConsts" | "declTypes" | "declUses");
+    let is_section = |k: &str| {
+        matches!(
+            k,
+            K::DECL_VARS | K::DECL_CONSTS | K::DECL_TYPES | K::DECL_USES
+        )
+    };
 
-    if prev_kind == "defProc" && next_kind == "defProc" {
+    if prev_kind == K::DEF_PROC && next_kind == K::DEF_PROC {
         return config.between_procedures;
     }
     if is_section(prev_kind) && is_section(next_kind) {
         return config.between_sections;
     }
-    if (is_section(prev_kind) && next_kind == "defProc")
-        || (prev_kind == "defProc" && is_section(next_kind))
+    if (is_section(prev_kind) && next_kind == K::DEF_PROC)
+        || (prev_kind == K::DEF_PROC && is_section(next_kind))
     {
         return config.between_sections;
     }
@@ -83,14 +89,17 @@ mod tests {
     #[test]
     fn blank_line_between_procedures() {
         let config = BlankLineConfig::default();
-        assert_eq!(needs_blank_line_between("defProc", "defProc", &config), 1);
+        assert_eq!(
+            needs_blank_line_between(K::DEF_PROC, K::DEF_PROC, &config),
+            1
+        );
     }
 
     #[test]
     fn blank_line_between_sections() {
         let config = BlankLineConfig::default();
         assert_eq!(
-            needs_blank_line_between("declVars", "declConsts", &config),
+            needs_blank_line_between(K::DECL_VARS, K::DECL_CONSTS, &config),
             1
         );
     }

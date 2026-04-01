@@ -7,6 +7,8 @@ pub mod suppress {
     pub use pascal_core::directives::*;
 }
 
+use pascal_core::node_kind as K;
+
 use crate::cfg::analysis::AnalysisContext;
 use crate::config::{Config, RuleSeverityOverride};
 use crate::dcu::ProjectContext;
@@ -171,7 +173,7 @@ fn collect_proc_scopes(root: tree_sitter::Node, source: &[u8]) -> Vec<ProcScope>
 }
 
 fn collect_proc_scopes_recursive(node: tree_sitter::Node, source: &[u8], out: &mut Vec<ProcScope>) {
-    if node.kind() == "defProc" {
+    if node.kind() == K::DEF_PROC {
         if let Some(name) = extract_proc_display_name(node, source) {
             out.push(ProcScope {
                 start_line: node.start_position().row + 1,
@@ -194,16 +196,16 @@ fn extract_proc_display_name(def_proc: tree_sitter::Node, source: &[u8]) -> Opti
     let mut cursor = def_proc.walk();
     let decl_proc = def_proc
         .children(&mut cursor)
-        .find(|c| c.kind() == "declProc")?;
+        .find(|c| c.kind() == K::DECL_PROC)?;
 
     let mut decl_cursor = decl_proc.walk();
     if let Some(generic_dot) = decl_proc
         .children(&mut decl_cursor)
-        .find(|c| c.kind() == "genericDot")
+        .find(|c| c.kind() == K::GENERIC_DOT)
     {
         let idents: Vec<tree_sitter::Node> = generic_dot
             .children(&mut generic_dot.walk())
-            .filter(|c| c.kind() == "identifier")
+            .filter(|c| c.kind() == K::IDENTIFIER)
             .collect();
         if idents.len() >= 2 {
             return Some(format!(
@@ -223,7 +225,7 @@ fn extract_proc_display_name(def_proc: tree_sitter::Node, source: &[u8]) -> Opti
 
     let mut cursor2 = decl_proc.walk();
     for child in decl_proc.children(&mut cursor2) {
-        if child.kind() == "identifier" {
+        if child.kind() == K::IDENTIFIER {
             return Some(node_text(child, source));
         }
     }

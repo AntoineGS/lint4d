@@ -1,4 +1,5 @@
 use crate::printer::Printer;
+use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
 /// A segment of a flattened binary expression chain.
@@ -24,8 +25,8 @@ impl<'a> Printer<'a> {
             .collect();
 
         // Find the positions of `(` and `)` tokens.
-        let open_idx = children.iter().position(|c| c.kind() == "(");
-        let close_idx = children.iter().rposition(|c| c.kind() == ")");
+        let open_idx = children.iter().position(|c| c.kind() == K::OPEN_PAREN);
+        let close_idx = children.iter().rposition(|c| c.kind() == K::CLOSE_PAREN);
 
         let (open_idx, close_idx) = match (open_idx, close_idx) {
             (Some(o), Some(c)) => (o, c),
@@ -139,7 +140,7 @@ impl<'a> Printer<'a> {
         while i < children.len() {
             let child = children[i];
             match child.kind() {
-                "kIf" => {
+                K::K_IF => {
                     // Emit "if" normally.
                     self.print_node(child);
 
@@ -148,7 +149,7 @@ impl<'a> Printer<'a> {
                     let cond_start = i + 1;
                     let cond_end = children[cond_start..]
                         .iter()
-                        .position(|c| c.kind() == "kThen" || c.kind() == "kDo")
+                        .position(|c| c.kind() == K::K_THEN || c.kind() == K::K_DO)
                         .map(|p| cond_start + p)
                         .unwrap_or(children.len());
 
@@ -160,13 +161,13 @@ impl<'a> Printer<'a> {
                     i = cond_end;
                     continue;
                 }
-                "kThen" | "kDo" => {
+                K::K_THEN | K::K_DO => {
                     // Emit the keyword on the same line (or after condition).
                     self.print_node(child);
                     // If the NEXT child is a single statement (not begin..end),
                     // put it on its own indented line.
                     if let Some(next) = children.get(i + 1) {
-                        if next.kind() != "block" && next.kind() != "kElse" {
+                        if next.kind() != K::BLOCK && next.kind() != K::K_ELSE {
                             self.ensure_newline();
                             self.indent.indent();
                             self.print_node(*next);
@@ -176,15 +177,17 @@ impl<'a> Printer<'a> {
                         }
                     }
                 }
-                "kElse" => {
+                K::K_ELSE => {
                     // `else` aligns with `if` — no extra indent.
                     self.ensure_newline();
                     self.emit_indented("else");
-                    self.last_token_kind = "kElse".to_string();
+                    self.last_token_kind = K::K_ELSE.to_string();
                     // If next child is a single statement (not begin..end or
                     // another if), put it on its own indented line.
                     if let Some(next) = children.get(i + 1) {
-                        if next.kind() != "block" && next.kind() != "if" && next.kind() != "ifElse"
+                        if next.kind() != K::BLOCK
+                            && next.kind() != K::IF
+                            && next.kind() != K::IF_ELSE
                         {
                             self.ensure_newline();
                             self.indent.indent();
@@ -210,7 +213,7 @@ impl<'a> Printer<'a> {
     fn emit_condition_with_breaks(&mut self, nodes: &[Node]) {
         // If there's a single exprBinary node, flatten its chain to find
         // top-level and/or operators.  Otherwise treat the nodes as-is.
-        let segments = if nodes.len() == 1 && nodes[0].kind() == "exprBinary" {
+        let segments = if nodes.len() == 1 && nodes[0].kind() == K::EXPR_BINARY {
             flatten_binary_chain(nodes[0])
         } else {
             // Multiple condition nodes at the same level — look for kAnd/kOr
@@ -286,14 +289,14 @@ impl<'a> Printer<'a> {
     /// (arithmetic, logical, bitwise), not just `kAnd`/`kOr`.
     pub(crate) fn print_expression_breaking(&mut self, node: Node) {
         // Flatten the binary chain at any operator level.
-        let segments = if node.kind() == "exprBinary" {
+        let segments = if node.kind() == K::EXPR_BINARY {
             flatten_binary_chain_any_op(node)
         } else {
             // Not a direct exprBinary — try to find one inside.
             // Look for an exprBinary child.
             let binary_child = node
                 .children(&mut node.walk())
-                .find(|c| c.kind() == "exprBinary");
+                .find(|c| c.kind() == K::EXPR_BINARY);
             if let Some(bin) = binary_child {
                 flatten_binary_chain_any_op(bin)
             } else {
@@ -374,8 +377,8 @@ impl<'a> Printer<'a> {
             .collect();
 
         // Find the positions of `(` and `)` tokens.
-        let open_idx = children.iter().position(|c| c.kind() == "(");
-        let close_idx = children.iter().rposition(|c| c.kind() == ")");
+        let open_idx = children.iter().position(|c| c.kind() == K::OPEN_PAREN);
+        let close_idx = children.iter().rposition(|c| c.kind() == K::CLOSE_PAREN);
 
         let (open_idx, close_idx) = match (open_idx, close_idx) {
             (Some(o), Some(c)) => (o, c),
@@ -466,7 +469,7 @@ fn split_at_commas<'a>(nodes: &[Node<'a>]) -> Vec<Vec<Node<'a>>> {
     let mut current_group: Vec<Node> = Vec::new();
 
     for node in nodes {
-        if node.kind() == "," {
+        if node.kind() == K::COMMA {
             groups.push(current_group);
             current_group = Vec::new();
         } else {
@@ -490,7 +493,7 @@ fn split_at_semicolons<'a>(nodes: &[Node<'a>]) -> Vec<Vec<Node<'a>>> {
 
     for node in nodes {
         current_group.push(*node);
-        if node.kind() == ";" {
+        if node.kind() == K::SEMICOLON {
             groups.push(current_group);
             current_group = Vec::new();
         }
@@ -516,7 +519,7 @@ fn flatten_binary_chain_any_op<'a>(node: Node<'a>) -> Vec<ConditionSegment<'a>> 
 }
 
 fn flatten_binary_chain_any_op_inner<'a>(node: Node<'a>, segments: &mut Vec<ConditionSegment<'a>>) {
-    debug_assert_eq!(node.kind(), "exprBinary");
+    debug_assert_eq!(node.kind(), K::EXPR_BINARY);
 
     let children: Vec<Node<'a>> = node
         .children(&mut node.walk())
@@ -539,7 +542,7 @@ fn flatten_binary_chain_any_op_inner<'a>(node: Node<'a>, segments: &mut Vec<Cond
 
     // Recurse into the left child if it's another bare exprBinary
     // (not wrapped in parens). We always recurse for any operator type.
-    if left.kind() == "exprBinary" {
+    if left.kind() == K::EXPR_BINARY {
         flatten_binary_chain_any_op_inner(left, segments);
     } else {
         segments.push(ConditionSegment {
@@ -579,7 +582,7 @@ fn flatten_binary_chain<'a>(node: Node<'a>) -> Vec<ConditionSegment<'a>> {
 }
 
 fn flatten_binary_chain_inner<'a>(node: Node<'a>, segments: &mut Vec<ConditionSegment<'a>>) {
-    debug_assert_eq!(node.kind(), "exprBinary");
+    debug_assert_eq!(node.kind(), K::EXPR_BINARY);
 
     let children: Vec<Node<'a>> = node
         .children(&mut node.walk())
@@ -601,7 +604,7 @@ fn flatten_binary_chain_inner<'a>(node: Node<'a>, segments: &mut Vec<ConditionSe
     let op = children[1];
     let right = children[2];
 
-    if op.kind() != "kAnd" && op.kind() != "kOr" {
+    if op.kind() != K::K_AND && op.kind() != K::K_OR {
         // Not a logical operator — treat entire node as atomic.
         segments.push(ConditionSegment {
             operator: None,
@@ -612,7 +615,7 @@ fn flatten_binary_chain_inner<'a>(node: Node<'a>, segments: &mut Vec<ConditionSe
 
     // Recurse into the left child if it's another bare exprBinary
     // (not wrapped in parens).
-    if left.kind() == "exprBinary" {
+    if left.kind() == K::EXPR_BINARY {
         flatten_binary_chain_inner(left, segments);
     } else {
         segments.push(ConditionSegment {
@@ -637,7 +640,7 @@ fn split_at_and_or<'a>(nodes: &[Node<'a>]) -> Vec<ConditionSegment<'a>> {
     let mut current_operand: Vec<Node<'a>> = Vec::new();
 
     for node in nodes {
-        if node.kind() == "kAnd" || node.kind() == "kOr" {
+        if node.kind() == K::K_AND || node.kind() == K::K_OR {
             // Flush current operand as a segment, then start a new one
             // with this operator.
             if !current_operand.is_empty() {

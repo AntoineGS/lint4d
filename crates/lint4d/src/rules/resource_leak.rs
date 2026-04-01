@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use crate::cfg::analysis::AnalysisContext;
@@ -17,7 +18,7 @@ fn first_identifier(node: Node) -> Option<Node> {
     let count = node.child_count();
     for i in 0..count {
         let child = node.child(i)?;
-        if child.kind() == "identifier" && !child.is_extra() {
+        if child.kind() == K::IDENTIFIER && !child.is_extra() {
             return Some(child);
         }
     }
@@ -85,7 +86,7 @@ impl Rule for ResourceLeakUnprotectedRule {
 /// Recursively walk the AST looking for block-like nodes that contain
 /// sequential statements (e.g., `begin..end` blocks).
 fn visit_blocks(node: Node, source: &[u8], ctx: &mut LintContext) {
-    if node.kind() == "block" {
+    if node.kind() == K::BLOCK {
         check_block_for_leaks(node, source, ctx);
     }
 
@@ -105,7 +106,7 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
 
     for (i, child) in children.iter().enumerate() {
         // Step 1: Is this an assignment whose RHS is a constructor or factory call?
-        if child.kind() != "assignment" {
+        if child.kind() != K::ASSIGNMENT {
             continue;
         }
 
@@ -126,7 +127,7 @@ fn check_block_for_leaks(block: Node, source: &[u8], ctx: &mut LintContext) {
         // Step 2: Look ahead for a `try` node whose `finally` frees this variable.
         let mut try_index = None;
         for (j, sibling) in children.iter().enumerate().skip(i + 1) {
-            if sibling.kind() == "try" && finally_frees_variable(*sibling, source, &var_name) {
+            if sibling.kind() == K::TRY && finally_frees_variable(*sibling, source, &var_name) {
                 try_index = Some(j);
                 break;
             }
@@ -179,7 +180,7 @@ fn finally_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool
         .collect();
 
     for child in &finally_children {
-        if child.kind() == "statements" {
+        if child.kind() == K::STATEMENTS {
             return statements_free_variable(*child, source, var_name);
         }
     }
@@ -336,7 +337,7 @@ fn check_block_no_try(
     let interface_vars = collect_interface_vars(block, source, project, uses, ast_intf_types);
 
     for (i, child) in children.iter().enumerate() {
-        if child.kind() != "assignment" {
+        if child.kind() != K::ASSIGNMENT {
             continue;
         }
 
@@ -386,7 +387,7 @@ fn check_block_no_try(
         // it.  Check that every raise-bearing sibling is a try node itself.
         if var_name.eq_ignore_ascii_case("result") {
             let has_unprotected_raise = children[(i + 1)..].iter().any(|s| {
-                s.is_named() && !s.is_extra() && s.kind() != "try" && ast_contains_raise(*s)
+                s.is_named() && !s.is_extra() && s.kind() != K::TRY && ast_contains_raise(*s)
             });
             if has_unprotected_raise {
                 let start = child.start_position();
@@ -440,7 +441,7 @@ fn check_block_no_try(
         // throw between the constructor and the cleanup.
         let next_stmt = children[(i + 1)..]
             .iter()
-            .find(|n| n.is_named() && !n.is_extra() && n.kind() != "kEnd");
+            .find(|n| n.is_named() && !n.is_extra() && n.kind() != K::K_END);
         if let Some(next) = next_stmt {
             if helpers::ast_frees_variable(*next, source, &var_name) {
                 continue;
@@ -449,7 +450,7 @@ fn check_block_no_try(
 
         // Look ahead for any try block (finally or except) that frees this variable.
         let has_protecting_try = children[(i + 1)..].iter().any(|sibling| {
-            sibling.kind() == "try" && try_frees_variable(*sibling, source, &var_name)
+            sibling.kind() == K::TRY && try_frees_variable(*sibling, source, &var_name)
         });
 
         if !has_protecting_try {
@@ -496,18 +497,18 @@ fn collect_interface_vars(
 
     // The parent of a block inside a procedure is the defProc/lambda node.
     let proc_node = match block.parent() {
-        Some(p) if p.kind() == "defProc" || p.kind() == "lambda" => p,
+        Some(p) if p.kind() == K::DEF_PROC || p.kind() == K::LAMBDA => p,
         _ => return result,
     };
 
     let mut proc_cursor = proc_node.walk();
     for child in proc_node.children(&mut proc_cursor) {
-        if child.kind() != "declVars" {
+        if child.kind() != K::DECL_VARS {
             continue;
         }
         let mut vars_cursor = child.walk();
         for decl_var in child.children(&mut vars_cursor) {
-            if decl_var.kind() != "declVar" {
+            if decl_var.kind() != K::DECL_VAR {
                 continue;
             }
             let type_name = match extract_decl_var_type(decl_var, source) {
@@ -520,7 +521,7 @@ fn collect_interface_vars(
             // Collect all identifier names in this declVar (handles `a, b: IFoo`).
             let mut dv_cursor = decl_var.walk();
             for dv_child in decl_var.children(&mut dv_cursor) {
-                if dv_child.kind() == "identifier" {
+                if dv_child.kind() == K::IDENTIFIER {
                     result.insert(node_text(dv_child, source));
                 }
             }
@@ -567,11 +568,11 @@ fn is_interface_type(
 /// For `TFoo.Create(args)` (exprCall wrapping exprDot) returns `"TFoo"`.
 fn extract_constructor_class_name(rhs_node: Node, source: &[u8]) -> Option<String> {
     let dot_node = match rhs_node.kind() {
-        "exprDot" => rhs_node,
-        "exprCall" => rhs_node.child_by_field_name("entity")?,
+        K::EXPR_DOT => rhs_node,
+        K::EXPR_CALL => rhs_node.child_by_field_name("entity")?,
         _ => return None,
     };
-    if dot_node.kind() != "exprDot" {
+    if dot_node.kind() != K::EXPR_DOT {
         return None;
     }
     let lhs = dot_node.child_by_field_name("lhs")?;
@@ -602,13 +603,13 @@ fn is_non_refcounting_class(class_name: &str, project: &ProjectContext, uses: &[
 fn extract_decl_var_type(decl_var: Node, source: &[u8]) -> Option<String> {
     let mut cursor = decl_var.walk();
     for child in decl_var.children(&mut cursor) {
-        if child.kind() == "type" {
+        if child.kind() == K::TYPE {
             let mut type_cursor = child.walk();
             for type_child in child.children(&mut type_cursor) {
-                if type_child.kind() == "typeref" {
+                if type_child.kind() == K::TYPEREF {
                     let mut ref_cursor = type_child.walk();
                     for ref_child in type_child.children(&mut ref_cursor) {
-                        if ref_child.kind() == "identifier" {
+                        if ref_child.kind() == K::IDENTIFIER {
                             return Some(node_text(ref_child, source));
                         }
                     }
@@ -634,7 +635,7 @@ fn assigned_to_interface_var(
     }
     let var_lower = var_name.to_lowercase();
     for sibling in children.iter().skip(start_idx + 1) {
-        if sibling.kind() != "assignment" {
+        if sibling.kind() != K::ASSIGNMENT {
             continue;
         }
         let lhs = match sibling.child_by_field_name("lhs") {
@@ -671,11 +672,11 @@ fn except_frees_variable(try_node: Node, source: &[u8], var_name: &str) -> bool 
     let mut found_except = false;
     let mut cursor = try_node.walk();
     for child in try_node.children(&mut cursor) {
-        if child.kind() == "kExcept" {
+        if child.kind() == K::K_EXCEPT {
             found_except = true;
             continue;
         }
-        if found_except && child.kind() == "statements" {
+        if found_except && child.kind() == K::STATEMENTS {
             return statements_free_variable(child, source, var_name);
         }
     }
@@ -698,7 +699,7 @@ fn collect_ast_class_fields_recursive(
     source: &[u8],
     out: &mut HashMap<String, Vec<String>>,
 ) {
-    if node.kind() == "declType" {
+    if node.kind() == K::DECL_TYPE {
         if let Some((class_name, fields)) = parse_class_fields(node, source) {
             out.insert(class_name.to_lowercase(), fields);
             return;
@@ -721,15 +722,15 @@ fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<String>)
     let mut cursor = node.walk();
     let decl_class = node
         .children(&mut cursor)
-        .find(|c| c.kind() == "declClass")?;
+        .find(|c| c.kind() == K::DECL_CLASS)?;
 
     let mut fields = Vec::new();
     let mut class_cursor = decl_class.walk();
     for section in decl_class.children(&mut class_cursor) {
-        if section.kind() == "declSection" {
+        if section.kind() == K::DECL_SECTION {
             let mut section_cursor = section.walk();
             for item in section.children(&mut section_cursor) {
-                if item.kind() == "declField" {
+                if item.kind() == K::DECL_FIELD {
                     if let Some(id_node) = first_identifier(item) {
                         fields.push(node_text(id_node, source));
                     }
@@ -751,9 +752,9 @@ fn collect_ast_interface_types(root: Node, source: &[u8]) -> HashSet<String> {
 }
 
 fn collect_ast_interface_types_recursive(node: Node, source: &[u8], out: &mut HashSet<String>) {
-    if node.kind() == "declType" {
+    if node.kind() == K::DECL_TYPE {
         if let Some(type_node) = node.child_by_field_name("type") {
-            if type_node.kind() == "declIntf" {
+            if type_node.kind() == K::DECL_INTF {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     out.insert(node_text(name_node, source));
                 } else if let Some(id) = first_identifier(node) {
@@ -788,7 +789,7 @@ fn collect_leak_check_procs_recursive<'a>(
     source: &[u8],
     out: &mut Vec<LeakCheckProc<'a>>,
 ) {
-    if node.kind() == "defProc" {
+    if node.kind() == K::DEF_PROC {
         let class_name = crate::rules::field_leak::parse_def_proc(node, source)
             .map(|(cn, _, _, _)| cn)
             .unwrap_or_default();
@@ -811,10 +812,10 @@ fn visit_non_proc_blocks(
     ast_intf_types: &HashSet<String>,
     ctx: &mut LintContext,
 ) {
-    if node.kind() == "defProc" {
+    if node.kind() == K::DEF_PROC {
         return; // Skip — already handled by the defProc-based path
     }
-    if node.kind() == "block" {
+    if node.kind() == K::BLOCK {
         check_block_no_try(node, source, project, uses, ast_intf_types, &[], ctx);
     }
     let mut cursor = node.walk();
@@ -825,7 +826,7 @@ fn visit_non_proc_blocks(
 
 /// Check whether any descendant of `node` is a `raise` statement.
 fn ast_contains_raise(node: Node) -> bool {
-    if node.kind() == "raise" {
+    if node.kind() == K::RAISE {
         return true;
     }
     let mut cursor = node.walk();

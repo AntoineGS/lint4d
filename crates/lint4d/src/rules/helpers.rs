@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+
+use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
 /// Extract the UTF-8 text of a node from the source bytes.
@@ -16,7 +18,7 @@ pub fn node_text(node: Node, source: &[u8]) -> String {
 /// interfaces or other managed types.
 pub fn is_constructor_call(node: Node, source: &[u8]) -> bool {
     match node.kind() {
-        "exprDot" => {
+        K::EXPR_DOT => {
             let rhs = match node.child_by_field_name("rhs") {
                 Some(r) => r,
                 None => return false,
@@ -24,7 +26,7 @@ pub fn is_constructor_call(node: Node, source: &[u8]) -> bool {
             let rhs_text = node_text(rhs, source);
             rhs_text.eq_ignore_ascii_case("create")
         }
-        "exprCall" => {
+        K::EXPR_CALL => {
             let entity = match node.child_by_field_name("entity") {
                 Some(e) => e,
                 None => return false,
@@ -40,7 +42,7 @@ pub fn is_constructor_call(node: Node, source: &[u8]) -> bool {
 /// or `nil`).  A bare `TFoo.Create` or `TFoo.Create()` returns `false`.
 pub fn constructor_has_owner_args(rhs: Node, source: &[u8]) -> bool {
     // Only `exprCall` nodes have arguments; a bare `exprDot` has none.
-    if rhs.kind() != "exprCall" {
+    if rhs.kind() != K::EXPR_CALL {
         return false;
     }
 
@@ -84,7 +86,7 @@ pub fn statements_free_variable(statements: Node, source: &[u8], var_name: &str)
 /// string literals (tree-sitter excludes them from the AST).
 pub fn ast_frees_variable(node: Node, source: &[u8], var_name: &str) -> bool {
     match node.kind() {
-        "exprCall" => {
+        K::EXPR_CALL => {
             if let Some(entity) = node.child_by_field_name("entity") {
                 // Check for FreeAndNil(variable)
                 let entity_text = node_text(entity, source);
@@ -92,7 +94,7 @@ pub fn ast_frees_variable(node: Node, source: &[u8], var_name: &str) -> bool {
                     if let Some(args) = node.child_by_field_name("args") {
                         let mut cursor = args.walk();
                         for child in args.children(&mut cursor) {
-                            if child.kind() == "identifier" {
+                            if child.kind() == K::IDENTIFIER {
                                 let arg_text = node_text(child, source);
                                 if arg_text.eq_ignore_ascii_case(var_name) {
                                     return true;
@@ -107,7 +109,7 @@ pub fn ast_frees_variable(node: Node, source: &[u8], var_name: &str) -> bool {
                 }
             }
         }
-        "exprDot" => {
+        K::EXPR_DOT => {
             // Check for variable.Free / variable.Destroy (statement form without parens)
             if is_free_or_destroy_call(node, source, var_name) {
                 return true;
@@ -129,7 +131,7 @@ pub fn ast_frees_variable(node: Node, source: &[u8], var_name: &str) -> bool {
 
 /// Check if an exprDot node is `variable.Free` or `variable.Destroy`.
 fn is_free_or_destroy_call(dot_node: Node, source: &[u8], var_name: &str) -> bool {
-    if dot_node.kind() != "exprDot" {
+    if dot_node.kind() != K::EXPR_DOT {
         return false;
     }
     let lhs = match dot_node.child_by_field_name("lhs") {
@@ -152,7 +154,7 @@ fn is_free_or_destroy_call(dot_node: Node, source: &[u8], var_name: &str) -> boo
 /// Walks the AST for `identifier` nodes matching the variable name (case-insensitive).
 /// Tree-sitter excludes comments and string literals from identifier nodes.
 pub fn ast_references_variable(node: Node, source: &[u8], var_name: &str) -> bool {
-    if node.kind() == "identifier" {
+    if node.kind() == K::IDENTIFIER {
         let text = node_text(node, source);
         if text.eq_ignore_ascii_case(var_name) {
             return true;
@@ -180,7 +182,7 @@ pub fn constructor_is_owner_managed(
 ) -> bool {
     use crate::dcu::TypeRef;
 
-    if rhs.kind() != "exprCall" {
+    if rhs.kind() != K::EXPR_CALL {
         return false;
     }
 
@@ -221,10 +223,10 @@ pub fn extract_unit_name(root: Node, source: &[u8]) -> Option<String> {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         match child.kind() {
-            "unit" | "program" | "library" => {
+            K::UNIT | K::PROGRAM | K::LIBRARY => {
                 let mut inner = child.walk();
                 for grandchild in child.children(&mut inner) {
-                    if grandchild.kind() == "moduleName" {
+                    if grandchild.kind() == K::MODULE_NAME {
                         return Some(node_text(grandchild, source));
                     }
                 }
@@ -245,10 +247,10 @@ pub fn extract_uses_clauses(root: Node, source: &[u8]) -> Vec<String> {
 }
 
 fn collect_uses_recursive(node: Node, source: &[u8], units: &mut Vec<String>) {
-    if node.kind() == "declUses" {
+    if node.kind() == K::DECL_USES {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "moduleName" {
+            if child.kind() == K::MODULE_NAME {
                 units.push(node_text(child, source));
             }
         }
@@ -267,7 +269,9 @@ fn call_has_non_nil_args(call_node: Node, source: &[u8]) -> bool {
         for child in args.children(&mut cursor) {
             // Skip punctuation and whitespace nodes
             match child.kind() {
-                "kOpen" | "kClose" | "kComma" | "(" | ")" | "," => continue,
+                K::K_OPEN | K::K_CLOSE | K::K_COMMA | K::OPEN_PAREN | K::CLOSE_PAREN | K::COMMA => {
+                    continue
+                }
                 _ => {}
             }
             let text = node_text(child, source);
@@ -286,12 +290,12 @@ pub fn build_var_type_map(proc_node: Node, source: &[u8]) -> HashMap<String, Str
     let mut map = HashMap::new();
     let mut proc_cursor = proc_node.walk();
     for child in proc_node.children(&mut proc_cursor) {
-        if child.kind() != "declVars" {
+        if child.kind() != K::DECL_VARS {
             continue;
         }
         let mut vars_cursor = child.walk();
         for decl_var in child.children(&mut vars_cursor) {
-            if decl_var.kind() != "declVar" {
+            if decl_var.kind() != K::DECL_VAR {
                 continue;
             }
             let type_name = match extract_type_from_decl_var(decl_var, source) {
@@ -300,7 +304,7 @@ pub fn build_var_type_map(proc_node: Node, source: &[u8]) -> HashMap<String, Str
             };
             let mut dv_cursor = decl_var.walk();
             for dv_child in decl_var.children(&mut dv_cursor) {
-                if dv_child.kind() == "identifier" {
+                if dv_child.kind() == K::IDENTIFIER {
                     let var_name = node_text(dv_child, source);
                     map.insert(var_name.to_lowercase(), type_name.clone());
                 }
@@ -317,10 +321,10 @@ pub fn extract_type_from_decl_arg(decl_arg: Node, source: &[u8]) -> Option<Strin
     let type_node = decl_arg.child_by_field_name("type")?;
     let mut type_cursor = type_node.walk();
     for type_child in type_node.children(&mut type_cursor) {
-        if type_child.kind() == "typeref" {
+        if type_child.kind() == K::TYPEREF {
             let mut ref_cursor = type_child.walk();
             for ref_child in type_child.children(&mut ref_cursor) {
-                if ref_child.kind() == "identifier" {
+                if ref_child.kind() == K::IDENTIFIER {
                     return Some(node_text(ref_child, source));
                 }
             }
@@ -333,7 +337,7 @@ pub fn extract_type_from_decl_arg(decl_arg: Node, source: &[u8]) -> Option<Strin
 pub fn has_out_modifier(decl_arg: Node) -> bool {
     let mut cursor = decl_arg.walk();
     for child in decl_arg.children(&mut cursor) {
-        if child.kind() == "kOut" {
+        if child.kind() == K::K_OUT {
             return true;
         }
     }
@@ -346,13 +350,13 @@ pub fn has_out_modifier(decl_arg: Node) -> bool {
 pub fn extract_type_from_decl_var(decl_var: Node, source: &[u8]) -> Option<String> {
     let mut cursor = decl_var.walk();
     for child in decl_var.children(&mut cursor) {
-        if child.kind() == "type" {
+        if child.kind() == K::TYPE {
             let mut type_cursor = child.walk();
             for type_child in child.children(&mut type_cursor) {
-                if type_child.kind() == "typeref" {
+                if type_child.kind() == K::TYPEREF {
                     let mut ref_cursor = type_child.walk();
                     for ref_child in type_child.children(&mut ref_cursor) {
-                        if ref_child.kind() == "identifier" {
+                        if ref_child.kind() == K::IDENTIFIER {
                             return Some(node_text(ref_child, source));
                         }
                     }

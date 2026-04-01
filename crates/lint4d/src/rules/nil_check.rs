@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use cfg_core::summary::ProcId;
 use cfg_core::types::Cfg;
 use cfg_core::BlockId;
+use pascal_core::node_kind as K;
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use tree_sitter::{Node, Tree};
@@ -141,10 +142,10 @@ fn build_nillable_vars(
     if let Some(header) = def_proc.child_by_field_name("header") {
         let mut header_cursor = header.walk();
         for child in header.children(&mut header_cursor) {
-            if child.kind() == "declArgs" {
+            if child.kind() == K::DECL_ARGS {
                 let mut args_cursor = child.walk();
                 for arg in child.children(&mut args_cursor) {
-                    if arg.kind() != "declArg" {
+                    if arg.kind() != K::DECL_ARG {
                         continue;
                     }
                     if has_out_modifier(arg) {
@@ -163,7 +164,7 @@ fn build_nillable_vars(
                             Some(c) => c,
                             None => continue,
                         };
-                        if c.kind() == "identifier"
+                        if c.kind() == K::IDENTIFIER
                             && arg.field_name_for_child(i as u32) == Some("name")
                         {
                             let name = node_text(c, source);
@@ -184,12 +185,12 @@ fn build_nillable_vars(
     // Collect local variables from declVars
     let mut proc_cursor = def_proc.walk();
     for child in def_proc.children(&mut proc_cursor) {
-        if child.kind() != "declVars" {
+        if child.kind() != K::DECL_VARS {
             continue;
         }
         let mut vars_cursor = child.walk();
         for decl_var in child.children(&mut vars_cursor) {
-            if decl_var.kind() != "declVar" {
+            if decl_var.kind() != K::DECL_VAR {
                 continue;
             }
             let type_name = match extract_type_from_decl_var(decl_var, source) {
@@ -205,7 +206,7 @@ fn build_nillable_vars(
                     Some(c) => c,
                     None => continue,
                 };
-                if c.kind() == "identifier"
+                if c.kind() == K::IDENTIFIER
                     && decl_var.field_name_for_child(i as u32) == Some("name")
                 {
                     let name = node_text(c, source);
@@ -226,7 +227,7 @@ fn build_nillable_vars(
 
 /// Find the `defProc` AST node whose start byte matches the given offset.
 fn find_def_proc_at(root: Node, start_byte: usize) -> Option<Node> {
-    if root.kind() == "defProc" && root.start_byte() == start_byte {
+    if root.kind() == K::DEF_PROC && root.start_byte() == start_byte {
         return Some(root);
     }
     let mut cursor = root.walk();

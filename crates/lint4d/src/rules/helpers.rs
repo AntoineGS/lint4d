@@ -344,6 +344,33 @@ pub fn has_out_modifier(decl_arg: Node) -> bool {
     false
 }
 
+/// Return the first `identifier` child that isn't a comment/extra node.
+pub fn first_identifier(node: Node) -> Option<Node> {
+    let count = node.child_count();
+    for i in 0..count {
+        let child = node.child(i)?;
+        if child.kind() == K::IDENTIFIER && !child.is_extra() {
+            return Some(child);
+        }
+    }
+    None
+}
+
+/// Convert a byte offset to 1-based (line, column).
+pub fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
+    let offset = offset.min(source.len());
+    let mut line = 1;
+    let mut last_newline = 0;
+    for (i, &b) in source[..offset].iter().enumerate() {
+        if b == b'\n' {
+            line += 1;
+            last_newline = i + 1;
+        }
+    }
+    let col = offset - last_newline + 1;
+    (line, col)
+}
+
 /// Extract the type name from a `declVar` AST node.
 ///
 /// Walks `declVar -> type -> typeref -> identifier` to get the type name.

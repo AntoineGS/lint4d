@@ -13,8 +13,8 @@ use crate::cfg::analysis::AnalysisContext;
 use crate::dcu::{ProjectContext, TypeKind};
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
-    extract_type_from_decl_arg, extract_type_from_decl_var, extract_uses_clauses, has_out_modifier,
-    node_text,
+    byte_offset_to_line_col, extract_type_from_decl_arg, extract_type_from_decl_var,
+    extract_uses_clauses, has_out_modifier, node_text,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
@@ -814,18 +814,4 @@ fn is_safe_call(lower: &str) -> bool {
     trimmed.starts_with("assigned(")
         || trimmed.starts_with("raiseifnil(")
         || trimmed.starts_with("freeandnil(")
-}
-
-fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
-    let offset = offset.min(source.len());
-    let mut line = 1;
-    let mut last_newline = 0;
-    for (i, &b) in source[..offset].iter().enumerate() {
-        if b == b'\n' {
-            line += 1;
-            last_newline = i + 1;
-        }
-    }
-    let col = offset - last_newline + 1;
-    (line, col)
 }

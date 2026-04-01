@@ -4,22 +4,11 @@ use tree_sitter::{Node, Tree};
 use crate::cfg::analysis::AnalysisContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
-    ast_frees_variable, constructor_has_owner_args, is_constructor_call, node_text,
+    ast_frees_variable, constructor_has_owner_args, first_identifier, is_constructor_call,
+    node_text,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 use std::collections::{HashMap, HashSet};
-
-/// Return the first `identifier` child that isn't a comment/extra node.
-fn first_identifier(node: Node) -> Option<Node> {
-    let count = node.child_count();
-    for i in 0..count {
-        let child = node.child(i)?;
-        if child.kind() == K::IDENTIFIER && !child.is_extra() {
-            return Some(child);
-        }
-    }
-    None
-}
 
 // ─── Shared data structures ───────────────────────────────────────────────────
 

@@ -8,22 +8,10 @@ use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers;
 use crate::rules::helpers::{
-    ast_references_variable, extract_uses_clauses, is_constructor_call, node_text,
-    statements_free_variable,
+    ast_references_variable, extract_uses_clauses, first_identifier, is_constructor_call,
+    node_text, statements_free_variable,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
-
-/// Return the first `identifier` child that isn't a comment/extra node.
-fn first_identifier(node: Node) -> Option<Node> {
-    let count = node.child_count();
-    for i in 0..count {
-        let child = node.child(i)?;
-        if child.kind() == K::IDENTIFIER && !child.is_extra() {
-            return Some(child);
-        }
-    }
-    None
-}
 
 pub struct ResourceLeakUnprotectedRule {
     meta: RuleMeta,

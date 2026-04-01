@@ -3,22 +3,10 @@ use tree_sitter::{Node, Tree};
 
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::field_leak::{get_method_block, parse_def_proc};
-use crate::rules::helpers::node_text;
+use crate::rules::helpers::{first_identifier, node_text};
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// Return the first `identifier` child that isn't a comment/extra node.
-fn first_identifier(node: Node) -> Option<Node> {
-    let count = node.child_count();
-    for i in 0..count {
-        let child = node.child(i)?;
-        if child.kind() == K::IDENTIFIER && !child.is_extra() {
-            return Some(child);
-        }
-    }
-    None
-}
 
 /// Collect the meaningful direct-child statements of a `block` node.
 ///

@@ -272,27 +272,6 @@ impl<'a> DocBuilder<'a> {
         false
     }
 
-    // ── Stub handlers ────────────────────────────────────────────────
-    //
-    // All handlers delegate to `build_children` for now.  Tasks 5-8 will
-    // replace these stubs with real formatting logic.
-
-    fn build_unit(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
-    fn build_interface_section(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
-    fn build_implementation_section(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
-    fn build_init_final_section(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
     fn build_uses(&self, node: Node<'a>) -> Doc {
         let units = crate::uses::extract_uses_units(node, self.source);
         let indent_str = " ".repeat(self.config.indent_size);

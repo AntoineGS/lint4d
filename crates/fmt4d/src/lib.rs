@@ -3,6 +3,7 @@ pub mod comments;
 pub mod config;
 pub mod doc;
 pub mod doc_builder;
+pub mod doc_builder_sections;
 pub mod formatter;
 pub mod indent;
 pub mod line_break;

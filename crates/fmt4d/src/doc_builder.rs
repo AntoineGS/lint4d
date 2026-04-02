@@ -442,26 +442,6 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
-    fn build_try(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
-    fn build_case(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
-    fn build_repeat(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
-    fn build_if(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
-    fn build_loop(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
     fn build_args(&self, node: Node<'a>) -> Doc {
         self.build_children(node)
     }

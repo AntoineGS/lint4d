@@ -1,6 +1,7 @@
 pub mod blank_lines;
 pub mod comments;
 pub mod config;
+pub mod doc;
 pub mod formatter;
 pub mod indent;
 pub mod line_break;

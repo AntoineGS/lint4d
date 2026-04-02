@@ -15,6 +15,7 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut after_else = false;
         let mut else_body: Vec<Doc> = Vec::new();
+        let mut prev_was_case_branch = false;
 
         for child in &children {
             match child.kind() {
@@ -24,9 +25,14 @@ impl<'a> DocBuilder<'a> {
                 K::K_OF => {
                     parts.push(self.doc_for_node(*child));
                     parts.push(Doc::Hardline);
+                    prev_was_case_branch = false;
                 }
                 K::CASE_CASE => {
+                    if prev_was_case_branch {
+                        parts.push(Doc::Hardline);
+                    }
                     parts.push(doc::indent(self.doc_for_node(*child)));
+                    prev_was_case_branch = true;
                 }
                 K::K_ELSE => {
                     // Flush any accumulated body before `else`
@@ -37,6 +43,7 @@ impl<'a> DocBuilder<'a> {
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
                     after_else = true;
+                    prev_was_case_branch = false;
                 }
                 K::K_END => {
                     // Flush else body before end
@@ -46,6 +53,7 @@ impl<'a> DocBuilder<'a> {
                     after_else = false;
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
+                    prev_was_case_branch = false;
                 }
                 _ if after_else => {
                     // Statements after `else` are indented

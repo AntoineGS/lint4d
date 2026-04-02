@@ -1474,3 +1474,83 @@ end.
         result
     );
 }
+
+// ── Bug: Case branches collapsed onto same line ────────────────
+// Consecutive CASE_CASE branches were concatenated without Hardlines,
+// producing `end;',':` instead of separate lines.
+
+#[test]
+fn case_branches_on_separate_lines() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+var
+  C: Char;
+begin
+  case C of
+    ')':
+    begin
+      ReadChar;
+      Exit;
+    end;
+    ',':
+    begin
+      ReadChar;
+      Exit;
+    end;
+    '.':
+    begin
+      ReadChar;
+      Exit;
+    end;
+  end;
+end;
+end.
+";
+    let result = format_source(src);
+    // Each case branch must start on its own line — they must NOT be collapsed like end;',':
+    assert!(
+        !result.contains("end;'"),
+        "case branches were collapsed onto same line as previous end:\n{}",
+        result
+    );
+}
+
+#[test]
+fn case_simple_branches_on_separate_lines() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+var
+  I: Integer;
+begin
+  case I of
+    1: WriteLn('one');
+    2: WriteLn('two');
+    3: WriteLn('three');
+  end;
+end;
+end.
+";
+    let result = format_source(src);
+    // Verify each branch is on its own line
+    let branch_1 = result
+        .lines()
+        .find(|l| l.contains("1:"))
+        .expect("branch 1 not found");
+    let branch_2 = result
+        .lines()
+        .find(|l| l.contains("2:"))
+        .expect("branch 2 not found");
+    let branch_3 = result
+        .lines()
+        .find(|l| l.contains("3:"))
+        .expect("branch 3 not found");
+    // All three should be distinct lines
+    assert_ne!(branch_1, branch_2, "branches 1 and 2 are on the same line");
+    assert_ne!(branch_2, branch_3, "branches 2 and 3 are on the same line");
+}

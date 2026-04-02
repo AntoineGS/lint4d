@@ -7,6 +7,7 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn build_type_body(&self, node: Node<'a>) -> Doc {
         let children = self.code_children(node);
         let has_visibility = children.iter().any(|c| c.kind() == K::DECL_SECTION);
+        let has_end = children.iter().any(|c| c.kind() == K::K_END);
         let mut parts = Vec::new();
         let mut body_parts = Vec::new();
         let mut in_ancestor_list = false;
@@ -30,7 +31,9 @@ impl<'a> DocBuilder<'a> {
                 K::CLOSE_PAREN if in_ancestor_list => {
                     parts.push(Doc::Raw(")".into()));
                     in_ancestor_list = false;
-                    parts.push(Doc::Hardline);
+                    if has_end {
+                        parts.push(Doc::Hardline);
+                    }
                 }
                 K::COMMA if in_ancestor_list => {
                     parts.push(Doc::Raw(", ".into()));
@@ -66,7 +69,9 @@ impl<'a> DocBuilder<'a> {
                 _ => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
-                        parts.push(Doc::Hardline);
+                        if has_end {
+                            parts.push(Doc::Hardline);
+                        }
                     }
                     // Add Hardline between body items (e.g. record fields)
                     if !prev_body_kind.is_empty() {

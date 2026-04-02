@@ -1422,3 +1422,55 @@ end.
         result
     );
 }
+
+// ── Bug 21: Empty exception class semicolon on new line ─────────
+// `EFoo = class(Exception);` must not become:
+//   EFoo = class(Exception)
+//   ;
+
+#[test]
+fn empty_exception_class_semicolon_same_line() {
+    let src = "\
+unit T;
+interface
+type
+  EMyError = class(Exception);
+  ENotFound = class(Exception);
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("class(Exception);"),
+        "semicolon was split from empty class declaration:\n{}",
+        result
+    );
+    assert!(
+        result.contains("EMyError = class(Exception);"),
+        "EMyError declaration was mangled:\n{}",
+        result
+    );
+    assert!(
+        result.contains("ENotFound = class(Exception);"),
+        "ENotFound declaration was mangled:\n{}",
+        result
+    );
+}
+
+#[test]
+fn empty_class_no_ancestor_no_trailing_newline() {
+    let src = "\
+unit T;
+interface
+type
+  TMarker = class;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("TMarker = class;"),
+        "empty class with no ancestor was mangled:\n{}",
+        result
+    );
+}

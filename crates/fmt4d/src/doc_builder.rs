@@ -294,19 +294,144 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_uses(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        let units = crate::uses::extract_uses_units(node, self.source);
+        let indent_str = " ".repeat(self.config.indent_size);
+        let formatted =
+            crate::uses::format_uses(&units, &self.config.uses, &indent_str, &self.external_units);
+        doc::concat(vec![
+            Doc::Hardline,
+            doc::token("uses", K::K_USES, ""),
+            Doc::Hardline,
+            Doc::Raw(formatted),
+        ])
     }
 
     fn build_block(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        self.build_children_preserving_blank_lines(node)
+    }
+
+    fn build_children_preserving_blank_lines(&self, node: Node<'a>) -> Doc {
+        let children = self.code_children(node);
+        let mut parts = Vec::new();
+        let mut prev_end_row: Option<usize> = None;
+        let mut prev_kind = String::new();
+
+        for child in &children {
+            let kind = child.kind();
+
+            // Strip blank lines after block openers and before block closers.
+            let skip_blank =
+                prev_kind.is_empty() || is_block_opener(&prev_kind) || is_block_closer(kind);
+
+            if !skip_blank {
+                if let Some(prev_end) = prev_end_row {
+                    if self.has_blank_line_between(prev_end, child.start_position().row) {
+                        parts.push(Doc::BlankLine);
+                    }
+                }
+            }
+
+            match kind {
+                K::K_BEGIN | K::K_TRY | K::K_REPEAT | K::K_ASM => {
+                    parts.push(Doc::Hardline);
+                    parts.push(self.doc_for_node(*child));
+                    parts.push(Doc::Hardline);
+                }
+                K::K_END => {
+                    parts.push(Doc::Hardline);
+                    parts.push(self.doc_for_node(*child));
+                }
+                K::K_EXCEPT | K::K_FINALLY => {
+                    parts.push(Doc::Hardline);
+                    parts.push(self.doc_for_node(*child));
+                    parts.push(Doc::Hardline);
+                }
+                K::SEMICOLON => {
+                    parts.push(self.doc_for_node(*child));
+                    parts.push(Doc::Hardline);
+                }
+                _ => {
+                    parts.push(self.doc_for_node(*child));
+                }
+            }
+
+            prev_end_row = Some(child.end_position().row);
+            prev_kind = kind.to_string();
+        }
+
+        doc::concat(parts)
     }
 
     fn build_section(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        let children = self.code_children(node);
+        let mut parts = Vec::new();
+        let mut body_parts = Vec::new();
+        let mut prev_child_kind = String::new();
+
+        for child in &children {
+            match child.kind() {
+                K::K_VAR | K::K_CONST | K::K_TYPE => {
+                    parts.push(Doc::Hardline);
+                    parts.push(self.doc_for_node(*child));
+                    parts.push(Doc::Hardline);
+                }
+                _ => {
+                    let kind = child.kind().to_string();
+                    if kind == K::DECL_TYPE && prev_child_kind == K::DECL_TYPE {
+                        body_parts.push(Doc::BlankLine);
+                    }
+                    body_parts.push(self.doc_for_node(*child));
+                    prev_child_kind = kind;
+                }
+            }
+        }
+        if !body_parts.is_empty() {
+            parts.push(doc::indent(doc::concat(body_parts)));
+        }
+        doc::concat(parts)
     }
 
     fn build_decl_section(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        let children = self.code_children(node);
+        let mut parts = Vec::new();
+        let mut body_parts: Vec<Doc> = Vec::new();
+        let mut first = true;
+        let mut prev_end_row: Option<usize> = None;
+
+        for child in &children {
+            match child.kind() {
+                K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED | K::K_STRICT => {
+                    if !body_parts.is_empty() {
+                        parts.push(doc::indent(doc::concat(body_parts.clone())));
+                        body_parts.clear();
+                    }
+                    if first {
+                        parts.push(Doc::Hardline);
+                        parts.push(self.doc_for_node(*child));
+                        parts.push(Doc::Hardline);
+                        first = false;
+                    } else {
+                        parts.push(Doc::Raw(" ".into()));
+                        parts.push(Doc::Raw(self.node_text(*child)));
+                        parts.push(Doc::Hardline);
+                    }
+                    prev_end_row = Some(child.end_position().row);
+                }
+                _ => {
+                    if let Some(prev_end) = prev_end_row {
+                        if self.has_blank_line_between(prev_end, child.start_position().row) {
+                            body_parts.push(Doc::BlankLine);
+                        }
+                    }
+                    body_parts.push(self.doc_for_node(*child));
+                    prev_end_row = Some(child.end_position().row);
+                }
+            }
+        }
+        if !body_parts.is_empty() {
+            parts.push(doc::indent(doc::concat(body_parts)));
+        }
+        doc::concat(parts)
     }
 
     fn build_def_proc(&self, node: Node<'a>) -> Doc {
@@ -314,7 +439,28 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_decl_proc(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        let children = self.code_children(node);
+        let mut parts = Vec::new();
+        let mut i = 0;
+        while i < children.len() {
+            let child = children[i];
+            match child.kind() {
+                K::SEMICOLON => {
+                    let next = children.get(i + 1);
+                    parts.push(self.doc_for_node(child));
+                    if next.map(|n| n.kind()) == Some(K::PROC_ATTRIBUTE) {
+                        parts.push(Doc::Raw(" ".into()));
+                    } else {
+                        parts.push(Doc::Hardline);
+                    }
+                }
+                _ => {
+                    parts.push(self.doc_for_node(child));
+                }
+            }
+            i += 1;
+        }
+        doc::concat(parts)
     }
 
     fn build_type_body(&self, node: Node<'a>) -> Doc {
@@ -352,6 +498,14 @@ impl<'a> DocBuilder<'a> {
     fn build_expression_breaking(&self, node: Node<'a>) -> Doc {
         self.build_children(node)
     }
+}
+
+fn is_block_opener(kind: &str) -> bool {
+    matches!(kind, K::K_BEGIN | K::K_TRY | K::K_REPEAT | K::K_ASM)
+}
+
+fn is_block_closer(kind: &str) -> bool {
+    matches!(kind, K::K_END | K::K_EXCEPT | K::K_FINALLY)
 }
 
 #[cfg(test)]

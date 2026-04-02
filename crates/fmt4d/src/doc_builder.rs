@@ -213,7 +213,7 @@ impl<'a> DocBuilder<'a> {
     /// Return `true` if there is a blank (empty / whitespace-only) line in the
     /// source between `start_row` (exclusive) and `end_row` (exclusive).
     /// Both values are 0-based row indices.
-    fn has_blank_line_between(&self, start_row: usize, end_row: usize) -> bool {
+    pub(crate) fn has_blank_line_between(&self, start_row: usize, end_row: usize) -> bool {
         if end_row <= start_row + 1 {
             return false;
         }

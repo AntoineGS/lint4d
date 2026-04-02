@@ -101,17 +101,44 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn build_init_final_section(&self, node: Node) -> Doc {
         let children = self.code_children(node);
         let mut parts = Vec::new();
+        let mut body_parts: Vec<Doc> = Vec::new();
+        let mut prev_end_row: Option<usize> = None;
 
         for child in &children {
             match child.kind() {
                 K::K_INITIALIZATION | K::K_FINALIZATION => {
+                    // Flush accumulated body
+                    if !body_parts.is_empty() {
+                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body_parts))));
+                        prev_end_row = None;
+                    }
                     parts.push(self.doc_for_node(*child));
                     parts.push(Doc::Hardline);
                 }
+                K::SEMICOLON => {
+                    // Semicolons: just emit into body
+                    body_parts.push(self.doc_for_node(*child));
+                    prev_end_row = Some(child.end_position().row);
+                }
                 _ => {
-                    parts.push(doc::indent(self.doc_for_node(*child)));
+                    // Check for blank line preservation
+                    if let Some(prev_end) = prev_end_row {
+                        if self.has_blank_line_between(prev_end, child.start_position().row) {
+                            body_parts.push(Doc::BlankLine);
+                        }
+                    }
+                    // Add Hardline before each statement (except the first)
+                    if !body_parts.is_empty() {
+                        body_parts.push(Doc::Hardline);
+                    }
+                    body_parts.push(self.doc_for_node(*child));
+                    prev_end_row = Some(child.end_position().row);
                 }
             }
+        }
+        // Flush remaining body
+        if !body_parts.is_empty() {
+            parts.push(doc::indent(doc::concat(body_parts)));
         }
         doc::concat(parts)
     }

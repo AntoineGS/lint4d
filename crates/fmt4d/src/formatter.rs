@@ -2,7 +2,6 @@ use crate::blank_lines::normalize_blank_lines;
 use crate::comments::CommentMap;
 use crate::config::FmtConfig;
 use crate::doc_builder::DocBuilder;
-use crate::printer::Printer;
 use crate::renderer::Renderer;
 use crate::uses;
 use pascal_core::directives::parse_format_regions;
@@ -14,42 +13,6 @@ use std::collections::HashSet;
 /// Returns the formatted source, or an error message.
 /// If the source has parse errors, returns the original source unchanged.
 pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Result<String, String> {
-    let (tree, diagnostics) =
-        pascal_core::parser::parse_file(info, source).map_err(|e| e.to_string())?;
-
-    // If there are parse errors, return original source unchanged.
-    if !diagnostics.is_empty() {
-        let original = std::str::from_utf8(source).map_err(|e| format!("invalid UTF-8: {}", e))?;
-        return Ok(original.to_string());
-    }
-
-    // Resolve EOL: Auto detects from source, otherwise uses the configured value.
-    let resolved_eol = config.end_of_line.resolve(source);
-
-    let comment_map = CommentMap::build(tree.root_node(), source);
-    let format_regions = parse_format_regions(source);
-
-    let external_units = match &config.project_root {
-        Some(root) => uses::scan_external_paths(root, &config.uses.external_paths),
-        None => HashSet::new(),
-    };
-
-    let mut printer = Printer::new(source, config, &comment_map, format_regions, external_units);
-    printer.print_node(tree.root_node());
-    let raw_output = printer.result();
-
-    let normalized = normalize_blank_lines(&raw_output, &config.blank_lines);
-    let broken = break_long_lines(&normalized, config.max_line_length, config.indent_size);
-
-    Ok(resolved_eol.apply(&broken))
-}
-
-/// Format using the new Doc IR pipeline (for validation).
-pub fn format_source_ir(
-    source: &[u8],
-    info: &FileInfo,
-    config: &FmtConfig,
-) -> Result<String, String> {
     let (tree, diagnostics) =
         pascal_core::parser::parse_file(info, source).map_err(|e| e.to_string())?;
 

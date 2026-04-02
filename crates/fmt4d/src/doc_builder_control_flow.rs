@@ -13,6 +13,8 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn build_case(&self, node: Node<'a>) -> Doc {
         let children = self.code_children(node);
         let mut parts = Vec::new();
+        let mut after_else = false;
+        let mut else_body: Vec<Doc> = Vec::new();
 
         for child in &children {
             match child.kind() {
@@ -27,18 +29,37 @@ impl<'a> DocBuilder<'a> {
                     parts.push(doc::indent(self.doc_for_node(*child)));
                 }
                 K::K_ELSE => {
+                    // Flush any accumulated body before `else`
+                    if !else_body.is_empty() {
+                        parts.push(doc::indent(doc::concat(std::mem::take(&mut else_body))));
+                    }
                     // `else` aligns with `case`, not with branches
-                    parts.push(self.doc_for_node(*child));
                     parts.push(Doc::Hardline);
+                    parts.push(self.doc_for_node(*child));
+                    after_else = true;
                 }
                 K::K_END => {
+                    // Flush else body before end
+                    if !else_body.is_empty() {
+                        parts.push(doc::indent(doc::concat(std::mem::take(&mut else_body))));
+                    }
+                    after_else = false;
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
+                }
+                _ if after_else => {
+                    // Statements after `else` are indented
+                    else_body.push(Doc::Hardline);
+                    else_body.push(self.doc_for_node(*child));
                 }
                 _ => {
                     parts.push(self.doc_for_node(*child));
                 }
             }
+        }
+        // Flush any remaining else body
+        if !else_body.is_empty() {
+            parts.push(doc::indent(doc::concat(else_body)));
         }
         doc::concat(parts)
     }

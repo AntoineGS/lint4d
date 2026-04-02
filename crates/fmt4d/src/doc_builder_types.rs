@@ -10,6 +10,7 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut body_parts = Vec::new();
         let mut in_ancestor_list = false;
+        let mut prev_body_kind = String::new();
 
         for child in &children {
             match child.kind() {
@@ -54,13 +55,19 @@ impl<'a> DocBuilder<'a> {
                         // its own leading Hardline.
                     }
                     body_parts.push(self.doc_for_node(*child));
+                    prev_body_kind = K::DECL_SECTION.to_string();
                 }
                 _ => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
                         parts.push(Doc::Hardline);
                     }
+                    // Add Hardline between body items (e.g. record fields)
+                    if !prev_body_kind.is_empty() {
+                        body_parts.push(Doc::Hardline);
+                    }
                     body_parts.push(self.doc_for_node(*child));
+                    prev_body_kind = child.kind().to_string();
                 }
             }
         }

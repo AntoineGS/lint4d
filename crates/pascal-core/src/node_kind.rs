@@ -84,6 +84,7 @@ pub const EXPR_TPL: &str = "exprTpl";
 
 pub const LITERAL_CHAR: &str = "literalChar";
 pub const LITERAL_STRING: &str = "literalString";
+pub const INTEGER: &str = "integer";
 
 // ── Keyword tokens ──────────────────────────────────────────────────
 

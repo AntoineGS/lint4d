@@ -11,5 +11,6 @@ pub mod printer_control_flow;
 pub mod printer_measurement;
 pub mod printer_sections;
 pub mod printer_types;
+pub mod renderer;
 pub mod spacing;
 pub mod uses;

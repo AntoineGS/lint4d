@@ -1187,6 +1187,81 @@ end.
     );
 }
 
+// ── Bug 18: Var declarations collapsed onto single lines ───────
+// Each `var` / `const` / field declaration must be on its own line,
+// not concatenated: `A: Integer;B: string;...`.
+
+#[test]
+fn var_declarations_on_separate_lines() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+var
+  A: Integer;
+  B: string;
+  C: Boolean;
+begin
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        !result.contains("Integer;  B:") && !result.contains("Integer;B:"),
+        "var declarations were collapsed onto one line:\n{}",
+        result
+    );
+    assert!(
+        result.contains("  A: Integer;\n"),
+        "var A should be on its own line:\n{}",
+        result
+    );
+    assert!(
+        result.contains("  B: string;\n"),
+        "var B should be on its own line:\n{}",
+        result
+    );
+    assert!(
+        result.contains("  C: Boolean;\n"),
+        "var C should be on its own line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn class_field_declarations_on_separate_lines() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  private
+    FName: string;
+    FAge: Integer;
+    FActive: Boolean;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("    FName: string;\n"),
+        "field FName should be on its own line:\n{}",
+        result
+    );
+    assert!(
+        result.contains("    FAge: Integer;\n"),
+        "field FAge should be on its own line:\n{}",
+        result
+    );
+    assert!(
+        result.contains("    FActive: Boolean;\n"),
+        "field FActive should be on its own line:\n{}",
+        result
+    );
+}
+
 // ── Bug 17: Long string concatenation not broken ───────────────
 // A const string built via `+` that exceeds max_line_length should
 // be broken across multiple lines at the `+` operators.

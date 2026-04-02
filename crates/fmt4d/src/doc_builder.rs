@@ -419,6 +419,8 @@ impl<'a> DocBuilder<'a> {
                     let kind = child.kind().to_string();
                     if kind == K::DECL_TYPE && prev_child_kind == K::DECL_TYPE {
                         body_parts.push(Doc::BlankLine);
+                    } else if !prev_child_kind.is_empty() {
+                        body_parts.push(Doc::Hardline);
                     }
                     body_parts.push(self.doc_for_node(*child));
                     prev_child_kind = kind;
@@ -461,6 +463,8 @@ impl<'a> DocBuilder<'a> {
                     if let Some(prev_end) = prev_end_row {
                         if self.has_blank_line_between(prev_end, child.start_position().row) {
                             body_parts.push(Doc::BlankLine);
+                        } else if !body_parts.is_empty() {
+                            body_parts.push(Doc::Hardline);
                         }
                     }
                     body_parts.push(self.doc_for_node(*child));

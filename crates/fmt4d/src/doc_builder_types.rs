@@ -14,7 +14,13 @@ impl<'a> DocBuilder<'a> {
 
         for child in &children {
             match child.kind() {
-                K::K_CLASS | K::K_RECORD | K::K_INTERFACE | K::K_OBJECT => {
+                K::K_CLASS
+                | K::K_RECORD
+                | K::K_INTERFACE
+                | K::K_OBJECT
+                | K::K_PACKED
+                | K::K_ABSTRACT
+                | K::K_SEALED => {
                     parts.push(self.doc_for_node(*child));
                     in_ancestor_list = true;
                 }

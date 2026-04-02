@@ -152,6 +152,9 @@ pub const K_ARRAY: &str = "kArray";
 pub const K_SET: &str = "kSet";
 pub const K_STRING: &str = "kString";
 pub const K_FILE: &str = "kFile";
+pub const K_PACKED: &str = "kPacked";
+pub const K_ABSTRACT: &str = "kAbstract";
+pub const K_SEALED: &str = "kSealed";
 
 // Visibility keywords
 pub const K_PUBLIC: &str = "kPublic";

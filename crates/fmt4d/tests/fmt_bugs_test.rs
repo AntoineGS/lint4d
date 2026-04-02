@@ -1348,3 +1348,77 @@ end.
         result
     );
 }
+
+// ── Bug 19: `packed record` keyword split across lines ─────────
+// `packed record` must stay on the same line.
+
+#[test]
+fn packed_record_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+type
+  TPoint = packed record
+    X: Integer;
+    Y: Integer;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("packed record"),
+        "packed and record were split across lines:\n{}",
+        result
+    );
+    assert!(
+        !result.contains("record\n    packed"),
+        "packed was moved after record:\n{}",
+        result
+    );
+}
+
+// ── Bug 20: `class abstract` keyword split across lines ────────
+// `class abstract` must stay on the same line.
+
+#[test]
+fn class_abstract_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+type
+  TBase = class abstract
+  public
+    procedure DoWork; virtual; abstract;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("class abstract"),
+        "class and abstract were split across lines:\n{}",
+        result
+    );
+}
+
+#[test]
+fn class_sealed_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+type
+  TFinal = class sealed
+  public
+    procedure DoWork;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("class sealed"),
+        "class and sealed were split across lines:\n{}",
+        result
+    );
+}

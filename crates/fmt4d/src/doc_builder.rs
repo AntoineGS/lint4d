@@ -443,15 +443,135 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_args(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        self.build_paren_list(node, K::SEMICOLON)
     }
 
     fn build_call(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        self.build_paren_list(node, K::COMMA)
+    }
+
+    /// Build a parenthesised list with Group-based line breaking.
+    fn build_paren_list(&self, node: Node<'a>, separator: &str) -> Doc {
+        let children = self.code_children(node);
+        let open_idx = children.iter().position(|c| c.kind() == K::OPEN_PAREN);
+        let close_idx = children.iter().rposition(|c| c.kind() == K::CLOSE_PAREN);
+
+        let (open_idx, close_idx) = match (open_idx, close_idx) {
+            (Some(o), Some(c)) => (o, c),
+            _ => return self.build_children(node),
+        };
+
+        let mut before: Vec<Doc> = children[..=open_idx]
+            .iter()
+            .map(|c| self.doc_for_node(*c))
+            .collect();
+
+        let inner = &children[open_idx + 1..close_idx];
+        if inner.is_empty() {
+            before.push(self.doc_for_node(children[close_idx]));
+            for c in &children[close_idx + 1..] {
+                before.push(self.doc_for_node(*c));
+            }
+            return doc::concat(before);
+        }
+
+        let groups = Self::split_children_at(inner, separator);
+
+        let group_docs: Vec<Doc> = groups
+            .iter()
+            .map(|g| {
+                let parts: Vec<Doc> = g.iter().map(|n| self.doc_for_node(*n)).collect();
+                doc::concat(parts)
+            })
+            .collect();
+
+        let mut inner_parts = Vec::new();
+        for (i, gdoc) in group_docs.into_iter().enumerate() {
+            if i > 0 {
+                if separator == K::COMMA {
+                    inner_parts.push(doc::token(",", K::COMMA, ""));
+                }
+                inner_parts.push(Doc::Line);
+            }
+            inner_parts.push(gdoc);
+        }
+
+        let grouped = doc::group(doc::concat(vec![
+            doc::concat(before),
+            doc::indent(doc::concat(vec![Doc::Softline, doc::concat(inner_parts)])),
+            Doc::Softline,
+            self.doc_for_node(children[close_idx]),
+        ]));
+
+        let mut result = vec![grouped];
+        for c in &children[close_idx + 1..] {
+            result.push(self.doc_for_node(*c));
+        }
+        doc::concat(result)
+    }
+
+    fn split_children_at<'b>(nodes: &[Node<'b>], separator: &str) -> Vec<Vec<Node<'b>>> {
+        let mut groups: Vec<Vec<Node>> = Vec::new();
+        let mut current: Vec<Node> = Vec::new();
+
+        for node in nodes {
+            if node.kind() == separator {
+                if separator == K::SEMICOLON {
+                    current.push(*node);
+                }
+                groups.push(current);
+                current = Vec::new();
+            } else {
+                current.push(*node);
+            }
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+        groups
     }
 
     fn build_expression_breaking(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        let segments = if node.kind() == K::EXPR_BINARY {
+            flatten_binary_chain(node, None)
+        } else {
+            let binary_child = node
+                .children(&mut node.walk())
+                .find(|c| c.kind() == K::EXPR_BINARY);
+            match binary_child {
+                Some(bin) => flatten_binary_chain(bin, None),
+                None => return self.build_children(node),
+            }
+        };
+
+        if segments.len() <= 1 {
+            return self.build_children(node);
+        }
+
+        self.build_binary_chain_doc(&segments)
+    }
+
+    /// Build a flattened binary chain with Group-based line breaking.
+    pub(crate) fn build_binary_chain_doc(&self, segments: &[BinarySegment]) -> Doc {
+        let mut parts = Vec::new();
+
+        for (i, seg) in segments.iter().enumerate() {
+            if i == 0 {
+                for n in &seg.operand {
+                    parts.push(self.doc_for_node(*n));
+                }
+            } else {
+                parts.push(Doc::Line);
+                if let Some(op) = seg.operator {
+                    parts.push(self.doc_for_node(op));
+                }
+                for n in &seg.operand {
+                    parts.push(self.doc_for_node(*n));
+                }
+            }
+        }
+
+        doc::group(doc::indent(doc::concat(parts)))
     }
 }
 
@@ -461,6 +581,106 @@ fn is_block_opener(kind: &str) -> bool {
 
 fn is_block_closer(kind: &str) -> bool {
     matches!(kind, K::K_END | K::K_EXCEPT | K::K_FINALLY)
+}
+
+/// A segment of a flattened binary expression chain.
+pub(crate) struct BinarySegment<'a> {
+    pub operator: Option<Node<'a>>,
+    pub operand: Vec<Node<'a>>,
+}
+
+pub(crate) fn flatten_binary_chain<'a>(
+    node: Node<'a>,
+    only_ops: Option<&[&str]>,
+) -> Vec<BinarySegment<'a>> {
+    let mut segments = Vec::new();
+    flatten_binary_chain_inner(node, only_ops, &mut segments);
+    segments
+}
+
+fn flatten_binary_chain_inner<'a>(
+    node: Node<'a>,
+    only_ops: Option<&[&str]>,
+    segments: &mut Vec<BinarySegment<'a>>,
+) {
+    let children: Vec<Node<'a>> = node
+        .children(&mut node.walk())
+        .filter(|c| !c.is_extra())
+        .collect();
+
+    if children.len() != 3 {
+        segments.push(BinarySegment {
+            operator: None,
+            operand: vec![node],
+        });
+        return;
+    }
+
+    let left = children[0];
+    let op = children[1];
+    let right = children[2];
+
+    if let Some(allowed) = only_ops {
+        if !allowed.contains(&op.kind()) {
+            segments.push(BinarySegment {
+                operator: None,
+                operand: vec![node],
+            });
+            return;
+        }
+    }
+
+    if left.kind() == K::EXPR_BINARY {
+        flatten_binary_chain_inner(left, only_ops, segments);
+    } else {
+        segments.push(BinarySegment {
+            operator: None,
+            operand: vec![left],
+        });
+    }
+
+    segments.push(BinarySegment {
+        operator: Some(op),
+        operand: vec![right],
+    });
+}
+
+#[allow(dead_code)]
+pub(crate) fn split_at_and_or<'a>(nodes: &[Node<'a>]) -> Vec<BinarySegment<'a>> {
+    let mut segments: Vec<BinarySegment<'a>> = Vec::new();
+    let mut current_operand: Vec<Node<'a>> = Vec::new();
+
+    for node in nodes {
+        if node.kind() == K::K_AND || node.kind() == K::K_OR {
+            if !current_operand.is_empty() {
+                segments.push(BinarySegment {
+                    operator: None,
+                    operand: std::mem::take(&mut current_operand),
+                });
+            }
+            segments.push(BinarySegment {
+                operator: Some(*node),
+                operand: Vec::new(),
+            });
+        } else if let Some(last_seg) = segments.last_mut() {
+            if last_seg.operator.is_some() && last_seg.operand.is_empty() {
+                last_seg.operand.push(*node);
+            } else {
+                current_operand.push(*node);
+            }
+        } else {
+            current_operand.push(*node);
+        }
+    }
+
+    if !current_operand.is_empty() {
+        segments.push(BinarySegment {
+            operator: None,
+            operand: current_operand,
+        });
+    }
+
+    segments
 }
 
 #[cfg(test)]

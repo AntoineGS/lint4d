@@ -1,5 +1,4 @@
-use crate::printer::{is_generic_parent, is_keyword_needing_space_after, Printer};
-use crate::spacing;
+use crate::printer::Printer;
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
@@ -87,94 +86,7 @@ impl<'a> Printer<'a> {
         kind: &str,
         parent_kind: &str,
     ) -> bool {
-        // 1. No previous token → no space.
-        if prev_kind.is_empty() {
-            return false;
-        }
-        // 2. No space before `)`, `]`, `.`
-        if kind == K::CLOSE_PAREN || kind == K::CLOSE_BRACKET || kind == K::DOT {
-            return false;
-        }
-        // 3. No space after `(`, `[`, `.`
-        if prev_kind == K::OPEN_PAREN || prev_kind == K::OPEN_BRACKET || prev_kind == K::DOT {
-            return false;
-        }
-        // 4. No space before `;`
-        if kind == K::SEMICOLON {
-            return false;
-        }
-        // 5. No space before `,`
-        if kind == K::COMMA {
-            return false;
-        }
-        // 6. No space before `[` in subscript context
-        if kind == K::OPEN_BRACKET && parent_kind == K::EXPR_SUBSCRIPT {
-            return false;
-        }
-        // 7. No space before `(` in call/args context
-        if kind == K::OPEN_PAREN && (parent_kind == K::EXPR_CALL || parent_kind == K::DECL_ARGS) {
-            return false;
-        }
-        // 8. No spaces inside generic angle brackets
-        if (kind == K::K_LT || kind == K::LESS_THAN)
-            && (parent_kind == K::TYPEREF_TPL
-                || parent_kind == K::GENERIC_TPL
-                || parent_kind == K::GENERIC_ARGS
-                || parent_kind == K::TYPEREF_ARGS
-                || parent_kind == K::EXPR_TPL)
-        {
-            return false;
-        }
-        if (kind == K::K_GT || kind == K::GREATER_THAN)
-            && (parent_kind == K::TYPEREF_TPL
-                || parent_kind == K::GENERIC_TPL
-                || parent_kind == K::GENERIC_ARGS
-                || parent_kind == K::TYPEREF_ARGS
-                || parent_kind == K::EXPR_TPL)
-        {
-            return false;
-        }
-        // 9. No space after `<` in generic context
-        if prev_kind == K::K_LT && is_generic_parent(prev_parent_kind) {
-            return false;
-        }
-        // 10. No space before `:`
-        if kind == K::COLON {
-            return false;
-        }
-        // 11. No space around `..`
-        if kind == K::DOTDOT || prev_kind == K::DOTDOT {
-            return false;
-        }
-        // 12. No space before/after `kDot` or `.`
-        if kind == K::K_DOT {
-            return false;
-        }
-        if prev_kind == K::K_DOT || prev_kind == K::DOT {
-            return false;
-        }
-        // 13. spacing::space_before
-        if spacing::space_before(kind) {
-            return true;
-        }
-        // 14. spacing::space_after
-        if spacing::space_after(prev_kind) {
-            return true;
-        }
-        // 15. keyword needing space after
-        if is_keyword_needing_space_after(prev_kind) {
-            return true;
-        }
-        // 16. Default: space between two identifiers/keywords/literals
-        if !prev_kind.is_empty()
-            && prev_kind != K::SEMICOLON
-            && prev_kind != K::OPEN_PAREN
-            && prev_kind != K::OPEN_BRACKET
-        {
-            return true;
-        }
-        // 17. Otherwise
-        false
+        crate::spacing::would_need_space(prev_kind, prev_parent_kind, kind, parent_kind)
     }
 
     /// Measure the combined single-line width of a slice of nodes.

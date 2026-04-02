@@ -5,7 +5,9 @@ use tree_sitter::Node;
 
 impl<'a> DocBuilder<'a> {
     pub(crate) fn build_try(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        // try..except/finally..end — same structure as block but with
+        // try/except/finally/end as structural keywords.
+        self.build_children_preserving_blank_lines(node)
     }
 
     pub(crate) fn build_case(&self, node: Node<'a>) -> Doc {

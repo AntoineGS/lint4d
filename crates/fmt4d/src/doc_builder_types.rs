@@ -1,5 +1,5 @@
 use crate::doc::{self, Doc};
-use crate::doc_builder::DocBuilder;
+use crate::doc_builder::{strip_trailing_hardline, DocBuilder};
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
@@ -34,15 +34,15 @@ impl<'a> DocBuilder<'a> {
                 K::K_END => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
-                        parts.push(Doc::Hardline);
                     }
                     // Flush body with indent if no visibility sections
                     if !body_parts.is_empty() {
-                        if !has_visibility {
-                            parts.push(doc::indent(doc::concat(std::mem::take(&mut body_parts))));
+                        let body_doc = if !has_visibility {
+                            doc::indent(doc::concat(std::mem::take(&mut body_parts)))
                         } else {
-                            parts.push(doc::concat(std::mem::take(&mut body_parts)));
-                        }
+                            doc::concat(std::mem::take(&mut body_parts))
+                        };
+                        parts.push(strip_trailing_hardline(body_doc));
                     }
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
@@ -50,7 +50,8 @@ impl<'a> DocBuilder<'a> {
                 K::DECL_SECTION => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
-                        parts.push(Doc::Hardline);
+                        // No Hardline needed — build_decl_section starts with
+                        // its own leading Hardline.
                     }
                     body_parts.push(self.doc_for_node(*child));
                 }

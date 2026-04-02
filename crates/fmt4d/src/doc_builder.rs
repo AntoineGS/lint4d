@@ -160,7 +160,9 @@ impl<'a> DocBuilder<'a> {
 
         for (i, comment) in comments.iter().enumerate() {
             parts.push(Doc::Hardline);
-            parts.push(Doc::Raw(comment.text.clone()));
+            // Use Token (not Raw) so the renderer applies proper indentation
+            // when the comment appears at line start.
+            parts.push(doc::token(comment.text.clone(), K::COMMENT, ""));
 
             // Check for blank line between this comment and the next one (or node).
             let comment_end_row =
@@ -289,53 +291,112 @@ impl<'a> DocBuilder<'a> {
         self.build_children_preserving_blank_lines(node)
     }
 
-    fn build_children_preserving_blank_lines(&self, node: Node<'a>) -> Doc {
+    pub(crate) fn build_children_preserving_blank_lines(&self, node: Node<'a>) -> Doc {
         let children = self.code_children(node);
         let mut parts = Vec::new();
+        let mut body: Vec<Doc> = Vec::new();
+        let mut in_block = false;
         let mut prev_end_row: Option<usize> = None;
         let mut prev_kind = String::new();
 
         for child in &children {
             let kind = child.kind();
 
-            // Strip blank lines after block openers and before block closers.
-            let skip_blank =
-                prev_kind.is_empty() || is_block_opener(&prev_kind) || is_block_closer(kind);
-
-            if !skip_blank {
-                if let Some(prev_end) = prev_end_row {
-                    if self.has_blank_line_between(prev_end, child.start_position().row) {
-                        parts.push(Doc::BlankLine);
-                    }
-                }
-            }
-
             match kind {
                 K::K_BEGIN | K::K_TRY | K::K_REPEAT | K::K_ASM => {
+                    // Flush any accumulated body (shouldn't have any before first opener)
+                    if !body.is_empty() {
+                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
+                    }
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
-                    parts.push(Doc::Hardline);
+                    in_block = true;
+                    prev_end_row = Some(child.end_position().row);
+                    prev_kind = kind.to_string();
                 }
                 K::K_END => {
+                    // Flush body into Indent
+                    if !body.is_empty() {
+                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
+                    }
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
+                    in_block = false;
+                    prev_end_row = Some(child.end_position().row);
+                    prev_kind = kind.to_string();
                 }
                 K::K_EXCEPT | K::K_FINALLY => {
+                    // Flush body from try section
+                    if !body.is_empty() {
+                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
+                    }
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
-                    parts.push(Doc::Hardline);
+                    // Start new body for except/finally section
+                    in_block = true;
+                    prev_end_row = Some(child.end_position().row);
+                    prev_kind = kind.to_string();
+                }
+                K::SEMICOLON if in_block => {
+                    // Semicolons inside blocks: emit only — the next child's
+                    // Hardline provides the line break (matching the old
+                    // printer's idempotent ensure_newline).
+                    body.push(self.doc_for_node(*child));
+                    prev_end_row = Some(child.end_position().row);
+                    prev_kind = kind.to_string();
                 }
                 K::SEMICOLON => {
+                    // Semicolons outside blocks (e.g. after end) — no trailing
+                    // Hardline; the parent or next sibling provides it.
                     parts.push(self.doc_for_node(*child));
-                    parts.push(Doc::Hardline);
+                    prev_end_row = Some(child.end_position().row);
+                    prev_kind = kind.to_string();
                 }
                 _ => {
-                    parts.push(self.doc_for_node(*child));
+                    if in_block {
+                        // Check for preserved blank lines between statements
+                        let skip_blank = is_block_opener(&prev_kind) || is_block_closer(kind);
+                        if !skip_blank && !prev_kind.is_empty() {
+                            if let Some(prev_end) = prev_end_row {
+                                if self.has_blank_line_between(prev_end, child.start_position().row)
+                                {
+                                    body.push(Doc::BlankLine);
+                                }
+                            }
+                        }
+                        // Build the child doc first, then check if it already
+                        // starts with a Hardline (e.g. from leading comments
+                        // on a descendant). If so, skip our own Hardline to
+                        // match the old printer's idempotent ensure_newline.
+                        let child_doc = self.doc_for_node(*child);
+                        if !starts_with_hardline(&child_doc) {
+                            body.push(Doc::Hardline);
+                        }
+                        body.push(child_doc);
+                    } else {
+                        // Preserve blank lines outside blocks
+                        let skip_blank = prev_kind.is_empty()
+                            || is_block_opener(&prev_kind)
+                            || is_block_closer(kind);
+                        if !skip_blank {
+                            if let Some(prev_end) = prev_end_row {
+                                if self.has_blank_line_between(prev_end, child.start_position().row)
+                                {
+                                    parts.push(Doc::BlankLine);
+                                }
+                            }
+                        }
+                        parts.push(self.doc_for_node(*child));
+                    }
+                    prev_end_row = Some(child.end_position().row);
+                    prev_kind = kind.to_string();
                 }
             }
+        }
 
-            prev_end_row = Some(child.end_position().row);
-            prev_kind = kind.to_string();
+        // Flush any remaining body
+        if !body.is_empty() {
+            parts.push(doc::indent(doc::concat(body)));
         }
 
         doc::concat(parts)
@@ -414,7 +475,34 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_def_proc(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        // defProc children: declProc (signature), optional local sections
+        // (declVars/declConsts/declTypes), block (begin..end), final ;
+        // The old printer just recurses, relying on ensure_newline() being
+        // idempotent. We need to suppress trailing Hardlines from declProc
+        // before sections/blocks that start with their own Hardline.
+        let children = self.code_children(node);
+        let mut parts = Vec::new();
+
+        for (i, child) in children.iter().enumerate() {
+            let doc = self.doc_for_node(*child);
+
+            // Check if the next child starts with a Hardline (sections and
+            // blocks do). If so, strip trailing Hardline from this child's doc
+            // to avoid a blank line.
+            let next_starts_with_hardline = children.get(i + 1).is_some_and(|next| {
+                matches!(
+                    next.kind(),
+                    K::DECL_VARS | K::DECL_CONSTS | K::DECL_TYPES | K::BLOCK | K::STATEMENTS
+                )
+            });
+
+            if next_starts_with_hardline {
+                parts.push(strip_trailing_hardline(doc));
+            } else {
+                parts.push(doc);
+            }
+        }
+        doc::concat(parts)
     }
 
     fn build_decl_proc(&self, node: Node<'a>) -> Doc {
@@ -572,6 +660,42 @@ impl<'a> DocBuilder<'a> {
         }
 
         doc::group(doc::indent(doc::concat(parts)))
+    }
+}
+
+/// Remove a trailing `Hardline` from a Doc tree.
+///
+/// This mirrors the old printer's `ensure_newline()` idempotency: when two
+/// consecutive constructs both emit newlines at their boundary, the old printer
+/// collapses them into one because `ensure_newline` is a no-op if already at
+/// line start. We achieve the same by stripping the trailing Hardline from the
+/// first construct's Doc.
+pub(crate) fn strip_trailing_hardline(doc: Doc) -> Doc {
+    match doc {
+        Doc::Concat(mut docs) => {
+            if let Some(last) = docs.pop() {
+                let stripped = strip_trailing_hardline(last);
+                docs.push(stripped);
+            }
+            doc::concat(docs)
+        }
+        Doc::Indent(inner) => doc::indent(strip_trailing_hardline(*inner)),
+        Doc::Hardline => Doc::Empty,
+        other => other,
+    }
+}
+
+/// Check if a Doc starts with a Hardline (or BlankLine).
+///
+/// Drills into Concat to find the first non-empty element.
+fn starts_with_hardline(doc: &Doc) -> bool {
+    match doc {
+        Doc::Hardline | Doc::BlankLine => true,
+        Doc::Concat(docs) => docs
+            .iter()
+            .find(|d| !matches!(d, Doc::Empty))
+            .is_some_and(starts_with_hardline),
+        _ => false,
     }
 }
 

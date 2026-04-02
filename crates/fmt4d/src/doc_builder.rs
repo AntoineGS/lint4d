@@ -442,10 +442,6 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
-    fn build_type_body(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
-    }
-
     fn build_try(&self, node: Node<'a>) -> Doc {
         self.build_children(node)
     }

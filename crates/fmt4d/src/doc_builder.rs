@@ -88,6 +88,7 @@ impl<'a> DocBuilder<'a> {
             K::LITERAL_CHAR | K::LITERAL_STRING => self.build_verbatim_leaf(node),
             K::DECL_ARGS => self.build_args(node),
             K::EXPR_CALL => self.build_call(node),
+            K::EXPR_BRACKETS => self.build_bracket_list(node),
             _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
             _ => {
                 if node.child_count() > 0 && self.has_breakable_operators(node) {
@@ -626,7 +627,97 @@ impl<'a> DocBuilder<'a> {
             }
         }
 
+        // Hug a sole bracket-list argument: keep `([` and `])` together by
+        // merging the outer call group with the inner bracket group.
+        if let Some(hugged) = self.try_build_call_hugging_bracket(&flat) {
+            return hugged;
+        }
+
         self.build_delimited_list(&flat, K::COMMA, K::OPEN_PAREN, K::CLOSE_PAREN)
+    }
+
+    /// When a call has exactly one argument and that argument is an
+    /// `exprBrackets` node, produce a single merged group so that `([` and
+    /// `])` stay on the same line:
+    ///
+    /// ```text
+    /// Foo([        ← not   Foo(
+    ///   A,         ←         [A, B]
+    ///   B          ←       )
+    /// ]);
+    /// ```
+    fn try_build_call_hugging_bracket(&self, flat: &[Node<'a>]) -> Option<Doc> {
+        let open_idx = flat.iter().position(|c| c.kind() == K::OPEN_PAREN)?;
+        let close_idx = flat.iter().rposition(|c| c.kind() == K::CLOSE_PAREN)?;
+
+        let inner = &flat[open_idx + 1..close_idx];
+        if inner.len() != 1 || inner[0].kind() != K::EXPR_BRACKETS {
+            return None;
+        }
+        let bracket_node = inner[0];
+        let bracket_children = self.code_children(bracket_node);
+
+        let b_open_idx = bracket_children
+            .iter()
+            .position(|c| c.kind() == K::OPEN_BRACKET)?;
+        let b_close_idx = bracket_children
+            .iter()
+            .rposition(|c| c.kind() == K::CLOSE_BRACKET)?;
+        let b_inner = &bracket_children[b_open_idx + 1..b_close_idx];
+
+        // Build "before" for outer call (everything up to and including `(`)
+        let mut before: Vec<Doc> = flat[..=open_idx]
+            .iter()
+            .map(|c| self.doc_for_node(*c))
+            .collect();
+        // Immediately append `[` — no softline between `(` and `[`
+        before.push(self.doc_for_node(bracket_children[b_open_idx]));
+
+        if b_inner.is_empty() {
+            before.push(self.doc_for_node(bracket_children[b_close_idx]));
+            before.push(self.doc_for_node(flat[close_idx]));
+            for c in &flat[close_idx + 1..] {
+                before.push(self.doc_for_node(*c));
+            }
+            return Some(doc::concat(before));
+        }
+
+        let groups = Self::split_children_at(b_inner, K::COMMA);
+        let group_docs: Vec<Doc> = groups
+            .iter()
+            .map(|g| {
+                let parts: Vec<Doc> = g.iter().map(|n| self.doc_for_node(*n)).collect();
+                doc::concat(parts)
+            })
+            .collect();
+
+        let mut inner_parts = Vec::new();
+        for (i, gdoc) in group_docs.into_iter().enumerate() {
+            if i > 0 {
+                inner_parts.push(doc::token(",", K::COMMA, ""));
+                inner_parts.push(Doc::Line);
+            }
+            inner_parts.push(gdoc);
+        }
+
+        let grouped = doc::group(doc::concat(vec![
+            doc::concat(before),
+            doc::indent(doc::concat(vec![Doc::Softline, doc::concat(inner_parts)])),
+            Doc::Softline,
+            self.doc_for_node(bracket_children[b_close_idx]),
+            self.doc_for_node(flat[close_idx]),
+        ]));
+
+        let mut result = vec![grouped];
+        for c in &flat[close_idx + 1..] {
+            result.push(self.doc_for_node(*c));
+        }
+        Some(doc::concat(result))
+    }
+
+    fn build_bracket_list(&self, node: Node<'a>) -> Doc {
+        let children = self.code_children(node);
+        self.build_delimited_list(&children, K::COMMA, K::OPEN_BRACKET, K::CLOSE_BRACKET)
     }
 
     /// Build a parenthesised list with Group-based line breaking.

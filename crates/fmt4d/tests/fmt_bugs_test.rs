@@ -2281,3 +2281,54 @@ end.
     let result = format_source(src);
     assert_eq!(result, src, "short call should stay on one line:\n{result}");
 }
+
+// ── Bracket list one-per-line breaking ─────────────────────────────
+
+#[test]
+fn bracket_list_one_per_line_on_overflow() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+initialization
+  Rtti.RegisterFromText([
+    TypeInfo(TLinkField),
+    'masterField: RawUtf8; detailField: RawUtf8',
+    TypeInfo(TOptionDef),
+    'displayValue: RawUtf8; storedValue: RawUtf8'
+  ]);
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "bracket list should be one-per-line when overflowing:\n{result}"
+    );
+}
+
+#[test]
+fn short_bracket_list_stays_on_one_line() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  Format('hello %s %s', [A, B]);
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "short bracket list should stay on one line:\n{result}"
+    );
+}

@@ -608,7 +608,25 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_call(&self, node: Node<'a>) -> Doc {
-        self.build_paren_list(node, K::COMMA)
+        let children = self.code_children(node);
+
+        // Unwrap exprArgs: the tree-sitter grammar wraps call arguments in an
+        // exprArgs node, hiding commas from the delimiter-list splitter.
+        // Inline exprArgs's children so each argument gets its own line break.
+        let mut flat: Vec<Node<'a>> = Vec::new();
+        for child in &children {
+            if child.kind() == K::EXPR_ARGS {
+                for sub in child.children(&mut child.walk()) {
+                    if !sub.is_extra() {
+                        flat.push(sub);
+                    }
+                }
+            } else {
+                flat.push(*child);
+            }
+        }
+
+        self.build_delimited_list(&flat, K::COMMA, K::OPEN_PAREN, K::CLOSE_PAREN)
     }
 
     /// Build a parenthesised list with Group-based line breaking.

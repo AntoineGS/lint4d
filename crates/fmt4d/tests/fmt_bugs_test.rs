@@ -1893,3 +1893,391 @@ fn no_bom_when_source_has_none() {
         "BOM was added when source didn't have one"
     );
 }
+
+// ── Bug: Unwanted blank lines between method declarations in class/record types ──
+
+#[test]
+fn no_blank_lines_between_class_method_declarations() {
+    let src = "\
+unit T;
+
+interface
+
+type
+  TMyClass = class(TBase)
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function IsKeyword(const Token: string): Boolean; override;
+    function GetPaginationKeywords: TArray<string>; override;
+  end;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank lines inserted between method declarations:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_lines_in_abstract_class_methods() {
+    let src = "\
+unit T;
+
+interface
+
+type
+  TMyDialect = class abstract
+  public
+    function IsKeyword(const Token: string): Boolean; virtual; abstract;
+    function GetPaginationKeywords: TArray<string>; virtual; abstract;
+  end;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank lines inserted in abstract class:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_lines_in_record_with_visibility_sections() {
+    let src = "\
+unit T;
+
+interface
+
+type
+  TMyRec = record
+  private
+    FName: string;
+  public
+    procedure Init;
+    function ToString: string;
+  end;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank lines inserted in record with sections:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_visibility_sections_after_methods() {
+    let src = "\
+unit T;
+
+interface
+
+type
+  TMyClass = class
+  private
+    FName: string;
+    procedure InternalInit;
+    procedure InternalCleanup;
+  public
+    constructor Create;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between private/public sections:\n{result}"
+    );
+}
+
+#[test]
+fn blank_line_between_visibility_sections_preserved() {
+    let src = "\
+unit T;
+
+interface
+
+type
+  TMyClass = class
+  private
+    FName: string;
+    procedure InternalInit;
+    procedure InternalCleanup;
+
+  public
+    constructor Create;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line between visibility sections was not preserved:\n{result}"
+    );
+}
+
+#[test]
+fn intentional_blank_lines_in_class_preserved() {
+    let src = "\
+unit T;
+
+interface
+
+type
+  TMyClass = class
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure DoWork;
+    function GetResult: string;
+
+    property Name: string read FName write FName;
+    property Value: Integer read FValue;
+  end;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "intentional blank lines were not preserved:\n{result}"
+    );
+}
+
+// ── Bug: Blank line inserted before end/except/finally after comments ──
+
+#[test]
+fn no_blank_line_between_comment_and_end() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  DoSomething;
+  // trailing comment
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between comment and end:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_comment_and_end_in_except() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  try
+    Consolidate(Query);
+  except
+    // Do not raise on malformed SQL
+  end;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between comment and end in except:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_comment_and_end_in_nested_block() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  if X > 0 then
+  begin
+    // comment after begin
+    DoSomething;
+    // comment before end
+  end;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line around comments in nested block:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_multiline_comments_and_end() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  begin
+    DoWork;
+  end;
+  // First comment line.
+  // Second comment line.
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line between multi-line comments and end:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_after_case_else_before_comment() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  case Ch of
+    'A': DoA;
+  else
+    // Unknown character - skip it
+    ReadChar;
+  end;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line after case else before comment:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_after_begin_before_call_with_comment() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  if X > 0 then
+  begin
+    // Remove the field
+    FFields.Delete(I);
+  end;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line after begin before call with leading comment:\n{result}"
+    );
+}
+
+// ── Function call one-per-line breaking ────────────────────────────
+
+#[test]
+fn call_args_one_per_line_on_overflow() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  CreateOrder(
+    CustomerId,
+    ProductId,
+    Quantity,
+    UnitPrice,
+    DiscountPercent,
+    ShippingAddress,
+    BillingAddress,
+    PaymentMethod
+  );
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "call args should be one-per-line when overflowing:\n{result}"
+    );
+}
+
+#[test]
+fn short_call_stays_on_one_line() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  Foo(A, B, C);
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(result, src, "short call should stay on one line:\n{result}");
+}

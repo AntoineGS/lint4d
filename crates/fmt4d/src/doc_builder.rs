@@ -298,7 +298,11 @@ impl<'a> DocBuilder<'a> {
         let children = self.code_children(node);
         let mut parts = Vec::new();
         let mut body: Vec<Doc> = Vec::new();
-        let mut in_block = false;
+        // `statements` nodes (try/finally/repeat bodies) are already inside a
+        // block — their parent handles indentation, so we start in block mode
+        // but skip the indent wrapper when flushing.
+        let is_bare_statements = node.kind() == K::STATEMENTS;
+        let mut in_block = is_bare_statements;
         let mut prev_end_row: Option<usize> = None;
         let mut prev_kind = String::new();
 
@@ -309,7 +313,12 @@ impl<'a> DocBuilder<'a> {
                 K::K_BEGIN | K::K_TRY | K::K_REPEAT | K::K_ASM => {
                     // Flush any accumulated body (shouldn't have any before first opener)
                     if !body.is_empty() {
-                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
+                        let flushed = doc::concat(std::mem::take(&mut body));
+                        parts.push(if is_bare_statements {
+                            flushed
+                        } else {
+                            doc::indent(flushed)
+                        });
                     }
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
@@ -318,14 +327,21 @@ impl<'a> DocBuilder<'a> {
                     prev_kind = kind.to_string();
                 }
                 K::K_END => {
-                    // If kEnd has leading comments, they belong inside the body
+                    // If kEnd has leading comments, they belong inside the body.
+                    // Strip trailing Hardline — the handler adds its own before
+                    // the keyword, so keeping it would create a blank line.
                     let leading = self.leading_comments_doc(*child);
                     if !matches!(leading, Doc::Empty) {
-                        body.push(leading);
+                        body.push(strip_trailing_hardline(leading));
                     }
                     // Flush body into Indent
                     if !body.is_empty() {
-                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
+                        let flushed = doc::concat(std::mem::take(&mut body));
+                        parts.push(if is_bare_statements {
+                            flushed
+                        } else {
+                            doc::indent(flushed)
+                        });
                     }
                     parts.push(Doc::Hardline);
                     // Build the kEnd node WITHOUT its leading comments (already emitted above)
@@ -337,14 +353,20 @@ impl<'a> DocBuilder<'a> {
                     prev_kind = kind.to_string();
                 }
                 K::K_EXCEPT | K::K_FINALLY => {
-                    // If except/finally has leading comments, they belong inside the body
+                    // If except/finally has leading comments, they belong inside
+                    // the body. Strip trailing Hardline — same reason as kEnd.
                     let leading = self.leading_comments_doc(*child);
                     if !matches!(leading, Doc::Empty) {
-                        body.push(leading);
+                        body.push(strip_trailing_hardline(leading));
                     }
                     // Flush body from try section
                     if !body.is_empty() {
-                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
+                        let flushed = doc::concat(std::mem::take(&mut body));
+                        parts.push(if is_bare_statements {
+                            flushed
+                        } else {
+                            doc::indent(flushed)
+                        });
                     }
                     parts.push(Doc::Hardline);
                     // Build except/finally WITHOUT its leading comments (already emitted above)
@@ -415,7 +437,12 @@ impl<'a> DocBuilder<'a> {
 
         // Flush any remaining body
         if !body.is_empty() {
-            parts.push(doc::indent(doc::concat(body)));
+            let flushed = doc::concat(body);
+            parts.push(if is_bare_statements {
+                flushed
+            } else {
+                doc::indent(flushed)
+            });
         }
 
         doc::concat(parts)
@@ -479,20 +506,30 @@ impl<'a> DocBuilder<'a> {
                     prev_end_row = Some(child.end_position().row);
                 }
                 _ => {
+                    let child_doc = self.doc_for_node(*child);
                     if let Some(prev_end) = prev_end_row {
                         if self.has_blank_line_between(prev_end, child.start_position().row) {
                             body_parts.push(Doc::BlankLine);
                         } else if !body_parts.is_empty() {
-                            body_parts.push(Doc::Hardline);
+                            // Only add Hardline if the previous doc doesn't
+                            // already end with one (e.g. declProc items emit
+                            // a trailing Hardline after their final semicolon).
+                            let prev_ends = body_parts.last().is_some_and(ends_with_hardline);
+                            if !prev_ends && !starts_with_hardline(&child_doc) {
+                                body_parts.push(Doc::Hardline);
+                            }
                         }
                     }
-                    body_parts.push(self.doc_for_node(*child));
+                    body_parts.push(child_doc);
                     prev_end_row = Some(child.end_position().row);
                 }
             }
         }
         if !body_parts.is_empty() {
-            parts.push(doc::indent(doc::concat(body_parts)));
+            let body = doc::indent(doc::concat(body_parts));
+            // Strip trailing Hardline so it doesn't combine with the leading
+            // Hardline of the next visibility section to create a blank line.
+            parts.push(strip_trailing_hardline(body));
         }
         doc::concat(parts)
     }
@@ -577,12 +614,29 @@ impl<'a> DocBuilder<'a> {
     /// Build a parenthesised list with Group-based line breaking.
     fn build_paren_list(&self, node: Node<'a>, separator: &str) -> Doc {
         let children = self.code_children(node);
-        let open_idx = children.iter().position(|c| c.kind() == K::OPEN_PAREN);
-        let close_idx = children.iter().rposition(|c| c.kind() == K::CLOSE_PAREN);
+        self.build_delimited_list(&children, separator, K::OPEN_PAREN, K::CLOSE_PAREN)
+    }
+
+    /// Build a delimited list (parens or brackets) with Group-based line breaking.
+    ///
+    /// When the content fits on one line, keeps it flat.
+    /// When it overflows, puts each separator-delimited item on its own line.
+    fn build_delimited_list(
+        &self,
+        children: &[Node<'a>],
+        separator: &str,
+        open_kind: &str,
+        close_kind: &str,
+    ) -> Doc {
+        let open_idx = children.iter().position(|c| c.kind() == open_kind);
+        let close_idx = children.iter().rposition(|c| c.kind() == close_kind);
 
         let (open_idx, close_idx) = match (open_idx, close_idx) {
             (Some(o), Some(c)) => (o, c),
-            _ => return self.build_children(node),
+            _ => {
+                let docs: Vec<Doc> = children.iter().map(|c| self.doc_for_node(*c)).collect();
+                return doc::concat(docs);
+            }
         };
 
         let mut before: Vec<Doc> = children[..=open_idx]
@@ -723,7 +777,7 @@ pub(crate) fn strip_trailing_hardline(doc: Doc) -> Doc {
 
 /// Check if a Doc starts with a Hardline (or BlankLine).
 ///
-/// Drills into Concat to find the first non-empty element.
+/// Drills into Concat, Group, and Indent to find the first non-empty element.
 pub(crate) fn starts_with_hardline(doc: &Doc) -> bool {
     match doc {
         Doc::Hardline | Doc::BlankLine => true,
@@ -731,13 +785,14 @@ pub(crate) fn starts_with_hardline(doc: &Doc) -> bool {
             .iter()
             .find(|d| !matches!(d, Doc::Empty))
             .is_some_and(starts_with_hardline),
+        Doc::Group(inner) | Doc::Indent(inner) => starts_with_hardline(inner),
         _ => false,
     }
 }
 
 /// Check if a Doc ends with a Hardline (or BlankLine).
 ///
-/// Drills into Concat to find the last non-empty element.
+/// Drills into Concat, Group, and Indent to find the last non-empty element.
 pub(crate) fn ends_with_hardline(doc: &Doc) -> bool {
     match doc {
         Doc::Hardline | Doc::BlankLine => true,
@@ -745,6 +800,7 @@ pub(crate) fn ends_with_hardline(doc: &Doc) -> bool {
             .iter()
             .rfind(|d| !matches!(d, Doc::Empty))
             .is_some_and(ends_with_hardline),
+        Doc::Group(inner) | Doc::Indent(inner) => ends_with_hardline(inner),
         _ => false,
     }
 }

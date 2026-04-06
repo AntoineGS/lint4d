@@ -1835,3 +1835,61 @@ end.
         result
     );
 }
+
+// ── Bug: String concatenation over-broken into per-token lines ──
+
+#[test]
+fn string_concat_not_over_broken() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+var
+  S, A, B: string;
+begin
+  S := 'SELECT ' + A + '.' + B + ' FROM ' + A + ' WHERE ' + A + '.' + B + ' = ' + A + '.ID';
+end;
+end.
+";
+    let result = format_source(src);
+    // The expression is ~90 chars — should fit on one line with 120 char limit
+    let assign_line = result
+        .lines()
+        .find(|l| l.contains("'SELECT '"))
+        .expect("assignment not found");
+    assert!(
+        assign_line.contains(".ID'"),
+        "short string concat should stay on one line (total <120 chars):\n{}",
+        result
+    );
+}
+
+// ── Bug: BOM removal ───────────────────────────────────────────
+
+#[test]
+fn bom_preserved_in_output() {
+    let src_with_bom = "\u{FEFF}unit T;\ninterface\nimplementation\nend.\n";
+    let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let result = fmt4d::formatter::format_source(src_with_bom.as_bytes(), &info, &config)
+        .expect("formatting failed");
+    assert!(
+        result.starts_with('\u{FEFF}'),
+        "UTF-8 BOM was stripped from output:\n{:?}",
+        &result[..20.min(result.len())]
+    );
+}
+
+#[test]
+fn no_bom_when_source_has_none() {
+    let src = "unit T;\ninterface\nimplementation\nend.\n";
+    let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let result =
+        fmt4d::formatter::format_source(src.as_bytes(), &info, &config).expect("formatting failed");
+    assert!(
+        !result.starts_with('\u{FEFF}'),
+        "BOM was added when source didn't have one"
+    );
+}

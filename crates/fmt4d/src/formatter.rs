@@ -13,6 +13,8 @@ use std::collections::HashSet;
 /// Returns the formatted source, or an error message.
 /// If the source has parse errors, returns the original source unchanged.
 pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Result<String, String> {
+    let has_bom = source.starts_with(&[0xEF, 0xBB, 0xBF]);
+
     let (tree, diagnostics) =
         pascal_core::parser::parse_file(info, source).map_err(|e| e.to_string())?;
 
@@ -37,7 +39,13 @@ pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Resu
     let normalized = normalize_blank_lines(&raw_output, &config.blank_lines);
     let broken = break_long_lines(&normalized, config.max_line_length, config.indent_size);
 
-    Ok(resolved_eol.apply(&broken))
+    let mut final_output = resolved_eol.apply(&broken);
+
+    if has_bom && !final_output.starts_with('\u{FEFF}') {
+        final_output.insert(0, '\u{FEFF}');
+    }
+
+    Ok(final_output)
 }
 
 /// Post-processing pass: break lines that exceed `max_length`.
@@ -65,14 +73,21 @@ fn break_long_lines(source: &str, max_length: usize, indent_size: usize) -> Stri
 }
 
 /// Scan `bytes` for valid break positions — places where a long line can be
-/// split.  Returns byte offsets that point just past the break token and any
-/// trailing spaces (i.e. the start of the next segment).
+/// split.  Returns two tiers of byte offsets that point just past the break
+/// token and any trailing spaces (i.e. the start of the next segment).
 ///
-/// Valid break tokens:
+/// Preferred break tokens (first tier):
 /// - `;` or `,` inside parentheses
+///
+/// Fallback break tokens (second tier):
 /// - `+` outside string literals (string concatenation)
-fn scan_break_positions(bytes: &[u8]) -> Vec<usize> {
-    let mut positions = Vec::new();
+///
+/// The caller should use preferred breaks when available and only fall back
+/// to `+` breaks when no preferred breaks exist. This prevents string
+/// concatenations from being over-broken into per-token lines.
+fn scan_break_positions(bytes: &[u8]) -> (Vec<usize>, Vec<usize>) {
+    let mut preferred = Vec::new(); // ; and , inside parens
+    let mut fallback = Vec::new(); // + outside strings
     let mut paren_depth = 0i32;
     let mut in_string = false;
     let mut i = 0;
@@ -101,30 +116,39 @@ fn scan_break_positions(bytes: &[u8]) -> Vec<usize> {
                     while end < bytes.len() && bytes[end] == b' ' {
                         end += 1;
                     }
-                    positions.push(end);
+                    preferred.push(end);
                 }
                 b'+' => {
                     let mut end = i + 1;
                     while end < bytes.len() && bytes[end] == b' ' {
                         end += 1;
                     }
-                    positions.push(end);
+                    fallback.push(end);
                 }
                 _ => {}
             }
         }
         i += 1;
     }
-    positions
+    (preferred, fallback)
 }
 
 /// Break a single long line into multiple lines.
+///
+/// Prefers `;`/`,` break positions over `+` positions to avoid
+/// over-breaking string concatenations.
 fn break_single_line(line: &str, max_length: usize, indent_size: usize) -> Vec<String> {
     let base_indent = line.len() - line.trim_start().len();
     let continuation_indent = base_indent + indent_size;
     let cont_prefix: String = " ".repeat(continuation_indent);
 
-    let break_positions = scan_break_positions(line.as_bytes());
+    let (preferred, fallback) = scan_break_positions(line.as_bytes());
+    // Use preferred breaks if available, otherwise fall back to + breaks
+    let break_positions = if preferred.is_empty() {
+        fallback
+    } else {
+        preferred
+    };
 
     if break_positions.is_empty() {
         return vec![line.to_string()];
@@ -139,8 +163,9 @@ fn break_single_line(line: &str, max_length: usize, indent_size: usize) -> Vec<S
             break;
         }
 
-        // Find the rightmost break point that keeps the first part ≤ max_length
-        let positions = scan_break_positions(remaining.as_bytes());
+        // Find the rightmost break point that keeps the first part <= max_length
+        let (pref, fall) = scan_break_positions(remaining.as_bytes());
+        let positions = if pref.is_empty() { fall } else { pref };
         let best_bp = positions.iter().copied().rev().find(|&bp| bp <= max_length);
 
         if let Some(bp) = best_bp {

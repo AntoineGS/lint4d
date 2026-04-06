@@ -12,6 +12,7 @@ impl<'a> DocBuilder<'a> {
         let mut body_parts = Vec::new();
         let mut in_ancestor_list = false;
         let mut prev_body_kind = String::new();
+        let mut prev_body_end_row: Option<usize> = None;
 
         for (idx, child) in children.iter().enumerate() {
             match child.kind() {
@@ -68,8 +69,16 @@ impl<'a> DocBuilder<'a> {
                         // No Hardline needed — build_decl_section starts with
                         // its own leading Hardline.
                     }
+                    // Preserve blank lines between visibility sections when
+                    // the source has them (e.g. blank line before `public`).
+                    if let Some(prev_end) = prev_body_end_row {
+                        if self.has_blank_line_between(prev_end, child.start_position().row) {
+                            body_parts.push(Doc::BlankLine);
+                        }
+                    }
                     body_parts.push(self.doc_for_node(*child));
                     prev_body_kind = K::DECL_SECTION.to_string();
+                    prev_body_end_row = Some(child.end_position().row);
                 }
                 _ => {
                     if in_ancestor_list {
@@ -94,6 +103,7 @@ impl<'a> DocBuilder<'a> {
                     }
                     body_parts.push(child_doc);
                     prev_body_kind = child.kind().to_string();
+                    prev_body_end_row = Some(child.end_position().row);
                 }
             }
         }

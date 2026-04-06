@@ -56,9 +56,14 @@ impl<'a> DocBuilder<'a> {
                     prev_was_case_branch = false;
                 }
                 _ if after_else => {
-                    // Statements after `else` are indented
-                    else_body.push(Doc::Hardline);
-                    else_body.push(self.doc_for_node(*child));
+                    // Statements after `else` are indented.
+                    // Skip Hardline if the child already starts with one
+                    // (e.g. from leading comments) to avoid a blank line.
+                    let child_doc = self.doc_for_node(*child);
+                    if !crate::doc_builder::starts_with_hardline(&child_doc) {
+                        else_body.push(Doc::Hardline);
+                    }
+                    else_body.push(child_doc);
                 }
                 _ => {
                     parts.push(self.doc_for_node(*child));
@@ -73,7 +78,45 @@ impl<'a> DocBuilder<'a> {
     }
 
     pub(crate) fn build_repeat(&self, node: Node<'a>) -> Doc {
-        self.build_children(node)
+        let children = self.code_children(node);
+        let mut parts = Vec::new();
+        let mut body: Vec<Doc> = Vec::new();
+        let mut in_body = false;
+
+        for child in &children {
+            match child.kind() {
+                K::K_REPEAT => {
+                    parts.push(self.doc_for_node(*child));
+                    in_body = true;
+                }
+                K::K_UNTIL => {
+                    // Flush body
+                    if !body.is_empty() {
+                        parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
+                    }
+                    parts.push(Doc::Hardline);
+                    parts.push(self.doc_for_node(*child));
+                    in_body = false;
+                }
+                K::SEMICOLON if in_body => {
+                    body.push(self.doc_for_node(*child));
+                }
+                _ if in_body => {
+                    let child_doc = self.doc_for_node(*child);
+                    if !crate::doc_builder::starts_with_hardline(&child_doc) {
+                        body.push(Doc::Hardline);
+                    }
+                    body.push(child_doc);
+                }
+                _ => {
+                    parts.push(self.doc_for_node(*child));
+                }
+            }
+        }
+        if !body.is_empty() {
+            parts.push(doc::indent(doc::concat(body)));
+        }
+        doc::concat(parts)
     }
 
     pub(crate) fn build_if(&self, node: Node<'a>) -> Doc {

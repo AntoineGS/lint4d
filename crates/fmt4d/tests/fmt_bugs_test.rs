@@ -1701,3 +1701,61 @@ end.
         result
     );
 }
+
+// ── Bug 8: Aligned trailing comments collapsed to 1 space ──────
+// Column-aligned trailing comments (with multiple spaces before `//`)
+// must preserve their original spacing, not collapse to a single space.
+
+#[test]
+fn aligned_trailing_comments_preserved() {
+    let src = "\
+unit T;
+interface
+type
+  TInfo = record
+    Name: string;       // person name
+    Age: Integer;       // person age
+    Active: Boolean;    // is active
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    // The comments should maintain their original spacing (more than 1 space)
+    let comment_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.contains("// person") || l.contains("// is active"))
+        .collect();
+    assert!(
+        comment_lines.len() == 3,
+        "expected 3 comment lines, got {}:\n{}",
+        comment_lines.len(),
+        result
+    );
+    // There should be more than 1 space between the semicolon and the comment
+    for line in &comment_lines {
+        let semi_pos = line.find(';').unwrap();
+        let comment_pos = line.find("//").unwrap();
+        let gap = comment_pos - semi_pos - 1;
+        assert!(
+            gap >= 1,
+            "trailing comment should have at least 1 space gap, got {}:\n{}",
+            gap,
+            result
+        );
+    }
+    // Verify the original multi-space alignment is preserved (not collapsed to 1 space)
+    let name_line = result
+        .lines()
+        .find(|l| l.contains("// person name"))
+        .unwrap();
+    let semi_pos = name_line.find(';').unwrap();
+    let comment_pos = name_line.find("//").unwrap();
+    let gap = comment_pos - semi_pos - 1;
+    assert!(
+        gap > 1,
+        "aligned trailing comment gap was collapsed to {} spaces (expected >1):\n{}",
+        gap,
+        result
+    );
+}

@@ -195,7 +195,10 @@ impl<'a> DocBuilder<'a> {
 
         let docs: Vec<Doc> = comments
             .iter()
-            .map(|c| Doc::Raw(format!(" {}", c.text)))
+            .map(|c| {
+                let gap = if c.gap > 0 { c.gap } else { 1 };
+                Doc::Raw(format!("{}{}", " ".repeat(gap), c.text))
+            })
             .collect();
 
         doc::concat(docs)

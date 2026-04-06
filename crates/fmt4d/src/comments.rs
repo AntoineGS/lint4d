@@ -11,6 +11,9 @@ pub struct AttachedComment {
     pub trailing: bool,
     /// The source row (0-based) where the comment starts.
     pub source_row: usize,
+    /// Number of bytes between the preceding token and this comment in the source.
+    /// Only meaningful for trailing comments; 0 for leading comments.
+    pub gap: usize,
 }
 
 /// Maps node IDs to their attached comments.
@@ -38,6 +41,7 @@ impl CommentMap {
             // the comment — that makes it a trailing comment.
             if let Some(prev) = find_prev_leaf(root, *comment_node) {
                 if prev.end_position().row == comment_line {
+                    let gap = comment_node.start_byte().saturating_sub(prev.end_byte());
                     trailing
                         .entry(prev.id())
                         .or_default()
@@ -45,6 +49,7 @@ impl CommentMap {
                             text: text.clone(),
                             trailing: true,
                             source_row: comment_line,
+                            gap,
                         });
                     continue;
                 }
@@ -56,6 +61,7 @@ impl CommentMap {
                     text: text.clone(),
                     trailing: false,
                     source_row: comment_line,
+                    gap: 0,
                 });
             }
         }

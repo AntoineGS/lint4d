@@ -6,7 +6,7 @@ description = "Shared parsing and discovery infrastructure for Delphi/Object Pas
 
 [dependencies]
 tree-sitter = "0.24"
-tree-sitter-pascal = "0.10"
+tree-sitter-pascal = { git = "https://github.com/AntoineGS/tree-sitter-pascal.git" }
 tree-sitter-language = "0.1"
 serde = { version = "1", features = ["derive"] }
 globset = "0.4"

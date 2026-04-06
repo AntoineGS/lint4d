@@ -1759,3 +1759,79 @@ end.
         result
     );
 }
+
+// ── Task 9: Interface method blank lines ──────────────────────────
+
+#[test]
+fn interface_methods_no_extra_blank_lines() {
+    let src = "\
+unit T;
+interface
+type
+  IMyInterface = interface
+    function GetName: string;
+    function GetAge: Integer;
+    procedure SetName(const Value: string);
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    // There should NOT be blank lines between interface methods
+    assert!(
+        !result.contains("string;\n\n    function GetAge"),
+        "blank line inserted between interface methods:\n{}",
+        result
+    );
+    assert!(
+        !result.contains("Integer;\n\n    procedure SetName"),
+        "blank line inserted between interface methods:\n{}",
+        result
+    );
+}
+
+// ── Task 10: Class header to private blank line ───────────────────
+
+#[test]
+fn no_blank_line_between_class_header_and_private() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class(TObject)
+  private
+    FName: string;
+  public
+    constructor Create;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        !result.contains("class(TObject)\n\n  private"),
+        "blank line inserted between class header and private section:\n{}",
+        result
+    );
+}
+
+#[test]
+fn no_blank_line_between_class_and_private_no_ancestor() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  private
+    FName: string;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        !result.contains("class\n\n  private"),
+        "blank line inserted between class and private section:\n{}",
+        result
+    );
+}

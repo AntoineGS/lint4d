@@ -13,7 +13,7 @@ impl<'a> DocBuilder<'a> {
         let mut in_ancestor_list = false;
         let mut prev_body_kind = String::new();
 
-        for child in &children {
+        for (idx, child) in children.iter().enumerate() {
             match child.kind() {
                 K::K_CLASS
                 | K::K_RECORD
@@ -31,7 +31,12 @@ impl<'a> DocBuilder<'a> {
                 K::CLOSE_PAREN if in_ancestor_list => {
                     parts.push(Doc::Raw(")".into()));
                     in_ancestor_list = false;
-                    if has_end {
+                    // Only emit Hardline if next child is NOT a DECL_SECTION
+                    // (DECL_SECTION provides its own leading Hardline)
+                    let next_is_section = children
+                        .get(idx + 1)
+                        .is_some_and(|n| n.kind() == K::DECL_SECTION);
+                    if has_end && !next_is_section {
                         parts.push(Doc::Hardline);
                     }
                 }
@@ -69,15 +74,25 @@ impl<'a> DocBuilder<'a> {
                 _ => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
-                        if has_end {
+                        if has_end && child.kind() != K::DECL_SECTION {
                             parts.push(Doc::Hardline);
                         }
                     }
-                    // Add Hardline between body items (e.g. record fields)
-                    if !prev_body_kind.is_empty() {
+                    // Add Hardline between body items only if neither the
+                    // previous doc ends with one nor the current doc starts
+                    // with one (e.g. interface methods from build_decl_proc
+                    // already end with Hardline).
+                    let child_doc = self.doc_for_node(*child);
+                    let prev_ends = body_parts
+                        .last()
+                        .is_some_and(crate::doc_builder::ends_with_hardline);
+                    if !prev_body_kind.is_empty()
+                        && !prev_ends
+                        && !crate::doc_builder::starts_with_hardline(&child_doc)
+                    {
                         body_parts.push(Doc::Hardline);
                     }
-                    body_parts.push(self.doc_for_node(*child));
+                    body_parts.push(child_doc);
                     prev_body_kind = child.kind().to_string();
                 }
             }

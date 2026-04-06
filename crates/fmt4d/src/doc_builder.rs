@@ -724,13 +724,27 @@ pub(crate) fn strip_trailing_hardline(doc: Doc) -> Doc {
 /// Check if a Doc starts with a Hardline (or BlankLine).
 ///
 /// Drills into Concat to find the first non-empty element.
-fn starts_with_hardline(doc: &Doc) -> bool {
+pub(crate) fn starts_with_hardline(doc: &Doc) -> bool {
     match doc {
         Doc::Hardline | Doc::BlankLine => true,
         Doc::Concat(docs) => docs
             .iter()
             .find(|d| !matches!(d, Doc::Empty))
             .is_some_and(starts_with_hardline),
+        _ => false,
+    }
+}
+
+/// Check if a Doc ends with a Hardline (or BlankLine).
+///
+/// Drills into Concat to find the last non-empty element.
+pub(crate) fn ends_with_hardline(doc: &Doc) -> bool {
+    match doc {
+        Doc::Hardline | Doc::BlankLine => true,
+        Doc::Concat(docs) => docs
+            .iter()
+            .rfind(|d| !matches!(d, Doc::Empty))
+            .is_some_and(ends_with_hardline),
         _ => false,
     }
 }

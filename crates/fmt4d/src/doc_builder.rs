@@ -488,15 +488,28 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
 
         for (i, child) in children.iter().enumerate() {
+            let kind = child.kind();
+
+            // Nested DEF_PROC children don't produce their own leading
+            // Hardline (unlike sections and blocks), so we insert one.
+            if kind == K::DEF_PROC {
+                parts.push(Doc::Hardline);
+            }
+
             let doc = self.doc_for_node(*child);
 
-            // Check if the next child starts with a Hardline (sections and
-            // blocks do). If so, strip trailing Hardline from this child's doc
-            // to avoid a blank line.
+            // Check if the next child starts with a Hardline (sections,
+            // blocks, and nested procs do). If so, strip trailing Hardline
+            // from this child's doc to avoid a blank line.
             let next_starts_with_hardline = children.get(i + 1).is_some_and(|next| {
                 matches!(
                     next.kind(),
-                    K::DECL_VARS | K::DECL_CONSTS | K::DECL_TYPES | K::BLOCK | K::STATEMENTS
+                    K::DECL_VARS
+                        | K::DECL_CONSTS
+                        | K::DECL_TYPES
+                        | K::BLOCK
+                        | K::STATEMENTS
+                        | K::DEF_PROC
                 )
             });
 
@@ -519,7 +532,7 @@ impl<'a> DocBuilder<'a> {
                 K::SEMICOLON => {
                     let next = children.get(i + 1);
                     parts.push(self.doc_for_node(child));
-                    if next.map(|n| n.kind()) == Some(K::PROC_ATTRIBUTE) {
+                    if next.is_some_and(|n| matches!(n.kind(), K::PROC_ATTRIBUTE | K::K_FORWARD)) {
                         parts.push(Doc::Raw(" ".into()));
                     } else {
                         parts.push(Doc::Hardline);

@@ -1554,3 +1554,81 @@ end.
     assert_ne!(branch_1, branch_2, "branches 1 and 2 are on the same line");
     assert_ne!(branch_2, branch_3, "branches 2 and 3 are on the same line");
 }
+
+// ── Bug 14: Nested local functions run together ───────────────────
+// Nested local procedures/functions inside a procedure definition
+// must be separated by line breaks, not collapsed together.
+
+#[test]
+fn nested_local_functions_separated() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure Outer;
+
+  function Inner1: Integer;
+  begin
+    Result := 1;
+  end;
+
+  function Inner2: Integer;
+  begin
+    Result := 2;
+  end;
+
+begin
+  WriteLn(Inner1 + Inner2);
+end;
+end.
+";
+    let result = format_source(src);
+    // Nested functions should be on separate lines, not run together
+    assert!(
+        !result.contains("end;function") && !result.contains("end;  function"),
+        "nested functions were collapsed together:\n{}",
+        result
+    );
+    // Each nested function should be present
+    assert!(
+        result.contains("function Inner1"),
+        "Inner1 function missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("function Inner2"),
+        "Inner2 function missing:\n{}",
+        result
+    );
+}
+
+#[test]
+fn forward_declaration_stays_on_proc_line() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure Outer;
+  procedure Inner; forward;
+
+  procedure Helper;
+  begin
+  end;
+
+  procedure Inner;
+  begin
+    Helper;
+  end;
+
+begin
+end;
+end.
+";
+    let result = format_source(src);
+    // forward must stay on the same line as the declaration semicolon
+    assert!(
+        result.contains("procedure Inner; forward;"),
+        "forward was split from procedure declaration:\n{}",
+        result
+    );
+}

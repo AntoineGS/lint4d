@@ -182,6 +182,7 @@ pub const K_FINALIZATION: &str = "kFinalization";
 pub const K_RAISE: &str = "kRaise";
 pub const K_INHERITED: &str = "kInherited";
 pub const K_REINTRODUCE: &str = "kReintroduce";
+pub const K_FORWARD: &str = "kForward";
 pub const K_OUT: &str = "kOut";
 pub const K_DOT: &str = "kDot";
 

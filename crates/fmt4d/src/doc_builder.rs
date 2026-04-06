@@ -150,7 +150,7 @@ impl<'a> DocBuilder<'a> {
     /// Each comment is preceded by a `Hardline` and followed by a `Hardline`.
     /// If there is a blank line in the source between consecutive comments (or
     /// between the last comment and the node), a `BlankLine` is inserted.
-    fn leading_comments_doc(&self, node: Node<'a>) -> Doc {
+    pub(crate) fn leading_comments_doc(&self, node: Node<'a>) -> Doc {
         let comments = self.comments.leading_comments(node.id());
         if comments.is_empty() {
             return Doc::Empty;
@@ -187,7 +187,7 @@ impl<'a> DocBuilder<'a> {
     /// Build a `Doc` for the trailing comments of `node`.
     ///
     /// Each trailing comment is preceded by a single space.
-    fn trailing_comments_doc(&self, node: Node<'a>) -> Doc {
+    pub(crate) fn trailing_comments_doc(&self, node: Node<'a>) -> Doc {
         let comments = self.comments.trailing_comments(node.id());
         if comments.is_empty() {
             return Doc::Empty;
@@ -315,23 +315,39 @@ impl<'a> DocBuilder<'a> {
                     prev_kind = kind.to_string();
                 }
                 K::K_END => {
+                    // If kEnd has leading comments, they belong inside the body
+                    let leading = self.leading_comments_doc(*child);
+                    if !matches!(leading, Doc::Empty) {
+                        body.push(leading);
+                    }
                     // Flush body into Indent
                     if !body.is_empty() {
                         parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
                     }
                     parts.push(Doc::Hardline);
-                    parts.push(self.doc_for_node(*child));
+                    // Build the kEnd node WITHOUT its leading comments (already emitted above)
+                    let end_body = self.build_doc(*child);
+                    let end_trailing = self.trailing_comments_doc(*child);
+                    parts.push(doc::concat(vec![end_body, end_trailing]));
                     in_block = false;
                     prev_end_row = Some(child.end_position().row);
                     prev_kind = kind.to_string();
                 }
                 K::K_EXCEPT | K::K_FINALLY => {
+                    // If except/finally has leading comments, they belong inside the body
+                    let leading = self.leading_comments_doc(*child);
+                    if !matches!(leading, Doc::Empty) {
+                        body.push(leading);
+                    }
                     // Flush body from try section
                     if !body.is_empty() {
                         parts.push(doc::indent(doc::concat(std::mem::take(&mut body))));
                     }
                     parts.push(Doc::Hardline);
-                    parts.push(self.doc_for_node(*child));
+                    // Build except/finally WITHOUT its leading comments (already emitted above)
+                    let kw_body = self.build_doc(*child);
+                    let kw_trailing = self.trailing_comments_doc(*child);
+                    parts.push(doc::concat(vec![kw_body, kw_trailing]));
                     // Start new body for except/finally section
                     in_block = true;
                     prev_end_row = Some(child.end_position().row);

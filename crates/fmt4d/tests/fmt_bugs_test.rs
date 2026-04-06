@@ -1632,3 +1632,72 @@ end.
         result
     );
 }
+
+// ── Bug: Comment indentation inside block closers ──────────────
+// Comments inside blocks (try/except/begin..end) must stay at the
+// body indent level, not de-indent to the closer's level.
+
+#[test]
+fn comment_inside_except_block_indented() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  try
+    DoWork;
+  except
+    // Do not raise on failure
+  end;
+end;
+end.
+";
+    let result = format_source(src);
+    let comment_line = result
+        .lines()
+        .find(|l| l.contains("// Do not raise"))
+        .expect("comment was removed");
+    let except_line = result
+        .lines()
+        .find(|l| l.trim() == "except")
+        .expect("except not found");
+    let except_indent = except_line.len() - except_line.trim_start().len();
+    let comment_indent = comment_line.len() - comment_line.trim_start().len();
+    // Comment should be indented MORE than except (inside the except block)
+    assert!(
+        comment_indent > except_indent,
+        "comment (indent {}) should be indented inside except block (indent {}):\n{}",
+        comment_indent,
+        except_indent,
+        result
+    );
+}
+
+#[test]
+fn comment_inside_begin_block_indented() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  // JoinType already set from default
+  DoWork;
+end;
+end.
+";
+    let result = format_source(src);
+    let comment_line = result
+        .lines()
+        .find(|l| l.contains("// JoinType"))
+        .expect("comment was removed");
+    let comment_indent = comment_line.len() - comment_line.trim_start().len();
+    // Comment inside begin..end should be at body indent level (2 spaces)
+    assert!(
+        comment_indent >= 2,
+        "comment (indent {}) should be indented inside begin..end:\n{}",
+        comment_indent,
+        result
+    );
+}

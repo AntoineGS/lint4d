@@ -2332,3 +2332,61 @@ end.
         "short bracket list should stay on one line:\n{result}"
     );
 }
+
+// ── Combined call + bracket formatting ─────────────────────────────
+
+#[test]
+fn rtti_register_from_text_pattern() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+initialization
+  Rtti.RegisterFromText([
+    TypeInfo(TLinkField),
+    'masterField: RawUtf8; detailField: RawUtf8',
+    TypeInfo(TOptionDef),
+    'displayValue: RawUtf8; storedValue: RawUtf8',
+    TypeInfo(TBehaviorDef),
+      'columnPromptEN: RawUtf8; columnPromptFR: RawUtf8; '
+      + 'displayWidth: Integer; visible: Boolean; readOnly: Boolean; '
+      + 'controlType: Integer; options: array of TOptionDef'
+  ]);
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "Rtti.RegisterFromText pattern should format cleanly:\n{result}"
+    );
+}
+
+#[test]
+fn format_call_with_bracket_arg_splits_cleanly() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  S := Format(
+    'SELECT %s, %s, %s FROM %s WHERE %s = %s AND %s = %s ORDER BY %s',
+    [Col1, Col2, Col3, TableName, FilterCol1, FilterVal1, FilterCol2, FilterVal2, SortColumn]
+  );
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "Format call with bracket arg should split per-arg:\n{result}"
+    );
+}

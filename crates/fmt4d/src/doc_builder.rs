@@ -89,6 +89,7 @@ impl<'a> DocBuilder<'a> {
             K::DECL_ARGS => self.build_args(node),
             K::EXPR_CALL => self.build_call(node),
             K::EXPR_BRACKETS => self.build_bracket_list(node),
+            K::DECL_ENUM => self.build_paren_list(node, K::COMMA),
             _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
             _ => {
                 if node.child_count() > 0 && self.has_breakable_operators(node) {
@@ -785,7 +786,36 @@ impl<'a> DocBuilder<'a> {
             return doc::concat(before);
         }
 
-        let groups = Self::split_children_at(inner, separator);
+        // Check for // line comments in the inner content — when present the
+        // list MUST break because a line comment eats the rest of the line.
+        let inner_start = children[open_idx].end_byte();
+        let inner_end = children[close_idx].start_byte();
+        let has_line_comments = self.source[inner_start..inner_end]
+            .windows(2)
+            .any(|w| w == b"//");
+
+        // Split into groups while collecting the separator nodes so their
+        // trailing comments (e.g. `// & prefix` after a comma) are preserved.
+        let mut groups: Vec<Vec<Node<'a>>> = Vec::new();
+        let mut sep_nodes: Vec<Node<'a>> = Vec::new();
+        let mut current: Vec<Node<'a>> = Vec::new();
+
+        for node in inner {
+            if node.kind() == separator {
+                if separator == K::SEMICOLON {
+                    current.push(*node);
+                }
+                groups.push(std::mem::take(&mut current));
+                if separator != K::SEMICOLON {
+                    sep_nodes.push(*node);
+                }
+            } else {
+                current.push(*node);
+            }
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
 
         let group_docs: Vec<Doc> = groups
             .iter()
@@ -799,19 +829,44 @@ impl<'a> DocBuilder<'a> {
         for (i, gdoc) in group_docs.into_iter().enumerate() {
             if i > 0 {
                 if separator == K::COMMA {
-                    inner_parts.push(doc::token(",", K::COMMA, ""));
+                    if let Some(sep_node) = sep_nodes.get(i - 1) {
+                        inner_parts.push(self.doc_for_node(*sep_node));
+                    } else {
+                        inner_parts.push(doc::token(",", K::COMMA, ""));
+                    }
                 }
-                inner_parts.push(Doc::Line);
+                if has_line_comments {
+                    inner_parts.push(Doc::Hardline);
+                } else {
+                    inner_parts.push(Doc::Line);
+                }
             }
             inner_parts.push(gdoc);
         }
 
-        let grouped = doc::group(doc::concat(vec![
+        let body = doc::concat(vec![
             doc::concat(before),
-            doc::indent(doc::concat(vec![Doc::Softline, doc::concat(inner_parts)])),
-            Doc::Softline,
+            doc::indent(doc::concat(vec![
+                if has_line_comments {
+                    Doc::Hardline
+                } else {
+                    Doc::Softline
+                },
+                doc::concat(inner_parts),
+            ])),
+            if has_line_comments {
+                Doc::Hardline
+            } else {
+                Doc::Softline
+            },
             self.doc_for_node(children[close_idx]),
-        ]));
+        ]);
+
+        let grouped = if has_line_comments {
+            body
+        } else {
+            doc::group(body)
+        };
 
         let mut result = vec![grouped];
         for c in &children[close_idx + 1..] {

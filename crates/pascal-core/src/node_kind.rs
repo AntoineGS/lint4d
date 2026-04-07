@@ -34,6 +34,7 @@ pub const DECL_FIELD: &str = "declField";
 pub const DECL_ARG: &str = "declArg";
 pub const DECL_ARGS: &str = "declArgs";
 pub const DECL_PROC: &str = "declProc";
+pub const DECL_ENUM: &str = "declEnum";
 pub const DEF_PROC: &str = "defProc";
 
 // ── Expression nodes ────────────────────────────────────────────────

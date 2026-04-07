@@ -485,25 +485,40 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut body_parts: Vec<Doc> = Vec::new();
         let mut first = true;
+        let mut after_strict = false;
         let mut prev_end_row: Option<usize> = None;
 
         for child in &children {
             match child.kind() {
                 K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED | K::K_STRICT => {
-                    if !body_parts.is_empty() {
-                        parts.push(doc::indent(doc::concat(body_parts.clone())));
-                        body_parts.clear();
-                    }
-                    if first {
-                        parts.push(Doc::Hardline);
-                        parts.push(self.doc_for_node(*child));
-                        parts.push(Doc::Hardline);
-                        first = false;
-                    } else {
+                    let is_strict = child.kind() == K::K_STRICT;
+
+                    if after_strict {
+                        // Continuation of "strict private" / "strict protected"
                         parts.push(Doc::Raw(" ".into()));
                         parts.push(Doc::Raw(self.node_text(*child)));
                         parts.push(Doc::Hardline);
+                        after_strict = false;
+                    } else {
+                        if !body_parts.is_empty() {
+                            parts.push(doc::indent(doc::concat(body_parts.clone())));
+                            body_parts.clear();
+                        }
+                        if first {
+                            parts.push(Doc::Hardline);
+                            parts.push(self.doc_for_node(*child));
+                            first = false;
+                        } else {
+                            parts.push(Doc::Raw(" ".into()));
+                            parts.push(Doc::Raw(self.node_text(*child)));
+                        }
+                        if is_strict {
+                            after_strict = true;
+                        } else {
+                            parts.push(Doc::Hardline);
+                        }
                     }
+
                     prev_end_row = Some(child.end_position().row);
                 }
                 _ => {

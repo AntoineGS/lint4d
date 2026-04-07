@@ -2551,3 +2551,51 @@ end.
         "semicolon must not be split to next line:\n{result}"
     );
 }
+
+// ── Bug: strict private / strict protected split across lines ───
+// "strict private" is a single visibility specifier in Delphi.
+// The formatter must keep "strict" and "private"/"protected" on one line.
+
+#[test]
+fn strict_private_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  strict private
+    FValue: Integer;
+  private
+    FName: string;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("strict private"),
+        "strict private was split across lines:\n{result}"
+    );
+}
+
+#[test]
+fn strict_protected_stays_on_one_line() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  strict protected
+    FValue: Integer;
+  protected
+    FName: string;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("strict protected"),
+        "strict protected was split across lines:\n{result}"
+    );
+}

@@ -2599,3 +2599,111 @@ end.
         "strict protected was split across lines:\n{result}"
     );
 }
+
+// ── Brace / paren-star comment spacing ──────────────────────────────
+
+#[test]
+fn no_blank_line_before_brace_comment_after_then() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  if FHasFields then
+  begin
+    { Initialize the record }
+    DoSomething;
+  end;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted before brace comment after then:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_before_paren_star_comment_after_then() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  if FHasFields then
+  begin
+    (* Initialize the record *)
+    DoSomething;
+  end;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted before paren-star comment after then:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_before_brace_comment_single_stmt_after_then() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  if FHasFields then
+    { Initialize the record }
+    DoSomething;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted before brace comment in single-stmt if:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_before_brace_comment_after_else() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+begin
+  if X then
+    DoA
+  else
+    { Handle the other case }
+    DoB;
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted before brace comment after else:\n{result}"
+    );
+}

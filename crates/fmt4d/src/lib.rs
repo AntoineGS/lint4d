@@ -11,5 +11,4 @@ pub mod indent;
 pub mod line_break;
 pub mod renderer;
 pub mod spacing;
-pub mod timings;
 pub mod uses;

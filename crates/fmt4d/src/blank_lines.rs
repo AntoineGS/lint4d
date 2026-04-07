@@ -44,14 +44,16 @@ pub fn needs_blank_line_between(
         )
     };
 
-    if prev_kind == K::DEF_PROC && next_kind == K::DEF_PROC {
+    let is_proc = |k: &str| matches!(k, K::DEF_PROC | K::DECL_PROC);
+
+    if is_proc(prev_kind) && is_proc(next_kind) {
         return config.between_procedures;
     }
     if is_section(prev_kind) && is_section(next_kind) {
         return config.between_sections;
     }
-    if (is_section(prev_kind) && next_kind == K::DEF_PROC)
-        || (prev_kind == K::DEF_PROC && is_section(next_kind))
+    if (is_section(prev_kind) && is_proc(next_kind))
+        || (is_proc(prev_kind) && is_section(next_kind))
     {
         return config.between_sections;
     }

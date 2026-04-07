@@ -50,8 +50,12 @@ impl<'a> DocBuilder<'a> {
                             &kind,
                             &self.config.blank_lines,
                         );
-                        for _ in 0..blanks {
-                            parts.push(Doc::BlankLine);
+                        if blanks > 0 {
+                            for _ in 0..blanks {
+                                parts.push(Doc::BlankLine);
+                            }
+                        } else {
+                            parts.push(Doc::Hardline);
                         }
                     }
                     parts.push(self.doc_for_node(*child));
@@ -86,8 +90,12 @@ impl<'a> DocBuilder<'a> {
                             &kind,
                             &self.config.blank_lines,
                         );
-                        for _ in 0..blanks {
-                            parts.push(Doc::BlankLine);
+                        if blanks > 0 {
+                            for _ in 0..blanks {
+                                parts.push(Doc::BlankLine);
+                            }
+                        } else {
+                            parts.push(Doc::Hardline);
                         }
                     }
                     parts.push(self.doc_for_node(*child));

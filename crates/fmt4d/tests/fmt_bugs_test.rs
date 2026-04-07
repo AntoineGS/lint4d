@@ -2707,3 +2707,75 @@ end.
         "blank line inserted before brace comment after else:\n{result}"
     );
 }
+
+// ── Bug: const section + function decl joined on one line ─────────
+// A const block followed by function declarations in the interface
+// section must be separated by a blank line, not concatenated.
+
+#[test]
+fn const_section_followed_by_function_decl_not_joined() {
+    let src = "\
+unit T;
+interface
+
+const
+  CLIENT_TOKEN_KINDS = [tkField, tkControl, tkUsageStatic];
+
+function ExtractMacroBlocks(const ASource: RawUtf8): TMacroBlockArray;
+function ParseTokenPrefix(const AExpression: RawUtf8): TTokenInfo;
+
+implementation
+end.
+";
+    let result = format_source(src);
+    // The const section and function declarations must NOT be joined on one line
+    assert!(
+        result.contains("tkUsageStatic];\n\nfunction ExtractMacroBlocks"),
+        "const section and function declaration were joined on one line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn var_section_followed_by_function_decl_not_joined() {
+    let src = "\
+unit T;
+interface
+
+var
+  GlobalFlag: Boolean;
+
+function DoSomething: Integer;
+
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("Boolean;\n\nfunction DoSomething"),
+        "var section and function declaration were joined on one line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn function_decl_followed_by_const_section_not_joined() {
+    let src = "\
+unit T;
+interface
+
+function DoSomething: Integer;
+
+const
+  MAX_VALUE = 100;
+
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("Integer;\n\nconst"),
+        "function declaration and const section were joined on one line:\n{}",
+        result
+    );
+}

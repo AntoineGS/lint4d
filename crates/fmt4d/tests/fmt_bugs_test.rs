@@ -1633,6 +1633,103 @@ end.
     );
 }
 
+// ── Bug: Nested procedures must be indented ─────────────────────
+// Nested procedures/functions declared inside another procedure must
+// be indented one level relative to the parent so they align with
+// local var section bodies.
+
+#[test]
+fn nested_procedure_indented_one_level() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure Outer;
+var
+  x: Integer;
+  function Inner(const A: RawUtf8): RawUtf8;
+  begin
+    Result := A;
+  end;
+begin
+  WriteLn(Inner(x));
+end;
+end.
+";
+    let result = format_source(src);
+    // The nested function signature must be indented by one level (2 spaces)
+    assert!(
+        result.contains("\n  function Inner"),
+        "nested function not indented:\n{}",
+        result
+    );
+    // Its begin/end must also be at one indent level
+    let lines: Vec<&str> = result.lines().collect();
+    let inner_begin = lines
+        .iter()
+        .position(|l| l.trim() == "begin" && l.starts_with("  "))
+        .expect("nested begin not found at indent 1");
+    let inner_end = lines
+        .iter()
+        .position(|l| l.trim() == "end;" && l.starts_with("  "))
+        .expect("nested end not found at indent 1");
+    assert!(inner_begin < inner_end, "begin should come before end");
+    // Body inside nested begin..end must be at two indent levels (4 spaces)
+    assert!(
+        result.contains("\n    Result := A;"),
+        "nested body not at indent 2:\n{}",
+        result
+    );
+}
+
+#[test]
+fn deeply_nested_procedure_indentation() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure Outer;
+
+  function Middle: Integer;
+  var
+    y: Integer;
+
+    procedure Deepest;
+    begin
+      y := 99;
+    end;
+
+  begin
+    Deepest;
+    Result := y;
+  end;
+
+begin
+  WriteLn(Middle);
+end;
+end.
+";
+    let result = format_source(src);
+    // Middle at indent 1
+    assert!(
+        result.contains("\n  function Middle"),
+        "middle function not at indent 1:\n{}",
+        result
+    );
+    // Deepest at indent 2 (4 spaces)
+    assert!(
+        result.contains("\n    procedure Deepest"),
+        "deepest procedure not at indent 2:\n{}",
+        result
+    );
+    // Deepest body at indent 3 (6 spaces)
+    assert!(
+        result.contains("\n      y := 99;"),
+        "deepest body not at indent 3:\n{}",
+        result
+    );
+}
+
 // ── Bug: Comment indentation inside block closers ──────────────
 // Comments inside blocks (try/except/begin..end) must stay at the
 // body indent level, not de-indent to the closer's level.
@@ -2351,7 +2448,7 @@ initialization
     TypeInfo(TOptionDef),
     'displayValue: RawUtf8; storedValue: RawUtf8',
     TypeInfo(TBehaviorDef),
-      'columnPromptEN: RawUtf8; columnPromptFR: RawUtf8; '
+    'columnPromptEN: RawUtf8; columnPromptFR: RawUtf8; '
       + 'displayWidth: Integer; visible: Boolean; readOnly: Boolean; '
       + 'controlType: Integer; options: array of TOptionDef'
   ]);
@@ -2388,5 +2485,69 @@ end.
     assert_eq!(
         result, src,
         "Format call with bracket arg should split per-arg:\n{result}"
+    );
+}
+
+// ── Bug: binary expr arg aligned with sibling args in call ──────
+// A string concatenation (binary +) used as one of several call
+// arguments must start at the same indent as the other arguments.
+
+#[test]
+fn call_args_binary_expr_aligned_with_siblings() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+var
+  msg: RawUtf8;
+begin
+  msg := FormatUtf8(
+    '{\"type\":\"cache\",\"event\":\"%\",\"branchId\":\"%\",' + '\"ruleCount\":%,\"durationMs\":%,\"status\":\"%\"}',
+    [aEvent, aBranchId, aRuleCount, aDurationMs, aStatus]
+  );
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "binary-expr arg should align with bracket-list arg:\n{result}"
+    );
+}
+
+// ── Bug: case-else semicolon on separate line ───────────────────
+// The semicolon after a statement in a case..else branch was placed
+// on a new line because build_case treated it as a separate statement.
+
+#[test]
+fn case_else_semicolon_stays_on_same_line() {
+    let src = "\
+unit T;
+interface
+implementation
+function F(AFieldType: Integer): RawUtf8;
+begin
+  case AFieldType of
+    1: Result := 'TEXT';
+    2: Result := 'BLOB';
+  else
+    Result := 'TEXT';
+  end;
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("Result := 'TEXT';"),
+        "semicolon should stay on same line as assignment in case-else:\n{result}"
+    );
+    assert!(
+        !result.contains("'TEXT'\n"),
+        "semicolon must not be split to next line:\n{result}"
     );
 }

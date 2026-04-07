@@ -756,3 +756,102 @@ end.
     let result = format_source_with_max(src, 80);
     assert_no_long_lines(&result, 80);
 }
+
+// ── Trailing Operator Position ──────────────────────────────────
+
+fn format_source_trailing(source: &str, max_line_length: usize) -> String {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.max_line_length = max_line_length;
+    config.operator_position = fmt4d::config::OperatorPosition::Trailing;
+    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+}
+
+fn assert_idempotent_trailing(source: &str, max_line_length: usize) {
+    let first = format_source_trailing(source, max_line_length);
+    let second = format_source_trailing(&first, max_line_length);
+    assert_eq!(
+        first, second,
+        "trailing-operator formatting is not idempotent"
+    );
+}
+
+#[test]
+fn trailing_op_and_breaks_at_end_of_line() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (SomeCondition = True) and (AnotherCondition > 10) and (YetAnother <> '') and (FourthCheck = 1) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_trailing(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_trailing(src, 80);
+    let and_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_end().ends_with(" and"))
+        .collect();
+    assert!(
+        !and_lines.is_empty(),
+        "`and` should trail at end of lines:\n{}",
+        result
+    );
+}
+
+#[test]
+fn trailing_op_or_breaks_at_end_of_line() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (SomeCondition = True) or (AnotherCondition > 10) or (YetAnother <> '') or (FourthCheck = 1) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_trailing(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_trailing(src, 80);
+    let or_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_end().ends_with(" or"))
+        .collect();
+    assert!(
+        !or_lines.is_empty(),
+        "`or` should trail at end of lines:\n{}",
+        result
+    );
+}
+
+#[test]
+fn trailing_op_plus_breaks_at_end_of_line() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Result := VeryLongExpression + AnotherLongExpression + YetMoreStuffHere + FinalPartOfExpression;
+end;
+end.
+";
+    let result = format_source_trailing(src, 80);
+    assert_no_long_lines(&result, 80);
+    assert_idempotent_trailing(src, 80);
+    let plus_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_end().ends_with(" +"))
+        .collect();
+    assert!(
+        !plus_lines.is_empty(),
+        "`+` should trail at end of lines:\n{}",
+        result
+    );
+}

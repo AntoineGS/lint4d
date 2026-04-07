@@ -21,6 +21,24 @@ pub enum BeginStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum OperatorPosition {
+    /// Operator leads the continuation line (default):
+    /// ```text
+    ///   a
+    ///     + b
+    /// ```
+    #[default]
+    Leading,
+    /// Operator trails at the end of the previous line:
+    /// ```text
+    ///   a +
+    ///     b
+    /// ```
+    Trailing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EndOfLine {
     #[default]
     Auto,
@@ -103,6 +121,7 @@ pub struct FmtConfig {
     pub max_line_length: usize,
     pub begin_style: BeginStyle,
     pub end_of_line: EndOfLine,
+    pub operator_position: OperatorPosition,
     pub blank_lines: BlankLineConfig,
     pub uses: UsesConfig,
     #[serde(skip)]
@@ -117,6 +136,7 @@ impl Default for FmtConfig {
             max_line_length: 120,
             begin_style: BeginStyle::NextLine,
             end_of_line: EndOfLine::Auto,
+            operator_position: OperatorPosition::default(),
             blank_lines: BlankLineConfig::default(),
             uses: UsesConfig::default(),
             project_root: None,
@@ -181,6 +201,7 @@ mod tests {
         assert_eq!(config.max_line_length, 120);
         assert_eq!(config.begin_style, BeginStyle::NextLine);
         assert_eq!(config.end_of_line, EndOfLine::Auto);
+        assert_eq!(config.operator_position, OperatorPosition::Leading);
         assert_eq!(config.blank_lines.between_procedures, 1);
         assert!(config.uses.sort);
         assert!(!config.uses.group);
@@ -279,6 +300,26 @@ external_prefixes = ["Spring", "Neon"]
         let config = FmtConfig::default().with_overrides(Some(4), Some(80), None);
         assert_eq!(config.indent_size, 4);
         assert_eq!(config.max_line_length, 80);
+    }
+
+    #[test]
+    fn parse_toml_operator_position_trailing() {
+        let toml = r#"
+[format]
+operator_position = "trailing"
+"#;
+        let config = FmtConfig::from_toml(toml).unwrap();
+        assert_eq!(config.operator_position, OperatorPosition::Trailing);
+    }
+
+    #[test]
+    fn parse_toml_operator_position_defaults_to_leading() {
+        let toml = r#"
+[format]
+indent_size = 2
+"#;
+        let config = FmtConfig::from_toml(toml).unwrap();
+        assert_eq!(config.operator_position, OperatorPosition::Leading);
     }
 
     #[test]

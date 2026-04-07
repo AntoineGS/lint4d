@@ -1,5 +1,5 @@
 use crate::comments::CommentMap;
-use crate::config::FmtConfig;
+use crate::config::{FmtConfig, OperatorPosition};
 use crate::doc::{self, Doc};
 use pascal_core::node_kind as K;
 use pascal_core::FormatOffRegion;
@@ -555,6 +555,14 @@ impl<'a> DocBuilder<'a> {
 
             let doc = self.doc_for_node(*child);
 
+            // Nested procedures must be indented one level relative to
+            // their parent procedure so they align with local var bodies.
+            let doc = if kind == K::DEF_PROC {
+                doc::indent(doc)
+            } else {
+                doc
+            };
+
             // Check if the next child starts with a Hardline (sections,
             // blocks, and nested procs do). If so, strip trailing Hardline
             // from this child's doc to avoid a blank line.
@@ -839,26 +847,47 @@ impl<'a> DocBuilder<'a> {
     }
 
     /// Build a flattened binary chain with Group-based line breaking.
+    ///
+    /// Operator placement depends on `config.operator_position`:
+    /// - `Leading` (default): operator starts the continuation line
+    /// - `Trailing`: operator ends the previous line
     pub(crate) fn build_binary_chain_doc(&self, segments: &[BinarySegment]) -> Doc {
-        let mut parts = Vec::new();
+        let mut first_parts = Vec::new();
+        let mut rest_parts = Vec::new();
+        let trailing = self.config.operator_position == OperatorPosition::Trailing;
 
         for (i, seg) in segments.iter().enumerate() {
             if i == 0 {
                 for n in &seg.operand {
-                    parts.push(self.doc_for_node(*n));
+                    first_parts.push(self.doc_for_node(*n));
+                }
+            } else if trailing {
+                if let Some(op) = seg.operator {
+                    rest_parts.push(self.doc_for_node(op));
+                }
+                rest_parts.push(Doc::Line);
+                for n in &seg.operand {
+                    rest_parts.push(self.doc_for_node(*n));
                 }
             } else {
-                parts.push(Doc::Line);
+                rest_parts.push(Doc::Line);
                 if let Some(op) = seg.operator {
-                    parts.push(self.doc_for_node(op));
+                    rest_parts.push(self.doc_for_node(op));
                 }
                 for n in &seg.operand {
-                    parts.push(self.doc_for_node(*n));
+                    rest_parts.push(self.doc_for_node(*n));
                 }
             }
         }
 
-        doc::group(doc::indent(doc::concat(parts)))
+        if rest_parts.is_empty() {
+            return doc::concat(first_parts);
+        }
+
+        doc::group(doc::concat(vec![
+            doc::concat(first_parts),
+            doc::indent(doc::concat(rest_parts)),
+        ]))
     }
 }
 

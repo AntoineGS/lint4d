@@ -55,6 +55,11 @@ impl<'a> DocBuilder<'a> {
                     parts.push(self.doc_for_node(*child));
                     prev_was_case_branch = false;
                 }
+                K::SEMICOLON if after_else => {
+                    // Semicolons in else body: emit without preceding Hardline
+                    // so they stay attached to the previous statement.
+                    else_body.push(self.doc_for_node(*child));
+                }
                 _ if after_else => {
                     // Statements after `else` are indented.
                     // Skip Hardline if the child already starts with one

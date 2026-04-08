@@ -7,7 +7,8 @@ fn format_with_eol(source: &[u8], eol: EndOfLine) -> String {
         end_of_line: eol,
         ..FmtConfig::default()
     };
-    fmt4d::formatter::format_source(source, &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(source, &info, &config, &std::collections::HashSet::new())
+        .expect("formatting failed")
 }
 
 const LF_SOURCE: &str = "unit Test;\ninterface\nimplementation\nend.\n";

@@ -1,9 +1,11 @@
 use clap::{CommandFactory, Parser};
 use fmt4d::config::{EndOfLine, FmtConfig};
 use fmt4d::formatter::format_source;
+use fmt4d::uses;
 use pascal_core::discovery::discover_files;
 use pascal_core::FileInfo;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -116,7 +118,7 @@ fn run_stdin(cli: &Cli) -> i32 {
     let config =
         FmtConfig::default().with_overrides(cli.indent_size, cli.max_line_length, cli.end_of_line);
 
-    match format_source(input.as_bytes(), &info, &config) {
+    match format_source(input.as_bytes(), &info, &config, &HashSet::new()) {
         Ok(formatted) => {
             print!("{}", formatted);
             EXIT_OK
@@ -177,6 +179,11 @@ fn run_files(cli: &Cli) -> i32 {
         cli.end_of_line,
     );
 
+    let external_units = match &config.project_root {
+        Some(root) => uses::scan_external_paths(root, &config.uses.external_paths),
+        None => HashSet::new(),
+    };
+
     let had_changes = AtomicBool::new(false);
     let had_errors = AtomicBool::new(false);
 
@@ -190,7 +197,7 @@ fn run_files(cli: &Cli) -> i32 {
             }
         };
 
-        let formatted = match format_source(&source, file_info, &config) {
+        let formatted = match format_source(&source, file_info, &config, &external_units) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("Error formatting {}: {}", file_info.path.display(), e);

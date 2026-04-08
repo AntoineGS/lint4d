@@ -5,14 +5,26 @@ use std::path::PathBuf;
 fn format_source(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 fn format_source_with_max(source: &str, max_line_length: usize) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();
     config.max_line_length = max_line_length;
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 /// Assert that no line in the output exceeds max_line_length.
@@ -764,7 +776,13 @@ fn format_source_trailing(source: &str, max_line_length: usize) -> String {
     let mut config = fmt4d::config::FmtConfig::default();
     config.max_line_length = max_line_length;
     config.operator_position = fmt4d::config::OperatorPosition::Trailing;
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 fn assert_idempotent_trailing(source: &str, max_line_length: usize) {

@@ -3,7 +3,13 @@ use std::path::PathBuf;
 fn format_source_helper(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 fn ast_eq(a: tree_sitter::Node, b: tree_sitter::Node) -> bool {
@@ -27,8 +33,13 @@ fn ast_eq(a: tree_sitter::Node, b: tree_sitter::Node) -> bool {
 fn roundtrip_check(source: &str) {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    let formatted = fmt4d::formatter::format_source(source.as_bytes(), &info, &config)
-        .expect("formatting failed");
+    let formatted = fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed");
 
     // Parse both
     let (tree_before, _) =
@@ -48,10 +59,20 @@ fn roundtrip_check(source: &str) {
 fn idempotency_check(source: &str) {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    let first = fmt4d::formatter::format_source(source.as_bytes(), &info, &config)
-        .expect("first format failed");
-    let second = fmt4d::formatter::format_source(first.as_bytes(), &info, &config)
-        .expect("second format failed");
+    let first = fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("first format failed");
+    let second = fmt4d::formatter::format_source(
+        first.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("second format failed");
     assert_eq!(first, second, "Not idempotent!");
 }
 

@@ -3,7 +3,6 @@ use crate::comments::CommentMap;
 use crate::config::FmtConfig;
 use crate::doc_builder::DocBuilder;
 use crate::renderer::Renderer;
-use crate::uses;
 use pascal_core::directives::parse_format_regions;
 use pascal_core::FileInfo;
 use std::collections::HashSet;
@@ -12,7 +11,15 @@ use std::collections::HashSet;
 ///
 /// Returns the formatted source, or an error message.
 /// If the source has parse errors, returns the original source unchanged.
-pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Result<String, String> {
+///
+/// `external_units` should be computed once via `uses::scan_external_paths()`
+/// and shared across all files to avoid redundant filesystem walks.
+pub fn format_source(
+    source: &[u8],
+    info: &FileInfo,
+    config: &FmtConfig,
+    external_units: &HashSet<String>,
+) -> Result<String, String> {
     let has_bom = source.starts_with(&[0xEF, 0xBB, 0xBF]);
 
     let (tree, diagnostics) =
@@ -27,12 +34,13 @@ pub fn format_source(source: &[u8], info: &FileInfo, config: &FmtConfig) -> Resu
     let comment_map = CommentMap::build(tree.root_node(), source);
     let format_regions = parse_format_regions(source);
 
-    let external_units = match &config.project_root {
-        Some(root) => uses::scan_external_paths(root, &config.uses.external_paths),
-        None => HashSet::new(),
-    };
-
-    let builder = DocBuilder::new(source, config, &comment_map, format_regions, external_units);
+    let builder = DocBuilder::new(
+        source,
+        config,
+        &comment_map,
+        format_regions,
+        external_units.clone(),
+    );
     let doc = builder.build(tree.root_node());
     let raw_output = Renderer::new(config).render(doc);
 

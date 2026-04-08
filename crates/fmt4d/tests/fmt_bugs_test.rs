@@ -9,7 +9,13 @@ use std::path::PathBuf;
 fn format_source(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 // ── Bug 1: Character literal corruption ─────────────────────────
@@ -1969,8 +1975,13 @@ fn bom_preserved_in_output() {
     let src_with_bom = "\u{FEFF}unit T;\ninterface\nimplementation\nend.\n";
     let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    let result = fmt4d::formatter::format_source(src_with_bom.as_bytes(), &info, &config)
-        .expect("formatting failed");
+    let result = fmt4d::formatter::format_source(
+        src_with_bom.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed");
     assert!(
         result.starts_with('\u{FEFF}'),
         "UTF-8 BOM was stripped from output:\n{:?}",
@@ -1983,8 +1994,13 @@ fn no_bom_when_source_has_none() {
     let src = "unit T;\ninterface\nimplementation\nend.\n";
     let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    let result =
-        fmt4d::formatter::format_source(src.as_bytes(), &info, &config).expect("formatting failed");
+    let result = fmt4d::formatter::format_source(
+        src.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed");
     assert!(
         !result.starts_with('\u{FEFF}'),
         "BOM was added when source didn't have one"

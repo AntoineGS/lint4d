@@ -5,17 +5,33 @@ fn format_source(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();
     config.uses.group = true;
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 fn idempotency_check(source: &str) {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();
     config.uses.group = true;
-    let first =
-        fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("first failed");
-    let second =
-        fmt4d::formatter::format_source(first.as_bytes(), &info, &config).expect("second failed");
+    let first = fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("first failed");
+    let second = fmt4d::formatter::format_source(
+        first.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("second failed");
     assert_eq!(first, second, "formatting is not idempotent");
 }
 
@@ -23,8 +39,13 @@ fn roundtrip_ast_check(source: &str) {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();
     config.uses.group = true;
-    let formatted =
-        fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("format failed");
+    let formatted = fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("format failed");
 
     let (tree_before, _) =
         pascal_core::parser::parse_file(&info, source.as_bytes()).expect("parse original failed");
@@ -196,7 +217,13 @@ fn uses_groups_with_external_prefixes() {
     config.uses.external_prefixes = vec!["Spring".to_string()];
 
     let source = "unit T;\ninterface\nuses\n  MyUnit, Spring.Container, System.SysUtils, Spring.Collections;\nimplementation\nend.\n";
-    let result = fmt4d::formatter::format_source(source.as_bytes(), &info, &config).unwrap();
+    let result = fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap();
 
     // Core section
     assert!(
@@ -233,9 +260,13 @@ fn uses_groups_with_external_paths() {
     config.uses.external_paths = vec!["vendor".to_string()];
     config.project_root = Some(dir.path().to_path_buf());
 
+    let external_units = fmt4d::uses::scan_external_paths(dir.path(), &config.uses.external_paths);
+
     let source =
         "unit T;\ninterface\nuses\n  MyUnit, SuperObject, System.SysUtils;\nimplementation\nend.\n";
-    let result = fmt4d::formatter::format_source(source.as_bytes(), &info, &config).unwrap();
+    let result =
+        fmt4d::formatter::format_source(source.as_bytes(), &info, &config, &external_units)
+            .unwrap();
 
     // Core
     assert!(

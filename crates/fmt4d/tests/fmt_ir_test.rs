@@ -3,14 +3,26 @@ use std::path::PathBuf;
 fn format(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let config = fmt4d::config::FmtConfig::default();
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 fn format_grouped(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();
     config.uses.group = true;
-    fmt4d::formatter::format_source(source.as_bytes(), &info, &config).expect("formatting failed")
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
 }
 
 #[test]

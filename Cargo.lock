@@ -381,6 +381,7 @@ dependencies = [
  "tempfile",
  "toml",
  "tree-sitter",
+ "walkdir",
 ]
 
 [[package]]

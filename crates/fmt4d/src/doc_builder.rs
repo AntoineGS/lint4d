@@ -455,6 +455,7 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut body_parts = Vec::new();
         let mut prev_child_kind = String::new();
+        let mut prev_single_line = false;
 
         for child in &children {
             match child.kind() {
@@ -465,13 +466,18 @@ impl<'a> DocBuilder<'a> {
                 }
                 _ => {
                     let kind = child.kind().to_string();
-                    if kind == K::DECL_TYPE && prev_child_kind == K::DECL_TYPE {
+                    let single_line = child.start_position().row == child.end_position().row;
+                    if kind == K::DECL_TYPE
+                        && prev_child_kind == K::DECL_TYPE
+                        && !(prev_single_line && single_line)
+                    {
                         body_parts.push(Doc::BlankLine);
                     } else if !prev_child_kind.is_empty() {
                         body_parts.push(Doc::Hardline);
                     }
                     body_parts.push(self.doc_for_node(*child));
                     prev_child_kind = kind;
+                    prev_single_line = single_line;
                 }
             }
         }

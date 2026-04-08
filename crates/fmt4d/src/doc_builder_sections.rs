@@ -31,6 +31,7 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut after_header = false;
         let mut prev_child_kind = String::new();
+        let mut prev_single_line = false;
 
         for child in &children {
             match child.kind() {
@@ -41,6 +42,8 @@ impl<'a> DocBuilder<'a> {
                 }
                 _ => {
                     let kind = child.kind().to_string();
+                    let single_line = child.start_position().row == child.end_position().row;
+                    let child_doc = self.doc_for_node(*child);
                     if after_header {
                         parts.push(Doc::Hardline);
                         after_header = false;
@@ -50,16 +53,22 @@ impl<'a> DocBuilder<'a> {
                             &kind,
                             &self.config.blank_lines,
                         );
-                        if blanks > 0 {
+                        if blanks > 0 && !(prev_single_line && single_line) {
                             for _ in 0..blanks {
                                 parts.push(Doc::BlankLine);
                             }
                         } else {
-                            parts.push(Doc::Hardline);
+                            let prev_ends = parts
+                                .last()
+                                .is_some_and(crate::doc_builder::ends_with_hardline);
+                            if !prev_ends && !crate::doc_builder::starts_with_hardline(&child_doc) {
+                                parts.push(Doc::Hardline);
+                            }
                         }
                     }
-                    parts.push(self.doc_for_node(*child));
+                    parts.push(child_doc);
                     prev_child_kind = kind;
+                    prev_single_line = single_line;
                 }
             }
         }
@@ -71,6 +80,7 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut after_header = false;
         let mut prev_child_kind = String::new();
+        let mut prev_single_line = false;
 
         for child in &children {
             match child.kind() {
@@ -81,6 +91,8 @@ impl<'a> DocBuilder<'a> {
                 }
                 _ => {
                     let kind = child.kind().to_string();
+                    let single_line = child.start_position().row == child.end_position().row;
+                    let child_doc = self.doc_for_node(*child);
                     if after_header {
                         parts.push(Doc::Hardline);
                         after_header = false;
@@ -90,16 +102,22 @@ impl<'a> DocBuilder<'a> {
                             &kind,
                             &self.config.blank_lines,
                         );
-                        if blanks > 0 {
+                        if blanks > 0 && !(prev_single_line && single_line) {
                             for _ in 0..blanks {
                                 parts.push(Doc::BlankLine);
                             }
                         } else {
-                            parts.push(Doc::Hardline);
+                            let prev_ends = parts
+                                .last()
+                                .is_some_and(crate::doc_builder::ends_with_hardline);
+                            if !prev_ends && !crate::doc_builder::starts_with_hardline(&child_doc) {
+                                parts.push(Doc::Hardline);
+                            }
                         }
                     }
-                    parts.push(self.doc_for_node(*child));
+                    parts.push(child_doc);
                     prev_child_kind = kind;
+                    prev_single_line = single_line;
                 }
             }
         }

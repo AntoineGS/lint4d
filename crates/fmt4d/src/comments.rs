@@ -31,6 +31,10 @@ impl CommentMap {
         let mut comments = Vec::new();
         collect_comments(root, source, &mut comments);
 
+        // Build the leaf index once — O(n) — instead of per-comment.
+        let mut leaves = Vec::new();
+        collect_leaves(root, &mut leaves);
+
         let mut leading: HashMap<usize, Vec<AttachedComment>> = HashMap::new();
         let mut trailing: HashMap<usize, Vec<AttachedComment>> = HashMap::new();
 
@@ -39,7 +43,7 @@ impl CommentMap {
 
             // Check if there is a non-comment token on the same line before
             // the comment — that makes it a trailing comment.
-            if let Some(prev) = find_prev_leaf(root, *comment_node) {
+            if let Some(prev) = find_prev_leaf_in(&leaves, *comment_node) {
                 if prev.end_position().row == comment_line {
                     let gap = comment_node.start_byte().saturating_sub(prev.end_byte());
                     trailing
@@ -56,7 +60,7 @@ impl CommentMap {
             }
 
             // Otherwise it is a leading comment for the next non-comment node.
-            if let Some(next) = find_next_code_node(root, *comment_node) {
+            if let Some(next) = find_next_code_node_in(&leaves, *comment_node) {
                 leading.entry(next.id()).or_default().push(AttachedComment {
                     text: text.clone(),
                     trailing: false,
@@ -94,30 +98,23 @@ fn collect_comments<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>, 
     }
 }
 
-/// Find the previous leaf node (non-extra) before `target` in tree order.
-fn find_prev_leaf<'a>(root: Node<'a>, target: Node<'a>) -> Option<Node<'a>> {
-    let mut leaves = Vec::new();
-    collect_leaves(root, &mut leaves);
+/// Find the previous leaf node (non-extra) before `target` using a pre-built index.
+fn find_prev_leaf_in<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<Node<'a>> {
     let target_start = target.start_byte();
-    let mut best: Option<Node<'a>> = None;
-    for leaf in leaves {
-        if leaf.start_byte() < target_start {
-            best = Some(leaf);
-        } else {
-            break;
-        }
+    // Leaves are in source order; binary search for the insertion point.
+    let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_start);
+    if idx > 0 {
+        Some(leaves[idx - 1])
+    } else {
+        None
     }
-    best
 }
 
-/// Find the next non-extra, non-comment node after `target` in tree order.
-fn find_next_code_node<'a>(root: Node<'a>, target: Node<'a>) -> Option<Node<'a>> {
-    let mut leaves = Vec::new();
-    collect_leaves(root, &mut leaves);
+/// Find the next non-extra, non-comment node after `target` using a pre-built index.
+fn find_next_code_node_in<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<Node<'a>> {
     let target_end = target.end_byte();
-    leaves
-        .into_iter()
-        .find(|leaf| leaf.start_byte() >= target_end)
+    let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_end);
+    leaves.get(idx).copied()
 }
 
 /// Collect all leaf nodes (child_count == 0, not extra) in source order.

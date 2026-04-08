@@ -794,11 +794,38 @@ impl<'a> DocBuilder<'a> {
 
         // Check for // line comments in the inner content — when present the
         // list MUST break because a line comment eats the rest of the line.
+        // Skip string literals (delimited by single quotes) so that `//`
+        // inside strings like `'http://'` is not mistaken for a comment.
         let inner_start = children[open_idx].end_byte();
         let inner_end = children[close_idx].start_byte();
-        let has_line_comments = self.source[inner_start..inner_end]
-            .windows(2)
-            .any(|w| w == b"//");
+        let has_line_comments = {
+            let bytes = &self.source[inner_start..inner_end];
+            let mut in_string = false;
+            let mut found = false;
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if in_string {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2; // escaped quote ''
+                            continue;
+                        }
+                        in_string = false;
+                    } else {
+                        in_string = true;
+                    }
+                } else if !in_string
+                    && bytes[i] == b'/'
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'/'
+                {
+                    found = true;
+                    break;
+                }
+                i += 1;
+            }
+            found
+        };
 
         // Split into groups while collecting the separator nodes so their
         // trailing comments (e.g. `// & prefix` after a comma) are preserved.

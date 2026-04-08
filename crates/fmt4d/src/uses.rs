@@ -186,30 +186,21 @@ pub fn scan_external_paths(project_root: &Path, external_paths: &[String]) -> Ha
     let mut units = HashSet::new();
     for rel_path in external_paths {
         let dir = project_root.join(rel_path);
-        if dir.is_dir() {
-            scan_dir_recursive(&dir, &mut units);
-        }
-    }
-    units
-}
-
-fn scan_dir_recursive(dir: &Path, units: &mut HashSet<String>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            scan_dir_recursive(&path, units);
-        } else if let Some(ext) = path.extension() {
-            if ext.eq_ignore_ascii_case("pas") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    units.insert(stem.to_lowercase());
+        for entry in walkdir::WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if ext.eq_ignore_ascii_case("pas") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        units.insert(stem.to_lowercase());
+                    }
                 }
             }
         }
     }
+    units
 }
 
 #[cfg(test)]

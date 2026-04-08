@@ -179,9 +179,13 @@ fn run_files(cli: &Cli) -> i32 {
         cli.end_of_line,
     );
 
-    let external_units = match &config.project_root {
-        Some(root) => uses::scan_external_paths(root, &config.uses.external_paths),
-        None => HashSet::new(),
+    let external_units = if config.uses.group {
+        match &config.project_root {
+            Some(root) => uses::scan_external_paths(root, &config.uses.external_paths),
+            None => HashSet::new(),
+        }
+    } else {
+        HashSet::new()
     };
 
     let had_changes = AtomicBool::new(false);

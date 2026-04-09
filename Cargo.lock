@@ -1052,7 +1052,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-pascal"
 version = "0.10.2"
-source = "git+https://github.com/AntoineGS/tree-sitter-pascal.git#b34c593df4aeed2b8dcbbceb9dbb071c0c5fed81"
+source = "git+https://github.com/AntoineGS/tree-sitter-pascal.git#3a9955c4b67e419a78e8c8cc17872b99eea50b21"
 dependencies = [
  "cc",
  "tree-sitter-language",

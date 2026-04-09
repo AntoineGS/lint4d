@@ -17,6 +17,14 @@ pub const BLOCK: &str = "block";
 pub const STATEMENTS: &str = "statements";
 pub const COMMENT: &str = "comment";
 
+// ── Preprocessor nodes ─────────────────────────────────────────────
+
+pub const PP_USES_BLOCK: &str = "ppUsesBlock";
+pub const PP_IF: &str = "ppIf";
+pub const PP_ELSE: &str = "ppElse";
+pub const PP_END_IF: &str = "ppEndIf";
+pub const PP_DIRECTIVE: &str = "ppDirective";
+
 // ── Declaration nodes ───────────────────────────────────────────────
 
 pub const DECL_USES: &str = "declUses";

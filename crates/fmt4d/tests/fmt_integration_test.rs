@@ -332,3 +332,69 @@ fn all_fixtures_are_idempotent() {
         idempotency_check(&formatted);
     }
 }
+
+// ── Compiler directive preservation ─────────────────────────────
+
+#[test]
+fn uses_preserves_ifdef_block() {
+    let input = "unit T;\ninterface\nuses\n  Windows, SysUtils,\n  {$IFDEF FOO}\n  SpecialUnit,\n  {$ELSE}\n  OtherUnit,\n  {$ENDIF}\n  Classes;\nimplementation\nend.\n";
+    let result = format_source(input);
+    // Unconditional units are sorted; IFDEF block is preserved
+    assert!(
+        result.contains("{$IFDEF FOO}"),
+        "IFDEF directive missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("{$ELSE}"),
+        "ELSE directive missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("{$ENDIF}"),
+        "ENDIF directive missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("SpecialUnit"),
+        "SpecialUnit missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("OtherUnit"),
+        "OtherUnit missing:\n{}",
+        result
+    );
+}
+
+#[test]
+fn uses_preserves_ifdef_idempotent() {
+    let input = "unit T;\ninterface\nuses\n  Windows, SysUtils,\n  {$IFDEF FOO}\n  SpecialUnit,\n  {$ELSE}\n  OtherUnit,\n  {$ENDIF}\n  Classes;\nimplementation\nend.\n";
+    let formatted = format_source(input);
+    idempotency_check(&formatted);
+}
+
+#[test]
+fn uses_preserves_standalone_directive() {
+    let input = "unit T;\ninterface\nuses\n  {$I compilers.inc}\n  SysUtils, Classes;\nimplementation\nend.\n";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$I compilers.inc}"),
+        "Include directive missing:\n{}",
+        result
+    );
+    assert!(result.contains("Classes"), "Classes missing:\n{}", result);
+    assert!(result.contains("SysUtils"), "SysUtils missing:\n{}", result);
+}
+
+#[test]
+fn uses_no_directives_unchanged() {
+    // Regression: existing behaviour with no directives should be identical
+    let input = "unit T;\ninterface\nuses\n  Forms, System.SysUtils, System.Classes;\nimplementation\nend.\n";
+    let result = format_source(input);
+    assert!(
+        result.contains("  Forms,\n  System.Classes,\n  System.SysUtils;\n"),
+        "Got:\n{}",
+        result
+    );
+}

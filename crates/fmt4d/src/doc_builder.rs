@@ -280,16 +280,59 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_uses(&self, node: Node<'a>) -> Doc {
-        let units = crate::uses::extract_uses_units(node, self.source);
+        let items = crate::uses::extract_uses_items(node, self.source);
         let indent_str = " ".repeat(self.config.indent_size);
-        let formatted =
-            crate::uses::format_uses(&units, &self.config.uses, &indent_str, &self.external_units);
-        doc::concat(vec![
-            Doc::Hardline,
-            doc::token("uses", K::K_USES, ""),
-            Doc::Hardline,
-            Doc::Raw(formatted),
-        ])
+        let formatted = crate::uses::format_uses_items(
+            &items,
+            &self.config.uses,
+            &indent_str,
+            &self.external_units,
+        );
+
+        // Collect pre-uses directives (extras immediately before this node)
+        let pre_directives = self.collect_pre_uses_directives(node);
+
+        let mut parts = Vec::new();
+        parts.push(Doc::Hardline);
+        for dir in pre_directives {
+            parts.push(Doc::Raw(dir));
+            parts.push(Doc::Hardline);
+        }
+        parts.push(doc::token("uses", K::K_USES, ""));
+        parts.push(Doc::Hardline);
+        parts.push(Doc::Raw(formatted));
+        doc::concat(parts)
+    }
+
+    /// Collect preprocessor directive texts that appear immediately before a
+    /// `declUses` node in the parent's children (e.g., `{$I MDCompilers.inc}`).
+    fn collect_pre_uses_directives(&self, uses_node: Node<'a>) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut prev = uses_node.prev_sibling();
+        while let Some(sib) = prev {
+            if sib.is_extra() {
+                let kind = sib.kind();
+                if kind == K::PP_DIRECTIVE {
+                    let text = std::str::from_utf8(&self.source[sib.start_byte()..sib.end_byte()])
+                        .unwrap_or("")
+                        .to_string();
+                    found.push(text);
+                } else if kind == K::COMMENT {
+                    // Comments are handled by the comment system — stop scanning
+                    break;
+                } else {
+                    // Unknown extra — stop scanning
+                    break;
+                }
+            } else {
+                // Hit a non-extra sibling — stop
+                break;
+            }
+            prev = sib.prev_sibling();
+        }
+        // Reverse since we walked backwards
+        found.reverse();
+        found
     }
 
     fn build_block(&self, node: Node<'a>) -> Doc {

@@ -306,6 +306,12 @@ impl<'a> DocBuilder<'a> {
 
     /// Collect preprocessor directive texts that appear immediately before a
     /// `declUses` node in the parent's children (e.g., `{$I MDCompilers.inc}`).
+    ///
+    /// Note: with the current grammar, only `ppDirective` can appear as an extra
+    /// outside `ppUsesBlock`. The structural `ppIf`/`ppElse`/`ppEndIf` nodes only
+    /// exist as named children of `ppUsesBlock`, so they cannot appear as
+    /// pre-uses extras. A bare `{$IFDEF}` outside a uses clause would be matched
+    /// as a generic `ppDirective` by the grammar.
     fn collect_pre_uses_directives(&self, uses_node: Node<'a>) -> Vec<String> {
         let mut found = Vec::new();
         let mut prev = uses_node.prev_sibling();

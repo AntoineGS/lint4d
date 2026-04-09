@@ -177,7 +177,7 @@ pub fn group_units(
 fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
     std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
         .unwrap_or("")
-        .to_string()
+        .replace('\r', "")
 }
 
 /// Walk children of a `ppUsesBlock` node and return an `IfDefBlock`.
@@ -389,11 +389,14 @@ pub fn format_uses_items(
     // We iterate pinned in original order to preserve relative order for same anchor.
     // For each pinned item, find the last occurrence of the anchor unit in slots and
     // insert after it. If anchor is None, insert at the very beginning.
+    let mut none_insert_pos: usize = 0;
     for (anchor, pinned_item) in pinned {
         match anchor {
             None => {
-                // Insert at position 0
-                slots.insert(0, Slot::Pinned(pinned_item));
+                // Insert at none_insert_pos and advance it so the next None-anchor
+                // item is placed after the previous one, preserving original order.
+                slots.insert(none_insert_pos, Slot::Pinned(pinned_item));
+                none_insert_pos += 1;
             }
             Some(anchor_name) => {
                 // Find the last position of the anchor unit in slots
@@ -1059,5 +1062,46 @@ mod tests {
             sysutils_pos < directive_pos,
             "directive follows its anchor SysUtils: {output:?}"
         );
+    }
+
+    #[test]
+    fn format_items_multiple_directives_at_start_preserve_order() {
+        let items = vec![
+            UsesItem::Directive("{$I a.inc}".to_string()),
+            UsesItem::Directive("{$I b.inc}".to_string()),
+            UsesItem::Unit("SysUtils".to_string()),
+        ];
+        let output = format_uses_items(&items, &default_config(), "  ", &HashSet::new());
+        let a_pos = output.find("{$I a.inc}").expect("a.inc missing");
+        let b_pos = output.find("{$I b.inc}").expect("b.inc missing");
+        assert!(
+            a_pos < b_pos,
+            "a.inc should appear before b.inc, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn extract_ifdef_with_elseif() {
+        let src = b"unit T;\ninterface\nuses\n  {$IFDEF XE6}\n  XE6Unit,\n  {$ELSEIF XE5}\n  XE5Unit,\n  {$ELSE}\n  OldUnit,\n  {$ENDIF}\n  Classes;\nimplementation\nend.\n";
+        let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
+        let (tree, _) = pascal_core::parser::parse_file(&info, src).unwrap();
+        let uses_node = find_decl_uses(tree.root_node()).unwrap();
+        let items = extract_uses_items(uses_node, src);
+        // IfDefBlock + Classes
+        assert_eq!(items.len(), 2);
+        if let UsesItem::IfDefBlock(block) = &items[0] {
+            assert!(block.if_branch.directive.contains("IFDEF XE6"));
+            assert_eq!(block.if_branch.items.len(), 1);
+            assert_eq!(
+                block.else_if_branches.len(),
+                1,
+                "expected one elseif branch"
+            );
+            assert!(block.else_if_branches[0].directive.contains("ELSEIF XE5"));
+            assert!(block.else_branch.is_some(), "expected else branch");
+        } else {
+            panic!("expected IfDefBlock as first item");
+        }
     }
 }

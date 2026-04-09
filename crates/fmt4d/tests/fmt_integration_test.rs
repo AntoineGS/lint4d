@@ -398,3 +398,22 @@ fn uses_no_directives_unchanged() {
         result
     );
 }
+
+#[test]
+fn uses_preserves_pre_uses_directive() {
+    let input = "unit T;\ninterface\n{$I MDCompilers.inc}\nuses\n  SysUtils, Classes;\nimplementation\nend.\n";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$I MDCompilers.inc}"),
+        "Pre-uses include directive missing:\n{}",
+        result
+    );
+    // The directive should appear before "uses"
+    let dir_pos = result.find("{$I MDCompilers.inc}").unwrap();
+    let uses_pos = result.find("uses").unwrap();
+    assert!(
+        dir_pos < uses_pos,
+        "Directive should appear before 'uses':\n{}",
+        result
+    );
+}

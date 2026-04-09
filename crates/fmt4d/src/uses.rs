@@ -174,47 +174,6 @@ pub fn group_units(
     result
 }
 
-pub fn format_uses(
-    units: &[String],
-    config: &UsesConfig,
-    indent: &str,
-    external_units: &HashSet<String>,
-) -> String {
-    let groups = group_units(units, config, external_units);
-    let mut output = String::new();
-
-    for (group_idx, group) in groups.iter().enumerate() {
-        if group_idx > 0 {
-            output.push('\n');
-        }
-        for (unit_idx, unit) in group.iter().enumerate() {
-            output.push_str(indent);
-            output.push_str(unit);
-            if group_idx == groups.len() - 1 && unit_idx == group.len() - 1 {
-                output.push_str(";\n");
-            } else {
-                output.push_str(",\n");
-            }
-        }
-    }
-    output
-}
-
-pub fn extract_uses_units(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
-    let mut units = Vec::new();
-    for child in node.children(&mut node.walk()) {
-        if child.kind() == K::MODULE_NAME {
-            let text = std::str::from_utf8(&source[child.start_byte()..child.end_byte()])
-                .unwrap_or("")
-                .to_string();
-            if !text.is_empty() {
-                units.push(text);
-            }
-        }
-    }
-    units
-}
-
 fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
     std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
         .unwrap_or("")
@@ -802,13 +761,16 @@ mod tests {
     fn format_uses_three_sections() {
         let mut config = default_config();
         config.external_prefixes = vec!["Spring".to_string()];
-        let units = vec![
-            "Vcl.Forms".to_string(),
-            "System.SysUtils".to_string(),
-            "Spring.Container".to_string(),
-            "MyApp.Utils".to_string(),
-        ];
-        let output = format_uses(&units, &config, "  ", &HashSet::new());
+        let items: Vec<UsesItem> = vec![
+            "Vcl.Forms",
+            "System.SysUtils",
+            "Spring.Container",
+            "MyApp.Utils",
+        ]
+        .into_iter()
+        .map(|s| UsesItem::Unit(s.to_string()))
+        .collect();
+        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
         let expected =
             "  System.SysUtils,\n  Vcl.Forms,\n\n  Spring.Container,\n\n  MyApp.Utils;\n";
         assert_eq!(output, expected);
@@ -999,24 +961,6 @@ mod tests {
     }
 
     // ─── Task 7: format_uses_items() ─────────────────────────────────────────
-
-    #[test]
-    fn format_items_plain_units_matches_format_uses() {
-        // format_uses_items with only Unit items should produce the same output
-        // as format_uses (regression test).
-        let mut config = default_config();
-        config.external_prefixes = vec!["Spring".to_string()];
-        let units = vec![
-            "Vcl.Forms".to_string(),
-            "System.SysUtils".to_string(),
-            "Spring.Container".to_string(),
-            "MyApp.Utils".to_string(),
-        ];
-        let items: Vec<UsesItem> = units.iter().map(|u| UsesItem::Unit(u.clone())).collect();
-        let output_items = format_uses_items(&items, &config, "  ", &HashSet::new());
-        let output_uses = format_uses(&units, &config, "  ", &HashSet::new());
-        assert_eq!(output_items, output_uses);
-    }
 
     #[test]
     fn format_items_ifdef_block_follows_anchor() {

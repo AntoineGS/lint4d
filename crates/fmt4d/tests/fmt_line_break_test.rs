@@ -648,7 +648,7 @@ end.
     let result = format_source(src);
     assert_no_long_lines(&result, 120);
     assert_idempotent(src);
-    // Each unit should be on its own line (format_uses puts one per line)
+    // Each unit should be on its own line (format_uses_items puts one per line)
     let unit_lines: Vec<&str> = result
         .lines()
         .filter(|l| l.trim_start().starts_with("Unit"))

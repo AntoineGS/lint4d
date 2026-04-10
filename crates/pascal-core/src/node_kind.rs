@@ -24,6 +24,7 @@ pub const PP_IF: &str = "ppIf";
 pub const PP_ELSE: &str = "ppElse";
 pub const PP_END_IF: &str = "ppEndIf";
 pub const PP_DIRECTIVE: &str = "ppDirective";
+pub const PP_BLOCK: &str = "ppBlock";
 
 // ── Declaration nodes ───────────────────────────────────────────────
 
@@ -81,9 +82,11 @@ pub const CONDITIONAL: &str = "conditional";
 
 pub const IDENTIFIER: &str = "identifier";
 pub const TYPEREF: &str = "typeref";
+pub const TYPEREF_PTR: &str = "typerefPtr";
 pub const MODULE_NAME: &str = "moduleName";
 pub const TYPE: &str = "type";
 pub const PROC_ATTRIBUTE: &str = "procAttribute";
+pub const RTTI_ATTRIBUTES: &str = "rttiAttributes";
 pub const HEADER: &str = "header";
 pub const GENERIC_ARGS: &str = "genericArgs";
 pub const GENERIC_TPL: &str = "genericTpl";
@@ -196,6 +199,7 @@ pub const K_REINTRODUCE: &str = "kReintroduce";
 pub const K_FORWARD: &str = "kForward";
 pub const K_OUT: &str = "kOut";
 pub const K_DOT: &str = "kDot";
+pub const K_HAT: &str = "kHat";
 
 // ── Punctuation tokens ──────────────────────────────────────────────
 

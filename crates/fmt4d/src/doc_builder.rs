@@ -90,6 +90,7 @@ impl<'a> DocBuilder<'a> {
             K::EXPR_CALL => self.build_call(node),
             K::EXPR_BRACKETS => self.build_bracket_list(node),
             K::DECL_ENUM => self.build_paren_list(node, K::COMMA),
+            K::RTTI_ATTRIBUTES => self.build_rtti_attributes(node),
             _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
             _ => {
                 if node.child_count() > 0 && self.has_breakable_operators(node) {
@@ -209,26 +210,44 @@ impl<'a> DocBuilder<'a> {
     // ── Utility helpers ──────────────────────────────────────────────
 
     /// Extract the source text for `node`, stripping carriage returns.
+    ///
+    /// Tolerates non-UTF-8 bytes (legacy Latin-1 / Windows-1252 Delphi
+    /// sources) via [`pascal_core::decode_bytes`], so accented text in
+    /// comments and string literals survives round-tripping.
     pub(crate) fn node_text(&self, node: Node) -> String {
-        std::str::from_utf8(&self.source[node.start_byte()..node.end_byte()])
-            .unwrap_or("")
+        pascal_core::decode_bytes(&self.source[node.start_byte()..node.end_byte()])
             .replace('\r', "")
     }
 
     /// Return `true` if there is a blank (empty / whitespace-only) line in the
     /// source between `start_row` (exclusive) and `end_row` (exclusive).
     /// Both values are 0-based row indices.
+    ///
+    /// Scans raw bytes rather than decoding UTF-8 so legacy Latin-1 /
+    /// Windows-1252 Pascal sources (common in older Delphi codebases) do not
+    /// silently disable blank-line preservation file-wide when a single
+    /// accented character appears in a comment. Whitespace and `\n` are ASCII
+    /// and thus encoding-independent for any ASCII-superset.
     pub(crate) fn has_blank_line_between(&self, start_row: usize, end_row: usize) -> bool {
         if end_row <= start_row + 1 {
             return false;
         }
-        let source_str = std::str::from_utf8(self.source).unwrap_or("");
-        for (row_idx, line) in source_str.lines().enumerate() {
-            if row_idx > start_row && row_idx < end_row && line.trim().is_empty() {
-                return true;
-            }
-            if row_idx >= end_row {
-                break;
+        let bytes = self.source;
+        let mut row_idx: usize = 0;
+        let mut line_start: usize = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                if row_idx > start_row && row_idx < end_row {
+                    let line = &bytes[line_start..i];
+                    if line.iter().all(|c| c.is_ascii_whitespace()) {
+                        return true;
+                    }
+                }
+                row_idx += 1;
+                if row_idx >= end_row {
+                    return false;
+                }
+                line_start = i + 1;
             }
         }
         false
@@ -319,9 +338,9 @@ impl<'a> DocBuilder<'a> {
             if sib.is_extra() {
                 let kind = sib.kind();
                 if kind == K::PP_DIRECTIVE {
-                    let text = std::str::from_utf8(&self.source[sib.start_byte()..sib.end_byte()])
-                        .unwrap_or("")
-                        .to_string();
+                    let text =
+                        pascal_core::decode_bytes(&self.source[sib.start_byte()..sib.end_byte()])
+                            .into_owned();
                     found.push(text);
                 } else if kind == K::COMMENT {
                     // Comments are handled by the comment system — stop scanning
@@ -505,28 +524,49 @@ impl<'a> DocBuilder<'a> {
         let mut body_parts = Vec::new();
         let mut prev_child_kind = String::new();
         let mut prev_single_line = false;
+        let mut prev_end_row: Option<usize> = None;
 
         for child in &children {
             match child.kind() {
                 K::K_VAR | K::K_CONST | K::K_TYPE => {
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
-                    parts.push(Doc::Hardline);
+                    // Note: no trailing Hardline here — the first body
+                    // child provides it. Adding one unconditionally would
+                    // double up when the first child's doc already starts
+                    // with a Hardline (e.g. from an attached leading
+                    // comment), producing a spurious blank line between
+                    // the keyword and the comment.
                 }
                 _ => {
                     let kind = child.kind().to_string();
                     let single_line = child.start_position().row == child.end_position().row;
-                    if kind == K::DECL_TYPE
-                        && prev_child_kind == K::DECL_TYPE
-                        && !(prev_single_line && single_line)
+                    let child_doc = self.doc_for_node(*child);
+                    // Preserve a blank line in the source between two body
+                    // items (e.g. grouped `const` declarations). Only
+                    // triggered once we've already seen a body item so we
+                    // don't insert a blank line between the keyword and
+                    // the first entry.
+                    let source_blank = !prev_child_kind.is_empty()
+                        && prev_end_row.is_some_and(|prev_end| {
+                            self.has_blank_line_between(prev_end, child.start_position().row)
+                        });
+                    if source_blank
+                        || (kind == K::DECL_TYPE
+                            && prev_child_kind == K::DECL_TYPE
+                            && !(prev_single_line && single_line))
                     {
                         body_parts.push(Doc::BlankLine);
-                    } else if !prev_child_kind.is_empty() {
+                    } else if !starts_with_hardline(&child_doc) {
+                        // Always separate body items (and the first item
+                        // from the preceding keyword) with a Hardline,
+                        // unless the child already starts with one.
                         body_parts.push(Doc::Hardline);
                     }
-                    body_parts.push(self.doc_for_node(*child));
+                    body_parts.push(child_doc);
                     prev_child_kind = kind;
                     prev_single_line = single_line;
+                    prev_end_row = Some(child.end_position().row);
                 }
             }
         }
@@ -655,6 +695,32 @@ impl<'a> DocBuilder<'a> {
                 parts.push(doc);
             }
         }
+        doc::concat(parts)
+    }
+
+    /// Format an `rttiAttributes` node so each `[...]` group sits on its own
+    /// line above the declaration it annotates.
+    ///
+    /// The grammar packs consecutive bracket attributes into a single
+    /// `rttiAttributes` node — e.g. `[Test][TestCase('case1')]` is one node
+    /// with children `[`, `Test`, `]`, `[`, `exprCall`, `]`. We insert a
+    /// `Hardline` before every `[` after the first, and a final `Hardline`
+    /// after the closing `]` so the next sibling (`procedure`, class name,
+    /// field name, `property`) starts on a fresh line.
+    fn build_rtti_attributes(&self, node: Node<'a>) -> Doc {
+        let children = self.code_children(node);
+        let mut parts: Vec<Doc> = Vec::new();
+        let mut seen_open_bracket = false;
+        for child in &children {
+            if child.kind() == K::OPEN_BRACKET {
+                if seen_open_bracket {
+                    parts.push(Doc::Hardline);
+                }
+                seen_open_bracket = true;
+            }
+            parts.push(self.doc_for_node(*child));
+        }
+        parts.push(Doc::Hardline);
         doc::concat(parts)
     }
 

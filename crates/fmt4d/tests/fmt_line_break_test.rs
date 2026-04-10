@@ -980,3 +980,112 @@ end.
         result
     );
 }
+
+// ── Multi-line source break preservation ──────────────────────────
+
+#[test]
+fn multiline_plus_chain_preserves_breaks() {
+    // Source has intentional line breaks in a string-concat chain.
+    // Those breaks should be preserved when the expression doesn't
+    // fit on one line.
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  S := 'update invdelslip set pickupstatus =''' + toStatus + '''' +
+    ' where invdelid = ' + invdelid +
+    '   and pickupstatus = ''' + fromStatus + '''';
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent_with_max(src, 120);
+
+    // The breaks after '''' + and invdelid + should be preserved.
+    // Count continuation lines starting with +.
+    let cont_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("+ "))
+        .collect();
+    assert_eq!(
+        cont_lines.len(),
+        2,
+        "multi-line source should preserve exactly 2 break points:\n{}",
+        result
+    );
+}
+
+#[test]
+fn multiline_plus_chain_joins_when_fits() {
+    // A multi-line + chain that fits on one line at the target width
+    // should be joined (Group goes flat).
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  S := 'hello' +
+    ' world' +
+    '!';
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    assert!(
+        result.contains("'hello' + ' world' + '!'"),
+        "short multi-line + chain should join onto one line:\n{}",
+        result
+    );
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn multiline_and_chain_still_joins() {
+    // Multi-line and/or chains should NOT use PreservedLine — they
+    // should join freely when they fit at the target width.
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if (A = 1)
+    and (B = 2)
+    and (C = 3) then
+    DoSomething;
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    let if_line = result
+        .lines()
+        .find(|l| l.trim_start().starts_with("if "))
+        .unwrap();
+    assert!(
+        if_line.contains("(C = 3) then"),
+        "multi-line and/or should still join at width 120:\n{}",
+        result
+    );
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn multiline_preserved_idempotent() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  S := 'update invdelslip set pickupstatus =''' + toStatus + '''' +
+    ' where invdelid = ' + invdelid +
+    '   and pickupstatus = ''' + fromStatus + '''';
+end;
+end.
+";
+    assert_idempotent_with_max(src, 120);
+}

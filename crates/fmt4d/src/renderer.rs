@@ -73,7 +73,7 @@ impl Renderer {
                     self.output.push('\n');
                 }
 
-                Doc::Line => match mode {
+                Doc::Line | Doc::PreservedLine => match mode {
                     Mode::Flat => {
                         self.output.push(' ');
                         self.current_column += 1;
@@ -125,7 +125,13 @@ impl Renderer {
                     let content = parts.remove(0);
 
                     let sep_mode = if matches!(&sep, Doc::Hardline) {
-                        // Author's preserved break — always newline.
+                        // Hardline always forces a break.
+                        Mode::Break
+                    } else if mode == Mode::Break && matches!(&sep, Doc::PreservedLine) {
+                        // PreservedLine forces break only when the enclosing
+                        // Group broke (expression doesn't fit on one line).
+                        // In flat mode it degrades to a regular Line so the
+                        // parent Group can join everything.
                         Mode::Break
                     } else {
                         // Greedy check: does sep (flat) + content fit?
@@ -285,7 +291,7 @@ impl Renderer {
                 true
             }
 
-            Doc::Line => {
+            Doc::Line | Doc::PreservedLine => {
                 if *remaining == 0 {
                     return false;
                 }

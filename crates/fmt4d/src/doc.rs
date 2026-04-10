@@ -27,6 +27,12 @@ pub enum Doc {
     /// In flat mode: nothing. In break mode: newline + current indent.
     Softline,
 
+    /// Renders identically to `Line` (space in flat, newline in break),
+    /// but the `Fill` handler treats it as a forced break — preserving
+    /// the author's intentional line break while still allowing a parent
+    /// `Group` to join everything onto one line when it fits.
+    PreservedLine,
+
     /// Sequence of docs.
     Concat(Vec<Doc>),
 

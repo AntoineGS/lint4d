@@ -450,3 +450,232 @@ end.
     assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
     idempotency_check(&result);
 }
+
+#[test]
+fn ppblock_const_section() {
+    let input = "\
+unit T;
+interface
+implementation
+procedure Foo;
+const
+  {$IFDEF PROD}
+  Timeout = 30000;
+  {$ELSE}
+  Timeout = 5000;
+  {$ENDIF}
+begin
+end;
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IFDEF PROD}"),
+        "IFDEF missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("Timeout = 30000;"),
+        "PROD const missing:\n{}",
+        result
+    );
+    assert!(result.contains("{$ELSE}"), "ELSE missing:\n{}", result);
+    assert!(
+        result.contains("Timeout = 5000;"),
+        "DEV const missing:\n{}",
+        result
+    );
+    assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
+    idempotency_check(&result);
+}
+
+#[test]
+fn ppblock_statements() {
+    let input = "\
+unit T;
+interface
+implementation
+procedure Foo;
+begin
+  SetUp;
+  {$IFDEF LOGGING}
+  Log('entered');
+  {$ENDIF}
+  DoWork;
+end;
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IFDEF LOGGING}"),
+        "IFDEF missing:\n{}",
+        result
+    );
+    assert!(result.contains("Log("), "Log call missing:\n{}", result);
+    assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
+    assert!(result.contains("SetUp"), "SetUp missing:\n{}", result);
+    assert!(result.contains("DoWork"), "DoWork missing:\n{}", result);
+    idempotency_check(&result);
+}
+
+#[test]
+fn ppblock_class_fields() {
+    let input = "\
+unit T;
+interface
+type
+  TMyClass = class
+  private
+    FName: string;
+    {$IFDEF EXTENDED_DEBUG}
+    FDebugInfo: string;
+    {$ENDIF}
+  public
+    procedure DoSomething;
+  end;
+implementation
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IFDEF EXTENDED_DEBUG}"),
+        "IFDEF missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("FDebugInfo: string;"),
+        "field missing:\n{}",
+        result
+    );
+    assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
+    idempotency_check(&result);
+}
+
+#[test]
+fn ppblock_interface_declarations() {
+    let input = "\
+unit T;
+interface
+{$IFDEF EXTRA}
+var
+  GlobalVar: Integer;
+{$ENDIF}
+implementation
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IFDEF EXTRA}"),
+        "IFDEF missing:\n{}",
+        result
+    );
+    assert!(result.contains("GlobalVar"), "var missing:\n{}", result);
+    assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
+    idempotency_check(&result);
+}
+
+#[test]
+fn ppblock_initialization() {
+    let input = "\
+unit T;
+interface
+implementation
+initialization
+  {$IFDEF REGISTER}
+  RegisterComponents;
+  {$ENDIF}
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IFDEF REGISTER}"),
+        "IFDEF missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("RegisterComponents"),
+        "call missing:\n{}",
+        result
+    );
+    assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
+    idempotency_check(&result);
+}
+
+#[test]
+fn ppblock_nested() {
+    let input = "\
+unit T;
+interface
+implementation
+procedure Foo;
+var
+  {$IFDEF WINDOWS}
+  WinHandle: THandle;
+  {$IFDEF WIN64}
+  ExtraPtr: Pointer;
+  {$ENDIF}
+  {$ENDIF}
+begin
+end;
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IFDEF WINDOWS}"),
+        "outer IFDEF missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("{$IFDEF WIN64}"),
+        "inner IFDEF missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("WinHandle"),
+        "WinHandle missing:\n{}",
+        result
+    );
+    assert!(result.contains("ExtraPtr"), "ExtraPtr missing:\n{}", result);
+    let endif_count = result.matches("{$ENDIF}").count();
+    assert_eq!(
+        endif_count, 2,
+        "Expected 2 ENDIFs, got {}:\n{}",
+        endif_count, result
+    );
+    idempotency_check(&result);
+}
+
+#[test]
+fn ppblock_elseif_chain() {
+    let input = "\
+unit T;
+interface
+implementation
+procedure Foo;
+var
+  {$IF DEFINED(WIN64)}
+  Handle: Int64;
+  {$ELSEIF DEFINED(WIN32)}
+  Handle: Integer;
+  {$ELSE}
+  Handle: LongInt;
+  {$ENDIF}
+begin
+end;
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IF DEFINED(WIN64)}"),
+        "IF missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("{$ELSEIF DEFINED(WIN32)}"),
+        "ELSEIF missing:\n{}",
+        result
+    );
+    assert!(result.contains("{$ELSE}"), "ELSE missing:\n{}", result);
+    assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
+    idempotency_check(&result);
+}

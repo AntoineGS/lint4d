@@ -6,7 +6,9 @@ pub mod discovery_dproj;
 pub mod discovery_msbuild;
 pub mod node_kind;
 pub mod parser;
+pub mod text;
 pub mod types;
 
 pub use directives::FormatOffRegion;
+pub use text::{decode_bytes, detect_encoding, encode_as, SourceEncoding};
 pub use types::{Diagnostic, FileInfo, FileType, Severity};

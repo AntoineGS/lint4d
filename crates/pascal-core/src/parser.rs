@@ -51,8 +51,7 @@ fn visit_node(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>)
         let end = node.end_position();
 
         let byte_end = node.end_byte().min(node.start_byte() + 40);
-        let snippet: String = std::str::from_utf8(&source[node.start_byte()..byte_end])
-            .unwrap_or("")
+        let snippet: String = crate::text::decode_bytes(&source[node.start_byte()..byte_end])
             .chars()
             .take(40)
             .collect();
@@ -98,9 +97,12 @@ fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
     false
 }
 
-/// Extract the UTF-8 text of a tree-sitter node from the source bytes.
+/// Extract the text of a tree-sitter node from the source bytes.
+///
+/// Tolerates non-UTF-8 source by decoding the slice as Latin-1 / ISO-8859-1
+/// (see [`crate::text::decode_bytes`]). Legacy Delphi codebases are commonly
+/// Windows-1252 encoded; this keeps accented identifiers, comments and string
+/// literals from silently becoming empty.
 pub fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
-    std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
-        .unwrap_or("")
-        .to_string()
+    crate::text::decode_bytes(&source[node.start_byte()..node.end_byte()]).into_owned()
 }

@@ -27,10 +27,10 @@ impl Suppression {
 /// - `// lint4d:ignore-next-line [rule-id]`     — targets the NEXT line.
 /// - `code; // lint4d:ignore [rule-id]`         — inline: targets the SAME line.
 pub fn parse_suppressions(source: &[u8]) -> Vec<Suppression> {
-    let text = match std::str::from_utf8(source) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    // Tolerate legacy Latin-1 / Windows-1252 sources — decoding every byte
+    // losslessly so a single accented character in a comment can't silently
+    // disable suppressions file-wide.
+    let text = crate::text::decode_bytes(source);
 
     let lines: Vec<&str> = text.lines().collect();
     let mut result = Vec::new();
@@ -136,10 +136,9 @@ pub struct FormatOffRegion {
 /// Case-insensitive matching. If `{$FMT.OFF}` appears without a matching
 /// `{$FMT.ON}`, the region extends to the end of the file.
 pub fn parse_format_regions(source: &[u8]) -> Vec<FormatOffRegion> {
-    let text = match std::str::from_utf8(source) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    // Tolerate legacy Latin-1 / Windows-1252 sources — otherwise a single
+    // accented character would silently disable all `{$FMT.OFF}` regions.
+    let text = crate::text::decode_bytes(source);
 
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len();
@@ -283,5 +282,47 @@ mod unit_tests {
         let source = b"line1\nline2\nline3\n";
         let regions = parse_format_regions(source);
         assert!(regions.is_empty());
+    }
+
+    // ── Non-UTF-8 (Latin-1) regression coverage ────────────────────
+    // Legacy Delphi sources are often Windows-1252/Latin-1. A single
+    // accented byte in a comment previously caused both directive parsers
+    // to return an empty vec, silently disabling all suppressions and
+    // format-off regions file-wide.
+
+    #[test]
+    fn format_regions_parse_latin1_source() {
+        // Line 2 contains a 0xE9 ('é') byte — invalid UTF-8, valid Latin-1.
+        let mut source: Vec<u8> =
+            b"line1\n// caf\xE9\n{$FMT.OFF}\nline4\n{$FMT.ON}\nline6\n".to_vec();
+        // sanity: ensure the bytes really are non-UTF-8
+        assert!(std::str::from_utf8(&source).is_err());
+        let regions = parse_format_regions(&source);
+        assert_eq!(
+            regions,
+            vec![FormatOffRegion {
+                start_line: 3,
+                end_line: 5
+            }],
+            "{{$FMT.OFF}} region should be found in Latin-1 source"
+        );
+        // Silence unused mut warning from the future `let mut` refactor.
+        source.clear();
+    }
+
+    #[test]
+    fn suppressions_parse_latin1_source() {
+        // Line 1 contains 0xE9 in a comment; the actual suppression is on
+        // a later line. The suppression must still be parsed.
+        let source: Vec<u8> =
+            b"// caf\xE9\n// lint4d:ignore-next-line my-rule\ncode := 1;\n".to_vec();
+        assert!(std::str::from_utf8(&source).is_err());
+        let sups = parse_suppressions(&source);
+        assert!(
+            !sups.is_empty(),
+            "suppressions should be parsed in Latin-1 source"
+        );
+        assert_eq!(sups[0].rule_id, Some("my-rule".to_string()));
+        assert_eq!(sups[0].target_line, 3);
     }
 }

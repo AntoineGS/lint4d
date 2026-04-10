@@ -154,3 +154,17 @@ fn to_upper_snake_case_camel() {
 fn to_upper_snake_case_acronym() {
     assert_eq!(to_upper_snake_case("HTTPPort"), "HTTP_PORT");
 }
+
+#[test]
+fn local_var_naming_inside_ifdef() {
+    let diagnostics = lint_fixture("tests/fixtures/naming/local_var_in_ifdef.pas");
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "local-variable-naming")
+        .collect();
+    // bad_var inside {$IFDEF} should still be caught
+    assert!(
+        !matches.is_empty(),
+        "Expected local-variable-naming diagnostic for bad_var inside IFDEF, got none"
+    );
+}

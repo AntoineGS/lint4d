@@ -404,37 +404,20 @@ impl<'a> DocBuilder<'a> {
 
     /// Collect preprocessor directive texts that appear immediately before a
     /// `declUses` node in the parent's children (e.g., `{$I MDCompilers.inc}`).
-    ///
-    /// Note: with the current grammar, only `ppDirective` can appear as an extra
-    /// outside `ppUsesBlock`. The structural `ppIf`/`ppElse`/`ppEndIf` nodes only
-    /// exist as named children of `ppUsesBlock`, so they cannot appear as
-    /// pre-uses extras. A bare `{$IFDEF}` outside a uses clause would be matched
-    /// as a generic `ppDirective` by the grammar.
     fn collect_pre_uses_directives(&self, uses_node: Node<'a>) -> Vec<String> {
         let mut found = Vec::new();
         let mut prev = uses_node.prev_sibling();
         while let Some(sib) = prev {
-            if sib.is_extra() {
-                let kind = sib.kind();
-                if kind == K::PP_DIRECTIVE {
-                    let text =
-                        pascal_core::decode_bytes(&self.source[sib.start_byte()..sib.end_byte()])
-                            .into_owned();
-                    found.push(text);
-                } else if kind == K::COMMENT {
-                    // Comments are handled by the comment system — stop scanning
-                    break;
-                } else {
-                    // Unknown extra — stop scanning
-                    break;
-                }
+            if sib.is_extra() && sib.kind() == K::PP_DIRECTIVE {
+                let text =
+                    pascal_core::decode_bytes(&self.source[sib.start_byte()..sib.end_byte()])
+                        .into_owned();
+                found.push(text);
             } else {
-                // Hit a non-extra sibling — stop
                 break;
             }
             prev = sib.prev_sibling();
         }
-        // Reverse since we walked backwards
         found.reverse();
         found
     }

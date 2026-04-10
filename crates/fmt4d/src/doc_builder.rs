@@ -91,6 +91,7 @@ impl<'a> DocBuilder<'a> {
             K::EXPR_BRACKETS => self.build_bracket_list(node),
             K::DECL_ENUM => self.build_paren_list(node, K::COMMA),
             K::RTTI_ATTRIBUTES => self.build_rtti_attributes(node),
+            K::PP_BLOCK => self.build_pp_block(node),
             _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
             _ => {
                 if node.child_count() > 0 && self.has_breakable_operators(node) {
@@ -320,6 +321,43 @@ impl<'a> DocBuilder<'a> {
         parts.push(doc::token("uses", K::K_USES, ""));
         parts.push(Doc::Hardline);
         parts.push(Doc::Raw(formatted));
+        doc::concat(parts)
+    }
+
+    fn build_pp_block(&self, node: Node<'a>) -> Doc {
+        let mut parts = Vec::new();
+        let mut prev_end_row: Option<usize> = None;
+
+        for child in node.children(&mut node.walk()) {
+            if child.is_extra() {
+                continue;
+            }
+            match child.kind() {
+                K::PP_IF | K::PP_ELSE | K::PP_END_IF => {
+                    if let Some(prev) = prev_end_row {
+                        if self.has_blank_line_between(prev, child.start_position().row) {
+                            parts.push(Doc::BlankLine);
+                        }
+                    }
+                    parts.push(Doc::Hardline);
+                    parts.push(doc::token(self.node_text(child), child.kind(), ""));
+                    prev_end_row = Some(child.end_position().row);
+                }
+                _ => {
+                    if let Some(prev) = prev_end_row {
+                        if self.has_blank_line_between(prev, child.start_position().row) {
+                            parts.push(Doc::BlankLine);
+                        }
+                    }
+                    let child_doc = self.doc_for_node(child);
+                    if !starts_with_hardline(&child_doc) {
+                        parts.push(Doc::Hardline);
+                    }
+                    parts.push(child_doc);
+                    prev_end_row = Some(child.end_position().row);
+                }
+            }
+        }
         doc::concat(parts)
     }
 

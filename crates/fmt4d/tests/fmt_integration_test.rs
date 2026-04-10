@@ -417,3 +417,36 @@ fn uses_preserves_pre_uses_directive() {
         result
     );
 }
+
+// ── ppBlock directive preservation ────────────────────────────────
+
+#[test]
+fn ppblock_var_section() {
+    let input = "\
+unit T;
+interface
+implementation
+procedure Foo;
+var
+  Normal: Integer;
+  {$IFDEF DEBUG}
+  DebugVar: String;
+  {$ENDIF}
+begin
+end;
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$IFDEF DEBUG}"),
+        "IFDEF missing:\n{}",
+        result
+    );
+    assert!(
+        result.contains("DebugVar: String;"),
+        "DebugVar missing:\n{}",
+        result
+    );
+    assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
+    idempotency_check(&result);
+}

@@ -153,11 +153,36 @@ impl Renderer {
         }
     }
 
+    /// Compute the character width consumed by indentation at a given level.
+    fn indent_width(&self, level: usize) -> usize {
+        match self.indent_style {
+            IndentStyle::Space => level * self.indent_size,
+            IndentStyle::Tab => level,
+        }
+    }
+
     /// Check if a Doc fits on the remainder of the current line in Flat mode.
     fn fits(&self, indent: usize, doc: &Doc) -> bool {
-        let mut remaining = self.max_line_length.saturating_sub(self.current_column);
-        let mut last_kind = self.last_token_kind.clone();
-        let mut last_parent = self.last_token_parent_kind.clone();
+        // When at line start, the first token will be preceded by
+        // indentation — account for that width up front.
+        let effective_column = if self.at_line_start() {
+            self.indent_width(indent)
+        } else {
+            self.current_column
+        };
+        let mut remaining = self.max_line_length.saturating_sub(effective_column);
+        let mut last_kind = if self.at_line_start() {
+            // At line start emit_with_spacing skips spacing, so clear
+            // last_kind so fits_inner doesn't charge a phantom space.
+            String::new()
+        } else {
+            self.last_token_kind.clone()
+        };
+        let mut last_parent = if self.at_line_start() {
+            String::new()
+        } else {
+            self.last_token_parent_kind.clone()
+        };
         self.fits_inner(
             doc,
             indent,
@@ -167,7 +192,6 @@ impl Renderer {
         )
     }
 
-    #[allow(clippy::only_used_in_recursion)]
     fn fits_inner(
         &self,
         doc: &Doc,
@@ -211,7 +235,20 @@ impl Renderer {
                 true
             }
 
-            Doc::Hardline | Doc::BlankLine => true,
+            Doc::Hardline | Doc::BlankLine => {
+                // A hardline starts a new line even in flat mode.  Reset
+                // `remaining` to the space available on the new line
+                // (accounting for indentation) so subsequent tokens are
+                // measured against the correct budget.
+                *remaining = self
+                    .max_line_length
+                    .saturating_sub(self.indent_width(indent));
+                // At line start no inter-token space is emitted, so clear
+                // the spacing state to match emit_with_spacing behaviour.
+                last_kind.clear();
+                last_parent.clear();
+                true
+            }
 
             Doc::Line => {
                 if *remaining == 0 {

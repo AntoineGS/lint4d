@@ -3422,3 +3422,67 @@ end.
         "blank line inserted before interleaved // comment:\n{result}"
     );
 }
+
+// ── Bug: Leading comments cause spurious call wrapping ──────────
+// When a function call has leading // comments attached to the
+// function name, the fits() check consumed remaining-budget on the
+// comment tokens (which live on separate lines), leaving too little
+// budget for the actual call, so the arguments were needlessly
+// wrapped onto separate lines.
+
+#[test]
+fn leading_comments_do_not_break_short_call() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if True then
+  begin
+    if True then
+    begin
+      if True then
+      begin
+        if True then
+        begin
+          //-----------------------------------
+          //  POS_SC.
+          //-----------------------------------
+          UpdateTransferStatusFrom0To1(aSimpleMfsHeader.transferid)
+        end;
+      end;
+    end;
+  end;
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("UpdateTransferStatusFrom0To1(aSimpleMfsHeader.transferid)"),
+        "short call with leading comments should stay on one line:\n{result}"
+    );
+}
+
+#[test]
+fn leading_comments_do_not_break_short_call_with_semicolon() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if True then
+  begin
+    // Mise du transfert en statut 1
+    UpdateTransferStatusFrom0To1(aSimpleMfsHeader.transferid);
+  end;
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("UpdateTransferStatusFrom0To1(aSimpleMfsHeader.transferid);"),
+        "short call with leading comment should stay on one line:\n{result}"
+    );
+}

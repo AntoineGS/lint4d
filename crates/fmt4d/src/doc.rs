@@ -40,6 +40,15 @@ pub enum Doc {
     /// Different content depending on enclosing group's break mode.
     IfBreak { broken: Box<Doc>, flat: Box<Doc> },
 
+    /// Greedy line-filling for binary chains.
+    ///
+    /// Parts alternate: `[sep_0, content_0, sep_1, content_1, ...]`
+    /// where separators are `Line` (greedy decision) or `Hardline` (forced
+    /// break).  The renderer processes pairs greedily: if `sep + content`
+    /// fits on the current line, render sep flat (space); otherwise render
+    /// sep as break (newline + indent).
+    Fill(Vec<Doc>),
+
     /// Identity element — produces no output.
     Empty,
 }
@@ -70,6 +79,10 @@ pub fn if_break(broken: Doc, flat: Doc) -> Doc {
         broken: Box::new(broken),
         flat: Box::new(flat),
     }
+}
+
+pub fn fill(docs: Vec<Doc>) -> Doc {
+    Doc::Fill(docs)
 }
 
 pub fn token(

@@ -873,3 +873,110 @@ end.
         result
     );
 }
+
+// ── Fill-based greedy packing ─────────────────────────────────────
+
+#[test]
+fn string_concat_greedy_packs_segments() {
+    // Multiple short segments should be packed onto as few lines as
+    // possible rather than one-per-line.
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  S := 'update invdelslip set pickupstatus =''' + toStatus + '''' + ' where invdelid = ' + invdelid + '   and pickupstatus = ''' + fromStatus + '''';
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent_with_max(src, 120);
+
+    // Count continuation lines — greedy packing should produce fewer
+    // lines than one-segment-per-line.
+    let cont_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("+ "))
+        .collect();
+    assert!(
+        cont_lines.len() <= 3,
+        "greedy packing should produce at most 3 continuation lines, got {}:\n{}",
+        cont_lines.len(),
+        result
+    );
+}
+
+#[test]
+fn string_concat_in_call_greedy_packs() {
+    // String concat used as a function argument should pack greedily
+    // after the call itself breaks.
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  ExecSql(aSv1020Connection, 'update invdelslip set pickupstatus =''' + toStatus + '''' + ' where invdelid = ' + invdelid + '   and pickupstatus = ''' + fromStatus + '''', trx);
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent_with_max(src, 120);
+
+    // The concat segments should NOT each be on their own line.
+    let plus_lines: Vec<&str> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("+ ") || l.trim_start().starts_with("'"))
+        .filter(|l| !l.contains("ExecSql") && !l.contains("trx"))
+        .collect();
+    // With greedy packing we expect significantly fewer lines than
+    // the 7+ that one-per-line would produce.
+    assert!(
+        plus_lines.len() <= 4,
+        "expected greedy packing in call arg, got {} continuation lines:\n{}",
+        plus_lines.len(),
+        result
+    );
+}
+
+#[test]
+fn greedy_pack_idempotent() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  S := 'update invdelslip set pickupstatus =''' + toStatus + '''' + ' where invdelid = ' + invdelid + '   and pickupstatus = ''' + fromStatus + '''';
+end;
+end.
+";
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn two_segment_chain_unchanged() {
+    // A two-segment chain should behave identically to the old Group
+    // approach: either fits on one line or breaks at the single +.
+    let src = "\
+unit T;
+interface
+implementation
+const
+  Keywords = 'ACTION,ACTIVE,ADD,ADMIN,AFTER,ALL,ALTER,AND,ANY,AS,ASC,ASCENDING,AT,AUTO' + ',AVG,BASE_NAME,BASED,BASENAME,BEFORE,BEGIN,BETWEEN,BLOB,BLOBEDIT,BUFFER,BY,CACHE';
+end.
+";
+    let result = format_source_with_max(src, 120);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent_with_max(src, 120);
+    // Should break at the single + since the whole thing doesn't fit.
+    let cont = result.lines().find(|l| l.trim_start().starts_with("+ '"));
+    assert!(
+        cont.is_some(),
+        "two-segment chain should break at +:\n{}",
+        result
+    );
+}

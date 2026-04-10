@@ -1126,48 +1126,68 @@ impl<'a> DocBuilder<'a> {
         self.build_binary_chain_doc(&segments)
     }
 
-    /// Build a flattened binary chain with Group-based line breaking.
+    /// Build a flattened binary chain with Fill-based greedy line packing.
     ///
     /// Operator placement depends on `config.operator_position`:
     /// - `Leading` (default): operator starts the continuation line
     /// - `Trailing`: operator ends the previous line
     pub(crate) fn build_binary_chain_doc(&self, segments: &[BinarySegment]) -> Doc {
-        let mut first_parts = Vec::new();
-        let mut rest_parts = Vec::new();
         let trailing = self.config.operator_position == OperatorPosition::Trailing;
 
-        for (i, seg) in segments.iter().enumerate() {
-            if i == 0 {
-                for n in &seg.operand {
-                    first_parts.push(self.doc_for_node(*n));
-                }
-            } else if trailing {
-                if let Some(op) = seg.operator {
-                    rest_parts.push(self.doc_for_node(op));
-                }
-                rest_parts.push(Doc::Line);
-                for n in &seg.operand {
-                    rest_parts.push(self.doc_for_node(*n));
-                }
-            } else {
-                rest_parts.push(Doc::Line);
-                if let Some(op) = seg.operator {
-                    rest_parts.push(self.doc_for_node(op));
-                }
-                for n in &seg.operand {
-                    rest_parts.push(self.doc_for_node(*n));
+        // Build the first operand (no operator).
+        let mut first_parts = Vec::new();
+        if let Some(seg) = segments.first() {
+            for n in &seg.operand {
+                first_parts.push(self.doc_for_node(*n));
+            }
+            // Trailing: attach the *next* segment's operator to the first operand.
+            if trailing && segments.len() > 1 {
+                if let Some(op) = segments[1].operator {
+                    first_parts.push(self.doc_for_node(op));
                 }
             }
         }
 
-        if rest_parts.is_empty() {
+        if segments.len() <= 1 {
             return doc::concat(first_parts);
         }
 
-        doc::group(doc::concat(vec![
+        // Build fill_parts: [sep, content, sep, content, ...]
+        let mut fill_parts = Vec::new();
+
+        for i in 1..segments.len() {
+            let seg = &segments[i];
+
+            fill_parts.push(Doc::Line);
+
+            // Build content item (operator + operand or operand + operator).
+            let mut item = Vec::new();
+            if trailing {
+                // Trailing: operand first, then next segment's operator (if any).
+                for n in &seg.operand {
+                    item.push(self.doc_for_node(*n));
+                }
+                if i + 1 < segments.len() {
+                    if let Some(op) = segments[i + 1].operator {
+                        item.push(self.doc_for_node(op));
+                    }
+                }
+            } else {
+                // Leading: operator first, then operand.
+                if let Some(op) = seg.operator {
+                    item.push(self.doc_for_node(op));
+                }
+                for n in &seg.operand {
+                    item.push(self.doc_for_node(*n));
+                }
+            }
+            fill_parts.push(doc::concat(item));
+        }
+
+        doc::concat(vec![
             doc::concat(first_parts),
-            doc::indent(doc::concat(rest_parts)),
-        ]))
+            doc::indent(doc::fill(fill_parts)),
+        ])
     }
 }
 

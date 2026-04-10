@@ -111,6 +111,41 @@ impl Renderer {
                     Mode::Flat => stack.push((indent, mode, *flat)),
                     Mode::Break => stack.push((indent, mode, *broken)),
                 },
+
+                Doc::Fill(mut parts) => {
+                    if parts.len() < 2 {
+                        // Trailing element or empty — render flat.
+                        for p in parts.into_iter().rev() {
+                            stack.push((indent, Mode::Flat, p));
+                        }
+                        continue;
+                    }
+
+                    let sep = parts.remove(0);
+                    let content = parts.remove(0);
+
+                    let sep_mode = if matches!(&sep, Doc::Hardline) {
+                        // Author's preserved break — always newline.
+                        Mode::Break
+                    } else {
+                        // Greedy check: does sep (flat) + content fit?
+                        let test = crate::doc::concat(vec![sep.clone(), content.clone()]);
+                        if self.fits(indent, &test) {
+                            Mode::Flat
+                        } else {
+                            Mode::Break
+                        }
+                    };
+
+                    // Push remaining fill (processed after this pair).
+                    if !parts.is_empty() {
+                        stack.push((indent, mode, Doc::Fill(parts)));
+                    }
+
+                    // Push pair: content after sep (LIFO order).
+                    stack.push((indent, Mode::Flat, content));
+                    stack.push((indent, sep_mode, sep));
+                }
             }
         }
 
@@ -277,6 +312,16 @@ impl Renderer {
 
             Doc::IfBreak { flat, .. } => {
                 self.fits_inner(flat, indent, remaining, last_kind, last_parent)
+            }
+
+            Doc::Fill(parts) => {
+                // In fit-checking treat Fill like Concat (all flat).
+                for part in parts {
+                    if !self.fits_inner(part, indent, remaining, last_kind, last_parent) {
+                        return false;
+                    }
+                }
+                true
             }
         }
     }
@@ -448,5 +493,46 @@ mod tests {
         ]));
         let result = Renderer::new(&config).render(doc);
         assert_eq!(result, "aa\nbb");
+    }
+
+    #[test]
+    fn render_fill_all_flat_when_fits() {
+        // All items fit on one line — everything stays flat.
+        let doc = fill(vec![
+            Doc::Line,
+            tok("a", K::IDENTIFIER, ""),
+            Doc::Line,
+            tok("b", K::IDENTIFIER, ""),
+            Doc::Line,
+            tok("c", K::IDENTIFIER, ""),
+        ]);
+        let result = default_renderer().render(doc);
+        assert_eq!(result, " a b c");
+    }
+
+    #[test]
+    fn render_fill_greedy_break() {
+        // With a narrow line, Fill should break greedily: pack as many
+        // items as fit per line.
+        let mut config = FmtConfig::default();
+        config.max_line_length = 12;
+        let doc = concat(vec![
+            tok("xx", K::IDENTIFIER, ""),
+            indent(fill(vec![
+                Doc::Line,
+                tok("+", K::K_ADD, ""),
+                tok("aa", K::IDENTIFIER, ""),
+                Doc::Line,
+                tok("+", K::K_ADD, ""),
+                tok("bb", K::IDENTIFIER, ""),
+                Doc::Line,
+                tok("+", K::K_ADD, ""),
+                tok("cc", K::IDENTIFIER, ""),
+            ])),
+        ]);
+        let result = Renderer::new(&config).render(doc);
+        // "xx + aa" = 7 chars, then " + bb" = 5 more → 12, fits.
+        // " + cc" = 5 more → 17, doesn't fit → breaks.
+        assert_eq!(result, "xx + aa + bb\n  + cc");
     }
 }

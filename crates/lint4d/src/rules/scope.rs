@@ -107,9 +107,9 @@ fn collect_node(node: Node, source: &[u8], scopes: &mut Scopes) {
 
 /// Collect all field names from a `declClass` or `declRecord` node.
 pub fn collect_class_fields(class_node: Node, source: &[u8], fields: &mut HashMap<String, String>) {
-    for child in class_node.children(&mut class_node.walk()) {
+    for child in super::helpers::effective_children(class_node) {
         if child.kind() == K::DECL_SECTION {
-            for item in child.children(&mut child.walk()) {
+            for item in super::helpers::effective_children(child) {
                 if item.kind() == K::DECL_FIELD {
                     // A field can declare multiple names: `A, B: Integer`
                     collect_decl_field_names(item, source, fields);
@@ -182,9 +182,9 @@ pub fn collect_method_scope(proc_node: Node, source: &[u8], map: &mut HashMap<St
         collect_params_from_header(header, source, map);
     }
     // Local vars are in direct `declVars` children of defProc/lambda.
-    for child in proc_node.children(&mut proc_node.walk()) {
+    for child in super::helpers::effective_children(proc_node) {
         if child.kind() == K::DECL_VARS {
-            for var_child in child.children(&mut child.walk()) {
+            for var_child in super::helpers::effective_children(child) {
                 if var_child.kind() == K::DECL_VAR {
                     collect_decl_var_names(var_child, source, map);
                 }

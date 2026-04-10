@@ -85,7 +85,7 @@ fn check_usages(root: Node, source: &[u8], scopes: &Scopes, ctx: &mut LintContex
 fn check_unit_usages(unit: Node, source: &[u8], scopes: &Scopes, ctx: &mut LintContext) {
     for child in unit.children(&mut unit.walk()) {
         if child.kind() == K::IMPLEMENTATION {
-            for impl_child in child.children(&mut child.walk()) {
+            for impl_child in super::helpers::effective_children(child) {
                 if impl_child.kind() == K::DEF_PROC {
                     check_proc_usages(impl_child, source, scopes, ctx);
                 }

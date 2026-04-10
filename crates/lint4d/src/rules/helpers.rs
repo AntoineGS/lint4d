@@ -398,11 +398,9 @@ pub fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<Stri
         .find(|c| c.kind() == K::DECL_CLASS)?;
 
     let mut fields = Vec::new();
-    let mut class_cursor = decl_class.walk();
-    for section in decl_class.children(&mut class_cursor) {
+    for section in effective_children(decl_class) {
         if section.kind() == K::DECL_SECTION {
-            let mut section_cursor = section.walk();
-            for item in section.children(&mut section_cursor) {
+            for item in effective_children(section) {
                 if item.kind() == K::DECL_FIELD {
                     if let Some(id_node) = first_identifier(item) {
                         fields.push(node_text(id_node, source));

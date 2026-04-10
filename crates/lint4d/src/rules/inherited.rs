@@ -13,9 +13,8 @@ use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 /// Filters out `kBegin`, `kEnd`, punctuation (`;`), comments (`is_extra`),
 /// and error/missing nodes.
 fn block_statements(block: Node) -> Vec<Node> {
-    let mut cursor = block.walk();
-    block
-        .children(&mut cursor)
+    super::helpers::effective_children(block)
+        .into_iter()
         .filter(|c| {
             c.is_named()
                 && !c.is_extra()

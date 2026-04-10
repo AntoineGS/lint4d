@@ -71,10 +71,8 @@ fn check_type_name(decl_type: Node, source: &[u8], ctx: &mut LintContext) {
         None => return,
     };
 
-    let name = match std::str::from_utf8(&source[name_node.start_byte()..name_node.end_byte()]) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let name = pascal_core::decode_bytes(&source[name_node.start_byte()..name_node.end_byte()]);
+    let name = name.as_ref();
 
     // Allow 'T' prefix (standard types) and 'E' prefix (exception classes).
     if name.starts_with('T') || name.starts_with('E') {
@@ -166,10 +164,8 @@ fn check_interface_name(decl_type: Node, source: &[u8], ctx: &mut LintContext) {
         None => return,
     };
 
-    let name = match std::str::from_utf8(&source[name_node.start_byte()..name_node.end_byte()]) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let name = pascal_core::decode_bytes(&source[name_node.start_byte()..name_node.end_byte()]);
+    let name = name.as_ref();
 
     if name.starts_with('I') {
         return;
@@ -255,10 +251,8 @@ fn check_constant_name(decl_const: Node, source: &[u8], style: &str, ctx: &mut L
         None => return,
     };
 
-    let name = match std::str::from_utf8(&source[name_node.start_byte()..name_node.end_byte()]) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let name = pascal_core::decode_bytes(&source[name_node.start_byte()..name_node.end_byte()]);
+    let name = name.as_ref();
 
     let (conforms, expected_label, suggestion) = if style == "PascalCase" {
         let ok = name.chars().next().is_some_and(|c| c.is_uppercase());
@@ -459,8 +453,7 @@ fn check_proc_local_vars(proc_node: Node, source: &[u8], style: &str, ctx: &mut 
     }
 
     // Check local variable declarations.
-    let mut cursor = proc_node.walk();
-    for child in proc_node.children(&mut cursor) {
+    for child in super::helpers::effective_children(proc_node) {
         if child.kind() == K::DECL_VARS {
             check_decl_vars(child, source, style, ctx);
         }
@@ -470,8 +463,7 @@ fn check_proc_local_vars(proc_node: Node, source: &[u8], style: &str, ctx: &mut 
 /// Iterate all `declVar` nodes inside a `declVars` block and check each
 /// identifier against the naming style.
 fn check_decl_vars(decl_vars: Node, source: &[u8], style: &str, ctx: &mut LintContext) {
-    let mut cursor = decl_vars.walk();
-    for child in decl_vars.children(&mut cursor) {
+    for child in super::helpers::effective_children(decl_vars) {
         if child.kind() == K::DECL_VAR {
             check_decl_var_names(child, source, style, ctx);
         }
@@ -500,10 +492,8 @@ fn check_decl_var_names(decl_var: Node, source: &[u8], style: &str, ctx: &mut Li
             continue;
         }
 
-        let name = match std::str::from_utf8(&source[child.start_byte()..child.end_byte()]) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let name = pascal_core::decode_bytes(&source[child.start_byte()..child.end_byte()]);
+        let name = name.as_ref();
 
         if !violates_naming_style(name, style) {
             continue;

@@ -679,3 +679,24 @@ end.
     assert!(result.contains("{$ENDIF}"), "ENDIF missing:\n{}", result);
     idempotency_check(&result);
 }
+
+#[test]
+fn standalone_directive_preserved() {
+    let input = "\
+unit T;
+interface
+implementation
+{$R *.dfm}
+procedure Foo;
+begin
+end;
+end.
+";
+    let result = format_source(input);
+    assert!(
+        result.contains("{$R *.dfm}"),
+        "standalone directive missing:\n{}",
+        result
+    );
+    idempotency_check(&result);
+}

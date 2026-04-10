@@ -1,5 +1,6 @@
 use crate::comments::CommentMap;
 use crate::config::{FmtConfig, OperatorPosition};
+use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
 use pascal_core::node_kind as K;
 use pascal_core::FormatOffRegion;
@@ -16,6 +17,7 @@ pub struct DocBuilder<'a> {
     pub(crate) source: &'a [u8],
     pub(crate) config: &'a FmtConfig,
     comments: &'a CommentMap,
+    directives: &'a DirectiveMap,
     format_regions: Vec<FormatOffRegion>,
     pub(crate) external_units: HashSet<String>,
 }
@@ -25,6 +27,7 @@ impl<'a> DocBuilder<'a> {
         source: &'a [u8],
         config: &'a FmtConfig,
         comments: &'a CommentMap,
+        directives: &'a DirectiveMap,
         format_regions: Vec<FormatOffRegion>,
         external_units: HashSet<String>,
     ) -> Self {
@@ -32,6 +35,7 @@ impl<'a> DocBuilder<'a> {
             source,
             config,
             comments,
+            directives,
             format_regions,
             external_units,
         }
@@ -56,11 +60,19 @@ impl<'a> DocBuilder<'a> {
             return Doc::Raw(self.node_text(node));
         }
 
-        let leading = self.leading_comments_doc(node);
+        let leading_comments = self.leading_comments_doc(node);
+        let leading_directives = self.leading_directives_doc(node);
         let body = self.build_doc(node);
-        let trailing = self.trailing_comments_doc(node);
+        let trailing_comments = self.trailing_comments_doc(node);
+        let trailing_directives = self.trailing_directives_doc(node);
 
-        doc::concat(vec![leading, body, trailing])
+        doc::concat(vec![
+            leading_comments,
+            leading_directives,
+            body,
+            trailing_comments,
+            trailing_directives,
+        ])
     }
 
     /// Dispatch to the correct handler by node kind.
@@ -205,6 +217,35 @@ impl<'a> DocBuilder<'a> {
             })
             .collect();
 
+        doc::concat(docs)
+    }
+
+    fn leading_directives_doc(&self, node: Node<'a>) -> Doc {
+        let directives = self.directives.leading_directives(node.id());
+        if directives.is_empty() {
+            return Doc::Empty;
+        }
+        let mut parts = Vec::new();
+        for directive in directives {
+            parts.push(Doc::Hardline);
+            parts.push(doc::token(directive.text.clone(), K::PP_DIRECTIVE, ""));
+        }
+        parts.push(Doc::Hardline);
+        doc::concat(parts)
+    }
+
+    fn trailing_directives_doc(&self, node: Node<'a>) -> Doc {
+        let directives = self.directives.trailing_directives(node.id());
+        if directives.is_empty() {
+            return Doc::Empty;
+        }
+        let docs: Vec<Doc> = directives
+            .iter()
+            .map(|d| {
+                let gap = if d.gap > 0 { d.gap } else { 1 };
+                Doc::Raw(format!("{}{}", " ".repeat(gap), d.text))
+            })
+            .collect();
         doc::concat(docs)
     }
 
@@ -1312,6 +1353,7 @@ mod tests {
     use super::*;
     use crate::comments::CommentMap;
     use crate::config::FmtConfig;
+    use crate::directive_map::DirectiveMap;
 
     fn parse(source: &str) -> (tree_sitter::Tree, Vec<u8>) {
         let bytes = source.as_bytes().to_vec();
@@ -1324,8 +1366,9 @@ mod tests {
         source: &'a [u8],
         config: &'a FmtConfig,
         comments: &'a CommentMap,
+        directives: &'a DirectiveMap,
     ) -> DocBuilder<'a> {
-        DocBuilder::new(source, config, comments, vec![], HashSet::new())
+        DocBuilder::new(source, config, comments, directives, vec![], HashSet::new())
     }
 
     #[test]
@@ -1334,7 +1377,8 @@ mod tests {
         let (tree, bytes) = parse(source);
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let builder = make_builder(&bytes, &config, &comments);
+        let directives = DirectiveMap::build(tree.root_node(), &bytes);
+        let builder = make_builder(&bytes, &config, &comments, &directives);
         let doc = builder.build(tree.root_node());
         assert!(!matches!(doc, Doc::Empty));
     }
@@ -1345,8 +1389,16 @@ mod tests {
         let (tree, bytes) = parse(source);
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
+        let directives = DirectiveMap::build(tree.root_node(), &bytes);
         let regions = pascal_core::directives::parse_format_regions(&bytes);
-        let builder = DocBuilder::new(&bytes, &config, &comments, regions, HashSet::new());
+        let builder = DocBuilder::new(
+            &bytes,
+            &config,
+            &comments,
+            &directives,
+            regions,
+            HashSet::new(),
+        );
         let doc = builder.build(tree.root_node());
         // The whole unit falls inside the format-off region, so it should be Raw.
         assert!(matches!(doc, Doc::Raw(_)));
@@ -1358,7 +1410,8 @@ mod tests {
         let (tree, bytes) = parse(source);
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let builder = make_builder(&bytes, &config, &comments);
+        let directives = DirectiveMap::empty();
+        let builder = make_builder(&bytes, &config, &comments, &directives);
         let root = tree.root_node();
         let children = builder.code_children(root);
         // All returned children must be non-extra.
@@ -1373,7 +1426,8 @@ mod tests {
         let (tree, bytes) = parse(source);
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let builder = make_builder(&bytes, &config, &comments);
+        let directives = DirectiveMap::empty();
+        let builder = make_builder(&bytes, &config, &comments, &directives);
 
         // The comment map attaches a leading comment to the next leaf node after
         // the comment. Walk the full tree and find any node with leading comments.
@@ -1405,7 +1459,8 @@ mod tests {
         let (tree, bytes) = parse(source);
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let builder = make_builder(&bytes, &config, &comments);
+        let directives = DirectiveMap::empty();
+        let builder = make_builder(&bytes, &config, &comments, &directives);
 
         // Find the leaf node that the trailing comment is attached to.
         // The comment map attaches trailing comments to the preceding leaf.
@@ -1433,7 +1488,8 @@ mod tests {
         let (tree, bytes) = parse(source);
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let builder = make_builder(&bytes, &config, &comments);
+        let directives = DirectiveMap::empty();
+        let builder = make_builder(&bytes, &config, &comments, &directives);
 
         // Walk tree to find a declArg node and verify is_ancestor works.
         fn find_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
@@ -1464,7 +1520,8 @@ mod tests {
         let (tree, bytes) = parse(source);
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let builder = make_builder(&bytes, &config, &comments);
+        let directives = DirectiveMap::empty();
+        let builder = make_builder(&bytes, &config, &comments, &directives);
 
         fn find_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
             if node.kind() == kind {

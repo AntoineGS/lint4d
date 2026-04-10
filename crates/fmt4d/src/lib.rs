@@ -1,6 +1,7 @@
 pub mod blank_lines;
 pub mod comments;
 pub mod config;
+pub mod directive_map;
 pub mod doc;
 pub mod doc_builder;
 pub mod doc_builder_control_flow;

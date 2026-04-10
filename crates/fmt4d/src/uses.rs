@@ -175,9 +175,7 @@ pub fn group_units(
 }
 
 fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
-    std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
-        .unwrap_or("")
-        .replace('\r', "")
+    pascal_core::decode_bytes(&source[node.start_byte()..node.end_byte()]).replace('\r', "")
 }
 
 /// Walk children of a `ppUsesBlock` node and return an `IfDefBlock`.

@@ -631,6 +631,53 @@ end.
 }
 
 #[test]
+fn blank_line_between_const_groups_preserved() {
+    // A single blank line separating groups of const declarations
+    // inside the same `const` section should be preserved — same
+    // policy as other places in the codebase (class bodies, etc.).
+    let src = "\
+unit T;
+interface
+const
+  kFoo = 'FOO';
+  kBar = 'BAR';
+
+  kBaz = 'BAZ';
+  kQux = 'QUX';
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("kBar = 'BAR';\n\n  kBaz = 'BAZ';"),
+        "blank line between const groups was stripped:\n{}",
+        result
+    );
+}
+
+#[test]
+fn blank_line_between_var_groups_preserved() {
+    // Same policy for `var` sections.
+    let src = "\
+unit T;
+interface
+var
+  GFoo: Integer;
+  GBar: Integer;
+
+  GBaz: Integer;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("GBar: Integer;\n\n  GBaz: Integer;"),
+        "blank line between var groups was stripped:\n{}",
+        result
+    );
+}
+
+#[test]
 fn blank_line_before_section_comment_procedure() {
     // When two procedures are separated by a section comment, there should
     // be a blank line between them (the comment is attached to the second proc).
@@ -2793,5 +2840,585 @@ end.
         result.contains("Integer;\n\nconst"),
         "function declaration and const section were joined on one line:\n{}",
         result
+    );
+}
+
+// ── Bug: Pointer-type caret gets a space inserted ─────────────
+// `^TFoo` (pointer type) and `P^` (dereference) must not have a
+// space between the caret and the adjacent token.
+
+#[test]
+fn pointer_type_caret_no_space_after() {
+    let src = "\
+unit T;
+interface
+type
+  PSimpleMfsHeader = ^TSimpleMfsHeader;
+  TSimpleMfsHeader = record
+    X: Integer;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("= ^TSimpleMfsHeader;"),
+        "space inserted between ^ and type name in pointer type:\n{}",
+        result
+    );
+    assert!(
+        !result.contains("^ TSimpleMfsHeader"),
+        "space inserted between ^ and type name in pointer type:\n{}",
+        result
+    );
+}
+
+#[test]
+fn pointer_var_type_caret_no_space_after() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure Q;
+var
+  P: ^Integer;
+begin
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains(": ^Integer;"),
+        "space inserted between ^ and type name in var pointer type:\n{}",
+        result
+    );
+}
+
+#[test]
+fn dereference_caret_no_space_before() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure Q;
+var
+  P: ^Integer;
+begin
+  P^ := 1;
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("P^ := 1"),
+        "space inserted between identifier and ^ in dereference:\n{}",
+        result
+    );
+    assert!(
+        !result.contains("P ^"),
+        "space inserted between identifier and ^ in dereference:\n{}",
+        result
+    );
+}
+
+// ── Bug: Blank lines stripped in files with non-UTF-8 (Latin-1) bytes ─────
+// Legacy Delphi sources are often Windows-1252/Latin-1 encoded. Any non-ASCII
+// byte in a comment caused `has_blank_line_between` to decode-fail the whole
+// source, silently disabling blank-line preservation file-wide.
+
+#[test]
+fn blank_lines_preserved_in_latin1_source() {
+    // Build a source containing a Latin-1 byte (0xE9 = 'é') in a comment
+    // far from the begin..end block we care about.
+    let mut src: Vec<u8> = b"\
+unit T;
+interface
+implementation
+// Commentaire avec accent: "
+        .to_vec();
+    src.push(0xE9); // invalid UTF-8 continuation byte
+    src.extend_from_slice(
+        b"\n\
+procedure Q;
+var
+  a, b: Boolean;
+  sa, sb: string;
+begin
+  sa := '';
+
+  if a then
+    sa := 'Y'
+  else
+    sa := 'N';
+
+  if b then
+    sb := 'Y'
+  else
+    sb := 'N';
+end;
+end.
+",
+    );
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let result =
+        fmt4d::formatter::format_source(&src, &info, &config, &std::collections::HashSet::new())
+            .expect("formatting failed");
+
+    assert!(
+        result.contains("sa := '';\n\n  if a then"),
+        "blank line before first if..else was stripped (Latin-1 source):\n{}",
+        result
+    );
+    assert!(
+        result.contains("sa := 'N';\n\n  if b then"),
+        "blank line between two if..else statements was stripped (Latin-1 source):\n{}",
+        result
+    );
+}
+
+#[test]
+fn latin1_comment_text_is_preserved() {
+    // A Latin-1 inline comment must survive formatting. Previously,
+    // any non-UTF-8 byte in the source caused comment text extraction
+    // to silently return "", stripping the entire comment.
+    let mut src: Vec<u8> = b"\
+unit T;
+interface
+implementation
+procedure Q;
+begin
+  x := 1; // v"
+        .to_vec();
+    src.push(0xE9); // Latin-1 'é'
+    src.extend_from_slice(b"rifier\nend;\nend.\n");
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let result =
+        fmt4d::formatter::format_source(&src, &info, &config, &std::collections::HashSet::new())
+            .expect("formatting failed");
+
+    assert!(
+        result.contains("vérifier"),
+        "Latin-1 character in comment was lost:\n{}",
+        result
+    );
+    assert!(
+        result.contains("// vérifier"),
+        "comment marker and body must be preserved together:\n{}",
+        result
+    );
+}
+
+#[test]
+fn latin1_source_roundtrips_to_latin1_bytes() {
+    // End-to-end: a Latin-1 byte sequence must come back out of the
+    // formatter pipeline as Latin-1 bytes, not as UTF-8. This is what
+    // keeps legacy Delphi codebases from having their on-disk encoding
+    // silently upgraded to UTF-8 every time fmt4d runs.
+    let mut src: Vec<u8> = b"\
+unit T;
+interface
+implementation
+procedure Q;
+begin
+  x := 1; // v"
+        .to_vec();
+    src.push(0xE9); // Latin-1 'é'
+    src.extend_from_slice(b"rifier\nend;\nend.\n");
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+
+    // Sanity: the input really is non-UTF-8.
+    assert_eq!(
+        pascal_core::detect_encoding(&src),
+        pascal_core::SourceEncoding::Latin1
+    );
+
+    let bytes = fmt4d::formatter::format_bytes(&src, &info, &config, &Default::default())
+        .expect("formatting failed");
+
+    // The result must still be Latin-1 (contains the 0xE9 byte and is
+    // not valid UTF-8 in any section that had the accented character).
+    assert_eq!(
+        pascal_core::detect_encoding(&bytes),
+        pascal_core::SourceEncoding::Latin1,
+        "output encoding changed from Latin-1 to UTF-8:\n{:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        bytes.windows(1).any(|w| w == [0xE9]),
+        "output does not contain the 0xE9 Latin-1 byte:\n{:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    // And the content must still make sense as decoded text.
+    let as_text = pascal_core::decode_bytes(&bytes);
+    assert!(
+        as_text.contains("// vérifier"),
+        "comment text lost in roundtrip:\n{}",
+        as_text
+    );
+}
+
+#[test]
+fn utf8_source_stays_utf8() {
+    // A UTF-8 source with multi-byte characters must come out as UTF-8,
+    // not get re-encoded to Latin-1.
+    let src =
+        "unit T;\ninterface\nimplementation\nprocedure Q;\nbegin\n  x := 1; // café\nend;\nend.\n"
+            .as_bytes();
+
+    assert_eq!(
+        pascal_core::detect_encoding(src),
+        pascal_core::SourceEncoding::Utf8
+    );
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let bytes = fmt4d::formatter::format_bytes(src, &info, &config, &Default::default())
+        .expect("formatting failed");
+
+    assert_eq!(
+        pascal_core::detect_encoding(&bytes),
+        pascal_core::SourceEncoding::Utf8,
+        "UTF-8 output mis-detected as another encoding"
+    );
+    // The multi-byte UTF-8 sequence for 'é' (0xC3 0xA9) must be present.
+    let text = std::str::from_utf8(&bytes).expect("output must be valid UTF-8");
+    assert!(text.contains("café"));
+}
+
+#[test]
+fn utf8_bom_source_preserves_bom() {
+    let mut src: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    src.extend_from_slice(
+        b"unit T;\ninterface\nimplementation\nprocedure Q;\nbegin\n  x := 1;\nend;\nend.\n",
+    );
+
+    assert_eq!(
+        pascal_core::detect_encoding(&src),
+        pascal_core::SourceEncoding::Utf8Bom
+    );
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let bytes = fmt4d::formatter::format_bytes(&src, &info, &config, &Default::default())
+        .expect("formatting failed");
+
+    assert!(
+        bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        "BOM was stripped from UTF-8+BOM output"
+    );
+    assert_eq!(
+        pascal_core::detect_encoding(&bytes),
+        pascal_core::SourceEncoding::Utf8Bom
+    );
+}
+
+#[test]
+fn latin1_leading_comment_text_is_preserved() {
+    // Leading comment (own-line) with a Latin-1 character. Goes through
+    // the comment-attachment path rather than the trailing path.
+    let mut src: Vec<u8> = b"\
+unit T;
+interface
+implementation
+procedure Q;
+begin
+  // V"
+        .to_vec();
+    src.push(0xE9);
+    src.extend_from_slice(b"rifier l'entree\n  x := 1;\nend;\nend.\n");
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let result =
+        fmt4d::formatter::format_source(&src, &info, &config, &std::collections::HashSet::new())
+            .expect("formatting failed");
+
+    assert!(
+        result.contains("Vérifier"),
+        "Latin-1 character in leading comment was lost:\n{}",
+        result
+    );
+}
+
+// ── Bug: RTTI attributes collapsed onto declaration line ────────
+// `[TestFixture]`, `[Test]`, and similar bracket attributes must
+// stay on their own line above the declaration they annotate —
+// never collapsed inline with `class`, `procedure`, `property`,
+// or a field name.
+
+#[test]
+fn rtti_testfixture_attribute_stays_on_own_line() {
+    let src = "\
+unit T;
+interface
+type
+  [TestFixture]
+  TFoo = class
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("[TestFixture]\n"),
+        "[TestFixture] was not placed on its own line:\n{}",
+        result
+    );
+    assert!(
+        !result.contains("[TestFixture] TFoo"),
+        "[TestFixture] was collapsed inline with the class name:\n{}",
+        result
+    );
+}
+
+#[test]
+fn rtti_test_attribute_on_method_stays_on_own_line() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  public
+    [Test]
+    procedure TestOne;
+    [Test]
+    procedure TestTwo;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        !result.contains("[Test] procedure"),
+        "[Test] was collapsed inline with `procedure`:\n{}",
+        result
+    );
+    assert!(
+        result.matches("[Test]\n").count() >= 2,
+        "expected two [Test] attributes each on their own line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn rtti_multiple_stacked_attributes_each_on_own_line() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  public
+    [Test]
+    [TestCase('case1')]
+    procedure TestIt;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        !result.contains("[Test] [TestCase"),
+        "[Test] and [TestCase] were joined on the same line:\n{}",
+        result
+    );
+    assert!(
+        !result.contains("[TestCase('case1')] procedure"),
+        "[TestCase('case1')] was collapsed inline with `procedure`:\n{}",
+        result
+    );
+    assert!(
+        result.contains("[Test]\n"),
+        "[Test] was not on its own line:\n{}",
+        result
+    );
+    assert!(
+        result.contains("[TestCase('case1')]\n"),
+        "[TestCase('case1')] was not on its own line:\n{}",
+        result
+    );
+}
+
+#[test]
+fn rtti_attribute_on_field_stays_on_own_line() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  private
+    [MyFieldAttr]
+    FField: Integer;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        !result.contains("[MyFieldAttr] FField"),
+        "[MyFieldAttr] was collapsed inline with field name:\n{}",
+        result
+    );
+    assert!(
+        result.contains("[MyFieldAttr]\n"),
+        "[MyFieldAttr] was not on its own line:\n{}",
+        result
+    );
+}
+
+// ── Bug: spurious blank line between const/var/type keyword and a ──
+// leading `//` comment on the first declaration.
+//
+// The section builder unconditionally pushed a Hardline after the
+// `const`/`var`/`type` keyword, but if the first declaration had a
+// leading `//` comment its doc already started with a Hardline from
+// comment attachment — doubling up and producing a blank line.
+
+#[test]
+fn no_blank_line_between_const_and_leading_line_comment() {
+    let src = "\
+unit T;
+
+interface
+
+const
+  //MSG_TO.VUSERTYPE
+  VUT_ALL_MASTER_BR = 'ALL';
+  VUT_BANNER = 'BANNER';
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between const and leading // comment:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_const_and_leading_brace_comment() {
+    let src = "\
+unit T;
+
+interface
+
+const
+  { section heading }
+  VUT_ALL_MASTER_BR = 'ALL';
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between const and leading brace comment:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_var_and_leading_line_comment() {
+    let src = "\
+unit T;
+
+interface
+
+var
+  //Global state
+  GFoo: Integer;
+  GBar: Integer;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between var and leading // comment:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_type_and_leading_line_comment() {
+    let src = "\
+unit T;
+
+interface
+
+type
+  //forward decls
+  TFoo = class;
+  TBar = class;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between type and leading // comment:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_local_const_and_leading_line_comment() {
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure Foo;
+const
+  //local constants
+  CMax = 42;
+begin
+  WriteLn(CMax);
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted between local const and leading // comment:\n{result}"
+    );
+}
+
+#[test]
+fn no_blank_line_between_decls_with_interleaved_line_comments() {
+    // A leading `//` comment on a non-first declaration must not
+    // create a blank line either. Previously the body pushed a
+    // Hardline before the child AND the child started with a
+    // Hardline from its attached comment, doubling up.
+    let src = "\
+unit T;
+
+interface
+
+const
+  FOO = 1;
+  //BAR is important
+  BAR = 2;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert_eq!(
+        result, src,
+        "blank line inserted before interleaved // comment:\n{result}"
     );
 }

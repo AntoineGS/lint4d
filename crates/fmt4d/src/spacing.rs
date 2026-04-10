@@ -141,6 +141,14 @@ pub fn would_need_space(
     if prev_kind == K::OPEN_PAREN || prev_kind == K::OPEN_BRACKET || prev_kind == K::DOT {
         return false;
     }
+    // `^` as pointer-type prefix (`^T` in `typerefPtr`): no space AFTER `^`.
+    if prev_kind == K::K_HAT && prev_parent_kind == K::TYPEREF_PTR {
+        return false;
+    }
+    // `^` as dereference postfix (`P^` in `exprUnary`): no space BEFORE `^`.
+    if kind == K::K_HAT && parent_kind == K::EXPR_UNARY {
+        return false;
+    }
     if kind == K::SEMICOLON {
         return false;
     }

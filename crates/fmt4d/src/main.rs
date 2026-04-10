@@ -1,13 +1,13 @@
 use clap::{CommandFactory, Parser};
 use fmt4d::config::{EndOfLine, FmtConfig};
-use fmt4d::formatter::format_source;
+use fmt4d::formatter::format_bytes;
 use fmt4d::uses;
 use pascal_core::discovery::discover_files;
 use pascal_core::FileInfo;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,8 +108,10 @@ fn main() {
 }
 
 fn run_stdin(cli: &Cli) -> i32 {
-    let mut input = String::new();
-    if let Err(e) = io::stdin().read_to_string(&mut input) {
+    // Read raw bytes so legacy Latin-1 / Windows-1252 input doesn't get
+    // rejected at the boundary (read_to_string would fail on non-UTF-8).
+    let mut input = Vec::new();
+    if let Err(e) = io::stdin().read_to_end(&mut input) {
         eprintln!("Error reading stdin: {}", e);
         return EXIT_ERROR;
     }
@@ -118,9 +120,14 @@ fn run_stdin(cli: &Cli) -> i32 {
     let config =
         FmtConfig::default().with_overrides(cli.indent_size, cli.max_line_length, cli.end_of_line);
 
-    match format_source(input.as_bytes(), &info, &config, &HashSet::new()) {
+    match format_bytes(&input, &info, &config, &HashSet::new()) {
         Ok(formatted) => {
-            print!("{}", formatted);
+            // Write raw bytes to stdout so the output encoding matches the
+            // input (e.g. Latin-1 in → Latin-1 out).
+            if let Err(e) = io::stdout().write_all(&formatted) {
+                eprintln!("Error writing stdout: {}", e);
+                return EXIT_ERROR;
+            }
             EXIT_OK
         }
         Err(e) => {
@@ -201,7 +208,13 @@ fn run_files(cli: &Cli) -> i32 {
             }
         };
 
-        let formatted = match format_source(&source, file_info, &config, &external_units) {
+        // Use `format_bytes` so the on-disk encoding of legacy Latin-1 /
+        // Windows-1252 sources is preserved on write. Comparing the raw
+        // byte sequences means a file that doesn't actually change (in its
+        // original encoding) is not reported as "would reformat" and is
+        // not rewritten — avoiding version-control churn on codebases
+        // that contain non-UTF-8 characters in comments or strings.
+        let formatted = match format_bytes(&source, file_info, &config, &external_units) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("Error formatting {}: {}", file_info.path.display(), e);
@@ -210,8 +223,7 @@ fn run_files(cli: &Cli) -> i32 {
             }
         };
 
-        let original = String::from_utf8_lossy(&source);
-        if formatted == original.as_ref() {
+        if formatted == source {
             return; // No changes needed
         }
 
@@ -220,7 +232,10 @@ fn run_files(cli: &Cli) -> i32 {
         if cli.check {
             println!("Would reformat: {}", file_info.path.display());
         } else if cli.diff {
-            print_diff(&file_info.path, &original, &formatted);
+            // Decode both sides losslessly for display purposes only.
+            let original_text = pascal_core::decode_bytes(&source);
+            let formatted_text = pascal_core::decode_bytes(&formatted);
+            print_diff(&file_info.path, &original_text, &formatted_text);
         } else {
             // Write formatted output back to the file
             if let Err(e) = fs::write(&file_info.path, &formatted) {

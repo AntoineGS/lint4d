@@ -87,8 +87,10 @@ impl CommentMap {
 /// Collect all `comment` (extra) nodes from the tree.
 fn collect_comments<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>, String)>) {
     if node.is_extra() && node.kind() == K::COMMENT {
-        let text = std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
-            .unwrap_or("")
+        // Use encoding-tolerant decoding so Latin-1 / Windows-1252 comments
+        // (common in legacy Delphi sources) are preserved instead of silently
+        // becoming empty strings.
+        let text = pascal_core::decode_bytes(&source[node.start_byte()..node.end_byte()])
             .replace('\r', "");
         out.push((node, text));
         return;

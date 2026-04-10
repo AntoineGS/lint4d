@@ -24,7 +24,9 @@ pub fn format_diagnostics(
         return String::new();
     }
 
-    let source_str = std::str::from_utf8(source).unwrap_or("");
+    // Tolerate non-UTF-8 (legacy Latin-1) sources so source snippets in
+    // diagnostics don't silently become empty.
+    let source_str = pascal_core::decode_bytes(source);
     let lines: Vec<&str> = source_str.lines().collect();
 
     let mut out = String::new();

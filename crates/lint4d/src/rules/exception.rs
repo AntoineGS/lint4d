@@ -147,8 +147,8 @@ fn check_try_bare_except(node: Node, source: &[u8], ctx: &mut LintContext) {
         return;
     }
 
-    let except_text = std::str::from_utf8(&source[except_start..except_end]).unwrap_or("");
-    if source_contains_raise(except_text) {
+    let except_text = pascal_core::decode_bytes(&source[except_start..except_end]);
+    if source_contains_raise(except_text.as_ref()) {
         return;
     }
 

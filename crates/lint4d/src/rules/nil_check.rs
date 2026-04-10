@@ -281,13 +281,10 @@ fn analyze_cfg(
             if start >= end {
                 continue;
             }
-            let text = match std::str::from_utf8(&source[start..end]) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            let text = pascal_core::decode_bytes(&source[start..end]);
 
             process_statement(
-                text,
+                text.as_ref(),
                 start,
                 source,
                 &mut state,
@@ -304,9 +301,7 @@ fn analyze_cfg(
         let nil_compare = block.stmts.last().and_then(|s| {
             let start = s.byte_range.start;
             let end = s.byte_range.end.min(source.len());
-            std::str::from_utf8(&source[start..end])
-                .ok()
-                .and_then(parse_nil_comparison)
+            parse_nil_comparison(pascal_core::decode_bytes(&source[start..end]).as_ref())
         });
 
         // Propagate state to successors via edges.
@@ -605,10 +600,7 @@ fn analyze_return_nil(cfg: &Cfg, source: &[u8]) -> bool {
             if start >= end {
                 continue;
             }
-            let text = match std::str::from_utf8(&source[start..end]) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            let text = pascal_core::decode_bytes(&source[start..end]);
             let lower = text.trim().to_lowercase();
 
             if let Some((var, rhs)) = parse_assignment_parts(&lower) {

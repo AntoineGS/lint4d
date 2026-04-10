@@ -100,12 +100,9 @@ fn analyze_cfg(cfg: &cfg_core::types::Cfg, source: &[u8], ctx: &mut LintContext)
             if start >= end {
                 continue;
             }
-            let text = match std::str::from_utf8(&source[start..end]) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            let text = pascal_core::decode_bytes(&source[start..end]);
 
-            process_statement(text, start, source, &mut state, ctx);
+            process_statement(text.as_ref(), start, source, &mut state, ctx);
         }
 
         // Propagate state to successors.

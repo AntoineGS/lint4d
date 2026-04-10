@@ -3,11 +3,13 @@ use std::collections::HashMap;
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
-/// Extract the UTF-8 text of a node from the source bytes.
+/// Extract the text of a node from the source bytes.
+///
+/// Tolerates legacy Latin-1 / Windows-1252 encoded sources via
+/// [`pascal_core::decode_bytes`] so non-ASCII characters in identifiers or
+/// string literals don't silently become empty.
 pub fn node_text(node: Node, source: &[u8]) -> String {
-    std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
-        .unwrap_or("")
-        .to_string()
+    pascal_core::decode_bytes(&source[node.start_byte()..node.end_byte()]).into_owned()
 }
 
 /// Check whether a node represents a constructor call pattern.
@@ -427,6 +429,29 @@ pub fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
     (line, col)
 }
 
+/// Iterate children of `node`, transparently flattening any `ppBlock`
+/// wrappers so callers see the same children as if no directives existed.
+/// Skips `ppIf`, `ppElse`, `ppEndIf` directive nodes within ppBlocks.
+pub fn effective_children<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let mut result = Vec::new();
+    for child in node.children(&mut node.walk()) {
+        if child.kind() == K::PP_BLOCK {
+            for inner in child.children(&mut child.walk()) {
+                match inner.kind() {
+                    K::PP_IF | K::PP_ELSE | K::PP_END_IF => continue,
+                    K::PP_BLOCK => {
+                        result.extend(effective_children(inner));
+                    }
+                    _ => result.push(inner),
+                }
+            }
+        } else {
+            result.push(child);
+        }
+    }
+    result
+}
+
 /// Extract the type name from a `declVar` AST node.
 ///
 /// Walks `declVar -> type -> typeref -> identifier` to get the type name.
@@ -448,4 +473,83 @@ pub fn extract_type_from_decl_var(decl_var: Node, source: &[u8]) -> Option<Strin
         }
     }
     None
+}
+
+#[cfg(test)]
+mod effective_children_tests {
+    use super::*;
+
+    fn parse(source: &str) -> (tree_sitter::Tree, Vec<u8>) {
+        let bytes = source.as_bytes().to_vec();
+        let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
+        let (tree, _) = pascal_core::parser::parse_file(&info, &bytes).unwrap();
+        (tree, bytes)
+    }
+
+    #[test]
+    fn flattens_ppblock_in_var_section() {
+        let source =
+            "unit T;\ninterface\nvar\n  a: integer;\n  {$IFDEF X}\n  b: string;\n  {$ENDIF}\nimplementation\nend.\n";
+        let (tree, _bytes) = parse(source);
+        let root = tree.root_node();
+        // Navigate: root -> unit -> interface -> declVars
+        let unit_node = root
+            .children(&mut root.walk())
+            .find(|c| c.kind() == "unit")
+            .expect("unit not found");
+        let iface = unit_node
+            .children(&mut unit_node.walk())
+            .find(|c| c.kind() == K::INTERFACE)
+            .expect("interface not found");
+        let decl_vars = iface
+            .children(&mut iface.walk())
+            .find(|c| c.kind() == K::DECL_VARS)
+            .expect("declVars not found");
+        let children = effective_children(decl_vars);
+        let kinds: Vec<&str> = children.iter().map(|c| c.kind()).collect();
+        assert!(
+            kinds.contains(&K::DECL_VAR),
+            "expected declVar children, got: {:?}",
+            kinds
+        );
+        let decl_var_count = kinds.iter().filter(|&&k| k == K::DECL_VAR).count();
+        assert_eq!(
+            decl_var_count, 2,
+            "expected 2 declVars, got {}: {:?}",
+            decl_var_count, kinds
+        );
+        assert!(!kinds.contains(&K::PP_IF), "ppIf should be filtered out");
+        assert!(
+            !kinds.contains(&K::PP_END_IF),
+            "ppEndIf should be filtered out"
+        );
+    }
+
+    #[test]
+    fn passthrough_without_ppblock() {
+        let source = "unit T;\ninterface\nvar\n  a: integer;\n  b: string;\nimplementation\nend.\n";
+        let (tree, _bytes) = parse(source);
+        let root = tree.root_node();
+        let unit_node = root
+            .children(&mut root.walk())
+            .find(|c| c.kind() == "unit")
+            .expect("unit not found");
+        let iface = unit_node
+            .children(&mut unit_node.walk())
+            .find(|c| c.kind() == K::INTERFACE)
+            .expect("interface not found");
+        let decl_vars = iface
+            .children(&mut iface.walk())
+            .find(|c| c.kind() == K::DECL_VARS)
+            .expect("declVars not found");
+        let normal = decl_vars
+            .children(&mut decl_vars.walk())
+            .collect::<Vec<_>>();
+        let effective = effective_children(decl_vars);
+        assert_eq!(
+            normal.len(),
+            effective.len(),
+            "without ppBlock, effective_children should match children"
+        );
+    }
 }

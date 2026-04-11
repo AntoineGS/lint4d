@@ -36,19 +36,38 @@ impl<'a> DocBuilder<'a> {
         // where defaultValue = kEq + _initializer
         let eq_idx = children.iter().position(|c| c.kind() == K::DEFAULT_VALUE)?;
 
-        // Name cell: everything before the defaultValue (identifier, optional : type)
+        // Name cell: everything before the defaultValue (identifier, optional : type).
+        // Use doc_for_node_sans_leading for the first child so that any
+        // leading comments are handled at the group level, not inside cells.
         let name_parts: Vec<Doc> = children[..eq_idx]
             .iter()
-            .map(|c| self.doc_for_node(*c))
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    self.doc_for_node_sans_leading(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
             .collect();
 
-        // Value cell: defaultValue + semicolon (everything from eq_idx onwards)
-        let value_parts: Vec<Doc> = children[eq_idx..]
-            .iter()
-            .map(|c| self.doc_for_node(*c))
-            .collect();
-
+        // Value cell: defaultValue + semicolon (everything from eq_idx onwards).
+        // Use doc_for_node_sans_trailing for the last child so that the
+        // trailing comment is handled as a separate alignment cell.
         let trailing_comment = self.trailing_comment_cell(node);
+        let value_range = &children[eq_idx..];
+        let value_last = value_range.len().saturating_sub(1);
+        let value_parts: Vec<Doc> = value_range
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == value_last && trailing_comment.is_some() {
+                    self.doc_for_node_sans_trailing(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
+            .collect();
 
         let mut cells = vec![
             doc::align_cell(doc::concat(name_parts), true),
@@ -78,9 +97,18 @@ impl<'a> DocBuilder<'a> {
         let colon_idx = children.iter().position(|c| c.kind() == K::COLON)?;
 
         // Name cell: everything before the colon.
+        // Use doc_for_node_sans_leading for the first child so that any
+        // leading comments are handled at the group level, not inside cells.
         let name_parts: Vec<Doc> = children[..colon_idx]
             .iter()
-            .map(|c| self.doc_for_node(*c))
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    self.doc_for_node_sans_leading(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
             .collect();
 
         // Find the defaultValue (= initializer) if present.
@@ -96,9 +124,19 @@ impl<'a> DocBuilder<'a> {
                 .map(|c| self.doc_for_node(*c))
                 .collect();
 
-            let value_parts: Vec<Doc> = children[def_idx..]
+            // Strip trailing comment from last child when extracted separately.
+            let value_range = &children[def_idx..];
+            let value_last = value_range.len().saturating_sub(1);
+            let value_parts: Vec<Doc> = value_range
                 .iter()
-                .map(|c| self.doc_for_node(*c))
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == value_last && has_tail {
+                        self.doc_for_node_sans_trailing(*c)
+                    } else {
+                        self.doc_for_node(*c)
+                    }
+                })
                 .collect();
 
             let mut cells = vec![
@@ -114,9 +152,19 @@ impl<'a> DocBuilder<'a> {
             Some(cells)
         } else {
             // No initializer: [name] [: type;] [comment?]
-            let type_parts: Vec<Doc> = children[colon_idx..]
+            // Strip trailing comment from last child when extracted separately.
+            let type_range = &children[colon_idx..];
+            let type_last = type_range.len().saturating_sub(1);
+            let type_parts: Vec<Doc> = type_range
                 .iter()
-                .map(|c| self.doc_for_node(*c))
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == type_last && has_tail {
+                        self.doc_for_node_sans_trailing(*c)
+                    } else {
+                        self.doc_for_node(*c)
+                    }
+                })
                 .collect();
 
             let mut cells = vec![
@@ -160,19 +208,37 @@ impl<'a> DocBuilder<'a> {
         // Find the kEq (=) position.
         let eq_idx = children.iter().position(|c| c.kind() == K::K_EQ)?;
 
-        // Name cell: everything before the =
+        // Name cell: everything before the =.
+        // Use doc_for_node_sans_leading for the first child so that any
+        // leading comments are handled at the group level, not inside cells.
         let name_parts: Vec<Doc> = children[..eq_idx]
             .iter()
-            .map(|c| self.doc_for_node(*c))
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    self.doc_for_node_sans_leading(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
             .collect();
 
-        // Type cell: = and everything after
-        let type_parts: Vec<Doc> = children[eq_idx..]
-            .iter()
-            .map(|c| self.doc_for_node(*c))
-            .collect();
-
+        // Type cell: = and everything after.
+        // Strip trailing comment from last child when extracted separately.
         let trailing_comment = self.trailing_comment_cell(node);
+        let type_range = &children[eq_idx..];
+        let type_last = type_range.len().saturating_sub(1);
+        let type_parts: Vec<Doc> = type_range
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == type_last && trailing_comment.is_some() {
+                    self.doc_for_node_sans_trailing(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
+            .collect();
 
         let mut cells = vec![
             doc::align_cell(doc::concat(name_parts), true),
@@ -204,10 +270,19 @@ impl<'a> DocBuilder<'a> {
         let write_idx = children.iter().position(|c| c.kind() == K::K_WRITE);
 
         // Name cell: everything up to and NOT including the colon
-        // (includes kProperty, optional kClass, identifier, optional declPropArgs)
+        // (includes kProperty, optional kClass, identifier, optional declPropArgs).
+        // Use doc_for_node_sans_leading for the first child so that any
+        // leading comments are handled at the group level, not inside cells.
         let name_parts: Vec<Doc> = children[..colon_idx]
             .iter()
-            .map(|c| self.doc_for_node(*c))
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    self.doc_for_node_sans_leading(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
             .collect();
 
         let trailing_comment = self.trailing_comment_cell(node);
@@ -244,15 +319,23 @@ impl<'a> DocBuilder<'a> {
         if let Some(ri) = read_idx {
             if let Some(wi) = write_idx {
                 // Has both read and write.
-                // Read cell: read getter
                 let read_parts: Vec<Doc> = children[ri..wi]
                     .iter()
                     .map(|c| self.doc_for_node(*c))
                     .collect();
-                // Write cell: write setter + remaining specifiers + ;
-                let write_parts: Vec<Doc> = children[wi..]
+                // Write cell: strip trailing comment from last child.
+                let write_range = &children[wi..];
+                let write_last = write_range.len().saturating_sub(1);
+                let write_parts: Vec<Doc> = write_range
                     .iter()
-                    .map(|c| self.doc_for_node(*c))
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i == write_last && has_tail {
+                            self.doc_for_node_sans_trailing(*c)
+                        } else {
+                            self.doc_for_node(*c)
+                        }
+                    })
                     .collect();
 
                 let mut cells = vec![
@@ -268,10 +351,19 @@ impl<'a> DocBuilder<'a> {
 
                 Some(cells)
             } else {
-                // Has read but no write.
-                let read_parts: Vec<Doc> = children[ri..]
+                // Has read but no write — strip trailing comment from last child.
+                let read_range = &children[ri..];
+                let read_last = read_range.len().saturating_sub(1);
+                let read_parts: Vec<Doc> = read_range
                     .iter()
-                    .map(|c| self.doc_for_node(*c))
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i == read_last && has_tail {
+                            self.doc_for_node_sans_trailing(*c)
+                        } else {
+                            self.doc_for_node(*c)
+                        }
+                    })
                     .collect();
 
                 let mut cells = vec![
@@ -288,9 +380,19 @@ impl<'a> DocBuilder<'a> {
             }
         } else {
             // No read specifier — just name : type [rest];
-            let rest_parts: Vec<Doc> = children[first_specifier_idx..]
+            // Strip trailing comment from last child.
+            let rest_range = &children[first_specifier_idx..];
+            let rest_last = rest_range.len().saturating_sub(1);
+            let rest_parts: Vec<Doc> = rest_range
                 .iter()
-                .map(|c| self.doc_for_node(*c))
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == rest_last && has_tail {
+                        self.doc_for_node_sans_trailing(*c)
+                    } else {
+                        self.doc_for_node(*c)
+                    }
+                })
                 .collect();
 
             let mut cells = vec![
@@ -311,12 +413,23 @@ impl<'a> DocBuilder<'a> {
 
     /// Extract the trailing comment for a node as an AlignCell, if present
     /// and comment alignment is enabled.
+    ///
+    /// CommentMap associates trailing comments with leaf nodes (e.g.
+    /// the `;` token), not with parent declaration nodes.  We check the
+    /// declaration node first, then fall back to its last code leaf.
     fn trailing_comment_cell(&self, node: Node<'a>) -> Option<AlignCell> {
         if !self.config.alignment.comments {
             return None;
         }
 
-        let comments = self.comments.trailing_comments(node.id());
+        let mut comments = self.comments.trailing_comments(node.id());
+        if comments.is_empty() {
+            // Fall back to last leaf descendant (typically `;`).
+            let children = self.code_children(node);
+            if let Some(last) = children.last() {
+                comments = self.comments.trailing_comments(last.id());
+            }
+        }
         if comments.is_empty() {
             return None;
         }
@@ -378,7 +491,18 @@ impl<'a> DocBuilder<'a> {
                 // Emit leading comments/directives for this declaration
                 // as plain docs (they don't participate in alignment but
                 // don't break the group either).
-                let leading = self.leading_comments_doc(*child);
+                //
+                // CommentMap associates comments with leaves, so when a
+                // comment precedes a declaration it's typically attached
+                // to the first leaf child (e.g. the identifier), not to
+                // the declaration node itself.  Check both.
+                let mut leading = self.leading_comments_doc(*child);
+                if matches!(leading, Doc::Empty) {
+                    let children = self.code_children(*child);
+                    if let Some(first) = children.first() {
+                        leading = self.leading_comments_doc(*first);
+                    }
+                }
                 if !matches!(leading, Doc::Empty) {
                     group_items.push(leading);
                 }
@@ -405,7 +529,13 @@ impl<'a> DocBuilder<'a> {
                 let child_doc = self.doc_for_node(*child);
                 if section_kind == K::DECL_TYPES && kind == K::DECL_TYPE {
                     // Complex type — break alignment group.
-                    group_items.push(Doc::BlankLine);
+                    // Use Hardline (not BlankLine) for the first item to
+                    // avoid inserting a spurious blank line after "type".
+                    if group_items.is_empty() {
+                        group_items.push(Doc::Hardline);
+                    } else {
+                        group_items.push(Doc::BlankLine);
+                    }
                     group_items.push(child_doc);
                     group_items.push(Doc::BlankLine);
                 } else {

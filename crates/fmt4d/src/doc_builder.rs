@@ -75,6 +75,52 @@ impl<'a> DocBuilder<'a> {
         ])
     }
 
+    /// Like `doc_for_node` but omits leading comments.
+    ///
+    /// Used by alignment decompose functions so that leading comments
+    /// can be extracted at the group level instead of being embedded
+    /// inside aligned cells.
+    pub(crate) fn doc_for_node_sans_leading(&self, node: Node<'a>) -> Doc {
+        if self.is_in_format_off_region(node) {
+            return Doc::Raw(self.node_text(node));
+        }
+
+        let leading_directives = self.leading_directives_doc(node);
+        let body = self.build_doc(node);
+        let trailing_comments = self.trailing_comments_doc(node);
+        let trailing_directives = self.trailing_directives_doc(node);
+
+        doc::concat(vec![
+            leading_directives,
+            body,
+            trailing_comments,
+            trailing_directives,
+        ])
+    }
+
+    /// Like `doc_for_node` but omits trailing comments.
+    ///
+    /// Used by alignment decompose functions so that trailing comments
+    /// can be extracted as a separate alignment cell instead of being
+    /// embedded inside the last data cell.
+    pub(crate) fn doc_for_node_sans_trailing(&self, node: Node<'a>) -> Doc {
+        if self.is_in_format_off_region(node) {
+            return Doc::Raw(self.node_text(node));
+        }
+
+        let leading_comments = self.leading_comments_doc(node);
+        let leading_directives = self.leading_directives_doc(node);
+        let body = self.build_doc(node);
+        let trailing_directives = self.trailing_directives_doc(node);
+
+        doc::concat(vec![
+            leading_comments,
+            leading_directives,
+            body,
+            trailing_directives,
+        ])
+    }
+
     /// Dispatch to the correct handler by node kind.
     ///
     /// All handlers are stubs that delegate to `build_children` for now.

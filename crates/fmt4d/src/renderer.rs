@@ -329,7 +329,9 @@ impl Renderer {
                 MergedItem::Row(cells) => {
                     if outlier_positions[pos] {
                         // Render with normal single-space formatting.
-                        self.emit_newline();
+                        if !self.at_line_start() {
+                            self.emit_newline();
+                        }
                         let indent_str = self.indent_string(indent);
                         self.output.push_str(&indent_str);
                         self.current_column = indent_str.len();
@@ -341,7 +343,9 @@ impl Renderer {
                         }
                     } else if let Some(ref col_widths) = position_col_widths[pos] {
                         // Render with aligned padding.
-                        self.emit_newline();
+                        if !self.at_line_start() {
+                            self.emit_newline();
+                        }
                         let indent_str = self.indent_string(indent);
                         self.output.push_str(&indent_str);
                         self.current_column = indent_str.len();

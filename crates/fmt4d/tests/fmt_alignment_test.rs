@@ -695,3 +695,42 @@ end.
         write_cols[0], write_cols[1], result
     );
 }
+
+// ── Leading comment on complex type — no spurious blank line ────────
+
+#[test]
+fn type_complex_with_leading_comment_no_blank_line() {
+    let source = "\
+unit Test;
+interface
+type
+  /// Wraps a cached TPromoRules instance with metadata
+  TCachedRuleSet = class
+  private
+    FPromoRules: TPromoRules;
+    FLoadedAt: TDateTime;
+    FRuleCount: Integer;
+  end;
+implementation
+end.
+";
+    let result = format_aligned(source);
+    // No blank line should appear between `type` and the `///` comment.
+    assert!(
+        !result.contains("type\n\n"),
+        "Should not have a blank line between type and leading /// comment. Got:\n{}",
+        result
+    );
+    // The comment should immediately follow `type` (indented).
+    assert!(
+        result.contains("type\n  /// Wraps"),
+        "/// comment should follow type on the next line. Got:\n{}",
+        result
+    );
+    // Idempotency.
+    let result2 = format_aligned(&result);
+    assert_eq!(
+        result, result2,
+        "Complex type with /// comment should be idempotent"
+    );
+}

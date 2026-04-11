@@ -673,8 +673,12 @@ impl<'a> DocBuilder<'a> {
                     // Complex type — break alignment group.
                     // Use Hardline (not BlankLine) for the first item to
                     // avoid inserting a spurious blank line after "type".
+                    // Skip the Hardline entirely when child_doc already
+                    // starts with one (e.g. from a leading comment).
                     if group_items.is_empty() {
-                        group_items.push(Doc::Hardline);
+                        if !crate::doc_builder::starts_with_hardline(&child_doc) {
+                            group_items.push(Doc::Hardline);
+                        }
                     } else {
                         group_items.push(Doc::BlankLine);
                     }

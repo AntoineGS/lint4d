@@ -629,6 +629,37 @@ end.
     assert_eq!(result, result2, "Comma var expansion should be idempotent");
 }
 
+// ── Single-line class declarations should not get blank lines ──────
+
+#[test]
+fn type_single_line_class_no_blank_lines() {
+    let source = "\
+unit Test;
+interface
+type
+  EUnresolvedMacros = class(Exception);
+  EUsageNotFound = class(Exception);
+  EDatabaseUnreachable = class(Exception);
+  ERecordNotFound = class(Exception);
+  EValidationError = class(Exception);
+implementation
+end.
+";
+    let result = format_aligned(source);
+    // No blank lines should be inserted between single-line class declarations.
+    assert!(
+        !result.contains("class(Exception);\n\n  E"),
+        "Should not have blank lines between single-line class decls. Got:\n{}",
+        result
+    );
+    // Idempotency check.
+    let result2 = format_aligned(&result);
+    assert_eq!(
+        result, result2,
+        "Single-line class alignment should be idempotent"
+    );
+}
+
 // ── Property alignment: read/write columns ─────────────────────────
 
 #[test]

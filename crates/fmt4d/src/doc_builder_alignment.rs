@@ -292,13 +292,15 @@ impl<'a> DocBuilder<'a> {
 
         // Check if this is a simple alias by looking at the type field.
         // Complex types have declClass, declRecord, declIntf, declEnum, etc.
+        // Single-line forward declarations (e.g. `EFoo = class(TBar);`) are
+        // still alignable — only reject multi-line bodies.
         let has_complex_type = children.iter().any(|c| {
             matches!(
                 c.kind(),
                 K::DECL_CLASS | K::DECL_RECORD | K::DECL_INTF | K::DECL_ENUM
             )
         });
-        if has_complex_type {
+        if has_complex_type && node.start_position().row != node.end_position().row {
             return None;
         }
 

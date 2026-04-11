@@ -1,11 +1,62 @@
 use crate::config::{FmtConfig, IndentStyle};
-use crate::doc::Doc;
+use crate::doc::{AlignCell, Doc};
 use crate::spacing;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     Flat,
     Break,
+}
+
+/// Internal enum for merging alignment rows with non-row docs.
+enum MergedItem {
+    Row(Vec<AlignCell>),
+    Other(Doc),
+}
+
+/// IQR-based outlier detection on a list of widths.
+///
+/// Returns a boolean vec of the same length: `true` = outlier.
+/// For groups with fewer than 6 items, no outliers are detected
+/// (quartile estimates are too noisy with fewer data points).
+///
+/// A minimum IQR floor of 5 prevents the "zero-IQR collapse" that
+/// occurs when most identifiers share the same width: without the
+/// floor, IQR→0 and the fence equals Q3 exactly, flagging any name
+/// even one character longer than the mode.
+fn detect_outliers(widths: &[usize]) -> Vec<bool> {
+    const MIN_GROUP: usize = 6;
+    const MIN_IQR: f64 = 5.0;
+
+    let n = widths.len();
+    if n < MIN_GROUP {
+        return vec![false; n];
+    }
+
+    let mut sorted: Vec<usize> = widths.to_vec();
+    sorted.sort_unstable();
+
+    let q1 = percentile(&sorted, 25.0);
+    let q3 = percentile(&sorted, 75.0);
+    let iqr = (q3 - q1).max(MIN_IQR);
+    let upper_fence = q3 + 1.5 * iqr;
+
+    widths.iter().map(|&w| (w as f64) > upper_fence).collect()
+}
+
+/// Compute the p-th percentile of a sorted slice using linear interpolation.
+fn percentile(sorted: &[usize], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0] as f64;
+    }
+    let rank = (p / 100.0) * (sorted.len() as f64 - 1.0);
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let frac = rank - lower as f64;
+    sorted[lower] as f64 + frac * (sorted[upper] as f64 - sorted[lower] as f64)
 }
 
 pub struct Renderer {
@@ -152,10 +203,317 @@ impl Renderer {
                     stack.push((indent, Mode::Flat, content));
                     stack.push((indent, sep_mode, sep));
                 }
+
+                Doc::AlignGroup(children) => {
+                    self.render_align_group(children, indent);
+                }
+
+                Doc::AlignRow(cells) => {
+                    // Standalone AlignRow outside a group — render as
+                    // plain concatenation (should not happen in practice).
+                    for cell in cells {
+                        stack.push((indent, mode, cell.content));
+                    }
+                }
             }
         }
 
         self.output
+    }
+
+    // ── Alignment group rendering ─────────────────────────────────
+
+    fn render_align_group(&mut self, children: Vec<Doc>, indent: usize) {
+        // Separate AlignRow entries from non-row docs (comments, directives).
+        // Also identify blank lines that break alignment groups.
+        let mut groups: Vec<Vec<(usize, Vec<AlignCell>)>> = vec![Vec::new()];
+        let mut non_rows: Vec<(usize, Doc)> = Vec::new(); // (position_index, doc)
+        let mut position = 0usize;
+
+        for child in children {
+            match child {
+                Doc::AlignRow(cells) => {
+                    groups.last_mut().unwrap().push((position, cells));
+                }
+                Doc::BlankLine => {
+                    // Blank line breaks the current alignment group.
+                    non_rows.push((position, Doc::BlankLine));
+                    groups.push(Vec::new());
+                }
+                other => {
+                    // Standalone comments/directives — don't break group.
+                    non_rows.push((position, other));
+                }
+            }
+            position += 1;
+        }
+
+        // Compute column widths per group and build a position→column_widths map.
+        let mut position_col_widths: Vec<Option<Vec<usize>>> = vec![None; position];
+        let mut outlier_positions: Vec<bool> = vec![false; position];
+
+        for group in &groups {
+            if group.is_empty() {
+                continue;
+            }
+
+            // Measure cell widths for each row.
+            let measured: Vec<(usize, Vec<usize>)> = group
+                .iter()
+                .map(|(pos, cells)| {
+                    let widths: Vec<usize> = cells
+                        .iter()
+                        .map(|c| Self::measure_width(&c.content))
+                        .collect();
+                    (*pos, widths)
+                })
+                .collect();
+
+            // Detect outliers on first column (name widths).
+            let first_col_widths: Vec<usize> = measured
+                .iter()
+                .map(|(_, w)| w.first().copied().unwrap_or(0))
+                .collect();
+            let outliers = detect_outliers(&first_col_widths);
+
+            // Mark outlier positions.
+            for (i, (pos, _)) in measured.iter().enumerate() {
+                if outliers[i] {
+                    outlier_positions[*pos] = true;
+                }
+            }
+
+            // Compute max column widths, excluding outliers.
+            let max_cols = measured
+                .iter()
+                .zip(outliers.iter())
+                .filter(|(_, &is_outlier)| !is_outlier)
+                .map(|((_, widths), _)| widths.len())
+                .max()
+                .unwrap_or(0);
+
+            let mut col_widths = vec![0usize; max_cols];
+            for ((_, widths), &is_outlier) in measured.iter().zip(outliers.iter()) {
+                if is_outlier {
+                    continue;
+                }
+                for (col, &w) in widths.iter().enumerate() {
+                    if col < col_widths.len() {
+                        col_widths[col] = col_widths[col].max(w);
+                    }
+                }
+            }
+
+            // Store resolved widths for each non-outlier position.
+            for (pos, _) in group {
+                if !outlier_positions[*pos] {
+                    position_col_widths[*pos] = Some(col_widths.clone());
+                }
+            }
+        }
+
+        // Merge rows and non-rows back into position order for rendering.
+        let mut merged: Vec<(usize, MergedItem)> = Vec::with_capacity(position);
+        for group in groups {
+            for (pos, cells) in group {
+                merged.push((pos, MergedItem::Row(cells)));
+            }
+        }
+        for (pos, doc) in non_rows {
+            merged.push((pos, MergedItem::Other(doc)));
+        }
+        merged.sort_by_key(|(pos, _)| *pos);
+
+        for (pos, item) in merged {
+            match item {
+                MergedItem::Row(cells) => {
+                    if outlier_positions[pos] {
+                        // Render with normal single-space formatting.
+                        self.emit_newline();
+                        let indent_str = self.indent_string(indent);
+                        self.output.push_str(&indent_str);
+                        self.current_column = indent_str.len();
+                        // Clear spacing state — the row starts fresh at indent.
+                        self.last_token_kind.clear();
+                        self.last_token_parent_kind.clear();
+                        for cell in cells {
+                            self.render_doc_inline(cell.content, indent);
+                        }
+                    } else if let Some(ref col_widths) = position_col_widths[pos] {
+                        // Render with aligned padding.
+                        self.emit_newline();
+                        let indent_str = self.indent_string(indent);
+                        self.output.push_str(&indent_str);
+                        self.current_column = indent_str.len();
+                        // Clear spacing state — the row starts fresh at indent.
+                        self.last_token_kind.clear();
+                        self.last_token_parent_kind.clear();
+                        for (col_idx, cell) in cells.into_iter().enumerate() {
+                            let before_len = self.output.len();
+                            self.render_doc_inline(cell.content, indent);
+                            let rendered_width = self.output.len() - before_len;
+                            if cell.pad {
+                                if let Some(&target_width) = col_widths.get(col_idx) {
+                                    let pad = target_width.saturating_sub(rendered_width);
+                                    if pad > 0 {
+                                        self.output.push_str(&" ".repeat(pad));
+                                        self.current_column += pad;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                MergedItem::Other(doc) => {
+                    // Render non-row items (comments, blank lines, directives).
+                    self.render_doc_inline(doc, indent);
+                }
+            }
+        }
+    }
+
+    /// Render a Doc inline into the current output (non-stack-based, for use
+    /// within alignment group rendering).
+    fn render_doc_inline(&mut self, doc: Doc, indent: usize) {
+        match doc {
+            Doc::Empty => {}
+            Doc::Token {
+                text,
+                kind,
+                parent_kind,
+            } => {
+                self.emit_with_spacing(&text, &kind, &parent_kind, indent);
+            }
+            Doc::Raw(text) => {
+                for ch in text.chars() {
+                    if ch == '\n' {
+                        self.current_column = 0;
+                    } else {
+                        self.current_column += 1;
+                    }
+                }
+                if text.ends_with(|c: char| c.is_whitespace()) {
+                    self.last_token_kind.clear();
+                    self.last_token_parent_kind.clear();
+                }
+                self.output.push_str(&text);
+            }
+            Doc::Hardline => self.emit_newline(),
+            Doc::BlankLine => {
+                self.emit_newline();
+                self.output.push('\n');
+            }
+            Doc::Line | Doc::PreservedLine => {
+                self.output.push(' ');
+                self.current_column += 1;
+                self.last_token_kind.clear();
+                self.last_token_parent_kind.clear();
+            }
+            Doc::Softline => {}
+            Doc::Concat(docs) => {
+                for d in docs {
+                    self.render_doc_inline(d, indent);
+                }
+            }
+            Doc::Indent(inner) => {
+                self.render_doc_inline(*inner, indent + 1);
+            }
+            Doc::Group(inner) => {
+                // Within alignment cells, always render flat.
+                self.render_doc_inline(*inner, indent);
+            }
+            Doc::IfBreak { flat, .. } => {
+                self.render_doc_inline(*flat, indent);
+            }
+            Doc::Fill(parts) => {
+                for p in parts {
+                    self.render_doc_inline(p, indent);
+                }
+            }
+            Doc::AlignGroup(children) => {
+                self.render_align_group(children, indent);
+            }
+            Doc::AlignRow(cells) => {
+                for cell in cells {
+                    self.render_doc_inline(cell.content, indent);
+                }
+            }
+        }
+    }
+
+    /// Measure the rendered width of a Doc without emitting output.
+    fn measure_width(doc: &Doc) -> usize {
+        let mut width = 0usize;
+        let mut last_kind = String::new();
+        let mut last_parent = String::new();
+        Self::measure_width_inner(doc, &mut width, &mut last_kind, &mut last_parent);
+        width
+    }
+
+    fn measure_width_inner(
+        doc: &Doc,
+        width: &mut usize,
+        last_kind: &mut String,
+        last_parent: &mut String,
+    ) {
+        match doc {
+            Doc::Empty => {}
+            Doc::Token {
+                text,
+                kind,
+                parent_kind,
+            } => {
+                if spacing::would_need_space(last_kind, last_parent, kind, parent_kind) {
+                    *width += 1;
+                }
+                *width += text.len();
+                *last_kind = kind.clone();
+                *last_parent = parent_kind.clone();
+            }
+            Doc::Raw(text) => {
+                // Count characters, but only on the last line if multi-line.
+                if let Some(last_line) = text.lines().last() {
+                    *width += last_line.len();
+                }
+            }
+            Doc::Hardline | Doc::BlankLine => {
+                // Newlines in a cell shouldn't happen, but handle gracefully.
+                *width = 0;
+            }
+            Doc::Line | Doc::PreservedLine => {
+                *width += 1; // space in flat mode
+            }
+            Doc::Softline => {}
+            Doc::Concat(docs) => {
+                for d in docs {
+                    Self::measure_width_inner(d, width, last_kind, last_parent);
+                }
+            }
+            Doc::Indent(inner) => {
+                Self::measure_width_inner(inner, width, last_kind, last_parent);
+            }
+            Doc::Group(inner) => {
+                Self::measure_width_inner(inner, width, last_kind, last_parent);
+            }
+            Doc::IfBreak { flat, .. } => {
+                Self::measure_width_inner(flat, width, last_kind, last_parent);
+            }
+            Doc::Fill(parts) => {
+                for p in parts {
+                    Self::measure_width_inner(p, width, last_kind, last_parent);
+                }
+            }
+            Doc::AlignGroup(children) => {
+                for c in children {
+                    Self::measure_width_inner(c, width, last_kind, last_parent);
+                }
+            }
+            Doc::AlignRow(cells) => {
+                for cell in cells {
+                    Self::measure_width_inner(&cell.content, width, last_kind, last_parent);
+                }
+            }
+        }
     }
 
     fn at_line_start(&self) -> bool {
@@ -324,6 +682,19 @@ impl Renderer {
                 // In fit-checking treat Fill like Concat (all flat).
                 for part in parts {
                     if !self.fits_inner(part, indent, remaining, last_kind, last_parent) {
+                        return false;
+                    }
+                }
+                true
+            }
+
+            // Alignment groups are always rendered in break mode (one
+            // declaration per line), so they never fit on a single line.
+            Doc::AlignGroup(_) => false,
+
+            Doc::AlignRow(cells) => {
+                for cell in cells {
+                    if !self.fits_inner(&cell.content, indent, remaining, last_kind, last_parent) {
                         return false;
                     }
                 }

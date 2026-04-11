@@ -115,6 +115,32 @@ impl Default for UsesConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct AlignmentConfig {
+    pub enabled: bool,
+    pub constants: bool,
+    pub variables: bool,
+    pub fields: bool,
+    pub properties: bool,
+    pub type_aliases: bool,
+    pub comments: bool,
+}
+
+impl Default for AlignmentConfig {
+    fn default() -> Self {
+        AlignmentConfig {
+            enabled: false,
+            constants: true,
+            variables: true,
+            fields: true,
+            properties: true,
+            type_aliases: true,
+            comments: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct FmtConfig {
     pub indent_size: usize,
     pub indent_style: IndentStyle,
@@ -124,6 +150,7 @@ pub struct FmtConfig {
     pub operator_position: OperatorPosition,
     pub blank_lines: BlankLineConfig,
     pub uses: UsesConfig,
+    pub alignment: AlignmentConfig,
     #[serde(skip)]
     pub project_root: Option<PathBuf>,
 }
@@ -139,6 +166,7 @@ impl Default for FmtConfig {
             operator_position: OperatorPosition::default(),
             blank_lines: BlankLineConfig::default(),
             uses: UsesConfig::default(),
+            alignment: AlignmentConfig::default(),
             project_root: None,
         }
     }
@@ -333,5 +361,44 @@ indent_size = 2
         // FmtConfig::default() should have project_root as None
         let config = FmtConfig::default();
         assert!(config.project_root.is_none());
+    }
+
+    #[test]
+    fn alignment_defaults_disabled() {
+        let config = FmtConfig::default();
+        assert!(!config.alignment.enabled);
+        assert!(config.alignment.constants);
+        assert!(config.alignment.variables);
+        assert!(config.alignment.fields);
+        assert!(config.alignment.properties);
+        assert!(config.alignment.type_aliases);
+        assert!(config.alignment.comments);
+    }
+
+    #[test]
+    fn parse_toml_alignment_enabled() {
+        let toml = r#"
+[format.alignment]
+enabled = true
+"#;
+        let config = FmtConfig::from_toml(toml).unwrap();
+        assert!(config.alignment.enabled);
+        assert!(config.alignment.constants);
+        assert!(config.alignment.comments);
+    }
+
+    #[test]
+    fn parse_toml_alignment_partial() {
+        let toml = r#"
+[format.alignment]
+enabled = true
+constants = false
+comments = false
+"#;
+        let config = FmtConfig::from_toml(toml).unwrap();
+        assert!(config.alignment.enabled);
+        assert!(!config.alignment.constants);
+        assert!(config.alignment.variables);
+        assert!(!config.alignment.comments);
     }
 }

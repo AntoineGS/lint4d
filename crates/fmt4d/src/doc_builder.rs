@@ -16,7 +16,7 @@ use tree_sitter::Node;
 pub struct DocBuilder<'a> {
     pub(crate) source: &'a [u8],
     pub(crate) config: &'a FmtConfig,
-    comments: &'a CommentMap,
+    pub(crate) comments: &'a CommentMap,
     directives: &'a DirectiveMap,
     format_regions: Vec<FormatOffRegion>,
     pub(crate) external_units: HashSet<String>,
@@ -221,7 +221,7 @@ impl<'a> DocBuilder<'a> {
         doc::concat(docs)
     }
 
-    fn leading_directives_doc(&self, node: Node<'a>) -> Doc {
+    pub(crate) fn leading_directives_doc(&self, node: Node<'a>) -> Doc {
         let directives = self.directives.leading_directives(node.id());
         if directives.is_empty() {
             return Doc::Empty;
@@ -235,7 +235,7 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
-    fn trailing_directives_doc(&self, node: Node<'a>) -> Doc {
+    pub(crate) fn trailing_directives_doc(&self, node: Node<'a>) -> Doc {
         let directives = self.directives.trailing_directives(node.id());
         if directives.is_empty() {
             return Doc::Empty;
@@ -583,69 +583,77 @@ impl<'a> DocBuilder<'a> {
 
     fn build_section(&self, node: Node<'a>) -> Doc {
         let children = self.code_children(node);
+        let section_kind = node.kind();
+        let use_alignment = self.should_align(section_kind);
+
         let mut parts = Vec::new();
-        let mut body_parts = Vec::new();
-        let mut prev_child_kind = String::new();
-        let mut prev_single_line = false;
-        let mut prev_end_row: Option<usize> = None;
+        let mut body_children: Vec<Node<'a>> = Vec::new();
+        let mut keyword_end_row: Option<usize> = None;
 
         for child in &children {
             match child.kind() {
                 K::K_VAR | K::K_CONST | K::K_TYPE => {
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
-                    // Note: no trailing Hardline here — the first body
-                    // child provides it. Adding one unconditionally would
-                    // double up when the first child's doc already starts
-                    // with a Hardline (e.g. from an attached leading
-                    // comment), producing a spurious blank line between
-                    // the keyword and the comment.
+                    keyword_end_row = Some(child.end_position().row);
                 }
                 _ => {
-                    let kind = child.kind().to_string();
-                    let single_line = child.start_position().row == child.end_position().row;
-                    let child_doc = self.doc_for_node(*child);
-                    // Preserve a blank line in the source between two body
-                    // items (e.g. grouped `const` declarations). Only
-                    // triggered once we've already seen a body item so we
-                    // don't insert a blank line between the keyword and
-                    // the first entry.
-                    let source_blank = !prev_child_kind.is_empty()
-                        && prev_end_row.is_some_and(|prev_end| {
-                            self.has_blank_line_between(prev_end, child.start_position().row)
-                        });
-                    if source_blank
-                        || (kind == K::DECL_TYPE
-                            && prev_child_kind == K::DECL_TYPE
-                            && !(prev_single_line && single_line))
-                    {
-                        body_parts.push(Doc::BlankLine);
-                    } else if !starts_with_hardline(&child_doc) {
-                        // Always separate body items (and the first item
-                        // from the preceding keyword) with a Hardline,
-                        // unless the child already starts with one.
-                        body_parts.push(Doc::Hardline);
-                    }
-                    body_parts.push(child_doc);
-                    prev_child_kind = kind;
-                    prev_single_line = single_line;
-                    prev_end_row = Some(child.end_position().row);
+                    body_children.push(*child);
                 }
             }
         }
-        if !body_parts.is_empty() {
-            parts.push(doc::indent(doc::concat(body_parts)));
+
+        if body_children.is_empty() {
+            return doc::concat(parts);
+        }
+
+        if use_alignment {
+            let aligned = self.build_aligned_section(&body_children, section_kind, keyword_end_row);
+            parts.push(doc::indent(aligned));
+        } else {
+            let mut body_parts = Vec::new();
+            let mut prev_child_kind = String::new();
+            let mut prev_single_line = false;
+            let mut prev_end_row: Option<usize> = keyword_end_row;
+
+            for child in &body_children {
+                let kind = child.kind().to_string();
+                let single_line = child.start_position().row == child.end_position().row;
+                let child_doc = self.doc_for_node(*child);
+                let source_blank = !prev_child_kind.is_empty()
+                    && prev_end_row.is_some_and(|prev_end| {
+                        self.has_blank_line_between(prev_end, child.start_position().row)
+                    });
+                if source_blank
+                    || (kind == K::DECL_TYPE
+                        && prev_child_kind == K::DECL_TYPE
+                        && !(prev_single_line && single_line))
+                {
+                    body_parts.push(Doc::BlankLine);
+                } else if !starts_with_hardline(&child_doc) {
+                    body_parts.push(Doc::Hardline);
+                }
+                body_parts.push(child_doc);
+                prev_child_kind = kind;
+                prev_single_line = single_line;
+                prev_end_row = Some(child.end_position().row);
+            }
+            if !body_parts.is_empty() {
+                parts.push(doc::indent(doc::concat(body_parts)));
+            }
         }
         doc::concat(parts)
     }
 
     fn build_decl_section(&self, node: Node<'a>) -> Doc {
         let children = self.code_children(node);
+        let align_fields = self.should_align("fields");
+        let align_props = self.should_align("properties");
         let mut parts = Vec::new();
-        let mut body_parts: Vec<Doc> = Vec::new();
+        let mut body_children: Vec<Node<'a>> = Vec::new();
         let mut first = true;
         let mut after_strict = false;
-        let mut prev_end_row: Option<usize> = None;
+        let mut visibility_end_row: Option<usize> = None;
 
         for child in &children {
             match child.kind() {
@@ -653,16 +661,11 @@ impl<'a> DocBuilder<'a> {
                     let is_strict = child.kind() == K::K_STRICT;
 
                     if after_strict {
-                        // Continuation of "strict private" / "strict protected"
                         parts.push(Doc::Raw(" ".into()));
                         parts.push(Doc::Raw(self.node_text(*child)));
                         parts.push(Doc::Hardline);
                         after_strict = false;
                     } else {
-                        if !body_parts.is_empty() {
-                            parts.push(doc::indent(doc::concat(body_parts.clone())));
-                            body_parts.clear();
-                        }
                         if first {
                             parts.push(Doc::Hardline);
                             parts.push(self.doc_for_node(*child));
@@ -678,33 +681,50 @@ impl<'a> DocBuilder<'a> {
                         }
                     }
 
-                    prev_end_row = Some(child.end_position().row);
+                    visibility_end_row = Some(child.end_position().row);
                 }
                 _ => {
-                    let child_doc = self.doc_for_node(*child);
-                    if let Some(prev_end) = prev_end_row {
-                        if self.has_blank_line_between(prev_end, child.start_position().row) {
-                            body_parts.push(Doc::BlankLine);
-                        } else if !body_parts.is_empty() {
-                            // Only add Hardline if the previous doc doesn't
-                            // already end with one (e.g. declProc items emit
-                            // a trailing Hardline after their final semicolon).
-                            let prev_ends = body_parts.last().is_some_and(ends_with_hardline);
-                            if !prev_ends && !starts_with_hardline(&child_doc) {
-                                body_parts.push(Doc::Hardline);
-                            }
-                        }
-                    }
-                    body_parts.push(child_doc);
-                    prev_end_row = Some(child.end_position().row);
+                    body_children.push(*child);
                 }
             }
         }
-        if !body_parts.is_empty() {
-            let body = doc::indent(doc::concat(body_parts));
-            // Strip trailing Hardline so it doesn't combine with the leading
-            // Hardline of the next visibility section to create a blank line.
-            parts.push(strip_trailing_hardline(body));
+
+        if body_children.is_empty() {
+            return doc::concat(parts);
+        }
+
+        if align_fields || align_props {
+            // Group consecutive fields and properties for alignment.
+            let body = self.build_aligned_decl_section_body(
+                &body_children,
+                visibility_end_row,
+                align_fields,
+                align_props,
+            );
+            parts.push(strip_trailing_hardline(doc::indent(body)));
+        } else {
+            let mut body_parts: Vec<Doc> = Vec::new();
+            let mut prev_end_row = visibility_end_row;
+
+            for child in &body_children {
+                let child_doc = self.doc_for_node(*child);
+                if let Some(prev_end) = prev_end_row {
+                    if self.has_blank_line_between(prev_end, child.start_position().row) {
+                        body_parts.push(Doc::BlankLine);
+                    } else if !body_parts.is_empty() {
+                        let prev_ends = body_parts.last().is_some_and(ends_with_hardline);
+                        if !prev_ends && !starts_with_hardline(&child_doc) {
+                            body_parts.push(Doc::Hardline);
+                        }
+                    }
+                }
+                body_parts.push(child_doc);
+                prev_end_row = Some(child.end_position().row);
+            }
+            if !body_parts.is_empty() {
+                let body = doc::indent(doc::concat(body_parts));
+                parts.push(strip_trailing_hardline(body));
+            }
         }
         doc::concat(parts)
     }

@@ -5,4 +5,3 @@
 - Support for DUnitX SetUp/Teardown logic
 - Replace define switches to turn them off for comments like other languages
 - Some units are getting long, need to refactor
-- string manipulations to concatenate and split long strings automatically

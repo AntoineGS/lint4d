@@ -320,6 +320,35 @@ fn run_init() -> i32 {
 # Prefixes that should be considered external (for grouping)
 # Default: []
 # external_prefixes = ["Spring", "Neon", "DevExpress"]
+
+[format.alignment]
+# Master switch for column alignment in declaration blocks
+# Default: false
+# enabled = false
+
+# Align constant declarations (= and values)
+# Default: true
+# constants = true
+
+# Align variable declarations (: and types, = and values)
+# Default: true
+# variables = true
+
+# Align record/class field declarations (: and types)
+# Default: true
+# fields = true
+
+# Align property declarations (:, read, write)
+# Default: true
+# properties = true
+
+# Align simple type alias declarations (= and target types)
+# Default: true
+# type_aliases = true
+
+# Align trailing comments as an additional column
+# Default: true
+# comments = true
 "#;
 
     if let Err(e) = fs::write(&config_path, default_config) {

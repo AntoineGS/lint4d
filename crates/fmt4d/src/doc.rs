@@ -55,8 +55,27 @@ pub enum Doc {
     /// sep as break (newline + indent).
     Fill(Vec<Doc>),
 
+    /// A group of rows that should be column-aligned.
+    /// The renderer pre-calculates column widths across all rows
+    /// before rendering with padding.
+    AlignGroup(Vec<Doc>),
+
+    /// A single row within an AlignGroup. Each cell is rendered
+    /// normally but padded to the group's resolved column width.
+    AlignRow(Vec<AlignCell>),
+
     /// Identity element — produces no output.
     Empty,
+}
+
+/// A single cell in an alignment row.
+#[derive(Debug, Clone)]
+pub struct AlignCell {
+    /// The content of this cell.
+    pub content: Doc,
+    /// If true, this cell is right-padded to the column width.
+    /// If false, rendered as-is (typically the last cell).
+    pub pad: bool,
 }
 
 /// Convenience: concatenate a list of Docs, filtering out Empty.
@@ -89,6 +108,18 @@ pub fn if_break(broken: Doc, flat: Doc) -> Doc {
 
 pub fn fill(docs: Vec<Doc>) -> Doc {
     Doc::Fill(docs)
+}
+
+pub fn align_group(rows: Vec<Doc>) -> Doc {
+    Doc::AlignGroup(rows)
+}
+
+pub fn align_row(cells: Vec<AlignCell>) -> Doc {
+    Doc::AlignRow(cells)
+}
+
+pub fn align_cell(content: Doc, pad: bool) -> AlignCell {
+    AlignCell { content, pad }
 }
 
 pub fn token(

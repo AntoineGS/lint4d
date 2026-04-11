@@ -44,6 +44,7 @@ pub const DECL_ARG: &str = "declArg";
 pub const DECL_ARGS: &str = "declArgs";
 pub const DECL_PROC: &str = "declProc";
 pub const DECL_ENUM: &str = "declEnum";
+pub const DECL_PROP: &str = "declProp";
 pub const DEF_PROC: &str = "defProc";
 
 // ── Expression nodes ────────────────────────────────────────────────
@@ -192,6 +193,17 @@ pub const K_IMPLEMENTATION: &str = "kImplementation";
 pub const K_INITIALIZATION: &str = "kInitialization";
 pub const K_FINALIZATION: &str = "kFinalization";
 
+// Property specifier keywords
+pub const K_READ: &str = "kRead";
+pub const K_WRITE: &str = "kWrite";
+pub const K_DEFAULT: &str = "kDefault";
+pub const K_NODEFAULT: &str = "kNodefault";
+pub const K_STORED: &str = "kStored";
+pub const K_INDEX: &str = "kIndex";
+pub const K_EQ: &str = "kEq";
+pub const DEFAULT_VALUE: &str = "defaultValue";
+pub const DECL_PROP_ARGS: &str = "declPropArgs";
+
 // Misc keywords
 pub const K_RAISE: &str = "kRaise";
 pub const K_INHERITED: &str = "kInherited";
@@ -200,6 +212,7 @@ pub const K_FORWARD: &str = "kForward";
 pub const K_OUT: &str = "kOut";
 pub const K_DOT: &str = "kDot";
 pub const K_HAT: &str = "kHat";
+pub const K_ABSOLUTE: &str = "kAbsolute";
 
 // ── Punctuation tokens ──────────────────────────────────────────────
 

@@ -1089,3 +1089,78 @@ end.
 ";
     assert_idempotent_with_max(src, 120);
 }
+
+// ── Comma-separated identifier breaking in declarations ─────────
+
+#[test]
+fn param_comma_idents_stay_flat_when_fit() {
+    // Short enough to stay on one line — no breaking.
+    let src = "\
+unit T;
+interface
+  procedure Foo(A, B, C: Integer);
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("procedure Foo(A, B, C: Integer);"),
+        "Short param list should stay flat:\n{}",
+        result
+    );
+}
+
+#[test]
+fn param_comma_idents_break_when_too_long() {
+    // Make the line overflow by using a narrow width.
+    let src = "\
+unit T;
+interface
+  procedure Foo(Alpha, Bravo, Charlie, Delta: Integer);
+implementation
+end.
+";
+    let result = format_source_with_max(src, 40);
+    // The identifiers should break at commas since the group doesn't
+    // fit within 40 chars.
+    assert!(
+        !result.contains("Alpha, Bravo, Charlie, Delta"),
+        "Long param ident list should break:\n{}",
+        result
+    );
+    assert_idempotent_with_max(src, 40);
+}
+
+#[test]
+fn param_comma_idents_with_keyword_break() {
+    // var/const prefix should be preserved when identifiers break.
+    let src = "\
+unit T;
+interface
+  procedure Foo(var Alpha, Bravo, Charlie, Delta: Integer);
+implementation
+end.
+";
+    let result = format_source_with_max(src, 40);
+    assert!(
+        !result.contains("Alpha, Bravo, Charlie, Delta"),
+        "Long param ident list with keyword should break:\n{}",
+        result
+    );
+    assert_idempotent_with_max(src, 40);
+}
+
+#[test]
+fn param_comma_idents_real_world() {
+    // The real-world scenario from the bug report.
+    let src = "\
+unit T;
+interface
+  class function TThirdPartyLinkBOUtils.GetTShippingConfig(ConfigName, FriendlyName, BoAlias, ThirdPartyName: string; IsOverridable: boolean): TShippingConfig;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent(src);
+}

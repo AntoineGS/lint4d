@@ -98,6 +98,7 @@ impl<'a> DocBuilder<'a> {
             K::IF | K::IF_ELSE => self.build_if(node),
             K::FOR | K::FOREACH | K::WHILE | K::WITH => self.build_loop(node),
             K::LITERAL_CHAR | K::LITERAL_STRING => self.build_verbatim_leaf(node),
+            K::DECL_ARG | K::DECL_VAR | K::DECL_FIELD => self.build_comma_ident_decl(node),
             K::DECL_ARGS => self.build_args(node),
             K::EXPR_CALL => self.build_call(node),
             K::EXPR_BRACKETS => self.build_bracket_list(node),
@@ -809,6 +810,63 @@ impl<'a> DocBuilder<'a> {
             i += 1;
         }
         doc::concat(parts)
+    }
+
+    /// Build a declaration that may contain comma-separated identifiers
+    /// sharing a type (e.g. `A, B, C: Integer`).  Wraps the identifier
+    /// list in a Group so the commas become break points when the list
+    /// exceeds the line width.
+    fn build_comma_ident_decl(&self, node: Node<'a>) -> Doc {
+        let children = self.code_children(node);
+
+        // No commas → no internal break needed.
+        if !children.iter().any(|c| c.kind() == K::COMMA) {
+            return self.build_children(node);
+        }
+
+        // Split at the colon: identifiers before, type/default after.
+        let colon_idx = children.iter().position(|c| c.kind() == K::COLON);
+        let (before_colon, from_colon) = match colon_idx {
+            Some(idx) => (&children[..idx], &children[idx..]),
+            None => (&children[..], &[][..]),
+        };
+
+        // Separate prefix keywords (var/const/out) from identifier list.
+        let first_ident = before_colon
+            .iter()
+            .position(|c| c.kind() == K::IDENTIFIER)
+            .unwrap_or(0);
+        let prefix = &before_colon[..first_ident];
+        let ident_list = &before_colon[first_ident..];
+
+        let prefix_docs: Vec<Doc> = prefix.iter().map(|c| self.doc_for_node(*c)).collect();
+
+        // Split identifiers at commas.
+        let groups = Self::split_children_at(ident_list, K::COMMA);
+        let group_docs: Vec<Doc> = groups
+            .iter()
+            .map(|g| {
+                let parts: Vec<Doc> = g.iter().map(|n| self.doc_for_node(*n)).collect();
+                doc::concat(parts)
+            })
+            .collect();
+
+        let mut ident_parts = Vec::new();
+        for (i, gdoc) in group_docs.into_iter().enumerate() {
+            if i > 0 {
+                ident_parts.push(doc::token(",", K::COMMA, node.kind()));
+                ident_parts.push(Doc::Line);
+            }
+            ident_parts.push(gdoc);
+        }
+
+        let suffix_docs: Vec<Doc> = from_colon.iter().map(|c| self.doc_for_node(*c)).collect();
+
+        doc::group(doc::concat(vec![
+            doc::concat(prefix_docs),
+            doc::concat(ident_parts),
+            doc::concat(suffix_docs),
+        ]))
     }
 
     fn build_args(&self, node: Node<'a>) -> Doc {

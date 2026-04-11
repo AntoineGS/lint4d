@@ -563,3 +563,104 @@ end.
         result
     );
 }
+
+// ── Comma-separated var expansion ──────────────────────────────────
+
+#[test]
+fn var_comma_expand_splits_into_separate_lines() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure Foo;
+var
+  I, J, K: Integer;
+  FoundTable: string;
+begin
+end;
+end.
+";
+    let result = format_aligned(source);
+    // Each identifier should be on its own line with the type repeated.
+    assert!(
+        result.contains("I         : Integer;"),
+        "I should be expanded and aligned. Got:\n{}",
+        result
+    );
+    assert!(
+        result.contains("J         : Integer;"),
+        "J should be expanded and aligned. Got:\n{}",
+        result
+    );
+    assert!(
+        result.contains("K         : Integer;"),
+        "K should be expanded and aligned. Got:\n{}",
+        result
+    );
+    assert!(
+        result.contains("FoundTable: string;"),
+        "FoundTable should be aligned. Got:\n{}",
+        result
+    );
+    // Must not contain the original comma-separated form.
+    assert!(
+        !result.contains("I, J, K"),
+        "Should not contain comma-separated identifiers. Got:\n{}",
+        result
+    );
+}
+
+#[test]
+fn var_comma_expand_is_idempotent() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure Foo;
+var
+  I, J, K: Integer;
+  FoundTable: string;
+begin
+end;
+end.
+";
+    let result = format_aligned(source);
+    let result2 = format_aligned(&result);
+    assert_eq!(result, result2, "Comma var expansion should be idempotent");
+}
+
+// ── Property alignment: read/write columns ─────────────────────────
+
+#[test]
+fn property_alignment_read_write_columns() {
+    let source = "\
+unit Test;
+interface
+type
+  TFoo = class
+  private
+    FGetTableFieldsProc: TGetTableFieldsProc;
+    FDatabaseName: string;
+  published
+    property GetTableFieldsProc: TGetTableFieldsProc read FGetTableFieldsProc write FGetTableFieldsProc;
+    property DatabaseName: string read FDatabaseName write FDatabaseName;
+  end;
+implementation
+end.
+";
+    let result = format_aligned(source);
+    // The `write` keywords must align across both property lines.
+    let lines: Vec<&str> = result.lines().collect();
+    let write_cols: Vec<usize> = lines.iter().filter_map(|line| line.find("write")).collect();
+    assert!(
+        write_cols.len() == 2,
+        "Expected 2 lines with 'write', got {}. Output:\n{}",
+        write_cols.len(),
+        result
+    );
+    assert_eq!(
+        write_cols[0], write_cols[1],
+        "write keywords should be at the same column ({} vs {}). Output:\n{}",
+        write_cols[0], write_cols[1], result
+    );
+}

@@ -180,6 +180,103 @@ impl<'a> DocBuilder<'a> {
         }
     }
 
+    /// Expand a multi-identifier `declVar` (e.g. `I, J, K: Integer;`) into
+    /// one alignment row per identifier.  Returns `None` when the node has
+    /// no commas (single-identifier declaration).
+    pub(crate) fn expand_comma_var_rows(&self, node: Node<'a>) -> Option<Vec<Vec<AlignCell>>> {
+        let children = self.code_children(node);
+
+        // Only expand when there are commas.
+        if !children.iter().any(|c| c.kind() == K::COMMA) {
+            return None;
+        }
+
+        let colon_idx = children.iter().position(|c| c.kind() == K::COLON)?;
+
+        // Collect just the IDENTIFIER nodes before the colon.
+        let idents: Vec<Node<'a>> = children[..colon_idx]
+            .iter()
+            .copied()
+            .filter(|c| c.kind() == K::IDENTIFIER)
+            .collect();
+        if idents.is_empty() {
+            return None;
+        }
+
+        // Build the type cell docs (from colon onward) — shared by all rows.
+        let trailing_comment = self.trailing_comment_cell(node);
+        let has_tail = trailing_comment.is_some();
+
+        let default_idx = children.iter().position(|c| c.kind() == K::DEFAULT_VALUE);
+
+        let (type_doc, value_doc) = if let Some(def_idx) = default_idx {
+            let type_parts: Vec<Doc> = children[colon_idx..def_idx]
+                .iter()
+                .map(|c| self.doc_for_node(*c))
+                .collect();
+            let value_range = &children[def_idx..];
+            let value_last = value_range.len().saturating_sub(1);
+            let value_parts: Vec<Doc> = value_range
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == value_last && has_tail {
+                        self.doc_for_node_sans_trailing(*c)
+                    } else {
+                        self.doc_for_node(*c)
+                    }
+                })
+                .collect();
+            (doc::concat(type_parts), Some(doc::concat(value_parts)))
+        } else {
+            let type_range = &children[colon_idx..];
+            let type_last = type_range.len().saturating_sub(1);
+            let type_parts: Vec<Doc> = type_range
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == type_last && has_tail {
+                        self.doc_for_node_sans_trailing(*c)
+                    } else {
+                        self.doc_for_node(*c)
+                    }
+                })
+                .collect();
+            (doc::concat(type_parts), None)
+        };
+
+        let mut rows = Vec::with_capacity(idents.len());
+        for (i, ident) in idents.iter().enumerate() {
+            let name_doc = self.doc_for_node_sans_leading(*ident);
+
+            let is_last = i == idents.len() - 1;
+
+            let mut cells = if let Some(ref val) = value_doc {
+                vec![
+                    doc::align_cell(name_doc, true),
+                    doc::align_cell(type_doc.clone(), true),
+                    doc::align_cell(val.clone(), is_last && has_tail),
+                ]
+            } else {
+                vec![
+                    doc::align_cell(name_doc, true),
+                    doc::align_cell(type_doc.clone(), is_last && has_tail),
+                ]
+            };
+
+            // Trailing comment only on the last row.
+            if is_last {
+                if let Some(ref comment_cell) = trailing_comment {
+                    cells.push(comment_cell.clone());
+                }
+            }
+
+            rows.push(cells);
+        }
+
+        Some(rows)
+    }
+
     /// Decompose a simple `declType` (type alias) into alignment cells.
     ///
     /// Structure: `identifier = <type_def> ;`
@@ -475,6 +572,49 @@ impl<'a> DocBuilder<'a> {
 
             if needs_blank {
                 group_items.push(Doc::BlankLine);
+            }
+
+            // Expand multi-identifier var declarations (e.g. `I, J, K: Integer;`)
+            // into one row per identifier before trying normal decomposition.
+            if section_kind == K::DECL_VARS && kind == K::DECL_VAR {
+                if let Some(expanded) = self.expand_comma_var_rows(*child) {
+                    // Leading comments/directives only on first row.
+                    let mut leading = self.leading_comments_doc(*child);
+                    if matches!(leading, Doc::Empty) {
+                        let ch = self.code_children(*child);
+                        if let Some(first) = ch.first() {
+                            leading = self.leading_comments_doc(*first);
+                        }
+                    }
+                    if !matches!(leading, Doc::Empty) {
+                        group_items.push(leading);
+                    }
+                    let leading_dir = self.leading_directives_doc(*child);
+                    if !matches!(leading_dir, Doc::Empty) {
+                        group_items.push(leading_dir);
+                    }
+
+                    let trailing_dir = self.trailing_directives_doc(*child);
+                    let expanded_len = expanded.len();
+                    for (i, cells) in expanded.into_iter().enumerate() {
+                        let is_last = i == expanded_len.saturating_sub(1);
+                        if !is_last || matches!(trailing_dir, Doc::Empty) {
+                            group_items.push(doc::align_row(cells));
+                        } else {
+                            let mut cells = cells;
+                            if let Some(last) = cells.last_mut() {
+                                last.content =
+                                    doc::concat(vec![last.content.clone(), trailing_dir.clone()]);
+                            }
+                            group_items.push(doc::align_row(cells));
+                        }
+                    }
+
+                    prev_child_kind = kind.to_string();
+                    prev_single_line = single_line;
+                    prev_end = Some(child.end_position().row);
+                    continue;
+                }
             }
 
             // Try to decompose as an aligned row.

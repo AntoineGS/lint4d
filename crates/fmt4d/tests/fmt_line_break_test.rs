@@ -1219,3 +1219,44 @@ end.
     assert_no_long_lines(&result, 120);
     assert_idempotent(src);
 }
+
+// ── Var comma-ident expansion (non-alignment path) ────────────────
+
+#[test]
+fn var_comma_idents_always_expand() {
+    // Comma-separated var declarations should always be expanded
+    // into separate lines, regardless of line width.
+    let src = "\
+unit T;
+interface
+implementation
+procedure Foo;
+var
+  I, J, K: Integer;
+begin
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        !result.contains("I, J, K"),
+        "Comma-separated var should be expanded:\n{}",
+        result
+    );
+    assert!(
+        result.contains("I: Integer;"),
+        "I should have its own declaration:\n{}",
+        result
+    );
+    assert!(
+        result.contains("J: Integer;"),
+        "J should have its own declaration:\n{}",
+        result
+    );
+    assert!(
+        result.contains("K: Integer;"),
+        "K should have its own declaration:\n{}",
+        result
+    );
+    assert_idempotent(src);
+}

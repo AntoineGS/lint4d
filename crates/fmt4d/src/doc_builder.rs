@@ -890,9 +890,12 @@ impl<'a> DocBuilder<'a> {
     }
 
     /// Build a declaration that may contain comma-separated identifiers
-    /// sharing a type (e.g. `A, B, C: Integer`).  Wraps the identifier
-    /// list in a Group so the commas become break points when the list
-    /// exceeds the line width.
+    /// sharing a type (e.g. `A, B, C: Integer`).
+    ///
+    /// For `DECL_VAR` nodes the identifiers are always expanded into
+    /// separate declarations (one per line).  For `DECL_ARG` / `DECL_FIELD`
+    /// the list is wrapped in a Group so commas become break points only
+    /// when the line overflows.
     fn build_comma_ident_decl(&self, node: Node<'a>) -> Doc {
         let children = self.code_children(node);
 
@@ -908,6 +911,30 @@ impl<'a> DocBuilder<'a> {
             None => (&children[..], &[][..]),
         };
 
+        // ── DECL_VAR: always expand into separate declarations ──────
+        if node.kind() == K::DECL_VAR {
+            let idents: Vec<Node<'a>> = before_colon
+                .iter()
+                .copied()
+                .filter(|c| c.kind() == K::IDENTIFIER)
+                .collect();
+            if !idents.is_empty() && !from_colon.is_empty() {
+                let suffix_docs: Vec<Doc> =
+                    from_colon.iter().map(|c| self.doc_for_node(*c)).collect();
+                let suffix = doc::concat(suffix_docs);
+
+                let mut parts = Vec::new();
+                for (i, ident) in idents.iter().enumerate() {
+                    if i > 0 {
+                        parts.push(Doc::Hardline);
+                    }
+                    parts.push(doc::concat(vec![self.doc_for_node(*ident), suffix.clone()]));
+                }
+                return doc::concat(parts);
+            }
+        }
+
+        // ── DECL_ARG / DECL_FIELD: wrap in a Group for optional breaking ─
         // Separate prefix keywords (var/const/out) from identifier list.
         let first_ident = before_colon
             .iter()

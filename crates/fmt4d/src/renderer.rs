@@ -257,13 +257,27 @@ impl Renderer {
                 continue;
             }
 
-            // Measure cell widths for each row.
+            // Measure cell widths for each row.  Chain spacing state
+            // across cells so that inter-cell leading spaces (added by
+            // emit_with_spacing during actual rendering) are included in
+            // the measured width, keeping measurement and rendering in sync.
             let measured: Vec<(usize, Vec<usize>)> = group
                 .iter()
                 .map(|(pos, cells)| {
+                    let mut last_kind = String::new();
+                    let mut last_parent = String::new();
                     let widths: Vec<usize> = cells
                         .iter()
-                        .map(|c| Self::measure_width(&c.content))
+                        .map(|c| {
+                            let mut w = 0;
+                            Self::measure_width_inner(
+                                &c.content,
+                                &mut w,
+                                &mut last_kind,
+                                &mut last_parent,
+                            );
+                            w
+                        })
                         .collect();
                     (*pos, widths)
                 })
@@ -464,14 +478,6 @@ impl Renderer {
     }
 
     /// Measure the rendered width of a Doc without emitting output.
-    fn measure_width(doc: &Doc) -> usize {
-        let mut width = 0usize;
-        let mut last_kind = String::new();
-        let mut last_parent = String::new();
-        Self::measure_width_inner(doc, &mut width, &mut last_kind, &mut last_parent);
-        width
-    }
-
     fn measure_width_inner(
         doc: &Doc,
         width: &mut usize,

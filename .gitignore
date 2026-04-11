@@ -17,3 +17,4 @@ crates/lint4d/tests/fixtures/projects/TestProject1/__recovery/
 tests/fixtures/dcu/
 docs/
 TODOS.md
+.superpowers/

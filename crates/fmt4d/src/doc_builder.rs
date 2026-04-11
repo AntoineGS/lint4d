@@ -7,6 +7,17 @@ use pascal_core::FormatOffRegion;
 use std::collections::HashSet;
 use tree_sitter::Node;
 
+/// Controls how a binary chain breaks across lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakStyle {
+    /// Greedy Fill: pack as many operands per line as fit.
+    GreedyFill,
+    /// Greedy Fill with preserved author line breaks (for `+` chains).
+    PreserveBreaks,
+    /// Expand all: one operand per line when the chain overflows.
+    ExpandAll,
+}
+
 /// Stateless AST-to-Doc builder.
 ///
 /// Converts a tree-sitter AST into a `Doc` IR tree. The key invariant is that
@@ -1248,31 +1259,49 @@ impl<'a> DocBuilder<'a> {
             return self.build_children(node);
         }
 
-        // Detect multi-line source for `+` chains — preserve author breaks.
-        let is_plus_chain = segments
+        // Determine the chain's operator family.
+        let is_add_chain = segments
             .iter()
             .skip(1)
             .all(|s| s.operator.is_none_or(|op| op.kind() == K::K_ADD));
-        let is_multiline =
-            is_plus_chain && binary_node.start_position().row != binary_node.end_position().row;
+        let is_bool_chain = segments.iter().skip(1).all(|s| {
+            s.operator
+                .is_none_or(|op| matches!(op.kind(), K::K_OR | K::K_AND))
+        });
 
-        self.build_binary_chain_doc(&segments, is_multiline)
+        let is_multiline = binary_node.start_position().row != binary_node.end_position().row;
+
+        let break_style = if is_bool_chain {
+            // or/and chains: expand all (one per line) when they overflow.
+            BreakStyle::ExpandAll
+        } else if is_add_chain && is_multiline {
+            // + chains: greedy pack, but preserve author breaks.
+            BreakStyle::PreserveBreaks
+        } else {
+            // Everything else: greedy pack.
+            BreakStyle::GreedyFill
+        };
+
+        self.build_binary_chain_doc(&segments, break_style)
     }
 
-    /// Build a flattened binary chain with Fill-based greedy line packing.
+    /// Build a flattened binary chain as a Doc IR.
     ///
     /// Operator placement depends on `config.operator_position`:
     /// - `Leading` (default): operator starts the continuation line
     /// - `Trailing`: operator ends the previous line
     ///
-    /// When `preserve_breaks` is true (multi-line `+` chain in source),
-    /// separators at positions where the source had a newline use
-    /// `PreservedLine` (forced break in Fill, but joinable if a parent
-    /// `Group` determines the whole expression fits on one line).
+    /// Break behaviour depends on `break_style`:
+    /// - `GreedyFill`: pack as many operands per line as fit (Fill).
+    /// - `PreserveBreaks`: like GreedyFill, but positions where the source
+    ///   had a newline use `PreservedLine` (forced break in Fill, joinable
+    ///   when a parent `Group` determines the whole expression fits).
+    /// - `ExpandAll`: all-or-nothing — either the whole chain fits on one
+    ///   line, or every operand gets its own line.
     pub(crate) fn build_binary_chain_doc(
         &self,
         segments: &[BinarySegment],
-        preserve_breaks: bool,
+        break_style: BreakStyle,
     ) -> Doc {
         let trailing = self.config.operator_position == OperatorPosition::Trailing;
 
@@ -1294,19 +1323,20 @@ impl<'a> DocBuilder<'a> {
             return doc::concat(first_parts);
         }
 
-        // Build fill_parts: [sep, content, sep, content, ...]
-        let mut fill_parts = Vec::new();
+        // Build parts: [sep, content, sep, content, ...]
+        let mut parts = Vec::new();
 
         for i in 1..segments.len() {
             let seg = &segments[i];
 
-            let sep = if preserve_breaks && has_newline_between(self.source, &segments[i - 1], seg)
+            let sep = if break_style == BreakStyle::PreserveBreaks
+                && has_newline_between(self.source, &segments[i - 1], seg)
             {
                 Doc::PreservedLine
             } else {
                 Doc::Line
             };
-            fill_parts.push(sep);
+            parts.push(sep);
 
             // Build content item (operator + operand or operand + operator).
             let mut item = Vec::new();
@@ -1329,12 +1359,20 @@ impl<'a> DocBuilder<'a> {
                     item.push(self.doc_for_node(*n));
                 }
             }
-            fill_parts.push(doc::concat(item));
+            parts.push(doc::concat(item));
         }
+
+        let continuation = if break_style == BreakStyle::ExpandAll {
+            // All-or-nothing: Group + Concat with Line separators.
+            doc::concat(parts)
+        } else {
+            // Greedy packing via Fill.
+            doc::fill(parts)
+        };
 
         doc::group(doc::concat(vec![
             doc::concat(first_parts),
-            doc::indent(doc::fill(fill_parts)),
+            doc::indent(continuation),
         ]))
     }
 }

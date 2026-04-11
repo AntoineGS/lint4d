@@ -379,6 +379,12 @@ impl Renderer {
     /// Render a Doc inline into the current output (non-stack-based, for use
     /// within alignment group rendering).
     fn render_doc_inline(&mut self, doc: Doc, indent: usize) {
+        self.render_doc_inline_mode(doc, indent, Mode::Flat);
+    }
+
+    /// Inner render with explicit mode — `Flat` collapses Line/Softline,
+    /// `Break` emits newlines (used when a Group doesn't fit).
+    fn render_doc_inline_mode(&mut self, doc: Doc, indent: usize, mode: Mode) {
         match doc {
             Doc::Empty => {}
             Doc::Token {
@@ -407,31 +413,43 @@ impl Renderer {
                 self.emit_newline();
                 self.output.push('\n');
             }
-            Doc::Line | Doc::PreservedLine => {
-                self.output.push(' ');
-                self.current_column += 1;
-                self.last_token_kind.clear();
-                self.last_token_parent_kind.clear();
+            Doc::Line | Doc::PreservedLine => match mode {
+                Mode::Flat => {
+                    self.output.push(' ');
+                    self.current_column += 1;
+                    self.last_token_kind.clear();
+                    self.last_token_parent_kind.clear();
+                }
+                Mode::Break => self.emit_newline(),
+            },
+            Doc::Softline => {
+                if mode == Mode::Break {
+                    self.emit_newline();
+                }
             }
-            Doc::Softline => {}
             Doc::Concat(docs) => {
                 for d in docs {
-                    self.render_doc_inline(d, indent);
+                    self.render_doc_inline_mode(d, indent, mode);
                 }
             }
             Doc::Indent(inner) => {
-                self.render_doc_inline(*inner, indent + 1);
+                self.render_doc_inline_mode(*inner, indent + 1, mode);
             }
             Doc::Group(inner) => {
-                // Within alignment cells, always render flat.
-                self.render_doc_inline(*inner, indent);
+                let inner_mode = if self.fits(indent, &inner) {
+                    Mode::Flat
+                } else {
+                    Mode::Break
+                };
+                self.render_doc_inline_mode(*inner, indent, inner_mode);
             }
-            Doc::IfBreak { flat, .. } => {
-                self.render_doc_inline(*flat, indent);
-            }
+            Doc::IfBreak { broken, flat } => match mode {
+                Mode::Flat => self.render_doc_inline_mode(*flat, indent, mode),
+                Mode::Break => self.render_doc_inline_mode(*broken, indent, mode),
+            },
             Doc::Fill(parts) => {
                 for p in parts {
-                    self.render_doc_inline(p, indent);
+                    self.render_doc_inline_mode(p, indent, mode);
                 }
             }
             Doc::AlignGroup(children) => {

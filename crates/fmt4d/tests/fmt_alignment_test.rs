@@ -198,6 +198,47 @@ end.
     );
 }
 
+// ── Enum type preservation with alignment ───────────────────────────
+
+#[test]
+fn enum_type_not_collapsed_with_alignment() {
+    // Enum types that overflow should keep one-value-per-line layout
+    // even when alignment is enabled.
+    let source = "\
+unit Test;
+interface
+type
+  TSQLTokenKind = (
+    tkIdentifier,
+    tkNumber,
+    tkString,
+    tkOperator,
+    tkLParen,
+    tkRParen,
+    tkComma,
+    tkDot,
+    tkSemicolon,
+    tkStar,
+    tkEOF
+  );
+implementation
+end.
+";
+    let result = format_aligned(source);
+    let enum_lines: Vec<_> = result
+        .lines()
+        .filter(|l| l.trim_start().starts_with("tk"))
+        .collect();
+    assert!(
+        enum_lines.len() >= 11,
+        "enum values should stay one-per-line with alignment enabled:\n{}",
+        result
+    );
+    // Idempotency
+    let result2 = format_aligned(&result);
+    assert_eq!(result, result2, "enum with alignment should be idempotent");
+}
+
 // ── Field alignment ─────────────────────────────────────────────────
 
 #[test]

@@ -1045,8 +1045,8 @@ end.
 
 #[test]
 fn multiline_and_chain_still_joins() {
-    // Multi-line and/or chains should NOT use PreservedLine — they
-    // should join freely when they fit at the target width.
+    // Multi-line and/or chains use PreservedLine, but should still
+    // join when they fit at the target width (Group stays flat).
     let src = "\
 unit T;
 interface
@@ -1071,6 +1071,61 @@ end.
         result
     );
     assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn multiline_or_chain_preserves_breaks() {
+    // Multi-line or chains should preserve author line breaks when
+    // the whole expression doesn't fit on a single line.
+    let src = "\
+unit T;
+interface
+implementation
+function TSQLParser.IsJoinKeyword(const Value: string): Boolean;
+begin
+  Result := SameText(Value, 'INNER') or
+    SameText(Value, 'LEFT') or
+    SameText(Value, 'RIGHT') or
+    SameText(Value, 'FULL') or
+    SameText(Value, 'CROSS') or
+    SameText(Value, 'OUTER') or
+    SameText(Value, 'JOIN');
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    // Each operand should be on its own line (preserved breaks).
+    let or_lines: Vec<_> = result.lines().filter(|l| l.contains("SameText(")).collect();
+    assert!(
+        or_lines.len() >= 7,
+        "multi-line or chain should preserve breaks:\n{}",
+        result
+    );
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn singleline_or_chain_expands_when_overflows() {
+    // A single-line or chain that exceeds max_line_length should expand
+    // to one operand per line (not greedy-pack onto two lines).
+    let src = "\
+unit T;
+interface
+implementation
+function TSQLParser.IsJoinKeyword(const Value: string): Boolean;
+begin
+  Result := SameText(Value, 'INNER') or SameText(Value, 'LEFT') or SameText(Value, 'RIGHT') or SameText(Value, 'FULL') or SameText(Value, 'CROSS') or SameText(Value, 'OUTER') or SameText(Value, 'JOIN');
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    let or_lines: Vec<_> = result.lines().filter(|l| l.contains("SameText(")).collect();
+    assert!(
+        or_lines.len() >= 7,
+        "overflowing single-line or chain should expand to one per line:\n{}",
+        result
+    );
+    assert_idempotent_with_max(&result, 120);
 }
 
 #[test]

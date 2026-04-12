@@ -3554,3 +3554,20 @@ end.
     assert!(result.contains("'z'"), "'z' missing: {}", result);
     assert!(result.contains("'w'"), "'w' missing: {}", result);
 }
+
+#[test]
+fn break_long_line_with_utf8_near_boundary_does_not_panic() {
+    // Regression guard for SEC-H5: a long string literal containing
+    // multi-byte UTF-8 characters placed near `max_line_length` must
+    // not cause `break_single_line` to slice inside a char boundary.
+    //
+    // Construction: 110 'x's + Greek letters (2 bytes each in UTF-8),
+    // a long line that exceeds the default 120 char budget. The
+    // scanner must choose a break position on a char boundary.
+    let src = format!(
+        "unit T;\ninterface\nimplementation\nprocedure P;\nconst S = '{}αβγδεζηθικλ';\nbegin end;\nend.\n",
+        "x".repeat(110)
+    );
+    // The assertion is "no panic".
+    let _ = format_source(&src);
+}

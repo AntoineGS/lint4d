@@ -26,6 +26,11 @@ tree-sitter = "0.24"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [lints.rust]
 warnings = "deny"
+
+[[bench]]
+name = "bench_format"
+harness = false

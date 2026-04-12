@@ -116,7 +116,7 @@ fn legacy_namespace(name: &str) -> Option<&'static str> {
     match name.to_ascii_lowercase().as_str() {
         "sysutils" | "classes" | "types" | "variants" | "sysconst" | "math" | "strutils"
         | "dateutils" | "ioutils" | "regularexpressions" | "syncobjs" | "rtti" | "typinfo"
-        | "contnrs" => Some("System"),
+        | "contnrs" | "xsbuiltins" => Some("System"),
 
         "forms" | "controls" | "stdctrls" | "extctrls" | "comctrls" | "dialogs" | "graphics"
         | "menus" | "actnlist" | "grids" | "buttons" | "imglist" | "toolwin" | "appevnts" => {
@@ -127,21 +127,69 @@ fn legacy_namespace(name: &str) -> Option<&'static str> {
 
         "windows" | "messages" | "shellapi" | "activex" | "commctrl" | "shlobj" => Some("Winapi"),
 
+        "ibdatabase" | "ibsql" | "ibquery" | "ibtable" | "ibupdatesql" | "ibevents"
+        | "ibcustomdataset" | "ibstoredproc" | "ibdatabaseinfo" => Some("IBX"),
+
         _ => None,
     }
 }
 
-pub fn group_units(
+/// Recursively collect all unit names from a list of items.
+fn collect_items_units(items: &[UsesItem], out: &mut Vec<String>) {
+    for item in items {
+        match item {
+            UsesItem::Unit(name) => out.push(name.clone()),
+            UsesItem::IfDefBlock(block) => collect_ifdef_units(block, out),
+            UsesItem::Directive(_) => {}
+        }
+    }
+}
+
+/// Recursively collect all unit names from an IfDefBlock.
+fn collect_ifdef_units(block: &IfDefBlock, out: &mut Vec<String>) {
+    collect_items_units(&block.if_branch.items, out);
+    for branch in &block.else_if_branches {
+        collect_items_units(&branch.items, out);
+    }
+    if let Some(else_items) = &block.else_branch {
+        collect_items_units(else_items, out);
+    }
+}
+
+/// If every unit in the block belongs to the same section, return that section.
+fn classify_ifdef_block(
+    block: &IfDefBlock,
+    config: &UsesConfig,
+    external_units: &HashSet<String>,
+) -> Option<UnitSection> {
+    let mut units = Vec::new();
+    collect_ifdef_units(block, &mut units);
+    if units.is_empty() {
+        return None;
+    }
+    let section = classify_unit(&units[0], config, external_units);
+    if units[1..]
+        .iter()
+        .all(|u| classify_unit(u, config, external_units) == section)
+    {
+        Some(section)
+    } else {
+        None
+    }
+}
+
+/// Like `group_units` but returns each group tagged with its section.
+fn group_units_tagged(
     units: &[String],
     config: &UsesConfig,
     external_units: &HashSet<String>,
-) -> Vec<Vec<String>> {
+) -> Vec<(UnitSection, Vec<String>)> {
     if !config.group {
         let mut sorted = units.to_vec();
         if config.sort {
             sorted.sort_by_key(|a: &String| a.to_lowercase());
         }
-        return vec![sorted];
+        return vec![(UnitSection::Core, sorted)];
     }
 
     let mut core: Vec<String> = Vec::new();
@@ -162,17 +210,28 @@ pub fn group_units(
         project.sort_by_key(|a: &String| a.to_lowercase());
     }
 
-    let mut result: Vec<Vec<String>> = Vec::new();
+    let mut result = Vec::new();
     if !core.is_empty() {
-        result.push(core);
+        result.push((UnitSection::Core, core));
     }
     if !external.is_empty() {
-        result.push(external);
+        result.push((UnitSection::External, external));
     }
     if !project.is_empty() {
-        result.push(project);
+        result.push((UnitSection::Project, project));
     }
     result
+}
+
+pub fn group_units(
+    units: &[String],
+    config: &UsesConfig,
+    external_units: &HashSet<String>,
+) -> Vec<Vec<String>> {
+    group_units_tagged(units, config, external_units)
+        .into_iter()
+        .map(|(_, units)| units)
+        .collect()
 }
 
 fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
@@ -336,6 +395,10 @@ pub fn extract_uses_items(node: tree_sitter::Node, source: &[u8]) -> Vec<UsesIte
 /// Units are sorted/grouped according to `config`; pinned items are re-inserted
 /// after their anchor unit (the unit that immediately preceded them in the
 /// original list), preserving their relative order.
+///
+/// When grouping is enabled, an `{$IFDEF}` block whose units all belong to the
+/// same section is placed at the end of that section instead of being pinned
+/// to its anchor unit.
 pub fn format_uses_items(
     items: &[UsesItem],
     config: &UsesConfig,
@@ -343,10 +406,14 @@ pub fn format_uses_items(
     external_units: &HashSet<String>,
 ) -> String {
     // Separate plain units from pinned items, recording the anchor (preceding unit name).
+    // When grouping is enabled, ifdef blocks whose units all belong to one section
+    // are placed in that section rather than pinned.
     let mut plain_units: Vec<String> = Vec::new();
     // pinned: (anchor: Option<String>, item)
     // anchor is None when the pinned item appears before any unit.
     let mut pinned: Vec<(Option<String>, UsesItem)> = Vec::new();
+    // section_blocks: ifdef blocks placed into a specific section.
+    let mut section_blocks: Vec<(UnitSection, UsesItem)> = Vec::new();
     let mut last_unit: Option<String> = None;
 
     for item in items {
@@ -355,14 +422,21 @@ pub fn format_uses_items(
                 plain_units.push(name.clone());
                 last_unit = Some(name.clone());
             }
+            UsesItem::IfDefBlock(block) if config.group => {
+                if let Some(section) = classify_ifdef_block(block, config, external_units) {
+                    section_blocks.push((section, item.clone()));
+                } else {
+                    pinned.push((last_unit.clone(), item.clone()));
+                }
+            }
             UsesItem::IfDefBlock(_) | UsesItem::Directive(_) => {
                 pinned.push((last_unit.clone(), item.clone()));
             }
         }
     }
 
-    // Sort/group plain units.
-    let groups = group_units(&plain_units, config, external_units);
+    // Sort/group plain units with section tags.
+    let tagged_groups = group_units_tagged(&plain_units, config, external_units);
 
     // Build a flat ordered list of units (with group separators tracked via index).
     // We'll insert pinned items after we build the structure.
@@ -375,12 +449,36 @@ pub fn format_uses_items(
     }
 
     let mut slots: Vec<Slot> = Vec::new();
-    for (g_idx, group) in groups.iter().enumerate() {
-        if g_idx > 0 {
+    let section_order = [
+        UnitSection::Core,
+        UnitSection::External,
+        UnitSection::Project,
+    ];
+    let mut first_section = true;
+
+    for &section in &section_order {
+        let group = tagged_groups.iter().find(|(s, _)| *s == section);
+        let blocks: Vec<_> = section_blocks
+            .iter()
+            .filter(|(s, _)| *s == section)
+            .collect();
+
+        if group.is_none() && blocks.is_empty() {
+            continue;
+        }
+
+        if !first_section {
             slots.push(Slot::GroupSep);
         }
-        for name in group {
-            slots.push(Slot::Unit { name: name.clone() });
+        first_section = false;
+
+        if let Some((_, units)) = group {
+            for name in units {
+                slots.push(Slot::Unit { name: name.clone() });
+            }
+        }
+        for (_, block_item) in &blocks {
+            slots.push(Slot::Pinned(block_item.clone()));
         }
     }
 
@@ -1101,6 +1199,165 @@ mod tests {
             a_pos < b_pos,
             "a.inc should appear before b.inc, got:\n{}",
             output
+        );
+    }
+
+    // ─── Section-placement for IfDef blocks ───────────────────────────────
+
+    #[test]
+    fn ifdef_all_core_placed_in_core_section() {
+        // All units in the ifdef are Core → block goes to Core section,
+        // not pinned to the anchor (which is a Project unit).
+        let mut config = default_config();
+        config.sort = true;
+
+        let block = IfDefBlock {
+            if_branch: CondBranch {
+                directive: "{$IFDEF DELPHI_XE6_UP}".to_string(),
+                items: vec![
+                    UsesItem::Unit("ibx.IBDatabase".to_string()),
+                    UsesItem::Unit("ibx.IBSQL".to_string()),
+                ],
+            },
+            else_if_branches: Vec::new(),
+            else_branch: Some(vec![
+                UsesItem::Unit("IBDatabase".to_string()),
+                UsesItem::Unit("IBSQL".to_string()),
+            ]),
+            endif: "{$ENDIF}".to_string(),
+        };
+
+        let items = vec![
+            UsesItem::Unit("MDIBDatabase".to_string()),
+            UsesItem::IfDefBlock(block),
+            UsesItem::Unit("Utils".to_string()),
+            UsesItem::Unit("ibxUtils".to_string()),
+        ];
+
+        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
+        // The ifdef block should be in the Core section (before the group separator),
+        // not pinned after MDIBDatabase in the Project section.
+        let endif_pos = output.find("{$ENDIF}").expect("ENDIF missing");
+        let group_sep = output.find("\n\n").expect("group separator missing");
+        assert!(
+            endif_pos < group_sep,
+            "ifdef block should be in Core section (before separator):\n{output}"
+        );
+    }
+
+    #[test]
+    fn ifdef_mixed_sections_stays_pinned() {
+        // Units in the ifdef are in different sections → stays pinned to anchor.
+        let mut config = default_config();
+        config.sort = true;
+
+        let block = IfDefBlock {
+            if_branch: CondBranch {
+                directive: "{$IFDEF FOO}".to_string(),
+                items: vec![UsesItem::Unit("System.SysUtils".to_string())],
+            },
+            else_if_branches: Vec::new(),
+            else_branch: Some(vec![UsesItem::Unit("MyProject.Utils".to_string())]),
+            endif: "{$ENDIF}".to_string(),
+        };
+
+        let items = vec![
+            UsesItem::Unit("MyApp.Main".to_string()),
+            UsesItem::IfDefBlock(block),
+            UsesItem::Unit("Vcl.Forms".to_string()),
+        ];
+
+        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
+        // The ifdef block should stay pinned after MyApp.Main (its anchor) in Project section.
+        let main_pos = output.find("MyApp.Main").expect("MyApp.Main missing");
+        let ifdef_pos = output.find("{$IFDEF FOO}").expect("IFDEF missing");
+        assert!(
+            main_pos < ifdef_pos,
+            "ifdef should follow its anchor MyApp.Main:\n{output}"
+        );
+    }
+
+    #[test]
+    fn ifdef_creates_section_when_only_block_units() {
+        // No plain Core units, but the ifdef block is all-Core.
+        // A Core section should be created for it.
+        let mut config = default_config();
+        config.sort = true;
+
+        let block = IfDefBlock {
+            if_branch: CondBranch {
+                directive: "{$IFDEF XE6}".to_string(),
+                items: vec![UsesItem::Unit("ibx.IBDatabase".to_string())],
+            },
+            else_if_branches: Vec::new(),
+            else_branch: Some(vec![UsesItem::Unit("IBDatabase".to_string())]),
+            endif: "{$ENDIF}".to_string(),
+        };
+
+        let items = vec![
+            UsesItem::Unit("MyApp.Main".to_string()),
+            UsesItem::IfDefBlock(block),
+        ];
+
+        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
+        // Core section (ifdef block) should come before Project section (MyApp.Main).
+        let ifdef_pos = output.find("{$IFDEF XE6}").expect("IFDEF missing");
+        let main_pos = output.find("MyApp.Main").expect("MyApp.Main missing");
+        assert!(
+            ifdef_pos < main_pos,
+            "ifdef Core section should precede Project section:\n{output}"
+        );
+    }
+
+    #[test]
+    fn ifdef_no_section_placement_without_grouping() {
+        // Grouping disabled → ifdef block stays pinned (no section placement).
+        let mut config = UsesConfig::default();
+        config.sort = true;
+        config.group = false;
+
+        let block = IfDefBlock {
+            if_branch: CondBranch {
+                directive: "{$IFDEF FOO}".to_string(),
+                items: vec![UsesItem::Unit("System.SysUtils".to_string())],
+            },
+            else_if_branches: Vec::new(),
+            else_branch: Some(vec![UsesItem::Unit("Classes".to_string())]),
+            endif: "{$ENDIF}".to_string(),
+        };
+
+        let items = vec![
+            UsesItem::Unit("Zebra".to_string()),
+            UsesItem::IfDefBlock(block),
+            UsesItem::Unit("Alpha".to_string()),
+        ];
+
+        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
+        // Without grouping: Alpha sorts first, Zebra second, block pinned after Zebra.
+        let alpha_pos = output.find("Alpha").expect("Alpha missing");
+        let zebra_pos = output.find("Zebra").expect("Zebra missing");
+        let ifdef_pos = output.find("{$IFDEF FOO}").expect("IFDEF missing");
+        assert!(alpha_pos < zebra_pos, "Alpha before Zebra");
+        assert!(
+            zebra_pos < ifdef_pos,
+            "ifdef follows anchor Zebra:\n{output}"
+        );
+    }
+
+    #[test]
+    fn ibx_legacy_units_classify_as_core() {
+        let config = default_config();
+        assert_eq!(
+            classify_unit("IBDatabase", &config, &HashSet::new()),
+            UnitSection::Core
+        );
+        assert_eq!(
+            classify_unit("IBSQL", &config, &HashSet::new()),
+            UnitSection::Core
+        );
+        assert_eq!(
+            classify_unit("IBQuery", &config, &HashSet::new()),
+            UnitSection::Core
         );
     }
 

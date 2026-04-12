@@ -196,11 +196,10 @@ impl<'a> DocBuilder<'a> {
 
     /// Map all non-extra children through `doc_for_node` and concatenate.
     pub(crate) fn build_children(&self, node: Node<'a>) -> Doc {
-        let docs: Vec<Doc> = self
-            .code_children(node)
-            .into_iter()
-            .map(|child| self.doc_for_node(child))
-            .collect();
+        let mut docs: Vec<Doc> = Vec::new();
+        self.for_each_code_child(node, |child| {
+            docs.push(self.doc_for_node(child));
+        });
         doc::concat(docs)
     }
 
@@ -209,6 +208,22 @@ impl<'a> DocBuilder<'a> {
         node.children(&mut node.walk())
             .filter(|c| !c.is_extra())
             .collect()
+    }
+
+    /// Like [`code_children`], but calls `f` with each non-extra child in
+    /// source order without allocating a `Vec<Node>`. Prefer this at call
+    /// sites that only iterate; use [`code_children`] when indexing or
+    /// windowed access is required.
+    ///
+    /// Review PERF-H1: `code_children` was called ~2000 times per 1000-line
+    /// file, each allocating a fresh `Vec`.
+    pub(crate) fn for_each_code_child(&self, node: Node<'a>, mut f: impl FnMut(Node<'a>)) {
+        let mut walker = node.walk();
+        for child in node.children(&mut walker) {
+            if !child.is_extra() {
+                f(child);
+            }
+        }
     }
 
     // ── Comment injection ────────────────────────────────────────────
@@ -633,7 +648,6 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_section(&self, node: Node<'a>) -> Doc {
-        let children = self.code_children(node);
         let section_kind = node.kind();
         let use_alignment = self.should_align(section_kind);
 
@@ -641,18 +655,16 @@ impl<'a> DocBuilder<'a> {
         let mut body_children: Vec<Node<'a>> = Vec::new();
         let mut keyword_end_row: Option<usize> = None;
 
-        for child in &children {
-            match child.kind() {
-                K::K_VAR | K::K_CONST | K::K_TYPE => {
-                    parts.push(Doc::Hardline);
-                    parts.push(self.doc_for_node(*child));
-                    keyword_end_row = Some(child.end_position().row);
-                }
-                _ => {
-                    body_children.push(*child);
-                }
+        self.for_each_code_child(node, |child| match child.kind() {
+            K::K_VAR | K::K_CONST | K::K_TYPE => {
+                parts.push(Doc::Hardline);
+                parts.push(self.doc_for_node(child));
+                keyword_end_row = Some(child.end_position().row);
             }
-        }
+            _ => {
+                body_children.push(child);
+            }
+        });
 
         if body_children.is_empty() {
             return doc::concat(parts);
@@ -697,7 +709,6 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_decl_section(&self, node: Node<'a>) -> Doc {
-        let children = self.code_children(node);
         let align_fields = self.should_align("fields");
         let align_props = self.should_align("properties");
         let mut parts = Vec::new();
@@ -706,39 +717,37 @@ impl<'a> DocBuilder<'a> {
         let mut after_strict = false;
         let mut visibility_end_row: Option<usize> = None;
 
-        for child in &children {
-            match child.kind() {
-                K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED | K::K_STRICT => {
-                    let is_strict = child.kind() == K::K_STRICT;
+        self.for_each_code_child(node, |child| match child.kind() {
+            K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED | K::K_STRICT => {
+                let is_strict = child.kind() == K::K_STRICT;
 
-                    if after_strict {
-                        parts.push(Doc::Raw(" ".into()));
-                        parts.push(Doc::Raw(self.node_text(*child)));
+                if after_strict {
+                    parts.push(Doc::Raw(" ".into()));
+                    parts.push(Doc::Raw(self.node_text(child)));
+                    parts.push(Doc::Hardline);
+                    after_strict = false;
+                } else {
+                    if first {
                         parts.push(Doc::Hardline);
-                        after_strict = false;
+                        parts.push(self.doc_for_node(child));
+                        first = false;
                     } else {
-                        if first {
-                            parts.push(Doc::Hardline);
-                            parts.push(self.doc_for_node(*child));
-                            first = false;
-                        } else {
-                            parts.push(Doc::Raw(" ".into()));
-                            parts.push(Doc::Raw(self.node_text(*child)));
-                        }
-                        if is_strict {
-                            after_strict = true;
-                        } else {
-                            parts.push(Doc::Hardline);
-                        }
+                        parts.push(Doc::Raw(" ".into()));
+                        parts.push(Doc::Raw(self.node_text(child)));
                     }
+                    if is_strict {
+                        after_strict = true;
+                    } else {
+                        parts.push(Doc::Hardline);
+                    }
+                }
 
-                    visibility_end_row = Some(child.end_position().row);
-                }
-                _ => {
-                    body_children.push(*child);
-                }
+                visibility_end_row = Some(child.end_position().row);
             }
-        }
+            _ => {
+                body_children.push(child);
+            }
+        });
 
         if body_children.is_empty() {
             return doc::concat(parts);
@@ -842,18 +851,17 @@ impl<'a> DocBuilder<'a> {
     /// after the closing `]` so the next sibling (`procedure`, class name,
     /// field name, `property`) starts on a fresh line.
     fn build_rtti_attributes(&self, node: Node<'a>) -> Doc {
-        let children = self.code_children(node);
         let mut parts: Vec<Doc> = Vec::new();
         let mut seen_open_bracket = false;
-        for child in &children {
+        self.for_each_code_child(node, |child| {
             if child.kind() == K::OPEN_BRACKET {
                 if seen_open_bracket {
                     parts.push(Doc::Hardline);
                 }
                 seen_open_bracket = true;
             }
-            parts.push(self.doc_for_node(*child));
-        }
+            parts.push(self.doc_for_node(child));
+        });
         parts.push(Doc::Hardline);
         doc::concat(parts)
     }
@@ -1028,13 +1036,11 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_call(&self, node: Node<'a>) -> Doc {
-        let children = self.code_children(node);
-
         // Unwrap exprArgs: the tree-sitter grammar wraps call arguments in an
         // exprArgs node, hiding commas from the delimiter-list splitter.
         // Inline exprArgs's children so each argument gets its own line break.
         let mut flat: Vec<Node<'a>> = Vec::new();
-        for child in &children {
+        self.for_each_code_child(node, |child| {
             if child.kind() == K::EXPR_ARGS {
                 for sub in child.children(&mut child.walk()) {
                     if !sub.is_extra() {
@@ -1042,9 +1048,9 @@ impl<'a> DocBuilder<'a> {
                     }
                 }
             } else {
-                flat.push(*child);
+                flat.push(child);
             }
-        }
+        });
 
         // Hug a sole bracket-list argument: keep `([` and `])` together by
         // merging the outer call group with the inner bracket group.

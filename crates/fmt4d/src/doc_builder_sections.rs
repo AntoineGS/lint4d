@@ -7,10 +7,10 @@ impl DocBuilder<'_> {
     pub(crate) fn build_unit(&self, node: Node) -> Doc {
         let children = self.code_children(node);
         let mut parts = Vec::new();
-        let mut prev_kind = String::new();
+        let mut prev_kind: &'static str = "";
 
         for child in &children {
-            let kind = child.kind().to_string();
+            let kind = child.kind();
             if (kind == K::INTERFACE
                 || kind == K::IMPLEMENTATION
                 || kind == K::INITIALIZATION
@@ -30,7 +30,7 @@ impl DocBuilder<'_> {
         let children = self.code_children(node);
         let mut parts = Vec::new();
         let mut after_header = false;
-        let mut prev_child_kind = String::new();
+        let mut prev_child_kind: &'static str = "";
         let mut prev_single_line = false;
 
         for child in &children {
@@ -41,7 +41,7 @@ impl DocBuilder<'_> {
                     after_header = true;
                 }
                 _ => {
-                    let kind = child.kind().to_string();
+                    let kind = child.kind();
                     let single_line = child.start_position().row == child.end_position().row;
                     let child_doc = self.doc_for_node(*child);
                     if after_header {
@@ -49,8 +49,8 @@ impl DocBuilder<'_> {
                         after_header = false;
                     } else if !prev_child_kind.is_empty() {
                         let blanks = crate::blank_lines::needs_blank_line_between(
-                            &prev_child_kind,
-                            &kind,
+                            prev_child_kind,
+                            kind,
                             &self.config.blank_lines,
                         );
                         if blanks > 0 && !(prev_single_line && single_line) {
@@ -79,7 +79,7 @@ impl DocBuilder<'_> {
         let children = self.code_children(node);
         let mut parts = Vec::new();
         let mut after_header = false;
-        let mut prev_child_kind = String::new();
+        let mut prev_child_kind: &'static str = "";
         let mut prev_single_line = false;
 
         for child in &children {
@@ -90,7 +90,7 @@ impl DocBuilder<'_> {
                     after_header = true;
                 }
                 _ => {
-                    let kind = child.kind().to_string();
+                    let kind = child.kind();
                     let single_line = child.start_position().row == child.end_position().row;
                     let child_doc = self.doc_for_node(*child);
                     if after_header {
@@ -98,8 +98,8 @@ impl DocBuilder<'_> {
                         after_header = false;
                     } else if !prev_child_kind.is_empty() {
                         let blanks = crate::blank_lines::needs_blank_line_between(
-                            &prev_child_kind,
-                            &kind,
+                            prev_child_kind,
+                            kind,
                             &self.config.blank_lines,
                         );
                         if blanks > 0 && !(prev_single_line && single_line) {

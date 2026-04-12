@@ -664,7 +664,7 @@ impl<'a> DocBuilder<'a> {
     ) -> Doc {
         let mut group_items: Vec<Doc> = Vec::new();
         let mut prev_end = prev_end_row;
-        let mut prev_child_kind = String::new();
+        let mut prev_child_kind: &'static str = "";
         let mut prev_single_line = false;
 
         for child in body_children {
@@ -722,7 +722,7 @@ impl<'a> DocBuilder<'a> {
                         }
                     }
 
-                    prev_child_kind = kind.to_string();
+                    prev_child_kind = kind;
                     prev_single_line = single_line;
                     prev_end = Some(child.end_position().row);
                     continue;
@@ -752,7 +752,7 @@ impl<'a> DocBuilder<'a> {
                         group_items.push(doc::align_row(cells));
                     }
 
-                    prev_child_kind = kind.to_string();
+                    prev_child_kind = kind;
                     prev_single_line = single_line;
                     prev_end = Some(child.end_position().row);
                     continue;
@@ -829,7 +829,7 @@ impl<'a> DocBuilder<'a> {
                 }
             }
 
-            prev_child_kind = kind.to_string();
+            prev_child_kind = kind;
             prev_single_line = single_line;
             prev_end = Some(child.end_position().row);
         }

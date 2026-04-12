@@ -179,10 +179,7 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn build_leaf(&self, node: Node<'a>) -> Doc {
         let text = self.node_text(node);
         let kind = node.kind();
-        let parent_kind = node
-            .parent()
-            .map(|p| p.kind().to_string())
-            .unwrap_or_default();
+        let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
         doc::token(text, kind, parent_kind)
     }
 
@@ -191,10 +188,7 @@ impl<'a> DocBuilder<'a> {
     fn build_verbatim_leaf(&self, node: Node<'a>) -> Doc {
         let text = self.node_text(node);
         let kind = node.kind();
-        let parent_kind = node
-            .parent()
-            .map(|p| p.kind().to_string())
-            .unwrap_or_default();
+        let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
         doc::token(text, kind, parent_kind)
     }
 
@@ -494,7 +488,7 @@ impl<'a> DocBuilder<'a> {
         let is_bare_statements = node.kind() == K::STATEMENTS;
         let mut in_block = is_bare_statements;
         let mut prev_end_row: Option<usize> = None;
-        let mut prev_kind = String::new();
+        let mut prev_kind: &'static str = "";
 
         for child in &children {
             let kind = child.kind();
@@ -514,7 +508,7 @@ impl<'a> DocBuilder<'a> {
                     parts.push(self.doc_for_node(*child));
                     in_block = true;
                     prev_end_row = Some(child.end_position().row);
-                    prev_kind = kind.to_string();
+                    prev_kind = kind;
                 }
                 K::K_END => {
                     // If kEnd has leading comments, they belong inside the body.
@@ -540,7 +534,7 @@ impl<'a> DocBuilder<'a> {
                     parts.push(doc::concat(vec![end_body, end_trailing]));
                     in_block = false;
                     prev_end_row = Some(child.end_position().row);
-                    prev_kind = kind.to_string();
+                    prev_kind = kind;
                 }
                 K::K_EXCEPT | K::K_FINALLY => {
                     // If except/finally has leading comments, they belong inside
@@ -566,7 +560,7 @@ impl<'a> DocBuilder<'a> {
                     // Start new body for except/finally section
                     in_block = true;
                     prev_end_row = Some(child.end_position().row);
-                    prev_kind = kind.to_string();
+                    prev_kind = kind;
                 }
                 K::SEMICOLON if in_block => {
                     // Semicolons inside blocks: emit only — the next child's
@@ -574,19 +568,19 @@ impl<'a> DocBuilder<'a> {
                     // printer's idempotent ensure_newline).
                     body.push(self.doc_for_node(*child));
                     prev_end_row = Some(child.end_position().row);
-                    prev_kind = kind.to_string();
+                    prev_kind = kind;
                 }
                 K::SEMICOLON => {
                     // Semicolons outside blocks (e.g. after end) — no trailing
                     // Hardline; the parent or next sibling provides it.
                     parts.push(self.doc_for_node(*child));
                     prev_end_row = Some(child.end_position().row);
-                    prev_kind = kind.to_string();
+                    prev_kind = kind;
                 }
                 _ => {
                     if in_block {
                         // Check for preserved blank lines between statements
-                        let skip_blank = is_block_opener(&prev_kind) || is_block_closer(kind);
+                        let skip_blank = is_block_opener(prev_kind) || is_block_closer(kind);
                         if !skip_blank && !prev_kind.is_empty() {
                             if let Some(prev_end) = prev_end_row {
                                 if self.has_blank_line_between(prev_end, child.start_position().row)
@@ -607,7 +601,7 @@ impl<'a> DocBuilder<'a> {
                     } else {
                         // Preserve blank lines outside blocks
                         let skip_blank = prev_kind.is_empty()
-                            || is_block_opener(&prev_kind)
+                            || is_block_opener(prev_kind)
                             || is_block_closer(kind);
                         if !skip_blank {
                             if let Some(prev_end) = prev_end_row {
@@ -620,7 +614,7 @@ impl<'a> DocBuilder<'a> {
                         parts.push(self.doc_for_node(*child));
                     }
                     prev_end_row = Some(child.end_position().row);
-                    prev_kind = kind.to_string();
+                    prev_kind = kind;
                 }
             }
         }
@@ -669,12 +663,12 @@ impl<'a> DocBuilder<'a> {
             parts.push(doc::indent(aligned));
         } else {
             let mut body_parts = Vec::new();
-            let mut prev_child_kind = String::new();
+            let mut prev_child_kind: &'static str = "";
             let mut prev_single_line = false;
             let mut prev_end_row: Option<usize> = keyword_end_row;
 
             for child in &body_children {
-                let kind = child.kind().to_string();
+                let kind = child.kind();
                 let single_line = child.start_position().row == child.end_position().row;
                 let child_doc = self.doc_for_node(*child);
                 let source_blank = !prev_child_kind.is_empty()

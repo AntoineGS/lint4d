@@ -127,7 +127,7 @@ impl<'a> DocBuilder<'a> {
     /// non-aligned logic (Hardline separation, blank line preservation).
     fn build_type_body_parts(&self, body_children: &[Node<'a>]) -> Vec<Doc> {
         let mut body_parts = Vec::new();
-        let mut prev_body_kind = String::new();
+        let mut prev_body_kind: &'static str = "";
         let mut prev_body_end_row: Option<usize> = None;
 
         for child in body_children {
@@ -138,7 +138,7 @@ impl<'a> DocBuilder<'a> {
                     }
                 }
                 body_parts.push(self.doc_for_node(*child));
-                prev_body_kind = K::DECL_SECTION.to_string();
+                prev_body_kind = K::DECL_SECTION;
                 prev_body_end_row = Some(child.end_position().row);
                 continue;
             }
@@ -154,7 +154,7 @@ impl<'a> DocBuilder<'a> {
                 body_parts.push(Doc::Hardline);
             }
             body_parts.push(child_doc);
-            prev_body_kind = child.kind().to_string();
+            prev_body_kind = child.kind();
             prev_body_end_row = Some(child.end_position().row);
         }
         body_parts

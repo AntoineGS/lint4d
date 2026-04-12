@@ -65,8 +65,8 @@ pub struct Renderer {
     indent_size: usize,
     indent_style: IndentStyle,
     max_line_length: usize,
-    last_token_kind: String,
-    last_token_parent_kind: String,
+    last_token_kind: &'static str,
+    last_token_parent_kind: &'static str,
 }
 
 impl Renderer {
@@ -77,8 +77,8 @@ impl Renderer {
             indent_size: config.indent_size,
             indent_style: config.indent_style,
             max_line_length: config.max_line_length,
-            last_token_kind: String::new(),
-            last_token_parent_kind: String::new(),
+            last_token_kind: "",
+            last_token_parent_kind: "",
         }
     }
 
@@ -95,7 +95,7 @@ impl Renderer {
                     kind,
                     parent_kind,
                 } => {
-                    self.emit_with_spacing(&text, &kind, &parent_kind, indent);
+                    self.emit_with_spacing(&text, kind, parent_kind, indent);
                 }
 
                 Doc::Raw(text) => {
@@ -109,8 +109,8 @@ impl Renderer {
                     // If the raw text ends with whitespace, clear spacing state so
                     // the next token won't add a duplicate space.
                     if text.ends_with(|c: char| c.is_whitespace()) {
-                        self.last_token_kind.clear();
-                        self.last_token_parent_kind.clear();
+                        self.last_token_kind = "";
+                        self.last_token_parent_kind = "";
                     }
                     self.output.push_str(&text);
                 }
@@ -129,8 +129,8 @@ impl Renderer {
                         self.output.push(' ');
                         self.current_column += 1;
                         // Clear spacing state so the next token won't add another space.
-                        self.last_token_kind.clear();
-                        self.last_token_parent_kind.clear();
+                        self.last_token_kind = "";
+                        self.last_token_parent_kind = "";
                     }
                     Mode::Break => self.emit_newline(),
                 },
@@ -264,8 +264,8 @@ impl Renderer {
             let measured: Vec<(usize, Vec<usize>)> = group
                 .iter()
                 .map(|(pos, cells)| {
-                    let mut last_kind = String::new();
-                    let mut last_parent = String::new();
+                    let mut last_kind: &'static str = "";
+                    let mut last_parent: &'static str = "";
                     let widths: Vec<usize> = cells
                         .iter()
                         .map(|c| {
@@ -350,8 +350,8 @@ impl Renderer {
                         self.output.push_str(&indent_str);
                         self.current_column = indent_str.len();
                         // Clear spacing state — the row starts fresh at indent.
-                        self.last_token_kind.clear();
-                        self.last_token_parent_kind.clear();
+                        self.last_token_kind = "";
+                        self.last_token_parent_kind = "";
                         for cell in cells {
                             self.render_doc_inline(cell.content, indent);
                         }
@@ -364,8 +364,8 @@ impl Renderer {
                         self.output.push_str(&indent_str);
                         self.current_column = indent_str.len();
                         // Clear spacing state — the row starts fresh at indent.
-                        self.last_token_kind.clear();
-                        self.last_token_parent_kind.clear();
+                        self.last_token_kind = "";
+                        self.last_token_parent_kind = "";
                         for (col_idx, cell) in cells.into_iter().enumerate() {
                             let before_len = self.output.len();
                             self.render_doc_inline(cell.content, indent);
@@ -406,7 +406,7 @@ impl Renderer {
                 kind,
                 parent_kind,
             } => {
-                self.emit_with_spacing(&text, &kind, &parent_kind, indent);
+                self.emit_with_spacing(&text, kind, parent_kind, indent);
             }
             Doc::Raw(text) => {
                 for ch in text.chars() {
@@ -417,8 +417,8 @@ impl Renderer {
                     }
                 }
                 if text.ends_with(|c: char| c.is_whitespace()) {
-                    self.last_token_kind.clear();
-                    self.last_token_parent_kind.clear();
+                    self.last_token_kind = "";
+                    self.last_token_parent_kind = "";
                 }
                 self.output.push_str(&text);
             }
@@ -431,8 +431,8 @@ impl Renderer {
                 Mode::Flat => {
                     self.output.push(' ');
                     self.current_column += 1;
-                    self.last_token_kind.clear();
-                    self.last_token_parent_kind.clear();
+                    self.last_token_kind = "";
+                    self.last_token_parent_kind = "";
                 }
                 Mode::Break => self.emit_newline(),
             },
@@ -481,8 +481,8 @@ impl Renderer {
     fn measure_width_inner(
         doc: &Doc,
         width: &mut usize,
-        last_kind: &mut String,
-        last_parent: &mut String,
+        last_kind: &mut &'static str,
+        last_parent: &mut &'static str,
     ) {
         match doc {
             Doc::Empty => {}
@@ -495,8 +495,8 @@ impl Renderer {
                     *width += 1;
                 }
                 *width += text.len();
-                *last_kind = kind.clone();
-                *last_parent = parent_kind.clone();
+                *last_kind = kind;
+                *last_parent = parent_kind;
             }
             Doc::Raw(text) => {
                 // Count characters, but only on the last line if multi-line.
@@ -548,14 +548,20 @@ impl Renderer {
         self.current_column == 0 || self.output.ends_with('\n')
     }
 
-    fn emit_with_spacing(&mut self, text: &str, kind: &str, parent_kind: &str, indent: usize) {
+    fn emit_with_spacing(
+        &mut self,
+        text: &str,
+        kind: &'static str,
+        parent_kind: &'static str,
+        indent: usize,
+    ) {
         if self.at_line_start() {
             let indent_str = self.indent_string(indent);
             self.output.push_str(&indent_str);
             self.current_column = indent_str.len();
         } else if spacing::would_need_space(
-            &self.last_token_kind,
-            &self.last_token_parent_kind,
+            self.last_token_kind,
+            self.last_token_parent_kind,
             kind,
             parent_kind,
         ) {
@@ -564,8 +570,8 @@ impl Renderer {
         }
         self.output.push_str(text);
         self.current_column += text.len();
-        self.last_token_kind = kind.to_string();
-        self.last_token_parent_kind = parent_kind.to_string();
+        self.last_token_kind = kind;
+        self.last_token_parent_kind = parent_kind;
     }
 
     fn emit_newline(&mut self) {
@@ -598,17 +604,17 @@ impl Renderer {
             self.current_column
         };
         let mut remaining = self.max_line_length.saturating_sub(effective_column);
-        let mut last_kind = if self.at_line_start() {
+        let mut last_kind: &'static str = if self.at_line_start() {
             // At line start emit_with_spacing skips spacing, so clear
             // last_kind so fits_inner doesn't charge a phantom space.
-            String::new()
+            ""
         } else {
-            self.last_token_kind.clone()
+            self.last_token_kind
         };
-        let mut last_parent = if self.at_line_start() {
-            String::new()
+        let mut last_parent: &'static str = if self.at_line_start() {
+            ""
         } else {
-            self.last_token_parent_kind.clone()
+            self.last_token_parent_kind
         };
         self.fits_inner(
             doc,
@@ -624,8 +630,8 @@ impl Renderer {
         doc: &Doc,
         indent: usize,
         remaining: &mut usize,
-        last_kind: &mut String,
-        last_parent: &mut String,
+        last_kind: &mut &'static str,
+        last_parent: &mut &'static str,
     ) -> bool {
         match doc {
             Doc::Empty => true,
@@ -646,8 +652,8 @@ impl Renderer {
                     return false;
                 }
                 *remaining -= needed;
-                *last_kind = kind.clone();
-                *last_parent = parent_kind.clone();
+                *last_kind = kind;
+                *last_parent = parent_kind;
                 true
             }
 
@@ -672,8 +678,8 @@ impl Renderer {
                     .saturating_sub(self.indent_width(indent));
                 // At line start no inter-token space is emitted, so clear
                 // the spacing state to match emit_with_spacing behaviour.
-                last_kind.clear();
-                last_parent.clear();
+                *last_kind = "";
+                *last_parent = "";
                 true
             }
 
@@ -742,7 +748,7 @@ mod tests {
         Renderer::new(&FmtConfig::default())
     }
 
-    fn tok(text: &str, kind: &str, parent: &str) -> Doc {
+    fn tok(text: &str, kind: &'static str, parent: &'static str) -> Doc {
         token(text, kind, parent)
     }
 

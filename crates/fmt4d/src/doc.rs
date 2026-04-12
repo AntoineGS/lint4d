@@ -6,10 +6,14 @@
 #[derive(Debug, Clone)]
 pub enum Doc {
     /// A source token — carries kind metadata for spacing resolution.
+    ///
+    /// `kind` and `parent_kind` reference `&'static str` constants from
+    /// `pascal_core::node_kind` (all grammar node kinds are compile-time
+    /// constants), avoiding per-token heap allocation.
     Token {
         text: String,
-        kind: String,
-        parent_kind: String,
+        kind: &'static str,
+        parent_kind: &'static str,
     },
 
     /// Pre-formatted text (comments, verbatim regions) — no spacing logic.
@@ -122,15 +126,11 @@ pub fn align_cell(content: Doc, pad: bool) -> AlignCell {
     AlignCell { content, pad }
 }
 
-pub fn token(
-    text: impl Into<String>,
-    kind: impl Into<String>,
-    parent_kind: impl Into<String>,
-) -> Doc {
+pub fn token(text: impl Into<String>, kind: &'static str, parent_kind: &'static str) -> Doc {
     Doc::Token {
         text: text.into(),
-        kind: kind.into(),
-        parent_kind: parent_kind.into(),
+        kind,
+        parent_kind,
     }
 }
 

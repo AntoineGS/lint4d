@@ -112,19 +112,20 @@ pub fn classify_unit(
 }
 
 fn legacy_namespace(name: &str) -> Option<&'static str> {
-    match name {
-        "SysUtils" | "Classes" | "Types" | "Variants" | "SysConst" | "Math" | "StrUtils"
-        | "DateUtils" | "IOUtils" | "RegularExpressions" | "SyncObjs" | "Rtti" | "TypInfo"
-        | "Contnrs" => Some("System"),
+    // Delphi unit names are case-insensitive, so normalise before matching.
+    match name.to_ascii_lowercase().as_str() {
+        "sysutils" | "classes" | "types" | "variants" | "sysconst" | "math" | "strutils"
+        | "dateutils" | "ioutils" | "regularexpressions" | "syncobjs" | "rtti" | "typinfo"
+        | "contnrs" => Some("System"),
 
-        "Forms" | "Controls" | "StdCtrls" | "ExtCtrls" | "ComCtrls" | "Dialogs" | "Graphics"
-        | "Menus" | "ActnList" | "Grids" | "Buttons" | "ImgList" | "ToolWin" | "AppEvnts" => {
+        "forms" | "controls" | "stdctrls" | "extctrls" | "comctrls" | "dialogs" | "graphics"
+        | "menus" | "actnlist" | "grids" | "buttons" | "imglist" | "toolwin" | "appevnts" => {
             Some("Vcl")
         }
 
-        "DB" | "DBClient" | "Provider" | "DBGrids" | "DBCtrls" | "SqlExpr" => Some("Data"),
+        "db" | "dbclient" | "provider" | "dbgrids" | "dbctrls" | "sqlexpr" => Some("Data"),
 
-        "Windows" | "Messages" | "ShellAPI" | "ActiveX" | "CommCtrl" | "ShlObj" => Some("Winapi"),
+        "windows" | "messages" | "shellapi" | "activex" | "commctrl" | "shlobj" => Some("Winapi"),
 
         _ => None,
     }
@@ -614,6 +615,30 @@ mod tests {
         );
         assert_eq!(
             classify_unit("Windows", &default_config(), &HashSet::new()),
+            UnitSection::Core
+        );
+    }
+
+    #[test]
+    fn legacy_core_units_case_insensitive() {
+        assert_eq!(
+            classify_unit("classes", &default_config(), &HashSet::new()),
+            UnitSection::Core
+        );
+        assert_eq!(
+            classify_unit("SYSUTILS", &default_config(), &HashSet::new()),
+            UnitSection::Core
+        );
+        assert_eq!(
+            classify_unit("forms", &default_config(), &HashSet::new()),
+            UnitSection::Core
+        );
+        assert_eq!(
+            classify_unit("db", &default_config(), &HashSet::new()),
+            UnitSection::Core
+        );
+        assert_eq!(
+            classify_unit("windows", &default_config(), &HashSet::new()),
             UnitSection::Core
         );
     }

@@ -72,6 +72,30 @@ fn write_mode_does_not_clobber_symlink_target() {
 }
 
 #[test]
+fn check_mode_exits_error_on_parse_failure() {
+    // Regression guard for SEC-CRIT-3: a file that fails to parse must
+    // cause --check to exit with EXIT_ERROR (2), not EXIT_OK (0). Silent
+    // "no changes needed" on a broken file means CI passes while the
+    // file is actually invalid.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("bad.pas");
+    // `beginn` is a typo — tree-sitter parses this into an error tree.
+    fs::write(
+        &path,
+        b"unit T;\ninterface\nimplementation\nprocedure P; beginn end;\nend.\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("fmt4d")
+        .unwrap()
+        .arg("--check")
+        .arg(path.to_str().unwrap())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse"));
+}
+
+#[test]
 fn wrong_type_in_fmt4d_toml_is_surfaced() {
     // Regression guard for C1 / SEC-H3: malformed config must not silently
     // fall back to defaults. A user who types `indent_size = "four"` (wrong

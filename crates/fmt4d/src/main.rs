@@ -190,11 +190,13 @@ fn run_files(cli: &Cli) -> i32 {
         match &config.project_root {
             Some(root) => {
                 let mut ext = uses::scan_external_paths(root, &config.uses.external_paths);
-                // Units found in project paths take priority — remove them
-                // from the external set so they are classified as project.
-                if !config.uses.project_paths.is_empty() {
-                    let proj = uses::scan_external_paths(root, &config.uses.project_paths);
-                    ext.retain(|u| !proj.contains(u));
+                // Units discovered as project files take priority — remove
+                // them from the external set so collisions (same unit name
+                // in both external and project trees) resolve to project.
+                for fi in &files {
+                    if let Some(stem) = fi.path.file_stem().and_then(|s| s.to_str()) {
+                        ext.remove(&stem.to_lowercase());
+                    }
                 }
                 ext
             }
@@ -329,12 +331,6 @@ fn run_init() -> i32 {
 # Prefixes that should be considered external (for grouping)
 # Default: []
 # external_prefixes = ["Spring", "Neon", "DevExpress"]
-
-# Paths that contain project source (for grouping)
-# Units found here take priority over external_paths when both contain
-# a file with the same name.
-# Default: []
-# project_paths = ["src", "Common"]
 
 [format.alignment]
 # Master switch for column alignment in declaration blocks

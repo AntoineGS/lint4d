@@ -289,11 +289,11 @@ fn uses_groups_with_external_paths() {
 }
 
 #[test]
-fn project_paths_override_external_paths() {
+fn project_files_override_external_scan() {
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
-    // Utils.pas exists in BOTH external and project paths.
+    // Utils.pas exists in BOTH external and project trees.
     let vendor = dir.path().join("vendor");
     std::fs::create_dir_all(&vendor).unwrap();
     std::fs::write(vendor.join("Utils.pas"), "unit Utils;").unwrap();
@@ -307,14 +307,19 @@ fn project_paths_override_external_paths() {
     let mut config = fmt4d::config::FmtConfig::default();
     config.uses.group = true;
     config.uses.external_paths = vec!["vendor".to_string()];
-    config.uses.project_paths = vec!["Common".to_string()];
     config.project_root = Some(dir.path().to_path_buf());
 
-    // Build external set, then subtract project units (mirrors main.rs logic).
+    // Simulate the main.rs logic: scan external paths, then subtract
+    // units that are also discovered project files.
     let mut external_units =
         fmt4d::uses::scan_external_paths(dir.path(), &config.uses.external_paths);
-    let project_units = fmt4d::uses::scan_external_paths(dir.path(), &config.uses.project_paths);
-    external_units.retain(|u| !project_units.contains(u));
+    // The project file list (from CLI paths / .dproj) includes Utils.pas.
+    let project_files = vec![pascal_core::FileInfo::new(common.join("Utils.pas"))];
+    for fi in &project_files {
+        if let Some(stem) = fi.path.file_stem().and_then(|s| s.to_str()) {
+            external_units.remove(&stem.to_lowercase());
+        }
+    }
 
     let source =
         "unit T;\ninterface\nuses\n  SuperObject, Utils, System.SysUtils;\nimplementation\nend.\n";

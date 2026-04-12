@@ -82,9 +82,22 @@ impl Renderer {
         }
     }
 
+    /// Construct a renderer whose output buffer is pre-sized to `cap`
+    /// bytes. Use when the input size is known (e.g., from
+    /// `source.len()`) so the renderer avoids log(N) growth reallocations.
+    ///
+    /// Review PERF-H4.
+    pub fn with_capacity(config: &FmtConfig, cap: usize) -> Self {
+        let mut r = Self::new(config);
+        r.output = String::with_capacity(cap);
+        r
+    }
+
     pub fn render(mut self, doc: Doc) -> String {
-        // Work stack: (indent_level, mode, doc)
-        let mut stack: Vec<(usize, Mode, Doc)> = vec![(0, Mode::Break, doc)];
+        // Pre-size the stack to absorb typical nested-group depth without
+        // reallocation. Review PERF-H3.
+        let mut stack: Vec<(usize, Mode, Doc)> = Vec::with_capacity(64);
+        stack.push((0, Mode::Break, doc));
 
         while let Some((indent, mode, doc)) = stack.pop() {
             match doc {

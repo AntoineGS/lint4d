@@ -55,7 +55,10 @@ pub fn format_source(
         external_units,
     );
     let doc = builder.build(tree.root_node());
-    let raw_output = Renderer::new(config).render(doc);
+    // Source length is a good upper bound for output length (the
+    // formatter mostly adds/removes whitespace). Slight overshoot
+    // avoids the final realloc. Review PERF-H4.
+    let raw_output = Renderer::with_capacity(config, source.len() + source.len() / 16).render(doc);
 
     let normalized = normalize_blank_lines(&raw_output, &config.blank_lines);
     let broken = break_long_lines(&normalized, config.max_line_length, config.indent_size);

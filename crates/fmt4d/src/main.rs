@@ -274,9 +274,27 @@ fn run_files(cli: &Cli) -> i32 {
             let formatted_text = pascal_core::decode_bytes(&formatted);
             print_diff(&file_info.path, &original_text, &formatted_text);
         } else {
-            // Write formatted output back to the file
-            if let Err(e) = fs::write(&file_info.path, &formatted) {
-                eprintln!("Error writing {}: {}", file_info.path.display(), e);
+            // Write formatted output atomically via tempfile + rename to
+            // avoid a TOCTOU window between read and write (review
+            // SEC-CRIT-2). fs::rename on Unix is atomic on the same
+            // filesystem; on Windows it replaces the target file if the
+            // target exists.
+            let tmp_path = match make_tmp_path(&file_info.path) {
+                Some(p) => p,
+                None => {
+                    eprintln!("Error computing temp path for {}", file_info.path.display());
+                    had_errors.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+            if let Err(e) = fs::write(&tmp_path, &formatted) {
+                eprintln!("Error writing {}: {}", tmp_path.display(), e);
+                had_errors.store(true, Ordering::Relaxed);
+                return;
+            }
+            if let Err(e) = fs::rename(&tmp_path, &file_info.path) {
+                let _ = fs::remove_file(&tmp_path);
+                eprintln!("Error replacing {}: {}", file_info.path.display(), e);
                 had_errors.store(true, Ordering::Relaxed);
                 return;
             }
@@ -425,4 +443,29 @@ fn print_diff(path: &std::path::Path, original: &str, formatted: &str) {
             (None, None) => {}
         }
     }
+}
+
+/// Build a sibling tempfile path in the same directory as `target`.
+///
+/// Using the same directory guarantees the subsequent `fs::rename` is a
+/// same-filesystem rename (otherwise it would be copy+unlink and lose the
+/// atomicity property).
+fn make_tmp_path(target: &std::path::Path) -> Option<PathBuf> {
+    let parent = target.parent()?;
+    let file_name = target.file_name()?.to_str()?;
+    let pid = std::process::id();
+    // Use a high-entropy-ish suffix to avoid collisions between rayon workers
+    // racing on the same path (shouldn't happen, but cheap insurance).
+    let rand: u64 = rand_u64_like();
+    Some(parent.join(format!(".{}.fmt4d-{}-{:x}.tmp", file_name, pid, rand)))
+}
+
+/// Best-effort per-call entropy without a dedicated rand dependency.
+fn rand_u64_like() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ std::process::id() as u64
 }

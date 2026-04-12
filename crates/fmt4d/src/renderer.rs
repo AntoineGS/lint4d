@@ -186,8 +186,34 @@ impl Renderer {
                         Mode::Break
                     } else {
                         // Greedy check: does sep (flat) + content fit?
-                        let test = crate::doc::concat(vec![sep.clone(), content.clone()]);
-                        if self.fits(indent, &test) {
+                        // Measure in place instead of cloning sep+content into a fresh
+                        // Doc — review PERF-C3.
+                        let effective_col = if self.at_line_start() {
+                            self.indent_width(indent)
+                        } else {
+                            self.current_column
+                        };
+                        let mut last_k: &'static str = if self.at_line_start() {
+                            ""
+                        } else {
+                            self.last_token_kind
+                        };
+                        let mut last_p: &'static str = if self.at_line_start() {
+                            ""
+                        } else {
+                            self.last_token_parent_kind
+                        };
+                        let mut remaining = self.max_line_length.saturating_sub(effective_col);
+                        let fits_both =
+                            self.fits_inner(&sep, indent, &mut remaining, &mut last_k, &mut last_p)
+                                && self.fits_inner(
+                                    &content,
+                                    indent,
+                                    &mut remaining,
+                                    &mut last_k,
+                                    &mut last_p,
+                                );
+                        if fits_both {
                             Mode::Flat
                         } else {
                             Mode::Break

@@ -186,11 +186,13 @@ fn run_files(cli: &Cli) -> i32 {
         })
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let config = FmtConfig::discover(&config_dir).with_overrides(
-        cli.indent_size,
-        cli.max_line_length,
-        cli.end_of_line,
-    );
+    let config = match FmtConfig::discover(&config_dir) {
+        Ok(c) => c.with_overrides(cli.indent_size, cli.max_line_length, cli.end_of_line),
+        Err(e) => {
+            eprintln!("{}", e);
+            return EXIT_ERROR;
+        }
+    };
 
     let external_units = if config.uses.group {
         match &config.project_root {

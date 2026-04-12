@@ -184,17 +184,24 @@ impl FmtConfig {
         Ok(raw.format.unwrap_or_default())
     }
 
-    pub fn discover(start_dir: &Path) -> FmtConfig {
+    /// Load and validate `.fmt4d.toml` starting at `start_dir`.
+    ///
+    /// Returns `Err` when the file exists but is malformed. Callers should
+    /// surface the error to the user rather than fall back to defaults —
+    /// silent fallback can reformat an entire tree to defaults on a typo
+    /// (review C1 / SEC-H3).
+    pub fn discover(start_dir: &Path) -> Result<FmtConfig, String> {
         match pascal_core::config_discovery::find_config_file(start_dir, ".fmt4d.toml") {
             Some((content, dir)) => {
-                let mut config = Self::from_toml(&content).unwrap_or_default();
+                let mut config = Self::from_toml(&content)
+                    .map_err(|e| format!("Invalid .fmt4d.toml in {}: {}", dir.display(), e))?;
                 config.project_root = Some(dir);
-                config
+                Ok(config)
             }
-            None => FmtConfig {
+            None => Ok(FmtConfig {
                 project_root: Some(start_dir.to_path_buf()),
                 ..FmtConfig::default()
-            },
+            }),
         }
     }
 

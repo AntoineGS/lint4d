@@ -16,6 +16,12 @@ const EXIT_OK: i32 = 0;
 const EXIT_FORMAT_NEEDED: i32 = 1;
 const EXIT_ERROR: i32 = 2;
 
+/// Maximum file size fmt4d will attempt to read (16 MiB).
+///
+/// Larger files are skipped with a warning on stderr to protect against
+/// OOM on adversarial inputs. See review finding SEC-H2.
+const MAX_FILE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Parser)]
 #[command(
     name = "fmt4d",
@@ -210,6 +216,26 @@ fn run_files(cli: &Cli) -> i32 {
     let had_errors = AtomicBool::new(false);
 
     files.par_iter().for_each(|file_info| {
+        // File-size guard: refuse to load files that would exhaust memory
+        // across parallel workers. See SEC-H2.
+        match fs::metadata(&file_info.path) {
+            Ok(meta) if meta.len() > MAX_FILE_SIZE_BYTES => {
+                eprintln!(
+                    "fmt4d: skipping {} ({} bytes, exceeds {} byte limit)",
+                    file_info.path.display(),
+                    meta.len(),
+                    MAX_FILE_SIZE_BYTES
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("fmt4d: stat {}: {}", file_info.path.display(), e);
+                had_errors.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+
         let source = match fs::read(&file_info.path) {
             Ok(s) => s,
             Err(e) => {

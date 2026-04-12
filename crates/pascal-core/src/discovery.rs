@@ -21,6 +21,14 @@ pub fn discover_files(
     let mut results: Vec<FileInfo> = Vec::new();
 
     for path in paths {
+        // Reject symlinks passed directly as positional args. Same reason as
+        // the walkdir case below. Use symlink_metadata so we don't follow.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                eprintln!("pascal-core: skipping symlink {}", path.display());
+                continue;
+            }
+        }
         if path.is_file() {
             if let Some(ft) = file_type_for_path(path) {
                 if !is_excluded(path, path.parent().unwrap_or(path), &excludes) {
@@ -32,9 +40,19 @@ pub fn discover_files(
             }
         } else if path.is_dir() {
             let base = path.as_path();
-            for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(path)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
                 let entry_path = entry.path();
-                if !entry_path.is_file() {
+                // Reject symlinks outright: following them enables arbitrary-file
+                // overwrite via `fs::write(path, ...)` in --write mode.
+                // See review SEC-CRIT-1.
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
+                if !entry.file_type().is_file() {
                     continue;
                 }
                 if let Some(ft) = file_type_for_path(entry_path) {

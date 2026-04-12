@@ -696,6 +696,51 @@ end.
     );
 }
 
+#[test]
+fn property_alignment_write_only_aligns_with_read_write() {
+    let source = "\
+unit Test;
+interface
+type
+  TFoo = class
+  published
+    property ComputerName: string read FComputerName write FComputerName;
+    property FileVersion: string read FFileVersion write FFileVersion;
+    property AuditType: TAuditType write SetAuditType;
+  end;
+implementation
+end.
+";
+    let result = format_aligned(source);
+    // The `write` keywords must align across all property lines,
+    // even when one property has no `read` specifier.
+    let lines: Vec<&str> = result.lines().collect();
+    let write_cols: Vec<usize> = lines.iter().filter_map(|line| line.find("write")).collect();
+    assert_eq!(
+        write_cols.len(),
+        3,
+        "Expected 3 lines with 'write', got {}. Output:\n{}",
+        write_cols.len(),
+        result
+    );
+    assert_eq!(
+        write_cols[0], write_cols[1],
+        "write columns 1 and 2 should match ({} vs {}). Output:\n{}",
+        write_cols[0], write_cols[1], result
+    );
+    assert_eq!(
+        write_cols[0], write_cols[2],
+        "write columns 1 and 3 should match ({} vs {}). Output:\n{}",
+        write_cols[0], write_cols[2], result
+    );
+    // Idempotency.
+    let second = format_aligned(&result);
+    assert_eq!(
+        result, second,
+        "Write-only property alignment should be idempotent"
+    );
+}
+
 // ── Leading comment on complex type — no spurious blank line ────────
 
 #[test]

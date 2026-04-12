@@ -558,8 +558,37 @@ impl<'a> DocBuilder<'a> {
 
                 Some(cells)
             }
+        } else if let Some(wi) = write_idx {
+            // No read but has write — emit an empty read cell so the write
+            // column lines up with properties that have both read and write.
+            let write_range = &children[wi..];
+            let write_last = write_range.len().saturating_sub(1);
+            let write_parts: Vec<Doc> = write_range
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == write_last && has_tail {
+                        self.doc_for_node_sans_trailing(*c)
+                    } else {
+                        self.doc_for_node(*c)
+                    }
+                })
+                .collect();
+
+            let mut cells = vec![
+                doc::align_cell(doc::concat(name_parts), true),
+                doc::align_cell(doc::concat(type_parts), true),
+                doc::align_cell(Doc::Empty, true),
+                doc::align_cell(doc::concat(write_parts), has_tail),
+            ];
+
+            if let Some(comment_cell) = trailing_comment {
+                cells.push(comment_cell);
+            }
+
+            Some(cells)
         } else {
-            // No read specifier — just name : type [rest];
+            // No read or write specifier — just name : type [rest];
             // Strip trailing comment from last child.
             let rest_range = &children[first_specifier_idx..];
             let rest_last = rest_range.len().saturating_sub(1);

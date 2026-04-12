@@ -30,7 +30,7 @@ pub struct DocBuilder<'a> {
     pub(crate) comments: &'a CommentMap,
     directives: &'a DirectiveMap,
     format_regions: Vec<FormatOffRegion>,
-    pub(crate) external_units: HashSet<String>,
+    pub(crate) external_units: &'a HashSet<String>,
 }
 
 impl<'a> DocBuilder<'a> {
@@ -40,7 +40,7 @@ impl<'a> DocBuilder<'a> {
         comments: &'a CommentMap,
         directives: &'a DirectiveMap,
         format_regions: Vec<FormatOffRegion>,
-        external_units: HashSet<String>,
+        external_units: &'a HashSet<String>,
     ) -> Self {
         DocBuilder {
             source,
@@ -399,7 +399,7 @@ impl<'a> DocBuilder<'a> {
             &items,
             &self.config.uses,
             &indent_str,
-            &self.external_units,
+            self.external_units,
         );
 
         // Collect pre-uses directives (extras immediately before this node)
@@ -1686,8 +1686,9 @@ mod tests {
         config: &'a FmtConfig,
         comments: &'a CommentMap,
         directives: &'a DirectiveMap,
+        external_units: &'a HashSet<String>,
     ) -> DocBuilder<'a> {
-        DocBuilder::new(source, config, comments, directives, vec![], HashSet::new())
+        DocBuilder::new(source, config, comments, directives, vec![], external_units)
     }
 
     #[test]
@@ -1697,7 +1698,8 @@ mod tests {
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
         let directives = DirectiveMap::build(tree.root_node(), &bytes);
-        let builder = make_builder(&bytes, &config, &comments, &directives);
+        let external_units = HashSet::new();
+        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
         let doc = builder.build(tree.root_node());
         assert!(!matches!(doc, Doc::Empty));
     }
@@ -1710,13 +1712,14 @@ mod tests {
         let comments = CommentMap::build(tree.root_node(), &bytes);
         let directives = DirectiveMap::build(tree.root_node(), &bytes);
         let regions = pascal_core::directives::parse_format_regions(&bytes);
+        let external_units = HashSet::new();
         let builder = DocBuilder::new(
             &bytes,
             &config,
             &comments,
             &directives,
             regions,
-            HashSet::new(),
+            &external_units,
         );
         let doc = builder.build(tree.root_node());
         // The whole unit falls inside the format-off region, so it should be Raw.
@@ -1730,7 +1733,8 @@ mod tests {
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
         let directives = DirectiveMap::empty();
-        let builder = make_builder(&bytes, &config, &comments, &directives);
+        let external_units = HashSet::new();
+        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
         let root = tree.root_node();
         let children = builder.code_children(root);
         // All returned children must be non-extra.
@@ -1746,7 +1750,8 @@ mod tests {
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
         let directives = DirectiveMap::empty();
-        let builder = make_builder(&bytes, &config, &comments, &directives);
+        let external_units = HashSet::new();
+        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
 
         // The comment map attaches a leading comment to the next leaf node after
         // the comment. Walk the full tree and find any node with leading comments.
@@ -1779,7 +1784,8 @@ mod tests {
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
         let directives = DirectiveMap::empty();
-        let builder = make_builder(&bytes, &config, &comments, &directives);
+        let external_units = HashSet::new();
+        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
 
         // Find the leaf node that the trailing comment is attached to.
         // The comment map attaches trailing comments to the preceding leaf.
@@ -1808,7 +1814,8 @@ mod tests {
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
         let directives = DirectiveMap::empty();
-        let builder = make_builder(&bytes, &config, &comments, &directives);
+        let external_units = HashSet::new();
+        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
 
         // Walk tree to find a declArg node and verify is_ancestor works.
         fn find_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
@@ -1840,7 +1847,8 @@ mod tests {
         let config = FmtConfig::default();
         let comments = CommentMap::build(tree.root_node(), &bytes);
         let directives = DirectiveMap::empty();
-        let builder = make_builder(&bytes, &config, &comments, &directives);
+        let external_units = HashSet::new();
+        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
 
         fn find_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
             if node.kind() == kind {

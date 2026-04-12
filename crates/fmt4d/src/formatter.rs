@@ -52,7 +52,7 @@ pub fn format_source(
         &comment_map,
         &directive_map,
         format_regions,
-        external_units.clone(),
+        external_units,
     );
     let doc = builder.build(tree.root_node());
     let raw_output = Renderer::new(config).render(doc);

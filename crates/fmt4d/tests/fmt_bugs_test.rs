@@ -3522,3 +3522,35 @@ fn deeply_nested_binary_chain_does_not_overflow() {
     // Just running to completion without aborting is the assertion.
     let _ = format_source(&src);
 }
+
+#[test]
+fn binary_chain_mixed_ops_preserve_all_segments() {
+    // Regression guard: the iterative flatten_binary_chain_inner must
+    // drain pending on early-break paths when only_ops rejects a mid-
+    // descent operator. A chain like `'x' + 'y' - 'z' + 'w'` contains
+    // a `-` that the uses case wouldn't filter (only_ops = None here),
+    // but this test exercises the full format pipeline to confirm
+    // no segments go missing.
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+var
+  s: string;
+begin
+  s := 'x' + 'y' - 'z' + 'w';
+end;
+
+end.
+";
+    let result = format_source(src);
+    // All 4 literals must survive
+    assert!(result.contains("'x'"), "'x' missing: {}", result);
+    assert!(result.contains("'y'"), "'y' missing: {}", result);
+    assert!(result.contains("'z'"), "'z' missing: {}", result);
+    assert!(result.contains("'w'"), "'w' missing: {}", result);
+}

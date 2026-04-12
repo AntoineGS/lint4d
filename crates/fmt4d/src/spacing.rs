@@ -158,6 +158,10 @@ pub fn would_need_space(
     if kind == K::OPEN_BRACKET && parent_kind == K::EXPR_SUBSCRIPT {
         return false;
     }
+    // `Array[TFoo]` — no space between the `array` keyword and `[`.
+    if kind == K::OPEN_BRACKET && prev_kind == K::K_ARRAY {
+        return false;
+    }
     if kind == K::OPEN_PAREN && (parent_kind == K::EXPR_CALL || parent_kind == K::DECL_ARGS) {
         return false;
     }

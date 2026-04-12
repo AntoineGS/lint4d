@@ -299,6 +299,28 @@ end.
 }
 
 #[test]
+fn no_space_between_array_keyword_and_bracket() {
+    let src = "\
+unit T;
+
+interface
+
+const
+  kExecStatus: Array[TExecStatus] of integer = (0, 1, 2);
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("Array[TExecStatus]"),
+        "space was injected between Array and [:\n{}",
+        result
+    );
+}
+
+#[test]
 fn no_space_before_string_indexer() {
     let src = "\
 unit T;

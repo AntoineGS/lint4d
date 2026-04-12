@@ -1193,6 +1193,13 @@ impl<'a> DocBuilder<'a> {
         // inside strings like `'http://'` is not mistaken for a comment.
         let inner_start = children[open_idx].end_byte();
         let inner_end = children[close_idx].start_byte();
+        // Guard against tree-sitter error-recovery producing inverted
+        // or out-of-range byte offsets (review SEC-H5). Fall back to a
+        // plain children walk rather than panic on a slice index.
+        if inner_start > inner_end || inner_end > self.source.len() {
+            let docs: Vec<Doc> = children.iter().map(|c| self.doc_for_node(*c)).collect();
+            return doc::concat(docs);
+        }
         let has_line_comments = {
             let bytes = &self.source[inner_start..inner_end];
             let mut in_string = false;

@@ -1536,50 +1536,65 @@ pub(crate) fn flatten_binary_chain<'a>(
 }
 
 fn flatten_binary_chain_inner<'a>(
-    node: Node<'a>,
+    start: Node<'a>,
     only_ops: Option<&[&str]>,
     segments: &mut Vec<BinarySegment<'a>>,
 ) {
-    let children: Vec<Node<'a>> = node
-        .children(&mut node.walk())
-        .filter(|c| !c.is_extra())
-        .collect();
-
-    if children.len() != 3 {
-        segments.push(BinarySegment {
-            operator: None,
-            operand: vec![node],
-        });
-        return;
-    }
-
-    let left = children[0];
-    let op = children[1];
-    let right = children[2];
-
-    if let Some(allowed) = only_ops {
-        if !allowed.contains(&op.kind()) {
+    // Walk the left spine iteratively: a binary chain `a op b op c op d`
+    // parses as `((a op b) op c) op d`, so `left` descends through the
+    // EXPR_BINARY spine. Previously this was recursive and would
+    // stack-overflow on ~5k-depth chains (review SEC-H1).
+    //
+    // We collect (op, right) pairs on the way down, then emit the leftmost
+    // operand first, then each (op, right) in source order by unwinding
+    // the stack.
+    let mut pending: Vec<(Node<'a>, Node<'a>)> = Vec::new();
+    let mut node = start;
+    loop {
+        let children: Vec<Node<'a>> = node
+            .children(&mut node.walk())
+            .filter(|c| !c.is_extra())
+            .collect();
+        if children.len() != 3 {
+            // Not a binary shape — emit the whole subtree as one operand.
             segments.push(BinarySegment {
                 operator: None,
                 operand: vec![node],
             });
-            return;
+            break;
         }
-    }
-
-    if left.kind() == K::EXPR_BINARY {
-        flatten_binary_chain_inner(left, only_ops, segments);
-    } else {
+        let left = children[0];
+        let op = children[1];
+        let right = children[2];
+        if let Some(allowed) = only_ops {
+            if !allowed.contains(&op.kind()) {
+                segments.push(BinarySegment {
+                    operator: None,
+                    operand: vec![node],
+                });
+                break;
+            }
+        }
+        pending.push((op, right));
+        if left.kind() == K::EXPR_BINARY {
+            node = left;
+            continue;
+        }
+        // Leaf reached: emit `left` as the first operand, then unwind
+        // the pending stack in reverse to emit each (op, right) segment
+        // in source order.
         segments.push(BinarySegment {
             operator: None,
             operand: vec![left],
         });
+        while let Some((op, right)) = pending.pop() {
+            segments.push(BinarySegment {
+                operator: Some(op),
+                operand: vec![right],
+            });
+        }
+        break;
     }
-
-    segments.push(BinarySegment {
-        operator: Some(op),
-        operand: vec![right],
-    });
 }
 
 /// Return `true` if the source text between two consecutive binary chain

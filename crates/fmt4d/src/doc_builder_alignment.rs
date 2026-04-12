@@ -277,6 +277,87 @@ impl<'a> DocBuilder<'a> {
         Some(rows)
     }
 
+    /// Detect when the tree-sitter parser has incorrectly merged two `declVar`
+    /// entries because the second identifier matches the `kAlias` keyword
+    /// (FPC `alias:` proc attribute).
+    ///
+    /// For example, `LookupSql: RawUtf8;\n  Alias: RawUtf8;` is parsed as a
+    /// single `declVar` with a `procAttribute` child.  This method splits it
+    /// back into two separate alignment rows.
+    ///
+    /// Returns `None` when the node has no misparse to fix.
+    pub(crate) fn expand_alias_misparse(&self, node: Node<'a>) -> Option<Vec<Vec<AlignCell>>> {
+        let children = self.code_children(node);
+
+        // Quick check: does the node contain any procAttribute children?
+        let has_proc_attr = children.iter().any(|c| c.kind() == K::PROC_ATTRIBUTE);
+        if !has_proc_attr {
+            return None;
+        }
+
+        // Only handle the case where the procAttribute starts with kAlias.
+        let proc_attr_idx = children
+            .iter()
+            .position(|c| c.kind() == K::PROC_ATTRIBUTE)?;
+        let proc_attr = children[proc_attr_idx];
+        let attr_children = self.code_children(proc_attr);
+        if attr_children.is_empty() || attr_children[0].kind() != "kAlias" {
+            return None;
+        }
+
+        // Build the main declaration row (up to the first semicolon).
+        let colon_idx = children.iter().position(|c| c.kind() == K::COLON)?;
+        let first_semi_idx = children.iter().position(|c| c.kind() == K::SEMICOLON)?;
+
+        let name_parts: Vec<Doc> = children[..colon_idx]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    self.doc_for_node_sans_leading(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
+            .collect();
+
+        let type_parts: Vec<Doc> = children[colon_idx..=first_semi_idx]
+            .iter()
+            .map(|c| self.doc_for_node(*c))
+            .collect();
+
+        let mut rows = vec![vec![
+            doc::align_cell(doc::concat(name_parts), true),
+            doc::align_cell(doc::concat(type_parts), false),
+        ]];
+
+        // Build a row for the alias misparse.
+        // procAttribute children: kAlias(':'), :, identifier (the type name from _expr).
+        // Reconstruct as: [Alias] [: TypeName;]
+        let alias_text = self.node_text(attr_children[0]);
+        let name_doc = doc::token(alias_text, K::IDENTIFIER, K::DECL_VAR);
+
+        let colon_in_attr = attr_children.iter().position(|c| c.kind() == K::COLON);
+        if let Some(ci) = colon_in_attr {
+            let mut type_cell_parts: Vec<Doc> = attr_children[ci..]
+                .iter()
+                .map(|c| self.doc_for_node(*c))
+                .collect();
+            // Add the semicolon that follows the procAttribute.
+            if let Some(semi) = children.get(proc_attr_idx + 1) {
+                if semi.kind() == K::SEMICOLON {
+                    type_cell_parts.push(self.doc_for_node(*semi));
+                }
+            }
+            rows.push(vec![
+                doc::align_cell(name_doc, true),
+                doc::align_cell(doc::concat(type_cell_parts), false),
+            ]);
+        }
+
+        Some(rows)
+    }
+
     /// Decompose a simple `declType` (type alias) into alignment cells.
     ///
     /// Structure: `identifier = <type_def> ;`
@@ -610,6 +691,36 @@ impl<'a> DocBuilder<'a> {
                             }
                             group_items.push(doc::align_row(cells));
                         }
+                    }
+
+                    prev_child_kind = kind.to_string();
+                    prev_single_line = single_line;
+                    prev_end = Some(child.end_position().row);
+                    continue;
+                }
+            }
+
+            // Fix alias keyword misparse: `Alias: T;` parsed as a
+            // procAttribute on the preceding declVar.
+            if section_kind == K::DECL_VARS && kind == K::DECL_VAR {
+                if let Some(expanded) = self.expand_alias_misparse(*child) {
+                    let mut leading = self.leading_comments_doc(*child);
+                    if matches!(leading, Doc::Empty) {
+                        let ch = self.code_children(*child);
+                        if let Some(first) = ch.first() {
+                            leading = self.leading_comments_doc(*first);
+                        }
+                    }
+                    if !matches!(leading, Doc::Empty) {
+                        group_items.push(leading);
+                    }
+                    let leading_dir = self.leading_directives_doc(*child);
+                    if !matches!(leading_dir, Doc::Empty) {
+                        group_items.push(leading_dir);
+                    }
+
+                    for cells in expanded {
+                        group_items.push(doc::align_row(cells));
                     }
 
                     prev_child_kind = kind.to_string();

@@ -172,3 +172,90 @@ end.
     let formatted = format_source_helper(source);
     idempotency_check(&formatted);
 }
+
+// ── Alias keyword misparse ──────────────────────────────────────
+
+#[test]
+fn idempotent_var_named_alias() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure DoSomething;
+var
+  I: Integer;
+  JoinIdx: Integer;
+  F: TFieldDef;
+  LookupSql: RawUtf8;
+  Alias: RawUtf8;
+  FirstOwnerKey: RawUtf8;
+  FirstLookupKey: RawUtf8;
+  FirstResultField: RawUtf8;
+begin
+end;
+end.
+";
+    idempotency_check(source);
+}
+
+#[test]
+fn idempotent_var_named_alias_first_in_block() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure Foo;
+var
+  Alias: Integer;
+  X: Integer;
+begin
+end;
+end.
+";
+    idempotency_check(source);
+}
+
+#[test]
+fn idempotent_var_named_alias_lowercase() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure Foo;
+var
+  X: Integer;
+  alias: String;
+  Y: Boolean;
+begin
+end;
+end.
+";
+    idempotency_check(source);
+}
+
+#[test]
+fn var_named_alias_not_merged_with_previous() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure Foo;
+var
+  LookupSql: RawUtf8;
+  Alias: RawUtf8;
+begin
+end;
+end.
+";
+    let formatted = format_source_helper(source);
+    assert!(
+        formatted.contains("LookupSql: RawUtf8;\n"),
+        "LookupSql should end its own line. Got:\n{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("Alias: RawUtf8;\n"),
+        "Alias should be on its own line. Got:\n{}",
+        formatted
+    );
+}

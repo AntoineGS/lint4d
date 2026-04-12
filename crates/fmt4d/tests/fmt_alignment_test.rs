@@ -734,3 +734,115 @@ end.
         "Complex type with /// comment should be idempotent"
     );
 }
+
+// ── Alias keyword misparse ─────────────────────────────────────────
+
+#[test]
+fn var_named_alias_aligned_separate_lines() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure DoSomething;
+var
+  I: Integer;
+  JoinIdx: Integer;
+  F: TFieldDef;
+  LookupSql: RawUtf8;
+  Alias: RawUtf8;
+  FirstOwnerKey: RawUtf8;
+  FirstLookupKey: RawUtf8;
+  FirstResultField: RawUtf8;
+begin
+end;
+end.
+";
+    let result = format_aligned(source);
+    assert!(
+        result.contains("LookupSql       : RawUtf8;\n"),
+        "LookupSql should end its own aligned line. Got:\n{}",
+        result
+    );
+    assert!(
+        result.contains("Alias           : RawUtf8;\n"),
+        "Alias should be on its own aligned line. Got:\n{}",
+        result
+    );
+}
+
+#[test]
+fn var_named_alias_aligned_idempotent() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure DoSomething;
+var
+  I: Integer;
+  JoinIdx: Integer;
+  F: TFieldDef;
+  LookupSql: RawUtf8;
+  Alias: RawUtf8;
+  FirstOwnerKey: RawUtf8;
+  FirstLookupKey: RawUtf8;
+  FirstResultField: RawUtf8;
+begin
+end;
+end.
+";
+    let first = format_aligned(source);
+    let second = format_aligned(&first);
+    assert_eq!(first, second, "Aligned var with Alias should be idempotent");
+}
+
+#[test]
+fn var_named_alias_first_in_block_aligned() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure Foo;
+var
+  Alias: Integer;
+  X: Integer;
+begin
+end;
+end.
+";
+    let result = format_aligned(source);
+    assert!(
+        result.contains("Alias: Integer;\n"),
+        "Alias as first var should be on its own line. Got:\n{}",
+        result
+    );
+    let second = format_aligned(&result);
+    assert_eq!(result, second, "Alias-first aligned should be idempotent");
+}
+
+#[test]
+fn var_named_alias_lowercase_aligned() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure Foo;
+var
+  X: Integer;
+  alias: String;
+  Y: Boolean;
+begin
+end;
+end.
+";
+    let result = format_aligned(source);
+    assert!(
+        result.contains("alias: String;\n"),
+        "lowercase alias should be on its own line. Got:\n{}",
+        result
+    );
+    let second = format_aligned(&result);
+    assert_eq!(
+        result, second,
+        "lowercase alias aligned should be idempotent"
+    );
+}

@@ -901,6 +901,14 @@ impl<'a> DocBuilder<'a> {
 
         // No commas → no internal break needed.
         if !children.iter().any(|c| c.kind() == K::COMMA) {
+            // Fix alias keyword misparse: if a declVar has a procAttribute
+            // child whose first child is kAlias, the parser incorrectly
+            // merged two declarations.  Split them onto separate lines.
+            if node.kind() == K::DECL_VAR {
+                if let Some(doc) = self.build_alias_misparse_split(node, &children) {
+                    return doc;
+                }
+            }
             return self.build_children(node);
         }
 
@@ -971,6 +979,54 @@ impl<'a> DocBuilder<'a> {
             doc::concat(ident_parts),
             doc::concat(suffix_docs),
         ]))
+    }
+
+    /// Handle the alias keyword misparse for non-alignment mode.
+    ///
+    /// When a `declVar` contains a `procAttribute` starting with `kAlias`,
+    /// the parser has incorrectly merged two variable declarations.  Render
+    /// the original declaration up to the first `;`, then emit a `Hardline`
+    /// and render the alias portion as a separate declaration.
+    fn build_alias_misparse_split(&self, _node: Node<'a>, children: &[Node<'a>]) -> Option<Doc> {
+        let proc_attr_idx = children
+            .iter()
+            .position(|c| c.kind() == K::PROC_ATTRIBUTE)?;
+        let proc_attr = children[proc_attr_idx];
+        let attr_children = self.code_children(proc_attr);
+        if attr_children.is_empty() || attr_children[0].kind() != "kAlias" {
+            return None;
+        }
+
+        // Render the main declaration (up to and including the first semicolon).
+        let first_semi_idx = children.iter().position(|c| c.kind() == K::SEMICOLON)?;
+        let main_parts: Vec<Doc> = children[..=first_semi_idx]
+            .iter()
+            .map(|c| self.doc_for_node(*c))
+            .collect();
+
+        let mut parts = vec![doc::concat(main_parts)];
+
+        // Reconstruct the alias as a separate declaration on the next line.
+        let alias_text = self.node_text(attr_children[0]);
+        let name_doc = doc::token(alias_text, K::IDENTIFIER, K::DECL_VAR);
+
+        let colon_in_attr = attr_children.iter().position(|c| c.kind() == K::COLON);
+        if let Some(ci) = colon_in_attr {
+            let mut alias_parts = vec![name_doc];
+            for c in &attr_children[ci..] {
+                alias_parts.push(self.doc_for_node(*c));
+            }
+            // Add the semicolon that follows the procAttribute.
+            if let Some(semi) = children.get(proc_attr_idx + 1) {
+                if semi.kind() == K::SEMICOLON {
+                    alias_parts.push(self.doc_for_node(*semi));
+                }
+            }
+            parts.push(Doc::Hardline);
+            parts.push(doc::concat(alias_parts));
+        }
+
+        Some(doc::concat(parts))
     }
 
     fn build_args(&self, node: Node<'a>) -> Doc {

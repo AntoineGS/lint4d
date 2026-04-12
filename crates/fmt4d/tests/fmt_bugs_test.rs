@@ -3571,3 +3571,18 @@ fn break_long_line_with_utf8_near_boundary_does_not_panic() {
     // The assertion is "no panic".
     let _ = format_source(&src);
 }
+
+#[test]
+fn inverted_paren_ranges_do_not_panic() {
+    // Regression guard for SEC-H5 inverted-range case: tree-sitter
+    // error-recovery can produce a closing_paren node whose start_byte
+    // precedes the opening_paren's end_byte on sources like
+    // `procedure Foo);` — a stray `)` before its matching `(`.
+    //
+    // The byte-range guard in build_delimited_list must fall back
+    // to the normal child-walk rather than slice-panic.
+    let src = "unit T;\ninterface\nimplementation\nprocedure Foo);\nbegin end;\nend.\n";
+    // The assertion is "no panic". Output correctness under error
+    // recovery is not guaranteed — the input is already invalid.
+    let _ = format_source(src);
+}

@@ -288,6 +288,58 @@ fn uses_groups_with_external_paths() {
     );
 }
 
+#[test]
+fn project_paths_override_external_paths() {
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    // Utils.pas exists in BOTH external and project paths.
+    let vendor = dir.path().join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(vendor.join("Utils.pas"), "unit Utils;").unwrap();
+    std::fs::write(vendor.join("SuperObject.pas"), "unit SuperObject;").unwrap();
+
+    let common = dir.path().join("Common");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::write(common.join("Utils.pas"), "unit Utils;").unwrap();
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.group = true;
+    config.uses.external_paths = vec!["vendor".to_string()];
+    config.uses.project_paths = vec!["Common".to_string()];
+    config.project_root = Some(dir.path().to_path_buf());
+
+    // Build external set, then subtract project units (mirrors main.rs logic).
+    let mut external_units =
+        fmt4d::uses::scan_external_paths(dir.path(), &config.uses.external_paths);
+    let project_units = fmt4d::uses::scan_external_paths(dir.path(), &config.uses.project_paths);
+    external_units.retain(|u| !project_units.contains(u));
+
+    let source =
+        "unit T;\ninterface\nuses\n  SuperObject, Utils, System.SysUtils;\nimplementation\nend.\n";
+    let result =
+        fmt4d::formatter::format_source(source.as_bytes(), &info, &config, &external_units)
+            .unwrap();
+
+    // Utils should be in the project group (last), not external.
+    // SuperObject should remain external.
+    let lines: Vec<&str> = result.lines().collect();
+    let utils_line = lines
+        .iter()
+        .position(|l| l.trim().starts_with("Utils"))
+        .unwrap();
+    let super_line = lines
+        .iter()
+        .position(|l| l.trim().starts_with("SuperObject"))
+        .unwrap();
+    assert!(
+        utils_line > super_line,
+        "Utils should be in project group (after external SuperObject). Got:\n{}",
+        result
+    );
+}
+
 // ── Cross-cutting integration tests ──────────────────────────────
 
 #[test]

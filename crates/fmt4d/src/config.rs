@@ -100,6 +100,7 @@ pub struct UsesConfig {
     pub group: bool,
     pub external_paths: Vec<String>,
     pub external_prefixes: Vec<String>,
+    pub project_paths: Vec<String>,
 }
 
 impl Default for UsesConfig {
@@ -109,6 +110,7 @@ impl Default for UsesConfig {
             group: false,
             external_paths: Vec::new(),
             external_prefixes: Vec::new(),
+            project_paths: Vec::new(),
         }
     }
 }
@@ -314,6 +316,7 @@ sort = true
 group = true
 external_paths = ["vendor", "lib/third-party"]
 external_prefixes = ["Spring", "Neon"]
+project_paths = ["src", "Common"]
 "#;
         let config = FmtConfig::from_toml(toml).unwrap();
         assert_eq!(
@@ -321,6 +324,7 @@ external_prefixes = ["Spring", "Neon"]
             vec!["vendor", "lib/third-party"]
         );
         assert_eq!(config.uses.external_prefixes, vec!["Spring", "Neon"]);
+        assert_eq!(config.uses.project_paths, vec!["src", "Common"]);
     }
 
     #[test]

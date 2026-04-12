@@ -196,6 +196,20 @@ fn scan_break_positions(bytes: &[u8]) -> (Vec<usize>, Vec<usize>) {
     (preferred, fallback)
 }
 
+/// Round `bp` forward to the nearest UTF-8 char boundary in `line`.
+///
+/// Returns `line.len()` if no boundary is reachable without exceeding it.
+/// This is the defense against SEC-H5: `scan_break_positions` operates on
+/// raw bytes and can return offsets that land inside a multi-byte sequence.
+/// Slicing at those offsets would panic with
+/// "byte index N is not a char boundary".
+fn round_up_to_char_boundary(line: &str, mut bp: usize) -> usize {
+    while bp <= line.len() && !line.is_char_boundary(bp) {
+        bp += 1;
+    }
+    bp.min(line.len())
+}
+
 /// Outcome of [`check_parse_errors`]: either the file parses cleanly or it
 /// has at least one tree-sitter diagnostic (which would have caused
 /// `format_source` to return the original source unchanged).
@@ -260,7 +274,13 @@ fn break_single_line(line: &str, max_length: usize, indent_size: usize) -> Vec<S
         // Find the rightmost break point that keeps the first part <= max_length
         let (pref, fall) = scan_break_positions(remaining.as_bytes());
         let positions = if pref.is_empty() { fall } else { pref };
-        let best_bp = positions.iter().copied().rev().find(|&bp| bp <= max_length);
+        let best_bp = positions
+            .iter()
+            .copied()
+            // Round forward to the nearest char boundary (SEC-H5).
+            .map(|bp| round_up_to_char_boundary(&remaining, bp))
+            .rev()
+            .find(|&bp| bp <= max_length);
 
         if let Some(bp) = best_bp {
             let first_part = remaining[..bp].trim_end().to_string();

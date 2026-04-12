@@ -70,3 +70,26 @@ fn write_mode_does_not_clobber_symlink_target() {
         "symlink target was clobbered via evil.pas"
     );
 }
+
+#[test]
+fn wrong_type_in_fmt4d_toml_is_surfaced() {
+    // Regression guard for C1 / SEC-H3: malformed config must not silently
+    // fall back to defaults. A user who types `indent_size = "four"` (wrong
+    // type) must see an error, not a 80k-line reformat to defaults.
+    let dir = TempDir::new().unwrap();
+    let cfg = dir.path().join(".fmt4d.toml");
+    fs::write(&cfg, "[format]\nindent_size = \"four\"\n").unwrap();
+
+    let src = dir.path().join("T.pas");
+    fs::write(&src, b"unit T;\ninterface\nimplementation\nend.\n").unwrap();
+
+    Command::cargo_bin("fmt4d")
+        .unwrap()
+        .arg(src.to_str().unwrap())
+        .arg("--check")
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains(".fmt4d.toml").and(predicate::str::contains("indent_size")),
+        );
+}

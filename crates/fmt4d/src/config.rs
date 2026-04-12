@@ -388,6 +388,18 @@ enabled = true
     }
 
     #[test]
+    fn from_toml_wrong_type_returns_err() {
+        // SEC-H3: wrong type must error, not silently default.
+        let toml = "[format]\nindent_size = \"four\"\n";
+        let result = FmtConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "expected Err for wrong-type indent_size, got {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn parse_toml_alignment_partial() {
         let toml = r#"
 [format.alignment]

@@ -196,6 +196,37 @@ fn scan_break_positions(bytes: &[u8]) -> (Vec<usize>, Vec<usize>) {
     (preferred, fallback)
 }
 
+/// Outcome of [`check_parse_errors`]: either the file parses cleanly or it
+/// has at least one tree-sitter diagnostic (which would have caused
+/// `format_source` to return the original source unchanged).
+pub enum ParseOutcome {
+    Clean,
+    HasErrors(String),
+}
+
+/// Probe a source file for tree-sitter parse errors without formatting it.
+///
+/// Used by the CLI to distinguish "nothing to do" from "file is broken"
+/// — the former exits 0, the latter exits EXIT_ERROR. See review
+/// SEC-CRIT-3.
+pub fn check_parse_errors(source: &[u8], info: &FileInfo) -> Result<ParseOutcome, String> {
+    let (_tree, diagnostics) =
+        pascal_core::parser::parse_file(info, source).map_err(|e| e.to_string())?;
+    if diagnostics.is_empty() {
+        Ok(ParseOutcome::Clean)
+    } else {
+        let first = diagnostics
+            .first()
+            .map(|d| format!("{:?}", d))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        Ok(ParseOutcome::HasErrors(format!(
+            "parse error at {}: {}",
+            info.path.display(),
+            first
+        )))
+    }
+}
+
 /// Break a single long line into multiple lines.
 ///
 /// Prefers `;`/`,` break positions over `+` positions to avoid

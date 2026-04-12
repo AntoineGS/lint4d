@@ -247,6 +247,21 @@ fn run_files(cli: &Cli) -> i32 {
             }
         };
 
+        // Probe for parse errors before formatting. See SEC-CRIT-3.
+        match fmt4d::formatter::check_parse_errors(&source, file_info) {
+            Ok(fmt4d::formatter::ParseOutcome::Clean) => {}
+            Ok(fmt4d::formatter::ParseOutcome::HasErrors(msg)) => {
+                eprintln!("{}", msg);
+                had_errors.store(true, Ordering::Relaxed);
+                return;
+            }
+            Err(e) => {
+                eprintln!("Error parsing {}: {}", file_info.path.display(), e);
+                had_errors.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+
         // Use `format_bytes` so the on-disk encoding of legacy Latin-1 /
         // Windows-1252 sources is preserved on write. Comparing the raw
         // byte sequences means a file that doesn't actually change (in its

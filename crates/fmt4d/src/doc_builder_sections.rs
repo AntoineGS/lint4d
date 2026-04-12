@@ -3,7 +3,7 @@ use crate::doc_builder::DocBuilder;
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
-impl<'a> DocBuilder<'a> {
+impl DocBuilder<'_> {
     pub(crate) fn build_unit(&self, node: Node) -> Doc {
         let children = self.code_children(node);
         let mut parts = Vec::new();

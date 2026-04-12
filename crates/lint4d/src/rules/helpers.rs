@@ -430,7 +430,7 @@ pub fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
 /// Iterate children of `node`, transparently flattening any `ppBlock`
 /// wrappers so callers see the same children as if no directives existed.
 /// Skips `ppIf`, `ppElse`, `ppEndIf` directive nodes within ppBlocks.
-pub fn effective_children<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+pub fn effective_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut result = Vec::new();
     for child in node.children(&mut node.walk()) {
         if child.kind() == K::PP_BLOCK {

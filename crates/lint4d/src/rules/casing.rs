@@ -112,8 +112,8 @@ fn check_proc_usages(def_proc: Node, source: &[u8], scopes: &Scopes, ctx: &mut L
 
 /// Walk all nodes under `node`, checking identifier usages.
 /// For nested `defProc`/`lambda`, recurse with updated scopes.
-fn walk_and_check<'a>(
-    node: Node<'a>,
+fn walk_and_check(
+    node: Node<'_>,
     source: &[u8],
     scopes: &Scopes,
     method_scope: &HashMap<String, String>,

@@ -83,7 +83,7 @@ implementation
 end."#;
     let map = build_map_from_source(source);
     assert_eq!(map.file.get("maxsize"), Some(&"MAX_SIZE".to_string()));
-    assert!(map.file.get("already_good").is_none());
+    assert!(!map.file.contains_key("already_good"));
 }
 
 #[test]
@@ -178,7 +178,7 @@ type
 implementation
 end."#;
     let map = build_map_from_source(source);
-    assert!(map.file.get("myclass").is_none());
+    assert!(!map.file.contains_key("myclass"));
 }
 
 #[test]

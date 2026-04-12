@@ -6,7 +6,6 @@ fn print_tree(node: tree_sitter::Node, depth: usize, source: &[u8]) {
     let start = node.start_byte();
     let end = (node.end_byte()).min(start + 50);
     let text = std::str::from_utf8(&source[start..end]).unwrap_or("?");
-    let text = text.replace('\n', "\n");
     println!("{}[{}] {}: '{}'", indent, node.id(), node.kind(), text);
 
     let mut cursor = node.walk();

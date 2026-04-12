@@ -16,8 +16,10 @@ fn format_source(source: &str) -> String {
 
 fn format_source_with_max(source: &str, max_line_length: usize) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let mut config = fmt4d::config::FmtConfig::default();
-    config.max_line_length = max_line_length;
+    let config = fmt4d::config::FmtConfig {
+        max_line_length,
+        ..fmt4d::config::FmtConfig::default()
+    };
     fmt4d::formatter::format_source(
         source.as_bytes(),
         &info,

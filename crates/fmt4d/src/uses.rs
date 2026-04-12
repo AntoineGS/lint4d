@@ -652,9 +652,10 @@ mod tests {
     use crate::config::UsesConfig;
 
     fn default_config() -> UsesConfig {
-        let mut cfg = UsesConfig::default();
-        cfg.group = true;
-        cfg
+        UsesConfig {
+            group: true,
+            ..UsesConfig::default()
+        }
     }
 
     #[test]
@@ -1092,9 +1093,11 @@ mod tests {
         // After sort (no grouping here): Classes, SysUtils
         // The IfDefBlock anchor is SysUtils (preceded it in original list)
         // So result should be: Classes, SysUtils, {IFDEF block}
-        let mut config = UsesConfig::default();
-        config.sort = true;
-        config.group = false;
+        let config = UsesConfig {
+            sort: true,
+            group: false,
+            ..UsesConfig::default()
+        };
 
         let block = IfDefBlock {
             if_branch: CondBranch {
@@ -1134,9 +1137,11 @@ mod tests {
     #[test]
     fn format_items_directive_at_start_stays_first() {
         // Directive with anchor=None should stay at the very beginning.
-        let mut config = UsesConfig::default();
-        config.sort = true;
-        config.group = false;
+        let config = UsesConfig {
+            sort: true,
+            group: false,
+            ..UsesConfig::default()
+        };
 
         let items = vec![
             UsesItem::Directive("{$I compilers.inc}".to_string()),
@@ -1161,9 +1166,11 @@ mod tests {
         // SysUtils, {$I inc}, Classes
         // After sort: Classes, SysUtils
         // Directive anchor = SysUtils → inserted after SysUtils
-        let mut config = UsesConfig::default();
-        config.sort = true;
-        config.group = false;
+        let config = UsesConfig {
+            sort: true,
+            group: false,
+            ..UsesConfig::default()
+        };
 
         let items = vec![
             UsesItem::Unit("SysUtils".to_string()),
@@ -1312,9 +1319,11 @@ mod tests {
     #[test]
     fn ifdef_no_section_placement_without_grouping() {
         // Grouping disabled → ifdef block stays pinned (no section placement).
-        let mut config = UsesConfig::default();
-        config.sort = true;
-        config.group = false;
+        let config = UsesConfig {
+            sort: true,
+            group: false,
+            ..UsesConfig::default()
+        };
 
         let block = IfDefBlock {
             if_branch: CondBranch {

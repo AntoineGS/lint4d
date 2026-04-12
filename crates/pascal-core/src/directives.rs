@@ -213,7 +213,7 @@ mod unit_tests {
 
     #[test]
     fn extract_rule_id_strips_em_dash_reason() {
-        let input = format!(" my-rule \u{2014} some reason");
+        let input = " my-rule \u{2014} some reason".to_string();
         assert_eq!(extract_rule_id(&input), Some("my-rule".to_string()));
     }
 

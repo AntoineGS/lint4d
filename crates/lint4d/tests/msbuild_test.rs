@@ -109,8 +109,8 @@ fn build_msbuild_command_includes_overrides() {
     use lint4d::discovery::msbuild::build_msbuild_command;
 
     let cmd = build_msbuild_command(
-        &PathBuf::from("C:\\BDS\\bin\\rsvars.bat").as_path(),
-        &PathBuf::from("C:\\tmp\\lint4d.targets").as_path(),
+        PathBuf::from("C:\\BDS\\bin\\rsvars.bat").as_path(),
+        PathBuf::from("C:\\tmp\\lint4d.targets").as_path(),
         Some("Win64"),
         Some("Release"),
     );
@@ -124,8 +124,8 @@ fn build_msbuild_command_without_overrides() {
     use lint4d::discovery::msbuild::build_msbuild_command;
 
     let cmd = build_msbuild_command(
-        &PathBuf::from("C:\\BDS\\bin\\rsvars.bat").as_path(),
-        &PathBuf::from("C:\\tmp\\lint4d.targets").as_path(),
+        PathBuf::from("C:\\BDS\\bin\\rsvars.bat").as_path(),
+        PathBuf::from("C:\\tmp\\lint4d.targets").as_path(),
         None,
         None,
     );

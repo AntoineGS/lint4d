@@ -88,14 +88,14 @@ fn spacing_roundtrip_safe() {
 
 #[test]
 fn spacing_adds_space_around_assign() {
-    let result = format_source(&"unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  x:Integer;\nbegin\n  x:=1;\nend;\nend.\n");
+    let result = format_source("unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  x:Integer;\nbegin\n  x:=1;\nend;\nend.\n");
     assert!(result.contains("x := 1"), "should add spaces around :=");
 }
 
 #[test]
 fn spacing_adds_space_after_colon() {
     let result = format_source(
-        &"unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  x:Integer;\nbegin\nend;\nend.\n",
+        "unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  x:Integer;\nbegin\nend;\nend.\n",
     );
     assert!(
         result.contains("x: Integer"),
@@ -106,7 +106,7 @@ fn spacing_adds_space_after_colon() {
 #[test]
 fn spacing_adds_space_after_comma() {
     let result = format_source(
-        &"unit T;\ninterface\nimplementation\nprocedure P;\nbegin\n  Foo(a,b,c);\nend;\nend.\n",
+        "unit T;\ninterface\nimplementation\nprocedure P;\nbegin\n  Foo(a,b,c);\nend;\nend.\n",
     );
     assert!(
         result.contains("Foo(a, b, c)"),
@@ -140,7 +140,7 @@ fn uses_roundtrip_safe() {
 
 #[test]
 fn uses_groups_system_units() {
-    let result = format_source(&"unit T;\ninterface\nuses\n  Forms, System.SysUtils, System.Classes;\nimplementation\nend.\n");
+    let result = format_source("unit T;\ninterface\nuses\n  Forms, System.SysUtils, System.Classes;\nimplementation\nend.\n");
     // All are core units — should be in one group, alphabetically sorted
     assert!(result.contains("  Forms,\n  System.Classes,\n  System.SysUtils;\n"));
 }
@@ -148,7 +148,7 @@ fn uses_groups_system_units() {
 #[test]
 fn uses_sorts_within_groups() {
     let result = format_source(
-        &"unit T;\ninterface\nuses\n  System.SysUtils, System.Classes;\nimplementation\nend.\n",
+        "unit T;\ninterface\nuses\n  System.SysUtils, System.Classes;\nimplementation\nend.\n",
     );
     // Both are core units, sorted alphabetically
     assert!(result.contains("  System.Classes,\n  System.SysUtils;\n"));

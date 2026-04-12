@@ -842,8 +842,10 @@ mod tests {
 
     #[test]
     fn render_group_breaks_when_overflow() {
-        let mut config = FmtConfig::default();
-        config.max_line_length = 5;
+        let config = FmtConfig {
+            max_line_length: 5,
+            ..FmtConfig::default()
+        };
         let doc = group(concat(vec![
             tok("aaa", K::IDENTIFIER, ""),
             Doc::Line,
@@ -855,8 +857,10 @@ mod tests {
 
     #[test]
     fn render_group_with_indent_on_break() {
-        let mut config = FmtConfig::default();
-        config.max_line_length = 5;
+        let config = FmtConfig {
+            max_line_length: 5,
+            ..FmtConfig::default()
+        };
         let doc = group(concat(vec![
             tok("aaa", K::IDENTIFIER, ""),
             indent(concat(vec![Doc::Line, tok("bbb", K::IDENTIFIER, "")])),
@@ -889,8 +893,10 @@ mod tests {
 
     #[test]
     fn render_if_break_broken() {
-        let mut config = FmtConfig::default();
-        config.max_line_length = 3;
+        let config = FmtConfig {
+            max_line_length: 3,
+            ..FmtConfig::default()
+        };
         let doc = group(concat(vec![
             tok("aa", K::IDENTIFIER, ""),
             if_break(Doc::Hardline, Doc::Raw(" ".into())),
@@ -919,8 +925,10 @@ mod tests {
     fn render_fill_greedy_break() {
         // With a narrow line, Fill should break greedily: pack as many
         // items as fit per line.
-        let mut config = FmtConfig::default();
-        config.max_line_length = 12;
+        let config = FmtConfig {
+            max_line_length: 12,
+            ..FmtConfig::default()
+        };
         let doc = concat(vec![
             tok("xx", K::IDENTIFIER, ""),
             indent(fill(vec![

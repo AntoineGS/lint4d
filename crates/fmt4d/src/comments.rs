@@ -152,7 +152,7 @@ mod tests {
 
         // The comment should be trailing on the `;` after `Test`
         let mut found_trailing = false;
-        for (_, comments) in &map.trailing {
+        for comments in map.trailing.values() {
             for c in comments {
                 if c.text.contains("this is a unit") {
                     found_trailing = true;
@@ -170,7 +170,7 @@ mod tests {
         let map = CommentMap::build(tree.root_node(), &bytes);
 
         let mut found_leading = false;
-        for (_, comments) in &map.leading {
+        for comments in map.leading.values() {
             for c in comments {
                 if c.text.contains("interface comment") {
                     found_leading = true;

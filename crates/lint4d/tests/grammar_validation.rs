@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 use tree_sitter::Parser;
-use tree_sitter_language::LanguageFn;
 use tree_sitter_pascal::LANGUAGE;
 
 fn parse_and_check_no_errors(fixture_path: &str) {
@@ -10,7 +9,7 @@ fn parse_and_check_no_errors(fixture_path: &str) {
         .unwrap_or_else(|e| panic!("Failed to read {}: {}", fixture_path, e));
 
     let mut parser = Parser::new();
-    let language = LanguageFn::from(LANGUAGE);
+    let language = LANGUAGE;
     parser
         .set_language(&language.into())
         .expect("Failed to set language");

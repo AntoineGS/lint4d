@@ -3508,3 +3508,17 @@ end.
         "short call with leading comment should stay on one line:\n{result}"
     );
 }
+
+#[test]
+fn deeply_nested_binary_chain_does_not_overflow() {
+    // Regression guard for SEC-H1: a 2000-operand `+` chain must not
+    // stack-overflow. Rust stack overflow is non-unwindable and kills
+    // the entire rayon run.
+    let chain = vec!["'a'"; 2000].join(" + ");
+    let src = format!(
+        "unit T;\ninterface\nimplementation\nprocedure P;\nvar s: string;\nbegin\n  s := {};\nend;\nend.\n",
+        chain
+    );
+    // Just running to completion without aborting is the assertion.
+    let _ = format_source(&src);
+}

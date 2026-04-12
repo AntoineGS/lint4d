@@ -1,0 +1,25 @@
+# Codecov configuration.
+# Docs: https://docs.codecov.com/docs/codecov-yaml
+
+codecov:
+  require_ci_to_pass: true
+  notify:
+    wait_for_ci: true
+
+coverage:
+  round: down
+  precision: 2
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 1%  # allow 1% regression without failing
+    patch:
+      default:
+        target: 80%
+        threshold: 0%  # every PR's new lines must hit 80%
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false

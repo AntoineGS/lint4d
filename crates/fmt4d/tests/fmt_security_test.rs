@@ -41,3 +41,32 @@ fn oversized_file_is_rejected_with_clear_message() {
                 .and(predicate::str::contains("too large").or(predicate::str::contains("skipp"))),
         );
 }
+
+#[cfg(unix)]
+#[test]
+fn write_mode_does_not_clobber_symlink_target() {
+    // Regression guard for SEC-CRIT-1 / SEC-CRIT-2 (symlink + TOCTOU).
+    // A .pas-named symlink pointing at an arbitrary file must NOT cause
+    // fs::write to follow the symlink and overwrite the target.
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let victim_path = dir.path().join("victim.txt");
+    let link_path = dir.path().join("evil.pas");
+
+    fs::write(&victim_path, b"SECRET CONTENT\n").unwrap();
+    symlink(&victim_path, &link_path).unwrap();
+
+    // Invoke fmt4d on the directory. Any exit code is acceptable — what
+    // matters is that the victim file is not modified.
+    let _ = Command::cargo_bin("fmt4d")
+        .unwrap()
+        .arg(dir.path().to_str().unwrap())
+        .assert();
+
+    let after = fs::read(&victim_path).unwrap();
+    assert_eq!(
+        after, b"SECRET CONTENT\n",
+        "symlink target was clobbered via evil.pas"
+    );
+}

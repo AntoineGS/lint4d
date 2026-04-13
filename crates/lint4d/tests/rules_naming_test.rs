@@ -1,5 +1,5 @@
 use lint4d::config::Config;
-use lint4d::engine::{run_lint, FileInfo};
+use lint4d::engine::{FileInfo, run_lint};
 use lint4d::rules::naming::{to_camel_case, to_pascal_case, to_upper_snake_case};
 use std::fs;
 use std::path::PathBuf;

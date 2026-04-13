@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use cfg_core::BlockId;
 use cfg_core::summary::ProcId;
 use cfg_core::types::Cfg;
-use cfg_core::BlockId;
 use pascal_core::node_kind as K;
-use petgraph::visit::EdgeRef;
 use petgraph::Direction;
+use petgraph::visit::EdgeRef;
 use tree_sitter::{Node, Tree};
 
 use crate::cfg::analysis::AnalysisContext;

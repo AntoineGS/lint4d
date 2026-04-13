@@ -226,11 +226,7 @@ impl Renderer {
                                     &mut last_k,
                                     &mut last_p,
                                 );
-                        if fits_both {
-                            Mode::Flat
-                        } else {
-                            Mode::Break
-                        }
+                        if fits_both { Mode::Flat } else { Mode::Break }
                     };
 
                     // Push remaining fill (processed after this pair).
@@ -340,7 +336,7 @@ impl Renderer {
             let max_cols = measured
                 .iter()
                 .zip(outliers.iter())
-                .filter(|(_, &is_outlier)| !is_outlier)
+                .filter(|&(_, &is_outlier)| !is_outlier)
                 .map(|((_, widths), _)| widths.len())
                 .max()
                 .unwrap_or(0);

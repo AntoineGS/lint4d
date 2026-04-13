@@ -107,11 +107,7 @@ fn collect_directives<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>
 fn find_prev_leaf<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<Node<'a>> {
     let target_start = target.start_byte();
     let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_start);
-    if idx > 0 {
-        Some(leaves[idx - 1])
-    } else {
-        None
-    }
+    if idx > 0 { Some(leaves[idx - 1]) } else { None }
 }
 
 /// Find the next non-extra node after `target`.

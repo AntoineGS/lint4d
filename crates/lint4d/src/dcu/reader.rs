@@ -1,5 +1,5 @@
-use crate::dcu::tags::DcuError;
 use crate::dcu::DcuVersion;
+use crate::dcu::tags::DcuError;
 
 pub struct DcuReader<'a> {
     data: &'a [u8],

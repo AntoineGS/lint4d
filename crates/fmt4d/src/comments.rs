@@ -105,11 +105,7 @@ fn find_prev_leaf_in<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<Node<'
     let target_start = target.start_byte();
     // Leaves are in source order; binary search for the insertion point.
     let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_start);
-    if idx > 0 {
-        Some(leaves[idx - 1])
-    } else {
-        None
-    }
+    if idx > 0 { Some(leaves[idx - 1]) } else { None }
 }
 
 /// Find the next non-extra, non-comment node after `target` using a pre-built index.

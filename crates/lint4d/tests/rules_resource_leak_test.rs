@@ -3,7 +3,7 @@ use lint4d::dcu::{
     DcuPlatform, DcuUnit, DcuVersion, FieldInfo, MethodInfo, MethodKind, ParamInfo, ParamModifier,
     ProjectContext, TypeInfo, TypeKind, TypeRef, Visibility,
 };
-use lint4d::engine::{run_lint, run_lint_with_context, FileInfo};
+use lint4d::engine::{FileInfo, run_lint, run_lint_with_context};
 use lint4d::rules::RuleRegistry;
 use std::fs;
 use std::path::PathBuf;

@@ -1,6 +1,6 @@
 use crate::types::{FileInfo, FileType};
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use std::path::{Path, PathBuf};
 
 /// Parse a Delphi `.dproj` (MSBuild XML) file and return the list of source

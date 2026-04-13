@@ -10,5 +10,5 @@ pub mod text;
 pub mod types;
 
 pub use directives::FormatOffRegion;
-pub use text::{decode_bytes, detect_encoding, encode_as, SourceEncoding};
+pub use text::{SourceEncoding, decode_bytes, detect_encoding, encode_as};
 pub use types::{Diagnostic, FileInfo, FileType, Severity};

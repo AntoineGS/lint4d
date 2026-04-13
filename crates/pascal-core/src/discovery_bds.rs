@@ -89,19 +89,15 @@ pub fn find_bds_root(bds_version: &str) -> Option<PathBuf> {
 /// Try the Windows registry for the BDS root directory.
 #[cfg(target_os = "windows")]
 fn find_bds_root_from_registry(bds_version: &str) -> Option<PathBuf> {
-    use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let key_path = format!("Software\\Embarcadero\\BDS\\{}", bds_version);
     let key = hkcu.open_subkey(&key_path).ok()?;
     let root_dir: String = key.get_value("RootDir").ok()?;
     let path = PathBuf::from(root_dir);
-    if path.is_dir() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.is_dir() { Some(path) } else { None }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -113,8 +109,8 @@ fn find_bds_root_from_registry(_bds_version: &str) -> Option<PathBuf> {
 /// valid `rsvars.bat`.
 #[cfg(target_os = "windows")]
 pub fn find_any_bds_root() -> Option<PathBuf> {
-    use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let bds_key = hkcu.open_subkey("Software\\Embarcadero\\BDS").ok()?;

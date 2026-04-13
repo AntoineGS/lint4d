@@ -22,7 +22,7 @@ opt-level = 3
 # ---- Shared package metadata (review BP-H8) ------------------------
 [workspace.package]
 version = "0.1.0"
-edition = "2021"  # Flip to "2024" in Phase F Task 2.
+edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/AntoineGS/lint4d"

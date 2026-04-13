@@ -5,8 +5,8 @@ use tree_sitter::Node;
 
 use crate::rules::helpers::node_text;
 use crate::rules::scope::{
-    collect_method_scope, extract_class_name, is_declaration_position, is_dot_rhs,
-    is_inside_inherited, is_inside_module_name, is_inside_typeref, Scopes,
+    Scopes, collect_method_scope, extract_class_name, is_declaration_position, is_dot_rhs,
+    is_inside_inherited, is_inside_module_name, is_inside_typeref,
 };
 
 use super::types::{FixConfig, ProcContext, RenameMap, TextEdit};

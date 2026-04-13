@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lint4d::config::Config;
-use lint4d::engine::{parse_file, run_lint, FileInfo};
+use lint4d::engine::{FileInfo, parse_file, run_lint};
 
 fn bench_lint_single_file(c: &mut Criterion) {
     let file = FileInfo::new("tests/fixtures/resource_leak/bad_unprotected.pas".into());

@@ -5,7 +5,7 @@ use crate::directive_map::DirectiveMap;
 use crate::doc_builder::DocBuilder;
 use crate::renderer::Renderer;
 use pascal_core::directives::parse_format_regions;
-use pascal_core::{detect_encoding, encode_as, FileInfo, SourceEncoding};
+use pascal_core::{FileInfo, SourceEncoding, detect_encoding, encode_as};
 use std::collections::HashSet;
 
 /// Format Delphi/Object Pascal source code.

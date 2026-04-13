@@ -1,9 +1,9 @@
+use crate::dcu::DcuUnit;
 use crate::dcu::const_add_info::skip_decl_const_add_info;
 use crate::dcu::decl_parser::read_decl_list_into;
 use crate::dcu::header::parse_unit_header;
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::*;
-use crate::dcu::DcuUnit;
 
 /// Parse a complete DCU file, extracting the unit name, version, platform,
 /// the list of imported unit names, and type declarations.

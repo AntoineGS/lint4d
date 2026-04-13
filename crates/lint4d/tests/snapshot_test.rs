@@ -1,5 +1,5 @@
 use lint4d::config::Config;
-use lint4d::engine::{run_lint, FileInfo};
+use lint4d::engine::{FileInfo, run_lint};
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;
 use std::fs;

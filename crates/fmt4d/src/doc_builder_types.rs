@@ -1,5 +1,5 @@
 use crate::doc::{self, Doc};
-use crate::doc_builder::{strip_trailing_hardline, DocBuilder};
+use crate::doc_builder::{DocBuilder, strip_trailing_hardline};
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 

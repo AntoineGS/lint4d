@@ -1,5 +1,5 @@
 use lint4d::config::Config;
-use lint4d::engine::{run_lint, FileInfo};
+use lint4d::engine::{FileInfo, run_lint};
 use std::path::PathBuf;
 
 // ─── field-not-freed ──────────────────────────────────────────────────────────

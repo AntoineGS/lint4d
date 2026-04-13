@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{CommandFactory, Parser};
-use lint4d::config::baseline::Baseline;
 use lint4d::config::Config;
+use lint4d::config::baseline::Baseline;
 use lint4d::discovery::discover_files;
 use lint4d::discovery::dproj::parse_dproj;
-use lint4d::engine::{run_lint_with_context, FileInfo, Severity};
+use lint4d::engine::{FileInfo, Severity, run_lint_with_context};
 use lint4d::fix::fix_file;
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;

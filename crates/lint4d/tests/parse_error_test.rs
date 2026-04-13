@@ -1,4 +1,4 @@
-use lint4d::engine::{parse_file, FileInfo, Severity};
+use lint4d::engine::{FileInfo, Severity, parse_file};
 use std::path::PathBuf;
 
 #[test]

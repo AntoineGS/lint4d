@@ -326,7 +326,7 @@ pub(crate) fn parse_class_def(
     let _ndx_fe = reader.read_uindex()?;
     let _prop_cnt = reader.read_uindex()?;
     let _b04 = reader.read_uindex()?; // D8+
-                                      // D2010+: BX3
+    // D2010+: BX3
     let _bx3 = reader.read_uindex()?;
     // ReadBeforeIntf: nothing for TClassDef (empty override)
     // ReadClassInterfaces:

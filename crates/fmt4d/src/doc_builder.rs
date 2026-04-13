@@ -2,8 +2,8 @@ use crate::comments::CommentMap;
 use crate::config::{FmtConfig, OperatorPosition};
 use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
-use pascal_core::node_kind as K;
 use pascal_core::FormatOffRegion;
+use pascal_core::node_kind as K;
 use std::collections::HashSet;
 use tree_sitter::Node;
 
@@ -1321,10 +1321,11 @@ impl<'a> DocBuilder<'a> {
         let binary_node = if node.kind() == K::EXPR_BINARY {
             node
         } else {
-            match node
-                .children(&mut node.walk())
-                .find(|c| c.kind() == K::EXPR_BINARY)
-            {
+            let mut cursor = node.walk();
+            let found = node
+                .children(&mut cursor)
+                .find(|c| c.kind() == K::EXPR_BINARY);
+            match found {
                 Some(bin) => bin,
                 None => return self.build_children(node),
             }

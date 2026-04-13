@@ -1,5 +1,5 @@
-use lint4d::dcu::reader::DcuReader;
 use lint4d::dcu::DcuVersion;
+use lint4d::dcu::reader::DcuReader;
 
 #[test]
 fn read_byte_returns_byte_and_advances() {

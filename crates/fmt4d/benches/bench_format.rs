@@ -2,7 +2,7 @@
 //! fixes. This is NOT a full benchmark suite — the full suite is Phase
 //! E/F work. Just enough to see numbers move when PERF-C1/C2/C3 land.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use fmt4d::config::FmtConfig;
 use fmt4d::formatter::format_source;
 use pascal_core::FileInfo;

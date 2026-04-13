@@ -43,10 +43,10 @@ fn discovers_files_recursively() {
 #[test]
 fn excludes_matching_patterns() {
     let dir = TempDir::new().unwrap();
-    let gen = dir.path().join("generated");
-    fs::create_dir(&gen).unwrap();
+    let gen_dir = dir.path().join("generated");
+    fs::create_dir(&gen_dir).unwrap();
     fs::write(dir.path().join("Unit1.pas"), "unit Unit1;").unwrap();
-    fs::write(gen.join("Generated.pas"), "unit Generated;").unwrap();
+    fs::write(gen_dir.join("Generated.pas"), "unit Generated;").unwrap();
 
     let files = discover_files(&[dir.path().to_path_buf()], &["generated/**".to_string()]).unwrap();
     assert_eq!(files.len(), 1);

@@ -272,7 +272,7 @@ fn call_has_non_nil_args(call_node: Node, source: &[u8]) -> bool {
             // Skip punctuation and whitespace nodes
             match child.kind() {
                 K::K_OPEN | K::K_CLOSE | K::K_COMMA | K::OPEN_PAREN | K::CLOSE_PAREN | K::COMMA => {
-                    continue
+                    continue;
                 }
                 _ => {}
             }
@@ -486,8 +486,7 @@ mod effective_children_tests {
 
     #[test]
     fn flattens_ppblock_in_var_section() {
-        let source =
-            "unit T;\ninterface\nvar\n  a: integer;\n  {$IFDEF X}\n  b: string;\n  {$ENDIF}\nimplementation\nend.\n";
+        let source = "unit T;\ninterface\nvar\n  a: integer;\n  {$IFDEF X}\n  b: string;\n  {$ENDIF}\nimplementation\nend.\n";
         let (tree, _bytes) = parse(source);
         let root = tree.root_node();
         // Navigate: root -> unit -> interface -> declVars

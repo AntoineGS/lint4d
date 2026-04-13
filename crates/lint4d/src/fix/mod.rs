@@ -7,7 +7,7 @@ pub use types::RenameMap;
 
 use crate::config::Config;
 use crate::engine::suppress::parse_suppressions;
-use crate::engine::{parse_file, FileInfo, FileType};
+use crate::engine::{FileInfo, FileType, parse_file};
 use crate::rules::scope::collect_file_scope;
 
 use apply::{apply_edits, collect_edits};

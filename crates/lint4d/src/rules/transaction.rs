@@ -5,7 +5,7 @@ use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
 use cfg_core::types::Cfg;
-use cfg_pascal::calls::{lookup_transaction_method, TransactionCallKind, TransactionOp};
+use cfg_pascal::calls::{TransactionCallKind, TransactionOp, lookup_transaction_method};
 
 use crate::cfg::analysis::AnalysisContext;
 use crate::dcu::ProjectContext;

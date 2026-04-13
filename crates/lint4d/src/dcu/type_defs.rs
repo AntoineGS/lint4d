@@ -1,9 +1,9 @@
+use crate::dcu::DcuVersion;
 use crate::dcu::class_parser::parse_class_def;
 use crate::dcu::decl_parser::read_decl_list;
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::*;
 use crate::dcu::types::fix_tag;
-use crate::dcu::DcuVersion;
 
 // --- Type definition skippers ---
 // Skip Rec entries (type definitions) in the declaration list.

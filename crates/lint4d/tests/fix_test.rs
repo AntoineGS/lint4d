@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use lint4d::config::Config;
 use lint4d::engine::suppress::parse_suppressions;
-use lint4d::engine::{parse_file, run_lint, FileInfo};
+use lint4d::engine::{FileInfo, parse_file, run_lint};
 use lint4d::fix::{build_rename_map, fix_file};
 
 fn build_map_from_source(source: &str) -> lint4d::fix::RenameMap {
@@ -664,7 +664,7 @@ fn fixture_local_variable_fix() {
         "ACTUAL:\n{fixed}"
     );
     assert!(fixed.contains("x: Integer;")); // single-char exempt
-                                            // Parameters should also be renamed
+    // Parameters should also be renamed
     assert!(fixed.contains("BadParam: Integer"), "ACTUAL:\n{fixed}");
     assert!(fixed.contains("AnotherParam: string"), "ACTUAL:\n{fixed}");
     // Usages of renamed parameters should also be updated

@@ -46,6 +46,7 @@ pub const DECL_PROC: &str = "declProc";
 pub const DECL_ENUM: &str = "declEnum";
 pub const DECL_PROP: &str = "declProp";
 pub const DEF_PROC: &str = "defProc";
+pub const ARR_INITIALIZER: &str = "arrInitializer";
 
 // ── Expression nodes ────────────────────────────────────────────────
 

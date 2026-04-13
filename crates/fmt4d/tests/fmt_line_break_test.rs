@@ -209,6 +209,44 @@ end.
 }
 
 #[test]
+fn long_const_array_initializer_breaks_at_commas() {
+    // Regression: `const FOO: array[...] of T = (a, b, c, ...)` was
+    // falling through to build_children because arrInitializer was
+    // unhandled, so the literal list never got wrapped in a Group
+    // and overflowed the budget.
+    let src = "\
+unit T;
+implementation
+const
+  EXCLUDED: array[0..7] of RawUtf8 = ('PIVOTSTATES', 'USERBLOB', 'SKINS', 'REPORTS', 'SFDOCUMENT', 'SFDOCUMENT_HTML_AUDIT', 'QUERYLOG', 'SFLOG');
+end.
+";
+    let result = format_source_with_max(src, 120);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn short_const_array_initializer_stays_on_one_line() {
+    // Counterpart: small array initializers must stay flat.
+    let src = "\
+unit T;
+implementation
+const
+  FLAGS: array[0..2] of RawUtf8 = ('A', 'B', 'C');
+end.
+";
+    let result = format_source_with_max(src, 120);
+    let arr_line = result.lines().find(|l| l.contains("FLAGS"));
+    assert!(arr_line.is_some(), "array not found:\n{}", result);
+    assert!(
+        arr_line.unwrap().contains("('A', 'B', 'C')"),
+        "short array initializer should stay flat:\n{}",
+        arr_line.unwrap()
+    );
+}
+
+#[test]
 fn function_return_type_fits_stays_on_one_line() {
     // Counterpart to the regression above: when the full line (params
     // *plus* return type) fits within the budget, the signature should

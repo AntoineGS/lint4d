@@ -159,6 +159,7 @@ impl<'a> DocBuilder<'a> {
             K::EXPR_CALL => self.build_call(node),
             K::EXPR_BRACKETS => self.build_bracket_list(node),
             K::DECL_ENUM => self.build_paren_list(node, K::COMMA),
+            K::ARR_INITIALIZER => self.build_paren_list(node, K::COMMA),
             K::RTTI_ATTRIBUTES => self.build_rtti_attributes(node),
             K::PP_BLOCK => self.build_pp_block(node),
             _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),

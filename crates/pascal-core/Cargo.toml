@@ -1,7 +1,12 @@
 [package]
 name = "pascal-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Shared parsing and discovery infrastructure for Delphi/Object Pascal tools"
 
 [dependencies]
@@ -19,5 +24,5 @@ winreg = "0.52"
 [dev-dependencies]
 tempfile = "3"
 
-[lints.rust]
-warnings = "deny"
+[lints]
+workspace = true

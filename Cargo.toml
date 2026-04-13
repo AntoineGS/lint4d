@@ -5,3 +5,55 @@ members = [
     "crates/fmt4d",
 ]
 resolver = "2"
+
+# ---- Release profile (review BP-H7 / CI-H2) ------------------------
+# Without this, release binaries don't use LTO or stripping and are
+# ~40% larger and ~15% slower than necessary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+
+# Optimize third-party deps in dev builds so incremental edits stay fast.
+[profile.dev.package."*"]
+opt-level = 3
+
+# ---- Shared package metadata (review BP-H8) ------------------------
+[workspace.package]
+version = "0.1.0"
+edition = "2021"  # Flip to "2024" in Phase F Task 2.
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AntoineGS/lint4d"
+homepage = "https://github.com/AntoineGS/lint4d"
+authors = ["Antoine Gaudreau Simard"]
+
+# ---- Workspace lints (review BP-H3, BP-H4) -------------------------
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+# pedantic is temporarily set to allow pending Phase F cleanup; the full
+# subset of allows below will become active when pedantic is re-enabled.
+pedantic = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_sign_loss = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+# Restriction lints — currently allow because CI uses `-D warnings`, so
+# warn would block the pipeline. Re-tighten to "warn" once test code is
+# annotated with local allows in Phase F.
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+todo = "allow"
+unimplemented = "allow"
+# Hard-deny: dbg! must never land in committed code.
+dbg_macro = "deny"

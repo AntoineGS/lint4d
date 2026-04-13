@@ -1,8 +1,15 @@
 [package]
 name = "fmt4d"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "An opinionated Delphi/Object Pascal code formatter"
+keywords = ["delphi", "pascal", "formatter", "lint", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "fmt4d"
@@ -28,8 +35,8 @@ predicates = "3"
 tempfile = "3"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
-[lints.rust]
-warnings = "deny"
+[lints]
+workspace = true
 
 [[bench]]
 name = "bench_format"

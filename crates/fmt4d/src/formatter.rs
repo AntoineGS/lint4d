@@ -15,8 +15,8 @@ use std::collections::HashSet;
 /// (Latin-1 / Windows-1252), the bytes are decoded losslessly by
 /// [`pascal_core::decode_bytes`] at the boundaries that need text.
 ///
-/// If `source` has parse errors, the original text is returned unchanged
-/// (decoded as text so callers get a [`String`] regardless of input encoding).
+/// If `source` has parse errors, returns [`crate::error::FmtError::Parse`]
+/// — the formatter will not rewrite a file whose AST it doesn't trust.
 ///
 /// **For disk I/O, prefer [`format_bytes`]**, which also detects and preserves
 /// the source encoding on output.
@@ -28,17 +28,25 @@ pub fn format_source(
     info: &FileInfo,
     config: &FmtConfig,
     external_units: &HashSet<String>,
-) -> Result<String, String> {
+) -> crate::error::Result<String> {
     let has_bom = source.starts_with(&[0xEF, 0xBB, 0xBF]);
 
-    let (tree, diagnostics) =
-        pascal_core::parser::parse_file(info, source).map_err(|e| e.to_string())?;
+    let (tree, diagnostics) = pascal_core::parser::parse_file(info, source).map_err(|e| {
+        crate::error::FmtError::Parse {
+            path: info.path.clone(),
+            message: e.to_string(),
+        }
+    })?;
 
     if !diagnostics.is_empty() {
-        // Return the source unchanged on parse errors. Use the tolerant
-        // decoder so legacy Latin-1 sources don't hit a hard "invalid UTF-8"
-        // error here — they just pass through as text.
-        return Ok(pascal_core::decode_bytes(source).into_owned());
+        let first = diagnostics
+            .first()
+            .map(|d| format!("{:?}", d))
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(crate::error::FmtError::Parse {
+            path: info.path.clone(),
+            message: first,
+        });
     }
 
     let resolved_eol = config.end_of_line.resolve(source);
@@ -93,7 +101,7 @@ pub fn format_bytes(
     info: &FileInfo,
     config: &FmtConfig,
     external_units: &HashSet<String>,
-) -> Result<Vec<u8>, String> {
+) -> crate::error::Result<Vec<u8>> {
     let encoding = detect_encoding(source);
     let formatted = format_source(source, info, config, external_units)?;
     // Guard: for Latin-1 sources, strip any U+FEFF that format_source may
@@ -211,37 +219,6 @@ fn round_up_to_char_boundary(line: &str, mut bp: usize) -> usize {
         bp += 1;
     }
     bp.min(line.len())
-}
-
-/// Outcome of [`check_parse_errors`]: either the file parses cleanly or it
-/// has at least one tree-sitter diagnostic (which would have caused
-/// `format_source` to return the original source unchanged).
-pub enum ParseOutcome {
-    Clean,
-    HasErrors(String),
-}
-
-/// Probe a source file for tree-sitter parse errors without formatting it.
-///
-/// Used by the CLI to distinguish "nothing to do" from "file is broken"
-/// — the former exits 0, the latter exits EXIT_ERROR. See review
-/// SEC-CRIT-3.
-pub fn check_parse_errors(source: &[u8], info: &FileInfo) -> Result<ParseOutcome, String> {
-    let (_tree, diagnostics) =
-        pascal_core::parser::parse_file(info, source).map_err(|e| e.to_string())?;
-    if diagnostics.is_empty() {
-        Ok(ParseOutcome::Clean)
-    } else {
-        let first = diagnostics
-            .first()
-            .map(|d| format!("{:?}", d))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        Ok(ParseOutcome::HasErrors(format!(
-            "parse error at {}: {}",
-            info.path.display(),
-            first
-        )))
-    }
 }
 
 /// Break a single long line into multiple lines.

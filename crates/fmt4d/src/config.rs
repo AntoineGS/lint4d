@@ -176,9 +176,12 @@ struct RawFmtToml {
 }
 
 impl FmtConfig {
-    pub fn from_toml(toml_str: &str) -> Result<FmtConfig, String> {
+    pub fn from_toml(toml_str: &str) -> crate::error::Result<FmtConfig> {
         let raw: RawFmtToml =
-            toml::from_str(toml_str).map_err(|e| format!("Invalid fmt4d config: {}", e))?;
+            toml::from_str(toml_str).map_err(|e| crate::error::FmtError::Config {
+                path: PathBuf::from("<in-memory>"),
+                source: Box::new(e),
+            })?;
         Ok(raw.format.unwrap_or_default())
     }
 
@@ -188,11 +191,15 @@ impl FmtConfig {
     /// surface the error to the user rather than fall back to defaults —
     /// silent fallback can reformat an entire tree to defaults on a typo
     /// (review C1 / SEC-H3).
-    pub fn discover(start_dir: &Path) -> Result<FmtConfig, String> {
+    pub fn discover(start_dir: &Path) -> crate::error::Result<FmtConfig> {
         match pascal_core::config_discovery::find_config_file(start_dir, ".fmt4d.toml") {
             Some((content, dir)) => {
-                let mut config = Self::from_toml(&content)
-                    .map_err(|e| format!("Invalid .fmt4d.toml in {}: {}", dir.display(), e))?;
+                let raw: RawFmtToml =
+                    toml::from_str(&content).map_err(|e| crate::error::FmtError::Config {
+                        path: dir.join(".fmt4d.toml"),
+                        source: Box::new(e),
+                    })?;
+                let mut config = raw.format.unwrap_or_default();
                 config.project_root = Some(dir);
                 Ok(config)
             }

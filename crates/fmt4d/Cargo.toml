@@ -28,6 +28,7 @@ rayon = "1"
 walkdir = "2"
 owo-colors = { version = "4", features = ["supports-colors"] }
 tree-sitter = "0.24"
+thiserror = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

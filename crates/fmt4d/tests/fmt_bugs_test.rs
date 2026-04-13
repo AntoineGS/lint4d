@@ -3666,10 +3666,16 @@ fn inverted_paren_ranges_do_not_panic() {
     //
     // The byte-range guard in build_delimited_list must fall back
     // to the normal child-walk rather than slice-panic.
-    let src = "unit T;\ninterface\nimplementation\nprocedure Foo);\nbegin end;\nend.\n";
-    // The assertion is "no panic". Output correctness under error
-    // recovery is not guaranteed — the input is already invalid.
-    let _ = format_source(src);
+    //
+    // The input is intentionally invalid Pascal so format_source returns
+    // Err(FmtError::Parse) — the assertion is "no panic", not "Ok".
+    use pascal_core::FileInfo;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    let src = b"unit T;\ninterface\nimplementation\nprocedure Foo);\nbegin end;\nend.\n";
+    let info = FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let _ = fmt4d::formatter::format_source(src, &info, &config, &HashSet::new());
 }
 
 // ── Phase 1 L2: Latin-1 / non-ASCII string literals ────────────
@@ -3681,7 +3687,7 @@ fn latin1_string_literal_survives_formatting() {
     // Latin-1 string literal containing a byte that decodes to \r in
     // some mapping. This test uses UTF-8 non-ASCII inside a literal
     // (the common case) to guard against loss.
-    let src = "unit T;\ninterface\nimplementation\nconst\n  K = 'caf\u{00E9}';\nbegin end;\nend.\n";
+    let src = "unit T;\ninterface\nimplementation\nconst\n  K = 'caf\u{00E9}';\nend.\n";
     let result = format_source(src);
     assert!(
         result.contains("caf\u{00E9}"),
@@ -3737,6 +3743,12 @@ fn format_empty_file_returns_empty_string() {
 
 #[test]
 fn format_single_char_file_does_not_panic() {
-    // Edge case: 1-byte input.
-    let _ = format_source("x");
+    // Edge case: 1-byte input. The input is invalid Pascal so format_source
+    // returns Err(FmtError::Parse) — the assertion is "no panic", not "Ok".
+    use pascal_core::FileInfo;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    let info = FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let _ = fmt4d::formatter::format_source(b"x", &info, &config, &HashSet::new());
 }

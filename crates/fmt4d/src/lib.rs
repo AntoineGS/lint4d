@@ -1,6 +1,8 @@
 pub mod blank_lines;
 pub mod comments;
 pub mod config;
+pub mod error;
+pub use error::{FmtError, Result};
 pub mod directive_map;
 pub mod doc;
 pub mod doc_builder;

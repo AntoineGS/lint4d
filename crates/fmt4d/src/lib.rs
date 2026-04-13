@@ -9,6 +9,7 @@ pub mod doc_builder;
 pub mod doc_builder_alignment;
 pub mod doc_builder_blocks;
 pub mod doc_builder_control_flow;
+pub mod doc_builder_decls;
 pub mod doc_builder_expressions;
 pub mod doc_builder_sections;
 pub mod doc_builder_types;

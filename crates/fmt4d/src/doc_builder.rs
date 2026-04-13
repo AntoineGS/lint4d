@@ -23,7 +23,6 @@ pub(crate) enum BreakStyle {
 /// Converts a tree-sitter AST into a `Doc` IR tree. The key invariant is that
 /// `doc_for_node` is the ONLY way to process a node — it always injects
 /// leading and trailing comments around the node's body.
-#[allow(dead_code)]
 pub struct DocBuilder<'a> {
     pub(crate) source: &'a [u8],
     pub(crate) config: &'a FmtConfig,
@@ -390,19 +389,6 @@ impl<'a> DocBuilder<'a> {
                     _ => {}
                 }
             }
-        }
-        false
-    }
-
-    /// Return `true` if any ancestor of `node` has `ancestor_kind`.
-    #[allow(dead_code)]
-    pub(crate) fn is_ancestor(node: Node, ancestor_kind: &str) -> bool {
-        let mut current = node.parent();
-        while let Some(p) = current {
-            if p.kind() == ancestor_kind {
-                return true;
-            }
-            current = p.parent();
         }
         false
     }
@@ -1635,44 +1621,6 @@ fn has_newline_between(source: &[u8], prev: &BinarySegment, curr: &BinarySegment
     source[prev_end..curr_start].contains(&b'\n')
 }
 
-#[allow(dead_code)]
-pub(crate) fn split_at_and_or<'a>(nodes: &[Node<'a>]) -> Vec<BinarySegment<'a>> {
-    let mut segments: Vec<BinarySegment<'a>> = Vec::new();
-    let mut current_operand: Vec<Node<'a>> = Vec::new();
-
-    for node in nodes {
-        if node.kind() == K::K_AND || node.kind() == K::K_OR {
-            if !current_operand.is_empty() {
-                segments.push(BinarySegment {
-                    operator: None,
-                    operand: std::mem::take(&mut current_operand),
-                });
-            }
-            segments.push(BinarySegment {
-                operator: Some(*node),
-                operand: Vec::new(),
-            });
-        } else if let Some(last_seg) = segments.last_mut() {
-            if last_seg.operator.is_some() && last_seg.operand.is_empty() {
-                last_seg.operand.push(*node);
-            } else {
-                current_operand.push(*node);
-            }
-        } else {
-            current_operand.push(*node);
-        }
-    }
-
-    if !current_operand.is_empty() {
-        segments.push(BinarySegment {
-            operator: None,
-            operand: current_operand,
-        });
-    }
-
-    segments
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1810,38 +1758,6 @@ mod tests {
         }
         walk_leaves(tree.root_node(), &builder, &mut found);
         assert!(found, "expected a trailing comment doc to be non-empty");
-    }
-
-    #[test]
-    fn is_ancestor_finds_parent_kind() {
-        let source =
-            "unit Test;\ninterface\nimplementation\nprocedure Foo(A: Integer);\nbegin\nend;\nend.\n";
-        let (tree, bytes) = parse(source);
-        let config = FmtConfig::default();
-        let comments = CommentMap::build(tree.root_node(), &bytes);
-        let directives = DirectiveMap::empty();
-        let external_units = HashSet::new();
-        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
-
-        // Walk tree to find a declArg node and verify is_ancestor works.
-        fn find_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-            if node.kind() == kind {
-                return Some(node);
-            }
-            for child in node.children(&mut node.walk()) {
-                if let Some(found) = find_kind(child, kind) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-
-        let _ = builder; // suppress unused warning
-        let decl_arg = find_kind(tree.root_node(), K::DECL_ARG);
-        if let Some(arg) = decl_arg {
-            assert!(DocBuilder::is_ancestor(arg, K::DECL_ARGS));
-        }
-        // Even if not found (grammar variation), the test should not panic.
     }
 
     #[test]

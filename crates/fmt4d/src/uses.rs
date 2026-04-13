@@ -238,6 +238,15 @@ fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
     pascal_core::decode_bytes(&source[node.start_byte()..node.end_byte()]).replace('\r', "")
 }
 
+/// Which conditional branch of a {$IFDEF}/{$ELSEIF}/{$ELSE}/{$ENDIF}
+/// block is currently being parsed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BranchState {
+    If,
+    ElseIf,
+    Else,
+}
+
 /// Walk children of a `ppUsesBlock` node and return an `IfDefBlock`.
 fn parse_pp_uses_block(node: tree_sitter::Node, source: &[u8]) -> IfDefBlock {
     let children: Vec<tree_sitter::Node> = node.children(&mut node.walk()).collect();
@@ -250,9 +259,9 @@ fn parse_pp_uses_block(node: tree_sitter::Node, source: &[u8]) -> IfDefBlock {
     let mut else_branch: Option<Vec<UsesItem>> = None;
     let mut endif = String::new();
 
-    // State machine: 0 = in if_branch, 1 = in an elseif branch, 2 = in else_branch
-    let mut state = 0usize;
-    // Current elseif branch being built (used when state==1)
+    // Which conditional branch we are currently appending items into.
+    let mut state = BranchState::If;
+    // Current elseif branch being built (used when state == BranchState::ElseIf)
     let mut current_elseif: Option<CondBranch> = None;
 
     for child in children {
@@ -264,32 +273,38 @@ fn parse_pp_uses_block(node: tree_sitter::Node, source: &[u8]) -> IfDefBlock {
                 let text = node_text(child, source);
                 if text.to_lowercase().contains("elseif") {
                     // Flush current branch
-                    if state == 0 {
-                        // we were in if_branch, nothing to flush to else_if_branches yet
-                    } else if state == 1 {
-                        if let Some(branch) = current_elseif.take() {
-                            else_if_branches.push(branch);
+                    match state {
+                        BranchState::If => {
+                            // we were in if_branch, nothing to flush to else_if_branches yet
+                        }
+                        BranchState::ElseIf => {
+                            if let Some(branch) = current_elseif.take() {
+                                else_if_branches.push(branch);
+                            }
+                        }
+                        BranchState::Else => {
+                            // Unreachable in well-formed input: {$ELSEIF} after {$ELSE}.
                         }
                     }
                     current_elseif = Some(CondBranch {
                         directive: text,
                         items: Vec::new(),
                     });
-                    state = 1;
+                    state = BranchState::ElseIf;
                 } else {
                     // It's a plain {$ELSE}
-                    if state == 1 {
+                    if state == BranchState::ElseIf {
                         if let Some(branch) = current_elseif.take() {
                             else_if_branches.push(branch);
                         }
                     }
                     else_branch = Some(Vec::new());
-                    state = 2;
+                    state = BranchState::Else;
                 }
             }
             k if k == K::PP_END_IF => {
                 // Flush any pending elseif
-                if state == 1 {
+                if state == BranchState::ElseIf {
                     if let Some(branch) = current_elseif.take() {
                         else_if_branches.push(branch);
                     }
@@ -301,54 +316,51 @@ fn parse_pp_uses_block(node: tree_sitter::Node, source: &[u8]) -> IfDefBlock {
                 if !text.is_empty() {
                     let item = UsesItem::Unit(text);
                     match state {
-                        0 => if_branch.items.push(item),
-                        1 => {
+                        BranchState::If => if_branch.items.push(item),
+                        BranchState::ElseIf => {
                             if let Some(ref mut branch) = current_elseif {
                                 branch.items.push(item);
                             }
                         }
-                        2 => {
+                        BranchState::Else => {
                             if let Some(ref mut v) = else_branch {
                                 v.push(item);
                             }
                         }
-                        _ => {}
                     }
                 }
             }
             k if k == K::PP_USES_BLOCK => {
                 let nested = UsesItem::IfDefBlock(parse_pp_uses_block(child, source));
                 match state {
-                    0 => if_branch.items.push(nested),
-                    1 => {
+                    BranchState::If => if_branch.items.push(nested),
+                    BranchState::ElseIf => {
                         if let Some(ref mut branch) = current_elseif {
                             branch.items.push(nested);
                         }
                     }
-                    2 => {
+                    BranchState::Else => {
                         if let Some(ref mut v) = else_branch {
                             v.push(nested);
                         }
                     }
-                    _ => {}
                 }
             }
             k if k == K::PP_DIRECTIVE => {
                 let text = node_text(child, source);
                 let item = UsesItem::Directive(text);
                 match state {
-                    0 => if_branch.items.push(item),
-                    1 => {
+                    BranchState::If => if_branch.items.push(item),
+                    BranchState::ElseIf => {
                         if let Some(ref mut branch) = current_elseif {
                             branch.items.push(item);
                         }
                     }
-                    2 => {
+                    BranchState::Else => {
                         if let Some(ref mut v) = else_branch {
                             v.push(item);
                         }
                     }
-                    _ => {}
                 }
             }
             _ => {} // skip kUses, commas, etc.

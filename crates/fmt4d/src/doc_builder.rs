@@ -414,7 +414,24 @@ impl<'a> DocBuilder<'a> {
         }
         parts.push(doc::token("uses", K::K_USES, ""));
         parts.push(Doc::Hardline);
-        parts.push(Doc::Raw(formatted));
+        // Convert the pre-formatted uses body to a Doc tree of Token+Hardline
+        // pairs so the renderer can see the contents (line-length budgeting,
+        // no blind Doc::Raw escape hatch). Review AH2 (intermediate fix);
+        // the full fix would have format_uses_items return Doc directly.
+        // The synthetic kind "pp_raw_line" is not matched by spacing.rs, and
+        // since each line is followed by a Hardline the renderer is at line
+        // start when the next token is emitted, so no spurious spaces leak.
+        for (i, line) in formatted.lines().enumerate() {
+            if i > 0 {
+                parts.push(Doc::Hardline);
+            }
+            if !line.is_empty() {
+                parts.push(doc::token(line.to_string(), "pp_raw_line", ""));
+            }
+        }
+        if formatted.ends_with('\n') {
+            parts.push(Doc::Hardline);
+        }
         doc::concat(parts)
     }
 

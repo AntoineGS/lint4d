@@ -20,6 +20,34 @@ impl<'a> DocBuilder<'a> {
         }
     }
 
+    /// Build a `Doc` for a slice of nodes, optionally stripping the trailing
+    /// comment from the last child so it can be promoted into a separate
+    /// alignment cell.
+    ///
+    /// All `decompose_*` and `expand_*` helpers in this module need to render
+    /// a contiguous range of children as a single concatenated `Doc`. When the
+    /// declaration has a trailing comment that becomes its own alignment cell,
+    /// the comment must be stripped from the last node in the range so it
+    /// isn't rendered twice. This helper consolidates that idiom.
+    fn concat_range_strip_trailing(&self, range: &[Node<'a>], strip_trailing: bool) -> Doc {
+        if range.is_empty() {
+            return Doc::Empty;
+        }
+        let last = range.len() - 1;
+        let parts: Vec<Doc> = range
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == last && strip_trailing {
+                    self.doc_for_node_sans_trailing(*c)
+                } else {
+                    self.doc_for_node(*c)
+                }
+            })
+            .collect();
+        doc::concat(parts)
+    }
+
     /// Decompose a `declConst` node into alignment cells.
     ///
     /// Structure: `identifier [: type] = <initializer> ;`
@@ -55,23 +83,12 @@ impl<'a> DocBuilder<'a> {
         // Use doc_for_node_sans_trailing for the last child so that the
         // trailing comment is handled as a separate alignment cell.
         let trailing_comment = self.trailing_comment_cell(node);
-        let value_range = &children[eq_idx..];
-        let value_last = value_range.len().saturating_sub(1);
-        let value_parts: Vec<Doc> = value_range
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if i == value_last && trailing_comment.is_some() {
-                    self.doc_for_node_sans_trailing(*c)
-                } else {
-                    self.doc_for_node(*c)
-                }
-            })
-            .collect();
+        let has_tail = trailing_comment.is_some();
+        let value_doc = self.concat_range_strip_trailing(&children[eq_idx..], has_tail);
 
         let mut cells = vec![
             doc::align_cell(doc::concat(name_parts), true),
-            doc::align_cell(doc::concat(value_parts), trailing_comment.is_some()),
+            doc::align_cell(value_doc, has_tail),
         ];
 
         if let Some(comment_cell) = trailing_comment {
@@ -125,24 +142,12 @@ impl<'a> DocBuilder<'a> {
                 .collect();
 
             // Strip trailing comment from last child when extracted separately.
-            let value_range = &children[def_idx..];
-            let value_last = value_range.len().saturating_sub(1);
-            let value_parts: Vec<Doc> = value_range
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if i == value_last && has_tail {
-                        self.doc_for_node_sans_trailing(*c)
-                    } else {
-                        self.doc_for_node(*c)
-                    }
-                })
-                .collect();
+            let value_doc = self.concat_range_strip_trailing(&children[def_idx..], has_tail);
 
             let mut cells = vec![
                 doc::align_cell(doc::concat(name_parts), true),
                 doc::align_cell(doc::concat(type_parts), true),
-                doc::align_cell(doc::concat(value_parts), has_tail),
+                doc::align_cell(value_doc, has_tail),
             ];
 
             if let Some(comment_cell) = trailing_comment {
@@ -153,23 +158,11 @@ impl<'a> DocBuilder<'a> {
         } else {
             // No initializer: [name] [: type;] [comment?]
             // Strip trailing comment from last child when extracted separately.
-            let type_range = &children[colon_idx..];
-            let type_last = type_range.len().saturating_sub(1);
-            let type_parts: Vec<Doc> = type_range
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if i == type_last && has_tail {
-                        self.doc_for_node_sans_trailing(*c)
-                    } else {
-                        self.doc_for_node(*c)
-                    }
-                })
-                .collect();
+            let type_doc = self.concat_range_strip_trailing(&children[colon_idx..], has_tail);
 
             let mut cells = vec![
                 doc::align_cell(doc::concat(name_parts), true),
-                doc::align_cell(doc::concat(type_parts), has_tail),
+                doc::align_cell(type_doc, has_tail),
             ];
 
             if let Some(comment_cell) = trailing_comment {
@@ -214,35 +207,11 @@ impl<'a> DocBuilder<'a> {
                 .iter()
                 .map(|c| self.doc_for_node(*c))
                 .collect();
-            let value_range = &children[def_idx..];
-            let value_last = value_range.len().saturating_sub(1);
-            let value_parts: Vec<Doc> = value_range
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if i == value_last && has_tail {
-                        self.doc_for_node_sans_trailing(*c)
-                    } else {
-                        self.doc_for_node(*c)
-                    }
-                })
-                .collect();
-            (doc::concat(type_parts), Some(doc::concat(value_parts)))
+            let value_doc = self.concat_range_strip_trailing(&children[def_idx..], has_tail);
+            (doc::concat(type_parts), Some(value_doc))
         } else {
-            let type_range = &children[colon_idx..];
-            let type_last = type_range.len().saturating_sub(1);
-            let type_parts: Vec<Doc> = type_range
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if i == type_last && has_tail {
-                        self.doc_for_node_sans_trailing(*c)
-                    } else {
-                        self.doc_for_node(*c)
-                    }
-                })
-                .collect();
-            (doc::concat(type_parts), None)
+            let type_doc = self.concat_range_strip_trailing(&children[colon_idx..], has_tail);
+            (type_doc, None)
         };
 
         let mut rows = Vec::with_capacity(idents.len());
@@ -406,23 +375,12 @@ impl<'a> DocBuilder<'a> {
         // Type cell: = and everything after.
         // Strip trailing comment from last child when extracted separately.
         let trailing_comment = self.trailing_comment_cell(node);
-        let type_range = &children[eq_idx..];
-        let type_last = type_range.len().saturating_sub(1);
-        let type_parts: Vec<Doc> = type_range
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if i == type_last && trailing_comment.is_some() {
-                    self.doc_for_node_sans_trailing(*c)
-                } else {
-                    self.doc_for_node(*c)
-                }
-            })
-            .collect();
+        let has_tail = trailing_comment.is_some();
+        let type_doc = self.concat_range_strip_trailing(&children[eq_idx..], has_tail);
 
         let mut cells = vec![
             doc::align_cell(doc::concat(name_parts), true),
-            doc::align_cell(doc::concat(type_parts), trailing_comment.is_some()),
+            doc::align_cell(type_doc, has_tail),
         ];
 
         if let Some(comment_cell) = trailing_comment {
@@ -496,128 +454,99 @@ impl<'a> DocBuilder<'a> {
             .map(|c| self.doc_for_node(*c))
             .collect();
 
-        if let Some(ri) = read_idx {
-            if let Some(wi) = write_idx {
-                // Has both read and write.
-                let read_parts: Vec<Doc> = children[ri..wi]
-                    .iter()
-                    .map(|c| self.doc_for_node(*c))
-                    .collect();
-                // Write cell: strip trailing comment from last child.
-                let write_range = &children[wi..];
-                let write_last = write_range.len().saturating_sub(1);
-                let write_parts: Vec<Doc> = write_range
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        if i == write_last && has_tail {
-                            self.doc_for_node_sans_trailing(*c)
-                        } else {
-                            self.doc_for_node(*c)
-                        }
-                    })
-                    .collect();
+        let name_doc = doc::concat(name_parts);
+        let type_doc = doc::concat(type_parts);
 
-                let mut cells = vec![
-                    doc::align_cell(doc::concat(name_parts), true),
-                    doc::align_cell(doc::concat(type_parts), true),
-                    doc::align_cell(doc::concat(read_parts), true),
-                    doc::align_cell(doc::concat(write_parts), has_tail),
-                ];
-
-                if let Some(comment_cell) = trailing_comment {
-                    cells.push(comment_cell);
-                }
-
-                Some(cells)
-            } else {
-                // Has read but no write — strip trailing comment from last child.
-                let read_range = &children[ri..];
-                let read_last = read_range.len().saturating_sub(1);
-                let read_parts: Vec<Doc> = read_range
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        if i == read_last && has_tail {
-                            self.doc_for_node_sans_trailing(*c)
-                        } else {
-                            self.doc_for_node(*c)
-                        }
-                    })
-                    .collect();
-
-                let mut cells = vec![
-                    doc::align_cell(doc::concat(name_parts), true),
-                    doc::align_cell(doc::concat(type_parts), true),
-                    doc::align_cell(doc::concat(read_parts), has_tail),
-                ];
-
-                if let Some(comment_cell) = trailing_comment {
-                    cells.push(comment_cell);
-                }
-
-                Some(cells)
-            }
-        } else if let Some(wi) = write_idx {
-            // No read but has write — emit an empty read cell so the write
-            // column lines up with properties that have both read and write.
-            let write_range = &children[wi..];
-            let write_last = write_range.len().saturating_sub(1);
-            let write_parts: Vec<Doc> = write_range
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if i == write_last && has_tail {
-                        self.doc_for_node_sans_trailing(*c)
-                    } else {
-                        self.doc_for_node(*c)
-                    }
-                })
-                .collect();
-
-            let mut cells = vec![
-                doc::align_cell(doc::concat(name_parts), true),
-                doc::align_cell(doc::concat(type_parts), true),
-                doc::align_cell(Doc::Empty, true),
-                doc::align_cell(doc::concat(write_parts), has_tail),
-            ];
-
-            if let Some(comment_cell) = trailing_comment {
-                cells.push(comment_cell);
-            }
-
-            Some(cells)
-        } else {
-            // No read or write specifier — just name : type [rest];
-            // Strip trailing comment from last child.
-            let rest_range = &children[first_specifier_idx..];
-            let rest_last = rest_range.len().saturating_sub(1);
-            let rest_parts: Vec<Doc> = rest_range
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if i == rest_last && has_tail {
-                        self.doc_for_node_sans_trailing(*c)
-                    } else {
-                        self.doc_for_node(*c)
-                    }
-                })
-                .collect();
-
-            let mut cells = vec![
-                doc::align_cell(doc::concat(name_parts), true),
-                doc::align_cell(
-                    doc::concat(vec![doc::concat(type_parts), doc::concat(rest_parts)]),
+        // Dispatch to the per-branch builder that assembles the variable
+        // middle cells; the surrounding name/type cells and the trailing
+        // comment cell are appended uniformly here.
+        let middle = match (read_idx, write_idx) {
+            (Some(ri), Some(wi)) => self.property_cells_read_write(&children, ri, wi, has_tail),
+            (Some(ri), None) => self.property_cells_read_only(&children, ri, has_tail),
+            (None, Some(wi)) => self.property_cells_write_only(&children, wi, has_tail),
+            (None, None) => {
+                // No specifier — fold the rest into the type cell.
+                let rest_doc =
+                    self.concat_range_strip_trailing(&children[first_specifier_idx..], has_tail);
+                return Some(self.finish_property_cells(
+                    name_doc,
+                    doc::concat(vec![type_doc, rest_doc]),
+                    Vec::new(),
                     has_tail,
-                ),
-            ];
-
-            if let Some(comment_cell) = trailing_comment {
-                cells.push(comment_cell);
+                    trailing_comment,
+                ));
             }
+        };
 
-            Some(cells)
+        Some(self.finish_property_cells(name_doc, type_doc, middle, has_tail, trailing_comment))
+    }
+
+    /// Assemble the read/write cells when the property has both `read` and
+    /// `write` specifiers.
+    fn property_cells_read_write(
+        &self,
+        children: &[Node<'a>],
+        ri: usize,
+        wi: usize,
+        has_tail: bool,
+    ) -> Vec<AlignCell> {
+        let read_parts: Vec<Doc> = children[ri..wi]
+            .iter()
+            .map(|c| self.doc_for_node(*c))
+            .collect();
+        let write_doc = self.concat_range_strip_trailing(&children[wi..], has_tail);
+        vec![
+            doc::align_cell(doc::concat(read_parts), true),
+            doc::align_cell(write_doc, has_tail),
+        ]
+    }
+
+    /// Assemble the read cell when the property has only `read`.
+    fn property_cells_read_only(
+        &self,
+        children: &[Node<'a>],
+        ri: usize,
+        has_tail: bool,
+    ) -> Vec<AlignCell> {
+        let read_doc = self.concat_range_strip_trailing(&children[ri..], has_tail);
+        vec![doc::align_cell(read_doc, has_tail)]
+    }
+
+    /// Assemble the write cell when the property has only `write`. An empty
+    /// read cell is emitted so the write column lines up with properties that
+    /// have both `read` and `write`.
+    fn property_cells_write_only(
+        &self,
+        children: &[Node<'a>],
+        wi: usize,
+        has_tail: bool,
+    ) -> Vec<AlignCell> {
+        let write_doc = self.concat_range_strip_trailing(&children[wi..], has_tail);
+        vec![
+            doc::align_cell(Doc::Empty, true),
+            doc::align_cell(write_doc, has_tail),
+        ]
+    }
+
+    /// Build the final `[name] [type] [middle...] [comment?]` cell vector
+    /// shared by every `decompose_property` branch.
+    fn finish_property_cells(
+        &self,
+        name_doc: Doc,
+        type_doc: Doc,
+        middle: Vec<AlignCell>,
+        has_tail: bool,
+        trailing_comment: Option<AlignCell>,
+    ) -> Vec<AlignCell> {
+        let type_pad = !middle.is_empty() || has_tail;
+        let mut cells = Vec::with_capacity(2 + middle.len() + usize::from(has_tail));
+        cells.push(doc::align_cell(name_doc, true));
+        cells.push(doc::align_cell(type_doc, type_pad));
+        cells.extend(middle);
+        if let Some(comment_cell) = trailing_comment {
+            cells.push(comment_cell);
         }
+        cells
     }
 
     /// Extract the trailing comment for a node as an AlignCell, if present

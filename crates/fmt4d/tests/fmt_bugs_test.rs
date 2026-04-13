@@ -28,11 +28,23 @@ end;
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("#0"),
-        "char literal #0 was corrupted to bare #:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+var
+  C: Char;
+begin
+  C := #0;
+end;
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -110,11 +122,22 @@ implementation
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("destructor Destroy; override;"),
-        "override directive was split to a separate line:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+type
+  TFoo = class
+  public
+    destructor Destroy; override;
+  end;
+
+implementation
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -174,11 +197,21 @@ implementation
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("class(TObject, IInterface)"),
-        "class ancestor list was detached from class keyword:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+type
+  TFoo = class(TObject, IInterface)
+
+  end;
+
+implementation
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -193,11 +226,21 @@ implementation
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("class(TObject)"),
-        "single class ancestor was detached from class keyword:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+type
+  TBar = class(TObject)
+
+  end;
+
+implementation
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 // ── Bug 4: Record field indentation lost ────────────────────────
@@ -218,17 +261,22 @@ implementation
 end.
 ";
     let result = format_source(src);
-    // Under `type` (indent 0), TPoint is at indent 2, fields should be at indent 4
-    assert!(
-        result.contains("    X: Integer;"),
-        "record field X should be indented 4 spaces:\n{}",
-        result
-    );
-    assert!(
-        result.contains("    Y: Integer;"),
-        "record field Y should be indented 4 spaces:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+type
+  TPoint = record
+    X: Integer;
+    Y: Integer;
+  end;
+
+implementation
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -244,13 +292,21 @@ implementation
 end.
 ";
     let result = format_source(src);
-    // `end` should be at same indent as TPoint (indent 2)
-    let end_line = result.lines().find(|l| l.trim() == "end;").unwrap();
-    assert!(
-        end_line.starts_with("  end;"),
-        "record end should be at indent 2, got: '{}'",
-        end_line
-    );
+    let expected = "\
+unit T;
+
+interface
+
+type
+  TPoint = record
+    X: Integer;
+  end;
+
+implementation
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 // ── Bug 5: Spaces injected inside array/string indexers ─────────
@@ -272,21 +328,24 @@ end;
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("Arr[0]"),
-        "space was injected before array indexer bracket:\n{}",
-        result
-    );
-    assert!(
-        result.contains("Arr[1]"),
-        "space was injected before array indexer bracket:\n{}",
-        result
-    );
-    assert!(
-        !result.contains("Arr ["),
-        "space was injected before array indexer bracket:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+var
+  Arr: array of Integer;
+begin
+  Arr[0] := 1;
+  Arr[1] := Arr[0] + 1;
+end;
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -326,11 +385,24 @@ end;
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("S[1]"),
-        "space was injected before string indexer bracket:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+var
+  S: string;
+begin
+  if S[1] = 'A' then
+    Exit;
+end;
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 // ── Bug 6: Spaces injected inside generic angle brackets ────────
@@ -352,11 +424,25 @@ implementation
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("TList<Integer>"),
-        "spaces were injected inside generic brackets:\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+uses
+  Generics.Collections;
+
+type
+  TFoo = class
+  private
+    FList: TList<Integer>;
+  end;
+
+implementation
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -526,16 +612,24 @@ end;
 end.
 ";
     let result = format_source(src);
-    assert!(
-        result.contains("if (x"),
-        "space was removed between 'if' and '(':\n{}",
-        result
-    );
-    assert!(
-        !result.contains("if(x"),
-        "space was removed between 'if' and '(':\n{}",
-        result
-    );
+    let expected = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+var
+  x: Integer;
+begin
+  if (x > 0) then
+    Exit;
+end;
+
+end.
+";
+    assert_eq!(result, expected);
 }
 
 #[test]

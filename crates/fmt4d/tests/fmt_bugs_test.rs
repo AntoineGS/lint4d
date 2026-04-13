@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 mod common;
-use common::format_source;
+use common::{format_source, idempotency_check};
 
 // ── Bug 1: Character literal corruption ─────────────────────────
 // #0, #9, #10, #13 etc. are reduced to bare `#`, producing code
@@ -3576,4 +3576,73 @@ fn inverted_paren_ranges_do_not_panic() {
     // The assertion is "no panic". Output correctness under error
     // recovery is not guaranteed — the input is already invalid.
     let _ = format_source(src);
+}
+
+// ── Phase 1 L2: Latin-1 / non-ASCII string literals ────────────
+
+#[test]
+fn latin1_string_literal_survives_formatting() {
+    // Regression guard for Phase 1 L2: build_unit strips \r from every
+    // node, which is correct for normalizing input but could corrupt a
+    // Latin-1 string literal containing a byte that decodes to \r in
+    // some mapping. This test uses UTF-8 non-ASCII inside a literal
+    // (the common case) to guard against loss.
+    let src = "unit T;\ninterface\nimplementation\nconst\n  K = 'caf\u{00E9}';\nbegin end;\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains("caf\u{00E9}"),
+        "Latin-1 string literal corrupted:\n{result}"
+    );
+}
+
+// ── Phase 1 C3 / SEC-H5: byte scanner Pascal-lexical correctness ──
+
+#[test]
+fn comment_containing_single_quote_not_split() {
+    // Regression guard for SEC-H5 / Phase 1 C3: the hand-rolled byte
+    // scanner in build_delimited_list / scan_break_positions must not
+    // flip its `in_string` state on a single quote inside a block
+    // comment. The `//` inside the comment must remain a comment
+    // character, not trigger a forced line split.
+    let src = "\
+unit T;
+
+interface
+
+implementation
+
+procedure P(
+  a: Integer; (* string 's' and // here *)
+  b: Integer
+);
+begin
+end;
+
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("(* string 's' and // here *)"),
+        "block comment corrupted:\n{result}"
+    );
+    idempotency_check(src);
+}
+
+// ── SEC-H2 edges: empty / single-char inputs ───────────────────
+
+#[test]
+fn format_empty_file_returns_empty_string() {
+    // Edge case: empty input must not panic and must produce a sensible
+    // result (empty or single newline).
+    let result = format_source("");
+    assert!(
+        result.is_empty() || result == "\n",
+        "unexpected empty-file output: {result:?}"
+    );
+}
+
+#[test]
+fn format_single_char_file_does_not_panic() {
+    // Edge case: 1-byte input.
+    let _ = format_source("x");
 }

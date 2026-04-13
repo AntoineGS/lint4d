@@ -158,3 +158,27 @@ fn config_default_is_auto() {
     let config = FmtConfig::default();
     assert_eq!(config.end_of_line, EndOfLine::Auto);
 }
+
+// ── Mixed-EOL normalization ────────────────────────────────────
+
+#[test]
+#[ignore = "TST-M4: mixed-EOL normalization pending"]
+fn mixed_eol_auto_mode_produces_dominant_only() {
+    // Regression guard for TST-M4: a file with mixed EOLs under Auto mode
+    // should normalize to the dominant EOL.
+    //
+    // 3 LF lines + 1 CRLF line → dominant is LF → output must be all LF.
+    let mixed = b"unit T;\r\ninterface\nimplementation\nend.\n";
+    let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig {
+        end_of_line: fmt4d::config::EndOfLine::Auto,
+        ..fmt4d::config::FmtConfig::default()
+    };
+    let result =
+        fmt4d::formatter::format_source(mixed, &info, &config, &std::collections::HashSet::new())
+            .expect("formatting failed");
+    assert!(
+        !result.contains("\r\n"),
+        "output retained CRLF under Auto/LF-dominant: {result:?}"
+    );
+}

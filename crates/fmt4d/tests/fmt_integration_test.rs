@@ -744,3 +744,35 @@ end.
     );
     idempotency_check(&result);
 }
+
+#[test]
+fn uses_only_ifdef_no_sortable_units() {
+    // Regression guard for TST-H5 / Phase 1 M8: a uses clause containing
+    // only {$IFDEF} blocks (no plain sortable units) must not lose items
+    // via the parse_pp_uses_block state-machine `_ => {}` fallthrough.
+    let src = "\
+unit T;
+
+interface
+
+uses
+  {$IFDEF X}
+  SpecialUnit,
+  {$ENDIF}
+  ;
+
+implementation
+
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("{$IFDEF X}"),
+        "IFDEF directive lost:\n{result}"
+    );
+    assert!(
+        result.contains("SpecialUnit"),
+        "unit inside IFDEF lost:\n{result}"
+    );
+    idempotency_check(src);
+}

@@ -107,3 +107,27 @@ fn default_mode_formats_in_place() {
     let after = fs::read_to_string(&file_path).unwrap();
     assert_ne!(after, content, "file should have been formatted");
 }
+
+#[test]
+fn init_flag_writes_parseable_toml() {
+    // Regression guard for TST-M6: `fmt4d --init` must write a .fmt4d.toml
+    // that FmtConfig::from_toml accepts.
+    let dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("fmt4d")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("--init")
+        .assert()
+        .success();
+
+    let written =
+        fs::read_to_string(dir.path().join(".fmt4d.toml")).expect(".fmt4d.toml was not created");
+
+    let parsed = fmt4d::config::FmtConfig::from_toml(&written);
+    assert!(
+        parsed.is_ok(),
+        ".fmt4d.toml from --init failed to parse: {:?}",
+        parsed.err()
+    );
+}

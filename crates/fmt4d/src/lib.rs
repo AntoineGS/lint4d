@@ -7,6 +7,7 @@ pub mod directive_map;
 pub mod doc;
 pub mod doc_builder;
 pub mod doc_builder_alignment;
+pub mod doc_builder_blocks;
 pub mod doc_builder_control_flow;
 pub mod doc_builder_expressions;
 pub mod doc_builder_sections;

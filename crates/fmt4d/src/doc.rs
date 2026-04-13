@@ -48,6 +48,7 @@ pub enum Doc {
     Group(Box<Doc>),
 
     /// Different content depending on enclosing group's break mode.
+    #[allow(dead_code)] // Phase F follow-up: builder integration pending.
     IfBreak { broken: Box<Doc>, flat: Box<Doc> },
 
     /// Greedy line-filling for binary chains.
@@ -103,6 +104,7 @@ pub fn indent(doc: Doc) -> Doc {
     Doc::Indent(Box::new(doc))
 }
 
+#[allow(dead_code)] // Phase F follow-up: builder integration pending.
 pub fn if_break(broken: Doc, flat: Doc) -> Doc {
     Doc::IfBreak {
         broken: Box::new(broken),
@@ -135,6 +137,7 @@ pub fn token(text: impl Into<String>, kind: &'static str, parent_kind: &'static 
 }
 
 /// Join docs with a separator between each pair.
+#[allow(dead_code)] // Phase F follow-up: builder integration pending.
 pub fn join(docs: Vec<Doc>, separator: Doc) -> Doc {
     let mut parts = Vec::with_capacity(docs.len() * 2);
     for (i, doc) in docs.into_iter().enumerate() {

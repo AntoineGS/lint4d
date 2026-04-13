@@ -10,6 +10,7 @@ authors.workspace = true
 description = "An opinionated Delphi/Object Pascal code formatter"
 keywords = ["delphi", "pascal", "formatter", "lint", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [lib]
 name = "fmt4d"

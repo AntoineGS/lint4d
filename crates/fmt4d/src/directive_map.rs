@@ -8,6 +8,7 @@ pub struct AttachedDirective {
     /// The directive text (e.g. `{$R *.dfm}`, `{$HINTS OFF}`).
     pub text: String,
     /// True if the directive appeared on the same line as code (trailing).
+    #[allow(dead_code)] // Phase F follow-up: used for trailing-directive placement.
     pub trailing: bool,
     /// Gap in bytes between preceding token and this directive (trailing only).
     pub gap: usize,
@@ -82,6 +83,7 @@ impl DirectiveMap {
     }
 
     /// Returns an empty DirectiveMap (no directives attached).
+    #[allow(dead_code)] // Phase F follow-up: wire into builder fall-back paths.
     pub fn empty() -> Self {
         DirectiveMap {
             leading: HashMap::new(),

@@ -3,6 +3,10 @@
 //! Provides functions that the printer can use to decide when to break long
 //! lines and where valid break points exist in a token sequence.
 
+// Skeleton module; not yet wired into the renderer pipeline.
+// Phase F follow-up: integrate with renderer or delete.
+#![allow(dead_code)]
+
 use pascal_core::node_kind as K;
 
 /// Check if a line exceeds `max_length` and should be broken.

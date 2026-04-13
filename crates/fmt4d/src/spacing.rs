@@ -76,6 +76,7 @@ pub fn space_after(kind: &str) -> bool {
 }
 
 /// Context-aware space-before check.
+#[allow(dead_code)] // Phase F follow-up: replace bare space_before in renderer.
 pub fn space_before_in_context(kind: &str, parent_kind: &str) -> bool {
     if kind == K::OPEN_PAREN && (parent_kind == K::EXPR_CALL || parent_kind == K::DECL_ARGS) {
         return false;

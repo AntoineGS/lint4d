@@ -8,6 +8,7 @@ pub struct AttachedComment {
     /// The comment text (including delimiters like `//`, `{}`).
     pub text: String,
     /// True if the comment appeared on the same line as code (trailing).
+    #[allow(dead_code)] // Phase F follow-up: used for trailing-comment placement.
     pub trailing: bool,
     /// The source row (0-based) where the comment starts.
     pub source_row: usize,

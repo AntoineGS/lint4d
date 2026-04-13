@@ -1,3 +1,7 @@
+// Skeleton helper; not yet wired into the renderer pipeline.
+// Phase F follow-up: integrate with renderer or delete.
+#![allow(dead_code)]
+
 use crate::config::IndentStyle;
 
 #[derive(Debug, Clone)]

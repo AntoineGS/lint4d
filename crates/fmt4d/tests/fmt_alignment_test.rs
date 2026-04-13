@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 mod common;
-use common::{format_aligned, format_source};
+use common::{format_aligned, format_source, idempotency_check_aligned};
 
 // ── Constant alignment ───────────────────────────────────────────────
 
@@ -34,6 +34,7 @@ end.
         "kBAZ should be padded. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -54,6 +55,7 @@ end.
         "kFOO should not be padded when alignment is off. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -80,6 +82,7 @@ end.
         "kLONGER should have normal spacing. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -119,6 +122,7 @@ end.
         "kDDD is longest in group 2. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Variable alignment ──────────────────────────────────────────────
@@ -148,6 +152,7 @@ end.
         "LongVarName should have normal spacing. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Type alias alignment ────────────────────────────────────────────
@@ -174,6 +179,7 @@ end.
         "TVeryLongTypeName should have normal spacing. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Enum type preservation with alignment ───────────────────────────
@@ -215,6 +221,7 @@ end.
     // Idempotency
     let result2 = format_aligned(&result);
     assert_eq!(result, result2, "enum with alignment should be idempotent");
+    idempotency_check_aligned(source);
 }
 
 // ── Field alignment ─────────────────────────────────────────────────
@@ -244,6 +251,7 @@ end.
         "FLongName should have normal spacing. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Record field alignment ──────────────────────────────────────────
@@ -272,6 +280,7 @@ end.
         "auditDesc should have normal spacing in record. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -299,6 +308,7 @@ end.
         "LongFieldName should have normal spacing. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Outlier detection ───────────────────────────────────────────────
@@ -332,6 +342,7 @@ end.
         "Outlier should have normal spacing. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Property alignment ──────────────────────────────────────────────
@@ -357,6 +368,7 @@ end.
         "Properties should be aligned. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Comment alignment ───────────────────────────────────────────────
@@ -401,6 +413,7 @@ end.
             result
         );
     }
+    idempotency_check_aligned(source);
 }
 
 // ── Selective disable ───────────────────────────────────────────────
@@ -446,6 +459,7 @@ end.
         "Variables should not be aligned. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Var with initializer ────────────────────────────────────────────
@@ -472,6 +486,7 @@ end.
         "Count should be padded on name and type. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Idempotency ─────────────────────────────────────────────────────
@@ -491,6 +506,7 @@ end.
     let first = format_aligned(source);
     let second = format_aligned(&first);
     assert_eq!(first, second, "Alignment should be idempotent");
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -511,6 +527,7 @@ end.
     let first = format_aligned(source);
     let second = format_aligned(&first);
     assert_eq!(first, second, "Field alignment should be idempotent");
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -540,6 +557,7 @@ end.
         "kLaunchProcessorHandle should be padded to align with kLaunchProcessorChoiceBDLess. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Comma-separated var expansion ──────────────────────────────────
@@ -586,6 +604,7 @@ end.
         "Should not contain comma-separated identifiers. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -605,6 +624,7 @@ end.
     let result = format_aligned(source);
     let result2 = format_aligned(&result);
     assert_eq!(result, result2, "Comma var expansion should be idempotent");
+    idempotency_check_aligned(source);
 }
 
 // ── Single-line class declarations should not get blank lines ──────
@@ -636,6 +656,7 @@ end.
         result, result2,
         "Single-line class alignment should be idempotent"
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Property alignment: read/write columns ─────────────────────────
@@ -672,6 +693,7 @@ end.
         "write keywords should be at the same column ({} vs {}). Output:\n{}",
         write_cols[0], write_cols[1], result
     );
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -717,6 +739,7 @@ end.
         result, second,
         "Write-only property alignment should be idempotent"
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Leading comment on complex type — no spurious blank line ────────
@@ -756,6 +779,7 @@ end.
         result, result2,
         "Complex type with /// comment should be idempotent"
     );
+    idempotency_check_aligned(source);
 }
 
 // ── Alias keyword misparse ─────────────────────────────────────────
@@ -791,6 +815,7 @@ end.
         "Alias should be on its own aligned line. Got:\n{}",
         result
     );
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -816,6 +841,7 @@ end.
     let first = format_aligned(source);
     let second = format_aligned(&first);
     assert_eq!(first, second, "Aligned var with Alias should be idempotent");
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -840,6 +866,7 @@ end.
     );
     let second = format_aligned(&result);
     assert_eq!(result, second, "Alias-first aligned should be idempotent");
+    idempotency_check_aligned(source);
 }
 
 #[test]
@@ -868,4 +895,5 @@ end.
         result, second,
         "lowercase alias aligned should be idempotent"
     );
+    idempotency_check_aligned(source);
 }

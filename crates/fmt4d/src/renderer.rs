@@ -8,6 +8,19 @@ enum Mode {
     Break,
 }
 
+/// Result of measuring a stack item during the rest-of-line walk that
+/// decides whether a `Doc::Group` fits flat.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FitsResult {
+    /// Budget exhausted before hitting a line break — group must break.
+    Overflow,
+    /// A forced line break was reached — no more content on this line,
+    /// so whatever fit so far is sufficient.
+    LineBreak,
+    /// Item measured; keep walking subsequent stack items.
+    Continue,
+}
+
 /// Internal enum for merging alignment rows with non-row docs.
 enum MergedItem {
     Row(Vec<AlignCell>),
@@ -98,7 +111,15 @@ impl Renderer {
         // reallocation. Review PERF-H3.
         let mut stack: Vec<(usize, Mode, Doc)> = Vec::with_capacity(64);
         stack.push((0, Mode::Break, doc));
+        self.drain_render_stack(stack);
+        self.output
+    }
 
+    /// Drain a render stack into `self.output`. Shared by the top-level
+    /// `render` entry point and the inline rendering used inside
+    /// alignment groups, so both paths get the same Group fit logic
+    /// (including `fits_group_with_rest`'s tail-walk).
+    fn drain_render_stack(&mut self, mut stack: Vec<(usize, Mode, Doc)>) {
         while let Some((indent, mode, doc)) = stack.pop() {
             match doc {
                 Doc::Empty => {}
@@ -164,7 +185,13 @@ impl Renderer {
                 }
 
                 Doc::Group(inner) => {
-                    if self.fits(indent, &inner) {
+                    // Measure the group's content *plus* the rest of the
+                    // current line (the trailing stack items up to the next
+                    // forced break). Without the tail walk, a group that
+                    // fits its own inner can still overflow once a suffix
+                    // like `: TRawUtf8DynArray;` is rendered after the
+                    // closing paren.
+                    if self.fits_group_with_rest(&inner, indent, &stack) {
                         stack.push((indent, Mode::Flat, *inner));
                     } else {
                         stack.push((indent, Mode::Break, *inner));
@@ -252,8 +279,6 @@ impl Renderer {
                 }
             }
         }
-
-        self.output
     }
 
     // ── Alignment group rendering ─────────────────────────────────
@@ -433,83 +458,15 @@ impl Renderer {
 
     /// Inner render with explicit mode — `Flat` collapses Line/Softline,
     /// `Break` emits newlines (used when a Group doesn't fit).
+    ///
+    /// Shares the main render loop's stack-drain so Groups get the same
+    /// `fits_group_with_rest` tail-walk behaviour. Without this sharing,
+    /// function declarations rendered inside alignment groups (e.g.
+    /// class method decls) would skip the tail walk and overflow.
     fn render_doc_inline_mode(&mut self, doc: Doc, indent: usize, mode: Mode) {
-        match doc {
-            Doc::Empty => {}
-            Doc::Token {
-                text,
-                kind,
-                parent_kind,
-            } => {
-                self.emit_with_spacing(&text, kind, parent_kind, indent);
-            }
-            Doc::Raw(text) => {
-                for ch in text.chars() {
-                    if ch == '\n' {
-                        self.current_column = 0;
-                    } else {
-                        self.current_column += 1;
-                    }
-                }
-                if text.ends_with(|c: char| c.is_whitespace()) {
-                    self.last_token_kind = "";
-                    self.last_token_parent_kind = "";
-                }
-                self.output.push_str(&text);
-            }
-            Doc::Hardline => self.emit_newline(),
-            Doc::BlankLine => {
-                self.emit_newline();
-                self.output.push('\n');
-            }
-            Doc::Line | Doc::PreservedLine => match mode {
-                Mode::Flat => {
-                    self.output.push(' ');
-                    self.current_column += 1;
-                    self.last_token_kind = "";
-                    self.last_token_parent_kind = "";
-                }
-                Mode::Break => self.emit_newline(),
-            },
-            Doc::Softline => {
-                if mode == Mode::Break {
-                    self.emit_newline();
-                }
-            }
-            Doc::Concat(docs) => {
-                for d in docs {
-                    self.render_doc_inline_mode(d, indent, mode);
-                }
-            }
-            Doc::Indent(inner) => {
-                self.render_doc_inline_mode(*inner, indent + 1, mode);
-            }
-            Doc::Group(inner) => {
-                let inner_mode = if self.fits(indent, &inner) {
-                    Mode::Flat
-                } else {
-                    Mode::Break
-                };
-                self.render_doc_inline_mode(*inner, indent, inner_mode);
-            }
-            Doc::IfBreak { broken, flat } => match mode {
-                Mode::Flat => self.render_doc_inline_mode(*flat, indent, mode),
-                Mode::Break => self.render_doc_inline_mode(*broken, indent, mode),
-            },
-            Doc::Fill(parts) => {
-                for p in parts {
-                    self.render_doc_inline_mode(p, indent, mode);
-                }
-            }
-            Doc::AlignGroup(children) => {
-                self.render_align_group(children, indent);
-            }
-            Doc::AlignRow(cells) => {
-                for cell in cells {
-                    self.render_doc_inline(cell.content, indent);
-                }
-            }
-        }
+        let mut stack: Vec<(usize, Mode, Doc)> = Vec::with_capacity(16);
+        stack.push((indent, mode, doc));
+        self.drain_render_stack(stack);
     }
 
     /// Measure the rendered width of a Doc without emitting output.
@@ -629,37 +586,6 @@ impl Renderer {
         }
     }
 
-    /// Check if a Doc fits on the remainder of the current line in Flat mode.
-    fn fits(&self, indent: usize, doc: &Doc) -> bool {
-        // When at line start, the first token will be preceded by
-        // indentation — account for that width up front.
-        let effective_column = if self.at_line_start() {
-            self.indent_width(indent)
-        } else {
-            self.current_column
-        };
-        let mut remaining = self.max_line_length.saturating_sub(effective_column);
-        let mut last_kind: &'static str = if self.at_line_start() {
-            // At line start emit_with_spacing skips spacing, so clear
-            // last_kind so fits_inner doesn't charge a phantom space.
-            ""
-        } else {
-            self.last_token_kind
-        };
-        let mut last_parent: &'static str = if self.at_line_start() {
-            ""
-        } else {
-            self.last_token_parent_kind
-        };
-        self.fits_inner(
-            doc,
-            indent,
-            &mut remaining,
-            &mut last_kind,
-            &mut last_parent,
-        )
-    }
-
     fn fits_inner(
         &self,
         doc: &Doc,
@@ -768,6 +694,210 @@ impl Renderer {
                     }
                 }
                 true
+            }
+        }
+    }
+
+    /// Prettier-style fit check for a `Doc::Group`: measure the group's
+    /// content flat AND the rest of the current line (subsequent stack
+    /// items up to the next forced break). This catches the case where
+    /// the group's content fits on its own but a trailing suffix on the
+    /// same line pushes past the budget.
+    fn fits_group_with_rest(
+        &self,
+        inner: &Doc,
+        indent: usize,
+        stack: &[(usize, Mode, Doc)],
+    ) -> bool {
+        let effective_column = if self.at_line_start() {
+            self.indent_width(indent)
+        } else {
+            self.current_column
+        };
+        let mut remaining = self.max_line_length.saturating_sub(effective_column);
+        let mut last_kind: &'static str = if self.at_line_start() {
+            ""
+        } else {
+            self.last_token_kind
+        };
+        let mut last_parent: &'static str = if self.at_line_start() {
+            ""
+        } else {
+            self.last_token_parent_kind
+        };
+
+        // Measure the group's own contents in flat mode first.
+        if !self.fits_inner(
+            inner,
+            indent,
+            &mut remaining,
+            &mut last_kind,
+            &mut last_parent,
+        ) {
+            return false;
+        }
+
+        // Walk the remaining stack in document order. `stack` is LIFO —
+        // the top (last element) is the next item to pop and render, so
+        // iterating in reverse yields document order.
+        for (item_indent, item_mode, item_doc) in stack.iter().rev() {
+            match self.fits_stack_item(
+                item_doc,
+                *item_indent,
+                *item_mode,
+                &mut remaining,
+                &mut last_kind,
+                &mut last_parent,
+            ) {
+                FitsResult::Overflow => return false,
+                FitsResult::LineBreak => return true,
+                FitsResult::Continue => {}
+            }
+        }
+        true
+    }
+
+    /// Measure a single stack item in its stored mode while walking
+    /// the rest of the current line for `fits_group_with_rest`.
+    ///
+    /// Differs from `fits_inner` in two ways:
+    /// - Honours each item's stored `Mode` for `Line`/`Softline`
+    ///   (Break mode means a real newline, which stops the walk).
+    /// - Returns a tri-state so the caller can distinguish "fits"
+    ///   from "fits and we reached the line end".
+    fn fits_stack_item(
+        &self,
+        doc: &Doc,
+        indent: usize,
+        mode: Mode,
+        remaining: &mut usize,
+        last_kind: &mut &'static str,
+        last_parent: &mut &'static str,
+    ) -> FitsResult {
+        match doc {
+            Doc::Empty => FitsResult::Continue,
+
+            Doc::Hardline | Doc::BlankLine => FitsResult::LineBreak,
+
+            Doc::Token {
+                text,
+                kind,
+                parent_kind,
+            } => {
+                let space = if spacing::would_need_space(last_kind, last_parent, kind, parent_kind)
+                {
+                    1
+                } else {
+                    0
+                };
+                let needed = space + text.len();
+                if needed > *remaining {
+                    return FitsResult::Overflow;
+                }
+                *remaining -= needed;
+                *last_kind = kind;
+                *last_parent = parent_kind;
+                FitsResult::Continue
+            }
+
+            Doc::Raw(text) => {
+                if text.contains('\n') {
+                    return FitsResult::LineBreak;
+                }
+                if text.len() > *remaining {
+                    return FitsResult::Overflow;
+                }
+                *remaining -= text.len();
+                FitsResult::Continue
+            }
+
+            Doc::Line | Doc::PreservedLine => match mode {
+                Mode::Flat => {
+                    if *remaining == 0 {
+                        return FitsResult::Overflow;
+                    }
+                    *remaining -= 1;
+                    FitsResult::Continue
+                }
+                Mode::Break => FitsResult::LineBreak,
+            },
+
+            Doc::Softline => match mode {
+                Mode::Flat => FitsResult::Continue,
+                Mode::Break => FitsResult::LineBreak,
+            },
+
+            Doc::Concat(docs) => {
+                for d in docs.iter() {
+                    match self.fits_stack_item(d, indent, mode, remaining, last_kind, last_parent) {
+                        FitsResult::Continue => {}
+                        other => return other,
+                    }
+                }
+                FitsResult::Continue
+            }
+
+            Doc::Indent(inner) => {
+                self.fits_stack_item(inner, indent + 1, mode, remaining, last_kind, last_parent)
+            }
+
+            // Nested group: optimistic — assume it would also pick flat.
+            // If the optimistic flat rendering already overflows, the
+            // outer group definitely can't fit on one line.
+            Doc::Group(inner) => {
+                if !self.fits_inner(inner, indent, remaining, last_kind, last_parent) {
+                    return FitsResult::Overflow;
+                }
+                FitsResult::Continue
+            }
+
+            Doc::IfBreak { flat, broken } => {
+                let branch = match mode {
+                    Mode::Flat => flat,
+                    Mode::Break => broken,
+                };
+                self.fits_stack_item(branch, indent, mode, remaining, last_kind, last_parent)
+            }
+
+            Doc::Fill(parts) => {
+                // Optimistic: measure all parts flat (same semantics as
+                // `fits_inner`). Fill's real break decisions are made at
+                // render time, not here.
+                for part in parts.iter() {
+                    match self.fits_stack_item(
+                        part,
+                        indent,
+                        Mode::Flat,
+                        remaining,
+                        last_kind,
+                        last_parent,
+                    ) {
+                        FitsResult::Continue => {}
+                        other => return other,
+                    }
+                }
+                FitsResult::Continue
+            }
+
+            // AlignGroup renders one row per line — treat as a line
+            // boundary so nothing past it counts against the current line.
+            Doc::AlignGroup(_) => FitsResult::LineBreak,
+
+            Doc::AlignRow(cells) => {
+                for cell in cells {
+                    match self.fits_stack_item(
+                        &cell.content,
+                        indent,
+                        mode,
+                        remaining,
+                        last_kind,
+                        last_parent,
+                    ) {
+                        FitsResult::Continue => {}
+                        other => return other,
+                    }
+                }
+                FitsResult::Continue
             }
         }
     }

@@ -182,6 +182,58 @@ end.
     assert_idempotent_with_max(src, 80);
 }
 
+#[test]
+fn function_return_type_counts_against_signature_width() {
+    // Regression: the parameter list Group's fit check must include the
+    // trailing `: ReturnType;` that follows the closing paren on the
+    // same line. Without the rest-of-line walk the Group only measured
+    // its own contents and left a 129-char line unwrapped at width 120.
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  private
+    function LoadFieldCaptions(AConn: TSqlDBConnection; AUsageId, AFieldListId: Integer; const ALang: RawUtf8): TRawUtf8DynArray;
+  end;
+implementation
+function LoadFieldCaptions(aConn: TSqlDBConnection; aUsageId, aFieldListId: Integer; const aLang: RawUtf8): TRawUtf8DynArray;
+begin
+  Result := nil;
+end;
+end.
+";
+    let result = format_source_with_max(src, 120);
+    assert_no_long_lines(&result, 120);
+    assert_idempotent_with_max(src, 120);
+}
+
+#[test]
+fn function_return_type_fits_stays_on_one_line() {
+    // Counterpart to the regression above: when the full line (params
+    // *plus* return type) fits within the budget, the signature should
+    // stay flat — i.e., the rest-of-line walk must not over-break.
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  private
+    function LoadFieldLists(AConn: TSqlDBConnection; AUsageId: Integer; const ALang: RawUtf8): TFieldListsByContext;
+  end;
+implementation
+end.
+";
+    let result = format_source_with_max(src, 120);
+    let sig_line = result.lines().find(|l| l.contains("LoadFieldLists"));
+    assert!(sig_line.is_some(), "signature not found:\n{}", result);
+    assert!(
+        sig_line.unwrap().contains("): TFieldListsByContext;"),
+        "116-char signature should stay on one line at width 120:\n{}",
+        sig_line.unwrap()
+    );
+}
+
 // ── Function Call Arguments Breaking (exprCall at ,) ────────────
 
 #[test]

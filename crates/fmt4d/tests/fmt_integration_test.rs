@@ -1,10 +1,20 @@
 use std::fs;
 use std::path::PathBuf;
 
+mod common;
+
+/// Local helper: integration tests need `uses.group = true` so they can verify
+/// the grouping/sorting behaviour against fixtures. This is intentionally
+/// distinct from `common::format_source`, which uses the default config.
 fn format_source(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let mut config = fmt4d::config::FmtConfig::default();
-    config.uses.group = true;
+    let config = fmt4d::config::FmtConfig {
+        uses: fmt4d::config::UsesConfig {
+            group: true,
+            ..fmt4d::config::UsesConfig::default()
+        },
+        ..fmt4d::config::FmtConfig::default()
+    };
     fmt4d::formatter::format_source(
         source.as_bytes(),
         &info,
@@ -15,37 +25,14 @@ fn format_source(source: &str) -> String {
 }
 
 fn idempotency_check(source: &str) {
-    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let mut config = fmt4d::config::FmtConfig::default();
-    config.uses.group = true;
-    let first = fmt4d::formatter::format_source(
-        source.as_bytes(),
-        &info,
-        &config,
-        &std::collections::HashSet::new(),
-    )
-    .expect("first failed");
-    let second = fmt4d::formatter::format_source(
-        first.as_bytes(),
-        &info,
-        &config,
-        &std::collections::HashSet::new(),
-    )
-    .expect("second failed");
+    let first = format_source(source);
+    let second = format_source(&first);
     assert_eq!(first, second, "formatting is not idempotent");
 }
 
 fn roundtrip_ast_check(source: &str) {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let mut config = fmt4d::config::FmtConfig::default();
-    config.uses.group = true;
-    let formatted = fmt4d::formatter::format_source(
-        source.as_bytes(),
-        &info,
-        &config,
-        &std::collections::HashSet::new(),
-    )
-    .expect("format failed");
+    let formatted = format_source(source);
 
     let (tree_before, _) =
         pascal_core::parser::parse_file(&info, source.as_bytes()).expect("parse original failed");

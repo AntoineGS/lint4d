@@ -1,29 +1,7 @@
 use std::path::PathBuf;
 
-fn format_aligned(source: &str) -> String {
-    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let mut config = fmt4d::config::FmtConfig::default();
-    config.alignment.enabled = true;
-    fmt4d::formatter::format_source(
-        source.as_bytes(),
-        &info,
-        &config,
-        &std::collections::HashSet::new(),
-    )
-    .expect("formatting failed")
-}
-
-fn format_unaligned(source: &str) -> String {
-    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let config = fmt4d::config::FmtConfig::default();
-    fmt4d::formatter::format_source(
-        source.as_bytes(),
-        &info,
-        &config,
-        &std::collections::HashSet::new(),
-    )
-    .expect("formatting failed")
-}
+mod common;
+use common::{format_aligned, format_source};
 
 // ── Constant alignment ───────────────────────────────────────────────
 
@@ -69,7 +47,7 @@ const
 implementation
 end.
 ";
-    let result = format_unaligned(source);
+    let result = format_source(source);
     // No alignment when disabled — each const has single space around =.
     assert!(
         result.contains("kFOO = 'A';"),

@@ -6,17 +6,8 @@
 
 use std::path::PathBuf;
 
-fn format_source(source: &str) -> String {
-    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
-    let config = fmt4d::config::FmtConfig::default();
-    fmt4d::formatter::format_source(
-        source.as_bytes(),
-        &info,
-        &config,
-        &std::collections::HashSet::new(),
-    )
-    .expect("formatting failed")
-}
+mod common;
+use common::format_source;
 
 // ── Bug 1: Character literal corruption ─────────────────────────
 // #0, #9, #10, #13 etc. are reduced to bare `#`, producing code

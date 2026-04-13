@@ -9,12 +9,12 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::process;
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const EXIT_OK: i32 = 0;
-const EXIT_FORMAT_NEEDED: i32 = 1;
-const EXIT_ERROR: i32 = 2;
+const EXIT_OK: u8 = 0;
+const EXIT_FORMAT_NEEDED: u8 = 1;
+const EXIT_ERROR: u8 = 2;
 
 /// Maximum file size fmt4d will attempt to read (16 MiB).
 ///
@@ -81,39 +81,36 @@ fn parse_end_of_line(s: &str) -> Result<EndOfLine, String> {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if cli.init {
-        process::exit(run_init());
-    }
-
-    if cli.stdin {
-        process::exit(run_stdin(&cli));
-    }
-
-    if cli.paths.is_empty() && cli.project.is_none() {
-        Cli::command().print_help().ok();
+    let code: u8 = if cli.init {
+        run_init()
+    } else if cli.stdin {
+        run_stdin(&cli)
+    } else if cli.paths.is_empty() && cli.project.is_none() {
+        let _ = Cli::command().print_help();
         println!();
-        process::exit(EXIT_OK);
-    }
-
-    // Auto-detect .dproj files passed as positional args
-    let mut cli = cli;
-    if cli.project.is_none() {
-        if let Some(pos) = cli.paths.iter().position(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("dproj"))
-        }) {
-            cli.project = Some(cli.paths.remove(pos));
+        EXIT_OK
+    } else {
+        // Auto-detect .dproj files passed as positional args
+        let mut cli = cli;
+        if cli.project.is_none() {
+            if let Some(pos) = cli.paths.iter().position(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("dproj"))
+            }) {
+                cli.project = Some(cli.paths.remove(pos));
+            }
         }
-    }
+        run_files(&cli)
+    };
 
-    process::exit(run_files(&cli));
+    ExitCode::from(code)
 }
 
-fn run_stdin(cli: &Cli) -> i32 {
+fn run_stdin(cli: &Cli) -> u8 {
     // Read raw bytes so legacy Latin-1 / Windows-1252 input doesn't get
     // rejected at the boundary (read_to_string would fail on non-UTF-8).
     let mut input = Vec::new();
@@ -143,7 +140,7 @@ fn run_stdin(cli: &Cli) -> i32 {
     }
 }
 
-fn run_files(cli: &Cli) -> i32 {
+fn run_files(cli: &Cli) -> u8 {
     let mut files = match discover_files(&cli.paths, &[]) {
         Ok(f) => f,
         Err(e) => {
@@ -315,7 +312,7 @@ fn run_files(cli: &Cli) -> i32 {
     EXIT_OK
 }
 
-fn run_init() -> i32 {
+fn run_init() -> u8 {
     let config_path = PathBuf::from(".fmt4d.toml");
     if config_path.exists() {
         eprintln!("fmt4d: .fmt4d.toml already exists");

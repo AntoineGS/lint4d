@@ -291,7 +291,11 @@ fn skip_line_comment(source: &[u8], start: usize) -> usize {
 }
 
 fn skip_paren_star_comment(source: &[u8], start: usize) -> usize {
-    let mut cursor = start + 2;
+    // Start scanning from `start + 1` (the `*` of the opener) so that the
+    // degenerate empty comment `(*)` — where the `*` is shared between
+    // opener and closer — is recognized. This mirrors the backward-scan
+    // semantics in `find_matching_paren_star`.
+    let mut cursor = start + 1;
     while cursor + 1 < source.len() {
         if source[cursor] == b'*' && source[cursor + 1] == b')' {
             return cursor + 2;
@@ -396,7 +400,7 @@ fn find_matching_open_brace_comment(body: &[u8], close_pos: usize) -> Option<usi
 
 fn find_matching_paren_star(body: &[u8], star_paren_pos: usize) -> Option<usize> {
     // Walk backward looking for `(*`.
-    let mut cursor = star_paren_pos;
+    let mut cursor = star_paren_pos + 1;
     while cursor >= 2 {
         cursor -= 1;
         if body[cursor - 1] == b'(' && body[cursor] == b'*' {
@@ -637,6 +641,16 @@ mod tests {
     #[test]
     fn rewrite_case_insensitive_keywords() {
         let src = ascii("{$ifndef DEBUG} if c THEN {$endif}\n  stmt;\n");
+        assert_eq!(patches_of(&src).len(), 1);
+    }
+
+    #[test]
+    fn rewrite_trailing_empty_paren_star_comment() {
+        // `if cond then(*)` — the (*) is an empty trailing comment that
+        // must be trimmed so `then` is recognized as the last significant
+        // token. Without the find_matching_paren_star off-by-one fix this
+        // returns zero patches.
+        let src = ascii("{$IFDEF A} if cond then(*){$ENDIF}\n  stmt;\n");
         assert_eq!(patches_of(&src).len(), 1);
     }
 }

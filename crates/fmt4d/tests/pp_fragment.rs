@@ -114,3 +114,20 @@ fn bucket_c_uses_semi_parses_and_is_idempotent() {
 fn bucket_c_visibility_directive() {
     assert_fragment_preserving("bucket_c_visibility_directive.pas");
 }
+
+#[test]
+fn bucket_c_visibility_strict() {
+    assert_fragment_preserving("bucket_c_visibility_strict.pas");
+
+    // `strict private` (and `strict protected`) must stay joined on a
+    // single line inside a ppDeclSection. Regression guard for the bug
+    // where build_pp_decl_section emitted a Hardline after `strict`.
+    let path = fixture_path("bucket_c_visibility_strict.pas");
+    let source = fs::read(&path).expect("fixture exists");
+    let formatted = format_bytes(&source);
+    let formatted_str = std::str::from_utf8(&formatted).expect("utf8 output");
+    assert!(
+        formatted_str.contains("strict private"),
+        "formatter split `strict private` across lines; got:\n{formatted_str}",
+    );
+}

@@ -170,15 +170,28 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut body_children: Vec<Node<'a>> = Vec::new();
         let mut visibility_end_row: Option<usize> = None;
+        let mut after_strict = false;
 
         self.for_each_code_child(node, |child| match child.kind() {
             K::PP_IF => {
                 parts.push(Doc::Hardline);
                 parts.push(Doc::Raw(self.node_text(child)));
             }
-            K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED | K::K_STRICT => {
+            K::K_STRICT => {
                 parts.push(Doc::Hardline);
                 parts.push(self.doc_for_node(child));
+                after_strict = true;
+                visibility_end_row = Some(child.end_position().row);
+            }
+            K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED => {
+                if after_strict {
+                    parts.push(Doc::Raw(" ".into()));
+                    parts.push(Doc::Raw(self.node_text(child)));
+                    after_strict = false;
+                } else {
+                    parts.push(Doc::Hardline);
+                    parts.push(self.doc_for_node(child));
+                }
                 visibility_end_row = Some(child.end_position().row);
             }
             K::PP_END_IF => {

@@ -162,6 +162,17 @@ impl<'a> DocBuilder<'a> {
             K::ARR_INITIALIZER => self.build_paren_list(node, K::COMMA),
             K::RTTI_ATTRIBUTES => self.build_rtti_attributes(node),
             K::PP_BLOCK => self.build_pp_block(node),
+            K::PP_FRAGMENT => {
+                // Render the fragment span verbatim: the external scanner consumed
+                // the whole {$ifdef ...}...{$endif} directive pair (plus any
+                // trailing identifier-chain continuation) as one opaque token, so
+                // we emit the node's original source bytes unchanged. No
+                // structural sub-parsing — fmt4d does not interpret the branches.
+                let text = self.node_text(node);
+                let kind = node.kind();
+                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                doc::token(text, kind, parent_kind)
+            }
             _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
             _ => {
                 if node.child_count() > 0 && self.has_breakable_operators(node) {

@@ -36,6 +36,7 @@ pub const DECL_CLASS: &str = "declClass";
 pub const DECL_RECORD: &str = "declRecord";
 pub const DECL_INTF: &str = "declIntf";
 pub const DECL_SECTION: &str = "declSection";
+pub const PP_DECL_SECTION: &str = "ppDeclSection";
 pub const DECL_VARS: &str = "declVars";
 pub const DECL_CONSTS: &str = "declConsts";
 pub const DECL_TYPES: &str = "declTypes";

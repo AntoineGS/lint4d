@@ -253,7 +253,7 @@ fn class_has_reintroduced_method(decl_class: Node, method_name: &str, source: &[
             && decl_proc_matches_and_reintroduced(child, method_name, source)
         {
             return true;
-        } else if child.kind() == K::DECL_SECTION {
+        } else if child.kind() == K::DECL_SECTION || child.kind() == K::PP_DECL_SECTION {
             let mut section_cursor = child.walk();
             for section_child in child.children(&mut section_cursor) {
                 if section_child.kind() == K::DECL_PROC

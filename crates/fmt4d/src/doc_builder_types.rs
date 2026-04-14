@@ -6,7 +6,9 @@ use tree_sitter::Node;
 impl<'a> DocBuilder<'a> {
     pub(crate) fn build_type_body(&self, node: Node<'a>) -> Doc {
         let children = self.code_children(node);
-        let has_visibility = children.iter().any(|c| c.kind() == K::DECL_SECTION);
+        let has_visibility = children
+            .iter()
+            .any(|c| c.kind() == K::DECL_SECTION || c.kind() == K::PP_DECL_SECTION);
         let has_end = children.iter().any(|c| c.kind() == K::K_END);
         let align_fields = self.should_align("fields");
         let align_props = self.should_align("properties");
@@ -33,9 +35,9 @@ impl<'a> DocBuilder<'a> {
                 K::CLOSE_PAREN if in_ancestor_list => {
                     parts.push(Doc::Raw(")".into()));
                     in_ancestor_list = false;
-                    let next_is_section = children
-                        .get(idx + 1)
-                        .is_some_and(|n| n.kind() == K::DECL_SECTION);
+                    let next_is_section = children.get(idx + 1).is_some_and(|n| {
+                        n.kind() == K::DECL_SECTION || n.kind() == K::PP_DECL_SECTION
+                    });
                     if has_end && !next_is_section {
                         parts.push(Doc::Hardline);
                     }
@@ -73,7 +75,7 @@ impl<'a> DocBuilder<'a> {
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(*child));
                 }
-                K::DECL_SECTION => {
+                K::DECL_SECTION | K::PP_DECL_SECTION => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
                     }
@@ -91,7 +93,9 @@ impl<'a> DocBuilder<'a> {
                 _ => {
                     if in_ancestor_list {
                         in_ancestor_list = false;
-                        if has_end && child.kind() != K::DECL_SECTION {
+                        let is_section =
+                            child.kind() == K::DECL_SECTION || child.kind() == K::PP_DECL_SECTION;
+                        if has_end && !is_section {
                             parts.push(Doc::Hardline);
                         }
                     }
@@ -131,14 +135,14 @@ impl<'a> DocBuilder<'a> {
         let mut prev_body_end_row: Option<usize> = None;
 
         for child in body_children {
-            if child.kind() == K::DECL_SECTION {
+            if child.kind() == K::DECL_SECTION || child.kind() == K::PP_DECL_SECTION {
                 if let Some(prev_end) = prev_body_end_row {
                     if self.has_blank_line_between(prev_end, child.start_position().row) {
                         body_parts.push(Doc::BlankLine);
                     }
                 }
                 body_parts.push(self.doc_for_node(*child));
-                prev_body_kind = K::DECL_SECTION;
+                prev_body_kind = child.kind();
                 prev_body_end_row = Some(child.end_position().row);
                 continue;
             }

@@ -109,3 +109,8 @@ fn bucket_b_statement_mid_block() {
 fn bucket_c_uses_semi_parses_and_is_idempotent() {
     assert_fragment_preserving("bucket_c_uses_semi.pas");
 }
+
+#[test]
+fn bucket_c_visibility_directive() {
+    assert_fragment_preserving("bucket_c_visibility_directive.pas");
+}

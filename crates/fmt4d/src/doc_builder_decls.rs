@@ -152,6 +152,83 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
+    /// Build a `ppDeclSection` node — a visibility specifier wrapped in a
+    /// preprocessor directive pair, e.g.:
+    ///
+    /// ```pascal
+    /// {$IFDEF UNITTEST}
+    /// published
+    /// {$ENDIF}
+    ///   property Bar: integer read FBar;
+    /// ```
+    ///
+    /// The ppIf/ppEndIf tokens are emitted verbatim at the visibility level,
+    /// and the body (fields, properties, etc.) is indented beneath.
+    pub(crate) fn build_pp_decl_section(&self, node: Node<'a>) -> Doc {
+        let align_fields = self.should_align("fields");
+        let align_props = self.should_align("properties");
+        let mut parts = Vec::new();
+        let mut body_children: Vec<Node<'a>> = Vec::new();
+        let mut visibility_end_row: Option<usize> = None;
+
+        self.for_each_code_child(node, |child| match child.kind() {
+            K::PP_IF => {
+                parts.push(Doc::Hardline);
+                parts.push(Doc::Raw(self.node_text(child)));
+            }
+            K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED | K::K_STRICT => {
+                parts.push(Doc::Hardline);
+                parts.push(self.doc_for_node(child));
+                visibility_end_row = Some(child.end_position().row);
+            }
+            K::PP_END_IF => {
+                parts.push(Doc::Hardline);
+                parts.push(Doc::Raw(self.node_text(child)));
+            }
+            _ => {
+                body_children.push(child);
+            }
+        });
+
+        if body_children.is_empty() {
+            return doc::concat(parts);
+        }
+
+        if align_fields || align_props {
+            let body = self.build_aligned_decl_section_body(
+                &body_children,
+                visibility_end_row,
+                align_fields,
+                align_props,
+            );
+            parts.push(strip_trailing_hardline(doc::indent(body)));
+        } else {
+            let mut body_parts: Vec<Doc> = Vec::new();
+            let mut prev_end_row = visibility_end_row;
+
+            for child in &body_children {
+                let child_doc = self.doc_for_node(*child);
+                if let Some(prev_end) = prev_end_row {
+                    if self.has_blank_line_between(prev_end, child.start_position().row) {
+                        body_parts.push(Doc::BlankLine);
+                    } else if !body_parts.is_empty() {
+                        let prev_ends = body_parts.last().is_some_and(ends_with_hardline);
+                        if !prev_ends && !starts_with_hardline(&child_doc) {
+                            body_parts.push(Doc::Hardline);
+                        }
+                    }
+                }
+                body_parts.push(child_doc);
+                prev_end_row = Some(child.end_position().row);
+            }
+            if !body_parts.is_empty() {
+                let body = doc::indent(doc::concat(body_parts));
+                parts.push(strip_trailing_hardline(body));
+            }
+        }
+        doc::concat(parts)
+    }
+
     pub(crate) fn build_def_proc(&self, node: Node<'a>) -> Doc {
         // defProc children: declProc (signature), optional local sections
         // (declVars/declConsts/declTypes), block (begin..end), final ;

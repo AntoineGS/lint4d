@@ -145,6 +145,7 @@ impl<'a> DocBuilder<'a> {
             K::BLOCK | K::STATEMENTS => self.build_block(node),
             K::DECL_CLASS | K::DECL_RECORD | K::DECL_INTF => self.build_type_body(node),
             K::DECL_SECTION => self.build_decl_section(node),
+            K::PP_DECL_SECTION => self.build_pp_decl_section(node),
             K::DECL_VARS | K::DECL_CONSTS | K::DECL_TYPES => self.build_section(node),
             K::DEF_PROC => self.build_def_proc(node),
             K::DECL_PROC => self.build_decl_proc(node),

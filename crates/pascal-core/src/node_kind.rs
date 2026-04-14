@@ -21,6 +21,7 @@ pub const COMMENT: &str = "comment";
 
 pub const PP_USES_BLOCK: &str = "ppUsesBlock";
 pub const PP_FRAGMENT_EXPR: &str = "ppFragmentExpr";
+pub const PP_FRAGMENT_STMT: &str = "ppFragmentStmt";
 pub const PP_IF: &str = "ppIf";
 pub const PP_ELSE: &str = "ppElse";
 pub const PP_END_IF: &str = "ppEndIf";

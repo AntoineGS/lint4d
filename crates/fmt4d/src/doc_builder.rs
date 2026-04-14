@@ -162,7 +162,7 @@ impl<'a> DocBuilder<'a> {
             K::ARR_INITIALIZER => self.build_paren_list(node, K::COMMA),
             K::RTTI_ATTRIBUTES => self.build_rtti_attributes(node),
             K::PP_BLOCK => self.build_pp_block(node),
-            K::PP_FRAGMENT_EXPR => {
+            K::PP_FRAGMENT_EXPR | K::PP_FRAGMENT_STMT => {
                 // Render the fragment span verbatim: the external scanner consumed
                 // the whole {$ifdef ...}...{$endif} directive pair (plus any
                 // trailing identifier-chain continuation) as one opaque token, so

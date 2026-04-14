@@ -84,3 +84,18 @@ fn pattern_d_cast_wrapping() {
 fn pattern_e_exception_type() {
     assert_fragment_preserving("pattern_e_exception_type.pas");
 }
+
+#[test]
+fn bucket_a_const_expression() {
+    assert_fragment_preserving("bucket_a_const_expression.pas");
+}
+
+#[test]
+fn bucket_a_assignment_rhs() {
+    assert_fragment_preserving("bucket_a_assignment_rhs.pas");
+}
+
+#[test]
+fn bucket_a_call_argument() {
+    assert_fragment_preserving("bucket_a_call_argument.pas");
+}

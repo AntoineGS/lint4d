@@ -99,3 +99,8 @@ fn bucket_a_assignment_rhs() {
 fn bucket_a_call_argument() {
     assert_fragment_preserving("bucket_a_call_argument.pas");
 }
+
+#[test]
+fn bucket_b_statement_mid_block() {
+    assert_fragment_preserving("bucket_b_statement_mid_block.pas");
+}

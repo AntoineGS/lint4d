@@ -387,7 +387,7 @@ pub fn extract_uses_items(node: tree_sitter::Node, source: &[u8]) -> Vec<UsesIte
                     items.push(UsesItem::Unit(text));
                 }
             }
-            k if k == K::PP_USES_BLOCK => {
+            k if k == K::PP_USES_BLOCK || k == K::PP_USES_BLOCK_WITH_SEMI => {
                 items.push(UsesItem::IfDefBlock(parse_pp_uses_block(child, source)));
             }
             k if k == K::PP_DIRECTIVE => {

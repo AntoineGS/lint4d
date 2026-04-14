@@ -104,3 +104,8 @@ fn bucket_a_call_argument() {
 fn bucket_b_statement_mid_block() {
     assert_fragment_preserving("bucket_b_statement_mid_block.pas");
 }
+
+#[test]
+fn bucket_c_uses_semi_parses_and_is_idempotent() {
+    assert_fragment_preserving("bucket_c_uses_semi.pas");
+}

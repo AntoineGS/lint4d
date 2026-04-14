@@ -20,6 +20,7 @@ pub const COMMENT: &str = "comment";
 // ── Preprocessor nodes ─────────────────────────────────────────────
 
 pub const PP_USES_BLOCK: &str = "ppUsesBlock";
+pub const PP_USES_BLOCK_WITH_SEMI: &str = "ppUsesBlockWithSemi";
 pub const PP_FRAGMENT_EXPR: &str = "ppFragmentExpr";
 pub const PP_FRAGMENT_STMT: &str = "ppFragmentStmt";
 pub const PP_IF: &str = "ppIf";

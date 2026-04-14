@@ -152,7 +152,7 @@ version = "0.1.0"
 dependencies = [
  "cfg-core",
  "tree-sitter",
- "tree-sitter-pascal 0.10.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tree-sitter-pascal 0.10.2",
 ]
 
 [[package]]
@@ -570,7 +570,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-language",
- "tree-sitter-pascal 0.10.2 (git+https://github.com/AntoineGS/tree-sitter-pascal.git)",
+ "tree-sitter-pascal 0.11.0",
  "walkdir",
  "winreg",
  "xxhash-rust",
@@ -647,7 +647,7 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-language",
- "tree-sitter-pascal 0.10.2",
+ "tree-sitter-pascal 0.11.0",
  "walkdir",
  "winreg",
 ]
@@ -1064,14 +1064,6 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 [[package]]
 name = "tree-sitter-pascal"
 version = "0.10.2"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-pascal"
-version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb51e9a57493fd237e4517566749f7f7453349261a72a427e5f11d3b34b72a8"
 dependencies = [
@@ -1081,8 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-pascal"
-version = "0.10.2"
-source = "git+https://github.com/AntoineGS/tree-sitter-pascal.git#3a9955c4b67e419a78e8c8cc17872b99eea50b21"
+version = "0.11.0"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -1,3 +1,4 @@
+use crate::directive_fragment_rewrite::{DirectivePatch, rewrite_partial_control_flow};
 use crate::types::{Diagnostic, FileInfo, Severity};
 use std::cell::RefCell;
 use tree_sitter::Parser;
@@ -15,19 +16,39 @@ thread_local! {
 ///
 /// Returns `Ok((Tree, Vec<Diagnostic>))` on success, or `Err(String)` if the
 /// parser fails to initialise or returns no tree.
+///
+/// This function runs the directive-fragment rewrite pass before parsing
+/// but discards the patches. Callers that need the patches should use
+/// [`parse_file_with_patches`] instead.
 pub fn parse_file(
-    _info: &FileInfo,
+    info: &FileInfo,
     source: &[u8],
 ) -> Result<(tree_sitter::Tree, Vec<Diagnostic>), String> {
+    let (tree, diagnostics, _patches) = parse_file_with_patches(info, source)?;
+    Ok((tree, diagnostics))
+}
+
+/// Parse Delphi source bytes, running the directive-fragment rewrite pass
+/// first. Returns the parsed tree, diagnostics, and the list of directive
+/// patches that were rewritten.
+///
+/// Callers that don't need patches should use [`parse_file`] instead.
+pub fn parse_file_with_patches(
+    _info: &FileInfo,
+    source: &[u8],
+) -> Result<(tree_sitter::Tree, Vec<Diagnostic>, Vec<DirectivePatch>), String> {
+    let (rewritten, patches) = rewrite_partial_control_flow(source);
     let tree = PARSER
         .with(|parser| {
             let mut parser = parser.borrow_mut();
-            parser.parse(source, None)
+            parser.parse(&*rewritten, None)
         })
         .ok_or_else(|| "parser returned no tree".to_string())?;
 
+    // Diagnostics are collected against the ORIGINAL source so error messages
+    // show the original bytes, not the whitespaced rewrite.
     let diagnostics = collect_parse_errors(&tree, source);
-    Ok((tree, diagnostics))
+    Ok((tree, diagnostics, patches))
 }
 
 /// Walk the tree and emit a `Diagnostic` for every ERROR or MISSING node.

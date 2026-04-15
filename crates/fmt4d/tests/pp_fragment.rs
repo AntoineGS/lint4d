@@ -131,3 +131,13 @@ fn bucket_c_visibility_strict() {
         "formatter split `strict private` across lines; got:\n{formatted_str}",
     );
 }
+
+#[test]
+fn bucket_c_partial_if() {
+    assert_fragment_preserving("bucket_c_partial_if.pas");
+}
+
+#[test]
+fn bucket_c_partial_if_else() {
+    assert_fragment_preserving("bucket_c_partial_if_else.pas");
+}

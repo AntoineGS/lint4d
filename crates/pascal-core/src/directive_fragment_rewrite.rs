@@ -146,6 +146,62 @@ pub fn rewrite_partial_control_flow(source: &[u8]) -> (Cow<'_, [u8]>, Vec<Direct
     (Cow::Owned(rewritten), patches)
 }
 
+/// Scan `source` for `{$IF cond}…{$IFEND}` (or `{$ENDIF}`) blocks whose body
+/// is not valid Pascal, blank the entire span to ASCII spaces (preserving
+/// newlines), and return the rewritten bytes plus a list of
+/// [`DirectivePatch::OpaqueBlock`] records carrying the original spans.
+///
+/// Returns `Cow::Borrowed(source)` when no patches are found.
+///
+/// **Only applies to `{$IF}`** — `{$IFDEF}`, `{$IFNDEF}`, and `{$IFOPT}` are
+/// left alone. Bucket F is specifically the "non-Pascal content hidden in a
+/// dead `{$IF}` branch" pattern.
+///
+/// Safe to run after `rewrite_partial_control_flow` on the same source:
+/// neither rewriter touches bytes the other has already blanked, and both
+/// preserve byte offsets.
+pub fn rewrite_opaque_if_blocks(source: &[u8]) -> (Cow<'_, [u8]>, Vec<DirectivePatch>) {
+    let Some(pairs) = scan_directive_pairs(source) else {
+        return (Cow::Borrowed(source), Vec::new());
+    };
+
+    let mut patches = Vec::new();
+    for pair in pairs {
+        if !is_if_opener(source, pair.opening_start) {
+            continue;
+        }
+        let body = &source[pair.opening_end..pair.closing_start];
+        if body_is_parseable_pascal(body) {
+            continue;
+        }
+        let (row, col) = row_col_at(source, pair.opening_start);
+        patches.push(DirectivePatch::OpaqueBlock(OpaqueBlockPatch {
+            start: pair.opening_start,
+            end: pair.closing_end,
+            text: bytes_to_lossy_string(&source[pair.opening_start..pair.closing_end]),
+            row,
+            col,
+        }));
+    }
+
+    if patches.is_empty() {
+        return (Cow::Borrowed(source), Vec::new());
+    }
+
+    let mut rewritten = source.to_vec();
+    for p in &patches {
+        let DirectivePatch::OpaqueBlock(ob) = p else {
+            continue;
+        };
+        for byte in &mut rewritten[ob.start..ob.end] {
+            if *byte != b'\r' && *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    (Cow::Owned(rewritten), patches)
+}
+
 /// One `{$if*}...{$endif}` pair discovered by the scan.
 struct Pair {
     opening_start: usize,
@@ -495,8 +551,6 @@ fn bytes_to_lossy_string(bytes: &[u8]) -> String {
 /// `{$IF}` from `{$IFDEF}`, `{$IFNDEF}`, `{$IFOPT}`, `{$IFEND}`, and `{$ENDIF}`.
 ///
 /// Case-insensitive on the keyword itself.
-#[allow(dead_code)]
-// Will be used by rewrite_opaque_if_blocks in Task 4
 fn is_if_opener(source: &[u8], opening_start: usize) -> bool {
     let prefix = &source[opening_start..];
     if prefix.len() < 4 {
@@ -525,7 +579,6 @@ fn is_if_opener(source: &[u8], opening_start: usize) -> bool {
 /// This is the detection heuristic for Bucket F: only bodies that both
 /// harnesses reject are considered "non-Pascal content" and blanked by
 /// `rewrite_opaque_if_blocks`.
-#[allow(dead_code)] // Will be used by rewrite_opaque_if_blocks in Task 4
 fn body_is_parseable_pascal(body: &[u8]) -> bool {
     if body.iter().all(|b| b.is_ascii_whitespace()) {
         return true;
@@ -544,7 +597,6 @@ fn body_is_parseable_pascal(body: &[u8]) -> bool {
 
 /// Wraps `body` in `header`/`footer`, parses the result, and returns true if
 /// the resulting tree has no ERROR or MISSING nodes.
-#[allow(dead_code)] // Will be used by rewrite_opaque_if_blocks in Task 4
 fn try_harness(header: &[u8], body: &[u8], footer: &[u8]) -> bool {
     let mut wrapped = Vec::with_capacity(header.len() + body.len() + footer.len());
     wrapped.extend_from_slice(header);
@@ -564,7 +616,6 @@ fn try_harness(header: &[u8], body: &[u8], footer: &[u8]) -> bool {
 
 /// Recursively checks whether `node` or any of its descendants is an ERROR
 /// or MISSING node.
-#[allow(dead_code)] // Will be used by rewrite_opaque_if_blocks in Task 4
 fn tree_has_error(node: tree_sitter::Node) -> bool {
     if node.is_error() || node.is_missing() {
         return true;
@@ -908,5 +959,125 @@ mod tests {
     #[test]
     fn body_parseable_accepts_begin_end_block() {
         assert!(body_is_parseable_pascal(b"begin X := 1; end;"));
+    }
+
+    fn opaque_patches_of(source: &[u8]) -> Vec<DirectivePatch> {
+        rewrite_opaque_if_blocks(source).1
+    }
+
+    fn opaque_rewritten_of(source: &[u8]) -> Vec<u8> {
+        rewrite_opaque_if_blocks(source).0.into_owned()
+    }
+
+    #[test]
+    fn f_u1_opaque_if_with_non_pascal_body_is_patched() {
+        // Use the real-world French dev note that is definitely not valid Pascal
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IF DEFINED(X)}\nrappel: developper en 32 bits pour plus de stabilite\n{$IFEND}\n\
+                    end.\n";
+        let patches = opaque_patches_of(src);
+        assert_eq!(patches.len(), 1, "expected one opaque patch");
+        let o = patches[0].expect_opaque();
+        assert!(o.text.starts_with("{$IF DEFINED(X)}"));
+        assert!(o.text.ends_with("{$IFEND}"));
+        assert!(o.text.contains("rappel: developper en 32 bits"));
+
+        // Rewritten bytes must preserve newlines but blank everything else
+        // in the opaque span.
+        let rewritten = opaque_rewritten_of(src);
+        assert_eq!(rewritten.len(), src.len());
+        for i in o.start..o.end {
+            let b = rewritten[i];
+            assert!(
+                b == b' ' || b == b'\n' || b == b'\r',
+                "rewritten byte at {i} must be space or newline, got {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f_u2_valid_if_body_is_not_patched() {
+        let src = b"unit X;\ninterface\n{$IF VERSION >= 28}\nconst X = 1;\n{$IFEND}\n\
+                    implementation\nend.\n";
+        let patches = opaque_patches_of(src);
+        assert_eq!(patches.len(), 0, "valid decl body must not be patched");
+    }
+
+    #[test]
+    fn f_u3_valid_if_statement_body_is_not_patched() {
+        // Embedded inside a begin/end so the body position matches the harness.
+        let src = b"program P;\nbegin\n{$IF DEBUG}\nWriteLn('x');\n{$IFEND}\nend.\n";
+        let patches = opaque_patches_of(src);
+        assert_eq!(patches.len(), 0, "valid statement body must not be patched");
+    }
+
+    #[test]
+    fn f_u4_ifdef_non_pascal_body_is_not_patched() {
+        // {$IFDEF} is out of scope for Bucket F — only {$IF} is covered.
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IFDEF X}\nrappel: developper\n{$ENDIF}\nend.\n";
+        let patches = opaque_patches_of(src);
+        assert_eq!(patches.len(), 0, "{{$IFDEF}} is out of Bucket F scope");
+    }
+
+    #[test]
+    fn f_u5_nested_if_inside_opaque_body_balances_to_outer() {
+        // Outer {$IF}...{$IFEND} contains an inner {$IF}...{$IFEND} and
+        // non-Pascal text. The outer should match and patch the whole outer span.
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IF A}\nrappel: developper en 32 bits pour plus de stabilite\n{$IF B}\nrappel: corriger le bug de parser\n{$IFEND}\n{$IFEND}\n\
+                    end.\n";
+        let patches = opaque_patches_of(src);
+        assert_eq!(
+            patches.len(),
+            1,
+            "nested {{$IF}} must balance to one outer patch"
+        );
+        let o = patches[0].expect_opaque();
+        assert!(o.text.starts_with("{$IF A}"));
+        // The outer text contains both the inner {$IF B} and the final {$IFEND}.
+        assert!(o.text.contains("{$IF B}"));
+        assert!(o.text.contains("{$IFEND}"));
+    }
+
+    #[test]
+    fn f_u6_if_with_ifend_closer() {
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IF A}\nrappel: developper en 32 bits pour plus de stabilite\n{$IFEND}\nend.\n";
+        assert_eq!(opaque_patches_of(src).len(), 1);
+    }
+
+    #[test]
+    fn f_u7_if_with_endif_closer() {
+        // Delphi accepts {$ENDIF} as a closer for {$IF} as well as for {$IFDEF}.
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IF A}\nrappel: developper en 32 bits pour plus de stabilite\n{$ENDIF}\nend.\n";
+        assert_eq!(opaque_patches_of(src).len(), 1);
+    }
+
+    #[test]
+    fn f_u8_empty_body_is_not_patched() {
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IF DEFINED(X)}{$IFEND}\nend.\n";
+        assert_eq!(opaque_patches_of(src).len(), 0);
+    }
+
+    #[test]
+    fn f_u9_byte_offsets_preserved_after_rewrite() {
+        let src = "unit X;\ninterface\nimplementation\n\
+                   {$IF X}\nnon-pascal content\n{$IFEND}\nend.\n"
+            .as_bytes();
+        let rewritten = opaque_rewritten_of(src);
+        assert_eq!(rewritten.len(), src.len(), "length preserved");
+
+        // Newlines in the opaque span remain at the same byte offsets.
+        for (i, b) in src.iter().enumerate() {
+            if *b == b'\n' {
+                assert_eq!(rewritten[i], b'\n', "newline at {i} preserved");
+            }
+            if *b == b'\r' {
+                assert_eq!(rewritten[i], b'\r', "CR at {i} preserved");
+            }
+        }
     }
 }

@@ -1,5 +1,8 @@
-use crate::directive_fragment_rewrite::{DirectivePatch, rewrite_partial_control_flow};
+use crate::directive_fragment_rewrite::{
+    DirectivePatch, rewrite_opaque_if_blocks, rewrite_partial_control_flow,
+};
 use crate::types::{Diagnostic, FileInfo, Severity};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use tree_sitter::Parser;
 
@@ -37,16 +40,35 @@ pub fn parse_file_with_patches(
     _info: &FileInfo,
     source: &[u8],
 ) -> Result<(tree_sitter::Tree, Vec<Diagnostic>, Vec<DirectivePatch>), String> {
-    let (rewritten, patches) = rewrite_partial_control_flow(source);
-    let tree = PARSER
+    // Phase 1 — always-on partial-control-flow rewrite (Bucket C).
+    let (phase1_source, mut patches) = rewrite_partial_control_flow(source);
+
+    let mut tree = PARSER
         .with(|parser| {
             let mut parser = parser.borrow_mut();
-            parser.parse(&*rewritten, None)
+            parser.parse(&*phase1_source, None)
         })
         .ok_or_else(|| "parser returned no tree".to_string())?;
 
-    // Diagnostics are collected against the ORIGINAL source so error messages
-    // show the original bytes, not the whitespaced rewrite.
+    // Phase 2 — lazy opaque-{$IF} rewrite (Bucket F). Runs only when the
+    // Phase 1 tree still has real errors.
+    if has_real_error(tree.root_node()) {
+        let (phase2_source, patches_f) = rewrite_opaque_if_blocks(&phase1_source);
+        if !patches_f.is_empty() {
+            let phase2_owned: Cow<[u8]> = Cow::Owned(phase2_source.into_owned());
+            tree = PARSER
+                .with(|parser| {
+                    let mut parser = parser.borrow_mut();
+                    parser.parse(&*phase2_owned, None)
+                })
+                .ok_or_else(|| "parser returned no tree".to_string())?;
+            patches.extend(patches_f);
+        }
+    }
+
+    // Diagnostics are collected against the ORIGINAL source so error
+    // messages show the original bytes, not the whitespaced rewrites.
+    // Both rewriters preserve byte offsets, so positions stay valid.
     let diagnostics = collect_parse_errors(&tree, source);
     Ok((tree, diagnostics, patches))
 }
@@ -122,7 +144,6 @@ fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
 /// that is *not* a bare `raise;` false-positive. This is the Phase 2
 /// fallback gate in `parse_file_with_patches`: if `has_real_error` returns
 /// true, we rerun the source through `rewrite_opaque_if_blocks` and reparse.
-#[allow(dead_code)] // Will be used by parse_file_with_patches in Task 6
 fn has_real_error(node: tree_sitter::Node) -> bool {
     if node.is_error() || node.is_missing() {
         if node.is_error() && is_bare_raise_error(node) {
@@ -186,5 +207,54 @@ mod has_real_error_tests {
             !has_real_error(tree.root_node()),
             "bare `raise;` must not count as a real error"
         );
+    }
+}
+
+#[cfg(test)]
+mod parse_with_patches_tests {
+    use super::*;
+    use crate::types::FileInfo;
+    use std::path::PathBuf;
+
+    fn info() -> FileInfo {
+        FileInfo::new(PathBuf::from("test.pas"))
+    }
+
+    #[test]
+    fn clean_source_produces_no_patches() {
+        let src = b"unit X;\ninterface\nimplementation\nend.\n";
+        let (_tree, diags, patches) = parse_file_with_patches(&info(), src).expect("parse ok");
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+        assert!(patches.is_empty(), "expected no patches, got {patches:?}");
+    }
+
+    #[test]
+    fn bucket_f_file_parses_cleanly_after_phase_2_rewrite() {
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IF DEFINED(WIN32) AND NOT DEFINED(UNITTEST)}\n\
+                    rappel: developper en 32 bits pour plus de stabilite\n\
+                    {$IFEND}\nend.\n";
+        let (_tree, diags, patches) = parse_file_with_patches(&info(), src).expect("parse ok");
+        assert_eq!(
+            diags.len(),
+            0,
+            "Phase 2 rewrite must clear all diagnostics, got {diags:?}"
+        );
+        assert_eq!(patches.len(), 1, "one opaque-block patch expected");
+        let o = patches[0].expect_opaque();
+        assert!(o.text.contains("rappel: developper"));
+    }
+
+    #[test]
+    fn clean_source_with_valid_if_skips_phase_2() {
+        // Source with a valid {$IF} block must not trigger Phase 2.
+        // We can't directly observe "Phase 2 didn't run", but we can assert
+        // that no OpaqueBlock patches were produced and no Markers either.
+        let src = b"unit X;\ninterface\n\
+                    {$IF VERSION >= 28}\nconst X = 1;\n{$IFEND}\n\
+                    implementation\nend.\n";
+        let (_tree, diags, patches) = parse_file_with_patches(&info(), src).expect("parse ok");
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+        assert!(patches.is_empty(), "expected no patches, got {patches:?}");
     }
 }

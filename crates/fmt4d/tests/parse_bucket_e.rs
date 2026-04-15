@@ -117,6 +117,52 @@ end.
     );
 }
 
+// ── E3: standalone subrange type alias ─────────────────────────────────
+// Grammar gap: the `type` rule accepts typeref/enum/set/array/file/string/
+// procRef, but not a bare subrange like `TMultiPayProcs = sppShift4 ..
+// sppTenderRetail;`. The `range` production exists (used in array indices
+// and case labels) but is not wired into top-level type declarations.
+// Repro: `C:\Multidev\Common\Payments\objLibrariesCallerPrototypes.pas:31`.
+
+#[test]
+fn bucket_e3_subrange_type_alias() {
+    let src = "\
+unit T;
+interface
+type
+  TPayProc = (sppShift4, sppPayPal, sppShopify, sppTenderRetail);
+  TMultiPayProcs = sppShift4 .. sppTenderRetail;
+implementation
+end.
+";
+    let result = format_source(src);
+    // Accept either spaced or unspaced `..` — the point is the parser no
+    // longer errors on a standalone subrange type alias.
+    assert!(
+        result.contains("sppShift4..sppTenderRetail")
+            || result.contains("sppShift4 .. sppTenderRetail"),
+        "expected subrange type alias to survive formatting, got:\n{result}"
+    );
+}
+
+#[test]
+fn bucket_e3_integer_subrange_type_alias() {
+    // Classic Pascal form that also needs to work.
+    let src = "\
+unit T;
+interface
+type
+  TDigit = 0 .. 9;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("0..9") || result.contains("0 .. 9"),
+        "expected integer subrange to survive formatting, got:\n{result}"
+    );
+}
+
 #[test]
 fn bucket_e2_typeref_field_with_deprecated_bare() {
     // Same pattern on a non-string typeref. The typeref rule previously

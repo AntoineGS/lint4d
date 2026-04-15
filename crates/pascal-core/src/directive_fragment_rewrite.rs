@@ -490,6 +490,32 @@ fn bytes_to_lossy_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Returns true iff `source[opening_start..]` begins with a `{$IF}` directive
+/// opener — i.e., `{$IF` followed by a non-alphabetic byte. This distinguishes
+/// `{$IF}` from `{$IFDEF}`, `{$IFNDEF}`, `{$IFOPT}`, `{$IFEND}`, and `{$ENDIF}`.
+///
+/// Case-insensitive on the keyword itself.
+#[allow(dead_code)]
+// Will be used by rewrite_opaque_if_blocks in Task 4
+fn is_if_opener(source: &[u8], opening_start: usize) -> bool {
+    let prefix = &source[opening_start..];
+    if prefix.len() < 4 {
+        return false;
+    }
+    if prefix[0] != b'{' || prefix[1] != b'$' {
+        return false;
+    }
+    if !(prefix[2] == b'i' || prefix[2] == b'I') {
+        return false;
+    }
+    if !(prefix[3] == b'f' || prefix[3] == b'F') {
+        return false;
+    }
+    // Character after "if" must not be alphabetic (else it's ifdef, ifend, etc.)
+    let next = prefix.get(4).copied().unwrap_or(b' ');
+    !next.is_ascii_alphabetic()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,5 +739,63 @@ mod tests {
         // returns zero patches.
         let src = ascii("{$IFDEF A} if cond then(*){$ENDIF}\n  stmt;\n");
         assert_eq!(patches_of(&src).len(), 1);
+    }
+
+    #[test]
+    fn is_if_opener_matches_if_with_space() {
+        assert!(is_if_opener(b"{$IF DEFINED(X)}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_matches_if_with_tab() {
+        assert!(is_if_opener(b"{$IF\tDEFINED(X)}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_matches_lowercase_if() {
+        assert!(is_if_opener(b"{$if DEFINED(X)}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_matches_bare_if_close() {
+        // `{$IF}` with no argument — unusual but legal tokenwise.
+        assert!(is_if_opener(b"{$IF}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_rejects_ifdef() {
+        assert!(!is_if_opener(b"{$IFDEF DEBUG}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_rejects_ifndef() {
+        assert!(!is_if_opener(b"{$IFNDEF DEBUG}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_rejects_ifopt() {
+        assert!(!is_if_opener(b"{$IFOPT Q+}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_rejects_ifend() {
+        // `{$IFEND}` is a closer, not an opener. It shouldn't pass this check.
+        assert!(!is_if_opener(b"{$IFEND}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_rejects_endif() {
+        assert!(!is_if_opener(b"{$ENDIF}", 0));
+    }
+
+    #[test]
+    fn is_if_opener_rejects_non_directive() {
+        assert!(!is_if_opener(b"{ regular comment }", 0));
+    }
+
+    #[test]
+    fn is_if_opener_handles_offset_start() {
+        let src = b"  {$IF X}";
+        assert!(is_if_opener(src, 2));
     }
 }

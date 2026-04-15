@@ -1,6 +1,19 @@
+use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::node_kind as K;
 use std::collections::HashMap;
 use tree_sitter::Node;
+
+/// A directive synthesized from a `DirectivePatch` returned by the
+/// partial-control-flow rewrite pass. Structurally identical to a real
+/// `ppDirective` node for attachment purposes, but carries explicit byte
+/// offsets and row/col positions instead of referencing a tree-sitter node.
+#[derive(Debug, Clone)]
+struct VirtualDirective {
+    start_byte: usize,
+    end_byte: usize,
+    text: String,
+    row: usize,
+}
 
 /// A directive attached to a code node.
 #[derive(Debug, Clone)]
@@ -27,6 +40,13 @@ pub struct DirectiveMap {
 impl DirectiveMap {
     /// Scan all `ppDirective` extra nodes and attach them to nearby code nodes.
     pub fn build(root: Node, source: &[u8]) -> Self {
+        Self::build_with_patches(root, source, &[])
+    }
+
+    /// Like [`DirectiveMap::build`], but also folds `DirectivePatch` records
+    /// from the partial-control-flow rewrite pass into the map as virtual
+    /// directives.
+    pub fn build_with_patches(root: Node, source: &[u8], patches: &[DirectivePatch]) -> Self {
         let mut directives = Vec::new();
         collect_directives(root, source, &mut directives);
 
@@ -37,36 +57,29 @@ impl DirectiveMap {
         let mut trailing: HashMap<usize, Vec<AttachedDirective>> = HashMap::new();
 
         for (dir_node, text) in &directives {
-            let dir_line = dir_node.start_position().row;
+            attach_one(
+                &leaves,
+                dir_node.start_byte(),
+                dir_node.end_byte(),
+                dir_node.start_position().row,
+                text.clone(),
+                &mut leading,
+                &mut trailing,
+            );
+        }
 
-            // Check if there is a non-extra token on the same line before
-            // the directive — that makes it trailing.
-            if let Some(prev) = find_prev_leaf(&leaves, *dir_node) {
-                if prev.end_position().row == dir_line {
-                    let gap = dir_node.start_byte().saturating_sub(prev.end_byte());
-                    trailing
-                        .entry(prev.id())
-                        .or_default()
-                        .push(AttachedDirective {
-                            text: text.clone(),
-                            trailing: true,
-                            gap,
-                        });
-                    continue;
-                }
-            }
-
-            // Otherwise it is a leading directive for the next code node.
-            if let Some(next) = find_next_leaf(&leaves, *dir_node) {
-                leading
-                    .entry(next.id())
-                    .or_default()
-                    .push(AttachedDirective {
-                        text: text.clone(),
-                        trailing: false,
-                        gap: 0,
-                    });
-            }
+        // Fold virtual directives derived from patches.
+        let virtuals = patches_to_virtuals(patches);
+        for v in &virtuals {
+            attach_one(
+                &leaves,
+                v.start_byte,
+                v.end_byte,
+                v.row,
+                v.text.clone(),
+                &mut leading,
+                &mut trailing,
+            );
         }
 
         DirectiveMap { leading, trailing }
@@ -105,18 +118,71 @@ fn collect_directives<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>
     }
 }
 
-/// Find the previous leaf node (non-extra) before `target`.
-fn find_prev_leaf<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<Node<'a>> {
-    let target_start = target.start_byte();
+/// Attach a single directive (real or virtual) to either a preceding leaf
+/// (trailing) or the next leaf (leading). Shared by `build` and
+/// `build_with_patches`.
+fn attach_one(
+    leaves: &[Node<'_>],
+    dir_start: usize,
+    dir_end: usize,
+    dir_row: usize,
+    text: String,
+    leading: &mut HashMap<usize, Vec<AttachedDirective>>,
+    trailing: &mut HashMap<usize, Vec<AttachedDirective>>,
+) {
+    if let Some(prev) = find_prev_leaf_at(leaves, dir_start) {
+        if prev.end_position().row == dir_row {
+            let gap = dir_start.saturating_sub(prev.end_byte());
+            trailing
+                .entry(prev.id())
+                .or_default()
+                .push(AttachedDirective {
+                    text,
+                    trailing: true,
+                    gap,
+                });
+            return;
+        }
+    }
+    if let Some(next) = find_next_leaf_at(leaves, dir_end) {
+        leading
+            .entry(next.id())
+            .or_default()
+            .push(AttachedDirective {
+                text,
+                trailing: false,
+                gap: 0,
+            });
+    }
+}
+
+fn find_prev_leaf_at<'a>(leaves: &[Node<'a>], target_start: usize) -> Option<Node<'a>> {
     let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_start);
     if idx > 0 { Some(leaves[idx - 1]) } else { None }
 }
 
-/// Find the next non-extra node after `target`.
-fn find_next_leaf<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<Node<'a>> {
-    let target_end = target.end_byte();
+fn find_next_leaf_at<'a>(leaves: &[Node<'a>], target_end: usize) -> Option<Node<'a>> {
     let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_end);
     leaves.get(idx).copied()
+}
+
+fn patches_to_virtuals(patches: &[DirectivePatch]) -> Vec<VirtualDirective> {
+    let mut v = Vec::with_capacity(patches.len() * 2);
+    for p in patches {
+        v.push(VirtualDirective {
+            start_byte: p.opening_start,
+            end_byte: p.opening_end,
+            text: p.opening_text.clone(),
+            row: p.opening_row,
+        });
+        v.push(VirtualDirective {
+            start_byte: p.closing_start,
+            end_byte: p.closing_end,
+            text: p.closing_text.clone(),
+            row: p.closing_row,
+        });
+    }
+    v
 }
 
 /// Collect all leaf nodes (child_count == 0, not extra) in source order.

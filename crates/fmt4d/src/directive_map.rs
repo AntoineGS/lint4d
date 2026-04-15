@@ -170,18 +170,30 @@ fn find_next_leaf_at<'a>(leaves: &[Node<'a>], target_end: usize) -> Option<Node<
 fn patches_to_virtuals(patches: &[DirectivePatch]) -> Vec<VirtualDirective> {
     let mut v = Vec::with_capacity(patches.len() * 2);
     for p in patches {
-        v.push(VirtualDirective {
-            start_byte: p.opening_start,
-            end_byte: p.opening_end,
-            text: p.opening_text.clone(),
-            row: p.opening_row,
-        });
-        v.push(VirtualDirective {
-            start_byte: p.closing_start,
-            end_byte: p.closing_end,
-            text: p.closing_text.clone(),
-            row: p.closing_row,
-        });
+        match p {
+            DirectivePatch::Markers(m) => {
+                v.push(VirtualDirective {
+                    start_byte: m.opening_start,
+                    end_byte: m.opening_end,
+                    text: m.opening_text.clone(),
+                    row: m.opening_row,
+                });
+                v.push(VirtualDirective {
+                    start_byte: m.closing_start,
+                    end_byte: m.closing_end,
+                    text: m.closing_text.clone(),
+                    row: m.closing_row,
+                });
+            }
+            DirectivePatch::OpaqueBlock(ob) => {
+                v.push(VirtualDirective {
+                    start_byte: ob.start,
+                    end_byte: ob.end,
+                    text: ob.text.clone(),
+                    row: ob.row,
+                });
+            }
+        }
     }
     v
 }

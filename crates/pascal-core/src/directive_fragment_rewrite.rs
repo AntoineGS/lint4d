@@ -13,12 +13,29 @@ use std::borrow::Cow;
 
 /// A directive pair that was rewritten from the source.
 ///
+/// Can be either a pair of markers (`{$if*}...{$endif}`) whose markers were
+/// blanked to allow parsing, or an opaque block (`{$IF...}{$IFEND}`) whose
+/// entire span was blanked because the body is not valid Pascal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectivePatch {
+    /// A `{$if*}…{$endif}` pair whose markers were blanked so the body
+    /// parses as a standalone fragment. Emitted by `rewrite_partial_control_flow`.
+    Markers(MarkersPatch),
+    /// A `{$IF…}…{$IFEND}` block whose entire span (markers + body) was
+    /// blanked because the body is not valid Pascal. The original bytes are
+    /// stored verbatim and re-emitted by the formatter. Emitted by
+    /// `rewrite_opaque_if_blocks`.
+    OpaqueBlock(OpaqueBlockPatch),
+}
+
+/// A directive pair that was rewritten from the source.
+///
 /// `opening_*` and `closing_*` byte ranges are relative to the **original**
 /// source (and also to the rewritten source, since the rewrite preserves byte
 /// offsets). `*_text` contains the original directive bytes verbatim so the
 /// formatter can re-emit them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectivePatch {
+pub struct MarkersPatch {
     pub opening_start: usize,
     pub opening_end: usize,
     pub opening_text: String,
@@ -29,6 +46,44 @@ pub struct DirectivePatch {
     pub closing_text: String,
     pub closing_row: usize,
     pub closing_col: usize,
+}
+
+/// An opaque directive block whose entire span was blanked.
+///
+/// Used when a `{$IF…}…{$IFEND}` block's body is not valid Pascal and cannot
+/// be parsed even after removing the markers. The entire block is stored as
+/// original bytes so the formatter can re-emit it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueBlockPatch {
+    /// Byte of `{` in the opening `{$IF…}`.
+    pub start: usize,
+    /// Byte after `}` in the closing `{$IFEND}` (or `{$ENDIF}`).
+    pub end: usize,
+    /// Original bytes `[start..end]` verbatim, including both markers
+    /// and the body between them.
+    pub text: String,
+    pub row: usize,
+    pub col: usize,
+}
+
+impl DirectivePatch {
+    /// Test helper: unwraps to `&MarkersPatch` or panics.
+    #[cfg(test)]
+    pub fn expect_markers(&self) -> &MarkersPatch {
+        match self {
+            Self::Markers(m) => m,
+            Self::OpaqueBlock(_) => panic!("expected Markers patch, got OpaqueBlock"),
+        }
+    }
+
+    /// Test helper: unwraps to `&OpaqueBlockPatch` or panics.
+    #[cfg(test)]
+    pub fn expect_opaque(&self) -> &OpaqueBlockPatch {
+        match self {
+            Self::OpaqueBlock(o) => o,
+            Self::Markers(_) => panic!("expected OpaqueBlock patch, got Markers"),
+        }
+    }
 }
 
 /// Scan `source` for partial-control-flow directive pairs, rewrite the
@@ -58,7 +113,7 @@ pub fn rewrite_partial_control_flow(source: &[u8]) -> (Cow<'_, [u8]>, Vec<Direct
         }
         let (opening_row, opening_col) = row_col_at(source, pair.opening_start);
         let (closing_row, closing_col) = row_col_at(source, pair.closing_start);
-        patches.push(DirectivePatch {
+        patches.push(DirectivePatch::Markers(MarkersPatch {
             opening_start: pair.opening_start,
             opening_end: pair.opening_end,
             opening_text: bytes_to_lossy_string(&source[pair.opening_start..pair.opening_end]),
@@ -69,7 +124,7 @@ pub fn rewrite_partial_control_flow(source: &[u8]) -> (Cow<'_, [u8]>, Vec<Direct
             closing_text: bytes_to_lossy_string(&source[pair.closing_start..pair.closing_end]),
             closing_row,
             closing_col,
-        });
+        }));
     }
 
     if patches.is_empty() {
@@ -78,10 +133,13 @@ pub fn rewrite_partial_control_flow(source: &[u8]) -> (Cow<'_, [u8]>, Vec<Direct
 
     let mut rewritten = source.to_vec();
     for p in &patches {
-        for byte in &mut rewritten[p.opening_start..p.opening_end] {
+        let DirectivePatch::Markers(m) = p else {
+            continue;
+        };
+        for byte in &mut rewritten[m.opening_start..m.opening_end] {
             *byte = b' ';
         }
-        for byte in &mut rewritten[p.closing_start..p.closing_end] {
+        for byte in &mut rewritten[m.closing_start..m.closing_end] {
             *byte = b' ';
         }
     }
@@ -459,7 +517,7 @@ mod tests {
         );
         let (rewritten, patches) = rewrite_partial_control_flow(&src);
         assert_eq!(patches.len(), 1, "expected one patch");
-        let p = &patches[0];
+        let p = patches[0].expect_markers();
         assert_eq!(p.opening_text, "{$IFNDEF DEBUG}");
         assert_eq!(p.closing_text, "{$ENDIF}");
         // Rewritten bytes must be the same length and must have spaces
@@ -503,8 +561,9 @@ mod tests {
         );
         let patches = patches_of(&src);
         assert_eq!(patches.len(), 1, "expected one patch");
-        assert_eq!(patches[0].opening_text, "{$IFNDEF NOSF}");
-        assert_eq!(patches[0].closing_text, "{$ENDIF}");
+        let m = patches[0].expect_markers();
+        assert_eq!(m.opening_text, "{$IFNDEF NOSF}");
+        assert_eq!(m.closing_text, "{$ENDIF}");
     }
 
     #[test]
@@ -583,10 +642,11 @@ mod tests {
             ascii("{$IFDEF A} if cond then {$IFDEF B} x {$ENDIF} then {$ENDIF}\n  DoThing;\n");
         let patches = patches_of(&src);
         assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].opening_text, "{$IFDEF A}");
-        assert_eq!(patches[0].closing_text, "{$ENDIF}");
+        let m = patches[0].expect_markers();
+        assert_eq!(m.opening_text, "{$IFDEF A}");
+        assert_eq!(m.closing_text, "{$ENDIF}");
         assert!(
-            patches[0].closing_start > src.windows(10).position(|w| w == b"{$IFDEF B}").unwrap(),
+            m.closing_start > src.windows(10).position(|w| w == b"{$IFDEF B}").unwrap(),
             "closing must be the OUTER {{$ENDIF}}"
         );
     }
@@ -631,11 +691,12 @@ mod tests {
         );
         let patches = patches_of(&src);
         assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].opening_row, 1);
-        assert_eq!(patches[0].opening_col, 0);
-        assert_eq!(patches[0].closing_row, 1);
+        let m = patches[0].expect_markers();
+        assert_eq!(m.opening_row, 1);
+        assert_eq!(m.opening_col, 0);
+        assert_eq!(m.closing_row, 1);
         // Closing col is where the `{` of `{$ENDIF}` starts on its line.
-        assert!(patches[0].closing_col > 0);
+        assert!(m.closing_col > 0);
     }
 
     #[test]

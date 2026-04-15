@@ -118,6 +118,27 @@ fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
     false
 }
 
+/// Returns true iff the tree contains at least one ERROR or MISSING node
+/// that is *not* a bare `raise;` false-positive. This is the Phase 2
+/// fallback gate in `parse_file_with_patches`: if `has_real_error` returns
+/// true, we rerun the source through `rewrite_opaque_if_blocks` and reparse.
+#[allow(dead_code)] // Will be used by parse_file_with_patches in Task 6
+fn has_real_error(node: tree_sitter::Node) -> bool {
+    if node.is_error() || node.is_missing() {
+        if node.is_error() && is_bare_raise_error(node) {
+            return false;
+        }
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if has_real_error(child) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract the text of a tree-sitter node from the source bytes.
 ///
 /// Tolerates non-UTF-8 source by decoding the slice as Latin-1 / ISO-8859-1
@@ -126,4 +147,44 @@ fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
 /// literals from silently becoming empty.
 pub fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
     crate::text::decode_bytes(&source[node.start_byte()..node.end_byte()]).into_owned()
+}
+
+#[cfg(test)]
+mod has_real_error_tests {
+    use super::*;
+
+    fn parse_raw(source: &[u8]) -> tree_sitter::Tree {
+        PARSER
+            .with(|p| p.borrow_mut().parse(source, None))
+            .expect("parser must produce a tree")
+    }
+
+    #[test]
+    fn has_real_error_false_for_clean_source() {
+        let tree = parse_raw(b"unit X;\ninterface\nimplementation\nend.\n");
+        assert!(!has_real_error(tree.root_node()));
+    }
+
+    #[test]
+    fn has_real_error_true_for_bucket_f_shape() {
+        let tree = parse_raw(
+            b"unit X;\ninterface\nimplementation\n\
+              {$IF DEFINED(X)}\nrappel: developper en 32 bits pour plus de stabilite\n{$IFEND}\nend.\n",
+        );
+        assert!(has_real_error(tree.root_node()));
+    }
+
+    #[test]
+    fn has_real_error_false_for_bare_raise_only() {
+        // `raise;` is a known false-positive ERROR node that
+        // is_bare_raise_error filters out; has_real_error must do the same.
+        let tree = parse_raw(
+            b"unit X;\ninterface\nimplementation\n\
+              procedure P; begin raise; end;\nend.\n",
+        );
+        assert!(
+            !has_real_error(tree.root_node()),
+            "bare `raise;` must not count as a real error"
+        );
+    }
 }

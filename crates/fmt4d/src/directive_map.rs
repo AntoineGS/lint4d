@@ -39,6 +39,7 @@ pub struct DirectiveMap {
 
 impl DirectiveMap {
     /// Scan all `ppDirective` extra nodes and attach them to nearby code nodes.
+    #[allow(dead_code)]
     pub fn build(root: Node, source: &[u8]) -> Self {
         Self::build_with_patches(root, source, &[])
     }

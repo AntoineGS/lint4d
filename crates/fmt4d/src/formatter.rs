@@ -31,11 +31,10 @@ pub fn format_source(
 ) -> crate::error::Result<String> {
     let has_bom = source.starts_with(&[0xEF, 0xBB, 0xBF]);
 
-    let (tree, diagnostics) = pascal_core::parser::parse_file(info, source).map_err(|e| {
-        crate::error::FmtError::Parse {
-            path: info.path.clone(),
-            message: e.to_string(),
-        }
+    let (tree, diagnostics, patches) = pascal_core::parser::parse_file_with_patches(info, source)
+        .map_err(|e| crate::error::FmtError::Parse {
+        path: info.path.clone(),
+        message: e.to_string(),
     })?;
 
     if !diagnostics.is_empty() {
@@ -51,7 +50,7 @@ pub fn format_source(
 
     let resolved_eol = config.end_of_line.resolve(source);
     let comment_map = CommentMap::build(tree.root_node(), source);
-    let directive_map = DirectiveMap::build(tree.root_node(), source);
+    let directive_map = DirectiveMap::build_with_patches(tree.root_node(), source, &patches);
     let format_regions = parse_format_regions(source);
 
     let builder = DocBuilder::new(

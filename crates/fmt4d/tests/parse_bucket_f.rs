@@ -21,11 +21,8 @@ fn format_source(src: &str) -> String {
         .expect("format succeeds")
 }
 
-// Ignored until Bucket F lands a fix (scanner-level handling of non-Pascal
-// text inside false-branch `{$IF ...}` directive bodies). The test is kept
-// green-by-ignore so it flips to a real failure the instant the fix lands
-// and starts parsing the body — at which point we remove `#[ignore]`.
-#[ignore = "bucket F: non-Pascal directive body — fix not landed yet"]
+// Bucket F regression test: non-Pascal content wrapped in a false-branch
+// `{$IF ...}` directive block must survive formatting verbatim.
 #[test]
 fn bucket_f1_if_ifend_wrapping_non_pascal_text() {
     // Minimal reproduction bisected from WebImportExportExecutePOS.pas:19349
@@ -44,5 +41,66 @@ end.
     assert!(
         result.contains("rappel: developper"),
         "expected free-form directive body to survive formatting, got:\n{result}"
+    );
+}
+
+#[test]
+fn bucket_f_full_file_round_trips_with_surrounding_code() {
+    // A realistic unit with a Bucket F block wedged between two procedure
+    // declarations. The Bucket F span must survive verbatim, and the
+    // surrounding code must still format normally.
+    let src = "\
+unit Sample;
+
+interface
+
+procedure Alpha(x: Integer);
+procedure Beta(y: Integer);
+
+implementation
+
+procedure Alpha(x: Integer);
+begin
+  x := x + 1;
+end;
+
+{$IF DEFINED(WIN32) AND NOT DEFINED(UNITTEST)}
+rappel: developper en 32 bits pour plus de stabilite
+{$IFEND}
+
+procedure Beta(y: Integer);
+begin
+  y := y * 2;
+end;
+
+end.
+";
+    let formatted = format_source(src);
+
+    // Bucket F span survives verbatim.
+    assert!(
+        formatted.contains("{$IF DEFINED(WIN32) AND NOT DEFINED(UNITTEST)}"),
+        "opening directive must survive:\n{formatted}"
+    );
+    assert!(
+        formatted.contains("rappel: developper en 32 bits pour plus de stabilite"),
+        "body text must survive:\n{formatted}"
+    );
+    assert!(
+        formatted.contains("{$IFEND}"),
+        "closing directive must survive:\n{formatted}"
+    );
+
+    // Surrounding procedures are still present.
+    assert!(formatted.contains("procedure Alpha(x: Integer);"));
+    assert!(formatted.contains("procedure Beta(y: Integer);"));
+    assert!(formatted.contains("x := x + 1;"));
+    assert!(formatted.contains("y := y * 2;"));
+
+    // Idempotence: formatting the output again produces the same string.
+    let second_pass = format_source(&formatted);
+    assert_eq!(
+        formatted, second_pass,
+        "formatter must be idempotent on Bucket F round-trips"
     );
 }

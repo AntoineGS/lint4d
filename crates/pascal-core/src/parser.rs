@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use tree_sitter::Parser;
 
 thread_local! {
-    static PARSER: RefCell<Parser> = RefCell::new({
+    pub(crate) static PARSER: RefCell<Parser> = RefCell::new({
         let mut p = Parser::new();
         let language = tree_sitter_pascal::LANGUAGE;
         p.set_language(&language.into()).expect("failed to set pascal language");

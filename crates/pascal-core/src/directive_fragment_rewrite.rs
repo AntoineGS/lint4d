@@ -516,6 +516,68 @@ fn is_if_opener(source: &[u8], opening_start: usize) -> bool {
     !next.is_ascii_alphabetic()
 }
 
+/// Probes whether `body` parses as valid Pascal when wrapped in a minimal
+/// harness. Tries a statement-position harness first; if that fails, tries
+/// a declaration-position harness. Returns true if either succeeds.
+///
+/// Empty or whitespace-only bodies are trivially valid.
+///
+/// This is the detection heuristic for Bucket F: only bodies that both
+/// harnesses reject are considered "non-Pascal content" and blanked by
+/// `rewrite_opaque_if_blocks`.
+#[allow(dead_code)] // Will be used by rewrite_opaque_if_blocks in Task 4
+fn body_is_parseable_pascal(body: &[u8]) -> bool {
+    if body.iter().all(|b| b.is_ascii_whitespace()) {
+        return true;
+    }
+
+    // Statement-position harness: body goes between `begin` and `end.`
+    const STMT_HEADER: &[u8] = b"program Harness;\nbegin\n";
+    const STMT_FOOTER: &[u8] = b"\nend.\n";
+
+    // Declaration-position harness: body goes in a unit interface.
+    const DECL_HEADER: &[u8] = b"unit Harness;\ninterface\n";
+    const DECL_FOOTER: &[u8] = b"\nimplementation\nend.\n";
+
+    try_harness(STMT_HEADER, body, STMT_FOOTER) || try_harness(DECL_HEADER, body, DECL_FOOTER)
+}
+
+/// Wraps `body` in `header`/`footer`, parses the result, and returns true if
+/// the resulting tree has no ERROR or MISSING nodes.
+#[allow(dead_code)] // Will be used by rewrite_opaque_if_blocks in Task 4
+fn try_harness(header: &[u8], body: &[u8], footer: &[u8]) -> bool {
+    let mut wrapped = Vec::with_capacity(header.len() + body.len() + footer.len());
+    wrapped.extend_from_slice(header);
+    wrapped.extend_from_slice(body);
+    wrapped.extend_from_slice(footer);
+
+    let parsed = crate::parser::PARSER.with(|p| {
+        let mut parser = p.borrow_mut();
+        parser.parse(&wrapped, None)
+    });
+
+    match parsed {
+        Some(tree) => !tree_has_error(tree.root_node()),
+        None => false,
+    }
+}
+
+/// Recursively checks whether `node` or any of its descendants is an ERROR
+/// or MISSING node.
+#[allow(dead_code)] // Will be used by rewrite_opaque_if_blocks in Task 4
+fn tree_has_error(node: tree_sitter::Node) -> bool {
+    if node.is_error() || node.is_missing() {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if tree_has_error(child) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,5 +859,54 @@ mod tests {
     fn is_if_opener_handles_offset_start() {
         let src = b"  {$IF X}";
         assert!(is_if_opener(src, 2));
+    }
+
+    #[test]
+    fn body_parseable_accepts_empty() {
+        assert!(body_is_parseable_pascal(b""));
+    }
+
+    #[test]
+    fn body_parseable_accepts_whitespace_only() {
+        assert!(body_is_parseable_pascal(b"  \n\t\r\n "));
+    }
+
+    #[test]
+    fn body_parseable_accepts_statement() {
+        assert!(body_is_parseable_pascal(b"X := 1;"));
+    }
+
+    #[test]
+    fn body_parseable_accepts_multiple_statements() {
+        assert!(body_is_parseable_pascal(b"X := 1;\nY := 2;\n"));
+    }
+
+    #[test]
+    fn body_parseable_accepts_const_declaration() {
+        assert!(body_is_parseable_pascal(b"const X = 1;"));
+    }
+
+    #[test]
+    fn body_parseable_accepts_type_declaration() {
+        assert!(body_is_parseable_pascal(b"type TFoo = Integer;"));
+    }
+
+    #[test]
+    fn body_parseable_rejects_french_dev_note() {
+        assert!(!body_is_parseable_pascal(
+            b"rappel: developper en 32 bits pour plus de stabilite"
+        ));
+    }
+
+    #[test]
+    fn body_parseable_rejects_prose() {
+        assert!(!body_is_parseable_pascal(
+            b"This is just a note to myself about the build."
+        ));
+    }
+
+    #[test]
+    fn body_parseable_accepts_begin_end_block() {
+        assert!(body_is_parseable_pascal(b"begin X := 1; end;"));
     }
 }

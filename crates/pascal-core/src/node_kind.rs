@@ -72,6 +72,7 @@ pub const IF: &str = "if";
 pub const IF_ELSE: &str = "ifElse";
 pub const CASE: &str = "case";
 pub const CASE_CASE: &str = "caseCase";
+pub const CASE_LABEL: &str = "caseLabel";
 pub const TRY: &str = "try";
 pub const REPEAT: &str = "repeat";
 pub const FOR: &str = "for";

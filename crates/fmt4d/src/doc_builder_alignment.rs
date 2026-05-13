@@ -113,6 +113,15 @@ impl<'a> DocBuilder<'a> {
         // Find the colon position.
         let colon_idx = children.iter().position(|c| c.kind() == K::COLON)?;
 
+        // Bail out of alignment when the name list contains a `// line` comment.
+        // An aligned cell renders on a single line; folding a `//` comment into
+        // a single line would let it swallow every following name (silent
+        // declaration deletion). Returning None makes the caller fall back to
+        // the multi-line non-aligned renderer, which forces hardlines.
+        if name_list_has_line_comment(self.source, &children[..colon_idx]) {
+            return None;
+        }
+
         // Name cell: everything before the colon.
         // Use doc_for_node_sans_leading for the first child so that any
         // leading comments are handled at the group level, not inside cells.
@@ -830,4 +839,36 @@ impl<'a> DocBuilder<'a> {
 
         doc::concat(result_parts)
     }
+}
+
+/// Return `true` if the source bytes spanned by `nodes` contain a `//`
+/// line-comment outside string literals. Mirrors the helper in
+/// `doc_builder_decls.rs`; a shared crate-private utility would be cleaner
+/// but the two callsites have intentionally different parent contexts.
+fn name_list_has_line_comment(source: &[u8], nodes: &[Node<'_>]) -> bool {
+    if nodes.len() < 2 {
+        return false;
+    }
+    let start = nodes.first().unwrap().start_byte();
+    let end = nodes.last().unwrap().end_byte();
+    if start >= end || end > source.len() {
+        return false;
+    }
+    let bytes = &source[start..end];
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+        } else if !in_string && b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }

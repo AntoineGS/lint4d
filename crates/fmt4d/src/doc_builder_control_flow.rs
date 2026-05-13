@@ -29,7 +29,7 @@ impl<'a> DocBuilder<'a> {
                 if prev_was_case_branch {
                     parts.push(Doc::Hardline);
                 }
-                parts.push(doc::indent(self.doc_for_node(child)));
+                parts.push(doc::indent(self.build_case_arm(child)));
                 prev_was_case_branch = true;
             }
             K::K_ELSE => {
@@ -77,6 +77,60 @@ impl<'a> DocBuilder<'a> {
             parts.push(doc::indent(doc::concat(else_body)));
         }
         doc::concat(parts)
+    }
+
+    /// Build a single `caseCase` arm.
+    ///
+    /// Falls through to default rendering unless a `//` line comment lives
+    /// between the case label and the arm body — in that case, joining
+    /// label/body on one line lets the comment swallow the body (silent
+    /// statement deletion). Force a hardline between them.
+    fn build_case_arm(&self, node: Node<'a>) -> Doc {
+        let children = self.code_children(node);
+        let Some(label_idx) = children.iter().position(|c| c.kind() == K::CASE_LABEL) else {
+            return self.doc_for_node(node);
+        };
+        let body_idx = label_idx + 1;
+        if body_idx >= children.len() {
+            return self.doc_for_node(node);
+        }
+        let label = children[label_idx];
+        let body = children[body_idx];
+
+        let label_end = label.end_byte();
+        let body_start = body.start_byte();
+        if label_end >= body_start || !has_line_comment_in_span(self.source, label_end, body_start)
+        {
+            return self.doc_for_node(node);
+        }
+
+        // doc_for_node on the label picks up its trailing `// comment`
+        // (attached to the colon leaf); we then force a hardline before
+        // emitting the body so the comment terminates correctly. Any
+        // trailing children of the arm (e.g. the `;` separator that lives
+        // *inside* caseCase per the grammar) are appended after the body
+        // so we don't silently drop them.
+        let label_doc = self.doc_for_node(label);
+        let body_doc = self.doc_for_node(body);
+
+        let mut indented = Vec::new();
+        if !crate::doc_builder::starts_with_hardline(&body_doc) {
+            indented.push(Doc::Hardline);
+        }
+        indented.push(body_doc);
+        for tail in &children[body_idx + 1..] {
+            indented.push(self.doc_for_node(*tail));
+        }
+
+        let leading = self.leading_comments_doc(node);
+        let trailing = self.trailing_comments_doc(node);
+
+        doc::concat(vec![
+            leading,
+            label_doc,
+            doc::indent(doc::concat(indented)),
+            trailing,
+        ])
     }
 
     pub(crate) fn build_repeat(&self, node: Node<'a>) -> Doc {
@@ -205,4 +259,30 @@ impl<'a> DocBuilder<'a> {
         }
         doc::concat(parts)
     }
+}
+
+/// Return `true` if the source bytes from `start` (inclusive) to `end`
+/// (exclusive) contain a `//` line comment outside of Pascal string
+/// literals.
+fn has_line_comment_in_span(source: &[u8], start: usize, end: usize) -> bool {
+    if start >= end || end > source.len() {
+        return false;
+    }
+    let bytes = &source[start..end];
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+        } else if !in_string && b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }

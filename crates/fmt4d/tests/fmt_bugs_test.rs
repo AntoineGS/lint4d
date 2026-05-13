@@ -3752,3 +3752,116 @@ fn format_single_char_file_does_not_panic() {
     let config = fmt4d::config::FmtConfig::default();
     let _ = fmt4d::formatter::format_source(b"x", &info, &config, &HashSet::new());
 }
+
+// ── `class var` keyword pair must stay together ────────────────
+// Repro from WebImportExportRESTExecute.pas: a `class var` field
+// section inside a class was being emitted as
+//   var
+//     class
+//     FName: TType;
+// which Delphi rejects ("PROCEDURE, FUNCTION, PROPERTY, or VAR
+// expected"). The grammar parses `declVars` as
+//   optional(kClass), choice(kVar, kThreadvar), repeat(declVar)
+// so the kClass token sits as a sibling of kVar and was being
+// dumped into body_children instead of becoming a keyword prefix.
+
+#[test]
+fn class_var_keyword_pair_preserved_in_class() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  private
+    class var
+      FConn: Integer;
+    var
+      FOther: string;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("class var"),
+        "`class var` keyword pair was split:\n{result}"
+    );
+    assert!(
+        !result.contains("var\n      class"),
+        "`class var` was reordered to `var` then `class`:\n{result}"
+    );
+    idempotency_check(src);
+}
+
+// ── Trailing `// comment` on class header line preserved ──────
+// Repro from WebImportExportRESTExecute.pas:
+//   TWIERestExecute = class(TInterfacedObject, IWIERestExecute) // ref counted
+//   private
+// fmt4d was silently dropping the `// ref counted` comment when
+// flushing the class ancestor list, because build_type_body
+// emitted the closing paren as Doc::Raw(")") and bypassed the
+// trailing-comment chain attached to the `)` leaf.
+
+#[test]
+fn trailing_comment_after_class_ancestor_list_preserved() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class(TObject, IBar) // ref counted
+  private
+    FX: Integer;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("// ref counted"),
+        "trailing `// ref counted` comment dropped:\n{result}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn trailing_comment_after_simple_class_header_preserved() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class // marker
+  private
+    FX: Integer;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("// marker"),
+        "trailing `// marker` comment dropped:\n{result}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn class_const_keyword_pair_preserved_in_class() {
+    let src = "\
+unit T;
+interface
+type
+  TFoo = class
+  private
+    class const
+      KMax = 42;
+  end;
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("class const"),
+        "`class const` keyword pair was split:\n{result}"
+    );
+    idempotency_check(src);
+}

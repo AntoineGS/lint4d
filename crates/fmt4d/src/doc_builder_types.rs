@@ -33,7 +33,11 @@ impl<'a> DocBuilder<'a> {
                     parts.push(Doc::Raw("(".into()));
                 }
                 K::CLOSE_PAREN if in_ancestor_list => {
-                    parts.push(Doc::Raw(")".into()));
+                    // Route through doc_for_node so any trailing `// ...`
+                    // comment attached to the `)` leaf survives — emitting
+                    // a bare `Doc::Raw(")")` here silently dropped the
+                    // comment chain (e.g. `class(TObject) // ref counted`).
+                    parts.push(self.doc_for_node(*child));
                     in_ancestor_list = false;
                     let next_is_section = children.get(idx + 1).is_some_and(|n| {
                         n.kind() == K::DECL_SECTION || n.kind() == K::PP_DECL_SECTION

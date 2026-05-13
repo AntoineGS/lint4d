@@ -17,10 +17,23 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut body_children: Vec<Node<'a>> = Vec::new();
         let mut keyword_end_row: Option<usize> = None;
+        // The grammar parses `class var` / `class const` as
+        //   declVars: optional(kClass), choice(kVar, kThreadvar), repeat(declVar)
+        // so the kClass token is a sibling of kVar. Treat it as a keyword
+        // prefix, not as a body declaration — otherwise it renders on its
+        // own line above the field names, producing invalid Pascal.
+        let mut pending_class_prefix: Option<Node<'a>> = None;
 
         self.for_each_code_child(node, |child| match child.kind() {
+            K::K_CLASS => {
+                pending_class_prefix = Some(child);
+            }
             K::K_VAR | K::K_CONST | K::K_TYPE => {
                 parts.push(Doc::Hardline);
+                if let Some(class_node) = pending_class_prefix.take() {
+                    parts.push(self.doc_for_node(class_node));
+                    parts.push(Doc::Raw(" ".into()));
+                }
                 parts.push(self.doc_for_node(child));
                 keyword_end_row = Some(child.end_position().row);
             }

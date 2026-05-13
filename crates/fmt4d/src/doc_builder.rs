@@ -209,8 +209,16 @@ impl<'a> DocBuilder<'a> {
     /// Map all non-extra children through `doc_for_node` and concatenate.
     pub(crate) fn build_children(&self, node: Node<'a>) -> Doc {
         let mut docs: Vec<Doc> = Vec::new();
+        let mut prev_had_line_comment = false;
         self.for_each_code_child(node, |child| {
+            if prev_had_line_comment {
+                // Previous sibling ended with a `//` line comment. The next
+                // child must start on a new line — anything else would be
+                // swallowed by the comment (e.g. RHS of `x := // ...\n RHS`).
+                docs.push(Doc::Hardline);
+            }
             docs.push(self.doc_for_node(child));
+            prev_had_line_comment = self.has_trailing_line_comment(child);
         });
         doc::concat(docs)
     }
@@ -299,6 +307,23 @@ impl<'a> DocBuilder<'a> {
         doc::concat(docs)
     }
 
+    /// Return `true` if `node` has at least one trailing comment and the
+    /// LAST of them is a `//` line comment. The next sibling MUST start on
+    /// a new line — otherwise the comment swallows it (a `//` runs to end-
+    /// of-line). Used by sibling-emitting helpers to insert a Hardline
+    /// only where a structural break isn't already provided.
+    pub(crate) fn has_trailing_line_comment(&self, node: Node<'a>) -> bool {
+        // Comments are attached to leaf nodes (via `CommentMap`), but in
+        // binary chains we ask about wrapper nodes like `kAdd` whose only
+        // child is the actual `+` leaf. Descend to the last non-extra leaf
+        // before consulting the comment map.
+        let leaf = last_leaf(node);
+        self.comments
+            .trailing_comments(leaf.id())
+            .last()
+            .is_some_and(|c| c.text.trim_start().starts_with("//"))
+    }
+
     pub(crate) fn leading_directives_doc(&self, node: Node<'a>) -> Doc {
         let directives = self.directives.leading_directives(node.id());
         if directives.is_empty() {
@@ -383,24 +408,25 @@ impl<'a> DocBuilder<'a> {
             .any(|r| node_start >= r.start_line && node_end <= r.end_line)
     }
 
-    /// Return `true` if any immediate leaf child of `node` is a breakable
-    /// binary operator (arithmetic, logical, or bitwise).
+    /// Return `true` if any immediate child of `node` is a breakable
+    /// binary operator (arithmetic, logical, or bitwise). Operator nodes
+    /// are identified by kind, regardless of whether tree-sitter-pascal
+    /// emits them as leaves or single-child wrappers around the literal
+    /// token — the operand subtrees never share these kinds.
     fn has_breakable_operators(&self, node: Node<'a>) -> bool {
         for child in node.children(&mut node.walk()) {
-            if child.child_count() == 0 {
-                match child.kind() {
-                    K::K_ADD
-                    | K::K_SUB
-                    | K::K_MUL
-                    | K::K_DIV
-                    | K::K_MOD
-                    | K::K_AND
-                    | K::K_OR
-                    | K::K_XOR
-                    | K::K_SHL
-                    | K::K_SHR => return true,
-                    _ => {}
-                }
+            match child.kind() {
+                K::K_ADD
+                | K::K_SUB
+                | K::K_MUL
+                | K::K_DIV
+                | K::K_MOD
+                | K::K_AND
+                | K::K_OR
+                | K::K_XOR
+                | K::K_SHL
+                | K::K_SHR => return true,
+                _ => {}
             }
         }
         false
@@ -601,6 +627,25 @@ pub(crate) fn ends_with_hardline(doc: &Doc) -> bool {
             .is_some_and(ends_with_hardline),
         Doc::Group(inner) | Doc::Indent(inner) => ends_with_hardline(inner),
         _ => false,
+    }
+}
+
+/// Descend through `node`'s rightmost non-extra children until we reach a
+/// leaf (a node with no code children). Used by `has_trailing_line_comment`
+/// because tree-sitter-pascal sometimes wraps operator tokens in a
+/// single-child node — comments are attached to the inner leaf, not the
+/// wrapper, by [`CommentMap`].
+fn last_leaf(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+    loop {
+        let last_child = current
+            .children(&mut current.walk())
+            .filter(|c| !c.is_extra())
+            .last();
+        match last_child {
+            Some(child) => current = child,
+            None => return current,
+        }
     }
 }
 

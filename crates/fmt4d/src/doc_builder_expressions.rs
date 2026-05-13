@@ -352,15 +352,24 @@ impl<'a> DocBuilder<'a> {
     ) -> Doc {
         let trailing = self.config.operator_position == OperatorPosition::Trailing;
 
-        // Build the first operand (no operator).
+        // Build the first operand (no operator). Insert Hardline before any
+        // sibling that follows a node carrying a trailing `//` line comment.
         let mut first_parts = Vec::new();
+        let mut prev_had_line_comment = false;
         if let Some(seg) = segments.first() {
             for n in &seg.operand {
+                if prev_had_line_comment {
+                    first_parts.push(Doc::Hardline);
+                }
                 first_parts.push(self.doc_for_node(*n));
+                prev_had_line_comment = self.has_trailing_line_comment(*n);
             }
             // Trailing: attach the *next* segment's operator to the first operand.
             if trailing && segments.len() > 1 {
                 if let Some(op) = segments[1].operator {
+                    if prev_had_line_comment {
+                        first_parts.push(Doc::Hardline);
+                    }
                     first_parts.push(self.doc_for_node(op));
                 }
             }
@@ -376,7 +385,30 @@ impl<'a> DocBuilder<'a> {
         for i in 1..segments.len() {
             let seg = &segments[i];
 
-            let sep = if break_style == BreakStyle::PreserveBreaks
+            // If the content preceding this separator ends with a `//` line
+            // comment, force a hard newline. A Line/PreservedLine in flat
+            // mode degrades to a space, which would slide the following
+            // operand onto the same physical line as the `//` and silently
+            // make it part of the comment (invalid Pascal).
+            let prev_ends_with_line_comment = if trailing {
+                // Trailing mode: the previous item ended with op[i]
+                // (segments[i].operator, attached to the prior segment's
+                // content). The trailing comment lives on that operator.
+                segments[i]
+                    .operator
+                    .is_some_and(|op| self.has_trailing_line_comment(op))
+            } else {
+                // Leading mode: the previous item ended with the last node
+                // of segments[i-1].operand.
+                segments[i - 1]
+                    .operand
+                    .last()
+                    .is_some_and(|n| self.has_trailing_line_comment(*n))
+            };
+
+            let sep = if prev_ends_with_line_comment {
+                Doc::Hardline
+            } else if break_style == BreakStyle::PreserveBreaks
                 && has_newline_between(self.source, &segments[i - 1], seg)
             {
                 Doc::PreservedLine
@@ -386,24 +418,41 @@ impl<'a> DocBuilder<'a> {
             parts.push(sep);
 
             // Build content item (operator + operand or operand + operator).
+            // Whenever a node in this item carries a trailing `//` line
+            // comment, the following sibling must start on a new physical
+            // line — anything else would be swallowed by the comment.
             let mut item = Vec::new();
             if trailing {
                 // Trailing: operand first, then next segment's operator (if any).
+                let mut prev_had_line_comment = false;
                 for n in &seg.operand {
+                    if prev_had_line_comment {
+                        item.push(Doc::Hardline);
+                    }
                     item.push(self.doc_for_node(*n));
+                    prev_had_line_comment = self.has_trailing_line_comment(*n);
                 }
                 if i + 1 < segments.len() {
                     if let Some(op) = segments[i + 1].operator {
+                        if prev_had_line_comment {
+                            item.push(Doc::Hardline);
+                        }
                         item.push(self.doc_for_node(op));
                     }
                 }
             } else {
                 // Leading: operator first, then operand.
+                let mut prev_had_line_comment = false;
                 if let Some(op) = seg.operator {
                     item.push(self.doc_for_node(op));
+                    prev_had_line_comment = self.has_trailing_line_comment(op);
                 }
                 for n in &seg.operand {
+                    if prev_had_line_comment {
+                        item.push(Doc::Hardline);
+                    }
                     item.push(self.doc_for_node(*n));
+                    prev_had_line_comment = self.has_trailing_line_comment(*n);
                 }
             }
             parts.push(doc::concat(item));

@@ -3865,3 +3865,60 @@ end.
     );
     idempotency_check(src);
 }
+
+// ── `//` line comment must not swallow the next-line operand ───
+// Repro from WebImportExportExecutePOS.pas (SQL-builder concat). When a
+// `//` trailing comment sits at the end of a binary-chain line, fmt4d
+// was emitting the next call's identifier and `(` on the SAME physical
+// line as the `//`, so the comment swallowed them — producing invalid
+// Pascal that fmt4d itself could no longer reparse. Two pieces had to
+// land for the fix: `has_trailing_line_comment` now descends to the
+// rightmost leaf (operators like `+` are wrapped in single-child kAdd
+// nodes by tree-sitter-pascal), and `build_binary_chain_doc` inserts a
+// Hardline wherever a chain element carries a trailing line comment.
+
+#[test]
+fn line_comment_does_not_swallow_following_call() {
+    use pascal_core::FileInfo;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+var
+  S: string;
+begin
+  S := 'a' + // c
+    SomeFunctionWithLongerName(X) + 'd';
+end;
+end.
+";
+    // Use `format_bytes` (the on-disk entry point the CLI uses). The
+    // helper-based `format_source` rejects this short fragment with a
+    // spurious whole-file parse error in the test harness — a separate
+    // issue tracked outside this fix — but `format_bytes` accepts it.
+    let info = FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig::default();
+    let formatted = fmt4d::formatter::format_bytes(src.as_bytes(), &info, &config, &HashSet::new())
+        .expect("first pass formatting failed");
+    let result = String::from_utf8(formatted).expect("non-utf8 output");
+
+    assert!(
+        !result.contains("// c SomeFunctionWithLongerName"),
+        "// line comment swallowed the next-line call identifier:\n{result}"
+    );
+
+    // Idempotence: the formatted output must itself be parseable Pascal.
+    // A swallowed `(` produces invalid syntax; the second pass would fail.
+    let formatted2 =
+        fmt4d::formatter::format_bytes(result.as_bytes(), &info, &config, &HashSet::new())
+            .expect("second pass formatting failed (output is not valid Pascal)");
+    let result2 = String::from_utf8(formatted2).expect("non-utf8 output");
+    assert_eq!(
+        result, result2,
+        "formatter is not idempotent.\nFirst pass:\n{result}\nSecond pass:\n{result2}"
+    );
+}

@@ -80,49 +80,52 @@ fn collect_parse_errors(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<Diagnost
     diagnostics
 }
 
-fn visit_node(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>) {
-    if node.is_error() || node.is_missing() {
-        // Skip bare `raise;` ERROR nodes — tree-sitter-pascal does not
-        // recognise standalone `raise` (re-raise) as valid syntax, but
-        // it is perfectly legal Delphi. The error node contains a single
-        // `kRaise` child.
-        if node.is_error() && is_bare_raise_error(node) {
-            return;
+fn visit_node(root: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            // Skip bare `raise;` ERROR nodes — tree-sitter-pascal does not
+            // recognise standalone `raise` (re-raise) as valid syntax, but
+            // it is perfectly legal Delphi. The error node contains a single
+            // `kRaise` child.
+            if node.is_error() && is_bare_raise_error(node) {
+                continue;
+            }
+
+            let start = node.start_position();
+            let end = node.end_position();
+
+            let byte_end = node.end_byte().min(node.start_byte() + 40);
+            let snippet: String = crate::text::decode_bytes(&source[node.start_byte()..byte_end])
+                .chars()
+                .take(40)
+                .collect();
+
+            let message = if node.is_missing() {
+                format!("missing syntax near {:?}", snippet)
+            } else {
+                format!("unexpected token {:?}", snippet)
+            };
+
+            out.push(Diagnostic {
+                rule_id: "parse-error".to_string(),
+                severity: Severity::Warning,
+                message,
+                line: start.row + 1,
+                column: start.column + 1,
+                end_line: end.row + 1,
+                end_column: end.column + 1,
+                help: None,
+                scope: None,
+            });
+
+            // Don't descend into error nodes to avoid duplicate diagnostics.
+            continue;
         }
 
-        let start = node.start_position();
-        let end = node.end_position();
-
-        let byte_end = node.end_byte().min(node.start_byte() + 40);
-        let snippet: String = crate::text::decode_bytes(&source[node.start_byte()..byte_end])
-            .chars()
-            .take(40)
-            .collect();
-
-        let message = if node.is_missing() {
-            format!("missing syntax near {:?}", snippet)
-        } else {
-            format!("unexpected token {:?}", snippet)
-        };
-
-        out.push(Diagnostic {
-            rule_id: "parse-error".to_string(),
-            severity: Severity::Warning,
-            message,
-            line: start.row + 1,
-            column: start.column + 1,
-            end_line: end.row + 1,
-            end_column: end.column + 1,
-            help: None,
-            scope: None,
-        });
-
-        // Don't descend into error nodes to avoid duplicate diagnostics.
-        return;
-    }
-
-    for child in node.children(&mut node.walk()) {
-        visit_node(child, source, out);
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
     }
 }
 
@@ -144,18 +147,19 @@ fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
 /// that is *not* a bare `raise;` false-positive. This is the Phase 2
 /// fallback gate in `parse_file_with_patches`: if `has_real_error` returns
 /// true, we rerun the source through `rewrite_opaque_if_blocks` and reparse.
-fn has_real_error(node: tree_sitter::Node) -> bool {
-    if node.is_error() || node.is_missing() {
-        if node.is_error() && is_bare_raise_error(node) {
-            return false;
-        }
-        return true;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if has_real_error(child) {
+fn has_real_error(root: tree_sitter::Node) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            if node.is_error() && is_bare_raise_error(node) {
+                continue;
+            }
             return true;
         }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
     }
     false
 }

@@ -1,0 +1,29 @@
+[package]
+name = "pascal-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Navigation library for a native Linux Delphi/Object Pascal LSP"
+
+[dependencies]
+pascal-core = { path = "../pascal-core" }
+lint4d = { path = "../lint4d" }
+fmt4d = { path = "../fmt4d" }
+tree-sitter = "0.24"
+lsp-types = "=0.95.1"
+lsp-server = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+globset = "0.4"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

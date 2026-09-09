@@ -231,6 +231,17 @@ lint4d --project MyApp.dproj --platform Win64 --build-config Release
 
 If RAD Studio is installed, lint4d can locate the BDS root automatically. You can override this with `--bds-path`.
 
+## Native Language Server
+
+`pascal-lsp` provides native Linux declaration/definition navigation, live lint
+diagnostics, and explicit formatting for Neovim and other LSP clients. No Windows
+process is required. See the [setup guide and navigation limits](crates/pascal-lsp/README.md)
+and the [Neovim configuration](crates/pascal-lsp/examples/neovim.lua).
+
+```sh
+cargo build --release --locked -p pascal-lsp
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE) for details.

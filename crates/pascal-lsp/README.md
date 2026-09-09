@@ -115,6 +115,10 @@ Implemented and covered by tests:
 
 - Case-insensitive unit, routine, type, variable, constant, parameter, field,
   and property declaration lookup.
+- Property `gD`/declaration navigation stays on the property; `gd`/`gi`
+  definition navigation follows its explicit `read` accessor (getter or
+  backing field), or its `write` accessor for write-only properties, with a
+  safe property-declaration fallback when the accessor cannot be resolved.
 - Lexical local/parameter shadowing and nested routines.
 - Cross-unit references restricted by `uses` visibility, including separate
   interface/implementation uses clauses; `uses` entries navigate to units.

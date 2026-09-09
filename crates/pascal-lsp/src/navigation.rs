@@ -106,7 +106,7 @@ impl NavigationIndex {
             self.unqualified_references(uri, document, offset, &name)
         };
 
-        self.locations_for(references, target)
+        self.locations_for(self.expand_property_candidates(references, target), target)
     }
 
     fn type_reference_candidates(
@@ -944,6 +944,57 @@ impl NavigationIndex {
             .and_then(|document| document.symbols.get(candidate.index))
     }
 
+    fn expand_property_candidates(
+        &self,
+        references: Vec<Candidate>,
+        target: NavigationTarget,
+    ) -> Vec<Candidate> {
+        if target == NavigationTarget::Declaration {
+            return references;
+        }
+
+        references
+            .into_iter()
+            .flat_map(|candidate| {
+                let Some(property) = self.symbol(&candidate) else {
+                    return vec![candidate];
+                };
+                if property.kind != SymbolKind::Property {
+                    return vec![candidate];
+                }
+                let Some(accessor) = property.accessor.as_deref() else {
+                    return vec![candidate];
+                };
+                let Some(owner_type) = property.owner_type.as_deref() else {
+                    return vec![candidate];
+                };
+                let key = canonical_name(accessor);
+                let Some(document) = self.documents.get(&candidate.uri) else {
+                    return vec![candidate];
+                };
+                let accessors: Vec<Candidate> = document
+                    .symbols
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, symbol)| {
+                        symbol.owner_type.as_deref() == Some(owner_type)
+                            && symbol.key == key
+                            && matches!(symbol.kind, SymbolKind::Field | SymbolKind::Routine)
+                    })
+                    .map(|(index, _)| Candidate {
+                        uri: candidate.uri.clone(),
+                        index,
+                    })
+                    .collect();
+                if accessors.is_empty() {
+                    vec![candidate]
+                } else {
+                    accessors
+                }
+            })
+            .collect()
+    }
+
     fn locations_for(&self, references: Vec<Candidate>, target: NavigationTarget) -> Vec<Location> {
         let mut routine_groups: BTreeMap<(String, String), Vec<Candidate>> = BTreeMap::new();
         let mut non_routines = Vec::new();
@@ -1118,6 +1169,7 @@ struct Symbol {
     routine_signature: Option<String>,
     body_scope: Option<usize>,
     unresolved_abbreviated: bool,
+    accessor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1255,6 +1307,7 @@ impl Document {
                 routine_signature: None,
                 body_scope: None,
                 unresolved_abbreviated: false,
+                accessor: None,
             });
         }
 
@@ -1592,6 +1645,7 @@ fn inject_abbreviated_parameters(
                 routine_signature: None,
                 body_scope: None,
                 unresolved_abbreviated: false,
+                accessor: None,
             });
         }
     });
@@ -1635,6 +1689,7 @@ fn add_definition_symbol(
         routine_signature: Some(signature),
         body_scope: Some(own_scope),
         unresolved_abbreviated: false,
+        accessor: None,
     });
 }
 
@@ -1668,6 +1723,7 @@ fn add_routine_symbol(
         routine_signature: Some(signature),
         body_scope: None,
         unresolved_abbreviated: false,
+        accessor: None,
     });
 }
 
@@ -1682,6 +1738,11 @@ fn add_named_symbol(
     let owner_type = enclosing_type(node, source);
     let scope = scope_for_declaration(node, scope_by_span);
     let local_only = kind == SymbolKind::Parameter && scope == ROOT_SCOPE;
+    let accessor = if kind == SymbolKind::Property {
+        property_accessor(node, source)
+    } else {
+        None
+    };
     let identifiers = field_identifier_nodes(node, "name");
     for identifier in identifiers {
         let name = node_text(identifier, source);
@@ -1702,8 +1763,16 @@ fn add_named_symbol(
             routine_signature: None,
             body_scope: None,
             unresolved_abbreviated: false,
+            accessor: accessor.clone(),
         });
     }
+}
+
+fn property_accessor(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("getter")
+        .or_else(|| node.child_by_field_name("setter"))
+        .map(|accessor| node_text(accessor, source))
+        .filter(|accessor| !accessor.is_empty())
 }
 
 fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<String>)> {

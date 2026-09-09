@@ -28,6 +28,12 @@ fn position_of(source: &str, needle: &str, occurrence: usize) -> Position {
     }
 }
 
+fn property_position(source: &str, name: &str) -> Position {
+    let mut position = position_of(source, &format!("property {name}"), 0);
+    position.character += "property ".encode_utf16().count() as u32;
+    position
+}
+
 fn locations_at(
     index: &NavigationIndex,
     source_uri: &Url,
@@ -517,6 +523,84 @@ type
     property MethodValue: Integer read GetValue write SetValue;
   end;
 implementation
+end.
+"#;
+
+const PROPERTY_NAVIGATION: &str = r#"unit PropertyNavigation;
+interface
+var
+  fFieldDelimiter: string;
+function GetDisplayName: string;
+procedure SetWriteOnly(const Value: string);
+type
+  TBase = class
+    function GetInherited: string;
+  end;
+  TConfig = class
+  private
+    fFieldDelimiter: string;
+    function GetDisplayName: string;
+    procedure SetFieldDelimiter(const Value: string);
+    procedure SetWriteOnly(const Value: string);
+  public
+    property FieldDelimiter: string read fFieldDelimiter write SetFieldDelimiter;
+    property DisplayName: string read GetDisplayName;
+    property WriteOnly: string write SetWriteOnly;
+    property Missing: string read MissingAccessor;
+    property SelfCycle: string read SelfCycle;
+    property Alias: string read FieldDelimiter;
+    property InheritedValue: string read GetInherited;
+  end;
+  TOther = class
+  private
+    fFieldDelimiter: string;
+    function GetDisplayName: string;
+    procedure SetWriteOnly(const Value: string);
+  end;
+implementation
+function GetDisplayName: string;
+begin
+  Result := 'global';
+end;
+procedure SetWriteOnly(const Value: string);
+begin
+end;
+function TBase.GetInherited: string;
+begin
+  Result := 'base';
+end;
+function TConfig.GetDisplayName: string;
+begin
+  Result := fFieldDelimiter;
+end;
+procedure TConfig.SetFieldDelimiter(const Value: string);
+begin
+  fFieldDelimiter := Value;
+end;
+procedure TConfig.SetWriteOnly(const Value: string);
+begin
+  fFieldDelimiter := Value;
+end;
+function TOther.GetDisplayName: string;
+begin
+  Result := 'other';
+end;
+procedure TOther.SetWriteOnly(const Value: string);
+begin
+end;
+end.
+"#;
+
+const PROPERTY_CALLER: &str = r#"unit PropertyCaller;
+interface
+uses PropertyNavigation;
+implementation
+procedure Run;
+var
+  Config: TConfig;
+begin
+  Config.FieldDelimiter := '|';
+end;
 end.
 "#;
 
@@ -1030,6 +1114,90 @@ fn property_accessors_keep_the_enclosing_class_context() {
             position_of(PROPERTY_ACCESSOR_CONTEXT, name, expected),
         );
     }
+}
+
+#[test]
+fn property_definition_uses_explicit_accessors_and_declaration_stays_property() {
+    let mut index = NavigationIndex::new();
+    let source_uri = uri("PropertyNavigation");
+    index
+        .update(source_uri.clone(), PROPERTY_NAVIGATION.to_string())
+        .expect("property navigation source parses");
+
+    let field_property = property_position(PROPERTY_NAVIGATION, "FieldDelimiter");
+    let declaration = index.navigate(&source_uri, field_property, NavigationTarget::Declaration);
+    assert_eq!(declaration.len(), 1);
+    assert_location_start(&declaration[0], &source_uri, field_property);
+
+    for target in [
+        NavigationTarget::Definition,
+        NavigationTarget::Implementation,
+    ] {
+        let result = index.navigate(&source_uri, field_property, target);
+        assert_eq!(result.len(), 1);
+        assert_location_start(
+            &result[0],
+            &source_uri,
+            position_of(PROPERTY_NAVIGATION, "fFieldDelimiter: string", 1),
+        );
+    }
+
+    let getter_property = property_position(PROPERTY_NAVIGATION, "DisplayName");
+    let mut getter_body = position_of(PROPERTY_NAVIGATION, "function TConfig.GetDisplayName", 0);
+    getter_body.character += "function TConfig.".encode_utf16().count() as u32;
+    let getter_definition =
+        index.navigate(&source_uri, getter_property, NavigationTarget::Definition);
+    assert_eq!(getter_definition.len(), 1);
+    assert_location_start(&getter_definition[0], &source_uri, getter_body);
+
+    let setter_property = property_position(PROPERTY_NAVIGATION, "WriteOnly");
+    let mut setter_body = position_of(PROPERTY_NAVIGATION, "procedure TConfig.SetWriteOnly", 0);
+    setter_body.character += "procedure TConfig.".encode_utf16().count() as u32;
+    let setter_definition =
+        index.navigate(&source_uri, setter_property, NavigationTarget::Definition);
+    assert_eq!(setter_definition.len(), 1);
+    assert_location_start(&setter_definition[0], &source_uri, setter_body);
+
+    for property_name in ["Missing", "SelfCycle", "Alias", "InheritedValue"] {
+        let property = property_position(PROPERTY_NAVIGATION, property_name);
+        let result = index.navigate(&source_uri, property, NavigationTarget::Definition);
+        assert_eq!(
+            result.len(),
+            1,
+            "{property_name} should have a safe fallback"
+        );
+        assert_location_start(&result[0], &source_uri, property);
+    }
+}
+
+#[test]
+fn typed_property_references_keep_cross_unit_accessor_and_declaration_semantics() {
+    let mut index = NavigationIndex::new();
+    let provider_uri = uri("PropertyNavigation");
+    let caller_uri = uri("PropertyCaller");
+    index
+        .update(provider_uri.clone(), PROPERTY_NAVIGATION.to_string())
+        .expect("property provider parses");
+    index
+        .update(caller_uri.clone(), PROPERTY_CALLER.to_string())
+        .expect("property caller parses");
+
+    let usage = position_of(PROPERTY_CALLER, "FieldDelimiter", 0);
+    let declaration = index.navigate(&caller_uri, usage, NavigationTarget::Declaration);
+    assert_eq!(declaration.len(), 1);
+    assert_location_start(
+        &declaration[0],
+        &provider_uri,
+        property_position(PROPERTY_NAVIGATION, "FieldDelimiter"),
+    );
+
+    let definition = index.navigate(&caller_uri, usage, NavigationTarget::Definition);
+    assert_eq!(definition.len(), 1);
+    assert_location_start(
+        &definition[0],
+        &provider_uri,
+        position_of(PROPERTY_NAVIGATION, "fFieldDelimiter: string", 1),
+    );
 }
 
 #[test]

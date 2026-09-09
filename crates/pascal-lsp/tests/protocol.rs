@@ -356,6 +356,40 @@ fn real_process_navigates_declaration_definition_and_implementation_across_units
 }
 
 #[test]
+fn real_process_navigates_typed_property_to_read_accessor() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("property workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TConfig = class\n  private\n    FValue: string;\n    procedure SetValue(const Value: string);\n  public\n    property Value: string read FValue write SetValue;\n  end;\nimplementation\nprocedure TConfig.SetValue(const Value: string);\nbegin\n  FValue := Value;\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar\n  Config: TConfig;\nbegin\n  Config.Value := '|';\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let root = main.parent().expect("workspace root");
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    for (id, method, expected_line) in [
+        ("property-declaration", "textDocument/declaration", 8),
+        ("property-definition", "textDocument/definition", 5),
+        ("property-implementation", "textDocument/implementation", 5),
+    ] {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            method,
+            navigation_params(&main, main_source, "Value", 0),
+        );
+        let locations = result_locations(server.response(&request_id));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+        assert_eq!(locations[0]["range"]["start"]["line"], expected_line);
+    }
+    server.shutdown();
+}
+
+#[test]
 fn unsaved_unicode_crlf_overlays_win_and_close_restores_disk() {
     let (_temp, main, provider, main_source, provider_source) = standard_workspace();
     let root = main.parent().expect("workspace root");

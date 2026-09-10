@@ -13,7 +13,9 @@ use std::path::{Component, Path, PathBuf};
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MAIN_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PACKAGE_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_IMPORT_COUNT: usize = 64;
+const MAX_METADATA_FILES: usize = MAX_IMPORT_COUNT + 1;
 const MAX_EXPANDED_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_PROPERTY_BYTES: usize = 16 * 1024 * 1024;
 const UNRESOLVED_MARKER: char = '\u{1}';
@@ -45,11 +47,26 @@ pub struct ProjectContext {
     pub defines: Vec<String>,
     pub config: Option<String>,
     pub platform: Option<String>,
+    /// Ordered, case-insensitively unique package names from DCC_UsePackage.
+    /// Package exports are resolved lazily and are not merged into the unit
+    /// search paths or the project-wide unit index.
+    pub packages: Vec<String>,
     /// Project, main-source, and imported option-set files used to build the
     /// context. Consumers can revalidate these paths without rediscovering or
     /// reparsing unrelated source files.
     pub metadata_files: Vec<PathBuf>,
     pub warnings: Vec<String>,
+}
+
+/// Metadata extracted from one source package descriptor. The descriptor is
+/// parsed only after a project import has failed the ordinary unit lookup;
+/// `metadata_files` contains every project/option-set dependency used to
+/// produce the result so callers can detect changes without file events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PackageMetadata {
+    pub units: HashMap<String, Vec<PathBuf>>,
+    pub warnings: Vec<String>,
+    pub metadata_files: Vec<PathBuf>,
 }
 
 impl ProjectContext {
@@ -467,6 +484,7 @@ fn build_project_context(
         defines: property_list(&builder, "dcc_define"),
         config: selected_config(&builder, options),
         platform: selected_platform(&builder, options),
+        packages: package_list(&builder),
         metadata_files,
         warnings: builder.warnings,
     })
@@ -512,6 +530,7 @@ fn build_standalone_context(
         defines: Vec::new(),
         config: options.build_config.clone(),
         platform: options.platform.clone(),
+        packages: Vec::new(),
         metadata_files: Vec::new(),
         warnings,
     }
@@ -545,6 +564,21 @@ fn property_list(builder: &ProjectBuilder, name: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn package_list(builder: &ProjectBuilder) -> Vec<String> {
+    let mut packages = Vec::new();
+    for value in property_list(builder, "dcc_usepackage") {
+        let package = canonical_package_name(&value);
+        if !package.is_empty()
+            && !packages
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&package))
+        {
+            packages.push(package);
+        }
+    }
+    packages
 }
 
 fn parse_aliases(value: Option<&str>) -> HashMap<String, String> {
@@ -661,12 +695,50 @@ fn canonical_unit_name(name: &str) -> String {
     name.trim().trim_matches('.').to_ascii_lowercase()
 }
 
+fn canonical_package_name(name: &str) -> String {
+    let normalized = name.trim().replace('\\', "/");
+    let name = normalized.rsplit('/').next().unwrap_or_default().trim();
+    let stem = ["dcp", "dpk", "dproj", "bpl"]
+        .iter()
+        .find_map(|extension| {
+            name.len()
+                .checked_sub(extension.len() + 1)
+                .filter(|&stem_len| {
+                    name.get(stem_len..)
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(&format!(".{extension}")))
+                })
+                .and_then(|stem_len| name.get(..stem_len))
+        })
+        .unwrap_or(name);
+    stem.trim().trim_matches('.').to_ascii_lowercase()
+}
+
 fn resolve_project_path(
     raw: &str,
     base: &Path,
     warnings: &mut Vec<String>,
     kind: &str,
     warn_missing: bool,
+) -> Option<PathBuf> {
+    let candidate = project_path_candidate(raw, base, warnings, kind)?;
+    match resolve_existing_path_status(&candidate, warnings, kind) {
+        ExistingPathStatus::Found(path) => Some(path),
+        ExistingPathStatus::Missing if warn_missing => {
+            warnings.push(format!(
+                "{kind} path does not exist and was omitted: {}",
+                candidate.display()
+            ));
+            None
+        }
+        ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => None,
+    }
+}
+
+fn project_path_candidate(
+    raw: &str,
+    base: &Path,
+    warnings: &mut Vec<String>,
+    kind: &str,
 ) -> Option<PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains(UNRESOLVED_MARKER) {
@@ -685,15 +757,14 @@ fn resolve_project_path(
     } else {
         base.join(path)
     };
-    let candidate = lexical_normalize(&candidate);
-    let resolved = resolve_existing_path(&candidate, warnings, kind);
-    if resolved.is_none() && warn_missing {
-        warnings.push(format!(
-            "{kind} path does not exist and was omitted: {}",
-            candidate.display()
-        ));
-    }
-    resolved
+    Some(lexical_normalize(&candidate))
+}
+
+#[derive(Debug)]
+enum ExistingPathStatus {
+    Found(PathBuf),
+    Missing,
+    Unresolvable,
 }
 
 fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
@@ -725,17 +796,30 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 fn resolve_existing_path(path: &Path, warnings: &mut Vec<String>, kind: &str) -> Option<PathBuf> {
+    match resolve_existing_path_status(path, warnings, kind) {
+        ExistingPathStatus::Found(path) => Some(path),
+        ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => None,
+    }
+}
+
+fn resolve_existing_path_status(
+    path: &Path,
+    warnings: &mut Vec<String>,
+    kind: &str,
+) -> ExistingPathStatus {
     if is_windows_absolute(path) {
         warnings.push(format!(
             "Windows path in {kind} is unavailable on Linux and was omitted: {}",
             path.display()
         ));
-        return None;
+        return ExistingPathStatus::Unresolvable;
     }
     let absolute = if path.is_absolute() {
         lexical_normalize(path)
     } else {
-        let current = std::env::current_dir().ok()?;
+        let Ok(current) = std::env::current_dir() else {
+            return ExistingPathStatus::Unresolvable;
+        };
         lexical_normalize(&current.join(path))
     };
     let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
@@ -745,7 +829,9 @@ fn resolve_existing_path(path: &Path, warnings: &mut Vec<String>, kind: &str) ->
         };
         let wanted = component.to_string_lossy();
         let mut matches = Vec::new();
-        let entries = fs::read_dir(&current).ok()?;
+        let Ok(entries) = fs::read_dir(&current) else {
+            return ExistingPathStatus::Missing;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name();
             if name.to_string_lossy().eq_ignore_ascii_case(&wanted) {
@@ -764,11 +850,14 @@ fn resolve_existing_path(path: &Path, warnings: &mut Vec<String>, kind: &str) ->
                 "ambiguous case-insensitive {kind} path component {wanted:?} under {}",
                 current.display()
             ));
-            return None;
+            return ExistingPathStatus::Unresolvable;
         }
-        current = matches.into_iter().next()?;
+        let Some(next) = matches.into_iter().next() else {
+            return ExistingPathStatus::Missing;
+        };
+        current = next;
     }
-    Some(current)
+    ExistingPathStatus::Found(current)
 }
 
 fn is_windows_absolute(path: &Path) -> bool {
@@ -797,6 +886,166 @@ fn read_bounded(path: &Path, limit: u64) -> Result<String, String> {
     }
     let bytes = fs::read(path).map_err(|error| format!("could not read file: {error}"))?;
     String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))
+}
+
+pub(crate) fn read_package_metadata(path: &Path) -> Result<PackageMetadata, String> {
+    let contents = read_bounded(path, MAX_PACKAGE_METADATA_BYTES).map_err(|error| {
+        format!(
+            "could not read package metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    if extension_is(path, "dpk") {
+        return parse_dpk_metadata(path, &contents);
+    }
+    if extension_is(path, "dproj") {
+        return parse_dproj_package_metadata(path, &contents);
+    }
+    Err(format!(
+        "unsupported package descriptor extension: {}",
+        path.display()
+    ))
+}
+
+fn parse_dpk_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, String> {
+    if declared_package_name(contents).is_none() {
+        return Err(format!(
+            "package descriptor {} has no package declaration",
+            path.display()
+        ));
+    };
+    // The bounded filename catalogue selected this descriptor by the package
+    // name requested by the project. Its header is validated as package
+    // syntax, but a legacy header spelling does not replace that identity.
+    let mut metadata = PackageMetadata::default();
+    metadata.metadata_files.push(path.to_path_buf());
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    for (unit_name, raw_path) in parse_explicit_unit_paths(contents) {
+        let Some(unit_path) = package_unit_path(
+            &raw_path,
+            base,
+            &mut metadata.warnings,
+            "package contains path",
+        ) else {
+            continue;
+        };
+        add_unit_candidate(
+            &mut metadata.units,
+            canonical_unit_name(&unit_name),
+            unit_path,
+        );
+    }
+    Ok(metadata)
+}
+
+fn parse_dproj_package_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, String> {
+    let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut builder = ProjectBuilder::new(
+        &ProjectOptions::default(),
+        Vec::new(),
+        project_dir.to_path_buf(),
+    );
+    let operations = parse_xml_operations(contents, path)?;
+    builder.process_operations(operations, path);
+
+    let Some(main_source) = builder.property("mainsource") else {
+        return Err(format!(
+            "package project {} has no package MainSource",
+            path.display()
+        ));
+    };
+    let main_source = main_source.replace('\\', "/");
+    let main_path = Path::new(&main_source);
+    if !extension_is(main_path, "dpk") {
+        return Err(format!(
+            "package project {} does not identify a DPK MainSource",
+            path.display()
+        ));
+    }
+
+    let mut metadata = PackageMetadata {
+        warnings: builder.warnings,
+        metadata_files: vec![path.to_path_buf()],
+        ..PackageMetadata::default()
+    };
+    if let Some(main_source) = package_unit_path(
+        &main_source,
+        project_dir,
+        &mut metadata.warnings,
+        "package main source",
+    ) {
+        metadata.metadata_files.push(main_source);
+    }
+    metadata.metadata_files.extend(builder.metadata_files);
+    for reference in builder.references {
+        let expanded = expand_value(
+            &reference.include,
+            "",
+            &builder.properties,
+            &mut metadata.warnings,
+            &reference.source_file,
+        );
+        if expanded.contains(UNRESOLVED_MARKER) {
+            continue;
+        }
+        let Some(unit_path) = package_unit_path(
+            &expanded,
+            project_dir,
+            &mut metadata.warnings,
+            "package project reference",
+        ) else {
+            continue;
+        };
+        let Some(stem) = unit_path.file_stem() else {
+            continue;
+        };
+        add_unit_candidate(
+            &mut metadata.units,
+            canonical_unit_name(&stem.to_string_lossy()),
+            unit_path,
+        );
+    }
+    Ok(metadata)
+}
+
+fn package_unit_path(
+    raw: &str,
+    base: &Path,
+    warnings: &mut Vec<String>,
+    kind: &str,
+) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains(UNRESOLVED_MARKER) {
+        return None;
+    }
+    if is_windows_absolute_text(raw) {
+        warnings.push(format!(
+            "Windows path in {kind} is unavailable on Linux and was omitted: {raw}"
+        ));
+        return None;
+    }
+    let normalized = raw.replace('\\', "/");
+    let raw_path = Path::new(&normalized);
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        base.join(raw_path)
+    };
+    let candidate = lexical_normalize(&candidate);
+    Some(resolve_existing_path(&candidate, warnings, kind).unwrap_or(candidate))
+}
+
+fn declared_package_name(source: &str) -> Option<String> {
+    let tokens = lex_pascal(source);
+    tokens.windows(2).find_map(|tokens| {
+        let [PascalToken::Word(keyword), PascalToken::Word(name)] = tokens else {
+            return None;
+        };
+        keyword
+            .eq_ignore_ascii_case("package")
+            .then(|| canonical_package_name(name))
+            .filter(|name| !name.is_empty())
+    })
 }
 
 #[derive(Debug)]
@@ -952,6 +1201,42 @@ impl ProjectBuilder {
             ));
             return;
         }
+        let expanded = expand_value(
+            &import.project,
+            "",
+            &self.properties,
+            &mut self.warnings,
+            source_file,
+        );
+        if expanded.contains(UNRESOLVED_MARKER) {
+            return;
+        }
+        let Some(candidate) =
+            project_path_candidate(&expanded, base, &mut self.warnings, "optset import")
+        else {
+            return;
+        };
+        let path_status =
+            resolve_existing_path_status(&candidate, &mut self.warnings, "optset import");
+        let path = match &path_status {
+            ExistingPathStatus::Found(path) => path,
+            ExistingPathStatus::Missing => &candidate,
+            ExistingPathStatus::Unresolvable => return,
+        };
+        if !self
+            .metadata_files
+            .iter()
+            .any(|existing| paths_equal_ci(existing, path))
+        {
+            if self.metadata_files.len() >= MAX_METADATA_FILES {
+                self.warnings.push(format!(
+                    "optset metadata file limit ({MAX_METADATA_FILES}) reached while reading {}",
+                    source_file.display()
+                ));
+                return;
+            }
+            self.metadata_files.push(path.clone());
+        }
         if !condition_matches(
             import.condition.as_deref(),
             &self.properties,
@@ -968,19 +1253,11 @@ impl ProjectBuilder {
             ));
             return;
         }
-        let expanded = expand_value(
-            &import.project,
-            "",
-            &self.properties,
-            &mut self.warnings,
-            source_file,
-        );
-        if expanded.contains(UNRESOLVED_MARKER) {
-            return;
-        }
-        let Some(path) =
-            resolve_project_path(&expanded, base, &mut self.warnings, "optset import", true)
-        else {
+        let ExistingPathStatus::Found(path) = path_status else {
+            self.warnings.push(format!(
+                "optset import path does not exist and was omitted: {}",
+                path.display()
+            ));
             return;
         };
         if !self.active_imports.insert(path.clone()) {
@@ -989,7 +1266,6 @@ impl ProjectBuilder {
             return;
         }
         self.import_count += 1;
-        self.metadata_files.push(path.clone());
         let result = read_bounded(&path, MAX_IMPORT_BYTES)
             .and_then(|contents| parse_xml_operations(&contents, &path));
         match result {

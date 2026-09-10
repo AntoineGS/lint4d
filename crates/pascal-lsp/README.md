@@ -20,6 +20,10 @@ The workspace currently requires your `tree-sitter-pascal` checkout beside
 cfg-pascal are fetched from the Git revisions in Cargo.lock. Building in a nested
 worktree requires the grammar at that worktree's sibling path as well.
 
+The grammar checkout must include `tree-sitter-pascal` commit `6881c9b`
+(conditional method attributes) for the unit/type navigation regression tests
+and affected Delphi units to parse correctly.
+
 To install the executable into Cargo's bin directory:
 
 ```sh
@@ -53,6 +57,8 @@ another Pascal language server to the same buffer while evaluating this slice.
 
 | Key / Command | Behavior |
 | --- | --- |
+| `gd` on a unit in `uses` | Open that unit at its declaration |
+| `gd` or `gD` on a type name | Jump to the class, record, interface, or other type declaration |
 | `gd` | Go to a routine's implementation body, falling back to its declaration |
 | `gD` | Go to the visible declaration, such as the unit interface or class header |
 | `gi` | Go to implementation; uses the same fallback as `gd` in this slice |
@@ -64,6 +70,13 @@ another Pascal language server to the same buffer while evaluating this slice.
 If several overloads/candidates remain, Neovim presents multiple locations
 rather than the server guessing based on argument types. Keep the cursor on the
 identifier, not on whitespace following it.
+
+For example, put the cursor on `MDIBDatabase` in `uses MDIBDatabase;` and press
+`gd` to open the unit. Put it on `TMDIBDatabase` in a type annotation, generic
+argument, or constructor receiver to jump to the class declaration. These use
+the standard LSP definition/declaration requests, not a new editor-specific
+command. Navigation from a variable name to its type (`textDocument/typeDefinition`)
+is a separate feature and is not advertised by this server yet.
 
 ## Source Paths and Configuration
 
@@ -89,10 +102,36 @@ workspace folder. Libraries must be available as source files on Linux for
 source navigation. `projectFile`, `buildConfig`, and `platform` select the
 project metadata context used for navigation. The server reads `.dproj`,
 `.dpr`/`.dpk`, imported `.optset` files, `DCC_UnitSearchPath`, `DCCReference`,
-`DCC_Namespace`, `DCC_UnitAlias`, and explicit unit paths in a project main
-source. It does not launch a compiler, read the Windows registry, automatically
-translate Windows paths, or resolve compiled-only DCUs. Only use library sources
-you are entitled to access.
+`DCC_UsePackage`, `DCC_Namespace`, `DCC_UnitAlias`, and explicit unit paths in a
+project main source. It does not launch a compiler, read the Windows registry,
+automatically translate Windows paths, or resolve compiled-only DCUs. Only use
+library sources you are entitled to access.
+
+When an imported unit is not found through explicit project mappings or the
+ordinary unit search paths, the server lazily checks only source packages named
+by the selected project's evaluated `DCC_UsePackage` property. It performs a
+bounded, deterministic filename-only catalogue lookup under configured workspace
+roots and `sourcePaths`. The catalogue matches only descriptor filename stems
+named by `DCC_UsePackage` (case-insensitively); it never opens unrelated package
+headers to infer names. The catalogue retains only matching paths plus bounded
+directory stamps, and it must complete within its fixed safety bound before a
+package can be treated as unique; an incomplete catalogue is reported rather
+than guessed. Only the selected package descriptor and its relevant `contains`
+or project-reference metadata are read after that lookup. A selected descriptor
+must still have valid package syntax, but its header name may use a legacy
+variant: the matching filename remains the package identity. A same-stem `.dpk`
+is authoritative over its `.dproj`; duplicate package descriptors are reported
+as ambiguous rather than guessed. Package `.dproj` imports, imported option-set
+files, and the package `MainSource` are tracked for cache freshness and
+invalidation. Legacy descriptor filename aliases are not inferred; add the
+library's source directory to `sourcePaths` when its units need direct lookup.
+Package sources must remain under those configured roots, and missing compiled-only
+packages are skipped with a warning only when they are relevant to a failed
+import. Package `requires` dependencies are not followed transitively. Reference
+or candidate safety limits also report an incomplete result instead of returning
+a partial unique match. This discovery is not compiler-install or Windows-
+registry auto-detection and does not add package exports to global unit search
+paths.
 
 Without `projectFile`, discovery searches ancestor directories up to the
 workspace boundary for an unambiguous `.dproj`, falling back to a `.dpr` or

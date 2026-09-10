@@ -338,6 +338,66 @@ fn uses_option_style_optsets_and_falls_back_to_project_stem_main_source() {
 }
 
 #[test]
+fn known_missing_optset_import_is_retained_when_exists_guard_is_false() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let main = root.join("App.dpr");
+    let import = root.join("Mappings.optset");
+    write(&main, "program App; begin end.");
+    write(
+        &root.join("App.dproj"),
+        r#"<Project>
+  <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+  <Import Project="Mappings.optset" Condition="Exists('Mappings.optset')" />
+</Project>"#,
+    );
+
+    let missing = discover(&main, root, &options());
+    assert!(
+        missing.metadata_files.iter().any(|path| path == &import),
+        "known missing import was not retained: {missing:?}"
+    );
+    assert!(missing.defines.is_empty());
+
+    write(
+        &import,
+        "<Project><PropertyGroup><DCC_Define>CREATED</DCC_Define></PropertyGroup></Project>",
+    );
+    let restored = discover(&main, root, &options());
+    assert_eq!(restored.defines, ["CREATED"]);
+}
+
+#[test]
+fn unresolved_optset_import_path_is_not_retained_or_guessed() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let main = root.join("App.dpr");
+    write(&main, "program App; begin end.");
+    write(
+        &root.join("App.dproj"),
+        r#"<Project>
+  <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+  <Import Project="$(Unavailable)Mappings.optset" />
+</Project>"#,
+    );
+
+    let context = discover(&main, root, &options());
+    assert!(
+        !context
+            .metadata_files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("$(Unavailable)"))
+    );
+    assert!(context.defines.is_empty());
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Unavailable"))
+    );
+}
+
+#[test]
 fn inactive_xml_ancestors_do_not_apply_references_or_target_properties() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();
@@ -660,4 +720,24 @@ fn legacy_project_keeps_release_metadata_and_reference_paths() {
             root.join("Projects/Chaindrive/Librairies/hartlib.pas")
         ])
     );
+}
+
+#[test]
+fn evaluates_dcc_use_package_names_in_declared_order_without_duplicates() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("App.dproj").as_path(),
+        r#"<Project>
+  <PropertyGroup>
+    <MainSource>App.dpr</MainSource>
+    <DCC_UsePackage>FirstPkg; MultidevD10;firstpkg;SecondPkg</DCC_UsePackage>
+  </PropertyGroup>
+</Project>"#,
+    );
+
+    let context = discover(&root.join("App.dpr"), root, &options());
+
+    assert_eq!(context.packages, ["firstpkg", "multidevd10", "secondpkg"]);
 }

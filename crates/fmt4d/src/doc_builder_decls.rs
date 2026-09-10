@@ -311,15 +311,22 @@ impl<'a> DocBuilder<'a> {
         let children = self.code_children(node);
         let mut parts = Vec::new();
         let mut i = 0;
+        let mut prev_had_line_comment = false;
         while i < children.len() {
             let child = children[i];
+            if prev_had_line_comment {
+                parts.push(Doc::Hardline);
+            }
             match child.kind() {
                 K::SEMICOLON => {
                     let next = children.get(i + 1);
+                    let has_trailing_line_comment = self.has_trailing_line_comment(child);
                     parts.push(self.doc_for_node(child));
-                    if next.is_some_and(|n| matches!(n.kind(), K::PROC_ATTRIBUTE | K::K_FORWARD)) {
+                    if next.is_some_and(|n| matches!(n.kind(), K::PROC_ATTRIBUTE | K::K_FORWARD))
+                        && !has_trailing_line_comment
+                    {
                         parts.push(Doc::Raw(" ".into()));
-                    } else {
+                    } else if next.is_none() || !has_trailing_line_comment {
                         parts.push(Doc::Hardline);
                     }
                 }
@@ -327,6 +334,7 @@ impl<'a> DocBuilder<'a> {
                     parts.push(self.doc_for_node(child));
                 }
             }
+            prev_had_line_comment = self.has_trailing_line_comment(child);
             i += 1;
         }
         doc::concat(parts)

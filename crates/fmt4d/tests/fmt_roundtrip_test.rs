@@ -96,6 +96,145 @@ end.
 // ── Idempotency tests ───────────────────────────────────────────
 
 #[test]
+fn roundtrip_conditional_method_attributes() {
+    let source = r#"unit Test;
+
+interface
+
+type
+  TConditional = class
+    procedure IfDefElse; {$IFDEF DELPHI_XE6_UP}reintroduce{$ELSE}override{$ENDIF};
+    procedure IfDefNoElse; {$IFDEF DELPHI_XE6_UP}reintroduce{$ENDIF};
+    procedure StandardThenConditional; virtual; {$IFDEF DELPHI_XE6_UP}reintroduce{$ELSE}override{$ENDIF};
+    procedure ConditionalThenStandard; {$IFDEF DELPHI_XE6_UP}reintroduce{$ELSE}override{$ENDIF}; overload;
+  end;
+
+implementation
+
+end.
+"#;
+    let formatted = format_source(source);
+
+    for token in [
+        "{$IFDEF DELPHI_XE6_UP}",
+        "{$ELSE}",
+        "{$ENDIF}",
+        "reintroduce",
+        "override",
+        "virtual",
+        "overload",
+    ] {
+        assert!(
+            formatted.contains(token),
+            "formatted source dropped {token:?}:\n{formatted}"
+        );
+    }
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let (tree_before, diagnostics_before) =
+        pascal_core::parser::parse_file(&info, source.as_bytes()).expect("parse original failed");
+    let (tree_after, diagnostics_after) =
+        pascal_core::parser::parse_file(&info, formatted.as_bytes())
+            .expect("parse formatted failed");
+    assert!(
+        diagnostics_before.is_empty(),
+        "original conditional attributes produced diagnostics: {diagnostics_before:?}"
+    );
+    assert!(
+        diagnostics_after.is_empty(),
+        "formatted conditional attributes produced diagnostics: {diagnostics_after:?}"
+    );
+    assert!(ast_eq(tree_before.root_node(), tree_after.root_node()));
+    assert_eq!(formatted, format_source(&formatted));
+}
+
+#[test]
+fn roundtrip_conditional_method_attribute_trailing_comment() {
+    let source = "unit Test;\ninterface\nprocedure P; {$IFDEF X}reintroduce // comment\n {$ELSE}override{$ENDIF};\nimplementation\nend.\n";
+    let formatted = format_source(source);
+
+    let mut search_from = 0;
+    for directive in ["{$IFDEF X}", "{$ELSE}", "{$ENDIF}"] {
+        let relative = formatted[search_from..]
+            .find(directive)
+            .unwrap_or_else(|| panic!("formatted source dropped {directive:?}:\n{formatted}"));
+        search_from += relative + directive.len();
+    }
+    assert!(
+        formatted.contains("reintroduce // comment\n"),
+        "line comment must end before the next directive:\n{formatted}"
+    );
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let (tree_before, diagnostics_before) =
+        pascal_core::parser::parse_file(&info, source.as_bytes()).expect("parse original failed");
+    let (tree_after, diagnostics_after) =
+        pascal_core::parser::parse_file(&info, formatted.as_bytes())
+            .expect("parse formatted failed");
+    assert!(
+        diagnostics_before.is_empty(),
+        "original conditional attribute produced diagnostics: {diagnostics_before:?}"
+    );
+    assert!(
+        diagnostics_after.is_empty(),
+        "formatted conditional attribute produced diagnostics: {diagnostics_after:?}"
+    );
+    assert!(ast_eq(tree_before.root_node(), tree_after.root_node()));
+    assert_eq!(formatted, format_source(&formatted));
+}
+
+#[test]
+fn roundtrip_conditional_method_attribute_comment_is_three_pass_idempotent() {
+    let source = r#"unit Test;
+
+interface
+
+procedure P; {$IFDEF X}reintroduce{$ELSE}override{$ENDIF}; // comment
+overload;
+
+implementation
+
+end.
+"#;
+    let first = format_source(source);
+    let second = format_source(&first);
+    let third = format_source(&second);
+
+    assert_eq!(
+        first, second,
+        "formatter changed the second pass:\n{second}"
+    );
+    assert_eq!(second, third, "formatter changed the third pass:\n{third}");
+    assert!(
+        first.contains("// comment\n"),
+        "line comment must not gain trailing spaces:\n{first}"
+    );
+
+    let mut search_from = 0;
+    for directive in ["{$IFDEF X}", "{$ELSE}", "{$ENDIF}"] {
+        let relative = first[search_from..]
+            .find(directive)
+            .unwrap_or_else(|| panic!("formatted source dropped {directive:?}:\n{first}"));
+        search_from += relative + directive.len();
+    }
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let (tree_before, diagnostics_before) =
+        pascal_core::parser::parse_file(&info, source.as_bytes()).expect("parse original failed");
+    let (tree_after, diagnostics_after) =
+        pascal_core::parser::parse_file(&info, first.as_bytes()).expect("parse formatted failed");
+    assert!(
+        diagnostics_before.is_empty(),
+        "original conditional attribute produced diagnostics: {diagnostics_before:?}"
+    );
+    assert!(
+        diagnostics_after.is_empty(),
+        "formatted conditional attribute produced diagnostics: {diagnostics_after:?}"
+    );
+    assert!(ast_eq(tree_before.root_node(), tree_after.root_node()));
+}
+
+#[test]
 fn idempotent_simple_unit() {
     let source = "unit Test;\ninterface\nimplementation\nend.\n";
     idempotency_check(source);

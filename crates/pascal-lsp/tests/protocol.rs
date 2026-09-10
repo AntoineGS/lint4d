@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
 use lsp_types::{Position, Url};
+use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
+use pascal_lsp::{NavigationTarget, ProjectContext};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -1622,4 +1624,694 @@ fn shutdown_and_eof_leave_no_protocol_text_on_stdout() {
     server.stdin.take();
     let status = server.child.wait().expect("wait after EOF");
     assert!(status.success(), "EOF should terminate cleanly: {status}");
+}
+
+#[test]
+fn project_package_contains_resolves_case_insensitive_types_without_parsing_unrelated_sources() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("DatabaseManager.pas");
+    let package = root.join("multidev/MultidevD10.dpk");
+    let provider = root.join("multidev/src/MDIBDatabase.pas");
+    let unrelated = root.join("multidev/src/Unrelated.pas");
+    let main_source = "unit DatabaseManager;\ninterface\nuses mdibdatabase;\nimplementation\nprocedure Run;\nvar\n  Database: TMDIBDatabase;\nbegin\n  Database := TMDIBDatabase.Create;\nend;\nend.\n";
+    let provider_source = "unit MDIBDatabase;\ninterface\ntype\n  TMDIBDatabase = class\n  end;\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &unrelated,
+        "unit Unrelated;\ninterface\nprocedure NeverUsed;\nimplementation\nprocedure NeverUsed; begin end;\nend.\n",
+    );
+    write_file(
+        &package,
+        "package LegacyHeaderName;\ncontains\n  MDIBDatabase in 'src\\MDIBDatabase.pas';\nend.\n",
+    );
+    write_file(
+        &root.join("multidev/MultidevD10.dproj"),
+        "this project metadata is intentionally ignored when the same-stem DPK exists",
+    );
+    write_file(
+        &root.join("WebQuery.dproj"),
+        "<Project><PropertyGroup><MainSource>DatabaseManager.pas</MainSource><DCC_UsePackage>multidevd10</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let main_uri = uri(&main);
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "TMDIBDatabase", 0),
+        NavigationTarget::Definition,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+    assert_eq!(workspace.parsed_document_count(), 2);
+}
+
+#[test]
+fn direct_source_paths_override_package_contains_mappings() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let direct = root.join("direct/Override.pas");
+    let package = root.join("packages/OverridePackage.dpk");
+    let packaged = root.join("packages/Override.pas");
+    let main = root.join("Main.pas");
+    let main_source = "unit Main;\ninterface\nuses Override;\nimplementation\nprocedure Run;\nbegin\n  DirectRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &direct,
+        "unit Override;\ninterface\nprocedure DirectRoutine;\nimplementation\nprocedure DirectRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &packaged,
+        "unit Override;\ninterface\nprocedure PackagedRoutine;\nimplementation\nprocedure PackagedRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &package,
+        "package OverridePackage;\ncontains\n  Override in 'Override.pas';\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>OverridePackage</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let mut workspace = Workspace::new(
+        vec![root.clone()],
+        WorkspaceOptions {
+            source_paths: vec!["direct".to_string()],
+            ..WorkspaceOptions::default()
+        },
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "DirectRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&direct));
+    assert_eq!(workspace.parsed_document_count(), 2);
+}
+
+#[test]
+fn missing_compiled_only_package_is_reported_only_when_an_import_cannot_resolve() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let main_source = "unit Main;\ninterface\nuses MissingUnit;\nimplementation\nprocedure Run;\nbegin\n  MissingRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>MissingCompiledPackage</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let context = ProjectContext::discover(
+        &main,
+        std::slice::from_ref(&root),
+        &pascal_lsp::ProjectOptions::default(),
+    )
+    .expect("discover project context");
+    assert!(context.warnings.is_empty());
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &uri(&main),
+                position_of(main_source, "MissingRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert!(
+        workspace
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("missingcompiledpackage"))
+    );
+}
+
+#[test]
+fn package_name_in_an_unrelated_dpk_is_not_used_without_an_exact_filename_match() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("unrelated/HiddenUnit.pas");
+    let descriptor = root.join("unrelated/InstalledName.dpk");
+    let main_source = "unit Main;\ninterface\nuses HiddenUnit;\nimplementation\nprocedure Run;\nbegin\n  HiddenRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit HiddenUnit;\ninterface\nprocedure HiddenRoutine;\nimplementation\nprocedure HiddenRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &descriptor,
+        "package RequestedPackage;\ncontains\n  HiddenUnit in 'HiddenUnit.pas';\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>RequestedPackage</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &uri(&main),
+                position_of(main_source, "HiddenRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert!(workspace.warnings().iter().any(|warning| {
+        warning.contains("source for package requestedpackage was not found under")
+    }));
+}
+
+#[test]
+fn package_contains_changes_are_seen_without_file_watcher_notifications() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let package = root.join("Package.dpk");
+    let old_unit = root.join("packages/OldUnit.pas");
+    let new_unit = root.join("packages/NewUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses NewUnit;\nimplementation\nprocedure Run;\nbegin\n  NewRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &old_unit,
+        "unit OldUnit;\ninterface\nprocedure OldRoutine;\nimplementation\nprocedure OldRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &new_unit,
+        "unit NewUnit;\ninterface\nprocedure NewRoutine;\nimplementation\nprocedure NewRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &package,
+        "package Package;\ncontains\n  OldUnit in 'packages/OldUnit.pas';\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &uri(&main),
+                position_of(main_source, "NewRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+
+    write_file(
+        &package,
+        "package Package;\ncontains\n  NewUnit in 'packages/NewUnit.pas';\nend;\n",
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "NewRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&new_unit));
+}
+
+#[test]
+fn package_dproj_import_metadata_changes_are_seen_with_and_without_file_events() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let package_project = root.join("packages/Package.dproj");
+    let package_source = root.join("packages/PackageMain.dpk");
+    let mappings = root.join("packages/Mappings.optset");
+    let version_one = root.join("packages/v1/MappedUnit.pas");
+    let version_two = root.join("packages/version-two/MappedUnit.pas");
+    let version_three = root.join("packages/version-three/MappedUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses MappedUnit;\nimplementation\nprocedure Run;\nbegin\n  MappedRoutine;\nend;\nend.\n";
+    let provider_source = "unit MappedUnit;\ninterface\nprocedure MappedRoutine;\nimplementation\nprocedure MappedRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&version_one, provider_source);
+    write_file(&version_two, provider_source);
+    write_file(&version_three, provider_source);
+    write_file(&package_source, "package PackageMain;\ncontains\nend.\n");
+    write_file(
+        &mappings,
+        "<Project><ItemGroup><DCCReference Include=\"v1/MappedUnit.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &package_project,
+        "<Project><PropertyGroup><MainSource>PackageMain.dpk</MainSource></PropertyGroup><Import Project=\"Mappings.optset\" /></Project>",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let main_uri = uri(&main);
+    let mappings_uri = uri(&mappings);
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let first = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "MappedRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].uri, uri(&version_one));
+
+    write_file(
+        &mappings,
+        "<Project><ItemGroup><DCCReference Include=\"version-two/MappedUnit.pas\" /></ItemGroup></Project>",
+    );
+    let without_event = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "MappedRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(without_event.len(), 1);
+    assert_eq!(without_event[0].uri, uri(&version_two));
+
+    write_file(
+        &mappings,
+        "<Project><ItemGroup><DCCReference Include=\"version-three/MappedUnit.pas\" /></ItemGroup></Project>",
+    );
+    workspace.file_event(&mappings_uri, FileChange::Changed);
+    let with_event = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "MappedRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(with_event.len(), 1);
+    assert_eq!(with_event[0].uri, uri(&version_three));
+}
+
+fn exercise_missing_package_import_lifecycle(with_file_events: bool, exists_guard: bool) {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let package_project = root.join("packages/Package.dproj");
+    let package_source = root.join("packages/PackageMain.dpk");
+    let mappings = root.join("packages/Mappings.optset");
+    let version_one = root.join("packages/v1/MappedUnit.pas");
+    let version_two = root.join("packages/v2/MappedUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses MappedUnit;\nimplementation\nprocedure Run;\nbegin\n  MappedRoutine;\nend;\nend.\n";
+    let provider_source = "unit MappedUnit;\ninterface\nprocedure MappedRoutine;\nimplementation\nprocedure MappedRoutine; begin end;\nend.\n";
+    let import = if exists_guard {
+        "<Import Project=\"Mappings.optset\" Condition=\"Exists('Mappings.optset')\" />"
+    } else {
+        "<Import Project=\"Mappings.optset\" />"
+    };
+    write_file(&main, main_source);
+    write_file(&version_one, provider_source);
+    write_file(&version_two, provider_source);
+    write_file(&package_source, "package PackageMain;\ncontains\nend.\n");
+    write_file(
+        &package_project,
+        &format!(
+            "<Project><PropertyGroup><MainSource>PackageMain.dpk</MainSource></PropertyGroup>{import}</Project>"
+        ),
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let main_uri = uri(&main);
+    let mappings_uri = uri(&mappings);
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &main_uri,
+                position_of(main_source, "MappedRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+
+    write_file(
+        &mappings,
+        "<Project><ItemGroup><DCCReference Include=\"v1/MappedUnit.pas\" /></ItemGroup></Project>",
+    );
+    if with_file_events {
+        workspace.file_event(&mappings_uri, FileChange::Created);
+    }
+    let created = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "MappedRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].uri, uri(&version_one));
+
+    fs::remove_file(&mappings).expect("delete imported optset");
+    if with_file_events {
+        workspace.file_event(&mappings_uri, FileChange::Deleted);
+    }
+    assert!(
+        workspace
+            .navigate(
+                &main_uri,
+                position_of(main_source, "MappedRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+
+    write_file(
+        &mappings,
+        "<Project><ItemGroup><DCCReference Include=\"v2/MappedUnit.pas\" /></ItemGroup></Project>",
+    );
+    if with_file_events {
+        workspace.file_event(&mappings_uri, FileChange::Created);
+    }
+    let restored = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "MappedRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].uri, uri(&version_two));
+}
+
+#[test]
+fn missing_package_imports_revalidate_on_create_delete_restore_with_and_without_events() {
+    for with_file_events in [false, true] {
+        for exists_guard in [false, true] {
+            exercise_missing_package_import_lifecycle(with_file_events, exists_guard);
+        }
+    }
+}
+
+#[test]
+fn package_lookup_limit_does_not_return_a_partial_unique_match() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let first_provider = root.join("packages/Package000/SharedUnit.pas");
+    let last_provider = root.join("packages/Package256/SharedUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n";
+    let provider_source = "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&first_provider, provider_source);
+    write_file(&last_provider, provider_source);
+
+    let mut package_names = Vec::new();
+    for index in 0..=256 {
+        let package_name = format!("Package{index:03}");
+        package_names.push(package_name.clone());
+        let descriptor = root
+            .join("packages")
+            .join(&package_name)
+            .join(format!("{package_name}.dpk"));
+        let contents = if index == 0 || index == 256 {
+            "package {name};\ncontains\n  SharedUnit in 'SharedUnit.pas';\nend.\n"
+                .replace("{name}", &package_name)
+        } else {
+            format!("package {package_name};\ncontains\nend.\n")
+        };
+        write_file(&descriptor, &contents);
+    }
+    write_file(
+        &root.join("App.dproj"),
+        &format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>{}</DCC_UsePackage></PropertyGroup></Project>",
+            package_names.join(";"),
+        ),
+    );
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &uri(&main),
+                position_of(main_source, "SharedRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert!(
+        workspace
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("named package lookup limit (256)"))
+    );
+}
+
+#[test]
+fn package_unit_candidate_limit_does_not_return_a_partial_unique_match() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("valid/RequestedUnit.pas");
+    let package = root.join("RequestedPackage.dpk");
+    let main_source = "unit Main;\ninterface\nuses RequestedUnit;\nimplementation\nprocedure Run;\nbegin\n  RequestedRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit RequestedUnit;\ninterface\nprocedure RequestedRoutine;\nimplementation\nprocedure RequestedRoutine; begin end;\nend.\n",
+    );
+    let mut package_source = String::from("package RequestedPackage;\ncontains\n");
+    package_source.push_str("  RequestedUnit in 'valid/RequestedUnit.pas'");
+    for index in 0..1_024 {
+        package_source.push_str(&format!(", RequestedUnit in 'missing/Unit{index:04}.pas'"));
+    }
+    package_source.push_str(";\nend.\n");
+    write_file(&package, &package_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>RequestedPackage</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &uri(&main),
+                position_of(main_source, "RequestedRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert!(
+        workspace
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("package unit candidate limit (1024)"))
+    );
+}
+
+#[test]
+fn oversized_package_metadata_is_skipped_without_loading_package_units() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let package = root.join("Package.dpk");
+    let main_source = "unit Main;\ninterface\nuses MissingUnit;\nimplementation\nprocedure Run;\nbegin\n  MissingRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    let mut oversized = String::from("package Package;\ncontains\n");
+    oversized.push_str(&"X".repeat(4 * 1024 * 1024 + 1));
+    write_file(&package, &oversized);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &uri(&main),
+                position_of(main_source, "MissingRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert_eq!(workspace.parsed_document_count(), 1);
+    assert!(
+        workspace
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("safety limit"))
+    );
+}
+
+#[test]
+fn opening_a_project_does_not_parse_package_sources_until_navigation_needs_one() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let package = root.join("Package.dpk");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &package,
+        "package Package;\ncontains\n  Provider in 'Provider.pas';\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let main_uri = uri(&main);
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert_eq!(workspace.parsed_document_count(), 0);
+    workspace
+        .open_document(main_uri, main_source.to_string(), 1)
+        .expect("open main document");
+    assert_eq!(workspace.parsed_document_count(), 1);
+}
+
+#[test]
+fn dproj_without_a_package_main_source_is_not_a_package_by_filename_alone() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("packages/Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &root.join("packages/Package.dproj"),
+        "<Project><ItemGroup><DCCReference Include=\"Provider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        workspace
+            .navigate(
+                &uri(&main),
+                position_of(main_source, "ProviderRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+}
+
+#[test]
+fn package_dproj_references_are_used_when_a_same_stem_dpk_is_unavailable() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("packages/src/Provider.pas");
+    let package_project = root.join("packages/ProviderPackage.dproj");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &package_project,
+        "<Project><PropertyGroup><MainSource>ProviderPackage.dpk</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Provider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>ProviderPackage</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+}
+
+#[test]
+fn bounded_package_catalogue_finds_late_packages_and_rejects_late_duplicates() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let target_main = root.join("target-project/TargetMain.pas");
+    let duplicate_main = root.join("duplicate-project/DuplicateMain.pas");
+    let target_source = "unit TargetMain;\ninterface\nuses TargetUnit;\nimplementation\nprocedure Run;\nbegin\n  TargetRoutine;\nend;\nend.\n";
+    let duplicate_source = "unit DuplicateMain;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n";
+
+    write_file(&target_main, target_source);
+    write_file(
+        &root.join("target-project/Target.dproj"),
+        "<Project><PropertyGroup><MainSource>TargetMain.pas</MainSource><DCC_UsePackage>TargetPackage</DCC_UsePackage></PropertyGroup></Project>",
+    );
+    write_file(&duplicate_main, duplicate_source);
+    write_file(
+        &root.join("duplicate-project/Duplicate.dproj"),
+        "<Project><PropertyGroup><MainSource>DuplicateMain.pas</MainSource><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>",
+    );
+
+    for (directory, routine) in [("a-shared", "FirstRoutine"), ("z-shared", "SecondRoutine")] {
+        write_file(
+            &root.join(directory).join("Shared.dpk"),
+            "package Shared;\ncontains\n  SharedUnit in 'SharedUnit.pas';\nend.\n",
+        );
+        write_file(
+            &root.join(directory).join("SharedUnit.pas"),
+            &format!(
+                "unit SharedUnit;\ninterface\nprocedure {routine};\nimplementation\nprocedure {routine}; begin end;\nend.\n"
+            ),
+        );
+    }
+
+    let noise_root = root.join("b-large-metadata");
+    fs::create_dir_all(&noise_root).expect("create large metadata directory");
+    for index in 0..10_001 {
+        write_file(
+            &noise_root.join(format!("Noise{index:05}.dproj")),
+            "<Project />",
+        );
+    }
+
+    let target_package = root.join("z-target/TargetPackage.dpk");
+    let target_provider = root.join("z-target/TargetUnit.pas");
+    write_file(
+        &target_package,
+        "package TargetPackage;\ncontains\n  TargetUnit in 'TargetUnit.pas';\nend.\n",
+    );
+    write_file(
+        &target_provider,
+        "unit TargetUnit;\ninterface\nprocedure TargetRoutine;\nimplementation\nprocedure TargetRoutine; begin end;\nend.\n",
+    );
+
+    let mut target_workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+    let target_locations = target_workspace.navigate(
+        &uri(&target_main),
+        position_of(target_source, "TargetRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(target_locations.len(), 1);
+    assert_eq!(target_locations[0].uri, uri(&target_provider));
+
+    let mut duplicate_workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert!(
+        duplicate_workspace
+            .navigate(
+                &uri(&duplicate_main),
+                position_of(duplicate_source, "SharedRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert!(
+        duplicate_workspace
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("ambiguous package shared"))
+    );
 }

@@ -1,6 +1,6 @@
 //! Workspace state, bounded source discovery, overlays, diagnostics, and formatting.
 
-use crate::project::{ProjectContext, ProjectOptions};
+use crate::project::{PackageMetadata, ProjectContext, ProjectOptions, read_package_metadata};
 use crate::{NavigationIndex, NavigationTarget, text};
 use fmt4d::FmtConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -10,7 +10,7 @@ use lsp_types::{
 };
 use pascal_core::{FileInfo, Severity, decode_bytes, parser};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +27,15 @@ const MAX_DEPENDENCY_WORK: usize = 256;
 const MAX_DIRECTORY_CATALOGUES: usize = 1024;
 const MAX_FILENAME_CATALOGUE_ENTRIES: usize = 10_000;
 const MAX_FILENAME_CATALOGUES: usize = 256;
+// The multidev workspace currently contains 436,705 filesystem entries when
+// counted without following links. Keep a fixed margin for normal growth, but
+// retain a hard stop so a pathological workspace cannot turn package lookup
+// into an unbounded traversal.
+const MAX_PACKAGE_CATALOGUE_ENTRIES: usize = 524_288;
+const MAX_PACKAGE_CATALOGUES: usize = 64;
+const MAX_PACKAGE_LOOKUPS: usize = 256;
+const MAX_PACKAGE_METADATA_CACHE: usize = 512;
+const MAX_PACKAGE_UNIT_CANDIDATES: usize = 1_024;
 const MAX_WORKSPACE_WARNINGS: usize = 256;
 const MAX_DELETED_OVERRIDES: usize = 256;
 
@@ -179,6 +188,51 @@ struct FilenameCatalogue {
     complete: bool,
     directories: Vec<(PathBuf, Option<PathStamp>)>,
     last_used: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PackageCatalogue {
+    entries: HashMap<String, Vec<PathBuf>>,
+    requested_names: HashSet<String>,
+    complete: bool,
+    directories: Vec<(PathBuf, Option<PathStamp>)>,
+    validated_epoch: u64,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct PackageDescriptorMatch {
+    path: PathBuf,
+    names: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct PackageDescriptorFiles {
+    has_dpk: bool,
+    dpk: Vec<PackageDescriptorMatch>,
+    dproj: Vec<PackageDescriptorMatch>,
+}
+
+#[derive(Debug, Default)]
+struct PackageCatalogueScan {
+    entries: HashMap<String, Vec<PathBuf>>,
+    directories: Vec<(PathBuf, Option<PathStamp>)>,
+    complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPackageMetadata {
+    metadata_stamps: Vec<(PathBuf, Option<PathStamp>)>,
+    result: Result<PackageMetadata, String>,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct PackageLookup {
+    candidates: Vec<PathBuf>,
+    metadata_paths: Vec<PathBuf>,
+    warnings: Vec<String>,
+    complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -340,6 +394,9 @@ pub struct Workspace {
     open_document_contexts: HashMap<Url, ContextKey>,
     directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
     filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
+    package_catalogues: HashMap<PathBuf, PackageCatalogue>,
+    package_catalogue_epoch: u64,
+    package_metadata_cache: HashMap<PathBuf, CachedPackageMetadata>,
     warnings: Vec<String>,
 }
 
@@ -373,6 +430,7 @@ impl Workspace {
         position: Position,
         target: NavigationTarget,
     ) -> Vec<Location> {
+        self.package_catalogue_epoch = self.package_catalogue_epoch.wrapping_add(1);
         let Some(context_key) = self.context_for_uri(uri) else {
             return Vec::new();
         };
@@ -701,6 +759,8 @@ impl Workspace {
         self.open_document_contexts.clear();
         self.directory_catalogues.clear();
         self.filename_catalogues.clear();
+        self.package_catalogues.clear();
+        self.package_metadata_cache.clear();
         self.deleted_overrides.clear();
     }
 
@@ -1246,14 +1306,22 @@ impl Workspace {
 
     fn invalidate_directory_for_uri(&mut self, uri: &Url) {
         if let Ok(path) = uri.to_file_path() {
-            if let Some(parent) = absolute_path(path).parent() {
+            let path = absolute_path(path);
+            if let Some(parent) = path.parent() {
                 self.directory_catalogues.remove(parent);
             }
+            self.package_metadata_cache.retain(|_, cached| {
+                !cached
+                    .metadata_stamps
+                    .iter()
+                    .any(|(metadata_path, _)| paths_equal_ci(metadata_path, &path))
+            });
         }
         // A filename-only catalogue has no source-content dependency and is
         // cheap to rebuild, while clearing it ensures watcher-less creates and
         // renames are visible without a periodic repository scan.
         self.filename_catalogues.clear();
+        self.package_catalogues.clear();
     }
 
     fn ensure_supported_with_context(&self, uri: &Url, key: &ContextKey) -> bool {
@@ -1370,6 +1438,55 @@ impl Workspace {
                 }
             }
         }
+        let package_lookup = self.package_unit_candidates(requested_name, lookup_name, context);
+        for path in &package_lookup.metadata_paths {
+            self.watch_package_path(context_key, path);
+        }
+        if !package_lookup.complete {
+            for warning in package_lookup.warnings {
+                self.warn(warning);
+            }
+            return None;
+        }
+        let mut valid = Vec::new();
+        for path in package_lookup.candidates {
+            let Ok(candidate_uri) = Url::from_file_path(&path) else {
+                continue;
+            };
+            if candidate_uri == *current_uri {
+                continue;
+            }
+            if !self.load_source(&candidate_uri, context_key, pinned) {
+                continue;
+            }
+            let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
+                continue;
+            };
+            if unit_name_matches(&unit_name, requested_name, lookup_name, context) {
+                valid.push(candidate_uri);
+            }
+        }
+        valid.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        valid.dedup();
+        match valid.len() {
+            0 => {
+                for warning in package_lookup.warnings {
+                    self.warn(warning);
+                }
+            }
+            1 => return valid.pop(),
+            _ => {
+                self.warn(format!(
+                    "ambiguous unit {requested_name} in the named source packages: {}",
+                    valid
+                        .iter()
+                        .map(Url::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                return None;
+            }
+        }
         if context.project_file.is_some()
             && !context.explicit_units.is_empty()
             && !context.explicit_units.contains_key(lookup_name)
@@ -1412,6 +1529,460 @@ impl Workspace {
             }
         }
         groups
+    }
+
+    fn package_unit_candidates(
+        &mut self,
+        requested_name: &str,
+        lookup_name: &str,
+        context: &ProjectContext,
+    ) -> PackageLookup {
+        let mut lookup = PackageLookup {
+            complete: true,
+            ..PackageLookup::default()
+        };
+        if context.packages.is_empty() {
+            return lookup;
+        }
+        if context.packages.len() > MAX_PACKAGE_LOOKUPS {
+            lookup.complete = false;
+            lookup.warnings.push(format!(
+                "named package lookup limit ({MAX_PACKAGE_LOOKUPS}) reached while resolving {requested_name}"
+            ));
+            return lookup;
+        }
+
+        let package_names = context.packages.to_vec();
+        for package_name in &package_names {
+            let (descriptors, catalogue_complete) =
+                self.package_descriptors(&package_names, package_name);
+            if !catalogue_complete {
+                lookup.complete = false;
+                lookup.warnings.push(format!(
+                    "source for package {package_name} was not found because its bounded source catalogue was incomplete; compiled-only package skipped"
+                ));
+                lookup.candidates.clear();
+                return lookup;
+            }
+            if descriptors.is_empty() {
+                lookup.warnings.push(format!(
+                    "source for package {package_name} was not found under the configured workspace/source roots; compiled-only package skipped"
+                ));
+                continue;
+            }
+            if descriptors.len() > 1 {
+                lookup.warnings.push(format!(
+                    "ambiguous package {package_name}; matching source descriptors were found: {}",
+                    descriptors
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                continue;
+            }
+
+            let descriptor = &descriptors[0];
+            let metadata = match self.cached_package_metadata(descriptor) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    lookup.warnings.push(format!(
+                        "source package {package_name} was skipped: {error}"
+                    ));
+                    continue;
+                }
+            };
+            lookup.metadata_paths.push(descriptor.clone());
+            lookup
+                .metadata_paths
+                .extend(metadata.metadata_files.iter().cloned());
+            let mut matched_mapping = false;
+            for (unit_name, paths) in &metadata.units {
+                if !package_unit_name_matches(unit_name, requested_name, lookup_name, context) {
+                    continue;
+                }
+                matched_mapping = true;
+                for path in paths {
+                    if !self.package_source_is_configured(path) {
+                        lookup.warnings.push(format!(
+                            "source package {package_name} maps {requested_name} outside configured workspace/source roots; skipped: {}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    if !lookup
+                        .metadata_paths
+                        .iter()
+                        .any(|existing| package_paths_equal(existing, path))
+                    {
+                        lookup.metadata_paths.push(path.clone());
+                    }
+                    if lookup
+                        .candidates
+                        .iter()
+                        .any(|existing| package_paths_equal(existing, path))
+                    {
+                        continue;
+                    }
+                    if lookup.candidates.len() >= MAX_PACKAGE_UNIT_CANDIDATES {
+                        lookup.complete = false;
+                        lookup.warnings.push(format!(
+                            "package unit candidate limit ({MAX_PACKAGE_UNIT_CANDIDATES}) reached while resolving {requested_name}"
+                        ));
+                        lookup.candidates.clear();
+                        return lookup;
+                    }
+                    lookup.candidates.push(path.clone());
+                }
+            }
+            if !matched_mapping {
+                lookup.warnings.push(format!(
+                    "source package {package_name} has no contains mapping for {requested_name}"
+                ));
+            }
+            lookup.warnings.extend(metadata.warnings.iter().cloned());
+        }
+        lookup
+    }
+
+    fn package_descriptors(
+        &mut self,
+        requested_names: &[String],
+        package_name: &str,
+    ) -> (Vec<PathBuf>, bool) {
+        let requested_names: HashSet<String> = requested_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let key = package_name.to_ascii_lowercase();
+        let roots = self.package_catalogue_roots();
+
+        for root in &roots {
+            self.package_catalogue(root, &requested_names);
+        }
+        let (mut descriptors, complete) = self.catalogued_package_descriptors(&roots, &key);
+
+        descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        descriptors.dedup_by(|left, right| package_paths_equal(left, right));
+        (descriptors, complete)
+    }
+
+    fn catalogued_package_descriptors(
+        &self,
+        roots: &[PathBuf],
+        package_name: &str,
+    ) -> (Vec<PathBuf>, bool) {
+        let mut descriptors: Vec<PathBuf> = Vec::new();
+        let mut complete = true;
+        for root in roots {
+            let root = absolute_path(root.clone());
+            let Some(catalogue) = self.package_catalogues.get(&root) else {
+                complete = false;
+                continue;
+            };
+            complete &= catalogue.complete;
+            if let Some(paths) = catalogue.entries.get(package_name) {
+                for path in paths {
+                    if !descriptors
+                        .iter()
+                        .any(|existing| package_paths_equal(existing, path))
+                    {
+                        descriptors.push(path.clone());
+                    }
+                }
+            }
+        }
+        (descriptors, complete)
+    }
+
+    fn package_catalogue_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for workspace_root in &self.roots {
+            for root in &workspace_root.source_roots {
+                if !roots.iter().any(|existing| existing == root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        roots
+    }
+
+    fn package_source_is_configured(&self, path: &Path) -> bool {
+        self.roots.iter().any(|workspace_root| {
+            workspace_root
+                .source_roots
+                .iter()
+                .any(|root| path_starts_with_ci(path, root))
+        })
+    }
+
+    fn cached_package_metadata(&mut self, path: &Path) -> Result<PackageMetadata, String> {
+        let stamp = path_stamp(path);
+        if let Some(cached) = self.package_metadata_cache.get(path) {
+            if cached
+                .metadata_stamps
+                .iter()
+                .all(|(metadata_path, metadata_stamp)| path_stamp(metadata_path) == *metadata_stamp)
+            {
+                let result = cached.result.clone();
+                self.use_clock = self.use_clock.saturating_add(1);
+                if let Some(cached) = self.package_metadata_cache.get_mut(path) {
+                    cached.last_used = self.use_clock;
+                }
+                return result;
+            }
+        }
+        let previous_metadata_paths = self
+            .package_metadata_cache
+            .get(path)
+            .map(|cached| {
+                cached
+                    .metadata_stamps
+                    .iter()
+                    .map(|(metadata_path, _)| metadata_path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![path.to_path_buf()]);
+        let result = read_package_metadata(path);
+        let metadata_paths = result
+            .as_ref()
+            .map(|metadata| metadata.metadata_files.clone())
+            .unwrap_or(previous_metadata_paths);
+        let metadata_stamps = metadata_paths
+            .into_iter()
+            .map(|metadata_path| {
+                let metadata_stamp = if package_paths_equal(&metadata_path, path) {
+                    stamp.clone()
+                } else {
+                    path_stamp(&metadata_path)
+                };
+                (metadata_path, metadata_stamp)
+            })
+            .collect();
+        self.use_clock = self.use_clock.saturating_add(1);
+        self.package_metadata_cache.insert(
+            path.to_path_buf(),
+            CachedPackageMetadata {
+                metadata_stamps,
+                result: result.clone(),
+                last_used: self.use_clock,
+            },
+        );
+        self.trim_package_metadata_cache();
+        result
+    }
+
+    fn trim_package_metadata_cache(&mut self) {
+        while self.package_metadata_cache.len() > MAX_PACKAGE_METADATA_CACHE {
+            let Some(victim) = self
+                .package_metadata_cache
+                .iter()
+                .min_by_key(|(_, metadata)| metadata.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.package_metadata_cache.remove(&victim);
+        }
+    }
+
+    fn watch_package_path(&mut self, context_key: &ContextKey, path: &Path) {
+        if let Some(state) = self.contexts.get_mut(context_key) {
+            if (extension_is(path, "dpk") || extension_is(path, "dproj"))
+                && !state
+                    .context
+                    .metadata_files
+                    .iter()
+                    .any(|existing| paths_equal_ci(existing, path))
+            {
+                state.context.metadata_files.push(path.to_path_buf());
+            }
+            state
+                .watched_paths
+                .entry(path.to_path_buf())
+                .or_insert_with(|| path_stamp(path));
+        }
+    }
+
+    fn package_catalogue(
+        &mut self,
+        root: &Path,
+        requested_names: &HashSet<String>,
+    ) -> PackageCatalogue {
+        let root = absolute_path(root.to_path_buf());
+        let requested_names: HashSet<String> = requested_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let fresh = self.package_catalogues.get(&root).is_some_and(|catalogue| {
+            (catalogue.validated_epoch == self.package_catalogue_epoch
+                || catalogue
+                    .directories
+                    .iter()
+                    .all(|(path, stamp)| path_stamp(path) == *stamp))
+                && requested_names.is_subset(&catalogue.requested_names)
+        });
+        if fresh {
+            self.use_clock = self.use_clock.saturating_add(1);
+            if let Some(catalogue) = self.package_catalogues.get_mut(&root) {
+                catalogue.validated_epoch = self.package_catalogue_epoch;
+                catalogue.last_used = self.use_clock;
+                return catalogue.clone();
+            }
+        }
+
+        let mut scan_names = requested_names.clone();
+        if let Some(catalogue) = self.package_catalogues.get(&root) {
+            scan_names.extend(catalogue.requested_names.iter().cloned());
+        }
+        let scan = self.scan_package_catalogue(&root, &scan_names);
+
+        self.use_clock = self.use_clock.saturating_add(1);
+        let catalogue = PackageCatalogue {
+            entries: scan.entries,
+            requested_names: scan_names,
+            complete: scan.complete,
+            directories: scan.directories,
+            validated_epoch: self.package_catalogue_epoch,
+            last_used: self.use_clock,
+        };
+        self.package_catalogues.insert(root, catalogue.clone());
+        self.trim_package_catalogues();
+        catalogue
+    }
+
+    fn scan_package_catalogue(
+        &mut self,
+        root: &Path,
+        requested_names: &HashSet<String>,
+    ) -> PackageCatalogueScan {
+        let root = absolute_path(root.to_path_buf());
+        let excludes = self
+            .roots
+            .iter()
+            .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
+            .map(|workspace_root| workspace_root.excludes.clone());
+        let mut scan = PackageCatalogueScan {
+            complete: true,
+            directories: vec![(root.clone(), path_stamp(&root))],
+            ..PackageCatalogueScan::default()
+        };
+        let mut pending = VecDeque::from([root.clone()]);
+        let mut visited = 1usize;
+
+        'directories: while let Some(directory) = pending.pop_front() {
+            let read_dir = match fs::read_dir(&directory) {
+                Ok(read_dir) => read_dir,
+                Err(_) => {
+                    scan.complete = false;
+                    break;
+                }
+            };
+            let mut children = Vec::new();
+            for result in read_dir {
+                if visited >= MAX_PACKAGE_CATALOGUE_ENTRIES {
+                    scan.complete = false;
+                    break 'directories;
+                }
+                let Ok(entry) = result else {
+                    scan.complete = false;
+                    break 'directories;
+                };
+                visited += 1;
+                children.push(entry);
+            }
+            children.sort_by(|left, right| {
+                left.path()
+                    .to_string_lossy()
+                    .cmp(&right.path().to_string_lossy())
+            });
+
+            let mut descriptors_by_stem: HashMap<String, PackageDescriptorFiles> = HashMap::new();
+            for entry in children {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    scan.complete = false;
+                    continue;
+                };
+                let excluded = excludes
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_excluded(&path, &root));
+                if file_type.is_dir() {
+                    scan.directories.push((path.clone(), path_stamp(&path)));
+                    if !file_type.is_symlink() && !excluded {
+                        pending.push_back(path);
+                    }
+                    continue;
+                }
+                if file_type.is_symlink()
+                    || excluded
+                    || !file_type.is_file()
+                    || !(extension_is(&path, "dpk") || extension_is(&path, "dproj"))
+                {
+                    continue;
+                }
+                let Some(stem) = path.file_stem() else {
+                    continue;
+                };
+                let stem = stem.to_string_lossy().to_ascii_lowercase();
+                let mut matched_names = Vec::new();
+                if requested_names.contains(&stem) {
+                    matched_names.push(stem.clone());
+                }
+
+                let files = descriptors_by_stem.entry(stem).or_default();
+                if extension_is(&path, "dpk") {
+                    files.has_dpk = true;
+                    if !matched_names.is_empty() {
+                        files.dpk.push(PackageDescriptorMatch {
+                            path,
+                            names: matched_names,
+                        });
+                    }
+                } else if !matched_names.is_empty() {
+                    files.dproj.push(PackageDescriptorMatch {
+                        path,
+                        names: matched_names,
+                    });
+                }
+            }
+
+            for files in descriptors_by_stem.into_values() {
+                let selected = if files.has_dpk {
+                    files.dpk
+                } else {
+                    files.dproj
+                };
+                for descriptor in selected {
+                    for name in descriptor.names {
+                        scan.entries
+                            .entry(name)
+                            .or_default()
+                            .push(descriptor.path.clone());
+                    }
+                }
+            }
+        }
+
+        for paths in scan.entries.values_mut() {
+            paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+            paths.dedup_by(|left, right| package_paths_equal(left, right));
+        }
+        scan
+    }
+
+    fn trim_package_catalogues(&mut self) {
+        while self.package_catalogues.len() > MAX_PACKAGE_CATALOGUES {
+            let Some(victim) = self
+                .package_catalogues
+                .iter()
+                .min_by_key(|(_, catalogue)| catalogue.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.package_catalogues.remove(&victim);
+        }
     }
 
     fn filename_candidates_for_names(
@@ -2042,6 +2613,16 @@ fn paths_equal_ci(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
+#[cfg(windows)]
+fn package_paths_equal(left: &Path, right: &Path) -> bool {
+    paths_equal_ci(left, right)
+}
+
+#[cfg(not(windows))]
+fn package_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
 fn path_starts_with_ci(path: &Path, root: &Path) -> bool {
     let path_components = path.components().collect::<Vec<_>>();
     let root_components = root.components().collect::<Vec<_>>();
@@ -2139,6 +2720,21 @@ fn unit_name_matches(
         .unit_namespaces
         .iter()
         .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual))
+}
+
+fn package_unit_name_matches(
+    actual: &str,
+    requested: &str,
+    lookup: &str,
+    context: &ProjectContext,
+) -> bool {
+    actual.eq_ignore_ascii_case(requested)
+        || actual.eq_ignore_ascii_case(lookup)
+        || (!lookup.contains('.')
+            && context
+                .unit_namespaces
+                .iter()
+                .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual)))
 }
 
 fn is_default_excluded_component(component: Component<'_>) -> bool {

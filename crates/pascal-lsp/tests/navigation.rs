@@ -306,6 +306,46 @@ end;
 end.
 "#;
 
+const CONDITIONAL_TYPE_PROVIDER: &str = r#"unit ConditionalTypeProvider;
+interface
+
+type
+  TMDIBDatabase = class
+  public
+    procedure Execute;
+  end;
+
+  TMDIBSQL = class
+    procedure ExecQuery; {$IFDEF DELPHI_XE6_UP}reintroduce{$ELSE}override{$ENDIF};
+  end;
+
+implementation
+
+procedure TMDIBDatabase.Execute;
+begin
+end;
+
+procedure TMDIBSQL.ExecQuery;
+begin
+end;
+
+end.
+"#;
+
+const CONDITIONAL_TYPE_CALLER: &str = r#"unit ConditionalTypeCaller;
+interface
+uses ConditionalTypeProvider;
+implementation
+procedure Run;
+var
+  Database: TMDIBDatabase;
+  GenericDatabase: TList<TMDIBDatabase>;
+begin
+  Database.Execute;
+end;
+end.
+"#;
+
 const NAMESPACED_TYPES: &str = r#"unit Ns.U;
 interface
 procedure P;
@@ -842,6 +882,49 @@ fn imported_variable_types_resolve_in_their_declaration_context() {
     );
     assert_eq!(result.len(), 1);
     assert_location_start(&result[0], &types_uri, position_of(TYPES_UNIT, "Field", 0));
+}
+
+#[test]
+fn conditional_method_attributes_preserve_cross_unit_type_navigation() {
+    let mut index = NavigationIndex::new();
+    let provider_uri = uri("ConditionalTypeProvider");
+    let caller_uri = uri("ConditionalTypeCaller");
+    index
+        .update(provider_uri.clone(), CONDITIONAL_TYPE_PROVIDER.to_string())
+        .expect("conditional type provider parses");
+    index
+        .update(caller_uri.clone(), CONDITIONAL_TYPE_CALLER.to_string())
+        .expect("conditional type caller parses");
+
+    let generic_type = locations_at(
+        &index,
+        &caller_uri,
+        CONDITIONAL_TYPE_CALLER,
+        "TMDIBDatabase",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(generic_type.len(), 1);
+    assert_location_start(
+        &generic_type[0],
+        &provider_uri,
+        position_of(CONDITIONAL_TYPE_PROVIDER, "TMDIBDatabase", 0),
+    );
+
+    let receiver_definition = locations_at(
+        &index,
+        &caller_uri,
+        CONDITIONAL_TYPE_CALLER,
+        "Execute",
+        0,
+        NavigationTarget::Definition,
+    );
+    assert_eq!(receiver_definition.len(), 1);
+    assert_location_start(
+        &receiver_definition[0],
+        &provider_uri,
+        position_of(CONDITIONAL_TYPE_PROVIDER, "Execute", 1),
+    );
 }
 
 #[test]

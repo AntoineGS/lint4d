@@ -274,8 +274,6 @@ fn run_connection(connection: &Connection) -> Result<bool, Box<dyn Error + Send 
     )?;
 
     let mut workspace = Workspace::new(roots, options);
-    // The initialize result is already on the wire before this bounded scan begins.
-    workspace.scan();
     if watcher_registration_supported {
         register_file_watcher(connection)?;
     }
@@ -365,7 +363,6 @@ fn handle_request(
                 "textDocument/definition" => NavigationTarget::Definition,
                 _ => NavigationTarget::Implementation,
             };
-            workspace.refresh_for_navigation();
             let locations = workspace.navigate(
                 &params.text_document_position_params.text_document.uri,
                 params.text_document_position_params.position,
@@ -536,7 +533,7 @@ fn send_diagnostics(
 
 fn register_file_watcher(connection: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
     let watchers = vec![FileSystemWatcher {
-        glob_pattern: GlobPattern::String("**/*.{pas,dpr,dpk}".to_string()),
+        glob_pattern: GlobPattern::String("**/*.{pas,dpr,dpk,dproj,optset}".to_string()),
         kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
     }];
     let registration = Registration {

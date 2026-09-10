@@ -28,6 +28,20 @@ pub struct NavigationIndex {
     units: HashMap<String, Vec<Url>>,
 }
 
+/// A byte span in a parsed Pascal source document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Metadata for one unit imported by a document's `uses` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportMetadata {
+    pub name: String,
+    pub span: SourceSpan,
+}
+
 impl NavigationIndex {
     /// Construct an empty navigation index.
     pub fn new() -> Self {
@@ -63,6 +77,58 @@ impl NavigationIndex {
         }
     }
 
+    /// Return the parsed `uses` entries for a document.
+    pub fn imports(&self, uri: &Url) -> Vec<ImportMetadata> {
+        self.documents
+            .get(uri)
+            .map(|document| document.imports.clone())
+            .unwrap_or_default()
+    }
+
+    /// Bind a document's imports to the workspace-selected unit documents.
+    ///
+    /// Supplying an empty iterator is intentional: once a workspace owns an
+    /// index, an unresolved import must not fall back to a same-named unit
+    /// contributed by another project. A plain `NavigationIndex` remains
+    /// global and implicit when this method has not been called for a document.
+    pub fn bind_imports<I>(&mut self, uri: &Url, bindings: I)
+    where
+        I: IntoIterator<Item = (String, Url)>,
+    {
+        let bindings = bindings
+            .into_iter()
+            .map(|(name, uri)| (canonical_name(&name), uri))
+            .collect();
+        if let Some(document) = self.documents.get_mut(uri) {
+            document.import_bindings = Some(bindings);
+        }
+    }
+
+    /// Clear a document's resolved imports while retaining an explicit
+    /// workspace-owned empty binding map.
+    pub fn clear_import_bindings(&mut self, uri: &Url) {
+        if let Some(document) = self.documents.get_mut(uri) {
+            document.import_bindings = Some(HashMap::new());
+        }
+    }
+
+    /// Return the unit name declared by a parsed document.
+    pub fn unit_name(&self, uri: &Url) -> Option<String> {
+        self.documents
+            .get(uri)
+            .map(|document| document.unit_name.clone())
+    }
+
+    /// Return whether this URI has a parsed document in the index.
+    pub fn contains(&self, uri: &Url) -> bool {
+        self.documents.contains_key(uri)
+    }
+
+    /// Number of retained parsed documents.
+    pub fn document_count(&self) -> usize {
+        self.documents.len()
+    }
+
     /// Resolve the identifier at `position` in `uri`.
     ///
     /// Unknown names and unknown receivers return an empty vector. In
@@ -89,7 +155,7 @@ impl NavigationIndex {
 
         let name = node_text(identifier, &document.source);
         let references = if let Some(unit_name) = use_name_at(identifier, &document.source) {
-            self.unit_references(&unit_name)
+            self.unit_references(document, &unit_name)
         } else if let Some(direct) = self.direct_symbol_references(uri, identifier) {
             direct
         } else if let Some((path, cursor_index)) =
@@ -210,14 +276,12 @@ impl NavigationIndex {
         Some(references)
     }
 
-    fn unit_references(&self, name: &str) -> Vec<Candidate> {
+    fn unit_references(&self, current_document: &Document, name: &str) -> Vec<Candidate> {
         let key = canonical_name(name);
-        self.units
-            .get(&key)
+        self.unit_urls_for_import(current_document, &key)
             .into_iter()
-            .flat_map(|uris| uris.iter())
             .filter_map(|uri| {
-                let document = self.documents.get(uri)?;
+                let document = self.documents.get(&uri)?;
                 let index = document
                     .symbols
                     .iter()
@@ -228,6 +292,13 @@ impl NavigationIndex {
                 })
             })
             .collect()
+    }
+
+    fn unit_urls_for_import(&self, current_document: &Document, name: &str) -> Vec<Url> {
+        if let Some(bindings) = &current_document.import_bindings {
+            return bindings.get(name).cloned().into_iter().collect();
+        }
+        self.units.get(name).cloned().unwrap_or_default()
     }
 
     fn unqualified_references(
@@ -303,9 +374,9 @@ impl NavigationIndex {
         // by exported_references_for_document.
         let mut imported = Vec::new();
         for unit in document.active_uses(region) {
-            for unit_uri in self.units.get(unit).into_iter().flatten() {
+            for unit_uri in self.unit_urls_for_import(document, unit) {
                 imported.extend(
-                    self.exported_references_for_document(unit_uri)
+                    self.exported_references_for_document(&unit_uri)
                         .into_iter()
                         .filter(|candidate| {
                             self.symbol(candidate)
@@ -727,10 +798,8 @@ impl NavigationIndex {
         {
             return None;
         }
-        self.units
-            .get(&key)
-            .cloned()
-            .filter(|urls| !urls.is_empty())
+        let urls = self.unit_urls_for_import(current_document, &key);
+        (!urls.is_empty()).then_some(urls)
     }
 
     fn longest_visible_unit_prefix(
@@ -768,8 +837,9 @@ impl NavigationIndex {
             vec![current_uri.clone()],
         );
         for used in current_document.active_uses(region) {
-            if let Some(unit_uris) = self.units.get(used) {
-                consider(used, unit_uris.clone());
+            let unit_uris = self.unit_urls_for_import(current_document, used);
+            if !unit_uris.is_empty() {
+                consider(used, unit_uris);
             }
         }
         best
@@ -1226,6 +1296,8 @@ struct Document {
     implementation_range: Option<Span>,
     interface_uses: Vec<String>,
     implementation_uses: Vec<String>,
+    imports: Vec<ImportMetadata>,
+    import_bindings: Option<HashMap<String, Url>>,
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
 }
@@ -1269,6 +1341,7 @@ impl Document {
 
         let mut interface_uses = Vec::new();
         let mut implementation_uses = Vec::new();
+        let mut imports = Vec::new();
         for module_name in &module_names {
             if !has_ancestor_kind(*module_name, "declUses") {
                 continue;
@@ -1277,6 +1350,13 @@ impl Document {
             if name.is_empty() {
                 continue;
             }
+            imports.push(ImportMetadata {
+                name: name.clone(),
+                span: SourceSpan {
+                    start: module_name.start_byte(),
+                    end: module_name.end_byte(),
+                },
+            });
             match region_for_node(*module_name) {
                 Region::Interface => interface_uses.push(name),
                 Region::Implementation => implementation_uses.push(name),
@@ -1322,6 +1402,8 @@ impl Document {
             implementation_range,
             interface_uses,
             implementation_uses,
+            imports,
+            import_bindings: None,
             scopes,
             symbols,
         })

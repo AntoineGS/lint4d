@@ -1,6 +1,6 @@
 [package]
 name = "pascal-lsp"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ fmt4d = { path = "../fmt4d" }
 tree-sitter = "0.24"
 lsp-types = "=0.95.1"
 lsp-server = "0.7"
+quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"

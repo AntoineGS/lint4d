@@ -1,5 +1,8 @@
 use lsp_types::{Location, Position, Url};
-use pascal_lsp::{NavigationIndex, navigation::NavigationTarget, text};
+use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
+use pascal_lsp::{NavigationIndex, NavigationTarget, text};
+use std::collections::HashMap;
+use std::fs;
 use std::process::Command;
 
 fn uri(name: &str) -> Url {
@@ -1892,5 +1895,157 @@ fn deeply_nested_expression_does_not_overflow_navigation_or_parser_traversal() {
                 NavigationTarget::Declaration,
             )
             .is_empty()
+    );
+}
+
+#[test]
+fn imports_are_exposed_and_empty_workspace_bindings_block_global_unit_matches() {
+    let mut index = NavigationIndex::new();
+    let caller_uri = uri("BindingCaller");
+    let provider_uri = uri("BindingProvider");
+    let caller = "unit BindingCaller;\ninterface\nuses BindingProvider;\nimplementation\nprocedure Run; begin end;\nend.\n";
+    let provider = "unit BindingProvider;\ninterface\nprocedure Work;\nimplementation\nprocedure Work; begin end;\nend.\n";
+    index
+        .update(caller_uri.clone(), caller.to_string())
+        .expect("caller parses");
+    index
+        .update(provider_uri.clone(), provider.to_string())
+        .expect("provider parses");
+
+    let imports = index.imports(&caller_uri);
+    assert_eq!(imports.len(), 1);
+    assert_eq!(imports[0].name, "bindingprovider");
+    assert!(imports[0].span.start < imports[0].span.end);
+
+    index.bind_imports(&caller_uri, HashMap::new());
+    assert!(
+        index
+            .navigate(
+                &caller_uri,
+                position_of(caller, "BindingProvider", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "an explicitly empty workspace binding must not fall back to the global unit index"
+    );
+
+    let mut bindings = HashMap::new();
+    bindings.insert("BindingProvider".to_string(), provider_uri.clone());
+    index.bind_imports(&caller_uri, bindings);
+    assert_eq!(
+        index
+            .navigate(
+                &caller_uri,
+                position_of(caller, "BindingProvider", 0),
+                NavigationTarget::Declaration,
+            )
+            .first()
+            .map(|location| &location.uri),
+        Some(&provider_uri)
+    );
+}
+
+#[test]
+fn project_navigation_does_not_probe_unrelated_explicit_references() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    fs::create_dir_all(&root).expect("create workspace");
+    fs::write(&main, main_source).expect("write main");
+    fs::write(&provider, provider_source).expect("write provider");
+    let mut references = String::new();
+    for index in 0..12 {
+        let name = format!("Unrelated{index}.pas");
+        fs::write(
+            root.join(&name),
+            format!("unit Unrelated{index}; interface implementation end.\n"),
+        )
+        .expect("write unrelated reference");
+        references.push_str(&format!("<DCCReference Include=\"{name}\" />"));
+    }
+    fs::write(
+        root.join("App.dproj"),
+        format!(
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><ItemGroup>{references}</ItemGroup></Project>"
+        ),
+    )
+    .expect("write project");
+    fs::write(root.join("App.dpr"), "program App; begin end.\n").expect("write main project");
+
+    let main_uri = Url::from_file_path(&main).expect("main URI");
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(
+        locations[0].uri,
+        Url::from_file_path(&provider).expect("provider URI")
+    );
+    assert_eq!(
+        workspace.parsed_document_count(),
+        2,
+        "only the requested source and its matching dependency should be parsed"
+    );
+}
+
+#[test]
+fn local_navigation_does_not_revalidate_unrelated_disk_cache() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let unrelated = root.join("Unrelated.pas");
+    let main_source = "unit Main;\ninterface\nprocedure MainRoutine;\nimplementation\nprocedure MainRoutine; begin end;\nend.\n";
+    let unrelated_source = "unit Unrelated;\ninterface\nprocedure UnrelatedRoutine;\nimplementation\nprocedure UnrelatedRoutine; begin end;\nend.\n";
+    fs::create_dir_all(&root).expect("create workspace");
+    fs::write(&main, main_source).expect("write main");
+    fs::write(&unrelated, unrelated_source).expect("write unrelated");
+
+    let main_uri = Url::from_file_path(&main).expect("main URI");
+    let unrelated_uri = Url::from_file_path(&unrelated).expect("unrelated URI");
+    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    assert_eq!(
+        workspace
+            .navigate(
+                &unrelated_uri,
+                position_of(unrelated_source, "UnrelatedRoutine", 1),
+                NavigationTarget::Declaration,
+            )
+            .len(),
+        1
+    );
+    assert_eq!(
+        workspace
+            .navigate(
+                &main_uri,
+                position_of(main_source, "MainRoutine", 1),
+                NavigationTarget::Declaration,
+            )
+            .len(),
+        1
+    );
+    fs::remove_file(&unrelated).expect("delete unrelated source");
+
+    workspace.refresh_for_navigation();
+    assert_eq!(
+        workspace.parsed_document_count(),
+        2,
+        "a compatibility refresh must not revalidate unrelated cached files"
+    );
+    assert_eq!(
+        workspace
+            .navigate(
+                &main_uri,
+                position_of(main_source, "MainRoutine", 1),
+                NavigationTarget::Declaration,
+            )
+            .len(),
+        1
     );
 }

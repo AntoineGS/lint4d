@@ -7,6 +7,11 @@ vim.lsp.config('pascal_lsp', {
   filetypes = { 'pascal' },
   root_markers = { '.lint4d.toml', '.git' },
   init_options = {
+    -- Optional Delphi project selection. Relative paths are relative to the
+    -- workspace; omit these to discover the nearest unambiguous project.
+    -- projectFile = 'src/Shop.dproj',
+    -- buildConfig = 'Debug',
+    -- platform = 'Win32',
     -- Additional source directories; relative paths are relative to the workspace.
     -- Add Delphi RTL/VCL source and third-party library source here when available.
     sourcePaths = {},

@@ -290,6 +290,535 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
 }
 
 #[test]
+fn opening_a_buffer_is_not_rejected_by_unrelated_initial_disk_entries() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let unrelated = root.join("A_Unrelated.pas");
+    let main = root.join("Z_Main.pas");
+    write_file(
+        &unrelated,
+        "unit Unrelated;\ninterface\nimplementation\nend.\n",
+    );
+    let main_source = "unit Main;\ninterface\nimplementation\nend.\n";
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFiles": 1}));
+    let sync_id = RequestId::from("after-initialize".to_string());
+    server.send_request(sync_id.clone(), "pascal/unknown", json!({}));
+    assert!(server.response(&sync_id).error.is_some());
+    write_file(&main, main_source);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .all(|diagnostic| !diagnostic["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("file limit")),
+        "unrelated disk entries must not reject the opened buffer: {diagnostics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_context_binds_same_named_units_to_the_nearest_project() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let a_main = root.join("A/Main.pas");
+    let a_unit = root.join("A/Shared.pas");
+    let b_main = root.join("B/Main.pas");
+    let b_unit = root.join("B/Shared.pas");
+    let main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let unit_source = "unit Shared;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    write_file(&a_main, main_source);
+    write_file(&a_unit, unit_source);
+    write_file(&b_main, main_source);
+    write_file(&b_unit, unit_source);
+    write_file(
+        &root.join("A/App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("B/App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    for (id, main, unit) in [
+        ("project-a", &a_main, &a_unit),
+        ("project-b", &b_main, &b_unit),
+    ] {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/declaration",
+            navigation_params(main, main_source, "Routine", 0),
+        );
+        let locations = result_locations(server.response(&request_id));
+        assert_eq!(locations.len(), 1, "{id} should have one bound result");
+        assert_eq!(locations[0]["uri"], uri(unit).to_string());
+    }
+    server.shutdown();
+}
+
+#[test]
+fn open_dependency_keeps_its_selected_project_context_across_requests() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let shared = root.join("A/src/Shared.pas");
+    let a_config = root.join("A/lib/Config.pas");
+    let b_config = root.join("B/lib/Config.pas");
+    let b_main = root.join("B/Main.pas");
+    let shared_source = "unit Shared;\ninterface\nuses Config;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let b_main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let config_source = "unit Config;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    write_file(&shared, shared_source);
+    write_file(&a_config, config_source);
+    write_file(&b_config, config_source);
+    write_file(&b_main, b_main_source);
+    write_file(
+        &root.join("A/App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("A/App.dpr"),
+        "program App; uses Config in 'lib/Config.pas'; begin end.\n",
+    );
+    write_file(
+        &root.join("B/App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("B/App.dpr"),
+        "program App; uses Shared in '../A/src/Shared.pas', Config in 'lib/Config.pas'; begin end.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&shared), "languageId": "pascal", "version": 1, "text": shared_source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let b_request_id = RequestId::from("b-context".to_string());
+    server.send_request(
+        b_request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&b_main, b_main_source, "Shared", 0),
+    );
+    let b_locations = result_locations(server.response(&b_request_id));
+    assert_eq!(b_locations.len(), 1);
+    assert_eq!(b_locations[0]["uri"], uri(&shared).to_string());
+
+    let a_request_id = RequestId::from("a-context".to_string());
+    server.send_request(
+        a_request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&shared, shared_source, "Routine", 0),
+    );
+    let a_locations = result_locations(server.response(&a_request_id));
+    assert_eq!(a_locations.len(), 1);
+    assert_eq!(a_locations[0]["uri"], uri(&a_config).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn projectless_context_watches_each_file_ancestors_for_new_nearer_projects() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let a_main = root.join("A/Main.pas");
+    let b_main = root.join("B/Main.pas");
+    let a_config = root.join("A/Config.pas");
+    let b_config = root.join("B/Config.pas");
+    let selected_config = root.join("A/lib/Config.pas");
+    let main_source = "unit Main;\ninterface\nuses Config;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let config_source = "unit Config;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    write_file(&a_main, main_source);
+    write_file(&b_main, main_source);
+    write_file(&a_config, config_source);
+    write_file(&b_config, config_source);
+    write_file(&selected_config, config_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    for (id, main, expected) in [
+        ("projectless-a", &a_main, &a_config),
+        ("projectless-b", &b_main, &b_config),
+    ] {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/declaration",
+            navigation_params(main, main_source, "Routine", 0),
+        );
+        let locations = result_locations(server.response(&request_id));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(expected).to_string());
+    }
+
+    write_file(
+        &root.join("A/App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("A/App.dpr"),
+        "program App; uses Config in 'lib/Config.pas'; begin end.\n",
+    );
+    let request_id = RequestId::from("nearer-project".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&a_main, main_source, "Routine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&selected_config).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn navigation_loads_transitive_typed_dependencies_and_bounds_circular_uses() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let direct = root.join("Direct.pas");
+    let types = root.join("Types.pas");
+    let cycle_a = root.join("CycleA.pas");
+    let cycle_b = root.join("CycleB.pas");
+    let main_source = "unit Main;\ninterface\nuses Direct;\nimplementation\nprocedure Run;\nbegin\n  Item.Field;\nend;\nend.\n";
+    let direct_source = "unit Direct;\ninterface\nuses Types, CycleA;\nvar\n  Item: Types.TThing;\nimplementation\nuses Main;\nend.\n";
+    let types_source = "unit Types;\ninterface\ntype\n  TThing = class\n    Field: Integer;\n  end;\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(&direct, direct_source);
+    write_file(&types, types_source);
+    write_file(
+        &cycle_a,
+        "unit CycleA;\ninterface\nuses CycleB;\nprocedure A;\nimplementation\nprocedure A; begin end;\nend.\n",
+    );
+    write_file(
+        &cycle_b,
+        "unit CycleB;\ninterface\nuses CycleA;\nprocedure B;\nimplementation\nprocedure B; begin end;\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("transitive".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "Field", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&types).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn project_namespace_and_unit_aliases_bind_qualified_imports() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Vendor.Core.pas");
+    let main_source = "unit Main;\ninterface\nuses Legacy;\nimplementation\nprocedure Run;\nbegin\n  LegacyRoutine;\nend;\nend.\n";
+    let provider_source = "unit Vendor.Core;\ninterface\nprocedure LegacyRoutine;\nimplementation\nprocedure LegacyRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Namespace>Vendor</DCC_Namespace><DCC_UnitAlias>Legacy=Vendor.Core</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("namespace-alias".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "LegacyRoutine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn project_namespace_resolves_unqualified_unit_to_a_qualified_filename() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Vendor.Core.pas");
+    let main_source = "unit Main;\ninterface\nuses Core;\nimplementation\nprocedure Run;\nbegin\n  CoreRoutine;\nend;\nend.\n";
+    let provider_source = "unit Vendor.Core;\ninterface\nprocedure CoreRoutine;\nimplementation\nprocedure CoreRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Namespace>Vendor</DCC_Namespace></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("namespace-qualified".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "CoreRoutine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn open_document_context_survives_metadata_invalidation_before_dependency_load() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let shared = root.join("A/src/Shared.pas");
+    let a_config = root.join("A/lib/Config.pas");
+    let b_config = root.join("B/lib/Config.pas");
+    let b_main = root.join("B/Main.pas");
+    let a_project = root.join("A/App.dproj");
+    let shared_source = "unit Shared;\ninterface\nuses Config;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let b_main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let config_source = "unit Config;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    write_file(&shared, shared_source);
+    write_file(&a_config, config_source);
+    write_file(&b_config, config_source);
+    write_file(&b_main, b_main_source);
+    write_file(
+        &a_project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("A/App.dpr"),
+        "program App; uses Config in 'lib/Config.pas'; begin end.\n",
+    );
+    write_file(
+        &root.join("B/App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("B/App.dpr"),
+        "program App; uses Shared in '../A/src/Shared.pas', Config in 'lib/Config.pas'; begin end.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&shared), "languageId": "pascal", "version": 1, "text": shared_source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let before_id = RequestId::from("open-context-before-invalidation".to_string());
+    server.send_request(
+        before_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&shared, shared_source, "Routine", 0),
+    );
+    let before_locations = result_locations(server.response(&before_id));
+    assert_eq!(before_locations.len(), 1);
+    assert_eq!(before_locations[0]["uri"], uri(&a_config).to_string());
+
+    write_file(
+        &a_project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_Define>AFTER_EDIT</DCC_Define></PropertyGroup></Project>",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&a_project), "type": 2}]}),
+    );
+
+    let dependency_id = RequestId::from("dependency-context".to_string());
+    server.send_request(
+        dependency_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&b_main, b_main_source, "Shared", 0),
+    );
+    let dependency_locations = result_locations(server.response(&dependency_id));
+    assert_eq!(dependency_locations.len(), 1);
+    assert_eq!(dependency_locations[0]["uri"], uri(&shared).to_string());
+
+    let after_id = RequestId::from("open-context-after-invalidation".to_string());
+    server.send_request(
+        after_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&shared, shared_source, "Routine", 0),
+    );
+    let after_locations = result_locations(server.response(&after_id));
+    assert_eq!(after_locations.len(), 1);
+    assert_eq!(after_locations[0]["uri"], uri(&a_config).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn project_namespace_prefers_exact_filename_over_qualified_candidates() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let exact = root.join("Core.pas");
+    let namespaced = root.join("Vendor.Core.pas");
+    let main_source = "unit Main;\ninterface\nuses Core;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let exact_source = "unit Core;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    let namespaced_source = "unit Vendor.Core;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&exact, exact_source);
+    write_file(&namespaced, namespaced_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Namespace>Vendor;Other</DCC_Namespace></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("namespace-exact".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "Routine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&exact).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn project_namespace_order_prefers_the_first_qualified_candidate() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let vendor = root.join("Vendor.Core.pas");
+    let other = root.join("Other.Core.pas");
+    let main_source = "unit Main;\ninterface\nuses Core;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let vendor_source = "unit Vendor.Core;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    let other_source = "unit Other.Core;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&vendor, vendor_source);
+    write_file(&other, other_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Namespace>Vendor;Other</DCC_Namespace></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("namespace-order".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "Routine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&vendor).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn accepted_open_dependency_is_resolved_without_a_disk_entry() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&provider), "languageId": "pascal", "version": 1, "text": provider_source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let request_id = RequestId::from("open-provider".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "ProviderRoutine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn rejected_open_dependency_without_a_disk_entry_is_not_resolved() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFileBytes": 64}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&provider), "languageId": "pascal", "version": 1, "text": provider_source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let request_id = RequestId::from("rejected-open-provider".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "ProviderRoutine", 0),
+    );
+    assert!(result_locations(server.response(&request_id)).is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn project_explicit_dpr_unit_paths_can_load_sources_outside_workspace_root() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("App.dpr");
+    let external = temp.path().join("external/ExternalUnit.pas");
+    let main_source = "program App;\nuses ExternalUnit in '..\\external\\ExternalUnit.pas';\nbegin\n  ExternalRoutine;\nend.\n";
+    let external_source = "unit ExternalUnit;\ninterface\nprocedure ExternalRoutine;\nimplementation\nprocedure ExternalRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&external, external_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let request_id = RequestId::from("external-dpr".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "ExternalRoutine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&external).to_string());
+    server.shutdown();
+}
+
+#[test]
 fn dynamic_watcher_registration_is_conditional_and_acknowledged() {
     let (_temp, main, _provider, _main_source, _provider_source) = standard_workspace();
     let root = main.parent().expect("workspace root");
@@ -747,6 +1276,43 @@ fn explicit_roots_allow_excluded_ancestor_names_and_add_source_paths() {
         request_id.clone(),
         "textDocument/declaration",
         navigation_params(&main, main_source, "BuildRoutine", 0),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn projectless_filename_catalogue_revalidates_new_nested_sources_without_watchers() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let nested = root.join("library");
+    let main = root.join("Main.pas");
+    let provider = nested.join("Nested.pas");
+    let main_source = "unit Main;\ninterface\nuses Nested;\nimplementation\nprocedure Run;\nbegin\n  NestedRoutine;\nend;\nend.\n";
+    write_file(&main, main_source);
+    fs::create_dir_all(&nested).expect("create nested source directory");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("before-new-file".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "NestedRoutine", 0),
+    );
+    assert!(result_locations(server.response(&request_id)).is_empty());
+
+    write_file(
+        &provider,
+        "unit Nested;\ninterface\nprocedure NestedRoutine;\nimplementation\nprocedure NestedRoutine; begin end;\nend.\n",
+    );
+    let request_id = RequestId::from("after-new-file".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "NestedRoutine", 0),
     );
     let locations = result_locations(server.response(&request_id));
     assert_eq!(locations.len(), 1);

@@ -67,11 +67,14 @@ identifier, not on whitespace following it.
 
 ## Source Paths and Configuration
 
-The server indexes Pascal source under the workspace roots. Add library source
-directories outside those roots using `init_options` in the example:
+The server lazily indexes Pascal source under the workspace roots. Add library
+source directories outside those roots using `init_options` in the example:
 
 ```lua
 init_options = {
+  projectFile = 'src/Shop.dproj',
+  buildConfig = 'Debug',
+  platform = 'Win32',
   sourcePaths = {
     '../shared',
     '/home/me/delphi-sources/rtl',
@@ -83,9 +86,23 @@ init_options = {
 
 `sourcePaths` adds to the workspace root; relative paths resolve against each
 workspace folder. Libraries must be available as source files on Linux for
-source navigation. The server does not launch a compiler, read the Windows
-registry, automatically translate Windows paths, or resolve compiled-only DCUs.
-Only use library sources you are entitled to access.
+source navigation. `projectFile`, `buildConfig`, and `platform` select the
+project metadata context used for navigation. The server reads `.dproj`,
+`.dpr`/`.dpk`, imported `.optset` files, `DCC_UnitSearchPath`, `DCCReference`,
+`DCC_Namespace`, `DCC_UnitAlias`, and explicit unit paths in a project main
+source. It does not launch a compiler, read the Windows registry, automatically
+translate Windows paths, or resolve compiled-only DCUs. Only use library sources
+you are entitled to access.
+
+Without `projectFile`, discovery searches ancestor directories up to the
+workspace boundary for an unambiguous `.dproj`, falling back to a `.dpr` or
+`.dpk`. Ambiguous projects require an explicit selection; the server does not
+choose one arbitrarily. The project's configuration/platform defaults apply
+unless overridden. Ordered project mappings and search paths take precedence
+over unrelated repository files. Missing units and unsupported project settings
+are reported as warnings in the LSP log, not as compiler-grade undeclared-symbol
+errors. Defines are collected as metadata, but source conditional compilation
+is not yet evaluated.
 
 `.lint4d.toml` is discovered for each open file's lint settings and suppressions.
 Root-level excludes also apply to source discovery. `.fmt4d.toml` controls
@@ -94,20 +111,25 @@ settings. Formatting is explicit and returns an edit to the client: the server
 does not write files. DCU-dependent lint rules are not enabled through a project
 context in this slice, and the CLI's baseline filtering is not applied.
 
-Disk scans exclude descendants named `.git`, `.worktrees`, `target`,
+Source discovery is lazy: initialization never walks or parses the workspace.
+An opened buffer parses immediately; a navigation request parses its requested
+source and then only the direct/transitive units needed to resolve that request,
+within bounded dependency work. Project-aware imports are bound to the selected
+project, including an explicit empty binding when a unit cannot be resolved, so
+an identically named unit from another project cannot leak into the result.
+Projectless fallback uses a bounded filename-only catalogue and never parses
+unrelated candidates. Open buffers are authoritative until closed; closing
+restores the current disk version. Disk metadata and project metadata are
+revalidated on demand for the requested source and dependencies it traverses,
+and watcher events are supported but not required. Navigation does not
+globally rescan a large workspace on each request.
+
+Disk discovery excludes descendants named `.git`, `.worktrees`, `target`,
 `node_modules`, `build`, `dist`, and similar generated directories. An explicit
 workspace/source root may itself live under one of these names. Symlinked files
-and directories are not scanned. Open buffers are authoritative until closed;
-closing restores the disk version. Disk metadata is revalidated in bounded
-batches on navigation, with bounded discovery of new files. Changes across a
-large workspace may therefore take several navigation requests to be observed;
-restart the client for an immediate complete rescan. Client file-watcher events
-are also supported, but are not required.
-
-Initialization completes before the initial source scan. Requests can wait for
-that scan; choose narrow roots/excludes for a large monorepo. Linting is debounced
-by 250 ms. Source parsing, navigation and linting currently share a synchronous
-worker, so this is not yet a low-latency incremental compiler service.
+and directories are not scanned. Linting is debounced by 250 ms. Source
+parsing, navigation and linting currently share a synchronous worker, so this is
+not yet a low-latency incremental compiler service.
 
 ## Navigation Coverage
 
@@ -140,7 +162,8 @@ Not implemented or incomplete:
   syntactic index, not a compiler-validated semantic model.
 - Evaluation of `{$IFDEF}` branches or include-file expansion. Conditional
   variants and duplicate units can produce multiple candidate locations.
-- Automatic `.dproj`/`.delphilsp.json` compiler search-path/configuration loading.
+- Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
+  compiler-equivalent search-path/configuration loading.
 - Completion, hover, references, rename, code actions, and document/workspace
   symbols. The server does not advertise those capabilities.
 
@@ -151,13 +174,21 @@ against your own projects before treating navigation as compiler-equivalent.
 
 | Initialization option | Default and maximum |
 | --- | --- |
+| `projectFile` | Optional `.dproj`, `.dpr`, or `.dpk` project selector |
+| `buildConfig` | Optional selected Delphi build configuration |
+| `platform` | Optional selected Delphi platform |
+| `sourcePaths` | Additional ordered unit search paths |
+| `exclude` | Additional source-discovery exclude globs |
 | `maxFiles` | 10,000 indexed files |
 | `maxFileBytes` | 2,097,152 bytes per document |
 | `maxTotalBytes` | 268,435,456 source bytes per budget |
 
-These options may lower limits, not raise the hard caps. Index and retained
-overlay budgets are bounded separately; source-byte limits are not process RSS
-limits, since trees and indexes require additional memory. Limit warnings are
+Resource-limit options may lower limits, not raise the hard caps. Open buffers
+take priority over closed parsed-cache entries, which can be evicted and loaded
+again on demand. Current-request dependencies are protected during resolution;
+if they cannot fit, navigation reports incomplete resolution rather than
+discarding an editable buffer. Source-byte limits are not process RSS limits,
+since trees and indexes require additional memory. Limit warnings are
 written to stderr. Rejected editor buffers cannot return stale navigation or
 formatting edits and recover after a newer acceptable update.
 

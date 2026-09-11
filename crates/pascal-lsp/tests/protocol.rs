@@ -4947,66 +4947,6 @@ fn public_rename_accounts_for_bounded_include_owner_summaries() {
     server.shutdown();
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn rename_revalidates_resolved_include_content_with_equal_metadata() {
-    let temp = tempfile::tempdir().expect("temporary workspace");
-    let root = temp.path().join("fixture");
-    let main = root.join("Main.pas");
-    let include = root.join("Shared.inc");
-    let source = "unit Main;\ninterface\nimplementation\n{$I Shared.inc}\nprocedure Run;\nvar\n  badConst: Integer;\nbegin\n  badConst := 1;\nend;\nend.\n";
-    write_file(&include, "{$DEFINE FEATURE}\n");
-    write_file(&main, source);
-    let original_metadata = fs::metadata(&include).expect("include metadata");
-
-    let watch_path = CString::new(include.to_string_lossy().as_bytes()).expect("watch path");
-    let fd = unsafe { inotify_init1(0) };
-    assert!(fd >= 0, "inotify_init1 failed");
-    let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
-    assert!(watch >= 0, "inotify_add_watch failed");
-    let include_for_watcher = include.clone();
-    let watcher = thread::spawn(move || {
-        wait_for_close_events(fd, 1);
-        write_file(&include_for_watcher, "{$DEFINE CHANGED}\n");
-        restore_mtime(&include_for_watcher, &original_metadata);
-        assert_eq!(
-            fs::metadata(&include_for_watcher)
-                .expect("changed include metadata")
-                .modified()
-                .expect("changed include mtime"),
-            original_metadata
-                .modified()
-                .expect("original include mtime")
-        );
-    });
-
-    let mut server = TestServer::launch();
-    server.initialize(&root, Value::Null);
-    let request_id = RequestId::from("include-content-race".to_string());
-    server.send_request(
-        request_id.clone(),
-        "textDocument/rename",
-        json!({
-            "textDocument": {"uri": uri(&main)},
-            "position": position_of(source, "badConst", 0),
-            "newName": "BAD_CONST"
-        }),
-    );
-    let response = server.response(&request_id);
-    watcher.join().expect("include watcher must finish");
-    let error = response
-        .error
-        .expect("changed include content must invalidate the rename");
-    assert_eq!(error.code, -32803);
-    assert!(
-        error.message.to_ascii_lowercase().contains("changed")
-            || error.message.to_ascii_lowercase().contains("metadata"),
-        "unexpected include race error: {}",
-        error.message
-    );
-    server.shutdown();
-}
-
 #[test]
 fn rename_rejects_branch_dependent_declarations_even_when_the_directive_parses() {
     let temp = tempfile::tempdir().expect("temporary workspace");

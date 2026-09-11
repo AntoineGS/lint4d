@@ -3194,10 +3194,12 @@ fn skip_string(bytes: &[u8], index: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Directive, DirectiveKind, contains_any_identifier, directive_kind, read_include,
-        resolve_include_path,
+        Directive, DirectiveKind, Workspace, WorkspaceOptions, contains_any_identifier,
+        directive_kind, read_include, rename_from_input, resolve_include_path, revalidate_input,
     };
-    use std::fs;
+    use lsp_types::{Position, Url};
+    use std::fs::{self, File, FileTimes};
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn contains_any_identifier_uses_identifier_boundaries() {
@@ -3205,6 +3207,91 @@ mod tests {
 
         assert!(contains_any_identifier("value := FOO; &bar := 1;", &names));
         assert!(!contains_any_identifier("value := Foobar;", &names));
+    }
+
+    #[test]
+    fn rename_revalidates_resolved_include_content_with_equal_metadata() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let include = root.join("Shared.inc");
+        let source = "unit Main;\ninterface\nimplementation\n{$I Shared.inc}\nprocedure Run;\nvar\n  badConst: Integer;\nbegin\n  badConst := 1;\nend;\nend.\n";
+        let original_include = b"{$DEFINE FEATURE}\n";
+        let changed_include = b"{$DEFINE CHANGED}\n";
+        assert_eq!(original_include.len(), changed_include.len());
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&include, original_include).expect("include");
+        fs::write(&main, source).expect("main source");
+
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let validation_input = input.clone();
+        let cancel = AtomicBool::new(false);
+        let computed = rename_from_input(
+            input,
+            &main_uri,
+            Position::new(6, 2),
+            "BAD_CONST",
+            false,
+            &cancel,
+        );
+        let planned = computed
+            .value
+            .expect("rename must produce a plan before the mutation");
+        assert!(
+            planned
+                .changes
+                .as_ref()
+                .and_then(|changes| changes.get(&main_uri))
+                .is_some_and(|edits| !edits.is_empty()),
+            "rename plan must include the target source edit"
+        );
+
+        let include_record = computed
+            .records
+            .iter()
+            .find(|record| record.path.as_deref() == Some(include.as_path()))
+            .expect("rename read-set must retain the resolved include");
+        assert!(
+            include_record.content_hash.is_some(),
+            "resolved include must retain its content hash"
+        );
+        assert!(
+            revalidate_input(&validation_input, &computed.records, &cancel).is_ok(),
+            "unchanged rename inputs must revalidate successfully"
+        );
+
+        let original_metadata = fs::metadata(&include).expect("original include metadata");
+        let original_mtime = original_metadata
+            .modified()
+            .expect("original include mtime");
+        fs::write(&include, changed_include).expect("changed include");
+        File::options()
+            .write(true)
+            .open(&include)
+            .expect("open changed include for timestamp restore")
+            .set_times(FileTimes::new().set_modified(original_mtime))
+            .expect("restore include mtime");
+
+        let changed_metadata = fs::metadata(&include).expect("changed include metadata");
+        assert_eq!(changed_metadata.len(), original_metadata.len());
+        assert_eq!(
+            changed_metadata.modified().expect("changed include mtime"),
+            original_mtime
+        );
+        assert_ne!(
+            fs::read(&include).expect("changed include bytes"),
+            original_include
+        );
+
+        let error = revalidate_input(&validation_input, &computed.records, &cancel)
+            .expect_err("changed include content must invalidate the rename");
+        assert!(
+            error.to_ascii_lowercase().contains("changed")
+                || error.to_ascii_lowercase().contains("metadata"),
+            "unexpected include revalidation error: {error}"
+        );
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct ProjectOptions {
 /// Metadata used to resolve units without eagerly parsing the repository.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectContext {
+    /// Whether project selection and the metadata needed for binding completed
+    /// without an ambiguity or an unresolved project-selection fallback.
+    pub discovery_complete: bool,
     pub project_file: Option<PathBuf>,
     pub main_source: Option<PathBuf>,
     /// Ordered project and client-provided unit search paths.
@@ -123,13 +126,31 @@ fn discover_context(
     };
 
     match selected_project {
-        Some(project_file) => {
-            build_project_context(project_file, &file_path, &roots, options, warnings)
-        }
-        None => Ok(build_standalone_context(
-            &file_path, &roots, options, warnings,
+        ProjectSelection::Selected {
+            path: project_file,
+            explicit,
+        } => build_project_context(
+            project_file,
+            &file_path,
+            &roots,
+            options,
+            warnings,
+            explicit,
+        ),
+        ProjectSelection::Standalone => Ok(build_standalone_context(
+            &file_path, &roots, options, warnings, true,
+        )),
+        ProjectSelection::Incomplete => Ok(build_standalone_context(
+            &file_path, &roots, options, warnings, false,
         )),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectSelection {
+    Selected { path: PathBuf, explicit: bool },
+    Standalone,
+    Incomplete,
 }
 
 fn normalize_workspace_roots(
@@ -157,14 +178,14 @@ fn explicit_project_file(
     roots: &[PathBuf],
     file: &Path,
     warnings: &mut Vec<String>,
-) -> Option<PathBuf> {
+) -> ProjectSelection {
     let requested_text = requested.to_string_lossy();
     if is_windows_absolute_text(&requested_text) {
         warnings.push(format!(
             "Windows project path is unavailable on Linux and was omitted: {}",
             requested.display()
         ));
-        return None;
+        return ProjectSelection::Incomplete;
     }
     let requested = PathBuf::from(requested_text.replace('\\', "/"));
 
@@ -195,15 +216,18 @@ fn explicit_project_file(
                 "explicit project file was not found: {}",
                 requested.display()
             ));
-            None
+            ProjectSelection::Incomplete
         }
-        1 => Some(candidates.remove(0)),
+        1 => ProjectSelection::Selected {
+            path: candidates.remove(0),
+            explicit: true,
+        },
         _ => {
             warnings.push(format!(
                 "multiple explicit project files matched {}; no project selected",
                 requested.display()
             ));
-            None
+            ProjectSelection::Incomplete
         }
     }
 }
@@ -212,7 +236,7 @@ fn discover_project_file(
     file: &Path,
     workspace_root: Option<&Path>,
     warnings: &mut Vec<String>,
-) -> Option<PathBuf> {
+) -> ProjectSelection {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     let mut fallback_dpr = None;
     let mut ambiguous_fallback_dpr = None;
@@ -225,7 +249,7 @@ fn discover_project_file(
                     "could not inspect project directory {}: {error}",
                     directory.display()
                 ));
-                return None;
+                return ProjectSelection::Incomplete;
             }
         };
         let mut dproj = Vec::new();
@@ -267,7 +291,12 @@ fn discover_project_file(
     if let Some((candidates, directory)) = ambiguous_fallback_dpr {
         return choose_project_candidate(candidates, &directory, "DPR/DPK files", warnings);
     }
-    fallback_dpr
+    fallback_dpr.map_or(ProjectSelection::Standalone, |path| {
+        ProjectSelection::Selected {
+            path,
+            explicit: false,
+        }
+    })
 }
 
 fn choose_project_candidate(
@@ -275,9 +304,12 @@ fn choose_project_candidate(
     directory: &Path,
     kind: &str,
     warnings: &mut Vec<String>,
-) -> Option<PathBuf> {
+) -> ProjectSelection {
     if candidates.len() == 1 {
-        return candidates.pop();
+        return ProjectSelection::Selected {
+            path: candidates.pop().expect("one candidate"),
+            explicit: false,
+        };
     }
     candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
     warnings.push(format!(
@@ -289,7 +321,7 @@ fn choose_project_candidate(
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    None
+    ProjectSelection::Incomplete
 }
 
 fn relevant_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
@@ -363,6 +395,7 @@ fn build_project_context(
     roots: &[PathBuf],
     options: &ProjectOptions,
     warnings: Vec<String>,
+    explicit: bool,
 ) -> Result<ProjectContext, String> {
     let project_dir = project_file
         .parent()
@@ -475,6 +508,7 @@ fn build_project_context(
     }
 
     Ok(ProjectContext {
+        discovery_complete: !project_context_warnings_incomplete(&builder.warnings, explicit),
         project_file: Some(project_file),
         main_source,
         search_paths,
@@ -495,6 +529,7 @@ fn build_standalone_context(
     roots: &[PathBuf],
     options: &ProjectOptions,
     mut warnings: Vec<String>,
+    discovery_complete: bool,
 ) -> ProjectContext {
     let mut search_paths = Vec::new();
     if let Some(parent) = file.parent() {
@@ -521,6 +556,7 @@ fn build_standalone_context(
     }
 
     ProjectContext {
+        discovery_complete,
         project_file: None,
         main_source: None,
         search_paths,
@@ -534,6 +570,29 @@ fn build_standalone_context(
         metadata_files: Vec::new(),
         warnings,
     }
+}
+
+fn project_context_warnings_incomplete(warnings: &[String], explicit: bool) -> bool {
+    warnings.iter().any(|warning| {
+        let warning = warning.to_ascii_lowercase();
+        (!explicit && warning.contains("no resolvable"))
+            || warning.contains("unresolved property")
+            || warning.contains("path does not exist and was omitted")
+            || warning.contains("could not read optset")
+            || warning.contains("could not inspect project")
+            || warning.contains("could not inspect")
+            || warning.contains("invalid xml")
+            || warning.contains("windows path")
+            || warning.contains("unavailable property path")
+            || warning.contains("unknown project condition")
+            || warning.contains("unsupported project condition")
+            || warning.contains("ambiguous case-insensitive")
+            || warning.contains("multiple main sources")
+            || warning.contains("property memory budget exceeded")
+            || warning.contains("optset import limit")
+            || warning.contains("optset import path does not exist")
+            || warning.contains("workspace root could not be resolved")
+    })
 }
 
 fn selected_config(builder: &ProjectBuilder, options: &ProjectOptions) -> Option<String> {

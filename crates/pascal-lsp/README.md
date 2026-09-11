@@ -1,10 +1,10 @@
 # pascal-lsp
 
 A native, source-based Delphi/Object Pascal language server. Runs on Linux
-without Windows, Wine, RAD Studio, or `DelphiLSP.exe`. This first slice prioritizes
-declaration/definition navigation and reuses lint4d and fmt4d for diagnostics and
-formatting. It is not a replacement for Delphi's compiler or its complete type
-system.
+without Windows, Wine, RAD Studio, or `DelphiLSP.exe`. This slice provides
+declaration/definition navigation, conservative symbol-aware rename, naming
+quick fixes, and reuses lint4d and fmt4d for diagnostics and formatting. It is
+not a replacement for Delphi's compiler or its complete type system.
 
 ## Build and Run
 
@@ -63,6 +63,8 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `gD` | Go to the visible declaration, such as the unit interface or class header |
 | `gi` | Go to implementation; uses the same fallback as `gd` in this slice |
 | `<C-o>` | Return to the previous jump location |
+| `grn` / `:lua vim.lsp.buf.rename()` | Rename the symbol under the cursor |
+| `gra` / `:lua vim.lsp.buf.code_action()` | Show naming quick fixes for the requested range |
 | `:lua vim.lsp.buf.format({ name = 'pascal_lsp' })` | Explicitly format the current buffer |
 | `:checkhealth vim.lsp` | Inspect attachment, executable, and client configuration |
 | `:lua print(vim.lsp.log.get_filename())` | Locate the LSP log, including server stderr |
@@ -141,7 +143,11 @@ unless overridden. Ordered project mappings and search paths take precedence
 over unrelated repository files. Missing units and unsupported project settings
 are reported as warnings in the LSP log, not as compiler-grade undeclared-symbol
 errors. Defines are collected as metadata, but source conditional compilation
-is not yet evaluated.
+is not yet evaluated. In the current MultidevComponents real-project example,
+the public `MDIBDatabase` constant action remains disabled: automatic discovery
+finds 13 project candidates, while explicit `MDDatabaseXE3` has an undefined
+inactive condition and missing `.dcp` warnings. This is an intentional
+fail-closed refusal, not evidence that the project action is supported.
 
 `.lint4d.toml` is discovered for each open file's lint settings and suppressions.
 Root-level excludes also apply to source discovery. `.fmt4d.toml` controls
@@ -203,11 +209,40 @@ Not implemented or incomplete:
   variants and duplicate units can produce multiple candidate locations.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
-- Completion, hover, references, rename, code actions, and document/workspace
-  symbols. The server does not advertise those capabilities.
+- Completion, hover, references, and document/workspace symbols.
 
 Unsupported expressions can return no location. Results should be evaluated
 against your own projects before treating navigation as compiler-equivalent.
+
+## Rename and naming code actions
+
+`textDocument/rename` and `textDocument/prepareRename` build a fresh, bounded
+workspace snapshot. The snapshot includes unopened Pascal sources under the
+workspace roots and unsaved buffers, then uses the same binding-based planner
+for every returned edit. Open buffers receive versioned
+`WorkspaceEdit.documentChanges`; closed files receive null-version edits. The
+client applies the edit—`pascal-lsp` never writes application files.
+
+`textDocument/codeAction` initially provides `quickfix` actions for
+`constant-naming` and `local-variable-naming`. Suggestions use the configured
+lint4d naming styles and honor rule-off settings and source suppressions. A
+client with code-action resolve support receives a bounded opaque action token;
+the server rechecks the declaration, source/configuration generations, rule,
+and configuration before resolving it. Clients without resolve support receive
+eager edits instead.
+
+For safety, rename is refused rather than returning a partial edit when the
+workspace scan is incomplete, an import/project context is unresolved or
+ambiguous, a source path is a symlink escape, or an edit would touch an
+external `sourcePaths` file. Include files and conditional compilation are
+not expanded, so snapshots containing potentially relevant include or
+conditional directives are rejected. Unit/module renames (which require
+`RenameFile`), inherited/`with` lookup, overloaded/override relationships,
+compiled-only consumers, and other unsupported bindings are also rejected by
+the shared planner. Name collisions and reference capture are rejected before
+any edit is returned. These checks are conservative; they bound races and
+avoid false-safe workspace edits but do not eliminate changes made after a
+request has completed.
 
 ## Limits
 
@@ -241,12 +276,16 @@ intended for a trusted local editor, not network exposure.
 ```sh
 cargo test --locked -p pascal-lsp
 cargo clippy --locked -p pascal-lsp --all-targets --no-deps -- -D warnings
+cargo fmt --manifest-path crates/pascal-lsp/Cargo.toml -- --check
 ```
 
 Tests include navigation fixtures, real-process framed LSP sessions, and a
-headless Neovim test loading the shipped example and invoking `gd`, `gD`, and
-`gi`. The Neovim test skips when `nvim` is not installed; when installed it must
-be version 0.11 or newer. No personal Neovim configuration is changed.
+headless Neovim test loading the shipped example. It invokes standard
+`vim.lsp.buf.rename()` and `vim.lsp.buf.code_action()` on disposable provider
+and initially unopened consumer fixtures, verifies their exact in-memory edits,
+and verifies that neither fixture is saved. The Neovim test skips when `nvim` is
+not installed; when installed it must be version 0.11 or newer. No personal
+Neovim configuration is changed.
 
 ## License
 

@@ -1,23 +1,27 @@
 //! Synchronous stdio LSP protocol loop for the Pascal navigation workspace.
 
 use crate::NavigationTarget;
-use crate::workspace::{FileChange, Workspace, WorkspaceOptions};
-use crossbeam_channel::{RecvTimeoutError, bounded};
+use crate::workspace::codeactions::{self, ClientActionFeatures};
+use crate::workspace::rename::{self, SourceRecord};
+use crate::workspace::{FileChange, Workspace, WorkspaceOptions, canonical_file_uri};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    ClientCapabilities, DeclarationCapability, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, FileChangeType, FileSystemWatcher,
-    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, OneOf,
-    PublishDiagnosticsParams, Registration, RegistrationParams, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Url, WatchKind, WorkspaceFolder,
-    WorkspaceFoldersServerCapabilities,
+    ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams, FileChangeType,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
+    Position, PrepareRenameResponse, PublishDiagnosticsParams, Registration, RegistrationParams,
+    ServerInfo, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
 };
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::error::Error;
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -25,6 +29,300 @@ const SERVER_NAME: &str = "pascal-lsp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
+const MAX_ANALYSIS_JOBS: usize = 2;
+const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy)]
+struct ClientFeatures {
+    action_resolve: bool,
+    action_disabled: bool,
+    document_changes: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionRequestParams {
+    text_document: TextDocumentIdentifier,
+    position: Position,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameRequestParams {
+    text_document: TextDocumentIdentifier,
+    position: Position,
+    new_name: String,
+}
+
+enum AnalysisRequest {
+    Prepare {
+        uri: Url,
+        position: Position,
+    },
+    Rename {
+        uri: Url,
+        position: Position,
+        new_name: String,
+    },
+    CodeActions(CodeActionParams),
+    Resolve(CodeAction),
+}
+
+enum AnalysisResultValue {
+    Prepare(Result<PrepareRenameResponse, String>),
+    Rename(Box<Result<WorkspaceEdit, String>>),
+    CodeActions(Result<Vec<CodeActionOrCommand>, String>),
+    Resolve(Box<Result<CodeAction, String>>),
+}
+
+struct AnalysisResult {
+    id: RequestId,
+    source_generation: u64,
+    configuration_generation: u64,
+    records: Vec<SourceRecord>,
+    value: AnalysisResultValue,
+}
+
+struct PendingAnalysis {
+    cancellation: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+struct AnalysisJobs {
+    sender: Sender<AnalysisResult>,
+    receiver: Receiver<AnalysisResult>,
+    pending: std::collections::HashMap<RequestId, PendingAnalysis>,
+}
+
+impl AnalysisJobs {
+    fn new() -> Self {
+        let (sender, receiver) = unbounded();
+        Self {
+            sender,
+            receiver,
+            pending: std::collections::HashMap::new(),
+        }
+    }
+
+    fn start(
+        &mut self,
+        id: RequestId,
+        request: AnalysisRequest,
+        workspace: &Workspace,
+        features: ClientFeatures,
+    ) -> Result<(), String> {
+        if self.pending.len() >= MAX_ANALYSIS_JOBS {
+            return Err("analysis server is busy; retry the request".to_string());
+        }
+        let input = workspace.analysis_input();
+        let source_generation = input.source_generation;
+        let configuration_generation = input.configuration_generation;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let sender = self.sender.clone();
+        let worker_id = id.clone();
+        let panic_id = id.clone();
+        let handle = thread::Builder::new()
+            .name("PascalLspAnalysis".to_string())
+            .spawn(move || {
+                let validation_input = input.clone();
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
+                        AnalysisRequest::Prepare { uri, position } => {
+                            let computed = rename::prepare_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::Prepare(computed.value),
+                            }
+                        }
+                        AnalysisRequest::Rename {
+                            uri,
+                            position,
+                            new_name,
+                        } => {
+                            let computed = rename::rename_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &new_name,
+                                features.document_changes,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::Rename(Box::new(computed.value)),
+                            }
+                        }
+                        AnalysisRequest::CodeActions(params) => {
+                            let computed = codeactions::code_actions_from_input(
+                                input,
+                                params,
+                                ClientActionFeatures {
+                                    resolve: features.action_resolve,
+                                    document_changes: features.document_changes,
+                                    disabled: features.action_disabled,
+                                },
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::CodeActions(computed.value),
+                            }
+                        }
+                        AnalysisRequest::Resolve(action) => {
+                            let computed = codeactions::resolve_from_input(
+                                input,
+                                action,
+                                ClientActionFeatures {
+                                    resolve: features.action_resolve,
+                                    document_changes: features.document_changes,
+                                    disabled: features.action_disabled,
+                                },
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::Resolve(Box::new(computed.value)),
+                            }
+                        }
+                    }));
+                let mut result = result.unwrap_or_else(|_| AnalysisResult {
+                    id: panic_id,
+                    source_generation,
+                    configuration_generation,
+                    records: Vec::new(),
+                    value: AnalysisResultValue::Prepare(Err(
+                        "analysis worker failed without changing workspace state".to_string(),
+                    )),
+                });
+                if let Err(error) = rename::revalidate_input(
+                    &validation_input,
+                    &result.records,
+                    &worker_cancellation,
+                ) {
+                    invalidate_analysis_result(&mut result, error);
+                }
+                let _ = sender.send(result);
+            })
+            .map_err(|error| format!("could not start analysis worker: {error}"))?;
+        self.pending.insert(
+            id,
+            PendingAnalysis {
+                cancellation,
+                handle,
+            },
+        );
+        Ok(())
+    }
+
+    fn cancel(&self, id: &RequestId) {
+        if let Some(job) = self.pending.get(id) {
+            job.cancellation
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn poll(
+        &mut self,
+        connection: &Connection,
+        workspace: &Workspace,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        while let Ok(result) = self.receiver.try_recv() {
+            if let Some(job) = self.pending.remove(&result.id) {
+                let _ = job.handle.join();
+            }
+            deliver_analysis_result(connection, workspace, result)?;
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn shutdown(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        for (_, job) in pending {
+            job.cancellation
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = job.handle.join();
+        }
+    }
+}
+
+fn deliver_analysis_result(
+    connection: &Connection,
+    workspace: &Workspace,
+    result: AnalysisResult,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if result.source_generation != workspace.source_generation()
+        || result.configuration_generation != workspace.configuration_generation()
+    {
+        return send_error(
+            connection,
+            result.id,
+            ErrorCode::RequestFailed,
+            "analysis result became stale; retry the request",
+        );
+    }
+    match result.value {
+        AnalysisResultValue::Prepare(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::Rename(value) => match *value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::CodeActions(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::Resolve(value) => match *value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+    }
+}
+
+fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
+    match &mut result.value {
+        AnalysisResultValue::Prepare(value) => *value = Err(error),
+        AnalysisResultValue::Rename(value) => **value = Err(error),
+        AnalysisResultValue::CodeActions(value) => *value = Err(error),
+        AnalysisResultValue::Resolve(value) => **value = Err(error),
+    }
+}
+
+fn send_analysis_error(
+    connection: &Connection,
+    id: RequestId,
+    error: String,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let code = if error == rename::CANCELLATION_MESSAGE {
+        ErrorCode::RequestCanceled
+    } else {
+        ErrorCode::RequestFailed
+    };
+    send_error(connection, id, code, error)
+}
 
 /// Run one native LSP session over stdin/stdout.
 pub fn run_stdio() -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -260,6 +558,7 @@ fn run_connection(connection: &Connection) -> Result<bool, Box<dyn Error + Send 
     let workspace_folders_supported = supports_workspace_folders(&initialize.capabilities);
     let watcher_registration_supported =
         supports_watched_file_registration(&initialize.capabilities);
+    let client_features = client_features(&initialize.capabilities);
     let capabilities = server_capabilities(&initialize.capabilities);
 
     connection.initialize_finish(
@@ -278,31 +577,48 @@ fn run_connection(connection: &Connection) -> Result<bool, Box<dyn Error + Send 
         register_file_watcher(connection)?;
     }
 
-    event_loop(connection, &mut workspace, workspace_folders_supported)
+    event_loop(
+        connection,
+        &mut workspace,
+        workspace_folders_supported,
+        client_features,
+    )
 }
 
 fn event_loop(
     connection: &Connection,
     workspace: &mut Workspace,
     workspace_folders_supported: bool,
+    client_features: ClientFeatures,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
+    let mut jobs = AnalysisJobs::new();
     loop {
         publish_due_diagnostics(connection, workspace)?;
+        jobs.poll(connection, workspace)?;
         let timeout = workspace
             .next_diagnostic_timeout()
-            .unwrap_or(Duration::from_secs(86_400));
+            .unwrap_or(Duration::from_secs(86_400))
+            .min(if jobs.is_empty() {
+                Duration::from_secs(86_400)
+            } else {
+                ANALYSIS_POLL_INTERVAL
+            });
         let message = match connection.receiver.recv_timeout(timeout) {
             Ok(message) => message,
             Err(RecvTimeoutError::Timeout) => {
                 publish_due_diagnostics(connection, workspace)?;
                 continue;
             }
-            Err(RecvTimeoutError::Disconnected) => return Ok(true),
+            Err(RecvTimeoutError::Disconnected) => {
+                jobs.shutdown();
+                return Ok(true);
+            }
         };
 
         match message {
             Message::Request(request) if request.method == "shutdown" => {
+                jobs.shutdown();
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
             }
@@ -315,13 +631,26 @@ fn event_loop(
                         "request received after shutdown",
                     )?;
                 } else {
-                    handle_request(connection, workspace, request)?;
+                    handle_request(connection, workspace, request, client_features, &mut jobs)?;
                 }
             }
             Message::Notification(notification) if notification.method == "exit" => {
+                jobs.shutdown();
                 return Ok(shutdown_received);
             }
             Message::Notification(notification) => {
+                if notification.method == "$/cancelRequest" {
+                    if let Ok(id) = serde_json::from_value::<RequestId>(
+                        notification
+                            .params
+                            .get("id")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    ) {
+                        jobs.cancel(&id);
+                    }
+                    continue;
+                }
                 if let Err(error) = handle_notification(
                     connection,
                     workspace,
@@ -343,12 +672,108 @@ fn event_loop(
     }
 }
 
+fn start_analysis(
+    connection: &Connection,
+    workspace: &Workspace,
+    jobs: &mut AnalysisJobs,
+    id: RequestId,
+    request: AnalysisRequest,
+    features: ClientFeatures,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if let Err(error) = jobs.start(id.clone(), request, workspace, features) {
+        send_error(connection, id, ErrorCode::RequestFailed, error)?;
+    }
+    Ok(())
+}
+
 fn handle_request(
     connection: &Connection,
     workspace: &mut Workspace,
     request: Request,
+    client_features: ClientFeatures,
+    jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     match request.method.as_str() {
+        "textDocument/prepareRename" => {
+            let id = request.id.clone();
+            let params: PositionRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Prepare {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    position: params.position,
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/rename" => {
+            let id = request.id.clone();
+            let params: RenameRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Rename {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    position: params.position,
+                    new_name: params.new_name,
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/codeAction" => {
+            let id = request.id.clone();
+            let mut params: CodeActionParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            params.text_document.uri = canonical_file_uri(&params.text_document.uri);
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::CodeActions(params),
+                client_features,
+            )?;
+        }
+        "codeAction/resolve" => {
+            let id = request.id.clone();
+            let action: CodeAction = match parse_params(&request) {
+                Ok(action) => action,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Resolve(action),
+                client_features,
+            )?;
+        }
         "textDocument/declaration" | "textDocument/definition" | "textDocument/implementation" => {
             let id = request.id.clone();
             let params: GotoDefinitionParams = match parse_params(&request) {
@@ -589,31 +1014,54 @@ fn send_error(
     Ok(())
 }
 
-fn server_capabilities(client: &ClientCapabilities) -> ServerCapabilities {
-    let workspace =
-        supports_workspace_folders(client).then_some(lsp_types::WorkspaceServerCapabilities {
-            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
-                supported: Some(true),
-                change_notifications: Some(OneOf::Left(true)),
-            }),
-            ..Default::default()
+fn server_capabilities(client: &ClientCapabilities) -> Value {
+    let mut capabilities = serde_json::json!({
+        "positionEncoding": "utf-16",
+        "textDocumentSync": {
+            "openClose": true,
+            "change": 1,
+            "save": true
+        },
+        "declarationProvider": true,
+        "definitionProvider": true,
+        "implementationProvider": true,
+        "documentFormattingProvider": true,
+        "renameProvider": {"prepareProvider": true},
+        "codeActionProvider": {
+            "codeActionKinds": ["quickfix"],
+            "resolveProvider": true
+        }
+    });
+    if supports_workspace_folders(client) {
+        capabilities["workspace"] = serde_json::json!({
+            "workspaceFolders": {
+                "supported": true,
+                "changeNotifications": true
+            }
         });
-    ServerCapabilities {
-        position_encoding: Some(lsp_types::PositionEncodingKind::UTF16),
-        text_document_sync: Some(TextDocumentSyncCapability::Options(
-            TextDocumentSyncOptions {
-                open_close: Some(true),
-                change: Some(TextDocumentSyncKind::FULL),
-                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-                ..Default::default()
-            },
-        )),
-        declaration_provider: Some(DeclarationCapability::Simple(true)),
-        definition_provider: Some(OneOf::Left(true)),
-        implementation_provider: Some(lsp_types::ImplementationProviderCapability::Simple(true)),
-        document_formatting_provider: Some(OneOf::Left(true)),
-        workspace,
-        ..Default::default()
+    }
+    capabilities
+}
+
+fn client_features(client: &ClientCapabilities) -> ClientFeatures {
+    let value = serde_json::to_value(client).unwrap_or(Value::Null);
+    let code_action = &value["textDocument"]["codeAction"];
+    let action_resolve = code_action["dataSupport"].as_bool().unwrap_or(false)
+        && code_action["resolveSupport"]["properties"]
+            .as_array()
+            .is_some_and(|properties| {
+                properties
+                    .iter()
+                    .any(|property| property.as_str() == Some("edit"))
+            });
+    let action_disabled = code_action["disabledSupport"].as_bool().unwrap_or(false);
+    let document_changes = value["workspace"]["workspaceEdit"]["documentChanges"]
+        .as_bool()
+        .unwrap_or(false);
+    ClientFeatures {
+        action_resolve,
+        action_disabled,
+        document_changes,
     }
 }
 

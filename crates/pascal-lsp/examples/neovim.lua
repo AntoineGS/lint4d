@@ -24,6 +24,10 @@ vim.lsp.config('pascal_lsp', {
       { buffer = buffer, desc = 'Pascal: go to declaration' })
     vim.keymap.set('n', 'gi', vim.lsp.buf.implementation,
       { buffer = buffer, desc = 'Pascal: go to implementation' })
+    vim.keymap.set('n', 'grn', vim.lsp.buf.rename,
+      { buffer = buffer, desc = 'Pascal: rename symbol' })
+    vim.keymap.set({ 'n', 'x' }, 'gra', vim.lsp.buf.code_action,
+      { buffer = buffer, desc = 'Pascal: code actions' })
   end,
 })
 

@@ -1,6 +1,16 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, BufReader};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -13,6 +23,82 @@ use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationTarget, ProjectContext};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn inotify_init1(flags: i32) -> i32;
+    fn inotify_add_watch(fd: i32, pathname: *const std::os::raw::c_char, mask: u32) -> i32;
+    fn utimensat(
+        dirfd: i32,
+        pathname: *const std::os::raw::c_char,
+        times: *const Timespec,
+        flags: i32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+
+#[cfg(target_os = "linux")]
+const IN_OPEN: u32 = 0x0000_0020;
+
+#[cfg(target_os = "linux")]
+const AT_FDCWD: i32 = -100;
+
+#[cfg(target_os = "linux")]
+const UTIME_OMIT: i64 = 1_073_741_822;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_close_events(fd: i32, expected: usize) {
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut events = [0_u8; 4096];
+    let mut closes = 0;
+    while closes < expected {
+        let bytes = io::Read::read(&mut file, &mut events).expect("read inotify event");
+        assert!(bytes > 0, "inotify read must produce a close event");
+        let mut offset = 0;
+        while offset + 16 <= bytes {
+            let mask = u32::from_ne_bytes(
+                events[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("inotify mask bytes"),
+            );
+            let name_length = u32::from_ne_bytes(
+                events[offset + 12..offset + 16]
+                    .try_into()
+                    .expect("inotify name length bytes"),
+            ) as usize;
+            offset = offset.saturating_add(16).saturating_add(name_length);
+            if mask & IN_CLOSE_NOWRITE != 0 {
+                closes += 1;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
+    let pathname = CString::new(path.to_string_lossy().as_bytes()).expect("valid path");
+    let times = [
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        Timespec {
+            tv_sec: metadata.mtime(),
+            tv_nsec: metadata.mtime_nsec(),
+        },
+    ];
+    let result = unsafe { utimensat(AT_FDCWD, pathname.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(result, 0, "utimensat failed for {}", path.display());
+}
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -159,6 +245,28 @@ impl TestServer {
         initialization_options: Value,
         dynamic_watched_registration: bool,
     ) -> Value {
+        self.initialize_with_client_capabilities(
+            root,
+            initialization_options,
+            dynamic_watched_registration,
+            false,
+        )
+    }
+
+    fn initialize_with_action_support(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+    ) -> Value {
+        self.initialize_with_client_capabilities(root, initialization_options, false, true)
+    }
+
+    fn initialize_with_resolve_properties(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+        properties: Value,
+    ) -> Value {
         let root_uri = Url::from_file_path(root).expect("workspace URI");
         let id = RequestId::from("initialize".to_string());
         self.send_request(
@@ -175,11 +283,98 @@ impl TestServer {
                         "formatting": {"dynamicRegistration": false},
                         "declaration": {"dynamicRegistration": false},
                         "definition": {"dynamicRegistration": false},
-                        "implementation": {"dynamicRegistration": false}
+                        "implementation": {"dynamicRegistration": false},
+                        "codeAction": {
+                            "dynamicRegistration": false,
+                            "dataSupport": true,
+                            "disabledSupport": true,
+                            "resolveSupport": {"properties": properties}
+                        }
                     },
                     "workspace": {
                         "workspaceFolders": true,
-                        "didChangeWatchedFiles": {"dynamicRegistration": dynamic_watched_registration}
+                        "workspaceEdit": {"documentChanges": true}
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    fn initialize_without_document_changes(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+    ) -> Value {
+        self.initialize_with_client_capabilities_and_document_changes(
+            root,
+            initialization_options,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn initialize_with_client_capabilities(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+        dynamic_watched_registration: bool,
+        action_support: bool,
+    ) -> Value {
+        self.initialize_with_client_capabilities_and_document_changes(
+            root,
+            initialization_options,
+            dynamic_watched_registration,
+            action_support,
+            true,
+        )
+    }
+
+    fn initialize_with_client_capabilities_and_document_changes(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+        dynamic_watched_registration: bool,
+        action_support: bool,
+        document_changes: bool,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("initialize".to_string());
+        let code_action_capabilities = if action_support {
+            json!({
+                "dynamicRegistration": false,
+                "dataSupport": true,
+                "disabledSupport": true,
+                "resolveSupport": {"properties": ["edit"]}
+            })
+        } else {
+            json!({})
+        };
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": initialization_options,
+                "capabilities": {
+                    "general": {"positionEncodings": ["utf-16"]},
+                    "textDocument": {
+                        "synchronization": {"dynamicRegistration": false, "didSave": true},
+                        "formatting": {"dynamicRegistration": false},
+                        "declaration": {"dynamicRegistration": false},
+                        "definition": {"dynamicRegistration": false},
+                        "implementation": {"dynamicRegistration": false},
+                        "codeAction": code_action_capabilities
+                    },
+                    "workspace": {
+                        "workspaceFolders": true,
+                        "didChangeWatchedFiles": {"dynamicRegistration": dynamic_watched_registration},
+                        "workspaceEdit": {"documentChanges": document_changes}
                     }
                 }
             }),
@@ -261,6 +456,19 @@ fn write_file(path: &Path, source: &str) {
         fs::create_dir_all(parent).expect("create source directory");
     }
     fs::write(path, source).expect("write Pascal source");
+}
+
+fn workspace_edit_uris(edit: &Value) -> HashSet<String> {
+    if let Some(changes) = edit["documentChanges"].as_array() {
+        return changes
+            .iter()
+            .filter_map(|change| change["textDocument"]["uri"].as_str().map(str::to_owned))
+            .collect();
+    }
+    edit["changes"]
+        .as_object()
+        .map(|changes| changes.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn standard_workspace() -> (TempDir, PathBuf, PathBuf, String, String) {
@@ -2314,4 +2522,2028 @@ fn bounded_package_catalogue_finds_late_packages_and_rejects_late_duplicates() {
             .iter()
             .any(|warning| warning.contains("ambiguous package shared"))
     );
+}
+
+#[test]
+fn rename_capabilities_and_unopened_consumer_are_supported() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  kSQLDebugFile = 'debug.sql';\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(kSQLDebugFile);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(&root, Value::Null);
+    let capabilities = &initialize["capabilities"];
+    assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
+    assert_eq!(capabilities["codeActionProvider"]["resolveProvider"], true);
+    assert!(
+        capabilities["codeActionProvider"]["codeActionKinds"]
+            .as_array()
+            .expect("code action kinds")
+            .iter()
+            .any(|kind| kind == "quickfix")
+    );
+
+    let rename_id = RequestId::from("rename-unopened-consumer".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": {"line": 3, "character": 14},
+            "newName": "K_SQL_DEBUG_FILE"
+        }),
+    );
+    let response = server.response(&rename_id);
+    assert!(response.error.is_none(), "rename failed: {response:?}");
+    let result = response.result.expect("rename result");
+    assert!(
+        result["documentChanges"]
+            .as_array()
+            .expect("document changes")
+            .len()
+            >= 2
+    );
+    assert_eq!(
+        fs::read_to_string(&provider).expect("provider remains unchanged"),
+        provider_source
+    );
+    assert_eq!(
+        fs::read_to_string(&consumer).expect("consumer remains unchanged"),
+        consumer_source
+    );
+    server.shutdown();
+}
+
+#[test]
+fn unicode_shadow_recovery_refuses_explicit_eager_and_resolved_partial_edits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nvar badConsté: Integer;\nbegin\n  badConsté := 2;\n  WriteLn(badConst);\n  WriteLn(badConsté);\nend;\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    let selected = position_of(provider_source, "badConst", 0);
+    let diagnostic_end = Position::new(selected.line, selected.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let rename_id = RequestId::from("unicode-shadow-explicit".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": selected,
+            "newName": "BAD_CONST"
+        }),
+    );
+    let rename_response = server.response(&rename_id);
+    assert!(
+        rename_response.error.is_some(),
+        "explicit rename must refuse the recovered Unicode shadow"
+    );
+    server.shutdown();
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let eager_id = RequestId::from("unicode-shadow-eager".to_string());
+    server.send_request(
+        eager_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "range": {"start": selected, "end": diagnostic_end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": selected, "end": diagnostic_end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let eager_response = server.response(&eager_id);
+    assert!(
+        eager_response.error.is_none(),
+        "eager codeAction failed: {eager_response:?}"
+    );
+    assert_eq!(eager_response.result.expect("eager actions"), json!([]));
+    server.shutdown();
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions_id = RequestId::from("unicode-shadow-resolved-actions".to_string());
+    server.send_request(
+        actions_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "range": {"start": selected, "end": diagnostic_end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": selected, "end": diagnostic_end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let actions_response = server.response(&actions_id);
+    assert!(
+        actions_response.error.is_none(),
+        "resolved codeAction discovery failed: {actions_response:?}"
+    );
+    let actions = actions_response.result.expect("resolved actions");
+    assert_eq!(actions.as_array().expect("action array").len(), 1);
+    assert!(actions[0]["edit"].is_null());
+
+    let resolve_id = RequestId::from("unicode-shadow-resolved".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let resolved_response = server.response(&resolve_id);
+    assert!(
+        resolved_response.error.is_none(),
+        "resolved codeAction request failed instead of returning a disabled action: {resolved_response:?}"
+    );
+    let resolved_action = resolved_response.result.expect("resolved action");
+    assert!(resolved_action["edit"].is_null());
+    assert!(
+        resolved_action["disabled"]["reason"]
+            .as_str()
+            .expect("disabled reason")
+            .contains("parser recovery")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn unopened_utf16le_and_utf16be_consumers_never_produce_partial_renames() {
+    let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  WriteLn(badConst);\nend;\nend.\n";
+
+    for (label, little_endian) in [("le", true), ("be", false)] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        write_file(&provider, provider_source);
+
+        let mut encoded = if little_endian {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for code_unit in consumer_source.encode_utf16() {
+            let bytes = if little_endian {
+                code_unit.to_le_bytes()
+            } else {
+                code_unit.to_be_bytes()
+            };
+            encoded.extend_from_slice(&bytes);
+        }
+        fs::write(&consumer, encoded).expect("write UTF-16 consumer");
+
+        let mut server = TestServer::launch();
+        server.initialize(&root, Value::Null);
+        let request_id = RequestId::from(format!("utf16-{label}-rename"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/rename",
+            json!({
+                "textDocument": {"uri": uri(&provider)},
+                "position": position_of(provider_source, "badConst", 0),
+                "newName": "BAD_CONST"
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_some(),
+            "UTF-16 {label} consumer must cause an explicit no-edit refusal: {response:?}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn prepare_rename_returns_the_original_utf16_identifier_range() {
+    let (_temp, main, provider, _main_source, provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root");
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let request_id = RequestId::from("prepare-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/prepareRename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(&provider_source, "PublicRoutine", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "prepareRename failed: {response:?}"
+    );
+    let result = response.result.expect("prepare result");
+    assert_eq!(result["start"], json!({"line": 2, "character": 10}));
+    assert_eq!(result["end"], json!({"line": 2, "character": 23}));
+    server.shutdown();
+}
+
+#[test]
+fn rename_returns_versioned_open_and_null_version_closed_document_edits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  kSQLDebugFile = 'debug.sql';\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(kSQLDebugFile);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&provider), "languageId": "pascal", "version": 7, "text": provider_source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let request_id = RequestId::from("versioned-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": {"line": 3, "character": 14},
+            "newName": "K_SQL_DEBUG_FILE"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "rename failed: {response:?}");
+    let result = response.result.expect("rename result");
+    let changes = result["documentChanges"]
+        .as_array()
+        .expect("document changes");
+    let provider_change = changes
+        .iter()
+        .find(|change| change["textDocument"]["uri"] == uri(&provider).to_string())
+        .expect("open provider edit");
+    assert_eq!(provider_change["textDocument"]["version"], 7);
+    let consumer_change = changes
+        .iter()
+        .find(|change| change["textDocument"]["uri"] == uri(&consumer).to_string())
+        .expect("closed consumer edit");
+    assert!(consumer_change["textDocument"]["version"].is_null());
+    assert_eq!(
+        fs::read_to_string(&provider).expect("provider remains unchanged"),
+        provider_source
+    );
+    assert_eq!(
+        fs::read_to_string(&consumer).expect("consumer remains unchanged"),
+        consumer_source
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_revalidates_a_single_constant_diagnostic_and_eagerly_shares_rename_edits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+
+    let diagnostic_start = position_of(source, "badConst", 0);
+    let diagnostic_end = Position::new(diagnostic_start.line, diagnostic_start.character + 8);
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("constant-code-action".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": diagnostic_start, "end": diagnostic_end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": diagnostic_start, "end": diagnostic_end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "client text is intentionally not trusted"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let actions = response.result.expect("code action result");
+    assert_eq!(actions.as_array().expect("actions").len(), 1);
+    let action = &actions[0];
+    assert_eq!(action["title"], "Rename 'badConst' to 'BAD_CONST'");
+    assert_eq!(action["kind"], "quickfix");
+    assert!(
+        action["edit"].is_object(),
+        "old clients receive eager edits: {action}"
+    );
+    assert!(
+        action["data"].is_object(),
+        "action identity is opaque and bounded: {action}"
+    );
+
+    let rename_id = RequestId::from("constant-code-action-equivalence".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": diagnostic_start,
+            "newName": "BAD_CONST"
+        }),
+    );
+    let rename_response = server.response(&rename_id);
+    assert!(
+        rename_response.error.is_none(),
+        "explicit rename failed: {rename_response:?}"
+    );
+    assert_eq!(
+        action["edit"],
+        rename_response.result.expect("explicit rename result"),
+        "naming quick-fix and explicit rename must share the edit planner"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_resolve_rechecks_identity_and_rejects_stale_source_actions() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let action_id = RequestId::from("unresolved-constant-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "ignored by the server"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let action_response = server.response(&action_id);
+    assert!(
+        action_response.error.is_none(),
+        "codeAction failed: {action_response:?}"
+    );
+    let action = action_response.result.expect("actions")[0].clone();
+    assert!(action["edit"].is_null());
+    assert!(action["data"].is_object());
+    for field in [
+        "sourceGeneration",
+        "configurationGeneration",
+        "configFingerprint",
+        "sourceHash",
+    ] {
+        assert!(
+            action["data"][field].is_string(),
+            "code-action {field} must survive JavaScript/Lua number round trips: {action}"
+        );
+    }
+
+    let resolve_id = RequestId::from("resolve-constant-action".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action.clone());
+    let resolved = server.response(&resolve_id);
+    assert!(resolved.error.is_none(), "resolve failed: {resolved:?}");
+    let resolved_action = resolved.result.expect("resolved action");
+    assert!(resolved_action["edit"].is_object());
+    assert_eq!(resolved_action["title"], action["title"]);
+    assert_eq!(resolved_action["data"], action["data"]);
+
+    let mut tampered = action.clone();
+    tampered["data"]["newName"] = json!("EVIL_NAME");
+    let tampered_id = RequestId::from("tampered-constant-action".to_string());
+    server.send_request(tampered_id.clone(), "codeAction/resolve", tampered);
+    assert!(server.response(&tampered_id).error.is_some());
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let stale_id = RequestId::from("stale-constant-action".to_string());
+    server.send_request(stale_id.clone(), "codeAction/resolve", action);
+    let stale = server.response(&stale_id);
+    assert!(
+        stale.error.is_some(),
+        "stale resolve must not produce edits: {stale:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_resolve_rejects_closed_source_changes_without_a_generation_event() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let action_id = RequestId::from("closed-source-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let action_response = server.response(&action_id);
+    assert!(
+        action_response.error.is_none(),
+        "codeAction failed: {action_response:?}"
+    );
+    let action = action_response.result.expect("actions")[0].clone();
+    assert!(action["edit"].is_null());
+
+    write_file(
+        &main,
+        &source.replace("Log(badConst)", "Log(badConst);\n  Log(1)"),
+    );
+    let resolve_id = RequestId::from("closed-source-action-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_some(),
+        "resolve must reject a changed closed source without a generation event: {resolved:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_offers_local_variable_fix_using_the_configured_conversion() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Use;\nvar\n  BadVariable: Integer;\nbegin\n  BadVariable := 1;\nend;\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nlocal_variable_style = \"camelCase\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "BadVariable", 0);
+    let end = Position::new(start.line, start.character + 11);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("local-code-action".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 4,
+                    "code": "local-variable-naming",
+                    "message": "old client wording"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "local codeAction failed: {response:?}"
+    );
+    let actions = response.result.expect("local actions");
+    assert_eq!(actions.as_array().expect("actions").len(), 1);
+    assert_eq!(actions[0]["title"], "Rename 'BadVariable' to 'badVariable'");
+    assert!(actions[0]["edit"].is_object());
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_honor_requested_kind_filter() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("refactor-only-code-actions".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [],
+                "only": ["refactor"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    assert_eq!(response.result.expect("code actions"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_or_returns_the_complete_edit_set_after_dependency_eviction() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let external = temp.path().join("external");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let d = root.join("D.pas");
+    let a = root.join("A.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    let d_source = "unit D;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    let a_source = "unit A;\ninterface\nuses Extra;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&d, d_source);
+    write_file(&a, a_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><DCC_UnitSearchPath>../external</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &external.join("Extra.pas"),
+        "unit Extra;\ninterface\nimplementation\nend.\n",
+    );
+
+    let expected: HashSet<String> = [uri(&provider), uri(&consumer), uri(&d)]
+        .into_iter()
+        .map(|uri| uri.to_string())
+        .collect();
+    for attempt in 0..5 {
+        let mut server = TestServer::launch();
+        server.initialize(&root, json!({"maxFiles": 4}));
+        let request_id = RequestId::from(format!("dependency-eviction-{attempt}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/rename",
+            json!({
+                "textDocument": {"uri": uri(&provider)},
+                "position": position_of(provider_source, "badConst", 0),
+                "newName": "BAD_CONST"
+            }),
+        );
+        let response = server.response(&request_id);
+        if let Some(error) = response.error {
+            assert_eq!(
+                error.code, -32803,
+                "unexpected dependency failure: {error:?}"
+            );
+        } else {
+            let edit = response.result.expect("rename result");
+            assert_eq!(
+                workspace_edit_uris(&edit),
+                expected,
+                "a successful rename must include every reverse consumer"
+            );
+        }
+        server.shutdown();
+    }
+}
+
+#[test]
+fn local_rename_does_not_use_the_workspace_retained_file_cap_for_unrelated_sources() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run;\nvar\n  BadVariable: Integer;\nbegin\n  BadVariable := 1;\nend;\nend.\n";
+    write_file(&main, source);
+    for index in 0..40 {
+        write_file(
+            &root.join(format!("Noise{index:02}.pas")),
+            &format!("unit Noise{index:02};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+    write_file(&root.join("Malformed.pas"), "not a Pascal source; ???\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFiles": 1}));
+    let request_id = RequestId::from("local-rename-retained-cap".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "BadVariable", 0),
+            "newName": "badVariable"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "a local rename must not scan unrelated sources into its retained budget: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("local rename result")),
+        HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_does_not_silently_omit_include_only_consumers() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let body = root.join("Body.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Provider;\nimplementation\n{$I Body.inc}\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&body, "procedure Use;\nbegin\n  Log(badConst);\nend;\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("include-only-consumer-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("an unsupported source-bearing include must not be omitted");
+    assert!(
+        error.message.to_ascii_lowercase().contains("include"),
+        "unexpected include error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_applies_retained_limits_only_to_relevant_sources() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    for index in 0..80 {
+        write_file(
+            &root.join(format!("Noise{index:02}.pas")),
+            &format!("unit Noise{index:02};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFiles": 2}));
+    let request_id = RequestId::from("public-rename-retained-cap".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "unrelated sources must not consume the retained source budget: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("public rename result")),
+        HashSet::from([uri(&provider).to_string(), uri(&consumer).to_string()])
+    );
+    server.shutdown();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn public_rename_never_deduplicates_case_distinct_linux_source_paths() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let filename_upper = root.join("Consumer.pas");
+    let filename_lower = root.join("consumer.pas");
+    let directory_upper = root.join("Lib").join("Consumer.pas");
+    let directory_lower = root.join("lib").join("Consumer.pas");
+    let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  WriteLn(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    for path in [
+        &filename_upper,
+        &filename_lower,
+        &directory_upper,
+        &directory_lower,
+    ] {
+        write_file(path, consumer_source);
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("case-distinct-path-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    if let Some(error) = response.error {
+        let message = error.message.to_ascii_lowercase();
+        assert!(
+            message.contains("case")
+                || message.contains("collision")
+                || message.contains("ambiguous"),
+            "case-collision refusal must explain the ambiguity: {error:?}"
+        );
+    } else {
+        assert_eq!(
+            workspace_edit_uris(&response.result.expect("rename result")),
+            HashSet::from([
+                uri(&provider).to_string(),
+                uri(&filename_upper).to_string(),
+                uri(&filename_lower).to_string(),
+                uri(&directory_upper).to_string(),
+                uri(&directory_lower).to_string(),
+            ])
+        );
+    }
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_revalidates_every_scanned_source_before_returning_edits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let original_consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(0);\nend;\nend.\n";
+    let changed_consumer_source = original_consumer_source.replace("Log(0)", "Log(badConst)");
+    write_file(&provider, provider_source);
+    write_file(&consumer, original_consumer_source);
+    for index in 0..400 {
+        write_file(
+            &root.join(format!("Noise{index:04}.pas")),
+            &format!("unit Noise{index:04};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+
+    let watch_path = CString::new(consumer.to_string_lossy().as_bytes()).expect("watch path");
+    let fd = unsafe { inotify_init1(0) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
+    assert!(watch >= 0, "inotify_add_watch failed");
+    let consumer_for_watcher = consumer.clone();
+    let watcher = thread::spawn(move || {
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut events = [0_u8; 4096];
+        let bytes = std::io::Read::read(&mut file, &mut events).expect("read inotify event");
+        assert!(bytes > 0, "consumer read must produce a close event");
+        write_file(&consumer_for_watcher, &changed_consumer_source);
+    });
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("read-set-race-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    watcher.join().expect("watcher must finish");
+    let error = response
+        .error
+        .expect("a scanned source changed before the result and must invalidate the rename");
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_rejects_a_target_source_change_after_scope_classification() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let local_source = format!(
+        "unit Provider;\ninterface\nimplementation procedure Use;\nvar   badConst: Integer;\nbegin badConst := 1; end;\nend.\n{{{}}}\n",
+        "x".repeat(400_000)
+    );
+    let public_source = "unit Provider;\ninterface\n\nconst badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, &local_source);
+    write_file(&consumer, consumer_source);
+
+    let watch_path = CString::new(provider.to_string_lossy().as_bytes()).expect("watch path");
+    let fd = unsafe { inotify_init1(0) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
+    assert!(watch >= 0, "inotify_add_watch failed");
+    let provider_for_watcher = provider.clone();
+    let public_for_watcher = public_source.to_owned();
+    let watcher = thread::spawn(move || {
+        wait_for_close_events(fd, 2);
+        write_file(&provider_for_watcher, &public_for_watcher);
+    });
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("scope-classification-race".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(&local_source, "badConst", 0),
+            "newName": "RENAMED_CONST"
+        }),
+    );
+    watcher.join().expect("scope race watcher must finish");
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("a source change after classification must invalidate the rename");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.to_ascii_lowercase().contains("changed")
+            || error.message.to_ascii_lowercase().contains("stale"),
+        "unexpected scope race error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_revalidates_filtered_source_content_with_equal_metadata() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let original_consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(00000000);\nend;\nend.\n";
+    let changed_consumer_source =
+        original_consumer_source.replace("Log(00000000)", "Log(badConst)");
+    write_file(&provider, provider_source);
+    write_file(&consumer, original_consumer_source);
+    for index in 0..600 {
+        write_file(
+            &root.join(format!("Noise{index:04}.pas")),
+            &format!("unit Noise{index:04};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+    let original_metadata = fs::metadata(&consumer).expect("consumer metadata");
+
+    let watch_path = CString::new(consumer.to_string_lossy().as_bytes()).expect("watch path");
+    let fd = unsafe { inotify_init1(0) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
+    assert!(watch >= 0, "inotify_add_watch failed");
+    let consumer_for_watcher = consumer.clone();
+    let changed_for_watcher = changed_consumer_source.clone();
+    let watcher = thread::spawn(move || {
+        wait_for_close_events(fd, 1);
+        write_file(&consumer_for_watcher, &changed_for_watcher);
+        restore_mtime(&consumer_for_watcher, &original_metadata);
+    });
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("equal-metadata-content-race".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    watcher.join().expect("equal-metadata watcher must finish");
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("filtered source content changes must invalidate the rename");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.to_ascii_lowercase().contains("changed")
+            || error.message.to_ascii_lowercase().contains("metadata"),
+        "unexpected equal-metadata error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_revalidates_project_metadata_from_the_pre_read_baseline() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let watched_source = root.join("Noise0000.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    for index in 0..400 {
+        write_file(
+            &root.join(format!("Noise{index:04}.pas")),
+            &format!("unit Noise{index:04};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+    let project = root.join("App.dproj");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><DCC_UnitAlias>Provider=Provider</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+
+    let watch_path = CString::new(watched_source.to_string_lossy().as_bytes()).expect("watch path");
+    let fd = unsafe { inotify_init1(0) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
+    assert!(watch >= 0, "inotify_add_watch failed");
+    let project_for_watcher = project.clone();
+    let watcher = thread::spawn(move || {
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut events = [0_u8; 4096];
+        let bytes = std::io::Read::read(&mut file, &mut events).expect("read inotify event");
+        assert!(bytes > 0, "noise read must produce a close event");
+        write_file(
+            &project_for_watcher,
+            "<Project><PropertyGroup><DCC_UnitAlias>Provider=Other</DCC_UnitAlias></PropertyGroup></Project>",
+        );
+    });
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("metadata-baseline-race".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    watcher.join().expect("metadata watcher must finish");
+    let error = response
+        .error
+        .expect("metadata changed after the baseline and must invalidate the rename");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.to_ascii_lowercase().contains("metadata")
+            || error.message.to_ascii_lowercase().contains("changed")
+            || error.message.to_ascii_lowercase().contains("stale"),
+        "unexpected metadata race error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_normalizes_percent_encoded_file_uris_before_snapshot_lookup() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("root@encoded");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("percent-encoded-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "encoded file URI must resolve: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("encoded rename result")),
+        HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_resolve_normalizes_percent_encoded_file_uris() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("root@encoded");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+    let request_id = RequestId::from("encoded-code-action".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let action = response.result.expect("encoded code action")[0].clone();
+    assert!(action["edit"].is_null());
+
+    let resolve_id = RequestId::from("encoded-code-action-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "codeAction resolve failed: {resolved:?}"
+    );
+    assert!(resolved.result.expect("resolved action")["edit"].is_object());
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_ambiguous_project_selection_instead_of_using_standalone_bindings() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let other = root.join("Other.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let other_source = "unit Other;\ninterface\nconst\n  badConst = 2;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&other, other_source);
+    write_file(&consumer, consumer_source);
+    for name in ["A.dproj", "B.dproj"] {
+        write_file(
+            &root.join(name),
+            "<Project><PropertyGroup><DCC_UnitAlias>Provider=Other</DCC_UnitAlias></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("ambiguous-project-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("ambiguous project selection must fail closed");
+    assert!(
+        error.message.to_ascii_lowercase().contains("ambiguous")
+            || error.message.to_ascii_lowercase().contains("incomplete"),
+        "unexpected error: {}",
+        error.message
+    );
+    server.shutdown();
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "A.dproj"}));
+    let request_id = RequestId::from("explicit-project-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "explicit project must resolve: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("explicit project rename result")),
+        HashSet::from([uri(&provider).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_an_unsaved_reverse_consumer_that_was_rejected_by_limits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFileBytes": 128}));
+    let rejected_source = format!("{consumer_source}{}", "x".repeat(128));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&consumer),
+                "languageId": "pascal",
+                "version": 1,
+                "text": rejected_source
+            }
+        }),
+    );
+    let rejection = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        rejection["diagnostics"][0]["message"]
+            .as_str()
+            .expect("rejection diagnostic")
+            .contains("per-file limit")
+    );
+
+    let request_id = RequestId::from("rejected-unsaved-consumer-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("rejected unsaved consumer must prevent a partial rename");
+    assert!(
+        error.message.to_ascii_lowercase().contains("rejected")
+            || error.message.to_ascii_lowercase().contains("incomplete"),
+        "unexpected error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_prunes_excluded_subtrees_before_traversal_and_source_budgets() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let ignored = root.join("ignored");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &ignored.join("Nested.pas"),
+        "unit Nested;\ninterface\nimplementation\nend.\n",
+    );
+    let mut permissions = fs::metadata(&ignored)
+        .expect("ignored directory metadata")
+        .permissions();
+    permissions.set_mode(0o0);
+    fs::set_permissions(&ignored, permissions).expect("make excluded directory unreadable");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"exclude": ["ignored"], "maxFiles": 1}));
+    let request_id = RequestId::from("excluded-subtree-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let mut restore = fs::metadata(&ignored)
+        .expect("ignored directory metadata")
+        .permissions();
+    restore.set_mode(0o755);
+    fs::set_permissions(&ignored, restore).expect("restore excluded directory permissions");
+    assert!(
+        response.error.is_none(),
+        "excluded unreadable subtree must not make the retained source incomplete: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_scans_beyond_the_retained_file_budget() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    fs::create_dir_all(&root).expect("create workspace root");
+    for index in 0..5_000 {
+        fs::write(
+            root.join(format!("unrelated-{index:04}.txt")),
+            "not a Pascal source",
+        )
+        .expect("write unrelated entry");
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFiles": 1}));
+    let request_id = RequestId::from("bounded-traversal-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "unrelated traversal entries must not consume the retained file budget: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("rename result")),
+        HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_eagerly_include_edits_unless_edit_resolution_is_advertised() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    for (label, properties, expect_eager) in [
+        ("empty", json!([]), true),
+        ("other", json!(["command"]), true),
+        ("edit", json!(["edit"]), false),
+    ] {
+        let mut server = TestServer::launch();
+        server.initialize_with_resolve_properties(&root, Value::Null, properties);
+        let request_id = RequestId::from(format!("resolve-properties-{label}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(&main)},
+                "range": {"start": start, "end": end},
+                "context": {
+                    "diagnostics": [{
+                        "range": {"start": start, "end": end},
+                        "severity": 4,
+                        "code": "constant-naming",
+                        "source": "lint4d",
+                        "message": "naming violation"
+                    }],
+                    "only": ["quickfix"]
+                }
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "codeAction failed: {response:?}");
+        let action = &response.result.expect("actions")[0];
+        assert_eq!(
+            action["edit"].is_object(),
+            expect_eager,
+            "resolve properties {label} must negotiate edit ownership"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn rename_allows_harmless_compiler_directive_includes_and_unrelated_conditionals() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let include = root.join("BuildDirectives.inc");
+    let source = "unit Main;\ninterface\n{$I BuildDirectives.inc}\nconst\n  badConst = 1;\n{$IFDEF FEATURE}\nconst\n  unrelatedValue = 2;\n{$ENDIF}\nimplementation\nend.\n";
+    write_file(&include, "{$DEFINE FEATURE}\n{$METHODINFO ON}\n");
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("harmless-directives-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "harmless directives must not blanket-reject rename: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("rename result")),
+        HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn prepare_rename_rejects_an_unresolved_include_before_returning_a_range() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\n{$I MissingGenerated.inc}\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("unresolved-include-prepare".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/prepareRename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("prepareRename must reject an unresolved include");
+    assert!(
+        error.message.to_ascii_lowercase().contains("include"),
+        "unexpected error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_refuses_sources_with_potentially_relevant_includes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\n{$I Generated.inc}\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response.error.expect("include-sensitive rename must fail");
+    assert!(error.message.to_ascii_lowercase().contains("include"));
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_rejects_an_unresolved_include_in_a_consumer() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  {$I MissingBody.inc}\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("unresolved-consumer-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("unresolved consumer include must fail closed");
+    assert!(
+        error.message.to_ascii_lowercase().contains("include"),
+        "unexpected error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_refuses_sources_with_conditional_compilation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nprocedure Use;\nbegin\n{$IFDEF FEATURE}\n  Log(badConst);\n{$ENDIF}\nend;\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("conditional-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("conditional rename must fail conservatively");
+    assert!(
+        error.message.to_ascii_lowercase().contains("conditional"),
+        "unexpected error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_rejects_a_symlink_that_escapes_the_workspace_root() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let outside = temp.path().join("outside.pas");
+    let link = root.join("Linked.pas");
+    let source = "unit Outside;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&outside, source);
+    fs::create_dir_all(&root).expect("create workspace root");
+    symlink(&outside, &link).expect("create source symlink");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("symlink-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&link)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response.error.expect("symlink escape must fail");
+    assert!(
+        error.message.to_ascii_lowercase().contains("workspace"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert_eq!(
+        fs::read_to_string(&outside).expect("outside source remains"),
+        source
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_does_not_fall_back_to_disk_for_a_rejected_open_document() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let disk_source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, disk_source);
+    let oversized_overlay = format!("{disk_source}{}", "x".repeat(100));
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFileBytes": 128}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": oversized_overlay
+            }
+        }),
+    );
+    let rejection = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        rejection["diagnostics"][0]["message"]
+            .as_str()
+            .expect("rejection diagnostic")
+            .contains("per-file limit")
+    );
+
+    let request_id = RequestId::from("rejected-overlay-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(disk_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some(),
+        "rejected overlay must not use disk fallback"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_a_target_in_an_external_source_path() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let external = temp.path().join("external");
+    let provider = external.join("Provider.pas");
+    let source = "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    fs::create_dir_all(&root).expect("create workspace root");
+    write_file(&provider, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"sourcePaths": [external]}));
+    let request_id = RequestId::from("external-source-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response.error.expect("external source rename must fail");
+    assert!(
+        error.message.to_ascii_lowercase().contains("workspace"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert_eq!(
+        fs::read_to_string(&provider).expect("external source remains"),
+        source
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_refuses_a_workspace_with_an_unresolved_import_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses MissingUnit, Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("unresolved-import-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response.error.expect("unresolved import must fail");
+    assert!(error.message.to_ascii_lowercase().contains("incomplete"));
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_respect_naming_suppressions() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n// lint4d:ignore constant-naming\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("suppressed-code-action".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    assert_eq!(response.result.expect("code actions"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_respect_disabled_naming_rules() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules]\n\"constant-naming\" = \"off\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("disabled-code-action".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    assert_eq!(response.result.expect("code actions"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn code_action_resolve_rejects_stale_configuration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let action_id = RequestId::from("stale-config-actions".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let action_response = server.response(&action_id);
+    assert!(
+        action_response.error.is_none(),
+        "codeAction failed: {action_response:?}"
+    );
+    let action = action_response.result.expect("actions")[0].clone();
+
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let resolve_id = RequestId::from("stale-config-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let response = server.response(&resolve_id);
+    assert!(response.error.is_some(), "stale config must reject resolve");
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_defer_incomplete_workspace_explanation_until_resolve() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let other = root.join("Other.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let other_source = "unit Other;\ninterface\nuses Main;\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(&other, other_source);
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, json!({"maxFiles": 1}));
+    let request_id = RequestId::from("incomplete-code-actions".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let actions = response.result.expect("actions");
+    assert_eq!(actions.as_array().expect("action array").len(), 1);
+    assert!(actions[0]["edit"].is_null());
+    assert!(actions[0]["disabled"].is_null());
+    let resolve_id = RequestId::from("incomplete-code-action-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let resolved = server.response(&resolve_id);
+    assert!(resolved.error.is_none(), "resolve failed: {resolved:?}");
+    assert!(
+        resolved.result.expect("resolved action")["disabled"]["reason"]
+            .as_str()
+            .expect("disabled action reason")
+            .contains("incomplete")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_uses_legacy_changes_for_clients_without_document_changes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let request_id = RequestId::from("legacy-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "rename failed: {response:?}");
+    let result = response.result.expect("rename result");
+    assert!(result["changes"].is_object());
+    assert!(result["documentChanges"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn rename_cancellation_returns_the_standard_request_canceled_error() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    for index in 0..2_000 {
+        write_file(
+            &root.join(format!("Noise{index:04}.pas")),
+            &format!("unit Noise{index:04};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("cancelled-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": "cancelled-rename"}));
+    let response = server.response(&request_id);
+    let error = response.error.expect("cancelled rename must fail");
+    assert_eq!(error.code, -32800);
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_cancellation_during_final_content_hash_returns_request_canceled() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let noise = root.join("Noise.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &noise,
+        &format!(
+            "unit Noise;\ninterface\nimplementation\n//{}\nend.\n",
+            "x".repeat(15 * 1024 * 1024)
+        ),
+    );
+
+    let watch_path = CString::new(noise.to_string_lossy().as_bytes()).expect("watch path");
+    let fd = unsafe { inotify_init1(0) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_OPEN) };
+    assert!(watch >= 0, "inotify_add_watch failed");
+    let (hash_started, hash_started_receiver) = mpsc::channel();
+    let watcher = thread::spawn(move || {
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut events = [0_u8; 4096];
+        let mut opens = 0;
+        while opens < 2 {
+            let bytes = std::io::Read::read(&mut file, &mut events).expect("read inotify event");
+            assert!(bytes > 0, "noise read must produce an open event");
+            let mut offset = 0;
+            while offset + 16 <= bytes {
+                let mask = u32::from_ne_bytes(
+                    events[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("inotify mask bytes"),
+                );
+                let name_length = u32::from_ne_bytes(
+                    events[offset + 12..offset + 16]
+                        .try_into()
+                        .expect("inotify name length bytes"),
+                ) as usize;
+                offset = offset.saturating_add(16).saturating_add(name_length);
+                if mask & IN_OPEN != 0 {
+                    opens += 1;
+                }
+            }
+        }
+        hash_started.send(()).expect("notify final hash start");
+    });
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("cancel-during-final-content-hash".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    hash_started_receiver
+        .recv_timeout(IO_TIMEOUT)
+        .expect("final content hash must start");
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "cancel-during-final-content-hash"}),
+    );
+    let response = server.response(&request_id);
+    watcher.join().expect("watcher must finish");
+    let error = response.error.expect("cancelled rename must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
 }

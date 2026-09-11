@@ -1,10 +1,14 @@
 use crate::text;
 use lsp_types::{Location, Position, Range, Url};
+use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::{FileInfo, parser};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use tree_sitter::{Node, Tree};
+
+mod rename;
+pub(crate) use rename::RenameBindingInfo;
 
 /// The navigation operation requested by an LSP client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +89,12 @@ impl NavigationIndex {
             .unwrap_or_default()
     }
 
+    pub(crate) fn source_text(&self, uri: &Url) -> Option<&str> {
+        self.documents
+            .get(uri)
+            .map(|document| document.source.as_str())
+    }
+
     /// Bind a document's imports to the workspace-selected unit documents.
     ///
     /// Supplying an empty iterator is intentional: once a workspace owns an
@@ -153,8 +163,20 @@ impl NavigationIndex {
             return Vec::new();
         };
 
+        let references = self.resolve_candidates_at(uri, document, offset, identifier);
+
+        self.locations_for(self.expand_property_candidates(references, target), target)
+    }
+
+    fn resolve_candidates_at(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+    ) -> Vec<Candidate> {
         let name = node_text(identifier, &document.source);
-        let references = if let Some(unit_name) = use_name_at(identifier, &document.source) {
+        if let Some(unit_name) = use_name_at(identifier, &document.source) {
             self.unit_references(document, &unit_name)
         } else if let Some(direct) = self.direct_symbol_references(uri, identifier) {
             direct
@@ -170,9 +192,7 @@ impl NavigationIndex {
             }
         } else {
             self.unqualified_references(uri, document, offset, &name)
-        };
-
-        self.locations_for(self.expand_property_candidates(references, target), target)
+        }
     }
 
     fn type_reference_candidates(
@@ -1166,20 +1186,20 @@ impl NavigationIndex {
 
 const ROOT_SCOPE: usize = 0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Region {
     Interface,
     Implementation,
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Origin {
     Declaration,
     Definition,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SymbolKind {
     Unit,
     Type,
@@ -1291,6 +1311,7 @@ impl ResolutionState {
 struct Document {
     source: String,
     tree: Tree,
+    parser_recovery_spans: Vec<Span>,
     unit_name: String,
     interface_range: Option<Span>,
     implementation_range: Option<Span>,
@@ -1300,6 +1321,7 @@ struct Document {
     import_bindings: Option<HashMap<String, Url>>,
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
+    opaque_ranges: Vec<Span>,
 }
 
 impl Document {
@@ -1308,8 +1330,20 @@ impl Document {
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));
         let info = FileInfo::new(path);
-        let (tree, _diagnostics) = parser::parse_file(&info, source.as_bytes())?;
+        let (tree, _diagnostics, patches) =
+            parser::parse_file_with_patches(&info, source.as_bytes())?;
         let root = tree.root_node();
+        let parser_recovery_spans = collect_parser_recovery_spans(root);
+        let opaque_ranges = patches
+            .into_iter()
+            .filter_map(|patch| match patch {
+                DirectivePatch::OpaqueBlock(block) => Some(Span {
+                    start: block.start,
+                    end: block.end,
+                }),
+                DirectivePatch::Markers(_) => None,
+            })
+            .collect();
 
         let mut module_names = Vec::new();
         let mut sections = Vec::new();
@@ -1397,6 +1431,7 @@ impl Document {
         Ok(Self {
             source,
             tree,
+            parser_recovery_spans,
             unit_name,
             interface_range,
             implementation_range,
@@ -1406,6 +1441,7 @@ impl Document {
             import_bindings: None,
             scopes,
             symbols,
+            opaque_ranges,
         })
     }
 
@@ -1480,6 +1516,12 @@ impl Document {
         // used by property accessors still resolve in the enclosing type.
         identifier_at(self.tree.root_node(), offset)
             .and_then(|identifier| enclosing_type(identifier, &self.source))
+    }
+
+    fn has_parser_recovery_near(&self, span: Span) -> bool {
+        self.parser_recovery_spans
+            .iter()
+            .any(|recovery| recovery.start <= span.end && recovery.end >= span.start)
     }
 }
 
@@ -2040,6 +2082,16 @@ fn collect_nodes<'a>(root: Node<'a>, callback: &mut impl FnMut(Node<'a>)) {
         let children: Vec<_> = node.children(&mut cursor).collect();
         pending.extend(children.into_iter().rev());
     }
+}
+
+fn collect_parser_recovery_spans(root: Node<'_>) -> Vec<Span> {
+    let mut spans = Vec::new();
+    collect_nodes(root, &mut |node| {
+        if node.is_error() || node.is_missing() {
+            spans.push(Span::from_node(node));
+        }
+    });
+    spans
 }
 
 fn identifier_nodes<'a>(node: Node<'a>) -> Vec<Node<'a>> {

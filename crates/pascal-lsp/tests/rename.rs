@@ -1,0 +1,1869 @@
+use lsp_types::{Position, PrepareRenameResponse, Range, TextEdit, Url};
+use pascal_lsp::NavigationIndex;
+use std::collections::HashMap;
+
+fn uri(name: &str) -> Url {
+    Url::parse(&format!("file:///workspace/{name}.pas")).expect("valid test URI")
+}
+
+fn position_of(source: &str, needle: &str, occurrence: usize) -> Position {
+    let mut search_from = 0;
+    let mut offset = None;
+    for _ in 0..=occurrence {
+        let relative = source[search_from..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} occurrence {occurrence} not found"));
+        search_from += relative;
+        offset = Some(search_from);
+        search_from += needle.len();
+    }
+    let offset = offset.expect("at least one occurrence");
+    let line_start = source[..offset].rfind('\n').map_or(0, |idx| idx + 1);
+    Position {
+        line: source[..offset]
+            .bytes()
+            .filter(|&byte| byte == b'\n')
+            .count() as u32,
+        character: source[line_start..offset].encode_utf16().count() as u32,
+    }
+}
+
+fn property_position(source: &str, name: &str) -> Position {
+    let mut position = position_of(source, &format!("property {name}"), 0);
+    position.character += "property ".encode_utf16().count() as u32;
+    position
+}
+
+fn update(index: &mut NavigationIndex, name: &str, source: &str) -> Url {
+    let uri = uri(name);
+    index
+        .update(uri.clone(), source.to_string())
+        .expect("fixture parses");
+    uri
+}
+
+fn range_of(source: &str, needle: &str, occurrence: usize) -> Range {
+    let start = position_of(source, needle, occurrence);
+    let end = Position {
+        line: start.line,
+        character: start.character + needle.encode_utf16().count() as u32,
+    };
+    Range { start, end }
+}
+
+fn range_in(source: &str, surrounding: &str, identifier: &str, occurrence: usize) -> Range {
+    range_in_occurrence(source, surrounding, identifier, occurrence, 0)
+}
+
+fn range_in_occurrence(
+    source: &str,
+    surrounding: &str,
+    identifier: &str,
+    occurrence: usize,
+    identifier_occurrence: usize,
+) -> Range {
+    let surrounding_start = position_of(source, surrounding, occurrence);
+    let mut search_from = 0;
+    let mut identifier_offset = None;
+    for _ in 0..=identifier_occurrence {
+        let relative = surrounding[search_from..]
+            .find(identifier)
+            .expect("identifier is present in surrounding text");
+        search_from += relative;
+        identifier_offset = Some(search_from);
+        search_from += identifier.len();
+    }
+    let identifier_offset = identifier_offset.expect("identifier occurrence is present");
+    let start = Position {
+        line: surrounding_start.line,
+        character: surrounding_start.character
+            + surrounding[..identifier_offset].encode_utf16().count() as u32,
+    };
+    let end = Position {
+        line: start.line,
+        character: start.character + identifier.encode_utf16().count() as u32,
+    };
+    Range { start, end }
+}
+
+fn edit_signature(uri: &Url, range: Range, new_text: &str) -> (String, u32, u32, u32, u32, String) {
+    (
+        uri.to_string(),
+        range.start.line,
+        range.start.character,
+        range.end.line,
+        range.end.character,
+        new_text.to_owned(),
+    )
+}
+
+fn exact_edit_signatures(
+    edits: &std::collections::HashMap<Url, Vec<TextEdit>>,
+) -> Vec<(String, u32, u32, u32, u32, String)> {
+    let mut result = edits
+        .iter()
+        .flat_map(|(uri, document_edits)| {
+            document_edits
+                .iter()
+                .map(|edit| edit_signature(uri, edit.range, &edit.new_text))
+        })
+        .collect::<Vec<_>>();
+    result.sort();
+    result
+}
+
+fn assert_exact_edits(
+    edits: &std::collections::HashMap<Url, Vec<TextEdit>>,
+    mut expected: Vec<(Url, Range, String)>,
+) {
+    let mut expected_signatures = expected
+        .drain(..)
+        .map(|(uri, range, new_text)| edit_signature(&uri, range, &new_text))
+        .collect::<Vec<_>>();
+    expected_signatures.sort();
+    assert_eq!(exact_edit_signatures(edits), expected_signatures);
+}
+
+fn apply_edits(source: &str, edits: &[TextEdit]) -> String {
+    let mut replacements = edits
+        .iter()
+        .map(|edit| {
+            let start = pascal_lsp::text::position_to_offset(source, edit.range.start)
+                .expect("valid edit start");
+            let end = pascal_lsp::text::position_to_offset(source, edit.range.end)
+                .expect("valid edit end");
+            (start, end, edit.new_text.as_str())
+        })
+        .collect::<Vec<_>>();
+    replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+
+    let mut result = source.to_owned();
+    for (start, end, new_text) in replacements {
+        result.replace_range(start..end, new_text);
+    }
+    result
+}
+
+fn assert_document_after_edits(source: &str, edits: &[TextEdit], expected_source: &str) {
+    assert_eq!(apply_edits(source, edits), expected_source);
+}
+
+#[test]
+fn renames_public_class_constant_across_units() {
+    let provider_uri = uri("Provider");
+    let consumer_uri = uri("Consumer");
+    let provider = "unit Provider;
+interface
+type TLog = class
+public const kSQLDebugFile = 'debug.log';
+end;
+implementation
+end.
+";
+    let consumer = "unit Consumer;
+interface
+uses Provider;
+implementation
+procedure Run;
+begin
+  WriteLn(TLog.kSQLDebugFile);
+end;
+end.
+";
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_string())
+        .expect("provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_string())
+        .expect("consumer parses");
+    let mut bindings = HashMap::new();
+    bindings.insert("Provider".to_string(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+
+    let edits = index
+        .rename_edits(&provider_uri, Position::new(3, 14), "K_SQL_DEBUG_FILE")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "kSQLDebugFile", 0),
+                "K_SQL_DEBUG_FILE".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "kSQLDebugFile", 0),
+                "K_SQL_DEBUG_FILE".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        provider,
+        &edits[&provider_uri],
+        &provider.replacen("kSQLDebugFile", "K_SQL_DEBUG_FILE", 1),
+    );
+    assert_document_after_edits(
+        consumer,
+        &edits[&consumer_uri],
+        &consumer.replacen("kSQLDebugFile", "K_SQL_DEBUG_FILE", 1),
+    );
+}
+
+#[test]
+fn unicode_identifier_recovery_refuses_a_partial_public_rename() {
+    let provider = "unit Provider;
+interface
+const badConst = 1;
+implementation
+end.
+";
+    let consumer = "unit Consumer;
+interface
+uses Provider;
+implementation
+procedure Use;
+var badConsté: Integer;
+begin
+  badConsté := 2;
+  WriteLn(badConst);
+  WriteLn(badConsté);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "UnicodeProvider", provider);
+    let consumer_uri = update(&mut index, "UnicodeConsumer", consumer);
+    index.bind_imports(
+        &consumer_uri,
+        [("Provider".to_owned(), provider_uri.clone())],
+    );
+
+    let result = index.rename_edits(
+        &provider_uri,
+        position_of(provider, "badConst", 0),
+        "RENAMED_CONST",
+    );
+
+    assert!(
+        result.is_err(),
+        "unsupported Unicode identifier recovery must not authorize a partial rename"
+    );
+}
+
+#[test]
+fn selecting_a_reference_uses_the_same_binding_as_its_declaration() {
+    let provider = "unit Provider;
+interface
+type TLog = class
+public const kSQLDebugFile = 'debug.log';
+end;
+implementation
+end.
+";
+    let consumer = "unit Consumer;
+interface
+uses Provider;
+implementation
+procedure Run;
+begin
+  WriteLn(TLog.kSQLDebugFile);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "Provider", provider);
+    let consumer_uri = update(&mut index, "Consumer", consumer);
+
+    let edits = index
+        .rename_edits(
+            &consumer_uri,
+            position_of(consumer, "kSQLDebugFile", 0),
+            "K_SQL_DEBUG_FILE",
+        )
+        .expect("reference rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "kSQLDebugFile", 0),
+                "K_SQL_DEBUG_FILE".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "kSQLDebugFile", 0),
+                "K_SQL_DEBUG_FILE".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        provider,
+        &edits[&provider_uri],
+        &provider.replacen("kSQLDebugFile", "K_SQL_DEBUG_FILE", 1),
+    );
+    assert_document_after_edits(
+        consumer,
+        &edits[&consumer_uri],
+        &consumer.replacen("kSQLDebugFile", "K_SQL_DEBUG_FILE", 1),
+    );
+}
+
+#[test]
+fn unit_bindings_are_rejected_without_rename_file_support() {
+    let provider = "unit Provider;
+interface
+implementation
+end.
+";
+    let consumer = "unit Consumer;
+interface
+uses Provider;
+implementation
+end.
+";
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "Provider", provider);
+    let consumer_uri = update(&mut index, "Consumer", consumer);
+
+    let declaration_position = position_of(provider, "Provider", 0);
+    assert!(
+        index
+            .prepare_rename(&provider_uri, declaration_position)
+            .is_err(),
+        "unit declaration rename requires RenameFile support"
+    );
+    assert!(
+        index
+            .rename_edits(&provider_uri, declaration_position, "RenamedProvider")
+            .is_err(),
+        "unit declaration rename must not return text edits"
+    );
+    assert!(
+        index
+            .rename_edits(
+                &consumer_uri,
+                position_of(consumer, "Provider", 0),
+                "RenamedProvider",
+            )
+            .is_err(),
+        "uses unit rename must not return text edits"
+    );
+}
+
+#[test]
+fn imported_reference_capture_by_a_local_name_is_rejected() {
+    let provider = "unit ImportedCaptureProvider;
+interface
+const Value = 1;
+implementation
+end.
+";
+    let consumer = "unit ImportedCaptureConsumer;
+interface
+uses ImportedCaptureProvider;
+implementation
+procedure Run;
+var
+  NewValue: Integer;
+begin
+  NewValue := Value;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "ImportedCaptureProvider", provider);
+    let consumer_uri = update(&mut index, "ImportedCaptureConsumer", consumer);
+    let mut bindings = HashMap::new();
+    bindings.insert("ImportedCaptureProvider".to_string(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+
+    assert!(
+        index
+            .rename_edits(&provider_uri, position_of(provider, "Value", 0), "NewValue")
+            .is_err(),
+        "a consumer local must not capture an imported binding"
+    );
+}
+
+#[test]
+fn local_rename_can_shadow_an_outer_name_without_capturing_references() {
+    let source = "unit LocalOuterName;
+interface
+const NewValue = 0;
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+  Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "LocalOuterName", source);
+
+    let mut selected = position_of(source, "  Value", 0);
+    selected.character += 2;
+    let edits = index
+        .rename_edits(&source_uri, selected, "NewValue")
+        .expect("local binding may shadow an outer declaration");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "  Value: Integer", "Value", 0),
+                "NewValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "  Value := 1", "Value", 0),
+                "NewValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source.replacen("  Value", "  NewValue", 2),
+    );
+}
+
+#[test]
+fn disjoint_local_new_name_references_are_not_reverse_capture() {
+    let source = "unit DisjointNewName;
+interface
+implementation
+procedure Run;
+var Value: Integer;
+begin Value := 1; end;
+procedure Other;
+var Count: Integer;
+begin Count := 2; end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "DisjointNewName", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value: Integer", 0),
+            "Count",
+        )
+        .expect("a disjoint local reference is not captured");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "Value: Integer", "Value", 0),
+                "Count".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 1", "Value", 0),
+                "Count".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source
+            .replacen("Value: Integer", "Count: Integer", 1)
+            .replacen("Value := 1", "Count := 1", 1),
+    );
+}
+
+#[test]
+fn class_constant_rename_does_not_capture_explicitly_disjoint_local() {
+    let source = "unit ClassConstantLocalName;
+interface
+type TBox = class
+ public const OldValue = 1;
+end;
+implementation
+procedure Run;
+var NewValue: Integer;
+begin
+ NewValue := 7;
+ WriteLn(TBox.OldValue, NewValue);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ClassConstantLocalName", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "OldValue = 1", 0),
+            "NewValue",
+        )
+        .expect("an explicitly qualified class constant is disjoint from a free local");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, " public const OldValue = 1", "OldValue", 0),
+                "NewValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, " WriteLn(TBox.OldValue, NewValue)", "OldValue", 0),
+                "NewValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source.replacen("OldValue = 1", "NewValue = 1", 1).replacen(
+            "TBox.OldValue",
+            "TBox.NewValue",
+            1,
+        ),
+    );
+}
+
+#[test]
+fn unresolved_new_name_reference_in_target_scope_is_rejected() {
+    let source = "unit UnresolvedNewName;
+interface
+implementation
+procedure Run;
+var Value: Integer;
+begin
+ Value := 1;
+ WriteLn(NewValue);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "UnresolvedNewName", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Value: Integer", 0),
+                "NewValue",
+            )
+            .is_err(),
+        "an unresolved reference in the target scope could be captured by the rename"
+    );
+}
+
+#[test]
+fn inherited_proposed_name_reference_rejects_reverse_capture() {
+    let source = "unit Probe;
+interface
+const NewValue = 7;
+type TBase = class
+ public const OldValue = 1;
+end;
+TChild = class(TBase)
+ procedure Run;
+end;
+implementation
+procedure TChild.Run;
+begin WriteLn(NewValue); end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "InheritedProposedNameCapture", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "OldValue = 1", 0),
+                "NewValue",
+            )
+            .is_err(),
+        "an inherited class member must not capture a global proposed-name reference"
+    );
+}
+
+#[test]
+fn with_proposed_name_reference_rejects_reverse_capture() {
+    let source = "unit Probe;
+interface
+const NewValue = 7;
+type TBox = class
+ public const OldValue = 1;
+end;
+implementation
+procedure Run(Box: TBox);
+begin
+ with Box do WriteLn(NewValue);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithProposedNameCapture", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "OldValue = 1", 0),
+                "NewValue",
+            )
+            .is_err(),
+        "a class member must not capture a global proposed-name reference through with"
+    );
+}
+
+#[test]
+fn local_rename_rejects_reverse_capture_of_existing_new_name_reference() {
+    let source = "unit ReverseCaptureVariable;
+interface
+const NewValue = 7;
+implementation
+procedure Run;
+var Value: Integer;
+begin
+ Value := NewValue;
+ WriteLn(Value);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ReverseCaptureVariable", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Value: Integer", 0),
+                "NewValue",
+            )
+            .is_err(),
+        "an existing reference to the proposed local name must not be captured"
+    );
+}
+
+#[test]
+fn local_constant_rename_rejects_reverse_capture_of_existing_new_name_reference() {
+    let source = "unit ReverseCaptureConstant;
+interface
+const NewValue = 7;
+implementation
+procedure Run;
+const Value = 1;
+begin
+ WriteLn(Value, NewValue);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ReverseCaptureConstant", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Value = 1", 0), "NewValue",)
+            .is_err(),
+        "an existing constant reference must not be captured by the renamed local constant"
+    );
+}
+
+#[test]
+fn cross_unit_same_named_class_owner_rejects_inherited_member_rename() {
+    let provider = "unit Provider;
+interface
+type TBox = class
+ public const Value = 1;
+end;
+implementation
+end.
+";
+    let consumer = "unit Consumer;
+interface
+uses Provider;
+const Value = 100;
+type TBox = class(Provider.TBox)
+ procedure Run;
+end;
+implementation
+procedure TBox.Run;
+begin WriteLn(Value); end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "Provider", provider);
+    let consumer_uri = update(&mut index, "Consumer", consumer);
+    let mut bindings = HashMap::new();
+    bindings.insert("Provider".to_owned(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+    let selected = position_of(provider, "Value = 1", 0);
+
+    assert!(
+        index.prepare_rename(&provider_uri, selected).is_err(),
+        "same-named class owners in different units must not be treated as identical"
+    );
+    assert!(
+        index
+            .rename_edits(&provider_uri, selected, "Count")
+            .is_err(),
+        "inherited member lookup across same-named units must be rejected"
+    );
+}
+
+#[test]
+fn cross_unit_same_named_class_owner_rejects_virtual_override_rename() {
+    let provider = "unit Provider;
+interface
+type TBox = class
+ procedure Work; virtual;
+end;
+implementation
+procedure TBox.Work; begin end;
+end.
+";
+    let consumer = "unit Consumer;
+interface
+uses Provider;
+type TBox = class(Provider.TBox)
+ procedure Work; override;
+end;
+implementation
+procedure TBox.Work; begin end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "Provider", provider);
+    let consumer_uri = update(&mut index, "Consumer", consumer);
+    let mut bindings = HashMap::new();
+    bindings.insert("Provider".to_owned(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+    let selected = position_of(provider, "Work; virtual", 0);
+
+    assert!(
+        index.prepare_rename(&provider_uri, selected).is_err(),
+        "same-named class owners in different units must not hide overrides"
+    );
+    assert!(
+        index
+            .rename_edits(&provider_uri, selected, "RunWork")
+            .is_err(),
+        "cross-unit virtual override families must be rejected"
+    );
+}
+
+#[test]
+fn ordinary_local_rename_is_case_insensitive_and_scope_limited() {
+    let source = "unit LocalRename;
+interface
+procedure Run;
+procedure Other;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+  vAlUe := 1;
+  Value := Value + 1;
+end;
+procedure Other;
+var
+  Value: Integer;
+begin
+  Value := 2;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "LocalRename", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue")
+        .expect("local rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "vAlUe", 0),
+                "RenamedValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in_occurrence(source, "  Value := Value + 1", "Value", 0, 0),
+                "RenamedValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in_occurrence(source, "  Value := Value + 1", "Value", 0, 1),
+                "RenamedValue".to_owned(),
+            ),
+        ],
+    );
+    let expected_source = source
+        .replacen("  Value: Integer", "  RenamedValue: Integer", 1)
+        .replacen("  vAlUe := 1", "  RenamedValue := 1", 1)
+        .replacen(
+            "  Value := Value + 1",
+            "  RenamedValue := RenamedValue + 1",
+            1,
+        );
+    assert_document_after_edits(source, &edits[&source_uri], &expected_source);
+}
+
+#[test]
+fn nested_shadowing_is_left_alone() {
+    let source = "unit NestedShadowing;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+  procedure Nested;
+  var
+    Value: Integer;
+  begin
+    Value := 2;
+  end;
+begin
+  Value := 1;
+  Nested;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "NestedShadowing", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue")
+        .expect("outer local rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "  Value: Integer", "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "  Value := 1", "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+        ],
+    );
+    let expected_source = source
+        .replacen("  Value: Integer", "  RenamedValue: Integer", 1)
+        .replacen("  Value := 1", "  RenamedValue := 1", 1);
+    assert_document_after_edits(source, &edits[&source_uri], &expected_source);
+}
+
+#[test]
+fn nested_local_capture_aborts_without_partial_edits() {
+    let source = "unit NestedCapture;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+  procedure Nested;
+  var
+    RenamedValue: Integer;
+  begin
+    Value := 2;
+  end;
+begin
+  Value := 1;
+  Nested;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "NestedCapture", source);
+
+    let result = index.rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue");
+    assert!(result.is_err(), "nested local capture must be rejected");
+}
+
+#[test]
+fn qualified_class_and_self_member_uses_are_renamed() {
+    let source = "unit QualifiedMembers;
+interface
+type
+  TWidget = class
+    FValue: Integer;
+    procedure Run;
+  end;
+implementation
+procedure TWidget.Run;
+begin
+  Self.FValue := 1;
+  TWidget.FValue := 2;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "QualifiedMembers", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "FValue", 0), "FCount")
+        .expect("qualified member rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "FValue", 0),
+                "FCount".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "FValue", 1),
+                "FCount".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "FValue", 2),
+                "FCount".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source.replacen("FValue", "FCount", 3),
+    );
+}
+
+#[test]
+fn unrelated_class_homonyms_are_not_renamed() {
+    let source = "unit ClassHomonyms;
+interface
+type
+  TOne = class
+    Value: Integer;
+  end;
+  TTwo = class
+    Value: Integer;
+  end;
+  TCaller = class
+    One: TOne;
+    Two: TTwo;
+    procedure Run;
+  end;
+implementation
+procedure TCaller.Run;
+begin
+  One.Value := 1;
+  Two.Value := 2;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ClassHomonyms", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Value", 0), "Count")
+        .expect("homonym rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "Count".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 2),
+                "Count".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source
+            .replacen("Value", "Count", 1)
+            .replacen("One.Value", "One.Count", 1),
+    );
+}
+
+#[test]
+fn comments_and_strings_are_not_rename_occurrences() {
+    let source = "unit RenameNoise;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+  // Value
+  Value := 1;
+  WriteLn('Value');
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "RenameNoise", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue")
+        .expect("noise-aware rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "  Value := 1", "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source
+            .replacen("Value: Integer", "RenamedValue: Integer", 1)
+            .replacen("Value := 1", "RenamedValue := 1", 1),
+    );
+}
+
+#[test]
+fn invalid_and_keyword_new_names_are_rejected() {
+    let source = "unit InvalidRename;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+  Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "InvalidRename", source);
+
+    for new_name in ["", "begin", "read", "bad-name", "123Value", "Value "] {
+        assert!(
+            index
+                .rename_edits(&source_uri, position_of(source, "Value", 0), new_name,)
+                .is_err(),
+            "{new_name:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn case_insensitive_declaration_collision_is_rejected() {
+    let source = "unit RenameCollision;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value, Other: Integer;
+begin
+  Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "RenameCollision", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Value", 0), "other",)
+            .is_err(),
+        "case-insensitive same-scope collision must be rejected"
+    );
+}
+
+#[test]
+fn property_and_getter_bindings_are_separate() {
+    let source = "unit PropertyRename;
+interface
+type
+  TConfig = class
+    FValue: Integer;
+    function GetValue: Integer;
+    property Value: Integer read GetValue;
+    procedure Run;
+  end;
+implementation
+function TConfig.GetValue: Integer;
+begin
+  Result := FValue;
+end;
+procedure TConfig.Run;
+begin
+  Self.Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "PropertyRename", source);
+
+    let property_edits = index
+        .rename_edits(
+            &source_uri,
+            property_position(source, "Value"),
+            "RenamedValue",
+        )
+        .expect("property rename succeeds");
+    assert_exact_edits(
+        &property_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "property Value: Integer", "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Self.Value", "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &property_edits[&source_uri],
+        &source
+            .replacen("property Value", "property RenamedValue", 1)
+            .replacen("Self.Value", "Self.RenamedValue", 1),
+    );
+
+    let getter_edits = index
+        .rename_edits(&source_uri, position_of(source, "GetValue", 0), "ReadValue")
+        .expect("getter rename succeeds");
+    assert_exact_edits(
+        &getter_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "GetValue", 0),
+                "ReadValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "GetValue", 1),
+                "ReadValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "GetValue", 2),
+                "ReadValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &getter_edits[&source_uri],
+        &source
+            .replacen("function GetValue:", "function ReadValue:", 1)
+            .replacen("read GetValue", "read ReadValue", 1)
+            .replacen(
+                "function TConfig.GetValue:",
+                "function TConfig.ReadValue:",
+                1,
+            ),
+    );
+}
+
+#[test]
+fn prepare_rename_returns_the_selected_original_source_range() {
+    let source = "unit PrepareRename;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+  Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "PrepareRename", source);
+    let selected = position_of(source, "Value", 1);
+
+    let response = index
+        .prepare_rename(&source_uri, selected)
+        .expect("prepare rename succeeds");
+    match response {
+        PrepareRenameResponse::Range(range) => {
+            assert_eq!(range.start, selected);
+            assert_eq!(range.end.character, selected.character + 5);
+        }
+        other => panic!("unexpected prepare response: {other:?}"),
+    }
+}
+
+#[test]
+fn utf16_positions_and_crlf_source_spans_are_preserved() {
+    let source = "unit Utf16Rename;\r\ninterface\r\nprocedure Run;\r\nimplementation\r\nprocedure Run;\r\nvar\r\n  é, Value: Integer;\r\nbegin\r\n  é := 1; Value := 2;\r\nend;\r\nend.\r\n";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "Utf16Rename", source);
+    let selected = position_of(source, "Value", 0);
+
+    let edits = index
+        .rename_edits(&source_uri, selected, "Renamed")
+        .expect("UTF-16/CRLF rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "Renamed".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 1),
+                "Renamed".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source.replacen("Value", "Renamed", 2),
+    );
+}
+
+#[test]
+fn overloaded_reference_aborts_without_partial_edits() {
+    let source = "unit OverloadedRename;
+interface
+procedure Do(Value: Integer); overload;
+procedure Do(Value: string); overload;
+procedure Run;
+implementation
+procedure Do(Value: Integer);
+begin
+  Value := 1;
+end;
+procedure Do(Value: string);
+begin
+  Value := 'x';
+end;
+procedure Run;
+begin
+  Do(1);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "OverloadedRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Do", 0), "RenamedDo",)
+            .is_err(),
+        "an overload use that cannot be disambiguated must abort the rename"
+    );
+}
+
+#[test]
+fn selecting_one_overload_without_a_call_still_aborts_conservatively() {
+    let source = "unit OverloadedDeclarationRename;
+interface
+procedure Do(Value: Integer); overload;
+procedure Do(Value: string); overload;
+implementation
+procedure Do(Value: Integer);
+begin
+end;
+procedure Do(Value: string);
+begin
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "OverloadedDeclarationRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Do", 0), "RenamedDo",)
+            .is_err(),
+        "overloaded declarations must not yield a partial rename"
+    );
+}
+
+#[test]
+fn with_member_reference_aborts_without_partial_edits() {
+    let source = "unit WithRename;
+interface
+type
+  TConfig = class
+    Value: Integer;
+    procedure Run;
+  end;
+implementation
+procedure TConfig.Run;
+begin
+  with Self do
+    Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue",)
+            .is_err(),
+        "with references must not produce a partial rename"
+    );
+}
+
+#[test]
+fn with_member_homonym_fallback_aborts_without_partial_edits() {
+    let source = "unit WithHomonymRename;
+interface
+type TBox = class
+ Value: Integer;
+end;
+implementation
+procedure Run(Box: TBox);
+var Value: Integer;
+begin
+ with Box do Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithHomonymRename", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Value: Integer", 0),
+                "Count",
+            )
+            .is_err(),
+        "an unsupported with lookup must not fall back to a local homonym"
+    );
+}
+
+#[test]
+fn inherited_member_reference_aborts_without_partial_edits() {
+    let source = "unit InheritedRename;
+interface
+type
+  TBase = class
+    Value: Integer;
+  end;
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Self.Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "InheritedRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue",)
+            .is_err(),
+        "inherited references must not produce a partial rename"
+    );
+}
+
+#[test]
+fn inherited_unqualified_homonym_fallback_aborts_without_partial_edits() {
+    let source = "unit InheritedHomonymRename;
+interface
+const Value = 100;
+type TBase = class
+ public const Value = 1;
+end;
+TChild = class(TBase)
+ procedure Run;
+end;
+implementation
+procedure TChild.Run;
+begin
+ WriteLn(Value);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "InheritedHomonymRename", source);
+    let mut selected = position_of(source, "public const Value", 0);
+    selected.character += "public const ".encode_utf16().count() as u32;
+
+    assert!(
+        index.rename_edits(&source_uri, selected, "Count",).is_err(),
+        "an unqualified descendant lookup must not fall back to a global homonym"
+    );
+}
+
+#[test]
+fn virtual_override_family_rename_is_rejected_without_explicit_calls() {
+    let source = "unit VirtualOverrideRename;
+interface
+type TBase = class
+ procedure Work; virtual;
+end;
+TChild = class(TBase)
+ procedure Work; override;
+end;
+implementation
+procedure TBase.Work; begin end;
+procedure TChild.Work; begin end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "VirtualOverrideRename", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Work; virtual", 0),
+                "RunWork",
+            )
+            .is_err(),
+        "virtual override families must not be partially renamed"
+    );
+}
+
+#[test]
+fn virtual_override_family_with_implicit_inherited_call_is_rejected() {
+    let source = "unit VirtualInheritedRename;
+interface
+type TBase = class
+ procedure Work; virtual;
+end;
+TChild = class(TBase)
+ procedure Work; override;
+end;
+implementation
+procedure TBase.Work; begin end;
+procedure TChild.Work;
+begin
+ inherited;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "VirtualInheritedRename", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Work; virtual", 0),
+                "RunWork",
+            )
+            .is_err(),
+        "implicit inherited calls must not preserve an incomplete override family rename"
+    );
+}
+
+#[test]
+fn forward_class_completion_rename_is_rejected_without_type_references() {
+    let source = "unit ForwardClassRename;
+interface
+type TBox = class;
+ TBox = class
+ end;
+implementation
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ForwardClassRename", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "TBox = class;", 0),
+                "TNewBox",
+            )
+            .is_err(),
+        "forward class declarations must not be renamed independently"
+    );
+}
+
+#[test]
+fn unused_abbreviated_parameter_collision_is_rejected() {
+    let source = "unit AbbreviatedParameterCollision;
+interface
+procedure Run(Value: Integer);
+implementation
+procedure Run;
+var Count: Integer;
+begin
+ Count := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "AbbreviatedParameterCollision", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Value: Integer", 0),
+                "Count",
+            )
+            .is_err(),
+        "an unused abbreviated parameter must still collide with a body local"
+    );
+}
+
+#[test]
+fn opaque_directive_occurrence_aborts_without_partial_edits() {
+    let source = "unit OpaqueRename;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+  Value := 1;
+{$IF UNKNOWN_CONDITION}
+  not valid Pascal Value @@@
+{$IFEND}
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "OpaqueRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue",)
+            .is_err(),
+        "opaque directive occurrences must not produce a partial rename"
+    );
+}
+
+#[test]
+fn paired_routine_declaration_and_definition_are_renamed_together() {
+    let source = "unit PairedRoutineRename;
+interface
+procedure DoWork;
+implementation
+procedure DoWork;
+begin
+  DoWork;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "PairedRoutineRename", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "DoWork", 0), "RunWork")
+        .expect("paired routine rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "DoWork", 0),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "DoWork", 1),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "DoWork", 2),
+                "RunWork".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source.replacen("DoWork", "RunWork", 3),
+    );
+}
+
+#[test]
+fn duplicate_routine_declarations_are_not_coalesced_as_a_pair() {
+    let source = "unit DuplicateRoutineRename;
+interface
+procedure DoWork;
+procedure DoWork;
+implementation
+procedure DoWork;
+begin
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "DuplicateRoutineRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "DoWork", 0), "RunWork",)
+            .is_err(),
+        "duplicate declarations must not be treated as one routine pair"
+    );
+}
+
+#[test]
+fn routine_parameter_declaration_and_body_are_renamed_together() {
+    let source = "unit ParameterRename;
+interface
+procedure Run(Value: Integer);
+implementation
+procedure Run(Arg: Integer);
+begin
+  aRg := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ParameterRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value: Integer", 0),
+            "NewValue",
+        )
+        .expect("parameter rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "NewValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Arg", 0),
+                "NewValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "aRg", 0),
+                "NewValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source
+            .replacen("Value: Integer", "NewValue: Integer", 1)
+            .replacen("Arg: Integer", "NewValue: Integer", 1)
+            .replacen("aRg :=", "NewValue :=", 1),
+    );
+}
+
+#[test]
+fn paired_parameter_alias_selection_has_the_same_rename_plan() {
+    let source = "unit PairedParameterAlias;
+interface
+procedure Run(Value: Integer);
+implementation
+procedure Run(Arg: Integer);
+begin Arg := 1; end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "PairedParameterAlias", source);
+
+    let prototype_edits = index
+        .rename_edits(&source_uri, position_of(source, "Value: Integer", 0), "Arg")
+        .expect("prototype selection can use the implementation spelling");
+    let implementation_edits = index
+        .rename_edits(&source_uri, position_of(source, "Arg", 0), "Arg")
+        .expect("implementation selection can keep its existing spelling");
+    assert_eq!(
+        exact_edit_signatures(&prototype_edits),
+        exact_edit_signatures(&implementation_edits),
+        "all selections of one paired parameter must produce one plan"
+    );
+    assert_exact_edits(
+        &prototype_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "Arg".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Arg", 0),
+                "Arg".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Arg", 1),
+                "Arg".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &prototype_edits[&source_uri],
+        &source.replacen("Value: Integer", "Arg: Integer", 1),
+    );
+}
+
+#[test]
+fn parameter_rename_can_shadow_an_outer_unit_name() {
+    let source = "unit ParameterOuterName;
+interface
+const NewValue = 0;
+procedure Run(Value: Integer);
+implementation
+procedure Run(Arg: Integer);
+begin
+  Arg := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ParameterOuterName", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value: Integer", 0),
+            "NewValue",
+        )
+        .expect("parameter may shadow an outer unit name");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "Value: Integer", "Value", 0),
+                "NewValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Arg", 0),
+                "NewValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Arg", 1),
+                "NewValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source
+            .replacen("Value: Integer", "NewValue: Integer", 1)
+            .replacen("Arg: Integer", "NewValue: Integer", 1)
+            .replacen("  Arg := 1", "  NewValue := 1", 1),
+    );
+}
+
+#[test]
+fn overloaded_routine_parameter_rename_is_rejected() {
+    let source = "unit OverloadedParameterRename;
+interface
+procedure Do(Value: Integer); overload;
+procedure Do(Value: string); overload;
+implementation
+procedure Do(Arg: Integer);
+begin
+  Arg := 1;
+end;
+procedure Do(Arg: string);
+begin
+  Arg := 'x';
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "OverloadedParameterRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Value", 0), "NewValue",)
+            .is_err(),
+        "overloaded routine parameters must not yield a partial rename"
+    );
+}
+
+#[test]
+fn ordinary_conditional_directives_do_not_make_a_rename_opaque() {
+    let source = "unit ConditionalRename;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+{$IFDEF ENABLE_VALUE}
+  Value := 1;
+{$ENDIF}
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ConditionalRename", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Value", 0), "NewValue")
+        .expect("conditional source rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "NewValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 1),
+                "NewValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source.replacen("Value", "NewValue", 2),
+    );
+}

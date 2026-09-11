@@ -12,10 +12,14 @@ use pascal_core::{FileInfo, Severity, decode_bytes, parser};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
+use std::hash::Hasher;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
+
+pub(crate) mod codeactions;
+pub(crate) mod rename;
 
 /// Maximum syntax-tree depth used before invoking the recursive lint/format pipelines.
 pub const MAX_TREE_DEPTH: usize = 256;
@@ -160,16 +164,17 @@ struct DiskSource {
     text: String,
     bytes: usize,
     stamp: DiskStamp,
+    content_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DiskStamp {
+pub(crate) struct DiskStamp {
     bytes: u64,
     modified: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PathStamp {
+pub(crate) struct PathStamp {
     bytes: u64,
     modified: Option<SystemTime>,
     is_dir: bool,
@@ -398,6 +403,8 @@ pub struct Workspace {
     package_catalogue_epoch: u64,
     package_metadata_cache: HashMap<PathBuf, CachedPackageMetadata>,
     warnings: Vec<String>,
+    source_generation: u64,
+    configuration_generation: u64,
 }
 
 impl Workspace {
@@ -598,6 +605,7 @@ impl Workspace {
         };
         self.pending_diagnostics.remove(uri);
         if was_open {
+            self.bump_source_generation();
             self.open_document_contexts.remove(uri);
             self.disk_stamps.remove(uri);
             self.refresh_loaded_disk(uri);
@@ -612,6 +620,7 @@ impl Workspace {
         version: i32,
         context_key: ContextKey,
     ) {
+        self.bump_source_generation();
         let text_len = text.len();
         let source_for_index = text.clone();
         if let Some(previous) = self.open_documents.get(&uri) {
@@ -637,6 +646,7 @@ impl Workspace {
     }
 
     fn reject_open_document(&mut self, uri: Url, version: i32, reason: String) {
+        self.bump_source_generation();
         if let Some(previous) = self.open_documents.get(&uri) {
             if let Some(previous_text) = &previous.text {
                 self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
@@ -707,6 +717,10 @@ impl Workspace {
     }
 
     pub fn file_event(&mut self, uri: &Url, change: FileChange) {
+        self.bump_source_generation();
+        if is_configuration_path(uri) {
+            self.bump_configuration_generation();
+        }
         self.invalidate_metadata_for_uri(uri);
         self.invalidate_directory_for_uri(uri);
         match change {
@@ -731,6 +745,8 @@ impl Workspace {
         added: impl IntoIterator<Item = PathBuf>,
         removed: impl IntoIterator<Item = PathBuf>,
     ) {
+        self.bump_source_generation();
+        self.bump_configuration_generation();
         for removed in removed {
             let removed = absolute_path(removed);
             self.roots
@@ -2328,6 +2344,22 @@ impl Workspace {
         &self.warnings
     }
 
+    pub(crate) fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    pub(crate) fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    fn bump_source_generation(&mut self) {
+        self.source_generation = self.source_generation.wrapping_add(1);
+    }
+
+    fn bump_configuration_generation(&mut self) {
+        self.configuration_generation = self.configuration_generation.wrapping_add(1);
+    }
+
     fn warn(&mut self, message: String) {
         if self.warnings.iter().any(|warning| warning == &message) {
             return;
@@ -2566,7 +2598,15 @@ fn read_disk_source(path: &Path, max_bytes: usize) -> Result<DiskSource, String>
             bytes: metadata.len(),
             modified: metadata.modified().ok(),
         },
+        content_hash: content_hash_bytes(&bytes),
     })
+}
+
+pub(crate) fn content_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.write_usize(bytes.len());
+    hasher.finish()
 }
 
 fn disk_stamp(path: &Path) -> Option<DiskStamp> {
@@ -2597,6 +2637,13 @@ fn absolute_path(path: PathBuf) -> PathBuf {
         }
     }
     normalized
+}
+
+pub(crate) fn canonical_file_uri(uri: &Url) -> Url {
+    uri.to_file_path()
+        .ok()
+        .and_then(|path| Url::from_file_path(absolute_path(path)).ok())
+        .unwrap_or_else(|| uri.clone())
 }
 
 fn path_stamp(path: &Path) -> Option<PathStamp> {
@@ -2773,6 +2820,20 @@ fn is_pascal_path(path: &Path) -> bool {
 fn extension_is(path: &Path, extension: &str) -> bool {
     path.extension()
         .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(extension))
+}
+
+fn is_configuration_path(uri: &Url) -> bool {
+    let Ok(path) = uri.to_file_path() else {
+        return false;
+    };
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(".lint4d.toml"))
+        || path.extension().is_some_and(|extension| {
+            matches!(
+                extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                "dproj" | "dpr" | "dpk" | "optset"
+            )
+        })
 }
 
 #[cfg(test)]

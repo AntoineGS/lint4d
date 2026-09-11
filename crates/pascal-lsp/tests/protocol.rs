@@ -471,6 +471,81 @@ fn workspace_edit_uris(edit: &Value) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+fn assert_exact_rename_edits(
+    edit: &Value,
+    path: &Path,
+    source: &str,
+    needle: &str,
+    occurrences: usize,
+    new_name: &str,
+) {
+    let changes = edit["documentChanges"]
+        .as_array()
+        .expect("document changes");
+    let mut actual = changes
+        .iter()
+        .flat_map(|change| {
+            let uri = change["textDocument"]["uri"]
+                .as_str()
+                .expect("changed document URI")
+                .to_owned();
+            change["edits"]
+                .as_array()
+                .expect("document edits")
+                .iter()
+                .map(move |edit| {
+                    let start = &edit["range"]["start"];
+                    let end = &edit["range"]["end"];
+                    (
+                        uri.clone(),
+                        Position::new(
+                            start["line"].as_u64().expect("start line") as u32,
+                            start["character"].as_u64().expect("start character") as u32,
+                        ),
+                        Position::new(
+                            end["line"].as_u64().expect("end line") as u32,
+                            end["character"].as_u64().expect("end character") as u32,
+                        ),
+                        edit["newText"].as_str().expect("replacement").to_owned(),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut expected = (0..occurrences)
+        .map(|occurrence| {
+            let start = position_of(source, needle, occurrence);
+            let end = Position::new(
+                start.line,
+                start.character + needle.encode_utf16().count() as u32,
+            );
+            (uri(path).to_string(), start, end, new_name.to_owned())
+        })
+        .collect::<Vec<_>>();
+    let sort_edits = |edits: &mut Vec<(String, Position, Position, String)>| {
+        edits.sort_by(|left, right| {
+            (
+                &left.0,
+                left.1.line,
+                left.1.character,
+                left.2.line,
+                left.2.character,
+                &left.3,
+            )
+                .cmp(&(
+                    &right.0,
+                    right.1.line,
+                    right.1.character,
+                    right.2.line,
+                    right.2.character,
+                    &right.3,
+                ))
+        });
+    };
+    sort_edits(&mut actual);
+    sort_edits(&mut expected);
+    assert_eq!(actual, expected);
+}
+
 fn standard_workspace() -> (TempDir, PathBuf, PathBuf, String, String) {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("workspace with spaces");
@@ -3224,6 +3299,402 @@ fn local_rename_does_not_use_the_workspace_retained_file_cap_for_unrelated_sourc
 }
 
 #[test]
+fn local_rename_ignores_unresolved_imports_when_binding_is_provably_local() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nuses MissingSdkUnit;\nimplementation\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\nend;\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("local-rename-missing-import".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "LocalValue", 0),
+            "newName": "renamedLocalValue"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "a proven local rename must not depend on unrelated imports: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("local rename result")),
+        HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_ignores_unresolved_imports_when_binding_is_provably_self_contained() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = "unit Provider;\ninterface\nuses MissingSdkUnit;\ntype\n  TLog = class\n  public\n    const kSQLDebugFile = 'debug.sql';\n  end;\nimplementation\nprocedure Use;\nbegin\n  Log(TLog.kSQLDebugFile);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("self-contained-public-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "kSQLDebugFile", 0),
+            "newName": "K_SQL_DEBUG_FILE"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "same-document public binding must not depend on an unresolved SDK import: {response:?}"
+    );
+    assert_eq!(
+        response
+            .result
+            .as_ref()
+            .expect("self-contained rename result")["documentChanges"]
+            .as_array()
+            .expect("document changes")
+            .iter()
+            .map(|change| change["edits"].as_array().expect("document edits").len())
+            .sum::<usize>(),
+        2,
+        "the declaration and same-document reference must both be edited"
+    );
+    assert_exact_rename_edits(
+        response
+            .result
+            .as_ref()
+            .expect("self-contained rename result"),
+        &provider,
+        provider_source,
+        "kSQLDebugFile",
+        2,
+        "K_SQL_DEBUG_FILE",
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("self-contained rename result")),
+        HashSet::from([uri(&provider).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_rejects_self_contained_global_fallback_inside_unknown_ancestor_method() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TChild = class(TUnknownAncestor)\n  public\n    procedure Use;\n  end;\nconst\n  badConst = 1;\nimplementation\nprocedure TChild.Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("unknown-ancestor-global-fallback-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some(),
+        "a global fallback inside a method with an unknown ancestor is not self-contained: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_rejects_global_fallback_through_unknown_local_intermediate_base() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = "unit Provider;\ninterface\nuses MissingSdk;\nconst badConst = 1;\ntype TLocalBase = class(TUnknownAncestor) end;\nTChild = class(TLocalBase)\n  procedure Use;\nend;\nimplementation\nprocedure TChild.Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("unknown-local-intermediate-base-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "GOOD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some(),
+        "an unknown grandparent must not make a global fallback self-contained: {response:?}"
+    );
+    assert!(
+        response.result.is_none(),
+        "an unsafe intermediate-base rename must not return partial edits: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_rejects_global_fallback_through_local_alias_to_unknown_base() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = "unit Provider;\ninterface\nuses MissingSdk;\nconst badConst = 1;\ntype TLocalBase = TUnknownAncestor;\nTChild = class(TLocalBase)\n  procedure Use;\nend;\nimplementation\nprocedure TChild.Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("unknown-local-alias-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "GOOD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some(),
+        "an unknown aliased grandparent must not make a global fallback self-contained: {response:?}"
+    );
+    assert!(
+        response.result.is_none(),
+        "an unsafe alias rename must not return partial edits: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_allows_same_class_member_over_unknown_ancestor_fallback() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TChild = class(TUnknownAncestor)\n  public\n    const badConst = 1;\n    procedure Use;\n  end;\nimplementation\nprocedure TChild.Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("same-class-member-unknown-ancestor-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "a declared same-class member outranks an unknown ancestor: {response:?}"
+    );
+    assert_exact_rename_edits(
+        response
+            .result
+            .as_ref()
+            .expect("same-class member rename result"),
+        &provider,
+        provider_source,
+        "badConst",
+        2,
+        "BAD_CONST",
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("same-class member rename result")),
+        HashSet::from([uri(&provider).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_allows_local_parameter_over_unknown_ancestor_fallback() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TChild = class(TUnknownAncestor)\n  public\n    procedure Use(badConst: Integer);\n  end;\nimplementation\nprocedure TChild.Use(badConst: Integer);\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("local-parameter-unknown-ancestor-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 1),
+            "newName": "renamedParam"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "a local parameter outranks an unknown ancestor: {response:?}"
+    );
+    assert_exact_rename_edits(
+        response
+            .result
+            .as_ref()
+            .expect("local parameter rename result"),
+        &provider,
+        provider_source,
+        "badConst",
+        3,
+        "renamedParam",
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("local parameter rename result")),
+        HashSet::from([uri(&provider).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_refuses_an_imported_consumer_with_a_missing_potential_shadow() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source = "unit Provider;\ninterface\nuses MissingProviderSdk;\ntype\n  TLog = class\n  public\n    const kSQLDebugFile = 'debug.sql';\n  end;\nimplementation\nprocedure Use;\nbegin\n  Log(TLog.kSQLDebugFile);\nend;\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider, MissingShadowUnit;\nimplementation\nprocedure Use;\nbegin\n  Log(TLog.kSQLDebugFile);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("missing-consumer-shadow-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "kSQLDebugFile", 0),
+            "newName": "K_SQL_DEBUG_FILE"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("a missing potentially shadowing consumer import must refuse rename");
+    assert!(
+        error.message.to_ascii_lowercase().contains("incomplete")
+            || error.message.to_ascii_lowercase().contains("import"),
+        "unexpected missing-consumer error: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_refuses_an_unknown_receiver_in_a_candidate_reference() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = "unit Provider;\ninterface\nuses MissingSdkUnit;\ntype\n  TLog = class\n  public\n    const kSQLDebugFile = 'debug.sql';\n  end;\nimplementation\nprocedure Use;\nbegin\n  Log(UnknownReceiver.kSQLDebugFile);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("unknown-receiver-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "kSQLDebugFile", 0),
+            "newName": "K_SQL_DEBUG_FILE"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some(),
+        "an unknown receiver must not authorize a partial public rename"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_refuses_a_proposed_name_reference_through_an_import() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let other = root.join("OtherUnit.pas");
+    let provider_source = "unit Provider;\ninterface\nuses MissingSdkUnit, OtherUnit;\ntype\n  TLog = class\n  public\n    const kSQLDebugFile = 'debug.sql';\n  end;\nimplementation\nprocedure Use;\nbegin\n  Log(TLog.kSQLDebugFile);\n  Log(OtherUnit.K_SQL_DEBUG_FILE);\nend;\nend.\n";
+    let other_source = "unit OtherUnit;\ninterface\nconst\n  K_SQL_DEBUG_FILE = 'other.sql';\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&other, other_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("proposed-import-reference-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "kSQLDebugFile", 0),
+            "newName": "K_SQL_DEBUG_FILE"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some(),
+        "a proposed name already used through an import must refuse rename"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn public_rename_does_not_silently_omit_include_only_consumers() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -3232,8 +3703,7 @@ fn public_rename_does_not_silently_omit_include_only_consumers() {
     let body = root.join("Body.inc");
     let provider_source =
         "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
-    let consumer_source =
-        "unit Consumer;\ninterface\nuses Provider;\nimplementation\n{$I Body.inc}\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nimplementation\n{$I Body.inc}\nend.\n";
     write_file(&provider, provider_source);
     write_file(&consumer, consumer_source);
     write_file(&body, "procedure Use;\nbegin\n  Log(badConst);\nend;\n");
@@ -3258,6 +3728,200 @@ fn public_rename_does_not_silently_omit_include_only_consumers() {
         error.message.to_ascii_lowercase().contains("include"),
         "unexpected include error: {}",
         error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_allows_an_irrelevant_source_bearing_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let body = root.join("Body.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Provider;\nimplementation\n{$I Body.inc}\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&body, "procedure Unrelated;\nbegin\nend;\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("irrelevant-source-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "an irrelevant source-bearing include must not block the rename: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("rename result")),
+        HashSet::from([uri(&provider).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_rejects_an_unresolved_include_in_an_unrelated_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let unrelated = root.join("Unrelated.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let unrelated_source =
+        "unit Unrelated;\ninterface\n{$I MissingUnrelated.inc}\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&unrelated, unrelated_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("unrelated-unresolved-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("an unresolved include must block rename even without uses/target tokens");
+    assert!(
+        error.message.to_ascii_lowercase().contains("include"),
+        "unexpected unresolved unrelated include error: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_audits_nested_source_bearing_include_before_allowing_irrelevant_content() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let parent = root.join("Parent.inc");
+    let nested = root.join("Nested.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nimplementation\n{$I Parent.inc}\nend.\n";
+    let parent_source = "procedure Irrelevant;\nbegin\nend;\n{$I Nested.inc}\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&parent, parent_source);
+    write_file(&nested, "{$DEFINE SAFE}\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("nested-safe-source-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "a fully audited irrelevant nested include must allow rename: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("rename result")),
+        HashSet::from([uri(&provider).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_rejects_a_nested_candidate_in_a_source_bearing_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let parent = root.join("Parent.inc");
+    let nested = root.join("Nested.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nimplementation\n{$I Parent.inc}\nend.\n";
+    let parent_source = "procedure Irrelevant;\nbegin\nend;\n{$I Nested.inc}\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&parent, parent_source);
+    write_file(&nested, "procedure Use;\nbegin\n  Log(badConst);\nend;\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("nested-candidate-source-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("nested source content with a candidate must fail closed");
+    assert!(
+        error.message.to_ascii_lowercase().contains("include"),
+        "unexpected nested candidate error: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_rejects_a_missing_nested_include_without_parent_candidate_tokens() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let parent = root.join("Parent.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nimplementation\n{$I Parent.inc}\nend.\n";
+    let parent_source = "procedure Irrelevant;\nbegin\nend;\n{$I MissingNested.inc}\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&parent, parent_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("nested-missing-source-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("a missing nested include must fail closed");
+    assert!(
+        error.message.to_ascii_lowercase().contains("include"),
+        "unexpected nested missing include error: {error:?}"
     );
     server.shutdown();
 }
@@ -3978,6 +4642,400 @@ fn rename_allows_harmless_compiler_directive_includes_and_unrelated_conditionals
     assert_eq!(
         workspace_edit_uris(&response.result.expect("rename result")),
         HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_resolves_includes_from_source_then_ordered_project_paths() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_dir = root.join("src");
+    let include_one = root.join("include-one");
+    let include_two = root.join("include-two");
+    let main = source_dir.join("Main.pas");
+    let source = "unit Main;\ninterface\n{$I Shared.inc}\n{$I Ordered.inc}\nconst\n  badConst = 1;\nimplementation\nend.\n";
+
+    write_file(
+        &source_dir.join("Shared.inc"),
+        "// source-directory include\n{$DEFINE LOCAL}\n",
+    );
+    write_file(
+        &include_one.join("Shared.inc"),
+        "procedure MustNotBeSelected; begin Log(badConst); end;\n",
+    );
+    write_file(
+        &include_one.join("Ordered.inc"),
+        "{$IFDEF FIRST}\n{$DEFINE FIRST_VALUE}\n{$ENDIF}\n",
+    );
+    write_file(
+        &include_two.join("Ordered.inc"),
+        "procedure MustNotBeSelected; begin Log(badConst); end;\n",
+    );
+    write_file(&main, source);
+    write_file(&root.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_IncludePath>include-one;include-two</DCC_IncludePath><DCCReference Include=\"src\\Main.pas\"/></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        &root,
+        json!({"projectFile": "App.dproj", "sourcePaths": ["src"]}),
+    );
+    let request_id = RequestId::from("ordered-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "source and ordered project includes must resolve safely: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("rename result")),
+        HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_falls_back_to_delphi_unit_then_client_source_paths_for_includes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let unit_include = root.join("unit-includes");
+    let client_include = root.join("client-includes");
+    let main = root.join("src/Main.pas");
+    let source =
+        "unit Main;\ninterface\n{$I Fallback.inc}\nconst\n  badConst = 1;\nimplementation\nend.\n";
+
+    write_file(
+        &unit_include.join("Fallback.inc"),
+        "{$IFDEF UNIT_PATH}\n{$DEFINE UNIT_VALUE}\n{$ENDIF}\n",
+    );
+    write_file(
+        &client_include.join("Fallback.inc"),
+        "procedure MustNotBeSelected; begin Log(badConst); end;\n",
+    );
+    write_file(&main, source);
+    write_file(&root.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>unit-includes</DCC_UnitSearchPath><DCCReference Include=\"src\\Main.pas\"/></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        &root,
+        json!({"projectFile": "App.dproj", "sourcePaths": ["client-includes"]}),
+    );
+    let request_id = RequestId::from("fallback-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "DCC_UnitSearchPath must precede client source paths for includes: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_accepts_realistic_conditional_directive_include_and_edits_unopened_consumer() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let common = root.join("Common");
+    let provider = root.join("src/Provider.pas");
+    let consumer = root.join("src/Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\n{$I MDCompilers.inc}\nimplementation\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    let compiler_include = "// compiler selection only\n{$IFDEF badConst}\n{$DEFINE TARGET_NAME_IS_A_COMPILER_SYMBOL}\n{$ENDIF}\n{$IFDEF LEGACY_COMPILER}\n{$DEFINE LEGACY}\n{$ELSEIF Defined(NEW_COMPILER)}\n{$DEFINE MODERN}\n{$ENDIF}\n{$IF CompilerVersion >= 24}\n{$DEFINE DELPHI_XE3_UP}\n{$ENDIF}\n{$IFDEF CPPB_3_UP}\n{$ObjExportAll On}\n{$ENDIF}\n";
+
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&common.join("MDCompilers.inc"), compiler_include);
+    write_file(&root.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCCReference Include=\"src\\Provider.pas\"/><DCCReference Include=\"src\\Consumer.pas\"/></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        &root,
+        json!({"projectFile": "App.dproj", "sourcePaths": ["Common"]}),
+    );
+    let request_id = RequestId::from("conditional-include-unopened-consumer".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "directive-only conditional include must not block rename: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("rename result")),
+        HashSet::from([uri(&provider).to_string(), uri(&consumer).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_pascal_symbol_in_declared_include_expression() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\n{$I Shared.inc}\nend.\n";
+    write_file(
+        &root.join("Shared.inc"),
+        "{$IF Declared(badConst)}\n{$DEFINE EXISTS}\n{$ENDIF}\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("declared-include-expression-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "GOOD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("Pascal-dependent Declared expression must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.to_ascii_lowercase().contains("include"));
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_pascal_symbol_in_elseif_include_expression() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\n{$I Shared.inc}\nend.\n";
+    write_file(
+        &root.join("Shared.inc"),
+        "{$IF CompilerVersion >= 24}\n{$DEFINE SAFE}\n{$ELSEIF badConst = 1}\n{$DEFINE TARGET}\n{$ENDIF}\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("elseif-include-expression-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "GOOD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("Pascal-dependent ELSEIF expression must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.to_ascii_lowercase().contains("include"));
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_excessive_nested_include_depth_without_crashing() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\n{$I chain0.inc}\nend.\n";
+    write_file(&main, source);
+    for index in 0..500 {
+        let body = if index == 499 {
+            "{$DEFINE SAFE}\n".to_string()
+        } else {
+            format!("{{$I chain{}.inc}}\n", index + 1)
+        };
+        write_file(&root.join(format!("chain{index}.inc")), &body);
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("nested-include-depth-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "GOOD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("excessive include depth must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.to_ascii_lowercase().contains("depth"));
+    server.shutdown();
+}
+
+#[test]
+fn public_rename_accounts_for_bounded_include_owner_summaries() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nimplementation\n{$I Shared.inc}\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&root.join("Shared.inc"), "{$DEFINE SAFE}\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFiles": 1}));
+    let request_id = RequestId::from("include-owner-retained-limit".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "GOOD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("include owner retention must fail before omission");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error
+            .message
+            .to_ascii_lowercase()
+            .contains("include owners")
+    );
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_revalidates_resolved_include_content_with_equal_metadata() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let source = "unit Main;\ninterface\nimplementation\n{$I Shared.inc}\nprocedure Run;\nvar\n  badConst: Integer;\nbegin\n  badConst := 1;\nend;\nend.\n";
+    write_file(&include, "{$DEFINE FEATURE}\n");
+    write_file(&main, source);
+    let original_metadata = fs::metadata(&include).expect("include metadata");
+
+    let watch_path = CString::new(include.to_string_lossy().as_bytes()).expect("watch path");
+    let fd = unsafe { inotify_init1(0) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
+    assert!(watch >= 0, "inotify_add_watch failed");
+    let include_for_watcher = include.clone();
+    let watcher = thread::spawn(move || {
+        wait_for_close_events(fd, 1);
+        write_file(&include_for_watcher, "{$DEFINE CHANGED}\n");
+        restore_mtime(&include_for_watcher, &original_metadata);
+        assert_eq!(
+            fs::metadata(&include_for_watcher)
+                .expect("changed include metadata")
+                .modified()
+                .expect("changed include mtime"),
+            original_metadata
+                .modified()
+                .expect("original include mtime")
+        );
+    });
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("include-content-race".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    watcher.join().expect("include watcher must finish");
+    let error = response
+        .error
+        .expect("changed include content must invalidate the rename");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.to_ascii_lowercase().contains("changed")
+            || error.message.to_ascii_lowercase().contains("metadata"),
+        "unexpected include race error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_branch_dependent_declarations_even_when_the_directive_parses() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\n{$IFDEF FIRST}\nconst\n  badConst = 1;\n{$ELSEIF SECOND}\nconst\n  badConst = 2;\n{$ELSE}\nconst\n  badConst = 3;\n{$ENDIF}\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("conditional-declaration-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("branch-dependent declarations must fail closed");
+    assert!(
+        error.message.to_ascii_lowercase().contains("conditional")
+            || error.message.to_ascii_lowercase().contains("ambiguous"),
+        "unexpected conditional declaration error: {}",
+        error.message
     );
     server.shutdown();
 }

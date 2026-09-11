@@ -190,6 +190,7 @@ pub(crate) fn code_actions_from_input(
         &candidate_names,
         mode,
         Some(SnapshotSeed::new(target_record)),
+        &[],
         cancel,
     ) {
         Ok(snapshot) => snapshot,
@@ -313,6 +314,7 @@ pub(crate) fn resolve_from_input(
         &candidate_names,
         mode,
         Some(SnapshotSeed::new(target_record)),
+        &[],
         cancel,
     ) {
         Ok(snapshot) => snapshot,

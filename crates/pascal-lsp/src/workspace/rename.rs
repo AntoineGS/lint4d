@@ -7,11 +7,12 @@
 //! cache or the filesystem.
 
 use super::{
-    DiskStamp, OpenDocument, PathStamp, Workspace, WorkspaceOptions, absolute_path,
+    ContextKey, DiskStamp, OpenDocument, PathStamp, Workspace, WorkspaceOptions, absolute_path,
     canonical_file_uri, disk_stamp, is_pascal_path, path_stamp, path_starts_with_ci,
     paths_equal_ci, read_disk_source,
 };
 use crate::NavigationIndex;
+use crate::project::ProjectContext;
 use crate::text;
 use lsp_types::{
     DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
@@ -20,9 +21,9 @@ use lsp_types::{
 use pascal_core::decode_bytes;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
 
@@ -35,6 +36,14 @@ const MAX_SNAPSHOT_DEPENDENCY_FILES: usize = 512;
 const MAX_RENAME_TRAVERSAL_ENTRIES: usize = 1_048_576;
 const MAX_RENAME_SCANNED_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_RENAME_SCAN_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RENAME_INCLUDE_FILES: usize = 4_096;
+const MAX_RENAME_INCLUDE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_RENAME_INCLUDE_DIRECTIVES: usize = 16_384;
+const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
+const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
+const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
+const INCLUDE_BYTE_BUDGET_ERROR: &str =
+    "include byte limit would be exceeded before reading the file";
 
 #[derive(Debug, Clone)]
 pub(crate) struct OverlayInput {
@@ -92,7 +101,6 @@ pub(crate) struct RenameSnapshot {
     pub(crate) incomplete_reason: Option<String>,
     pub(crate) include_errors: Vec<String>,
     pub(crate) baseline_records: Vec<SourceRecord>,
-    pub(crate) max_file_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,9 +218,16 @@ impl Workspace {
                         record.uri
                     ));
                 };
-                if document.version != record.version.unwrap_or_default()
-                    || document.text.as_deref() != Some(record.text.as_str())
-                {
+                let text_changed = record.content_hash.map_or_else(
+                    || document.text.as_deref() != Some(record.text.as_str()),
+                    |expected| {
+                        document
+                            .text
+                            .as_deref()
+                            .is_none_or(|text| text_content_hash(text) != expected)
+                    },
+                );
+                if document.version != record.version.unwrap_or_default() || text_changed {
                     return Err(format!(
                         "source changed while resolving {}; retry the request",
                         record.uri
@@ -274,8 +289,11 @@ pub(crate) fn revalidate_input(
                     record.uri
                 ));
             };
-            if overlay.version != record.version.unwrap_or_default() || overlay.text != record.text
-            {
+            let text_changed = record.content_hash.map_or_else(
+                || overlay.text != record.text,
+                |expected| text_content_hash(&overlay.text) != expected,
+            );
+            if overlay.version != record.version.unwrap_or_default() || text_changed {
                 return Err(format!(
                     "source changed while resolving {}; retry the request",
                     record.uri
@@ -396,6 +414,12 @@ fn file_content_hash(path: &Path, cancel: &AtomicBool) -> Result<u64, String> {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     Ok(hasher.finish())
+}
+
+fn text_content_hash(source: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug)]
@@ -546,20 +570,20 @@ pub(crate) fn input_source_is_editable(input: &WorkspaceInput, uri: &Url) -> boo
     workspace.accepts_path(&path) && is_editable_source_path(&workspace, &path)
 }
 
+type InputBindingInfo = (
+    String,
+    SourceRecord,
+    Option<(crate::navigation::RenameBindingInfo, bool)>,
+);
+
 fn binding_info_for_input(
     input: &WorkspaceInput,
     uri: &Url,
     position: Position,
-) -> Result<
-    (
-        String,
-        SourceRecord,
-        Option<crate::navigation::RenameBindingInfo>,
-    ),
-    String,
-> {
+    additional_names: &[String],
+) -> Result<InputBindingInfo, String> {
     let (source, record) = source_for_input(input, uri)?;
-    let info = binding_info_for_source(uri, &source, position).ok();
+    let info = binding_info_for_source(uri, &source, position, additional_names).ok();
     Ok((source, record, info))
 }
 
@@ -567,13 +591,16 @@ fn binding_info_for_source(
     uri: &Url,
     source: &str,
     position: Position,
-) -> Result<crate::navigation::RenameBindingInfo, String> {
+    additional_names: &[String],
+) -> Result<(crate::navigation::RenameBindingInfo, bool), String> {
     let uri = canonical_file_uri(uri);
     let mut index = NavigationIndex::new();
     index
         .update(uri.clone(), source.to_owned())
         .map_err(|error| format!("could not index rename source {uri}: {error}"))?;
-    index.rename_binding_info(&uri, position)
+    let info = index.rename_binding_info(&uri, position)?;
+    let self_contained = index.self_contained_rename_binding(&uri, position, additional_names);
+    Ok((info, self_contained))
 }
 
 fn contains_identifier(source: &str, name: &str) -> bool {
@@ -677,7 +704,7 @@ pub(crate) fn prepare_from_input(
         }
     };
     let (planning_source, target_record, binding_info) =
-        match binding_info_for_input(&input, &uri, position) {
+        match binding_info_for_input(&input, &uri, position, &[]) {
             Ok(result) => result,
             Err(error) => return failed(source_generation, configuration_generation, error),
         };
@@ -688,8 +715,8 @@ pub(crate) fn prepare_from_input(
             "rename target source changed while classifying; retry the request".to_string(),
         );
     }
-    let (mode, candidate_names) = match binding_info {
-        Some(info) => {
+    let (mode, candidate_names, self_contained) = match binding_info {
+        Some((info, self_contained)) => {
             let mut names = info.names;
             if names.is_empty() {
                 names.push(original_name.clone());
@@ -701,9 +728,15 @@ pub(crate) fn prepare_from_input(
                     SnapshotMode::Workspace
                 },
                 names,
+                self_contained,
             )
         }
-        None => (SnapshotMode::Workspace, vec![original_name]),
+        None => (SnapshotMode::Workspace, vec![original_name], false),
+    };
+    let skip_imports_for: &[Url] = if self_contained {
+        std::slice::from_ref(&uri)
+    } else {
+        &[]
     };
     let snapshot = match build_snapshot(
         &input,
@@ -711,6 +744,7 @@ pub(crate) fn prepare_from_input(
         &candidate_names,
         mode,
         Some(SnapshotSeed::new(target_record)),
+        skip_imports_for,
         cancel,
     ) {
         Ok(snapshot) => snapshot,
@@ -778,8 +812,9 @@ pub(crate) fn rename_from_input(
             );
         }
     };
+    let additional_names = [new_name.to_owned()];
     let (planning_source, target_record, binding_info) =
-        match binding_info_for_input(&input, &uri, position) {
+        match binding_info_for_input(&input, &uri, position, &additional_names) {
             Ok(result) => result,
             Err(error) => return failed(source_generation, configuration_generation, error),
         };
@@ -790,8 +825,8 @@ pub(crate) fn rename_from_input(
             "rename target source changed while classifying; retry the request".to_string(),
         );
     }
-    let (mode, candidate_names) = match binding_info {
-        Some(info) => {
+    let (mode, candidate_names, self_contained) = match binding_info {
+        Some((info, self_contained)) => {
             let mut names = info.names;
             if names.is_empty() {
                 names.push(original_name.clone());
@@ -804,12 +839,19 @@ pub(crate) fn rename_from_input(
                     SnapshotMode::Workspace
                 },
                 names,
+                self_contained,
             )
         }
         None => (
             SnapshotMode::Workspace,
             vec![original_name, new_name.to_string()],
+            false,
         ),
+    };
+    let skip_imports_for: &[Url] = if self_contained {
+        std::slice::from_ref(&uri)
+    } else {
+        &[]
     };
     let snapshot = match build_snapshot(
         &input,
@@ -817,6 +859,7 @@ pub(crate) fn rename_from_input(
         &candidate_names,
         mode,
         Some(SnapshotSeed::new(target_record)),
+        skip_imports_for,
         cancel,
     ) {
         Ok(snapshot) => snapshot,
@@ -923,6 +966,7 @@ pub(crate) fn build_snapshot(
     candidate_names: &[String],
     mode: SnapshotMode,
     priority_seed: Option<SnapshotSeed>,
+    skip_imports_for: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     if is_cancelled(cancel) {
@@ -1164,21 +1208,70 @@ pub(crate) fn build_snapshot(
         let should_index = is_priority
             || candidate_names.is_empty()
             || contains_any_identifier(&source, candidate_names);
-        for include_path in include_paths(&uri, &source) {
-            add_baseline_path(&mut baseline_paths, &mut baseline_keys, include_path);
-        }
-        if mode == SnapshotMode::Workspace {
-            if let Some(error) = relevant_include_error(
-                &uri,
-                &source,
-                candidate_names,
-                &mut baseline_content_hashes,
-                cancel,
-            )? {
-                include_errors.push(error);
-            }
-        }
         if !should_index {
+            let owner_directives = directives(&source);
+            if owner_directives
+                .iter()
+                .any(|directive| directive.kind == DirectiveKind::Include)
+            {
+                let Some(summary) = include_owner_summary(&source, &owner_directives) else {
+                    complete = false;
+                    incomplete_reason.get_or_insert_with(|| {
+                        format!(
+                            "include owner {path:?} exceeds the bounded directive summary limit ({MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES} bytes)"
+                        )
+                    });
+                    continue;
+                };
+                let summary_bytes = summary.len();
+                if summary_bytes > input.options.limits.max_file_bytes {
+                    complete = false;
+                    incomplete_reason.get_or_insert_with(|| {
+                        format!(
+                            "include owner {path:?} directive summary exceeds the configured per-file limit"
+                        )
+                    });
+                    continue;
+                }
+                if retained_files >= input.options.limits.max_files
+                    || retained_bytes.saturating_add(summary_bytes)
+                        > input.options.limits.max_total_bytes
+                {
+                    complete = false;
+                    incomplete_reason.get_or_insert_with(|| {
+                        if retained_files >= input.options.limits.max_files {
+                            format!(
+                                "retained source file limit ({}) reached while retaining include owners",
+                                input.options.limits.max_files
+                            )
+                        } else {
+                            format!(
+                                "retained source byte limit ({}) reached while retaining include owners",
+                                input.options.limits.max_total_bytes
+                            )
+                        }
+                    });
+                    continue;
+                }
+
+                let mut summary_record = record;
+                summary_record.text = summary.clone();
+                if summary_record.open {
+                    summary_record.content_hash = Some(text_content_hash(&source));
+                } else {
+                    let stamp = summary_record.stamp.take();
+                    summary_record.path = Some(path.clone());
+                    summary_record.path_stamp = stamp.map(|stamp| PathStamp {
+                        bytes: stamp.bytes,
+                        modified: stamp.modified,
+                        is_dir: false,
+                    });
+                }
+                sources.insert(uri.clone(), summary);
+                records.insert(uri, summary_record);
+                retained_files = retained_files.saturating_add(1);
+                retained_bytes = retained_bytes.saturating_add(summary_bytes);
+            }
             continue;
         }
         if source.len() > input.options.limits.max_file_bytes {
@@ -1281,6 +1374,12 @@ pub(crate) fn build_snapshot(
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         if let Some(context_key) = contexts.get(&uri).cloned() {
+            if skip_imports_for.iter().any(|skip_uri| skip_uri == &uri) {
+                loader
+                    .index
+                    .bind_imports(&uri, std::iter::empty::<(String, Url)>());
+                continue;
+            }
             let import_count = loader.index.imports(&uri).len();
             let dependencies = loader.load_imports(&uri, &context_key, &mut pins);
             if dependencies.len() < import_count {
@@ -1362,9 +1461,6 @@ pub(crate) fn build_snapshot(
                 },
             )
         };
-        for include_path in include_paths(&uri, &source) {
-            add_baseline_path(&mut baseline_paths, &mut baseline_keys, include_path);
-        }
         if let Some(context_key) = loader.document_contexts.get(&uri).cloned() {
             contexts.insert(uri.clone(), context_key);
         }
@@ -1373,6 +1469,30 @@ pub(crate) fn build_snapshot(
         }
         sources.insert(uri.clone(), source);
         records.insert(uri, record);
+    }
+
+    let include_audit = audit_includes(IncludeAuditor {
+        sources: &sources,
+        loader: &mut loader,
+        contexts: &mut contexts,
+        baseline_paths: &mut baseline_paths,
+        baseline_keys: &mut baseline_keys,
+        baseline_content_hashes: &mut baseline_content_hashes,
+        candidate_names,
+        max_file_bytes: input.options.limits.max_file_bytes,
+        cancel,
+        cache: HashMap::new(),
+        active: HashSet::new(),
+        files_read: 0,
+        bytes_read: 0,
+        directives_seen: 0,
+        stopped: false,
+        result: IncludeAuditResult::default(),
+    })?;
+    include_errors.extend(include_audit.errors);
+    if let Some(reason) = include_audit.incomplete_reason {
+        complete = false;
+        incomplete_reason.get_or_insert(reason);
     }
 
     for context_key in loader.contexts.keys().cloned().collect::<Vec<_>>() {
@@ -1404,7 +1524,6 @@ pub(crate) fn build_snapshot(
         incomplete_reason,
         include_errors,
         baseline_records,
-        max_file_bytes: input.options.limits.max_file_bytes,
     })
 }
 
@@ -1878,73 +1997,429 @@ pub(crate) fn check_includes(
                 ));
             }
         }
-
-        for directive in directives(source)
-            .into_iter()
-            .filter(|directive| directive.kind == DirectiveKind::Include)
-        {
-            let Some(path) = include_path(source_uri, source, &directive) else {
-                return Err(format!(
-                    "rename cannot prove completeness because a relevant include path in {source_uri} is unresolved"
-                ));
-            };
-            let include_source = match read_include(&path, snapshot.max_file_bytes, None) {
-                Ok(source) => source,
-                Err(error) => {
-                    return Err(format!(
-                        "rename cannot prove completeness because include {path:?} could not be read: {error}"
-                    ));
-                }
-            };
-            let include_relevant = target_name
-                .as_deref()
-                .is_some_and(|name| contains_identifier(&include_source.text, name));
-            if !is_harmless_include(&include_source.text) || include_relevant {
-                return Err(format!(
-                    "rename cannot prove completeness because include {path:?} contains source content"
-                ));
-            }
-        }
     }
     Ok(())
 }
 
-fn relevant_include_error(
-    uri: &Url,
-    source: &str,
-    candidate_names: &[String],
-    baseline_content_hashes: &mut HashMap<String, u64>,
-    cancel: &AtomicBool,
-) -> Result<Option<String>, String> {
-    for directive in directives(source)
-        .into_iter()
-        .filter(|directive| directive.kind == DirectiveKind::Include)
-    {
-        let Some(path) = include_path(uri, source, &directive) else {
-            return Ok(Some(format!(
-                "rename cannot prove completeness because an include path in {uri} is unresolved"
-            )));
+#[derive(Debug, Default)]
+struct IncludeAuditResult {
+    errors: Vec<String>,
+    incomplete_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct IncludeLookup {
+    observations: Vec<IncludeObservation>,
+    selected: Option<PathBuf>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IncludeObservation {
+    path: PathBuf,
+    stamp: Option<PathStamp>,
+}
+
+#[derive(Debug, Clone)]
+struct IncludeAnalysis {
+    safe: bool,
+    relevant: bool,
+    reason: Option<String>,
+}
+
+impl IncludeAnalysis {
+    fn safe(relevant: bool) -> Self {
+        Self {
+            safe: true,
+            relevant,
+            reason: None,
+        }
+    }
+
+    fn unsafe_with_reason(reason: impl Into<String>, relevant: bool) -> Self {
+        Self {
+            safe: false,
+            relevant,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+struct IncludeAuditor<'a> {
+    sources: &'a HashMap<Url, String>,
+    loader: &'a mut Workspace,
+    contexts: &'a mut HashMap<Url, ContextKey>,
+    baseline_paths: &'a mut Vec<BaselinePath>,
+    baseline_keys: &'a mut HashSet<String>,
+    baseline_content_hashes: &'a mut HashMap<String, u64>,
+    candidate_names: &'a [String],
+    max_file_bytes: usize,
+    cancel: &'a AtomicBool,
+    cache: HashMap<String, IncludeAnalysis>,
+    active: HashSet<String>,
+    files_read: usize,
+    bytes_read: usize,
+    directives_seen: usize,
+    stopped: bool,
+    result: IncludeAuditResult,
+}
+
+fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult, String> {
+    let mut uris = auditor.sources.keys().cloned().collect::<Vec<_>>();
+    uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for uri in uris {
+        if auditor.stopped {
+            break;
+        }
+        if is_cancelled(auditor.cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Some(source) = auditor.sources.get(&uri) else {
+            continue;
         };
-        let include_source = match read_include(&path, MAX_RENAME_SCAN_FILE_BYTES, Some(cancel)) {
+        let source_directives = directives(source);
+        if source_directives
+            .iter()
+            .any(|directive| directive.kind == DirectiveKind::Other)
+        {
+            auditor.record_error(format!(
+                "rename cannot prove completeness because include owner {uri} contains an unsupported directive"
+            ));
+            auditor.stopped = true;
+            break;
+        }
+        let include_directives = source_directives
+            .into_iter()
+            .filter(|directive| directive.kind == DirectiveKind::Include)
+            .collect::<Vec<_>>();
+        if include_directives.is_empty() {
+            continue;
+        }
+
+        let context = auditor.context_for_source(&uri)?;
+        for directive in include_directives {
+            if auditor.stopped {
+                break;
+            }
+            if is_cancelled(auditor.cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if !auditor.take_directive_budget() {
+                auditor.record_error(format!(
+                    "rename cannot prove completeness because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
+                ));
+                auditor.stopped = true;
+                break;
+            }
+            auditor.inspect_top_level(&uri, &directive, context.as_ref())?;
+        }
+    }
+
+    Ok(auditor.result)
+}
+
+impl IncludeAuditor<'_> {
+    fn context_for_source(&mut self, uri: &Url) -> Result<Option<ProjectContext>, String> {
+        let context_key = if let Some(context_key) = self.contexts.get(uri).cloned() {
+            Some(context_key)
+        } else if let Some(context_key) = self.loader.document_contexts.get(uri).cloned() {
+            self.contexts.insert(uri.clone(), context_key.clone());
+            Some(context_key)
+        } else {
+            let context_key = self.loader.context_for_uri(uri);
+            if let Some(context_key) = &context_key {
+                self.contexts.insert(uri.clone(), context_key.clone());
+            }
+            context_key
+        };
+
+        let Some(context_key) = context_key else {
+            return Ok(None);
+        };
+        let workspace: &Workspace = &*self.loader;
+        capture_context_baseline(
+            workspace,
+            &context_key,
+            self.baseline_paths,
+            self.baseline_keys,
+            self.baseline_content_hashes,
+            self.cancel,
+        )?;
+        let Some(state) = self.loader.contexts.get(&context_key) else {
+            return Ok(None);
+        };
+        let context = state.context.clone();
+        if !context.discovery_complete {
+            self.result.incomplete_reason.get_or_insert_with(|| {
+                format!("project context is ambiguous or incomplete for {uri}")
+            });
+        }
+        Ok(Some(context))
+    }
+
+    fn take_directive_budget(&mut self) -> bool {
+        if self.directives_seen >= MAX_RENAME_INCLUDE_DIRECTIVES {
+            return false;
+        }
+        self.directives_seen += 1;
+        true
+    }
+
+    fn inspect_top_level(
+        &mut self,
+        uri: &Url,
+        directive: &Directive,
+        context: Option<&ProjectContext>,
+    ) -> Result<(), String> {
+        let Some(owner_path) = uri.to_file_path().ok().map(absolute_path) else {
+            self.record_error(format!(
+                "rename cannot prove completeness because an include path in {uri} is unresolved"
+            ));
+            self.stopped = true;
+            return Ok(());
+        };
+
+        let directories = include_search_directories(&owner_path, context);
+        let lookup = resolve_include_path(directive, &directories);
+        self.observe_lookup(&lookup);
+        if let Some(error) = lookup.error {
+            self.record_error(format!(
+                "rename cannot prove completeness because include in {uri} could not be read: {error}"
+            ));
+            self.stopped = true;
+            return Ok(());
+        }
+        let Some(path) = lookup.selected else {
+            self.record_error(format!(
+                "rename cannot prove completeness because an include path in {uri} is unresolved"
+            ));
+            self.stopped = true;
+            return Ok(());
+        };
+
+        let analysis = self.inspect_include_file(&path, context, 0)?;
+        if !analysis.safe || analysis.relevant {
+            let reason = analysis
+                .reason
+                .unwrap_or_else(|| format!("include {path:?} contains source content"));
+            self.record_error(format!("rename cannot prove completeness because {reason}"));
+            self.stopped = true;
+        }
+        Ok(())
+    }
+
+    fn inspect_nested(
+        &mut self,
+        owner_path: &Path,
+        directive: &Directive,
+        context: Option<&ProjectContext>,
+        depth: usize,
+    ) -> Result<IncludeAnalysis, String> {
+        if depth >= MAX_RENAME_INCLUDE_DEPTH {
+            self.stopped = true;
+            return Ok(IncludeAnalysis::unsafe_with_reason(
+                format!(
+                    "include in {owner_path:?} exceeds the maximum include nesting depth ({MAX_RENAME_INCLUDE_DEPTH})"
+                ),
+                false,
+            ));
+        }
+        let directories = include_search_directories(owner_path, context);
+        let lookup = resolve_include_path(directive, &directories);
+        self.observe_lookup(&lookup);
+        if let Some(error) = lookup.error {
+            return Ok(IncludeAnalysis::unsafe_with_reason(
+                format!("include in {owner_path:?} could not be read: {error}"),
+                false,
+            ));
+        }
+        let Some(path) = lookup.selected else {
+            return Ok(IncludeAnalysis::unsafe_with_reason(
+                format!("include in {owner_path:?} has an unresolved path"),
+                false,
+            ));
+        };
+        self.inspect_include_file(&path, context, depth + 1)
+    }
+
+    fn inspect_include_file(
+        &mut self,
+        path: &Path,
+        context: Option<&ProjectContext>,
+        depth: usize,
+    ) -> Result<IncludeAnalysis, String> {
+        if is_cancelled(self.cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+
+        if depth > MAX_RENAME_INCLUDE_DEPTH {
+            self.stopped = true;
+            return Ok(IncludeAnalysis::unsafe_with_reason(
+                format!(
+                    "include {path:?} exceeds the maximum include nesting depth ({MAX_RENAME_INCLUDE_DEPTH})"
+                ),
+                false,
+            ));
+        }
+        let directories = include_search_directories(path, context);
+        let cache_key = include_cache_key(path, &directories);
+        let active_key = canonical_include_key(path);
+        if self.active.contains(&active_key) {
+            return Ok(IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has an include cycle"),
+                false,
+            ));
+        }
+        if let Some(analysis) = self.cache.get(&cache_key) {
+            return Ok(analysis.clone());
+        }
+        if self.files_read >= MAX_RENAME_INCLUDE_FILES {
+            self.stopped = true;
+            let analysis = IncludeAnalysis::unsafe_with_reason(
+                format!(
+                    "include {path:?} could not be audited because include file limit ({MAX_RENAME_INCLUDE_FILES}) was reached"
+                ),
+                false,
+            );
+            self.cache.insert(cache_key, analysis.clone());
+            return Ok(analysis);
+        }
+        let remaining_bytes = MAX_RENAME_INCLUDE_BYTES.saturating_sub(self.bytes_read);
+        if remaining_bytes == 0 {
+            self.stopped = true;
+            let analysis = IncludeAnalysis::unsafe_with_reason(
+                format!(
+                    "include {path:?} could not be audited because include byte limit ({MAX_RENAME_INCLUDE_BYTES}) was reached"
+                ),
+                false,
+            );
+            self.cache.insert(cache_key, analysis.clone());
+            return Ok(analysis);
+        }
+
+        self.files_read += 1;
+        let include_source = match read_include(
+            path,
+            self.max_file_bytes,
+            Some(remaining_bytes),
+            Some(self.cancel),
+        ) {
             Ok(source) => source,
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
             Err(error) => {
-                return Ok(Some(format!(
-                    "rename cannot prove completeness because include {path:?} could not be read: {error}"
-                )));
+                if error == INCLUDE_BYTE_BUDGET_ERROR {
+                    self.stopped = true;
+                }
+                let analysis = IncludeAnalysis::unsafe_with_reason(
+                    format!("include {path:?} could not be read: {error}"),
+                    false,
+                );
+                self.cache.insert(cache_key, analysis.clone());
+                return Ok(analysis);
             }
         };
-        baseline_content_hashes
-            .entry(path_key(&path))
+        self.bytes_read = self.bytes_read.saturating_add(include_source.bytes);
+        self.baseline_content_hashes
+            .entry(path_key(path))
             .or_insert(include_source.content_hash);
-        let include_relevant = contains_any_identifier(&include_source.text, candidate_names);
-        if include_relevant || !is_harmless_include(&include_source.text) {
-            return Ok(Some(format!(
-                "rename cannot prove completeness because include {path:?} contains source content"
-            )));
+
+        let directive_only = directive_only_directives(&include_source.text, true);
+        let relevant = directive_only.is_none()
+            && contains_any_identifier(&include_source.text, self.candidate_names);
+        let include_directives = directive_only.unwrap_or_else(|| directives(&include_source.text));
+        let analysis = if self.bytes_read >= MAX_RENAME_INCLUDE_BYTES {
+            self.stopped = true;
+            IncludeAnalysis::unsafe_with_reason(
+                format!(
+                    "include {path:?} could not be audited because include byte limit ({MAX_RENAME_INCLUDE_BYTES}) was reached"
+                ),
+                relevant,
+            )
+        } else if include_directives
+            .iter()
+            .any(|directive| directive.kind == DirectiveKind::Other)
+        {
+            IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} contains an unsupported directive"),
+                relevant,
+            )
+        } else if conditional_include_references_candidate(
+            &include_directives,
+            self.candidate_names,
+        ) {
+            IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has a Pascal-dependent conditional expression"),
+                true,
+            )
+        } else {
+            self.active.insert(active_key.clone());
+            let mut nested = None;
+            for directive in include_directives {
+                if is_cancelled(self.cancel) {
+                    self.active.remove(&active_key);
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                if !self.take_directive_budget() {
+                    self.stopped = true;
+                    nested = Some(IncludeAnalysis::unsafe_with_reason(
+                        format!(
+                            "include {path:?} could not be audited because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
+                        ),
+                        relevant,
+                    ));
+                    break;
+                }
+                if directive.kind != DirectiveKind::Include {
+                    continue;
+                }
+                let child = self.inspect_nested(path, &directive, context, depth)?;
+                if !child.safe || child.relevant {
+                    self.stopped = true;
+                    nested = Some(IncludeAnalysis::unsafe_with_reason(
+                        child
+                            .reason
+                            .unwrap_or_else(|| format!("include {path:?} contains source content")),
+                        child.relevant,
+                    ));
+                    break;
+                }
+            }
+            self.active.remove(&active_key);
+            nested.unwrap_or_else(|| {
+                if relevant {
+                    IncludeAnalysis::unsafe_with_reason(
+                        format!("include {path:?} contains source content"),
+                        true,
+                    )
+                } else {
+                    IncludeAnalysis::safe(false)
+                }
+            })
+        };
+        self.cache.insert(cache_key, analysis.clone());
+        Ok(analysis)
+    }
+
+    fn observe_lookup(&mut self, lookup: &IncludeLookup) {
+        for observation in &lookup.observations {
+            add_baseline_path_with_stamp(
+                self.baseline_paths,
+                self.baseline_keys,
+                observation.path.clone(),
+                observation.stamp.clone(),
+            );
         }
     }
-    Ok(None)
+
+    fn record_error(&mut self, error: String) {
+        if self.result.errors.len() < MAX_RENAME_INCLUDE_ERRORS {
+            self.result.errors.push(error);
+        } else if self.result.errors.len() == MAX_RENAME_INCLUDE_ERRORS {
+            self.result.errors.push(format!(
+                "rename cannot prove completeness because include error limit ({MAX_RENAME_INCLUDE_ERRORS}) was reached"
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1967,40 +2442,399 @@ struct Directive {
     end: usize,
 }
 
-fn include_paths(uri: &Url, source: &str) -> Vec<PathBuf> {
-    directives(source)
-        .into_iter()
-        .filter(|directive| directive.kind == DirectiveKind::Include)
-        .filter_map(|directive| include_path(uri, source, &directive))
-        .collect()
+fn include_search_directories(owner_path: &Path, context: Option<&ProjectContext>) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(parent) = absolute_path(owner_path.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf)
+    {
+        add_include_directory(&mut directories, parent);
+    }
+    if let Some(context) = context {
+        for path in &context.include_paths {
+            add_include_directory(&mut directories, path.clone());
+        }
+        for path in &context.search_paths {
+            add_include_directory(&mut directories, path.clone());
+        }
+    }
+    directories
 }
 
-fn include_path(uri: &Url, _source: &str, directive: &Directive) -> Option<PathBuf> {
+fn add_include_directory(directories: &mut Vec<PathBuf>, path: PathBuf) {
+    let path = absolute_path(path);
+    if !directories
+        .iter()
+        .any(|existing| path_key(existing) == path_key(&path))
+    {
+        directories.push(path);
+    }
+}
+
+fn include_cache_key(path: &Path, directories: &[PathBuf]) -> String {
+    let mut key = path_key(path);
+    key.push('\0');
+    for directory in directories {
+        key.push_str(&path_key(directory));
+        key.push('\0');
+    }
+    key
+}
+
+fn canonical_include_key(path: &Path) -> String {
+    fs::canonicalize(path)
+        .map(|canonical| path_key(&canonical))
+        .unwrap_or_else(|_| path_key(path))
+}
+
+fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> IncludeLookup {
+    let Some(raw) = include_name(directive) else {
+        return IncludeLookup {
+            observations: Vec::new(),
+            selected: None,
+            error: None,
+        };
+    };
+
+    let mut observations = Vec::new();
+    let mut selected = None;
+    let mut error = None;
+    for directory in directories {
+        observations.push(IncludeObservation {
+            path: directory.clone(),
+            stamp: fs::metadata(directory)
+                .ok()
+                .map(|metadata| path_stamp_from_metadata(&metadata)),
+        });
+        let candidate = absolute_path(directory.join(&raw));
+        if observations
+            .iter()
+            .any(|observation| path_key(&observation.path) == path_key(&candidate))
+        {
+            continue;
+        }
+        let metadata = fs::metadata(&candidate);
+        let stamp = metadata.as_ref().ok().map(path_stamp_from_metadata);
+        observations.push(IncludeObservation {
+            path: candidate.clone(),
+            stamp,
+        });
+        match metadata {
+            Ok(metadata) if metadata.is_file() => {
+                selected = Some(candidate);
+                break;
+            }
+            Ok(_) => {}
+            Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
+                let case_lookup = resolve_case_insensitive_include_path(&candidate);
+                observations.extend(case_lookup.observations);
+                if let Some(case_error) = case_lookup.error {
+                    error = Some(case_error);
+                    break;
+                }
+                if let Some(actual) = case_lookup.selected {
+                    let actual_metadata = fs::metadata(&actual);
+                    observations.push(IncludeObservation {
+                        path: actual.clone(),
+                        stamp: actual_metadata.as_ref().ok().map(path_stamp_from_metadata),
+                    });
+                    match actual_metadata {
+                        Ok(metadata) if metadata.is_file() => {
+                            selected = Some(actual);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(io_error) => {
+                            error = Some(format!("{}: {io_error}", actual.display()));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(io_error) => {
+                error = Some(format!("{}: {io_error}", candidate.display()));
+                break;
+            }
+        }
+    }
+    IncludeLookup {
+        observations,
+        selected,
+        error,
+    }
+}
+
+#[derive(Debug)]
+struct CaseInsensitiveIncludeLookup {
+    observations: Vec<IncludeObservation>,
+    selected: Option<PathBuf>,
+    error: Option<String>,
+}
+
+fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeLookup {
+    let absolute = absolute_path(path.to_path_buf());
+    let mut base = absolute.clone();
+    while !base.exists() {
+        if !base.pop() {
+            base = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+            break;
+        }
+    }
+    let relative = absolute
+        .strip_prefix(&base)
+        .unwrap_or_else(|_| Path::new(""));
+    let mut current = base.clone();
+    let mut observations = Vec::new();
+    observations.push(IncludeObservation {
+        path: current.clone(),
+        stamp: fs::metadata(&current)
+            .ok()
+            .map(|metadata| path_stamp_from_metadata(&metadata)),
+    });
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = current.pop();
+            }
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Normal(component) => {
+                let wanted = component.to_string_lossy();
+                let entries = match fs::read_dir(&current) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        return CaseInsensitiveIncludeLookup {
+                            observations,
+                            selected: None,
+                            error: Some(format!(
+                                "could not inspect {} while resolving case-insensitive include: {error}",
+                                current.display()
+                            )),
+                        };
+                    }
+                };
+                let mut matches = entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&wanted)
+                            .then_some(entry.path())
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() > 1 {
+                    return CaseInsensitiveIncludeLookup {
+                        observations,
+                        selected: None,
+                        error: Some(format!(
+                            "ambiguous case-insensitive include path component {wanted:?} under {}",
+                            current.display()
+                        )),
+                    };
+                }
+                let Some(next) = matches.pop() else {
+                    observations.push(IncludeObservation {
+                        path: current.join(component),
+                        stamp: None,
+                    });
+                    return CaseInsensitiveIncludeLookup {
+                        observations,
+                        selected: None,
+                        error: None,
+                    };
+                };
+                let stamp = match next.metadata() {
+                    Ok(metadata) => Some(path_stamp_from_metadata(&metadata)),
+                    Err(error) => {
+                        observations.push(IncludeObservation {
+                            path: next.clone(),
+                            stamp: None,
+                        });
+                        return CaseInsensitiveIncludeLookup {
+                            observations,
+                            selected: None,
+                            error: Some(format!(
+                                "could not inspect {} while resolving case-insensitive include: {error}",
+                                next.display()
+                            )),
+                        };
+                    }
+                };
+                observations.push(IncludeObservation {
+                    path: next.clone(),
+                    stamp,
+                });
+                current = next;
+            }
+        }
+    }
+    CaseInsensitiveIncludeLookup {
+        observations,
+        selected: Some(current),
+        error: None,
+    }
+}
+
+fn path_stamp_from_metadata(metadata: &fs::Metadata) -> PathStamp {
+    PathStamp {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        is_dir: metadata.is_dir(),
+    }
+}
+
+fn include_name(directive: &Directive) -> Option<String> {
     let raw = directive
         .body
         .trim_start()
         .split_once(|character: char| character.is_ascii_whitespace() || character == ':')
         .map(|(_, remainder)| remainder.trim())
-        .filter(|remainder| !remainder.is_empty())?
-        .trim_matches(|character| character == '\'' || character == '"');
+        .filter(|remainder| !remainder.is_empty())?;
     if raw.is_empty() || raw.contains("$(") {
         return None;
     }
-    let path = uri.to_file_path().ok()?;
-    let parent = absolute_path(path).parent()?.to_path_buf();
-    Some(absolute_path(parent.join(raw.replace('\\', "/"))))
+    let raw = if let Some(quoted) = raw.strip_prefix('\'') {
+        quoted.strip_suffix('\'')?
+    } else if let Some(quoted) = raw.strip_prefix('"') {
+        quoted.strip_suffix('"')?
+    } else {
+        if raw
+            .chars()
+            .any(|character| character == '\'' || character == '"')
+        {
+            return None;
+        }
+        raw
+    };
+    (!raw.is_empty()).then(|| raw.replace('\\', "/"))
 }
 
+fn include_owner_summary(source: &str, owner_directives: &[Directive]) -> Option<String> {
+    let mut summary = String::new();
+    for directive in owner_directives {
+        let fragment = source.get(directive.start..directive.end)?;
+        if summary
+            .len()
+            .saturating_add(fragment.len())
+            .saturating_add(1)
+            > MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES
+        {
+            return None;
+        }
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(fragment);
+    }
+    (!owner_directives.is_empty() && !summary.is_empty()).then_some(summary)
+}
+
+fn conditional_include_references_candidate(
+    directives: &[Directive],
+    candidate_names: &[String],
+) -> bool {
+    if candidate_names
+        .iter()
+        .any(|name| !name.trim_start_matches('&').is_ascii())
+    {
+        return true;
+    }
+    directives.iter().any(|directive| {
+        let keyword = directive_keyword(&directive.body)
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if keyword != "if" && keyword != "elseif" && keyword != "elif" {
+            return false;
+        }
+        let expression = directive_arguments(&directive.body);
+        identifier_spans(expression)
+            .into_iter()
+            .any(|(start, end)| {
+                let identifier = &expression[start..end];
+                candidate_names.iter().any(|name| {
+                    identifier.eq_ignore_ascii_case(name.trim_start_matches('&'))
+                        && !is_defined_compiler_symbol(expression, start)
+                })
+            })
+    })
+}
+
+fn is_defined_compiler_symbol(expression: &str, identifier_start: usize) -> bool {
+    let prefix = expression[..identifier_start].trim_end();
+    let Some(prefix) = prefix.strip_suffix('(') else {
+        return false;
+    };
+    let prefix = prefix.trim_end();
+    let start = prefix
+        .as_bytes()
+        .iter()
+        .rposition(|byte| !is_identifier_byte(*byte))
+        .map_or(0, |index| index + 1);
+    if !prefix[start..].eq_ignore_ascii_case("defined") {
+        return false;
+    }
+    !prefix[..start].trim_end().ends_with('.')
+}
+
+fn directive_keyword(body: &str) -> Option<&str> {
+    body.trim_start()
+        .split(|character: char| character.is_ascii_whitespace() || character == ':')
+        .next()
+        .filter(|keyword| !keyword.is_empty())
+}
+
+fn directive_arguments(body: &str) -> &str {
+    let body = body.trim_start();
+    let Some(keyword) = directive_keyword(body) else {
+        return "";
+    };
+    body.get(keyword.len()..)
+        .map(str::trim_start)
+        .unwrap_or_default()
+}
+
+fn identifier_spans(source: &str) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\'' {
+            skip_string(bytes, &mut index);
+            continue;
+        }
+        if is_identifier_byte(bytes[index]) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_identifier_byte(bytes[index]) {
+                index += 1;
+            }
+            spans.push((start, index));
+        } else {
+            index += 1;
+        }
+    }
+    spans
+}
+
+#[derive(Debug, Clone)]
 struct IncludeSource {
     text: String,
     content_hash: u64,
+    bytes: usize,
 }
 
 fn read_include(
     path: &Path,
     max_file_bytes: usize,
+    max_total_bytes: Option<usize>,
     cancel: Option<&AtomicBool>,
 ) -> Result<IncludeSource, String> {
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file() {
         return Err("path is not a regular file".to_string());
@@ -2010,8 +2844,14 @@ fn read_include(
             "file exceeds the configured per-file limit {max_file_bytes}"
         ));
     }
+    if max_total_bytes.is_some_and(|limit| metadata.len() > limit as u64) {
+        return Err(INCLUDE_BYTE_BUDGET_ERROR.to_string());
+    }
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
     let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(metadata.len().min(max_file_bytes as u64) as usize);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut byte_count = 0usize;
@@ -2019,7 +2859,16 @@ fn read_include(
         if cancel.is_some_and(is_cancelled) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        let read_limit = max_total_bytes
+            .map(|limit| limit.saturating_sub(byte_count))
+            .unwrap_or(buffer.len())
+            .min(buffer.len());
+        if read_limit == 0 {
+            break;
+        }
+        let read = file
+            .read(&mut buffer[..read_limit])
+            .map_err(|error| error.to_string())?;
         if read == 0 {
             break;
         }
@@ -2042,22 +2891,89 @@ fn read_include(
     Ok(IncludeSource {
         text: decode_bytes(&bytes).into_owned(),
         content_hash: hasher.finish(),
+        bytes: byte_count,
     })
 }
 
-fn is_harmless_include(source: &str) -> bool {
-    let entries = directives(source);
-    let mut content = source.to_string();
-    for directive in entries.iter().rev() {
-        content.replace_range(directive.start..directive.end, "");
+fn directive_only_directives(source: &str, allow_includes: bool) -> Option<Vec<Directive>> {
+    let bytes = source.as_bytes();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index = source[index..]
+                .find('\n')
+                .map_or(bytes.len(), |offset| index + offset + 1);
+            continue;
+        }
+        if bytes[index] == b'{' {
+            if bytes.get(index + 1) == Some(&b'$') {
+                let end = source[index + 2..].find('}')?;
+                let body = source[index + 2..index + 2 + end].to_string();
+                entries.push(Directive {
+                    kind: directive_kind(&body),
+                    body,
+                    start: index,
+                    end: index + end + 3,
+                });
+                index += end + 3;
+            } else {
+                let end = source[index + 1..].find('}')?;
+                index += end + 2;
+            }
+            continue;
+        }
+        if bytes[index] == b'(' && bytes.get(index + 1) == Some(&b'*') {
+            if bytes.get(index + 2) == Some(&b'$') {
+                let end = source[index + 3..].find("*)")?;
+                let body = source[index + 3..index + 3 + end].to_string();
+                entries.push(Directive {
+                    kind: directive_kind(&body),
+                    body,
+                    start: index,
+                    end: index + end + 5,
+                });
+                index += end + 5;
+            } else {
+                let end = source[index + 2..].find("*)")?;
+                index += end + 4;
+            }
+            continue;
+        }
+        return None;
     }
-    content.chars().all(char::is_whitespace)
-        && entries.iter().all(|directive| {
-            matches!(
-                directive.kind,
-                DirectiveKind::CompilerDefine | DirectiveKind::MethodInfo | DirectiveKind::Harmless
-            )
-        })
+
+    let mut conditional_frames = Vec::new();
+    for directive in &entries {
+        match directive.kind {
+            DirectiveKind::ConditionalStart => conditional_frames.push(false),
+            DirectiveKind::ConditionalMiddle => {
+                let seen_else = conditional_frames.last_mut()?;
+                if directive_keyword(&directive.body)
+                    .is_some_and(|keyword| keyword.eq_ignore_ascii_case("else"))
+                {
+                    if *seen_else {
+                        return None;
+                    }
+                    *seen_else = true;
+                } else if *seen_else {
+                    return None;
+                }
+            }
+            DirectiveKind::ConditionalEnd => {
+                conditional_frames.pop()?;
+            }
+            DirectiveKind::Include if allow_includes => {}
+            DirectiveKind::CompilerDefine | DirectiveKind::MethodInfo | DirectiveKind::Harmless => {
+            }
+            DirectiveKind::Include | DirectiveKind::Other => return None,
+        }
+    }
+    conditional_frames.is_empty().then_some(entries)
 }
 
 fn conditional_regions(source: &str) -> Vec<(usize, usize)> {
@@ -2155,11 +3071,7 @@ fn directives(source: &str) -> Vec<Directive> {
 }
 
 fn directive_kind(body: &str) -> DirectiveKind {
-    let Some(keyword) = body
-        .trim_start()
-        .split(|character: char| character.is_ascii_whitespace() || character == ':')
-        .next()
-    else {
+    let Some(keyword) = directive_keyword(body) else {
         return DirectiveKind::Other;
     };
     let keyword = keyword.to_ascii_lowercase();
@@ -2172,7 +3084,7 @@ fn directive_kind(body: &str) -> DirectiveKind {
     if keyword == "else" || keyword == "elseif" || keyword == "elif" {
         return DirectiveKind::ConditionalMiddle;
     }
-    if keyword == "if" || keyword.starts_with("if") {
+    if matches!(keyword.as_str(), "if" | "ifdef" | "ifndef" | "ifopt") {
         return DirectiveKind::ConditionalStart;
     }
     if keyword == "define" || keyword == "undef" {
@@ -2181,27 +3093,88 @@ fn directive_kind(body: &str) -> DirectiveKind {
     if keyword == "methodinfo" {
         return DirectiveKind::MethodInfo;
     }
-    if matches!(
-        keyword.as_str(),
-        "assertions"
-            | "booleval"
-            | "debug"
-            | "debugsymbols"
-            | "extendedsyntax"
-            | "h"
-            | "longstrings"
-            | "m"
-            | "optimization"
-            | "overflowchecks"
-            | "rangechecks"
-            | "rtti"
-            | "typedaddress"
-            | "warn"
-            | "writeableconst"
-    ) {
+    if is_harmless_directive(body) {
         return DirectiveKind::Harmless;
     }
     DirectiveKind::Other
+}
+
+fn is_harmless_directive(body: &str) -> bool {
+    if body.contains(',') {
+        split_directive_parts(body)
+            .into_iter()
+            .all(|part| directive_keyword(part).is_some_and(is_harmless_directive_keyword))
+    } else {
+        directive_keyword(body).is_some_and(is_harmless_directive_keyword)
+    }
+}
+
+fn split_directive_parts(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(quote_byte) = quote {
+            if byte == quote_byte {
+                if bytes.get(index + 1) == Some(&quote_byte) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if byte == b',' {
+            parts.push(&body[start..index]);
+            start = index + 1;
+        }
+        index += 1;
+    }
+    parts.push(&body[start..]);
+    parts
+}
+
+fn is_harmless_directive_keyword(keyword: &str) -> bool {
+    let keyword = keyword
+        .trim()
+        .trim_end_matches(['+', '-'])
+        .to_ascii_lowercase();
+    matches!(
+        keyword.as_str(),
+        "apptype"
+            | "asmmode"
+            | "assertions"
+            | "booleval"
+            | "debug"
+            | "debugsymbols"
+            | "endregion"
+            | "excessprecision"
+            | "extendedsyntax"
+            | "h"
+            | "hints"
+            | "longstrings"
+            | "m"
+            | "message"
+            | "mode"
+            | "objexportall"
+            | "optimization"
+            | "overflowchecks"
+            | "q"
+            | "r"
+            | "rangechecks"
+            | "region"
+            | "rtti"
+            | "stronglinktypes"
+            | "t"
+            | "typedaddress"
+            | "warn"
+            | "warnings"
+            | "writeableconst"
+            | "x"
+    )
 }
 
 fn skip_string(bytes: &[u8], index: &mut usize) {
@@ -2220,7 +3193,11 @@ fn skip_string(bytes: &[u8], index: &mut usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_any_identifier;
+    use super::{
+        Directive, DirectiveKind, contains_any_identifier, directive_kind, read_include,
+        resolve_include_path,
+    };
+    use std::fs;
 
     #[test]
     fn contains_any_identifier_uses_identifier_boundaries() {
@@ -2228,5 +3205,133 @@ mod tests {
 
         assert!(contains_any_identifier("value := FOO; &bar := 1;", &names));
         assert!(!contains_any_identifier("value := Foobar;", &names));
+    }
+
+    #[test]
+    fn compiler_switch_directives_with_values_are_harmless() {
+        for body in [
+            "M+",
+            "M-",
+            "R *.dfm",
+            "R-,T-,H+,X+",
+            "APPTYPE CONSOLE",
+            "HINTS OFF",
+            "STRONGLINKTYPES OFF",
+            "REGION name",
+            "REGION 'section, with a comma'",
+            "ENDREGION",
+            "MESSAGE ERROR 'Delphi 2010 should be used to compile this.'",
+            "Q-",
+            "EXCESSPRECISION OFF",
+            "MODE Delphi",
+            "ASMMODE INTEL",
+            "WARNINGS OFF",
+            "WARNINGS ON",
+        ] {
+            assert_eq!(
+                directive_kind(body),
+                DirectiveKind::Harmless,
+                "{body} must not make an unrelated include owner unsafe"
+            );
+        }
+    }
+
+    #[test]
+    fn include_lookup_keeps_the_missing_precedence_observation() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("root");
+        let fallback = temp.path().join("fallback");
+        let earlier = root.join("subdir/Shared.inc");
+        let selected = fallback.join("subdir/Shared.inc");
+        fs::create_dir_all(earlier.parent().expect("earlier parent")).expect("earlier directory");
+        fs::create_dir_all(selected.parent().expect("selected parent"))
+            .expect("selected directory");
+        fs::write(&selected, "{$DEFINE SAFE}\n").expect("selected include");
+
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: "I subdir/Shared.inc".to_string(),
+            start: 0,
+            end: 0,
+        };
+        let lookup = resolve_include_path(&directive, &[root, fallback]);
+        assert_eq!(lookup.selected.as_deref(), Some(selected.as_path()));
+        let observation = lookup
+            .observations
+            .iter()
+            .find(|observation| observation.path == earlier)
+            .expect("earlier candidate observation");
+        assert!(observation.stamp.is_none());
+
+        fs::write(&earlier, "procedure Hidden; begin end;\n").expect("create earlier include");
+        assert!(observation.stamp.is_none());
+    }
+
+    #[test]
+    fn include_lookup_matches_pascal_file_names_case_insensitively() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let include = temp.path().join("MDCompilers.inc");
+        fs::write(&include, "{$DEFINE SAFE}\n").expect("include");
+
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: "I MDCompilers.Inc".to_string(),
+            start: 0,
+            end: 0,
+        };
+        let lookup = resolve_include_path(&directive, &[temp.path().to_path_buf()]);
+
+        assert_eq!(lookup.selected.as_deref(), Some(include.as_path()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn include_lookup_snapshots_case_insensitive_directories_and_absence() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let actual_directory = temp.path().join("ActualDir");
+        let actual_include = actual_directory.join("Shared.inc");
+        let missing_directory = temp.path().join("MissingRoot");
+        fs::create_dir_all(&actual_directory).expect("actual directory");
+        fs::write(&actual_include, "{$DEFINE SAFE}\n").expect("include");
+
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: "I actualdir/Shared.Inc".to_string(),
+            start: 0,
+            end: 0,
+        };
+        let lookup = resolve_include_path(
+            &directive,
+            &[missing_directory.clone(), temp.path().to_path_buf()],
+        );
+
+        assert_eq!(lookup.selected.as_deref(), Some(actual_include.as_path()));
+        assert!(
+            lookup
+                .observations
+                .iter()
+                .any(|observation| observation.path == actual_directory
+                    && observation.stamp.is_some()),
+            "the actual case-insensitive directory must be in the read-set"
+        );
+        assert!(
+            lookup
+                .observations
+                .iter()
+                .any(|observation| observation.path == missing_directory
+                    && observation.stamp.is_none()),
+            "the absent higher-precedence directory must be in the read-set"
+        );
+    }
+
+    #[test]
+    fn include_byte_budget_is_checked_before_opening_content() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let include = temp.path().join("Large.inc");
+        fs::write(&include, "{$DEFINE SAFE}\n").expect("include");
+
+        let error = read_include(&include, 1024, Some(1), None)
+            .expect_err("remaining include budget is too small");
+        assert_eq!(error, super::INCLUDE_BYTE_BUDGET_ERROR);
     }
 }

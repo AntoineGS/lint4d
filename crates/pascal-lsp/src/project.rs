@@ -18,6 +18,11 @@ const MAX_IMPORT_COUNT: usize = 64;
 const MAX_METADATA_FILES: usize = MAX_IMPORT_COUNT + 1;
 const MAX_EXPANDED_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_PROPERTY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OWNERSHIP_CANDIDATES: usize = 32;
+const MAX_OWNERSHIP_METADATA_FILES: usize = 512;
+const MAX_OWNERSHIP_SOURCE_FILES: usize = 256;
+const MAX_OWNERSHIP_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OWNERSHIP_WARNING_BYTES: usize = 256 * 1024;
 const UNRESOLVED_MARKER: char = '\u{1}';
 
 /// Options supplied by the LSP client for project selection and evaluation.
@@ -44,6 +49,11 @@ pub struct ProjectContext {
     pub main_source: Option<PathBuf>,
     /// Ordered project and client-provided unit search paths.
     pub search_paths: Vec<PathBuf>,
+    /// Ordered project-relative include paths from DCC_IncludePath.
+    ///
+    /// Include paths are kept separate from unit search paths because include
+    /// lookup must not make an arbitrary directory a Pascal unit candidate.
+    pub include_paths: Vec<PathBuf>,
     pub explicit_units: HashMap<String, Vec<PathBuf>>,
     pub unit_namespaces: Vec<String>,
     pub unit_aliases: HashMap<String, String>,
@@ -54,9 +64,9 @@ pub struct ProjectContext {
     /// Package exports are resolved lazily and are not merged into the unit
     /// search paths or the project-wide unit index.
     pub packages: Vec<String>,
-    /// Project, main-source, and imported option-set files used to build the
-    /// context. Consumers can revalidate these paths without rediscovering or
-    /// reparsing unrelated source files.
+    /// Project, main-source, imported option-set, and automatic-selection
+    /// candidate files used to build the context. Consumers can revalidate
+    /// these paths without rediscovering or reparsing unrelated source files.
     pub metadata_files: Vec<PathBuf>,
     pub warnings: Vec<String>,
 }
@@ -122,13 +132,20 @@ fn discover_context(
     let selected_project = if let Some(project_file) = &options.project_file {
         explicit_project_file(project_file, &roots, &file_path, &mut warnings)
     } else {
-        discover_project_file(&file_path, relevant_root.as_deref(), &mut warnings)
+        discover_project_file(
+            &file_path,
+            relevant_root.as_deref(),
+            &roots,
+            options,
+            &mut warnings,
+        )
     };
 
     match selected_project {
         ProjectSelection::Selected {
             path: project_file,
             explicit,
+            metadata_files,
         } => build_project_context(
             project_file,
             &file_path,
@@ -136,21 +153,40 @@ fn discover_context(
             options,
             warnings,
             explicit,
+            metadata_files,
         ),
-        ProjectSelection::Standalone => Ok(build_standalone_context(
-            &file_path, &roots, options, warnings, true,
+        ProjectSelection::Standalone { metadata_files } => Ok(build_standalone_context(
+            &file_path,
+            &roots,
+            options,
+            warnings,
+            true,
+            metadata_files,
         )),
-        ProjectSelection::Incomplete => Ok(build_standalone_context(
-            &file_path, &roots, options, warnings, false,
+        ProjectSelection::Incomplete { metadata_files } => Ok(build_standalone_context(
+            &file_path,
+            &roots,
+            options,
+            warnings,
+            false,
+            metadata_files,
         )),
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectSelection {
-    Selected { path: PathBuf, explicit: bool },
-    Standalone,
-    Incomplete,
+    Selected {
+        path: PathBuf,
+        explicit: bool,
+        metadata_files: Vec<PathBuf>,
+    },
+    Standalone {
+        metadata_files: Vec<PathBuf>,
+    },
+    Incomplete {
+        metadata_files: Vec<PathBuf>,
+    },
 }
 
 fn normalize_workspace_roots(
@@ -185,7 +221,9 @@ fn explicit_project_file(
             "Windows project path is unavailable on Linux and was omitted: {}",
             requested.display()
         ));
-        return ProjectSelection::Incomplete;
+        return ProjectSelection::Incomplete {
+            metadata_files: Vec::new(),
+        };
     }
     let requested = PathBuf::from(requested_text.replace('\\', "/"));
 
@@ -216,18 +254,23 @@ fn explicit_project_file(
                 "explicit project file was not found: {}",
                 requested.display()
             ));
-            ProjectSelection::Incomplete
+            ProjectSelection::Incomplete {
+                metadata_files: Vec::new(),
+            }
         }
         1 => ProjectSelection::Selected {
             path: candidates.remove(0),
             explicit: true,
+            metadata_files: Vec::new(),
         },
         _ => {
             warnings.push(format!(
                 "multiple explicit project files matched {}; no project selected",
                 requested.display()
             ));
-            ProjectSelection::Incomplete
+            ProjectSelection::Incomplete {
+                metadata_files: Vec::new(),
+            }
         }
     }
 }
@@ -235,6 +278,8 @@ fn explicit_project_file(
 fn discover_project_file(
     file: &Path,
     workspace_root: Option<&Path>,
+    roots: &[PathBuf],
+    options: &ProjectOptions,
     warnings: &mut Vec<String>,
 ) -> ProjectSelection {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
@@ -249,7 +294,9 @@ fn discover_project_file(
                     "could not inspect project directory {}: {error}",
                     directory.display()
                 ));
-                return ProjectSelection::Incomplete;
+                return ProjectSelection::Incomplete {
+                    metadata_files: Vec::new(),
+                };
             }
         };
         let mut dproj = Vec::new();
@@ -260,14 +307,22 @@ fn discover_project_file(
                 continue;
             }
             if extension_is(&path, "dproj") {
-                dproj.push(path);
+                push_bounded_candidate(&mut dproj, path);
             } else if extension_is(&path, "dpr") || extension_is(&path, "dpk") {
-                dpr_or_dpk.push(path);
+                push_bounded_candidate(&mut dpr_or_dpk, path);
             }
         }
 
         if !dproj.is_empty() {
-            return choose_project_candidate(dproj, &directory, "project files", warnings);
+            return choose_project_candidate(
+                dproj,
+                &directory,
+                "project files",
+                file,
+                roots,
+                options,
+                warnings,
+            );
         }
         if fallback_dpr.is_none() && ambiguous_fallback_dpr.is_none() && !dpr_or_dpk.is_empty() {
             if dpr_or_dpk.len() == 1 {
@@ -289,29 +344,110 @@ fn discover_project_file(
         directory = parent.to_path_buf();
     }
     if let Some((candidates, directory)) = ambiguous_fallback_dpr {
-        return choose_project_candidate(candidates, &directory, "DPR/DPK files", warnings);
+        return choose_project_candidate(
+            candidates,
+            &directory,
+            "DPR/DPK files",
+            file,
+            roots,
+            options,
+            warnings,
+        );
     }
-    fallback_dpr.map_or(ProjectSelection::Standalone, |path| {
-        ProjectSelection::Selected {
+    fallback_dpr.map_or(
+        ProjectSelection::Standalone {
+            metadata_files: Vec::new(),
+        },
+        |path| ProjectSelection::Selected {
             path,
             explicit: false,
-        }
-    })
+            metadata_files: Vec::new(),
+        },
+    )
+}
+
+fn push_bounded_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if candidates.len() <= MAX_OWNERSHIP_CANDIDATES {
+        candidates.push(path);
+    }
 }
 
 fn choose_project_candidate(
     mut candidates: Vec<PathBuf>,
     directory: &Path,
     kind: &str,
+    file: &Path,
+    roots: &[PathBuf],
+    options: &ProjectOptions,
     warnings: &mut Vec<String>,
 ) -> ProjectSelection {
     if candidates.len() == 1 {
         return ProjectSelection::Selected {
             path: candidates.pop().expect("one candidate"),
             explicit: false,
+            metadata_files: Vec::new(),
         };
     }
     candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+
+    if candidates.len() > MAX_OWNERSHIP_CANDIDATES {
+        warnings.push(format!(
+            "automatic project ownership candidate limit ({MAX_OWNERSHIP_CANDIDATES}) reached in {}; no project selected",
+            directory.display()
+        ));
+        let metadata_files = candidates
+            .into_iter()
+            .take(MAX_OWNERSHIP_METADATA_FILES)
+            .collect();
+        return ProjectSelection::Incomplete { metadata_files };
+    }
+
+    // Ownership checks stay within the already discovered candidate
+    // directory. They read each candidate's bounded metadata, but never turn
+    // project selection into a recursive workspace scan.
+    let mut budget = OwnershipProbeBudget::default();
+    let mut consulted_metadata = Vec::new();
+    let mut owned = Vec::new();
+    let mut incomplete = false;
+    let mut candidate_warnings = Vec::new();
+    for candidate in &candidates {
+        let evaluation = inspect_project_candidate(candidate, file, roots, options, &mut budget);
+        if !budget.reserve_metadata_files(evaluation.metadata_files.len()) {
+            incomplete = true;
+        }
+        for metadata_file in evaluation.metadata_files {
+            if consulted_metadata
+                .iter()
+                .any(|existing| existing == &metadata_file)
+            {
+                continue;
+            }
+            if consulted_metadata.len() >= MAX_OWNERSHIP_METADATA_FILES {
+                budget.exhaust("automatic ownership metadata read-set");
+                incomplete = true;
+                break;
+            }
+            consulted_metadata.push(metadata_file);
+        }
+        append_bounded_warnings(&mut candidate_warnings, evaluation.warnings, &mut budget);
+        match evaluation.ownership {
+            CandidateOwnership::Owned => owned.push(candidate.clone()),
+            CandidateOwnership::NotOwned => {}
+            CandidateOwnership::Incomplete => incomplete = true,
+        }
+        if budget.exhausted || incomplete || owned.len() >= 2 {
+            break;
+        }
+    }
+
+    if owned.len() == 1 && !incomplete && !budget.exhausted {
+        return ProjectSelection::Selected {
+            path: owned.pop().expect("one owned candidate"),
+            explicit: false,
+            metadata_files: consulted_metadata,
+        };
+    }
+
     warnings.push(format!(
         "multiple {kind} in {}; no project selected: {}",
         directory.display(),
@@ -321,7 +457,359 @@ fn choose_project_candidate(
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    ProjectSelection::Incomplete
+    warnings.extend(candidate_warnings);
+    if budget.exhausted {
+        warnings.push(format!(
+            "automatic project ownership probe limit reached; no project selected: {}",
+            budget.exhaustion_reason.unwrap_or("aggregate budget")
+        ));
+    }
+    ProjectSelection::Incomplete {
+        metadata_files: consulted_metadata,
+    }
+}
+
+#[derive(Debug, Default)]
+struct OwnershipProbeBudget {
+    metadata_files: usize,
+    source_files: usize,
+    source_bytes: u64,
+    warning_bytes: usize,
+    exhausted: bool,
+    exhaustion_reason: Option<&'static str>,
+}
+
+impl OwnershipProbeBudget {
+    fn reserve_metadata_files(&mut self, count: usize) -> bool {
+        let Some(total) = self.metadata_files.checked_add(count) else {
+            self.exhaust("aggregate ownership metadata read-set");
+            return false;
+        };
+        if total > MAX_OWNERSHIP_METADATA_FILES {
+            self.exhaust("aggregate ownership metadata read-set");
+            return false;
+        }
+        self.metadata_files = total;
+        true
+    }
+
+    fn reserve_source_file(&mut self, bytes: u64) -> bool {
+        let Some(file_count) = self.source_files.checked_add(1) else {
+            self.exhaust("aggregate ownership source-file work");
+            return false;
+        };
+        let Some(total_bytes) = self.source_bytes.checked_add(bytes) else {
+            self.exhaust("aggregate ownership source-byte work");
+            return false;
+        };
+        if file_count > MAX_OWNERSHIP_SOURCE_FILES || total_bytes > MAX_OWNERSHIP_SOURCE_BYTES {
+            self.exhaust("aggregate ownership source-file work");
+            return false;
+        }
+        self.source_files = file_count;
+        self.source_bytes = total_bytes;
+        true
+    }
+
+    fn reserve_warning_bytes(&mut self, bytes: usize) -> bool {
+        let Some(total) = self.warning_bytes.checked_add(bytes) else {
+            self.exhaust("aggregate ownership diagnostics");
+            return false;
+        };
+        if total > MAX_OWNERSHIP_WARNING_BYTES {
+            self.exhaust("aggregate ownership diagnostics");
+            return false;
+        }
+        self.warning_bytes = total;
+        true
+    }
+
+    fn exhaust(&mut self, reason: &'static str) {
+        self.exhausted = true;
+        self.exhaustion_reason.get_or_insert(reason);
+    }
+}
+
+fn append_bounded_warnings(
+    target: &mut Vec<String>,
+    warnings: Vec<String>,
+    budget: &mut OwnershipProbeBudget,
+) {
+    for warning in warnings {
+        if !budget.reserve_warning_bytes(warning.len()) {
+            break;
+        }
+        target.push(warning);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateOwnership {
+    Owned,
+    NotOwned,
+    Incomplete,
+}
+
+#[derive(Debug)]
+struct CandidateEvaluation {
+    ownership: CandidateOwnership,
+    metadata_files: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
+fn inspect_project_candidate(
+    project_file: &Path,
+    file: &Path,
+    roots: &[PathBuf],
+    options: &ProjectOptions,
+    budget: &mut OwnershipProbeBudget,
+) -> CandidateEvaluation {
+    let mut metadata_files = vec![project_file.to_path_buf()];
+    match build_project_context(
+        project_file.to_path_buf(),
+        file,
+        roots,
+        options,
+        Vec::new(),
+        false,
+        Vec::new(),
+    ) {
+        Ok(context) => {
+            for metadata_file in &context.metadata_files {
+                add_unique_path(&mut metadata_files, metadata_file.clone());
+            }
+            if !context.discovery_complete {
+                return CandidateEvaluation {
+                    ownership: CandidateOwnership::Incomplete,
+                    metadata_files,
+                    warnings: context.warnings,
+                };
+            }
+            let membership = inspect_source_membership(&context, budget);
+            for metadata_file in &membership.metadata_files {
+                add_unique_path(&mut metadata_files, metadata_file.clone());
+            }
+            let mut ownership_paths = membership.source_files;
+            if let Some(main_source) = &context.main_source {
+                ownership_paths.push(main_source.clone());
+            }
+            ownership_paths.extend(context.explicit_units.values().flatten().cloned());
+            let (owns_source, identity_unverified) = source_ownership(&ownership_paths, file);
+            let ownership = if budget.exhausted || !membership.complete || identity_unverified {
+                CandidateOwnership::Incomplete
+            } else if owns_source {
+                CandidateOwnership::Owned
+            } else {
+                CandidateOwnership::NotOwned
+            };
+            let mut warnings = context.warnings;
+            warnings.extend(membership.warnings);
+            CandidateEvaluation {
+                ownership,
+                metadata_files,
+                warnings,
+            }
+        }
+        Err(error) => CandidateEvaluation {
+            ownership: CandidateOwnership::Incomplete,
+            metadata_files,
+            warnings: vec![format!(
+                "could not inspect project candidate {}: {error}",
+                project_file.display()
+            )],
+        },
+    }
+}
+
+#[derive(Debug, Default)]
+struct SourceMembershipInspection {
+    complete: bool,
+    source_files: Vec<PathBuf>,
+    metadata_files: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
+fn inspect_source_membership(
+    context: &ProjectContext,
+    budget: &mut OwnershipProbeBudget,
+) -> SourceMembershipInspection {
+    let mut inspection = SourceMembershipInspection {
+        complete: true,
+        ..SourceMembershipInspection::default()
+    };
+    let mut pending = Vec::new();
+    if let Some(main_source) = &context.main_source {
+        pending.push(main_source.clone());
+    }
+    pending.extend(context.explicit_units.values().flatten().cloned());
+    let mut queued = HashSet::new();
+    let mut cursor = 0;
+
+    while let Some(source_path) = pending.get(cursor).cloned() {
+        cursor += 1;
+        if !queued.insert(source_path.clone()) {
+            continue;
+        }
+        add_unique_path(&mut inspection.source_files, source_path.clone());
+        add_unique_path(&mut inspection.metadata_files, source_path.clone());
+
+        let size = match fs::metadata(&source_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                inspection.complete = false;
+                inspection.warnings.push(format!(
+                    "could not inspect source membership file {}: {error}",
+                    source_path.display()
+                ));
+                continue;
+            }
+        };
+        if size > MAX_MAIN_SOURCE_BYTES {
+            inspection.complete = false;
+            inspection.warnings.push(format!(
+                "source membership file {} exceeds the {} byte safety limit",
+                source_path.display(),
+                MAX_MAIN_SOURCE_BYTES
+            ));
+            continue;
+        }
+        if !budget.reserve_source_file(size) {
+            inspection.complete = false;
+            inspection.warnings.push(format!(
+                "automatic source membership probe limit reached at {}",
+                source_path.display()
+            ));
+            break;
+        }
+        let contents = match fs::read(&source_path)
+            .map_err(|error| format!("could not read file: {error}"))
+            .and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))
+            }) {
+            Ok(contents) => contents,
+            Err(error) => {
+                inspection.complete = false;
+                inspection.warnings.push(format!(
+                    "could not read source membership file {}: {error}",
+                    source_path.display()
+                ));
+                continue;
+            }
+        };
+        let parsed = parse_unit_membership(&contents);
+        if !parsed.exhaustive {
+            inspection.complete = false;
+            inspection.warnings.push(format!(
+                "source membership is incomplete for {}; bare uses/contains clauses require dependency resolution",
+                source_path.display()
+            ));
+        }
+        if contains_compiler_include_directive(&contents) {
+            inspection.complete = false;
+            inspection.warnings.push(format!(
+                "source membership is incomplete for {}; compiler include directives require dependency resolution",
+                source_path.display()
+            ));
+        }
+        let Some(base) = source_path.parent() else {
+            continue;
+        };
+        for (_, raw_path) in parsed.explicit_paths {
+            if is_compiled_reference(&raw_path) {
+                continue;
+            }
+            let Some(path) = resolve_project_path(
+                &raw_path,
+                base,
+                &mut inspection.warnings,
+                "ownership source membership",
+                true,
+            ) else {
+                inspection.complete = false;
+                continue;
+            };
+            add_unique_path(&mut inspection.metadata_files, path.clone());
+            if !queued.contains(&path) {
+                pending.push(path);
+            }
+        }
+    }
+    inspection
+}
+
+fn source_ownership(paths: &[PathBuf], target: &Path) -> (bool, bool) {
+    if filesystem_identity_unverified(target)
+        || paths
+            .iter()
+            .any(|path| filesystem_identity_unverified(path))
+    {
+        return (false, true);
+    }
+    let Some(target_identity) = fs::canonicalize(target).ok() else {
+        return (false, true);
+    };
+    let mut owns_source = false;
+    let mut identity_unverified = false;
+    for path in paths {
+        let Some(identity) = fs::canonicalize(path).ok() else {
+            identity_unverified = true;
+            continue;
+        };
+        let matches = if cfg!(windows) {
+            paths_equal_ci(&identity, &target_identity)
+        } else {
+            identity == target_identity
+        };
+        owns_source |= matches;
+    }
+    (owns_source, identity_unverified)
+}
+
+fn filesystem_identity_unverified(path: &Path) -> bool {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        let Ok(metadata) = fs::symlink_metadata(ancestor) else {
+            return true;
+        };
+        if metadata.file_type().is_symlink() {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_compiler_include_directive(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    let mut cursor = 0;
+    while let Some(relative_start) = lower[cursor..].find("{$") {
+        let start = cursor + relative_start + 2;
+        let rest = lower[start..].trim_start();
+        if is_include_directive_name(rest) {
+            return true;
+        }
+        cursor = start;
+    }
+    let mut cursor = 0;
+    while let Some(relative_start) = lower[cursor..].find("(*$") {
+        let start = cursor + relative_start + 3;
+        let rest = lower[start..].trim_start();
+        if is_include_directive_name(rest) {
+            return true;
+        }
+        cursor = start;
+    }
+    false
+}
+
+fn is_include_directive_name(rest: &str) -> bool {
+    let is_boundary = |value: &str| match value.chars().next() {
+        None => true,
+        Some(character) => character.is_whitespace() || character == '\'' || character == '"',
+    };
+    rest.strip_prefix("include").is_some_and(is_boundary)
+        || rest.strip_prefix('i').is_some_and(is_boundary)
 }
 
 fn relevant_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
@@ -396,6 +884,7 @@ fn build_project_context(
     options: &ProjectOptions,
     warnings: Vec<String>,
     explicit: bool,
+    consulted_metadata_files: Vec<PathBuf>,
 ) -> Result<ProjectContext, String> {
     let project_dir = project_file
         .parent()
@@ -451,6 +940,19 @@ fn build_project_context(
         }
     }
 
+    let mut include_paths = Vec::new();
+    if let Some(include_path) = builder.property("dcc_includepath") {
+        for item in include_path.split(';') {
+            add_resolved_search_path(
+                item,
+                &project_dir,
+                &mut include_paths,
+                &mut builder.warnings,
+                "DCC_IncludePath",
+            );
+        }
+    }
+
     let option_base = relevant_workspace_root(file, roots)
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| project_dir.clone());
@@ -469,18 +971,25 @@ fn build_project_context(
         add_explicit_units_from_source(main_source, &mut explicit_units, &mut builder.warnings);
     }
     for reference in &builder.references {
+        if is_compiled_reference(&reference.include) {
+            continue;
+        }
         let expanded = expand_value(
             &reference.include,
             "",
             &builder.properties,
+            &builder.unknown_properties,
             &mut builder.warnings,
             &reference.source_file,
         );
-        if expanded.contains(UNRESOLVED_MARKER) {
+        if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
+            continue;
+        }
+        if is_compiled_reference(&expanded.value) {
             continue;
         }
         let Some(path) = resolve_project_path(
-            &expanded,
+            &expanded.value,
             &builder.project_dir,
             &mut builder.warnings,
             "DCCReference",
@@ -506,12 +1015,19 @@ fn build_project_context(
             metadata_files.push(main_source.clone());
         }
     }
+    for metadata_file in consulted_metadata_files {
+        if !metadata_files.iter().any(|path| path == &metadata_file) {
+            metadata_files.push(metadata_file);
+        }
+    }
 
     Ok(ProjectContext {
-        discovery_complete: !project_context_warnings_incomplete(&builder.warnings, explicit),
+        discovery_complete: !builder.incomplete
+            && !project_context_warnings_incomplete(&builder.warnings, explicit),
         project_file: Some(project_file),
         main_source,
         search_paths,
+        include_paths,
         explicit_units,
         unit_namespaces: property_list(&builder, "dcc_namespace"),
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
@@ -530,6 +1046,7 @@ fn build_standalone_context(
     options: &ProjectOptions,
     mut warnings: Vec<String>,
     discovery_complete: bool,
+    metadata_files: Vec<PathBuf>,
 ) -> ProjectContext {
     let mut search_paths = Vec::new();
     if let Some(parent) = file.parent() {
@@ -560,6 +1077,7 @@ fn build_standalone_context(
         project_file: None,
         main_source: None,
         search_paths,
+        include_paths: Vec::new(),
         explicit_units: HashMap::new(),
         unit_namespaces: Vec::new(),
         unit_aliases: HashMap::new(),
@@ -567,7 +1085,7 @@ fn build_standalone_context(
         config: options.build_config.clone(),
         platform: options.platform.clone(),
         packages: Vec::new(),
-        metadata_files: Vec::new(),
+        metadata_files,
         warnings,
     }
 }
@@ -579,6 +1097,9 @@ fn project_context_warnings_incomplete(warnings: &[String], explicit: bool) -> b
             || warning.contains("unresolved property")
             || warning.contains("path does not exist and was omitted")
             || warning.contains("could not read optset")
+            || warning.contains("could not read main source")
+            || warning.contains("metadata file limit")
+            || warning.contains("property expansion exceeds")
             || warning.contains("could not inspect project")
             || warning.contains("could not inspect")
             || warning.contains("invalid xml")
@@ -704,6 +1225,27 @@ fn add_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
+}
+
+fn add_metadata_file(
+    metadata_files: &mut Vec<PathBuf>,
+    path: PathBuf,
+    warnings: &mut Vec<String>,
+    source_file: &Path,
+    kind: &str,
+) -> bool {
+    if metadata_files.iter().any(|existing| existing == &path) {
+        return true;
+    }
+    if metadata_files.len() >= MAX_METADATA_FILES {
+        warnings.push(format!(
+            "{kind} metadata file limit ({MAX_METADATA_FILES}) reached while reading {}",
+            source_file.display()
+        ));
+        return false;
+    }
+    metadata_files.push(path);
+    true
 }
 
 fn paths_equal_ci(left: &Path, right: &Path) -> bool {
@@ -934,6 +1476,15 @@ fn extension_is(path: &Path, extension: &str) -> bool {
         .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(extension))
 }
 
+fn is_compiled_reference(raw: &str) -> bool {
+    raw.trim()
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dcp"))
+}
+
 fn read_bounded(path: &Path, limit: u64) -> Result<String, String> {
     let metadata = fs::metadata(path).map_err(|error| format!("could not stat file: {error}"))?;
     if metadata.len() > limit {
@@ -1037,18 +1588,25 @@ fn parse_dproj_package_metadata(path: &Path, contents: &str) -> Result<PackageMe
     }
     metadata.metadata_files.extend(builder.metadata_files);
     for reference in builder.references {
+        if is_compiled_reference(&reference.include) {
+            continue;
+        }
         let expanded = expand_value(
             &reference.include,
             "",
             &builder.properties,
+            &builder.unknown_properties,
             &mut metadata.warnings,
             &reference.source_file,
         );
-        if expanded.contains(UNRESOLVED_MARKER) {
+        if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
+            continue;
+        }
+        if is_compiled_reference(&expanded.value) {
             continue;
         }
         let Some(unit_path) = package_unit_path(
-            &expanded,
+            &expanded.value,
             project_dir,
             &mut metadata.warnings,
             "package project reference",
@@ -1110,8 +1668,11 @@ fn declared_package_name(source: &str) -> Option<String> {
 #[derive(Debug)]
 struct ProjectBuilder {
     properties: HashMap<String, String>,
+    unknown_properties: HashSet<String>,
+    unknown_import_taint: bool,
     references: Vec<DccReference>,
     warnings: Vec<String>,
+    incomplete: bool,
     active_imports: HashSet<PathBuf>,
     import_count: usize,
     project_dir: PathBuf,
@@ -1143,8 +1704,11 @@ impl ProjectBuilder {
         let property_bytes = properties.values().map(String::len).sum();
         Self {
             properties,
+            unknown_properties: HashSet::new(),
+            unknown_import_taint: false,
             references: Vec::new(),
             warnings,
+            incomplete: false,
             active_imports: HashSet::new(),
             import_count: 0,
             project_dir,
@@ -1176,18 +1740,29 @@ impl ProjectBuilder {
                     self.process_property_group(group, source_file, base);
                 }
                 XmlOperation::DccReference(reference) => {
-                    if condition_matches(
+                    if is_compiled_reference(&reference.include) {
+                        continue;
+                    }
+                    let condition = condition_matches(
                         reference.condition.as_deref(),
-                        &self.properties,
+                        ConditionEnvironment {
+                            properties: &self.properties,
+                            unknown_properties: &self.unknown_properties,
+                            unknown_import_taint: self.unknown_import_taint,
+                        },
                         base,
+                        &mut self.metadata_files,
                         &mut self.warnings,
                         source_file,
-                    ) {
-                        self.references.push(DccReference {
+                    );
+                    match condition {
+                        TruthValue::True => self.references.push(DccReference {
                             include: reference.include,
                             condition: None,
                             source_file: source_file.to_path_buf(),
-                        });
+                        }),
+                        TruthValue::False => {}
+                        TruthValue::Unknown => self.incomplete = true,
                     }
                 }
                 XmlOperation::Import(import) => self.process_import(import, source_file, base),
@@ -1197,24 +1772,49 @@ impl ProjectBuilder {
     }
 
     fn process_property_group(&mut self, group: PropertyGroup, source_file: &Path, base: &Path) {
-        if !condition_matches(
+        let group_result = condition_matches(
             group.condition.as_deref(),
-            &self.properties,
+            ConditionEnvironment {
+                properties: &self.properties,
+                unknown_properties: &self.unknown_properties,
+                unknown_import_taint: self.unknown_import_taint,
+            },
             base,
+            &mut self.metadata_files,
             &mut self.warnings,
             source_file,
-        ) {
-            return;
+        );
+        match group_result {
+            TruthValue::False => return,
+            TruthValue::Unknown => {
+                self.incomplete = true;
+                for property in group.properties {
+                    self.mark_property_unknown(&property.name, source_file);
+                }
+                return;
+            }
+            TruthValue::True => {}
         }
         for property in group.properties {
-            if !condition_matches(
+            match condition_matches(
                 property.condition.as_deref(),
-                &self.properties,
+                ConditionEnvironment {
+                    properties: &self.properties,
+                    unknown_properties: &self.unknown_properties,
+                    unknown_import_taint: self.unknown_import_taint,
+                },
                 base,
+                &mut self.metadata_files,
                 &mut self.warnings,
                 source_file,
             ) {
-                continue;
+                TruthValue::False => continue,
+                TruthValue::Unknown => {
+                    self.incomplete = true;
+                    self.mark_property_unknown(&property.name, source_file);
+                    continue;
+                }
+                TruthValue::True => {}
             }
             if (property.name.eq_ignore_ascii_case("config") && self.global_config.is_some())
                 || (property.name.eq_ignore_ascii_case("platform")
@@ -1226,14 +1826,20 @@ impl ProjectBuilder {
                 &property.value,
                 &property.name,
                 &self.properties,
+                &self.unknown_properties,
                 &mut self.warnings,
                 source_file,
             );
-            self.set_property(&property.name, value.trim().to_string(), source_file);
+            self.set_property(
+                &property.name,
+                value.value.trim().to_string(),
+                value.unknown,
+                source_file,
+            );
         }
     }
 
-    fn set_property(&mut self, name: &str, value: String, source_file: &Path) {
+    fn set_property(&mut self, name: &str, value: String, unknown: bool, source_file: &Path) {
         let key = name.to_ascii_lowercase();
         let previous_bytes = self.properties.get(&key).map_or(0, String::len);
         let new_bytes = self
@@ -1241,6 +1847,7 @@ impl ProjectBuilder {
             .saturating_sub(previous_bytes)
             .saturating_add(value.len());
         if new_bytes > MAX_TOTAL_PROPERTY_BYTES {
+            self.incomplete = true;
             self.warnings.push(format!(
                 "property memory budget exceeded while evaluating {name} in {}; value ignored",
                 source_file.display()
@@ -1248,7 +1855,52 @@ impl ProjectBuilder {
             return;
         }
         self.property_bytes = new_bytes;
+        if unknown || value.contains(UNRESOLVED_MARKER) {
+            self.unknown_properties.insert(key.clone());
+        } else {
+            self.unknown_properties.remove(&key);
+        }
         self.properties.insert(key, value);
+    }
+
+    fn taint_unknown_import(&mut self) {
+        self.unknown_import_taint = true;
+        let keys: Vec<String> = self.properties.keys().cloned().collect();
+        for key in keys {
+            // MainSource identifies the project itself and is consumed after
+            // the complete metadata stream has been evaluated. Keep an
+            // already-established value available for that identity lookup,
+            // but retain its evaluation taint so later conditions cannot use
+            // it as definite evidence. A later definite assignment clears the
+            // taint normally.
+            if key.eq_ignore_ascii_case("mainsource") {
+                self.unknown_properties.insert(key);
+                continue;
+            }
+            if (key.eq_ignore_ascii_case("config") && self.global_config.is_some())
+                || (key.eq_ignore_ascii_case("platform") && self.global_platform.is_some())
+            {
+                continue;
+            }
+            let previous_bytes = self.properties.get(&key).map_or(0, String::len);
+            self.property_bytes = self
+                .property_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(UNRESOLVED_MARKER.len_utf8());
+            self.properties
+                .insert(key.clone(), UNRESOLVED_MARKER.to_string());
+            self.unknown_properties.insert(key);
+        }
+    }
+
+    fn mark_property_unknown(&mut self, name: &str, source_file: &Path) {
+        if (name.eq_ignore_ascii_case("config") && self.global_config.is_some())
+            || (name.eq_ignore_ascii_case("platform") && self.global_platform.is_some())
+        {
+            return;
+        }
+        self.set_property(name, UNRESOLVED_MARKER.to_string(), true, source_file);
+        self.unknown_properties.insert(name.to_ascii_lowercase());
     }
 
     fn process_import(&mut self, import: Import, source_file: &Path, base: &Path) {
@@ -1264,15 +1916,20 @@ impl ProjectBuilder {
             &import.project,
             "",
             &self.properties,
+            &self.unknown_properties,
             &mut self.warnings,
             source_file,
         );
-        if expanded.contains(UNRESOLVED_MARKER) {
+        if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
+            self.incomplete = true;
+            self.taint_unknown_import();
             return;
         }
         let Some(candidate) =
-            project_path_candidate(&expanded, base, &mut self.warnings, "optset import")
+            project_path_candidate(&expanded.value, base, &mut self.warnings, "optset import")
         else {
+            self.incomplete = true;
+            self.taint_unknown_import();
             return;
         };
         let path_status =
@@ -1280,32 +1937,47 @@ impl ProjectBuilder {
         let path = match &path_status {
             ExistingPathStatus::Found(path) => path,
             ExistingPathStatus::Missing => &candidate,
-            ExistingPathStatus::Unresolvable => return,
-        };
-        if !self
-            .metadata_files
-            .iter()
-            .any(|existing| paths_equal_ci(existing, path))
-        {
-            if self.metadata_files.len() >= MAX_METADATA_FILES {
-                self.warnings.push(format!(
-                    "optset metadata file limit ({MAX_METADATA_FILES}) reached while reading {}",
-                    source_file.display()
-                ));
+            ExistingPathStatus::Unresolvable => {
+                self.incomplete = true;
+                self.taint_unknown_import();
                 return;
             }
-            self.metadata_files.push(path.clone());
-        }
-        if !condition_matches(
-            import.condition.as_deref(),
-            &self.properties,
-            base,
+        };
+        if !add_metadata_file(
+            &mut self.metadata_files,
+            path.clone(),
             &mut self.warnings,
             source_file,
+            "optset",
         ) {
+            self.incomplete = true;
+            self.taint_unknown_import();
             return;
         }
+        let condition = condition_matches(
+            import.condition.as_deref(),
+            ConditionEnvironment {
+                properties: &self.properties,
+                unknown_properties: &self.unknown_properties,
+                unknown_import_taint: self.unknown_import_taint,
+            },
+            base,
+            &mut self.metadata_files,
+            &mut self.warnings,
+            source_file,
+        );
+        match condition {
+            TruthValue::True => {}
+            TruthValue::False => return,
+            TruthValue::Unknown => {
+                self.incomplete = true;
+                self.taint_unknown_import();
+                return;
+            }
+        }
         if self.import_count >= MAX_IMPORT_COUNT {
+            self.incomplete = true;
+            self.taint_unknown_import();
             self.warnings.push(format!(
                 "optset import limit ({MAX_IMPORT_COUNT}) reached while reading {}",
                 source_file.display()
@@ -1313,6 +1985,8 @@ impl ProjectBuilder {
             return;
         }
         let ExistingPathStatus::Found(path) = path_status else {
+            self.incomplete = true;
+            self.taint_unknown_import();
             self.warnings.push(format!(
                 "optset import path does not exist and was omitted: {}",
                 path.display()
@@ -1329,10 +2003,14 @@ impl ProjectBuilder {
             .and_then(|contents| parse_xml_operations(&contents, &path));
         match result {
             Ok(operations) => self.process_operations(operations, &path),
-            Err(error) => self.warnings.push(format!(
-                "could not read optset import {}: {error}",
-                path.display()
-            )),
+            Err(error) => {
+                self.incomplete = true;
+                self.taint_unknown_import();
+                self.warnings.push(format!(
+                    "could not read optset import {}: {error}",
+                    path.display()
+                ));
+            }
         }
         self.active_imports.remove(&path);
     }
@@ -1676,29 +2354,44 @@ fn xml_attributes(
     Ok(attributes)
 }
 
+#[derive(Debug)]
+struct ExpandedValue {
+    value: String,
+    unknown: bool,
+}
+
 fn expand_value(
     value: &str,
     current_property: &str,
     properties: &HashMap<String, String>,
+    unknown_properties: &HashSet<String>,
     warnings: &mut Vec<String>,
     source_file: &Path,
-) -> String {
+) -> ExpandedValue {
     let mut expanded = String::new();
+    let mut unknown = false;
     let mut cursor = 0;
     while let Some(relative_start) = value[cursor..].find("$(") {
         let start = cursor + relative_start;
         if !append_expansion(&mut expanded, &value[cursor..start], warnings, source_file) {
-            return UNRESOLVED_MARKER.to_string();
+            return ExpandedValue {
+                value: UNRESOLVED_MARKER.to_string(),
+                unknown: true,
+            };
         }
         let Some(relative_end) = value[start + 2..].find(')') else {
             warnings.push(format!(
                 "unsupported unclosed property expansion in {}",
                 source_file.display()
             ));
-            return UNRESOLVED_MARKER.to_string();
+            return ExpandedValue {
+                value: UNRESOLVED_MARKER.to_string(),
+                unknown: true,
+            };
         };
         let end = start + 2 + relative_end;
         let name = value[start + 2..end].trim();
+        let key = name.to_ascii_lowercase();
         if name.eq_ignore_ascii_case("thisfiledirectory")
             || name.eq_ignore_ascii_case("msbuildthisfiledirectory")
         {
@@ -1709,35 +2402,53 @@ fn expand_value(
                 .replace('\\', "/");
             let directory = format!("{}/", directory.trim_end_matches('/'));
             if !append_expansion(&mut expanded, &directory, warnings, source_file) {
-                return UNRESOLVED_MARKER.to_string();
+                return ExpandedValue {
+                    value: UNRESOLVED_MARKER.to_string(),
+                    unknown: true,
+                };
             }
-        } else if let Some(replacement) = properties.get(&name.to_ascii_lowercase()) {
+        } else if let Some(replacement) = properties.get(&key) {
             if !append_expansion(&mut expanded, replacement, warnings, source_file) {
-                return UNRESOLVED_MARKER.to_string();
+                return ExpandedValue {
+                    value: UNRESOLVED_MARKER.to_string(),
+                    unknown: true,
+                };
             }
+            unknown |= replacement.contains(UNRESOLVED_MARKER) || unknown_properties.contains(&key);
         } else if name.eq_ignore_ascii_case(current_property) {
             // Delphi project files commonly terminate list properties with
             // their own unset value. This is an intentional empty default.
+            unknown |= unknown_properties.contains(&key);
         } else {
             warnings.push(format!(
                 "unresolved property path $({name}) in {}",
                 source_file.display()
             ));
+            unknown = true;
             if !append_expansion(
                 &mut expanded,
                 &UNRESOLVED_MARKER.to_string(),
                 warnings,
                 source_file,
             ) {
-                return UNRESOLVED_MARKER.to_string();
+                return ExpandedValue {
+                    value: UNRESOLVED_MARKER.to_string(),
+                    unknown: true,
+                };
             }
         }
         cursor = end + 1;
     }
     if !append_expansion(&mut expanded, &value[cursor..], warnings, source_file) {
-        return UNRESOLVED_MARKER.to_string();
+        return ExpandedValue {
+            value: UNRESOLVED_MARKER.to_string(),
+            unknown: true,
+        };
     }
-    expanded
+    ExpandedValue {
+        value: expanded,
+        unknown,
+    }
 }
 
 fn append_expansion(
@@ -1768,9 +2479,17 @@ struct ConditionValue {
     unknown: bool,
 }
 
+struct ConditionEnvironment<'a> {
+    properties: &'a HashMap<String, String>,
+    unknown_properties: &'a HashSet<String>,
+    unknown_import_taint: bool,
+}
+
 fn expand_condition_value(
     value: &str,
     properties: &HashMap<String, String>,
+    unknown_properties: &HashSet<String>,
+    unknown_import_taint: bool,
     source_file: &Path,
     warnings: &mut Vec<String>,
 ) -> ConditionValue {
@@ -1815,9 +2534,23 @@ fn expand_condition_value(
                     unknown: true,
                 };
             }
-            missing |= replacement.contains(UNRESOLVED_MARKER);
+            missing |= replacement.contains(UNRESOLVED_MARKER)
+                || unknown_properties.contains(&name.to_ascii_lowercase());
         } else {
-            missing = true;
+            if unknown_import_taint || !is_known_project_local_configuration_property(name) {
+                missing = true;
+                if !append_expansion(
+                    &mut expanded,
+                    &UNRESOLVED_MARKER.to_string(),
+                    warnings,
+                    source_file,
+                ) {
+                    return ConditionValue {
+                        value: String::new(),
+                        unknown: true,
+                    };
+                }
+            }
         }
         cursor = end + 1;
     }
@@ -1847,13 +2580,14 @@ fn combine_conditions(parent: Option<&str>, own: Option<&str>) -> Option<String>
 
 fn condition_matches(
     condition: Option<&str>,
-    properties: &HashMap<String, String>,
+    environment: ConditionEnvironment<'_>,
     base: &Path,
+    metadata_files: &mut Vec<PathBuf>,
     warnings: &mut Vec<String>,
     source_file: &Path,
-) -> bool {
+) -> TruthValue {
     let Some(condition) = condition.map(str::trim).filter(|value| !value.is_empty()) else {
-        return true;
+        return TruthValue::True;
     };
     let tokens = match tokenize_condition(condition) {
         Ok(tokens) => tokens,
@@ -1862,14 +2596,17 @@ fn condition_matches(
                 "unsupported project condition in {}: {error}: {condition}",
                 source_file.display()
             ));
-            return false;
+            return TruthValue::Unknown;
         }
     };
     let mut parser = ConditionParser {
         tokens,
         position: 0,
-        properties,
+        properties: environment.properties,
+        unknown_properties: environment.unknown_properties,
+        unknown_import_taint: environment.unknown_import_taint,
         base,
+        metadata_files,
         warnings,
         source_file,
         unknown_seen: false,
@@ -1877,7 +2614,7 @@ fn condition_matches(
     let result = parser.parse();
     let unknown = parser.unknown_seen;
     match result {
-        Ok(TruthValue::True) => true,
+        Ok(TruthValue::True) => TruthValue::True,
         Ok(TruthValue::False) => {
             if unknown {
                 parser.warnings.push(format!(
@@ -1885,23 +2622,33 @@ fn condition_matches(
                     parser.source_file.display()
                 ));
             }
-            false
+            TruthValue::False
         }
         Ok(TruthValue::Unknown) => {
             parser.warnings.push(format!(
                 "unknown project condition in {}: {condition}",
                 parser.source_file.display()
             ));
-            false
+            TruthValue::Unknown
         }
         Err(error) => {
             parser.warnings.push(format!(
                 "unsupported project condition in {}: {error}: {condition}",
                 parser.source_file.display()
             ));
-            false
+            TruthValue::Unknown
         }
     }
+}
+
+fn is_known_project_local_configuration_property(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "config"
+        || name == "platform"
+        || name == "base"
+        || name.starts_with("base_")
+        || name.starts_with("cfg_")
+        || name == "cfgparent"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2025,7 +2772,10 @@ struct ConditionParser<'a> {
     tokens: Vec<ConditionToken>,
     position: usize,
     properties: &'a HashMap<String, String>,
+    unknown_properties: &'a HashSet<String>,
+    unknown_import_taint: bool,
     base: &'a Path,
+    metadata_files: &'a mut Vec<PathBuf>,
     warnings: &'a mut Vec<String>,
     source_file: &'a Path,
     unknown_seen: bool,
@@ -2077,14 +2827,35 @@ impl ConditionParser<'_> {
                 self.unknown_seen = true;
                 return Ok(TruthValue::Unknown);
             }
-            return Ok(resolve_project_path(
+            let Some(candidate) = project_path_candidate(
                 &argument.value,
                 self.base,
                 self.warnings,
                 "Exists condition",
-                false,
-            )
-            .map_or(TruthValue::False, |_| TruthValue::True));
+            ) else {
+                return Ok(TruthValue::False);
+            };
+            let path_status =
+                resolve_existing_path_status(&candidate, self.warnings, "Exists condition");
+            let path = match &path_status {
+                ExistingPathStatus::Found(path) => path,
+                ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => &candidate,
+            };
+            if !add_metadata_file(
+                self.metadata_files,
+                path.clone(),
+                self.warnings,
+                self.source_file,
+                "Exists condition",
+            ) {
+                self.unknown_seen = true;
+                return Ok(TruthValue::Unknown);
+            }
+            return Ok(match path_status {
+                ExistingPathStatus::Found(_) => TruthValue::True,
+                ExistingPathStatus::Missing => TruthValue::False,
+                ExistingPathStatus::Unresolvable => TruthValue::Unknown,
+            });
         }
 
         let left = self.parse_value()?;
@@ -2126,6 +2897,8 @@ impl ConditionParser<'_> {
                 let expanded = expand_condition_value(
                     &value,
                     self.properties,
+                    self.unknown_properties,
+                    self.unknown_import_taint,
                     self.source_file,
                     self.warnings,
                 );
@@ -2173,8 +2946,28 @@ enum PascalToken {
 }
 
 fn parse_explicit_unit_paths(source: &str) -> Vec<(String, String)> {
+    parse_unit_membership(source).explicit_paths
+}
+
+#[derive(Debug, Default)]
+struct UnitMembership {
+    explicit_paths: Vec<(String, String)>,
+    exhaustive: bool,
+}
+
+fn parse_unit_membership(source: &str) -> UnitMembership {
     let tokens = lex_pascal(source);
-    let mut result = Vec::new();
+    let mut result = UnitMembership {
+        exhaustive: true,
+        ..UnitMembership::default()
+    };
+    if contains_conditional_compiler_directive(source) {
+        // The lexer deliberately removes directives, so a conditional uses or
+        // contains clause cannot be proven exhaustive from the remaining
+        // tokens. Keep explicit paths for positive lookup, but never use them
+        // as negative ownership evidence.
+        result.exhaustive = false;
+    }
     let mut cursor = 0;
     while cursor < tokens.len() {
         let is_clause = matches!(
@@ -2191,30 +2984,50 @@ fn parse_explicit_unit_paths(source: &str) -> Vec<(String, String)> {
         while cursor < tokens.len() && !matches!(tokens[cursor], PascalToken::Semicolon) {
             cursor += 1;
         }
-        parse_unit_clause(&tokens[clause_start..cursor], &mut result);
+        parse_unit_clause(
+            &tokens[clause_start..cursor],
+            &mut result.explicit_paths,
+            &mut result.exhaustive,
+        );
         cursor = cursor.saturating_add(1);
     }
     result
 }
 
-fn parse_unit_clause(tokens: &[PascalToken], result: &mut Vec<(String, String)>) {
+fn contains_conditional_compiler_directive(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    ["{$if", "{$else", "{$endif", "(*$if", "(*$else", "(*$endif"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn parse_unit_clause(
+    tokens: &[PascalToken],
+    result: &mut Vec<(String, String)>,
+    exhaustive: &mut bool,
+) {
     let mut segment_start = 0;
     for index in 0..=tokens.len() {
         if index == tokens.len() || matches!(tokens[index], PascalToken::Comma) {
-            parse_unit_segment(&tokens[segment_start..index], result);
+            if !parse_unit_segment(&tokens[segment_start..index], result) {
+                *exhaustive = false;
+            }
             segment_start = index.saturating_add(1);
         }
     }
 }
 
-fn parse_unit_segment(tokens: &[PascalToken], result: &mut Vec<(String, String)>) {
+fn parse_unit_segment(tokens: &[PascalToken], result: &mut Vec<(String, String)>) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
     let Some(in_index) = tokens.iter().position(
         |token| matches!(token, PascalToken::Word(word) if word.eq_ignore_ascii_case("in")),
     ) else {
-        return;
+        return false;
     };
     let Some(PascalToken::String(path)) = tokens.get(in_index + 1) else {
-        return;
+        return false;
     };
     let mut unit_name = String::new();
     for token in &tokens[..in_index] {
@@ -2230,6 +3043,9 @@ fn parse_unit_segment(tokens: &[PascalToken], result: &mut Vec<(String, String)>
     let unit_name = unit_name.trim().to_string();
     if !unit_name.is_empty() && !path.is_empty() {
         result.push((unit_name, path.clone()));
+        true
+    } else {
+        false
     }
 }
 

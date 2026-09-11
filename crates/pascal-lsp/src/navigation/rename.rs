@@ -2,7 +2,7 @@ use super::{
     Candidate, Document, NavigationIndex, ROOT_SCOPE, Span, Symbol, SymbolKind, canonical_name,
     collect_nodes_matching, field_identifier_nodes, has_ancestor_kind, identifier_at,
     identifier_nodes, is_ignored_offset, is_right_hand_member, member_expression_at, node_text,
-    qualified_type_path_at, routine_name, routine_signature,
+    qualified_type_path_at, routine_name, routine_signature, use_name_at,
 };
 use lsp_types::{PrepareRenameResponse, Range, TextEdit, Url};
 use std::collections::{HashMap, HashSet};
@@ -76,6 +76,131 @@ impl NavigationIndex {
                     )
             });
         Ok(RenameBindingInfo { local, names })
+    }
+
+    /// Prove that the rename target can be resolved without any imported
+    /// documents. This is deliberately narrower than classifying a binding as
+    /// local: public bindings still require the workspace snapshot and its
+    /// reverse-reference checks.
+    pub(crate) fn self_contained_rename_binding(
+        &mut self,
+        uri: &Url,
+        position: lsp_types::Position,
+        additional_names: &[String],
+    ) -> bool {
+        self.bind_imports(uri, std::iter::empty::<(String, Url)>());
+        let Ok(plan) = self.rename_plan(uri, position) else {
+            return false;
+        };
+        let Some(document) = self.documents.get(uri) else {
+            return false;
+        };
+
+        let binding_names = plan
+            .binding
+            .names
+            .iter()
+            .map(|name| canonical_name(name))
+            .collect::<HashSet<_>>();
+        let candidate_names = binding_names
+            .iter()
+            .cloned()
+            .chain(additional_names.iter().map(|name| canonical_name(name)))
+            .collect::<HashSet<_>>();
+
+        for identifier in identifier_nodes(document.tree.root_node()) {
+            let span = Span::from_node(identifier);
+            let name = canonical_name(&node_text(identifier, &document.source));
+            if !candidate_names.contains(&name) {
+                continue;
+            }
+            if is_ignored_offset(document.tree.root_node(), span.start)
+                || has_ancestor_kind(identifier, "ppDirective")
+            {
+                continue;
+            }
+            if document
+                .opaque_ranges
+                .iter()
+                .any(|range| range.contains(span))
+                || document.has_parser_recovery_near(span)
+                || has_ancestor_kind(identifier, "with")
+                || has_ancestor_kind(identifier, "inherited")
+            {
+                return false;
+            }
+
+            let candidates = self.resolve_candidates_at(uri, document, span.start, identifier);
+            if candidates.len() != 1 {
+                return false;
+            }
+            let candidate = &candidates[0];
+            if self.is_unknown_global_fallback(uri, document, identifier, span.start, &candidates) {
+                return false;
+            }
+            if candidate.uri != *uri
+                || (binding_names.contains(&name)
+                    && !plan.binding.matches_candidate(self, candidate))
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn is_unknown_global_fallback(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        offset: usize,
+        candidates: &[Candidate],
+    ) -> bool {
+        document
+            .owner_type_at(offset)
+            .is_some_and(|owner| self.has_unknown_class_ancestor(document, &owner))
+            && member_expression_at(identifier).is_none()
+            && qualified_type_path_at(identifier, &document.source).is_none()
+            && use_name_at(identifier, &document.source).is_none()
+            && candidates
+                .iter()
+                .any(|candidate| candidate.uri == *uri && self.candidate_is_global(candidate))
+    }
+
+    fn candidate_is_global(&self, candidate: &Candidate) -> bool {
+        self.symbol(candidate).is_some_and(|symbol| {
+            symbol.scope == ROOT_SCOPE
+                && symbol.owner_type.is_none()
+                && !symbol.local_only
+                && matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Constant)
+        })
+    }
+
+    fn has_unknown_class_ancestor(&self, document: &Document, owner_type: &str) -> bool {
+        let Some(type_declaration) = collect_nodes_matching(document.tree.root_node(), "declType")
+            .into_iter()
+            .find(|node| {
+                field_identifier_nodes(*node, "name")
+                    .last()
+                    .is_some_and(|name| {
+                        canonical_name(&node_text(*name, &document.source)) == owner_type
+                    })
+            })
+        else {
+            return true;
+        };
+        let Some(type_node) = type_declaration.child_by_field_name("type") else {
+            return true;
+        };
+
+        // The resolver does not establish a complete inheritance or type-alias
+        // chain here. A same-document parent name is therefore not proof that
+        // inherited lookup is complete, and an omitted parent still has
+        // implicit TObject ancestry that is not modeled. Keep fallback globals
+        // conservative; lexical and same-class bindings are filtered before
+        // this guard is consulted.
+        type_node.kind() == "declClass"
     }
 
     /// Check whether the identifier at `position` can be renamed in the
@@ -401,6 +526,18 @@ impl NavigationIndex {
                 }
 
                 let candidates = self.resolve_candidates_at(uri, document, span.start, identifier);
+                if self.is_unknown_global_fallback(
+                    uri,
+                    document,
+                    identifier,
+                    span.start,
+                    &candidates,
+                ) {
+                    return Err(format!(
+                        "rename cannot prove the binding of {:?} at {}:{} because the class ancestor is unknown",
+                        binding.old_key, uri, span.start
+                    ));
+                }
                 let matching = candidates
                     .iter()
                     .filter(|candidate| binding.matches_candidate(self, candidate))

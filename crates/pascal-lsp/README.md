@@ -137,17 +137,30 @@ paths.
 
 Without `projectFile`, discovery searches ancestor directories up to the
 workspace boundary for an unambiguous `.dproj`, falling back to a `.dpr` or
-`.dpk`. Ambiguous projects require an explicit selection; the server does not
-choose one arbitrarily. The project's configuration/platform defaults apply
+`.dpk`. Multiple candidates can be narrowed to a unique proven source owner;
+shared ownership, uncertain dependencies, and incomplete candidate metadata
+still require an explicit selection. Candidate metadata is tracked for freshness,
+and ownership probing is bounded. The project's configuration/platform defaults apply
 unless overridden. Ordered project mappings and search paths take precedence
 over unrelated repository files. Missing units and unsupported project settings
 are reported as warnings in the LSP log, not as compiler-grade undeclared-symbol
-errors. Defines are collected as metadata, but source conditional compilation
-is not yet evaluated. In the current MultidevComponents real-project example,
-the public `MDIBDatabase` constant action remains disabled: automatic discovery
-finds 13 project candidates, while explicit `MDDatabaseXE3` has an undefined
-inactive condition and missing `.dcp` warnings. This is an intentional
-fail-closed refusal, not evidence that the project action is supported.
+errors. Ordinary absent project-local configuration properties can evaluate as
+empty, while unavailable environment inputs and values affected by uncertain
+imports remain unknown. Compiled-only `.dcp` references do not establish source
+membership or, by themselves, make source discovery incomplete. Missing source
+references still do. Defines are collected as metadata, but source conditional
+compilation is not yet evaluated.
+
+In the MultidevComponents example, `MDIBDatabase.pas` is genuinely shared by
+multiple packages, so automatic project selection still refuses to guess.
+Explicit `MDDatabaseXE3.dproj` with Debug/Win32 now evaluates successfully.
+The full-workspace rename remains blocked when includes referenced by
+`Common/Vcl.Styles.Ext.pas` (`source/vcl/StyleUtils.inc` and
+`source/vcl/StyleAPI.inc`) are unavailable through the configured search paths.
+These references are inside a source conditional that the server cannot yet
+prove inactive. With the current analysis, the include paths must resolve or
+the workspace scope must be explicitly adjusted; the server does not silently
+exclude potential consumers.
 
 `.lint4d.toml` is discovered for each open file's lint settings and suppressions.
 Root-level excludes also apply to source discovery. `.fmt4d.toml` controls
@@ -234,13 +247,23 @@ eager edits instead.
 For safety, rename is refused rather than returning a partial edit when the
 workspace scan is incomplete, an import/project context is unresolved or
 ambiguous, a source path is a symlink escape, or an edit would touch an
-external `sourcePaths` file. Include files and conditional compilation are
-not expanded, so snapshots containing potentially relevant include or
-conditional directives are rejected. Unit/module renames (which require
+external `sourcePaths` file. Include lookup searches the including file's
+directory, evaluated `DCC_IncludePath`, then ordered unit/client source paths.
+Nested includes are audited within depth, file, directive, and byte limits;
+lookup observations and content hashes participate in stale-input checks.
+Comments and recognized compiler-only directives, including conditional compiler
+flags, do not by themselves block a rename. Pascal-dependent conditional
+expressions and relevant source-bearing includes remain unsupported; missing or
+unreadable includes cannot be treated as evidence that no reference exists.
+Source conditional compilation is not expanded. Unit/module renames (which require
 `RenameFile`), inherited/`with` lookup, overloaded/override relationships,
 compiled-only consumers, and other unsupported bindings are also rejected by
 the shared planner. Name collisions and reference capture are rejected before
-any edit is returned. These checks are conservative; they bound races and
+any edit is returned. Unresolved imports can be irrelevant when all candidate
+references are proven to bind within the source document without imports;
+import-dependent references still require complete bindings. Unqualified global
+fallbacks in class methods are not such a proof because inherited lookup is
+not fully modeled. These checks are conservative; they bound races and
 avoid false-safe workspace edits but do not eliminate changes made after a
 request has completed.
 

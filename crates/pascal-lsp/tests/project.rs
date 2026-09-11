@@ -741,3 +741,801 @@ fn evaluates_dcc_use_package_names_in_declared_order_without_duplicates() {
 
     assert_eq!(context.packages, ["firstpkg", "multidevd10", "secondpkg"]);
 }
+
+#[test]
+fn ordinary_undefined_configuration_properties_are_empty() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("App.dproj").as_path(),
+        r#"<Project>
+  <PropertyGroup>
+    <MainSource>App.dpr</MainSource>
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_1)'!=''">
+    <Cfg_1>true</Cfg_1>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Cfg_1)'=='true') or '$(Cfg_1_Win32)'!=''">
+    <DCC_Define>DEBUG</DCC_Define>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_2)'!=''">
+    <DCC_Define>RELEASE</DCC_Define>
+  </PropertyGroup>
+</Project>"#,
+    );
+
+    let context = discover(
+        &root.join("App.dpr"),
+        root,
+        &ProjectOptions {
+            build_config: Some("Debug".to_string()),
+            platform: Some("Win32".to_string()),
+            ..ProjectOptions::default()
+        },
+    );
+
+    assert_eq!(context.defines, ["DEBUG"]);
+    assert!(
+        context.discovery_complete,
+        "unexpected incomplete context: {context:?}"
+    );
+    assert!(
+        context
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("Cfg_2") && !warning.contains("Cfg_1_Win32")),
+        "ordinary missing configuration properties stayed unknown: {:?}",
+        context.warnings
+    );
+}
+
+#[test]
+fn properties_from_unknown_prior_conditions_remain_unknown() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("App.dproj").as_path(),
+        r#"<Project>
+  <PropertyGroup>
+    <MainSource>App.dpr</MainSource>
+  </PropertyGroup>
+  <PropertyGroup Condition="Exists('$(Unavailable)')">
+    <Derived>true</Derived>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Derived)'!=''">
+    <DCC_Define>GUESSED</DCC_Define>
+  </PropertyGroup>
+</Project>"#,
+    );
+
+    let context = discover(&root.join("App.dpr"), root, &options());
+
+    assert!(
+        context.defines.is_empty(),
+        "unknown property was guessed: {context:?}"
+    );
+    assert!(
+        !context.discovery_complete,
+        "unknown property was treated as complete"
+    );
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unknown project condition")),
+        "unknown condition was not reported: {:?}",
+        context.warnings
+    );
+}
+
+#[test]
+fn automatic_selection_uses_the_unique_proven_source_owner() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let source = root.join("src/Shared.pas");
+    write(&source, "unit Shared; interface implementation end.");
+    write(
+        root.join("Other.pas").as_path(),
+        "unit Other; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(root.join("B.dpr").as_path(), "program B; begin end.");
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource><DCCReference Include=\"Other.pas\"/></PropertyGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource><DCCReference Include=\"src/Shared.pas\"/></PropertyGroup></Project>",
+    );
+
+    let context = discover(&source, root, &options());
+
+    assert_eq!(context.project_file, Some(root.join("B.dproj")));
+    assert!(
+        context.discovery_complete,
+        "unique owner was not complete: {context:?}"
+    );
+    assert!(
+        context
+            .metadata_files
+            .iter()
+            .any(|path| path == &root.join("A.dproj"))
+    );
+    assert!(
+        context
+            .metadata_files
+            .iter()
+            .any(|path| path == &root.join("B.dproj"))
+    );
+}
+
+#[test]
+fn automatic_selection_refuses_shared_source_owners_even_through_aliases() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let source = root.join("src/Shared.pas");
+    write(&source, "unit Shared; interface implementation end.");
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(root.join("B.dpr").as_path(), "program B; begin end.");
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource><DCCReference Include=\"src\\Shared.pas\"/></PropertyGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource><DCCReference Include=\"./src/../src/Shared.pas\"/></PropertyGroup></Project>",
+    );
+
+    let context = discover(&source, root, &options());
+
+    assert!(
+        context.project_file.is_none(),
+        "shared ownership was guessed: {context:?}"
+    );
+    assert!(!context.discovery_complete);
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("multiple project files")),
+        "shared ownership was not reported: {:?}",
+        context.warnings
+    );
+    assert!(
+        context
+            .metadata_files
+            .iter()
+            .any(|path| path == &root.join("A.dproj"))
+    );
+    assert!(
+        context
+            .metadata_files
+            .iter()
+            .any(|path| path == &root.join("B.dproj"))
+    );
+}
+
+#[test]
+fn incomplete_candidate_metadata_is_not_exclusion_proof() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let source = root.join("src/Shared.pas");
+    write(&source, "unit Shared; interface implementation end.");
+    write(
+        root.join("Owner.dpr").as_path(),
+        "program Owner; begin end.",
+    );
+    write(
+        root.join("Owner.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>Owner.dpr</MainSource><DCCReference Include=\"src/Shared.pas\"/></PropertyGroup></Project>",
+    );
+    write(
+        root.join("Unknown.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>Unknown.dpr</MainSource><DCCReference Include=\"$(Unavailable)/src/Shared.pas\"/></PropertyGroup></Project>",
+    );
+
+    let context = discover(&source, root, &options());
+
+    assert!(
+        context.project_file.is_none(),
+        "incomplete candidate was excluded: {context:?}"
+    );
+    assert!(!context.discovery_complete);
+    assert!(
+        context
+            .metadata_files
+            .iter()
+            .any(|path| path == &root.join("Unknown.dproj"))
+    );
+}
+
+#[test]
+fn missing_compiled_references_do_not_invalidate_source_context() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("App.dproj").as_path(),
+        r#"<Project>
+  <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+  <ItemGroup><DCCReference Include="missing.dcp" /></ItemGroup>
+</Project>"#,
+    );
+
+    let context = discover(&root.join("App.dpr"), root, &options());
+
+    assert!(
+        context.discovery_complete,
+        "missing DCP poisoned context: {context:?}"
+    );
+    assert!(context.explicit_units.is_empty());
+    assert!(
+        context
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("missing.dcp")),
+        "compiled-only reference was treated as source: {:?}",
+        context.warnings
+    );
+}
+
+#[test]
+fn missing_source_references_remain_incomplete() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("App.dproj").as_path(),
+        r#"<Project>
+  <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+  <ItemGroup>
+    <DCCReference Include="missing.pas" />
+    <DCCReference Include="missing.dpk" />
+    <DCCReference Include="missing.inc" />
+  </ItemGroup>
+</Project>"#,
+    );
+
+    let context = discover(&root.join("App.dpr"), root, &options());
+
+    assert!(
+        !context.discovery_complete,
+        "missing source references were ignored: {context:?}"
+    );
+    for extension in ["missing.pas", "missing.dpk", "missing.inc"] {
+        assert!(
+            context
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(extension)),
+            "missing source reference {extension} was not reported: {:?}",
+            context.warnings
+        );
+    }
+}
+
+#[test]
+fn evaluates_inherited_include_paths_without_adding_them_to_unit_search_paths() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let project_include = root.join("project-includes");
+    let optset_include = root.join("optset-includes");
+    fs::create_dir_all(&project_include).expect("create project include path");
+    fs::create_dir_all(&optset_include).expect("create optset include path");
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("common.optset").as_path(),
+        "<Project><PropertyGroup><DCC_IncludePath>optset-includes;$(DCC_IncludePath)</DCC_IncludePath><DCC_UnitSearchPath>units;$(DCC_UnitSearchPath)</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write(
+        root.join("App.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project=\"common.optset\"/><PropertyGroup><DCC_IncludePath>project-includes;$(DCC_IncludePath)</DCC_IncludePath></PropertyGroup></Project>",
+    );
+
+    let context = discover(&root.join("App.dpr"), root, &options());
+
+    assert_eq!(
+        context.include_paths,
+        vec![project_include.clone(), optset_include.clone()]
+    );
+    assert!(!context.search_paths.contains(&project_include));
+    assert!(!context.search_paths.contains(&optset_include));
+    assert!(context.search_paths.contains(&root.join("units")));
+}
+
+#[test]
+fn bare_uses_is_not_exclusion_proof_for_automatic_selection() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(
+        root.join("B.dpr").as_path(),
+        "program B; uses Shared; begin end.",
+    );
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource><DCC_UnitSearchPath>src</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+
+    let context = discover(&root.join("src/Shared.pas"), root, &options());
+
+    assert!(
+        context.project_file.is_none(),
+        "bare uses were excluded: {context:?}"
+    );
+    assert!(!context.discovery_complete);
+}
+
+#[test]
+fn transitive_bare_uses_are_not_exclusion_proof_for_automatic_selection() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(
+        root.join("Middle.pas").as_path(),
+        "unit Middle; interface uses Shared; implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(
+        root.join("B.dpr").as_path(),
+        "program B; uses Middle in 'Middle.pas'; begin end.",
+    );
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
+    );
+
+    let context = discover(&root.join("src/Shared.pas"), root, &options());
+
+    assert!(
+        context.project_file.is_none(),
+        "transitive bare uses were excluded: {context:?}"
+    );
+    assert!(!context.discovery_complete);
+}
+
+#[test]
+fn include_provided_membership_is_not_exclusion_proof_for_automatic_selection() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(root.join("B.inc").as_path(), "uses Shared;");
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(
+        root.join("B.dpr").as_path(),
+        "program B; {$I B.inc} begin end.",
+    );
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource><DCC_UnitSearchPath>src</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+
+    let context = discover(&root.join("src/Shared.pas"), root, &options());
+
+    assert!(
+        context.project_file.is_none(),
+        "include-provided membership was excluded: {context:?}"
+    );
+    assert!(!context.discovery_complete);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_source_is_not_exclusion_proof_for_automatic_selection() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(root.join("B.dpr").as_path(), "program B; begin end.");
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"alias/Shared.pas\"/></ItemGroup></Project>",
+    );
+    std::os::unix::fs::symlink(root.join("src"), root.join("alias")).expect("create source alias");
+
+    let context = discover(&root.join("src/Shared.pas"), root, &options());
+
+    assert!(
+        context.project_file.is_none(),
+        "symlink ownership was excluded: {context:?}"
+    );
+    assert!(!context.discovery_complete);
+}
+
+#[test]
+fn unmodeled_environment_properties_are_unknown_in_both_comparison_directions() {
+    for condition in ["'$(OS)'=='Windows_NT'", "'$(OS)'!='Windows_NT'"] {
+        let temp = tempfile::tempdir().expect("temporary fixture");
+        let root = temp.path();
+        write(
+            root.join("src/Shared.pas").as_path(),
+            "unit Shared; interface implementation end.",
+        );
+        write(root.join("B.dpr").as_path(), "program B; begin end.");
+        write(
+            root.join("B.dproj").as_path(),
+            &format!(
+                "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup><ItemGroup Condition=\"{condition}\"><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>"
+            ),
+        );
+
+        let context = discover(
+            &root.join("src/Shared.pas"),
+            root,
+            &ProjectOptions {
+                project_file: Some(root.join("B.dproj")),
+                ..ProjectOptions::default()
+            },
+        );
+
+        assert!(
+            !context.discovery_complete,
+            "unmodeled OS input was treated as known for {condition}: {context:?}"
+        );
+    }
+}
+
+#[test]
+fn metadata_limit_prevents_automatic_exclusion() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(root.join("B.dpr").as_path(), "program B; begin end.");
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    let mut imports = String::new();
+    for index in 0..64 {
+        imports.push_str(&format!(
+            "<Import Project=\"unused{index}.optset\" Condition=\"'a'=='b'\"/>"
+        ));
+    }
+    imports.push_str("<Import Project=\"owner.optset\"/>");
+    write(
+        root.join("owner.optset").as_path(),
+        "<Project><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        &format!(
+            "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup>{imports}</Project>"
+        ),
+    );
+
+    let explicit = discover(
+        &root.join("src/Shared.pas"),
+        root,
+        &ProjectOptions {
+            project_file: Some(root.join("B.dproj")),
+            ..ProjectOptions::default()
+        },
+    );
+    assert!(
+        !explicit.discovery_complete,
+        "metadata cutoff was reported as complete: {explicit:?}"
+    );
+    assert!(
+        explicit
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("metadata file limit")),
+        "metadata cutoff warning was lost: {:?}",
+        explicit.warnings
+    );
+
+    let automatic = discover(&root.join("src/Shared.pas"), root, &options());
+    assert!(
+        automatic.project_file.is_none() && !automatic.discovery_complete,
+        "metadata cutoff allowed automatic selection: {automatic:?}"
+    );
+    assert!(
+        automatic
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("metadata file limit")),
+        "automatic cutoff warning was lost: {:?}",
+        automatic.warnings
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn case_distinct_candidate_is_preserved_in_the_ownership_readset() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(root.join("B.dpr").as_path(), "program B; begin end.");
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        root.join("a.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup></Project>",
+    );
+
+    let before = discover(&root.join("src/Shared.pas"), root, &options());
+    assert_eq!(before.project_file, Some(root.join("A.dproj")));
+    assert!(
+        before
+            .metadata_files
+            .iter()
+            .any(|path| path == &root.join("a.dproj")),
+        "case-distinct candidate was dropped: {before:?}"
+    );
+
+    write(
+        root.join("a.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    let after = discover(&root.join("src/Shared.pas"), root, &options());
+    assert!(
+        after.project_file.is_none() && !after.discovery_complete,
+        "mutated case-distinct candidate was not re-evaluated: {after:?}"
+    );
+}
+
+#[test]
+fn exists_dependencies_are_retained_in_the_ownership_readset() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(root.join("B.dpr").as_path(), "program B; begin end.");
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup><ItemGroup Condition=\"Exists('enabled.flag')\"><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+
+    let before = discover(&root.join("src/Shared.pas"), root, &options());
+    assert_eq!(before.project_file, Some(root.join("A.dproj")));
+    assert!(
+        before
+            .metadata_files
+            .iter()
+            .any(|path| path == &root.join("enabled.flag")),
+        "missing Exists dependency was not retained: {before:?}"
+    );
+
+    write(root.join("enabled.flag").as_path(), "enabled");
+    let after = discover(&root.join("src/Shared.pas"), root, &options());
+    assert!(
+        after.project_file.is_none() && !after.discovery_complete,
+        "Exists dependency change did not invalidate ownership: {after:?}"
+    );
+}
+
+#[test]
+fn unknown_import_taints_later_property_conditions_until_reassignment() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("unknown.optset").as_path(),
+        "<Project><PropertyGroup><Derived>true</Derived><Config>Release</Config><Platform>Win64</Platform></PropertyGroup></Project>",
+    );
+    write(
+        root.join("App.dproj").as_path(),
+        r#"<Project>
+  <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+  <Import Project="unknown.optset" Condition="Exists('$(Unavailable)')"/>
+  <PropertyGroup Condition="'$(Derived)'==''"><DCC_Define>GUESSED</DCC_Define></PropertyGroup>
+  <PropertyGroup><Derived>known</Derived><Config>Release</Config><Platform>Win64</Platform></PropertyGroup>
+  <PropertyGroup Condition="'$(Derived)'=='known'"><DCC_Define>KNOWN</DCC_Define></PropertyGroup>
+</Project>"#,
+    );
+
+    let context = discover(
+        &root.join("App.dpr"),
+        root,
+        &ProjectOptions {
+            build_config: Some("Debug".to_string()),
+            platform: Some("Win32".to_string()),
+            ..ProjectOptions::default()
+        },
+    );
+
+    assert_eq!(context.defines, ["KNOWN"]);
+    assert_eq!(context.config.as_deref(), Some("Debug"));
+    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert!(!context.discovery_complete);
+}
+
+#[test]
+fn automatic_selection_has_an_aggregate_candidate_probe_bound() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(
+        root.join("Owner.dpr").as_path(),
+        "program Owner; begin end.",
+    );
+    write(
+        root.join("Owner.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>Owner.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    for index in 0..32 {
+        let name = format!("Candidate{index}");
+        write(
+            root.join(format!("{name}.dpr")).as_path(),
+            &format!("program {name}; begin end."),
+        );
+        write(
+            root.join(format!("{name}.dproj")).as_path(),
+            &format!(
+                "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"
+            ),
+        );
+    }
+
+    let context = discover(&root.join("src/Shared.pas"), root, &options());
+
+    assert!(
+        context.project_file.is_none() && !context.discovery_complete,
+        "candidate probe budget was not enforced: {context:?}"
+    );
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("candidate") && warning.contains("limit")),
+        "candidate probe limit was not reported: {:?}",
+        context.warnings
+    );
+}
+
+#[test]
+fn conditional_alternative_paths_are_not_exclusion_proof_for_automatic_selection() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(
+        root.join("Other.pas").as_path(),
+        "unit Other; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(
+        root.join("B.dpr").as_path(),
+        "program B;\nuses\n  {$IFDEF OTHER}\n  Other in 'Other.pas'\n  {$ELSE}\n  Shared in 'src/Shared.pas'\n  {$ENDIF};\nbegin\nend.",
+    );
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
+    );
+
+    let context = discover(&root.join("src/Shared.pas"), root, &options());
+
+    assert!(
+        context.project_file.is_none() && !context.discovery_complete,
+        "conditional alternative was treated as exhaustive ownership evidence: {context:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_dependent_automatic_ownership_is_refused() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(
+        root.join("src/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(
+        root.join("other/Shared.pas").as_path(),
+        "unit Shared; interface implementation end.",
+    );
+    write(root.join("A.dpr").as_path(), "program A; begin end.");
+    write(root.join("B.dpr").as_path(), "program B; begin end.");
+    write(
+        root.join("A.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\"/></ItemGroup></Project>",
+    );
+    write(
+        root.join("B.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"alias/Shared.pas\"/></ItemGroup></Project>",
+    );
+    std::os::unix::fs::symlink(root.join("other"), root.join("alias"))
+        .expect("create source alias");
+
+    let before = discover(&root.join("src/Shared.pas"), root, &options());
+    assert!(
+        before.project_file.is_none() && !before.discovery_complete,
+        "symlink-dependent candidate was used for automatic ownership: {before:?}"
+    );
+
+    fs::remove_file(root.join("alias")).expect("remove source alias");
+    std::os::unix::fs::symlink(root.join("src"), root.join("alias"))
+        .expect("retarget source alias");
+    let after = discover(&root.join("src/Shared.pas"), root, &options());
+    assert!(
+        after.project_file.is_none() && !after.discovery_complete,
+        "retargeted symlink was used for automatic ownership: {after:?}"
+    );
+}
+
+#[test]
+fn unknown_option_set_does_not_erase_the_known_main_source() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    write(root.join("App.dpr").as_path(), "program App; begin end.");
+    write(
+        root.join("unknown.optset").as_path(),
+        "<Project><PropertyGroup><MainSource>Alternative.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        root.join("App.dproj").as_path(),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project=\"unknown.optset\" Condition=\"Exists('$(Unavailable)')\"/><PropertyGroup><MainSource>$(MainSource)</MainSource><Derived>$(MainSource)</Derived></PropertyGroup><PropertyGroup Condition=\"'$(MainSource)'=='App.dpr'\"><DCC_Define>GUESSED_MAIN</DCC_Define></PropertyGroup><PropertyGroup Condition=\"'$(Derived)'=='App.dpr'\"><DCC_Define>GUESSED_DERIVED</DCC_Define></PropertyGroup><PropertyGroup><MainSource>App.dpr</MainSource><Derived>App.dpr</Derived></PropertyGroup><PropertyGroup Condition=\"'$(MainSource)'=='App.dpr' And '$(Derived)'=='App.dpr'\"><DCC_Define>KNOWN;$(DCC_Define)</DCC_Define></PropertyGroup></Project>",
+    );
+
+    let context = discover(&root.join("App.dpr"), root, &options());
+
+    assert_eq!(context.main_source, Some(root.join("App.dpr")));
+    assert!(
+        context.defines == ["KNOWN"],
+        "preserved entrypoint or derived taint leaked into an uncertain condition, or reassignment did not restore certainty: {context:?}"
+    );
+    assert!(!context.discovery_complete);
+}

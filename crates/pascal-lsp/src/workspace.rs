@@ -1216,7 +1216,7 @@ impl Workspace {
         }
         metadata.extend(self.discovery_directories(file));
         metadata.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        metadata.dedup_by(|left, right| paths_equal_ci(left, right));
+        metadata.dedup_by(|left, right| package_paths_equal(left, right));
         for path in metadata {
             let stamp = path_stamp(&path);
             watched_paths.insert(path, stamp);
@@ -2839,6 +2839,8 @@ fn is_configuration_path(uri: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{DiagnosticLineIndex, normalize_line_endings};
+    use crate::project::ProjectContext;
+    use std::fs;
 
     #[test]
     fn diagnostic_line_index_reuses_utf16_prefixes_for_unicode_and_bare_cr() {
@@ -2866,5 +2868,41 @@ mod tests {
                 .character as usize,
             source.len()
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn install_context_keeps_case_distinct_linux_metadata_paths() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let source_dir = root.join("src");
+        fs::create_dir_all(&source_dir).expect("source directory");
+        let source = source_dir.join("Main.pas");
+        let upper = root.join("Debug.optset");
+        let lower = root.join("debug.optset");
+        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
+        fs::write(&upper, "upper\n").expect("upper metadata");
+        fs::write(&lower, "lower\n").expect("lower metadata");
+
+        let mut workspace = super::Workspace::new(vec![root.clone()], Default::default());
+        let key = super::ContextKey {
+            project_file: None,
+            workspace_root: Some(root),
+            config: None,
+            platform: None,
+        };
+        let context = ProjectContext {
+            metadata_files: vec![upper.clone(), lower.clone()],
+            ..ProjectContext::default()
+        };
+
+        workspace.install_context(key.clone(), context, &source);
+        let watched_paths = &workspace
+            .contexts
+            .get(&key)
+            .expect("installed context")
+            .watched_paths;
+        assert!(watched_paths.contains_key(&upper));
+        assert!(watched_paths.contains_key(&lower));
     }
 }

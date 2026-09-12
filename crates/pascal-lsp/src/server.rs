@@ -3,7 +3,9 @@
 use crate::NavigationTarget;
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::rename::{self, SourceRecord};
-use crate::workspace::{FileChange, Workspace, WorkspaceOptions, canonical_file_uri};
+use crate::workspace::{
+    FileChange, MAX_CONFIGURATION_WATCH_PATHS, Workspace, WorkspaceOptions, canonical_file_uri,
+};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -11,15 +13,17 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams, FileChangeType,
     FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    Position, PrepareRenameResponse, PublishDiagnosticsParams, Registration, RegistrationParams,
-    ServerInfo, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
+    OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams, Registration,
+    RegistrationParams, RelativePattern, ServerInfo, TextDocumentIdentifier, Url, WatchKind,
+    WorkspaceEdit, WorkspaceFolder,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::error::Error;
 use std::io::{self, BufRead, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::{self, JoinHandle};
@@ -31,6 +35,7 @@ const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_ANALYSIS_JOBS: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct ClientFeatures {
@@ -52,6 +57,19 @@ struct RenameRequestParams {
     text_document: TextDocumentIdentifier,
     position: Position,
     new_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectContextRequestParams {
+    text_document: TextDocumentIdentifier,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectProjectRequestParams {
+    text_document: TextDocumentIdentifier,
+    project_uri: Value,
 }
 
 enum AnalysisRequest {
@@ -86,6 +104,102 @@ struct AnalysisResult {
 struct PendingAnalysis {
     cancellation: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+}
+
+struct FileWatcherRegistration {
+    acknowledged_paths: HashSet<String>,
+    pending_paths: std::collections::HashMap<RequestId, HashSet<String>>,
+    rejected_attempts: std::collections::HashMap<String, usize>,
+    degraded_paths: HashSet<String>,
+    relative_pattern_support: bool,
+    next_id: usize,
+}
+
+impl FileWatcherRegistration {
+    fn with_relative_pattern_support(relative_pattern_support: bool) -> Self {
+        Self {
+            acknowledged_paths: HashSet::new(),
+            pending_paths: std::collections::HashMap::new(),
+            rejected_attempts: std::collections::HashMap::new(),
+            degraded_paths: HashSet::new(),
+            relative_pattern_support,
+            next_id: 1,
+        }
+    }
+
+    fn new_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+        let pending_paths = self
+            .pending_paths
+            .values()
+            .flat_map(|paths| paths.iter())
+            .cloned()
+            .collect::<HashSet<_>>();
+        let tracked = self
+            .acknowledged_paths
+            .len()
+            .saturating_add(pending_paths.len());
+        let mut selected = Vec::new();
+        let mut selected_keys = HashSet::new();
+        for path in paths {
+            let key = watcher_path_key(&path);
+            if self.acknowledged_paths.contains(&key)
+                || pending_paths.contains(&key)
+                || self.degraded_paths.contains(&key)
+                || !selected_keys.insert(key)
+            {
+                continue;
+            }
+            if !self.relative_pattern_support {
+                self.degraded_paths.insert(watcher_path_key(&path));
+                continue;
+            }
+            if tracked.saturating_add(selected.len()) >= MAX_CONFIGURATION_WATCH_PATHS {
+                break;
+            }
+            selected.push(path);
+        }
+        selected
+    }
+
+    fn mark_pending(&mut self, request_id: RequestId, paths: &[PathBuf]) {
+        let keys = paths
+            .iter()
+            .map(|path| watcher_path_key(path))
+            .collect::<HashSet<_>>();
+        if !keys.is_empty() {
+            self.pending_paths.insert(request_id, keys);
+        }
+    }
+
+    fn complete(&mut self, request_id: &RequestId, rejected: bool) -> bool {
+        let Some(paths) = self.pending_paths.remove(request_id) else {
+            return false;
+        };
+        if rejected {
+            for path in paths {
+                let attempts = self.rejected_attempts.entry(path.clone()).or_default();
+                *attempts = attempts.saturating_add(1);
+                if *attempts >= MAX_WATCHER_REGISTRATION_RETRIES {
+                    self.degraded_paths.insert(path);
+                }
+            }
+        } else {
+            for path in paths {
+                self.rejected_attempts.remove(&path);
+                self.acknowledged_paths.insert(path);
+            }
+        }
+        true
+    }
+
+    fn handle_response(&mut self, response: &Response) -> Option<bool> {
+        if !self.pending_paths.contains_key(&response.id) {
+            return None;
+        }
+        let rejected = response.error.is_some();
+        self.complete(&response.id, rejected);
+        Some(!rejected)
+    }
 }
 
 struct AnalysisJobs {
@@ -558,6 +672,7 @@ fn run_connection(connection: &Connection) -> Result<bool, Box<dyn Error + Send 
     let workspace_folders_supported = supports_workspace_folders(&initialize.capabilities);
     let watcher_registration_supported =
         supports_watched_file_registration(&initialize.capabilities);
+    let relative_pattern_support = supports_relative_pattern(&initialize.capabilities);
     let client_features = client_features(&initialize.capabilities);
     let capabilities = server_capabilities(&initialize.capabilities);
 
@@ -573,15 +688,16 @@ fn run_connection(connection: &Connection) -> Result<bool, Box<dyn Error + Send 
     )?;
 
     let mut workspace = Workspace::new(roots, options);
-    if watcher_registration_supported {
-        register_file_watcher(connection)?;
-    }
+    let watcher_registration = watcher_registration_supported
+        .then(|| register_file_watcher(connection, &workspace, relative_pattern_support))
+        .transpose()?;
 
     event_loop(
         connection,
         &mut workspace,
         workspace_folders_supported,
         client_features,
+        watcher_registration,
     )
 }
 
@@ -590,6 +706,7 @@ fn event_loop(
     workspace: &mut Workspace,
     workspace_folders_supported: bool,
     client_features: ClientFeatures,
+    mut watcher_registration: Option<FileWatcherRegistration>,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
     let mut jobs = AnalysisJobs::new();
@@ -632,6 +749,9 @@ fn event_loop(
                     )?;
                 } else {
                     handle_request(connection, workspace, request, client_features, &mut jobs)?;
+                    if let Some(registration) = watcher_registration.as_mut() {
+                        sync_file_watcher(connection, workspace, registration)?;
+                    }
                 }
             }
             Message::Notification(notification) if notification.method == "exit" => {
@@ -658,10 +778,27 @@ fn event_loop(
                     workspace_folders_supported,
                 ) {
                     eprintln!("pascal-lsp: notification handling failed: {error}");
+                } else if let Some(registration) = watcher_registration.as_mut() {
+                    sync_file_watcher(connection, workspace, registration)?;
                 }
             }
             Message::Response(response) => {
-                if let Some(error) = response.error {
+                let watcher_response = watcher_registration
+                    .as_mut()
+                    .and_then(|registration| registration.handle_response(&response));
+                if let Some(accepted) = watcher_response {
+                    if !accepted {
+                        if let Some(error) = &response.error {
+                            eprintln!(
+                                "pascal-lsp: watcher registration {} rejected ({}): {}",
+                                response.id, error.code, error.message
+                            );
+                        }
+                    }
+                    if let Some(registration) = watcher_registration.as_mut() {
+                        sync_file_watcher(connection, workspace, registration)?;
+                    }
+                } else if let Some(error) = response.error {
                     eprintln!(
                         "pascal-lsp: client request {} failed ({}): {}",
                         response.id, error.code, error.message
@@ -694,6 +831,50 @@ fn handle_request(
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     match request.method.as_str() {
+        "pascal/projectContext" => {
+            let id = request.id.clone();
+            let params: ProjectContextRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            match workspace.project_context(&params.text_document.uri) {
+                Ok(context) => send_ok(connection, id, context)?,
+                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
+            }
+        }
+        "pascal/selectProject" => {
+            let id = request.id.clone();
+            let params: SelectProjectRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            let project = if params.project_uri.is_null() {
+                None
+            } else {
+                match serde_json::from_value(params.project_uri) {
+                    Ok(project) => Some(project),
+                    Err(error) => {
+                        send_error(
+                            connection,
+                            id,
+                            ErrorCode::InvalidParams,
+                            format!("invalid projectUri: {error}"),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            };
+            match workspace.select_project(&params.text_document.uri, project.as_ref()) {
+                Ok(context) => send_ok(connection, id, context)?,
+                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
+            }
+        }
         "textDocument/prepareRename" => {
             let id = request.id.clone();
             let params: PositionRequestParams = match parse_params(&request) {
@@ -956,20 +1137,95 @@ fn send_diagnostics(
     Ok(())
 }
 
-fn register_file_watcher(connection: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let watchers = vec![FileSystemWatcher {
-        glob_pattern: GlobPattern::String("**/*.{pas,dpr,dpk,dproj,optset}".to_string()),
+fn register_file_watcher(
+    connection: &Connection,
+    workspace: &Workspace,
+    relative_pattern_support: bool,
+) -> Result<FileWatcherRegistration, Box<dyn Error + Send + Sync>> {
+    let mut registration =
+        FileWatcherRegistration::with_relative_pattern_support(relative_pattern_support);
+    let mut watchers = vec![FileSystemWatcher {
+        glob_pattern: GlobPattern::String("**/*.{pas,dpr,dpk,dproj,optset,toml}".to_string()),
         kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
     }];
+    let paths = registration.new_paths(workspace.configuration_watch_paths());
+    for path in &paths {
+        watchers.push(configuration_watcher(path));
+    }
+    let request_id = RequestId::from("pascal-lsp-register-watcher".to_string());
+    registration.mark_pending(request_id.clone(), &paths);
+    send_file_watcher_registration(
+        connection,
+        "pascal-lsp-file-watcher",
+        "pascal-lsp-register-watcher",
+        watchers,
+    )
+    .inspect_err(|_| {
+        registration.complete(&request_id, true);
+    })?;
+    Ok(registration)
+}
+
+fn sync_file_watcher(
+    connection: &Connection,
+    workspace: &Workspace,
+    registration: &mut FileWatcherRegistration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut watchers = Vec::new();
+    let paths = registration.new_paths(workspace.configuration_watch_paths());
+    for path in &paths {
+        watchers.push(configuration_watcher(path));
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let id = registration.next_id;
+    registration.next_id = registration.next_id.saturating_add(1);
+    let request_id = format!("pascal-lsp-register-watcher-{id}");
+    let request_id_value = RequestId::from(request_id.clone());
+    registration.mark_pending(request_id_value.clone(), &paths);
+    send_file_watcher_registration(
+        connection,
+        &format!("pascal-lsp-file-watcher-{id}"),
+        &request_id,
+        watchers,
+    )
+    .inspect_err(|_| {
+        registration.complete(&request_id_value, true);
+    })
+}
+
+fn configuration_watcher(path: &Path) -> FileSystemWatcher {
+    let base_uri = Url::from_file_path(path.parent().unwrap_or(path))
+        .expect("configuration watcher base must be a file URI");
+    let pattern = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "*".to_string());
+    FileSystemWatcher {
+        glob_pattern: GlobPattern::Relative(RelativePattern {
+            base_uri: OneOf::Right(base_uri),
+            pattern,
+        }),
+        kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+    }
+}
+
+fn send_file_watcher_registration(
+    connection: &Connection,
+    registration_id: &str,
+    request_id: &str,
+    watchers: Vec<FileSystemWatcher>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let registration = Registration {
-        id: "pascal-lsp-file-watcher".to_string(),
+        id: registration_id.to_string(),
         method: "workspace/didChangeWatchedFiles".to_string(),
         register_options: Some(serde_json::to_value(
             lsp_types::DidChangeWatchedFilesRegistrationOptions { watchers },
         )?),
     };
     let request = Request::new(
-        RequestId::from("pascal-lsp-register-watcher".to_string()),
+        RequestId::from(request_id.to_string()),
         "client/registerCapability".to_string(),
         RegistrationParams {
             registrations: vec![registration],
@@ -977,6 +1233,18 @@ fn register_file_watcher(connection: &Connection) -> Result<(), Box<dyn Error + 
     );
     connection.sender.send(Message::Request(request))?;
     Ok(())
+}
+
+fn watcher_path_key(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        path.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
 }
 
 fn parse_params<T: DeserializeOwned>(request: &Request) -> Result<T, String> {
@@ -1030,6 +1298,9 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
         "codeActionProvider": {
             "codeActionKinds": ["quickfix"],
             "resolveProvider": true
+        },
+        "experimental": {
+            "projectSelection": true
         }
     });
     if supports_workspace_folders(client) {
@@ -1082,6 +1353,15 @@ fn supports_watched_file_registration(client: &ClientCapabilities) -> bool {
         .unwrap_or(false)
 }
 
+fn supports_relative_pattern(client: &ClientCapabilities) -> bool {
+    client
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.did_change_watched_files)
+        .and_then(|watched| watched.relative_pattern_support)
+        .unwrap_or(false)
+}
+
 #[allow(deprecated)]
 fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
     if let Some(folders) = &initialize.workspace_folders {
@@ -1108,9 +1388,17 @@ fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedReader, MAX_PAYLOAD_BYTES};
-    use lsp_server::Message;
+    use super::{
+        AnalysisResult, AnalysisResultValue, BoundedReader, FileWatcherRegistration,
+        MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES,
+        deliver_analysis_result,
+    };
+    use crate::workspace::Workspace;
+    use lsp_server::{Connection, Message, RequestId, Response};
+    use lsp_types::{Position, PrepareRenameResponse, Range, Url};
+    use std::fs;
     use std::io::{Cursor, ErrorKind};
+    use std::path::PathBuf;
 
     #[test]
     fn bounded_reader_rejects_oversized_content_length_before_payload_read() {
@@ -1132,5 +1420,206 @@ mod tests {
         let mut reader = BoundedReader::new(Cursor::new(header.into_bytes()));
         let error = Message::read(&mut reader).expect_err("oversized header must be rejected");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn watcher_paths_remain_pending_until_acknowledged() {
+        let path = PathBuf::from("/workspace/.lint4d.toml");
+        let mut registration = FileWatcherRegistration::with_relative_pattern_support(true);
+        let paths = registration.new_paths(vec![path.clone()]);
+        let request_id = RequestId::from("watcher-ack".to_string());
+        registration.mark_pending(request_id.clone(), &paths);
+
+        assert!(registration.new_paths(vec![path.clone()]).is_empty());
+        assert!(registration.acknowledged_paths.is_empty());
+        assert_eq!(
+            registration.handle_response(&Response::new_ok(request_id, serde_json::Value::Null)),
+            Some(true)
+        );
+        assert!(
+            registration
+                .acknowledged_paths
+                .contains(&super::watcher_path_key(&path))
+        );
+        assert!(registration.new_paths(vec![path]).is_empty());
+    }
+
+    #[test]
+    fn rejected_watcher_paths_are_retried_then_explicitly_degraded() {
+        let path = PathBuf::from("/workspace/.lint4d.toml");
+        let key = super::watcher_path_key(&path);
+        let mut registration = FileWatcherRegistration::with_relative_pattern_support(true);
+
+        for attempt in 0..MAX_WATCHER_REGISTRATION_RETRIES {
+            let paths = registration.new_paths(vec![path.clone()]);
+            assert_eq!(paths, vec![path.clone()]);
+            let request_id = RequestId::from(format!("watcher-reject-{attempt}"));
+            registration.mark_pending(request_id.clone(), &paths);
+            assert_eq!(
+                registration.handle_response(&Response::new_err(
+                    request_id,
+                    -32603,
+                    "rejected".to_string(),
+                )),
+                Some(false)
+            );
+            assert!(registration.acknowledged_paths.is_empty());
+            if attempt + 1 < MAX_WATCHER_REGISTRATION_RETRIES {
+                assert!(registration.new_paths(vec![path.clone()]).len() == 1);
+            }
+        }
+
+        assert!(registration.new_paths(vec![path]).is_empty());
+        assert!(registration.degraded_paths.contains(&key));
+        assert!(registration.acknowledged_paths.is_empty());
+    }
+
+    #[test]
+    fn watcher_allowance_reaches_eligible_paths_after_degraded_candidates() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let mut workspace = Workspace::new(vec![root.clone()], Default::default());
+        let source = "unit Main; interface implementation end.\n";
+
+        for index in 0..=MAX_CONFIGURATION_WATCH_PATHS {
+            let directory = root.join(format!("directory-{index:03}"));
+            fs::create_dir_all(&directory).expect("candidate directory");
+            let source_path = directory.join("Main.pas");
+            fs::write(&source_path, source).expect("source file");
+            fs::write(
+                directory.join(format!("Project-{index:03}.dproj")),
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+            )
+            .expect("project file");
+            let uri = Url::from_file_path(source_path).expect("source URI");
+            workspace
+                .project_context(&uri)
+                .expect("project context should be discoverable");
+        }
+
+        let all_paths = workspace.configuration_watch_paths();
+        assert!(
+            all_paths.len() > MAX_CONFIGURATION_WATCH_PATHS,
+            "workspace must expose more candidates than the explicit allowance"
+        );
+
+        let mut registration = FileWatcherRegistration::with_relative_pattern_support(true);
+        for attempt in 0..MAX_WATCHER_REGISTRATION_RETRIES {
+            let paths = registration.new_paths(all_paths.clone());
+            assert_eq!(paths.len(), MAX_CONFIGURATION_WATCH_PATHS);
+            let request_id = RequestId::from(format!("watcher-page-reject-{attempt}"));
+            registration.mark_pending(request_id.clone(), &paths);
+            assert_eq!(
+                registration.handle_response(&Response::new_err(
+                    request_id,
+                    -32603,
+                    "rejected".to_string(),
+                )),
+                Some(false)
+            );
+        }
+
+        let next_page = registration.new_paths(all_paths);
+        assert!(
+            !next_page.is_empty(),
+            "degraded candidates must not strand later eligible paths"
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_generation_change_after_compute() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let project_a = root.join("A.dproj");
+        let project_b = root.join("B.dproj");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, "unit Main; interface implementation end.\n").expect("source");
+        for project in [&project_a, &project_b] {
+            fs::write(
+                project,
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+            )
+            .expect("project");
+        }
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let project_a_uri = Url::from_file_path(&project_a).expect("project A URI");
+        let project_b_uri = Url::from_file_path(&project_b).expect("project B URI");
+        let (server, client) = Connection::memory();
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .select_project(&main_uri, Some(&project_a_uri))
+            .expect("select project A");
+        let source_generation = workspace.source_generation();
+        let configuration_generation = workspace.configuration_generation();
+        let control_id = RequestId::from("generation-boundary-control".to_string());
+        deliver_analysis_result(
+            &server,
+            &workspace,
+            AnalysisResult {
+                id: control_id.clone(),
+                source_generation,
+                configuration_generation,
+                records: Vec::new(),
+                value: AnalysisResultValue::Prepare(Ok(PrepareRenameResponse::Range(Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, 1),
+                )))),
+            },
+        )
+        .expect("unchanged result response");
+
+        let Message::Response(control) = client.receiver.recv().expect("control response") else {
+            panic!("expected a control response");
+        };
+        assert_eq!(control.id, control_id);
+        assert!(
+            control.error.is_none(),
+            "unchanged generation must deliver successfully: {control:?}"
+        );
+        assert!(
+            control.result.is_some(),
+            "successful result must be delivered"
+        );
+
+        let stale_source_generation = workspace.source_generation();
+        let stale_configuration_generation = workspace.configuration_generation();
+        workspace
+            .select_project(&main_uri, Some(&project_b_uri))
+            .expect("select project B");
+        assert_ne!(
+            workspace.configuration_generation(),
+            stale_configuration_generation,
+            "project selection must change the configuration generation"
+        );
+        assert_ne!(
+            workspace.source_generation(),
+            stale_source_generation,
+            "project selection must change the source generation"
+        );
+
+        let id = RequestId::from("generation-boundary".to_string());
+        deliver_analysis_result(
+            &server,
+            &workspace,
+            AnalysisResult {
+                id: id.clone(),
+                source_generation: stale_source_generation,
+                configuration_generation: stale_configuration_generation,
+                records: Vec::new(),
+                value: AnalysisResultValue::Prepare(Ok(PrepareRenameResponse::Range(Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, 1),
+                )))),
+            },
+        )
+        .expect("stale result response");
+
+        let Message::Response(response) = client.receiver.recv().expect("delivery response") else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.id, id);
+        assert_eq!(response.error.expect("stale result error").code, -32803);
     }
 }

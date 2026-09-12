@@ -163,11 +163,104 @@ the workspace scope must be explicitly adjusted; the server does not silently
 exclude potential consumers.
 
 `.lint4d.toml` is discovered for each open file's lint settings and suppressions.
-Root-level excludes also apply to source discovery. `.fmt4d.toml` controls
-formatting; this slice does not translate LSP indentation options into formatter
-settings. Formatting is explicit and returns an edit to the client: the server
-does not write files. DCU-dependent lint rules are not enabled through a project
-context in this slice, and the CLI's baseline filtering is not applied.
+Excludes from that sidecar suppress lint diagnostics for matching files; they do
+not apply to source discovery. The initialization `exclude` option controls
+source discovery. `.fmt4d.toml` controls formatting; this slice does not
+translate LSP indentation options into formatter settings. Formatting is
+explicit and returns an edit to the client: the server does not write files.
+DCU-dependent lint rules are not enabled through a project context in this
+slice, and the CLI's baseline filtering is not applied.
+
+### Per-project lint and formatter configuration
+
+Configuration is resolved independently for lint4d and fmt4d, for the effective
+project context of each document. This keeps a shared source file associated with
+the project selected for that buffer rather than applying one workspace-wide
+configuration. The lookup directories, in precedence order, are the selected
+project directory, the longest containing workspace folder, and the nearest Git
+root. A `.git` directory **or worktree `.git` file** establishes that final
+boundary. With no project context, the longest containing workspace folder is
+used; with neither workspace nor Git root, the document's parent directory is
+used.
+
+For each tool, the first existing sidecar in that order wins:
+
+```text
+project/.lint4d.toml  -> workspace/.lint4d.toml -> repository/.lint4d.toml
+project/.fmt4d.toml   -> workspace/.fmt4d.toml  -> repository/.fmt4d.toml
+```
+
+There is **no merge** with lower-priority files. For example, a project
+`.fmt4d.toml` that sets only `max_line_length` uses the formatter default for
+`indent_size`, not the repository's value. The lint and formatter searches are
+also independent: one can select a project sidecar while the other falls back
+to a workspace sidecar. A selected project directory takes precedence over a
+source file's intermediate directory; the resolver does not walk every ancestor.
+
+Lint `exclude` patterns are evaluated relative to the selected `.lint4d.toml`;
+an excluded document publishes no lint diagnostics. They do not globally remove
+the file from project-aware navigation or rename discovery. `sourcePaths` and
+the initialization `exclude` option remain client startup options, not values
+merged from sidecars. Relative `sourcePaths` resolve against each workspace root.
+For formatter `uses.group`, relative `uses.external_paths` resolve against the
+directory containing the selected `.fmt4d.toml`; the external-unit scan accepts
+only regular `.pas` files, does not follow symlinks, and is bounded by traversal,
+file-count, per-file, and total-byte limits. Project main and explicitly
+referenced units remain project units even when their stems also appear externally.
+
+Malformed, unreadable, non-UTF-8, non-regular, or over-4 MiB sidecars are not
+silently skipped in favor of a lower-priority file. Project-context responses
+report them in `warnings`; lint diagnostics report an error, and formatting or
+other requests that need the configuration fail with the reported error. The
+server watches selected and candidate sidecar paths through
+`workspace/didChangeWatchedFiles`, using a `RelativePattern` rooted at each
+sidecar's actual parent when the client advertises relative-pattern support. It
+invalidates the configuration generation and recomputes diagnostics and
+subsequent requests. A rename/code-action
+request whose configuration changes while it is being prepared is rejected with
+a retry error rather than returning edits based on stale input. Watcher events
+improve freshness but are not required: request-time checks preserve the same
+degraded, on-demand behavior when a client cannot register file watchers.
+Explicit paths that cannot be registered by such a client are degraded rather
+than emitted as invalid absolute string globs. Rejected explicit watcher
+registrations are retried up to three times; paths
+that remain rejected enter that degraded mode and no longer consume the bounded
+explicit-watcher allowance.
+
+`workspace/didChangeConfiguration` and general runtime settings overrides are
+not supported. Change sidecar files or restart the client after changing
+`initializationOptions`.
+
+### Project selection protocol and Neovim picker
+
+Project selection is session-local and scoped to the candidate directory: it is
+not written to `.dproj`, `.lint4d.toml`, `.fmt4d.toml`, or any other file. The
+server advertises `experimental.projectSelection: true`. A client can request:
+
+```text
+pascal/projectContext { textDocument: { uri } }
+pascal/selectProject { textDocument: { uri }, projectUri: URI | null }
+```
+
+Both request parameter objects and the response use camelCase. The context
+response contains `scopeUri`, `candidates`, `selectedProjectUri`,
+`selectionMode`, `lintConfigUri`, `fmtConfigUri`, and `warnings`.
+`selectionMode` is `directory` for a valid session selection, `configured` for
+the startup `projectFile`, `automatic` for unambiguous discovery, `ambiguous`
+when candidates need a choice, `standalone` when none exist, or `invalid` when
+a saved session choice is no longer current. `projectUri: null` chooses
+**Automatic**: it clears the directory choice and falls back to configured
+`projectFile` or automatic discovery. A selection must be a current `.dproj`
+candidate in the document's directory scope; invalid or malformed choices do
+not replace the prior live selection.
+
+The shipped Neovim helper creates the buffer-local `:PascalProject` command and
+`<leader>wp` mapping. It first checks `client.server_capabilities.experimental.projectSelection`; an older installed server (including the existing 0.4.0
+binary) shows an update warning instead of sending unsupported requests. The
+picker retains the buffer URI and verifies that the buffer is still valid and
+attached before applying asynchronous results, so a response cannot select a
+project for a different buffer. Install or point Neovim at an updated server to
+use this capability; this documentation does not install or deploy one.
 
 Source discovery is lazy: initialization never walks or parses the workspace.
 An opened buffer parses immediately; a navigation request parses its requested

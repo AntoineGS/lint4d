@@ -39,6 +39,14 @@ pub struct ProjectOptions {
     pub source_paths: Vec<String>,
 }
 
+pub(crate) type ProjectSelections = HashMap<PathBuf, PathBuf>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProjectCandidates {
+    pub(crate) directory: Option<PathBuf>,
+    pub(crate) files: Vec<PathBuf>,
+}
+
 /// Metadata used to resolve units without eagerly parsing the repository.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectContext {
@@ -107,29 +115,92 @@ pub fn discover(
     ProjectContext::discover(file, workspace_roots, options)
 }
 
+pub(crate) fn project_candidates(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+) -> Result<ProjectCandidates, String> {
+    let mut warnings = Vec::new();
+    let absolute_file = absolute_lexical(file)?;
+    let file_path = discovery_file_path(&absolute_file, &mut warnings);
+    let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
+    let relevant_root = relevant_workspace_root(&file_path, &roots);
+    find_project_candidates(&file_path, relevant_root.as_deref())
+}
+
+pub(crate) fn discover_with_selections(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+) -> Result<ProjectContext, String> {
+    discover_context_with_selections(file, workspace_roots, options, selections)
+}
+
 fn discover_context(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
 ) -> Result<ProjectContext, String> {
+    discover_context_with_selections(file, workspace_roots, options, &ProjectSelections::new())
+}
+
+fn discover_context_with_selections(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+) -> Result<ProjectContext, String> {
     let absolute_file = absolute_lexical(file)?;
     let mut warnings = Vec::new();
-    let file_path = resolve_existing_path(&absolute_file, &mut warnings, "source file")
-        .unwrap_or_else(|| {
-            let parent = absolute_file
-                .parent()
-                .and_then(|path| resolve_existing_path(path, &mut warnings, "source directory"))
-                .unwrap_or_else(|| {
-                    absolute_file
-                        .parent()
-                        .map_or_else(PathBuf::new, Path::to_path_buf)
-                });
-            parent.join(absolute_file.file_name().unwrap_or_default())
-        });
+    let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
     let relevant_root = relevant_workspace_root(&file_path, &roots);
 
-    let selected_project = if let Some(project_file) = &options.project_file {
+    let runtime_selection = if selections.is_empty() {
+        None
+    } else {
+        let candidates = match find_project_candidates(&file_path, relevant_root.as_deref()) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                warnings.push(error);
+                return Ok(build_standalone_context(
+                    &file_path,
+                    &roots,
+                    options,
+                    warnings,
+                    false,
+                    Vec::new(),
+                ));
+            }
+        };
+        runtime_project_selection(&file_path, &candidates, selections).map(|(scope, requested)| {
+            let selected = candidates
+                .files
+                .iter()
+                .find(|candidate| project_paths_equal(candidate, &requested))
+                .cloned();
+            (scope, requested, selected, candidates.files)
+        })
+    };
+
+    let selected_project = if let Some((scope, requested, selected, candidates)) = runtime_selection
+    {
+        let Some(project_file) = selected else {
+            warnings.push(format!(
+                "selected project {} is not a current candidate in {}",
+                requested.display(),
+                scope.display()
+            ));
+            return Ok(build_standalone_context(
+                &file_path, &roots, options, warnings, false, candidates,
+            ));
+        };
+        ProjectSelection::Selected {
+            path: project_file,
+            explicit: true,
+            metadata_files: candidates,
+        }
+    } else if let Some(project_file) = &options.project_file {
         explicit_project_file(project_file, &roots, &file_path, &mut warnings)
     } else {
         discover_project_file(
@@ -187,6 +258,136 @@ enum ProjectSelection {
     Incomplete {
         metadata_files: Vec<PathBuf>,
     },
+}
+
+fn discovery_file_path(absolute_file: &Path, warnings: &mut Vec<String>) -> PathBuf {
+    resolve_existing_path(absolute_file, warnings, "source file").unwrap_or_else(|| {
+        let parent = absolute_file
+            .parent()
+            .and_then(|path| resolve_existing_path(path, warnings, "source directory"))
+            .unwrap_or_else(|| {
+                absolute_file
+                    .parent()
+                    .map_or_else(PathBuf::new, Path::to_path_buf)
+            });
+        parent.join(absolute_file.file_name().unwrap_or_default())
+    })
+}
+
+pub(crate) fn runtime_project_selection(
+    file: &Path,
+    candidates: &ProjectCandidates,
+    selections: &ProjectSelections,
+) -> Option<(PathBuf, PathBuf)> {
+    selections
+        .iter()
+        .filter(|(scope, _)| project_path_starts_with(file, scope))
+        .filter(|(scope, _)| {
+            candidates.directory.as_deref().is_none_or(|directory| {
+                project_paths_equal(scope, directory) || project_path_starts_with(scope, directory)
+            })
+        })
+        .max_by_key(|(scope, _)| scope.components().count())
+        .map(|(scope, project)| (scope.clone(), project.clone()))
+}
+
+pub(crate) fn has_invalid_project_selection(context: &ProjectContext) -> bool {
+    context.warnings.iter().any(|warning| {
+        warning.starts_with("selected project ")
+            && warning.contains(" is not a current candidate in ")
+    })
+}
+
+pub(crate) fn selected_project_is_current(scope: &Path, selected: &Path) -> Result<bool, String> {
+    let (dproj, _) = project_directory_entries(scope)?;
+    Ok(dproj
+        .iter()
+        .any(|candidate| project_paths_equal(candidate, selected)))
+}
+
+fn find_project_candidates(
+    file: &Path,
+    workspace_root: Option<&Path>,
+) -> Result<ProjectCandidates, String> {
+    let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+    loop {
+        let (dproj, _) = project_directory_entries(&directory)?;
+        if !dproj.is_empty() {
+            let mut files = dproj;
+            files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+            return Ok(ProjectCandidates {
+                directory: Some(directory),
+                files,
+            });
+        }
+        if workspace_root.is_some_and(|root| project_paths_equal(&directory, root)) {
+            break;
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    Ok(ProjectCandidates::default())
+}
+
+fn project_path_starts_with(path: &Path, root: &Path) -> bool {
+    let path_components = path.components().collect::<Vec<_>>();
+    let root_components = root.components().collect::<Vec<_>>();
+    path_components.len() >= root_components.len()
+        && path_components
+            .iter()
+            .zip(root_components.iter())
+            .all(|(path, root)| project_components_equal(*path, *root))
+}
+
+fn project_paths_equal(left: &Path, right: &Path) -> bool {
+    let left_components = left.components().collect::<Vec<_>>();
+    let right_components = right.components().collect::<Vec<_>>();
+    left_components.len() == right_components.len()
+        && left_components
+            .iter()
+            .zip(right_components.iter())
+            .all(|(left, right)| project_components_equal(*left, *right))
+}
+
+fn project_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left.as_os_str() == right.as_os_str()
+    }
+}
+
+fn project_directory_entries(directory: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "could not inspect project directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let mut dproj = Vec::new();
+    let mut dpr_or_dpk = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if extension_is(&path, "dproj") {
+            push_bounded_candidate(&mut dproj, path);
+        } else if extension_is(&path, "dpr") || extension_is(&path, "dpk") {
+            push_bounded_candidate(&mut dpr_or_dpk, path);
+        }
+    }
+    Ok((dproj, dpr_or_dpk))
 }
 
 fn normalize_workspace_roots(
@@ -287,31 +488,15 @@ fn discover_project_file(
     let mut ambiguous_fallback_dpr = None;
 
     loop {
-        let entries = match fs::read_dir(&directory) {
+        let (dproj, dpr_or_dpk) = match project_directory_entries(&directory) {
             Ok(entries) => entries,
             Err(error) => {
-                warnings.push(format!(
-                    "could not inspect project directory {}: {error}",
-                    directory.display()
-                ));
+                warnings.push(error);
                 return ProjectSelection::Incomplete {
                     metadata_files: Vec::new(),
                 };
             }
         };
-        let mut dproj = Vec::new();
-        let mut dpr_or_dpk = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                continue;
-            }
-            if extension_is(&path, "dproj") {
-                push_bounded_candidate(&mut dproj, path);
-            } else if extension_is(&path, "dpr") || extension_is(&path, "dpk") {
-                push_bounded_candidate(&mut dpr_or_dpk, path);
-            }
-        }
 
         if !dproj.is_empty() {
             return choose_project_candidate(

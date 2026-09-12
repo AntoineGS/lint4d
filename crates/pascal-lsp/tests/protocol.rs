@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
 use lsp_types::{Position, Url};
+use pascal_core::FileInfo;
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationTarget, ProjectContext};
 use serde_json::{Value, json};
@@ -187,6 +188,10 @@ impl TestServer {
     }
 
     fn notification(&mut self, method: &str) -> Value {
+        self.notification_with_timeout(method, IO_TIMEOUT)
+    }
+
+    fn notification_with_timeout(&mut self, method: &str, timeout: Duration) -> Value {
         if let Some(index) = self.pending.iter().position(|message| {
             matches!(message, Message::Notification(notification) if notification.method == method)
         }) {
@@ -195,7 +200,7 @@ impl TestServer {
                 _ => unreachable!("pending notification predicate"),
             };
         }
-        let deadline = Instant::now() + IO_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             let message = self.receive_until(deadline);
             match message {
@@ -250,6 +255,22 @@ impl TestServer {
             initialization_options,
             dynamic_watched_registration,
             false,
+        )
+    }
+
+    fn initialize_with_watched_registration_and_relative_patterns(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+        relative_pattern_support: bool,
+    ) -> Value {
+        self.initialize_with_client_capabilities_and_document_changes_and_relative(
+            root,
+            initialization_options,
+            true,
+            false,
+            true,
+            relative_pattern_support,
         )
     }
 
@@ -342,6 +363,25 @@ impl TestServer {
         action_support: bool,
         document_changes: bool,
     ) -> Value {
+        self.initialize_with_client_capabilities_and_document_changes_and_relative(
+            root,
+            initialization_options,
+            dynamic_watched_registration,
+            action_support,
+            document_changes,
+            false,
+        )
+    }
+
+    fn initialize_with_client_capabilities_and_document_changes_and_relative(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+        dynamic_watched_registration: bool,
+        action_support: bool,
+        document_changes: bool,
+        relative_pattern_support: bool,
+    ) -> Value {
         let root_uri = Url::from_file_path(root).expect("workspace URI");
         let id = RequestId::from("initialize".to_string());
         let code_action_capabilities = if action_support {
@@ -373,7 +413,10 @@ impl TestServer {
                     },
                     "workspace": {
                         "workspaceFolders": true,
-                        "didChangeWatchedFiles": {"dynamicRegistration": dynamic_watched_registration},
+                        "didChangeWatchedFiles": {
+                            "dynamicRegistration": dynamic_watched_registration,
+                            "relativePatternSupport": relative_pattern_support
+                        },
                         "workspaceEdit": {"documentChanges": document_changes}
                     }
                 }
@@ -469,6 +512,129 @@ fn workspace_edit_uris(edit: &Value) -> HashSet<String> {
         .as_object()
         .map(|changes| changes.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+fn diagnostics_for_uri(server: &mut TestServer, expected: &Url) -> Value {
+    let expected = expected.to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(index) = server.pending.iter().position(|message| {
+            matches!(
+                message,
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics"
+                        && notification.params["uri"] == expected
+            )
+        }) {
+            return match server.pending.remove(index).expect("pending diagnostics") {
+                Message::Notification(notification) => notification.params,
+                _ => unreachable!("pending diagnostics predicate"),
+            };
+        }
+
+        match server.receive_until(deadline) {
+            Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics"
+                    && notification.params["uri"] == expected =>
+            {
+                return notification.params;
+            }
+            other => server.pending.push_back(other),
+        }
+    }
+}
+
+struct SharedOwnerFixture {
+    shared: PathBuf,
+    a_main: PathBuf,
+    a_project: PathBuf,
+    a_config: PathBuf,
+    b_main: PathBuf,
+    b_project: PathBuf,
+    main_source: String,
+    shared_source: String,
+}
+
+fn shared_owner_fixture(root: &Path) -> SharedOwnerFixture {
+    let shared = root.join("shared/Shared.pas");
+    let a_main = root.join("A/Main.pas");
+    let a_project = root.join("A/App.dproj");
+    let a_config = root.join("A/lib/Config.pas");
+    let b_main = root.join("B/Main.pas");
+    let b_project = root.join("B/App.dproj");
+    let b_config = root.join("B/lib/Config.pas");
+    let main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Use;\nbegin\n  Run;\nend;\nend.\n".to_string();
+    let shared_source = "unit Shared;\ninterface\nuses Config;\nconst\n  BadConst = 1;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  ConfigRoutine;\nend;\nend.\n".to_string();
+    let config_source = "unit Config;\ninterface\nprocedure ConfigRoutine;\nimplementation\nprocedure ConfigRoutine; begin end;\nend.\n";
+    let project = "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../shared/Shared.pas\" /><DCCReference Include=\"lib/Config.pas\" /></ItemGroup></Project>";
+
+    write_file(&shared, &shared_source);
+    write_file(&a_main, &main_source);
+    write_file(&a_project, project);
+    write_file(&a_config, config_source);
+    write_file(&b_main, &main_source);
+    write_file(&b_project, project);
+    write_file(&b_config, config_source);
+
+    SharedOwnerFixture {
+        shared,
+        a_main,
+        a_project,
+        a_config,
+        b_main,
+        b_project,
+        main_source,
+        shared_source,
+    }
+}
+
+struct OpenSharedOwnerFixture {
+    shared: PathBuf,
+    shared_source: String,
+    main_source: String,
+    a_main: PathBuf,
+    a_project: PathBuf,
+    a_config: PathBuf,
+    b_main: PathBuf,
+    b_project: PathBuf,
+}
+
+fn open_shared_owner_fixture(root: &Path) -> OpenSharedOwnerFixture {
+    let shared = root.join("A/src/Shared.pas");
+    let shared_source = "unit Shared;\ninterface\nuses Config;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  ConfigRoutine;\nend;\nend.\n".to_string();
+    let main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Use;\nbegin\n  Run;\nend;\nend.\n";
+    let config_source = "unit Config;\ninterface\nprocedure ConfigRoutine;\nimplementation\nprocedure ConfigRoutine; begin end;\nend.\n";
+    let a_main = root.join("A/Main.pas");
+    let a_project = root.join("A/App.dproj");
+    let a_config = root.join("A/lib/Config.pas");
+    let b_main = root.join("B/Main.pas");
+    let b_project = root.join("B/App.dproj");
+    let b_config = root.join("B/lib/Config.pas");
+
+    write_file(&shared, &shared_source);
+    write_file(&a_main, main_source);
+    write_file(&a_config, config_source);
+    write_file(&b_main, main_source);
+    write_file(&b_config, config_source);
+    write_file(
+        &a_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\" /><DCCReference Include=\"lib/Config.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &b_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../A/src/Shared.pas\" /><DCCReference Include=\"lib/Config.pas\" /></ItemGroup></Project>",
+    );
+
+    OpenSharedOwnerFixture {
+        shared,
+        shared_source,
+        main_source: main_source.to_string(),
+        a_main,
+        a_project,
+        a_config,
+        b_main,
+        b_project,
+    }
 }
 
 fn assert_exact_rename_edits(
@@ -571,6 +737,2352 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     assert_eq!(capabilities["definitionProvider"], true);
     assert_eq!(capabilities["implementationProvider"], true);
     assert_eq!(capabilities["documentFormattingProvider"], true);
+    assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[test]
+fn project_context_reports_candidates_and_accepts_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    write_file(&main, "unit Main; interface implementation end.");
+    for name in ["A", "B"] {
+        write_file(
+            &root.join(format!("{name}.dproj")),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("project-list".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let context = response.result.unwrap();
+    assert_eq!(context["candidates"].as_array().unwrap().len(), 2);
+    assert_eq!(context["selectionMode"], "ambiguous");
+    let id = RequestId::from("project-select".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&root.join("B.dproj"))
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(
+        response.result.unwrap()["selectedProjectUri"],
+        uri(&root.join("B.dproj")).to_string()
+    );
+    let id = RequestId::from("project-reset".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": null
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let context = response.result.unwrap();
+    assert_eq!(context["selectionMode"], "ambiguous");
+    assert!(context["selectedProjectUri"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn project_selection_rejects_missing_or_unrelated_projects() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let candidate = root.join("A.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    write_file(
+        &candidate,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let missing_id = RequestId::from("project-missing".to_string());
+    server.send_request(
+        missing_id.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert_eq!(
+        server
+            .response(&missing_id)
+            .error
+            .expect("missing projectUri error")
+            .code,
+        -32602
+    );
+
+    let unrelated_id = RequestId::from("project-unrelated".to_string());
+    server.send_request(
+        unrelated_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&root.join("Missing.dproj"))
+        }),
+    );
+    assert_eq!(
+        server
+            .response(&unrelated_id)
+            .error
+            .expect("unrelated project error")
+            .code,
+        -32803
+    );
+
+    let non_file_id = RequestId::from("project-non-file".to_string());
+    server.send_request(
+        non_file_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": "https://example.test/project.dproj"
+        }),
+    );
+    assert_eq!(
+        server
+            .response(&non_file_id)
+            .error
+            .expect("non-file project error")
+            .code,
+        -32803
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_context_preserves_configured_project_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let configured = root.join("A.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for name in ["A", "B"] {
+        write_file(
+            &root.join(format!("{name}.dproj")),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "A.dproj"}));
+    let id = RequestId::from("configured-project".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let context = response.result.unwrap();
+    assert_eq!(context["selectionMode"], "configured");
+    assert_eq!(context["selectedProjectUri"], uri(&configured).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn removed_project_selection_is_reported_as_invalid() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let selected = root.join("A.dproj");
+    let remaining = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project in [&selected, &remaining] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let select_id = RequestId::from("select-removed-project".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&selected)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    fs::remove_file(&selected).unwrap();
+
+    let context_id = RequestId::from("removed-project-context".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&context_id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let context = response.result.unwrap();
+    assert_eq!(context["selectionMode"], "invalid");
+    assert!(context["selectedProjectUri"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn removed_project_selection_publishes_invalid_diagnostics_after_watcher_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let selected = root.join("A.dproj");
+    let remaining = root.join("B.dproj");
+    let source = "unit Main; interface implementation end.";
+    write_file(&main, source);
+    for project in [&selected, &remaining] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let select_id = RequestId::from("select-project-for-diagnostics".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&selected)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    fs::remove_file(&selected).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&selected), "type": 3}]}),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert_eq!(diagnostics["uri"], uri(&main).to_string());
+    assert_eq!(
+        diagnostics["diagnostics"][0]["message"],
+        "project selection is invalid; select a current project or Automatic"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn removed_nested_selection_does_not_fall_back_to_an_ancestor_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let nested = root.join("nested");
+    let main = nested.join("Main.pas");
+    let ancestor_project = root.join("Ancestor.dproj");
+    let selected_project = nested.join("Selected.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    write_file(
+        &ancestor_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &selected_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let select_id = RequestId::from("select-nested-project".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&selected_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    fs::remove_file(&selected_project).unwrap();
+
+    let context_id = RequestId::from("removed-nested-project-context".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&context_id);
+    assert!(response.error.is_none(), "{response:?}");
+    let context = response.result.unwrap();
+    assert_eq!(context["selectionMode"], "invalid");
+    assert!(context["selectedProjectUri"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn automatic_reset_clears_removed_nested_override_without_removing_ancestor_choice() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let nested = root.join("nested");
+    let ancestor_main = root.join("Main.pas");
+    let nested_main = nested.join("Main.pas");
+    let ancestor_project = root.join("Ancestor.dproj");
+    let nested_project = nested.join("Nested.dproj");
+    write_file(&ancestor_main, "unit Main; interface implementation end.");
+    write_file(&nested_main, "unit Main; interface implementation end.");
+    write_file(
+        &ancestor_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &nested_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    for (id, document, project) in [
+        ("ancestor-choice", &ancestor_main, &ancestor_project),
+        ("nested-choice", &nested_main, &nested_project),
+    ] {
+        let id = RequestId::from(id.to_string());
+        server.send_request(
+            id.clone(),
+            "pascal/selectProject",
+            json!({
+                "textDocument": {"uri": uri(document)},
+                "projectUri": uri(project)
+            }),
+        );
+        assert!(server.response(&id).error.is_none());
+    }
+
+    fs::remove_file(&nested_project).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&nested_project), "type": 3}]}),
+    );
+    let invalid_id = RequestId::from("nested-invalid-before-reset".to_string());
+    server.send_request(
+        invalid_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&nested_main)}}),
+    );
+    let invalid = server.response(&invalid_id);
+    assert_eq!(invalid.result.unwrap()["selectionMode"], "invalid");
+
+    let reset_id = RequestId::from("nested-automatic-reset".to_string());
+    server.send_request(
+        reset_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&nested_main)},
+            "projectUri": null
+        }),
+    );
+    let reset = server.response(&reset_id);
+    assert!(reset.error.is_none(), "{reset:?}");
+    let context = reset.result.unwrap();
+    assert_eq!(context["selectionMode"], "directory");
+    assert_eq!(
+        context["selectedProjectUri"],
+        uri(&ancestor_project).to_string()
+    );
+
+    let ancestor_id = RequestId::from("ancestor-choice-after-reset".to_string());
+    server.send_request(
+        ancestor_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&ancestor_main)}}),
+    );
+    assert_eq!(
+        server.response(&ancestor_id).result.unwrap()["selectedProjectUri"],
+        uri(&ancestor_project).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_selections_are_independent_and_nested_scopes_do_not_inherit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let outer_main = root.join("Main.pas");
+    let nested_main = root.join("nested/Main.pas");
+    write_file(&outer_main, "unit Main; interface implementation end.");
+    write_file(&nested_main, "unit Main; interface implementation end.");
+    for name in ["OuterA", "OuterB"] {
+        write_file(
+            &root.join(format!("{name}.dproj")),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    for name in ["NestedA", "NestedB"] {
+        write_file(
+            &root.join("nested").join(format!("{name}.dproj")),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    for (id, document, project) in [
+        ("outer-select", &outer_main, root.join("OuterA.dproj")),
+        (
+            "nested-select",
+            &nested_main,
+            root.join("nested/NestedB.dproj"),
+        ),
+    ] {
+        let id = RequestId::from(id.to_string());
+        server.send_request(
+            id.clone(),
+            "pascal/selectProject",
+            json!({
+                "textDocument": {"uri": uri(document)},
+                "projectUri": uri(&project)
+            }),
+        );
+        let response = server.response(&id);
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(response.result.unwrap()["selectionMode"], "directory");
+    }
+
+    for (id, document, project) in [
+        ("outer-context", &outer_main, root.join("OuterA.dproj")),
+        (
+            "nested-context",
+            &nested_main,
+            root.join("nested/NestedB.dproj"),
+        ),
+    ] {
+        let id = RequestId::from(id.to_string());
+        server.send_request(
+            id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(document)}}),
+        );
+        let response = server.response(&id);
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(
+            response.result.unwrap()["selectedProjectUri"],
+            uri(&project).to_string()
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
+fn project_context_reports_project_scoped_configuration_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("app");
+    let main = project.join("Main.pas");
+    let lint_config = project.join(".lint4d.toml");
+    let fmt_config = project.join(".fmt4d.toml");
+    write_file(&main, "unit Main; interface implementation end.");
+    write_file(
+        &project.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &lint_config,
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    write_file(&fmt_config, "[format]\nindent_size = 4\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("project-config".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let context = response.result.unwrap();
+    assert_eq!(context["lintConfigUri"], uri(&lint_config).to_string());
+    assert_eq!(context["fmtConfigUri"], uri(&fmt_config).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_configuration_applies_to_shared_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let shared = root.join("shared/Shared.pas");
+    let source = "unit Shared;\ninterface\nconst\n  GoodConst = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(GoodConst);\nend;\nend.\n";
+    write_file(&shared, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(&root.join(".fmt4d.toml"), "[format]\nindent_size = 2\n");
+    write_file(&app.join(".fmt4d.toml"), "[format]\nindent_size = 4\n");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    write_file(
+        &app.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming"),
+        "the selected project lint sidecar must be used: {diagnostics}"
+    );
+
+    let format_id = RequestId::from("format-project-sidecar".to_string());
+    server.send_request(
+        format_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&shared)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&format_id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let edits = response.result.unwrap();
+    assert!(edits[0]["newText"].as_str().unwrap().contains("\n    Log"));
+
+    let start = position_of(source, "GoodConst", 0);
+    let end = Position::new(start.line, start.character + 9);
+    let action_id = RequestId::from("project-sidecar-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&shared)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 2,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "{response:?}");
+    let actions = response.result.unwrap();
+    assert_eq!(actions[0]["title"], "Rename 'GoodConst' to 'GOOD_CONST'");
+    assert!(actions[0]["edit"].is_null());
+
+    let resolve_id = RequestId::from("format-project-sidecar-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let resolved = server.response(&resolve_id);
+    assert!(resolved.error.is_none(), "{resolved:?}");
+    let resolved_action = resolved.result.unwrap();
+    assert_eq!(
+        resolved_action["title"],
+        "Rename 'GoodConst' to 'GOOD_CONST'"
+    );
+    assert!(resolved_action["edit"].is_object());
+    assert!(resolved_action["edit"].to_string().contains("GOOD_CONST"));
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_exclude_suppresses_diagnostics_and_naming_actions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let hidden = app.join("excluded/Hidden.pas");
+    let source = "unit Hidden;\ninterface\nconst\n  GoodConst = 1;\nimplementation\nend.\n";
+    write_file(&hidden, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".lint4d.toml"),
+        "[lint4d]\nexclude = [\"excluded/**\"]\n[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&hidden),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        diagnostics["diagnostics"].as_array().unwrap().is_empty(),
+        "project-relative lint excludes must clear diagnostics: {diagnostics}"
+    );
+
+    let start = position_of(source, "GoodConst", 0);
+    let end = Position::new(start.line, start.character + 9);
+    let action_id = RequestId::from("project-sidecar-exclude-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&hidden)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 2,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_sibling_exclude_is_relative_to_the_sidecar() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let shared = root.join("shared/Shared.pas");
+    let source = "unit Shared;\ninterface\nconst\n  BadConst = 1;\nimplementation\nend.\n";
+    write_file(&shared, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".lint4d.toml"),
+        "[lint4d]\nexclude = [\"../shared/*.pas\"]\n[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        diagnostics["diagnostics"].as_array().unwrap().is_empty(),
+        "sidecar-relative parent excludes must clear diagnostics: {diagnostics}"
+    );
+
+    let position = position_of(source, "BadConst", 0);
+    let action_id = RequestId::from("project-sidecar-sibling-exclude-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&shared)},
+            "range": {"start": position, "end": position},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": position, "end": position},
+                    "severity": 2,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_external_grouping_uses_project_unit_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let project_unit = app.join("src/Shared.pas");
+    let external_unit = app.join("vendor/Shared.pas");
+    let vendor_only = app.join("vendor/ThirdParty.pas");
+    let source = "unit Main;\ninterface\nuses\n  ThirdParty,\n  Shared,\n  System.SysUtils;\nimplementation\nend.\n";
+    let fmt_toml = "[format.uses]\nsort = true\ngroup = true\nexternal_paths = [\"vendor\"]\nexternal_prefixes = [\"Spring\"]\n";
+    write_file(&main, source);
+    write_file(
+        &project_unit,
+        "unit Shared; interface implementation end.\n",
+    );
+    write_file(
+        &external_unit,
+        "unit Shared; interface implementation end.\n",
+    );
+    write_file(
+        &vendor_only,
+        "unit ThirdParty; interface implementation end.\n",
+    );
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\" /></ItemGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(&app.join(".fmt4d.toml"), fmt_toml);
+
+    let mut expected_config = fmt4d::config::FmtConfig::from_toml(fmt_toml).unwrap();
+    expected_config.project_root = Some(app.clone());
+    let expected_external = HashSet::from(["thirdparty".to_string()]);
+    let expected = fmt4d::format_source(
+        source.as_bytes(),
+        &FileInfo::new(main.clone()),
+        &expected_config,
+        &expected_external,
+    )
+    .unwrap();
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    let id = RequestId::from("format-project-sidecar-external".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(response.result.unwrap()[0]["newText"], expected);
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_external_grouping_respects_cli_project_collection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("src/Main.pas");
+    let source_path = app.join("Uses.pas");
+    let project_unit = app.join("src/Shared.pas");
+    let external_same_name = app.join("vendor/Shared.pas");
+    let external_main = app.join("vendor/Main.pas");
+    let external_only = app.join("vendor/ThirdParty.pas");
+    let main_source = "unit Main;\ninterface\nimplementation\nend.\n";
+    let source = "unit Uses;\ninterface\nuses\n  ThirdParty,\n  Shared,\n  Main,\n  Spring.Logging;\nimplementation\nend.\n";
+    let fmt_toml = "[format.uses]\nsort = true\ngroup = true\nexternal_paths = [\"vendor\"]\nexternal_prefixes = [\"Spring\"]\n";
+    write_file(&main, main_source);
+    write_file(&source_path, source);
+    write_file(
+        &project_unit,
+        "unit Shared; interface implementation end.\n",
+    );
+    write_file(
+        &external_same_name,
+        "unit Shared; interface implementation end.\n",
+    );
+    write_file(&external_main, "unit Main; interface implementation end.\n");
+    write_file(
+        &external_only,
+        "unit ThirdParty; interface implementation end.\n",
+    );
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>src/Main.pas</MainSource><DCC_UnitSearchPath>src;vendor</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"src/Shared.pas\" /></ItemGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(&app.join(".fmt4d.toml"), fmt_toml);
+
+    let mut expected_config = fmt4d::config::FmtConfig::from_toml(fmt_toml).unwrap();
+    expected_config.project_root = Some(app.clone());
+    let expected_external = HashSet::from(["thirdparty".to_string()]);
+    let expected = fmt4d::format_source(
+        source.as_bytes(),
+        &FileInfo::new(source_path.clone()),
+        &expected_config,
+        &expected_external,
+    )
+    .unwrap();
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    let id = RequestId::from("format-project-sidecar-cli-collection".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(response.result.unwrap()[0]["newText"], expected);
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_external_scan_respects_workspace_bounds() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nuses\n  ThirdParty,\n  System.SysUtils;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".fmt4d.toml"),
+        "[format.uses]\ngroup = true\nexternal_paths = [\"vendor\"]\n",
+    );
+    for name in ["ExternalUnit", "OtherOne", "OtherTwo"] {
+        write_file(
+            &app.join("vendor").join(format!("{name}.pas")),
+            &format!("unit {name}; interface implementation end.\n"),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj", "maxFiles": 2}));
+    let id = RequestId::from("format-project-sidecar-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "external scan must stop at its bound: {response:?}"
+    );
+    let error = response.error.expect("external scan error");
+    assert!(error.message.contains("external"));
+    assert!(error.message.contains("limit"));
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_missing_external_path_refuses_formatting() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let missing = app.join("missing");
+    let source = "unit Main;\ninterface\nuses\n  System.SysUtils;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".fmt4d.toml"),
+        "[format.uses]\ngroup = true\nexternal_paths = [\"missing\"]\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    let id = RequestId::from("format-project-sidecar-missing-external".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("missing external path must fail");
+    assert!(error.message.contains("external path"));
+    assert!(error.message.contains(&missing.display().to_string()));
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_non_directory_external_path_refuses_formatting() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let invalid_path = app.join("NotADirectory.pas");
+    let source = "unit Main;\ninterface\nuses\n  System.SysUtils;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &invalid_path,
+        "unit NotADirectory; interface implementation end.\n",
+    );
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".fmt4d.toml"),
+        "[format.uses]\ngroup = true\nexternal_paths = [\"NotADirectory.pas\"]\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    let id = RequestId::from("format-project-sidecar-invalid-external".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("non-directory external path must fail");
+    assert!(error.message.contains("is not a directory"));
+    assert!(error.message.contains(&invalid_path.display().to_string()));
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn project_sidecar_permission_denied_external_directory_refuses_formatting() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let external = app.join("vendor");
+    let source = "unit Main;\ninterface\nuses\n  System.SysUtils;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".fmt4d.toml"),
+        "[format.uses]\ngroup = true\nexternal_paths = [\"vendor\"]\n",
+    );
+    fs::create_dir_all(&external).unwrap();
+    let original_mode = fs::metadata(&external).unwrap().permissions().mode();
+    fs::set_permissions(&external, fs::Permissions::from_mode(0o000)).unwrap();
+
+    if fs::read_dir(&external).is_ok() {
+        fs::set_permissions(&external, fs::Permissions::from_mode(original_mode)).unwrap();
+        eprintln!(
+            "skipping permission-denied external-directory test: runner can enumerate mode-000 directories"
+        );
+        return;
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    let id = RequestId::from("format-project-sidecar-permission-denied".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("permission-denied external path must fail");
+    assert!(
+        response.result.is_none(),
+        "permission failure must not return an edit"
+    );
+    assert!(error.message.contains("scan"));
+    assert!(error.message.contains(&external.display().to_string()));
+
+    fs::set_permissions(&external, fs::Permissions::from_mode(original_mode)).unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_external_scan_enforces_per_file_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let external = app.join("vendor/TooBig.pas");
+    let source = "unit Main;\ninterface\nuses\n  System.SysUtils;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &external,
+        &format!(
+            "unit TooBig; interface implementation end. // {}\n",
+            "x".repeat(200)
+        ),
+    );
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".fmt4d.toml"),
+        "[format.uses]\ngroup = true\nexternal_paths = [\"vendor\"]\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        root,
+        json!({"projectFile": "app/App.dproj", "maxFileBytes": 128}),
+    );
+    let id = RequestId::from("format-project-sidecar-per-file-limit".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("oversized external file must fail");
+    assert!(error.message.contains("per-file limit"));
+    assert!(error.message.contains(&external.display().to_string()));
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_external_scan_enforces_total_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let first = app.join("vendor/First.pas");
+    let second = app.join("vendor/Second.pas");
+    let source = "unit Main;\ninterface\nuses\n  System.SysUtils;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(&first, "unit First; interface implementation end.\n");
+    write_file(&second, "unit Second; interface implementation end.\n");
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &app.join(".fmt4d.toml"),
+        "[format.uses]\ngroup = true\nexternal_paths = [\"vendor\"]\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        root,
+        json!({"projectFile": "app/App.dproj", "maxTotalBytes": 64}),
+    );
+    let id = RequestId::from("format-project-sidecar-total-byte-limit".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("external byte budget must fail");
+    assert!(error.message.contains("byte limit"));
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_lint_rules_styles_and_suppressions_are_consistent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  // lint4d:ignore-next-line constant-naming\n  badConst = 1;\n  anotherConst = 2;\nimplementation\nprocedure Run;\nvar\n  BadLocal: Integer;\nbegin\n  BadLocal := anotherConst;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules]\nconstant-naming = \"warning\"\nlocal-variable-naming = \"warning\"\n[rules.naming]\nconstant_style = \"PascalCase\"\nlocal_variable_style = \"camelCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    let diagnostics = diagnostics["diagnostics"].as_array().unwrap();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["code"] == "constant-naming"
+            && diagnostic["severity"] == 2
+            && diagnostic["message"]
+                .as_str()
+                .unwrap()
+                .contains("anotherConst")
+    }));
+    assert!(!diagnostics.iter().any(|diagnostic| {
+        diagnostic["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("badConst")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["code"] == "local-variable-naming"
+            && diagnostic["severity"] == 2
+            && diagnostic["message"].as_str().unwrap().contains("BadLocal")
+    }));
+
+    let start = position_of(source, "anotherConst", 0);
+    let end = Position::new(start.line, start.character + 12);
+    let action_id = RequestId::from("project-sidecar-style-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 2,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()[0]["title"],
+        "Rename 'anotherConst' to 'AnotherConst'"
+    );
+
+    let local_start = position_of(source, "BadLocal", 0);
+    let local_end = Position::new(local_start.line, local_start.character + 8);
+    let local_action_id = RequestId::from("project-sidecar-local-style-action".to_string());
+    server.send_request(
+        local_action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": local_start, "end": local_end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": local_start, "end": local_end},
+                    "severity": 2,
+                    "code": "local-variable-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let local_response = server.response(&local_action_id);
+    assert!(local_response.error.is_none(), "{local_response:?}");
+    assert_eq!(
+        local_response.result.unwrap()[0]["title"],
+        "Rename 'BadLocal' to 'badLocal'"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_selected_shared_source_uses_local_variable_style() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let shared = root.join("shared/Shared.pas");
+    let source = "unit Shared;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nvar\n  BadLocal: Integer;\nbegin\n  BadLocal := 1;\nend;\nend.\n";
+    write_file(&shared, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../shared/Shared.pas\" /></ItemGroup></Project>",
+    );
+    write_file(&app.join("Main.dpr"), "program App; begin end.\n");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules]\nlocal-variable-naming = \"warning\"\n[rules.naming]\nlocal_variable_style = \"PascalCase\"\n",
+    );
+    write_file(
+        &app.join(".lint4d.toml"),
+        "[rules]\nlocal-variable-naming = \"warning\"\n[rules.naming]\nlocal_variable_style = \"camelCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    let diagnostics = diagnostics["diagnostics"].as_array().unwrap();
+    let position = position_of(source, "BadLocal", 0);
+    let end = Position::new(position.line, position.character + 8);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["code"] == "local-variable-naming"
+            && diagnostic["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("BadLocal")
+    }));
+
+    let action_id = RequestId::from("project-sidecar-selected-local-style".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&shared)},
+            "range": {"start": position, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": position, "end": end},
+                    "severity": 2,
+                    "code": "local-variable-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()[0]["title"],
+        "Rename 'BadLocal' to 'badLocal'"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_malformed_fmt_refuses_formatting_but_keeps_lint_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let malformed_fmt = app.join(".fmt4d.toml");
+    write_file(&malformed_fmt, "[format\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    let position = position_of(source, "badConst", 0);
+    let end = Position::new(position.line, position.character + 8);
+    let action_id = RequestId::from("project-sidecar-fallback-lint-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": position, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": position, "end": end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let action_response = server.response(&action_id);
+    assert!(action_response.error.is_none(), "{action_response:?}");
+    assert_eq!(
+        action_response.result.unwrap()[0]["title"],
+        "Rename 'badConst' to 'BadConst'"
+    );
+
+    let format_id = RequestId::from("project-sidecar-malformed-fmt".to_string());
+    server.send_request(
+        format_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let format_response = server.response(&format_id);
+    let format_error = format_response
+        .error
+        .expect("malformed fmt must refuse formatting");
+    assert!(
+        format_error
+            .message
+            .contains(&malformed_fmt.display().to_string())
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_malformed_lint_is_a_server_diagnostic_and_does_not_block_fmt() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Log;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &app.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&app.join("App.dpr"), "program App; begin end.\n");
+    write_file(&app.join(".lint4d.toml"), "[rules\n");
+    write_file(&root.join(".fmt4d.toml"), "[format]\nindent_size = 4\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    let diagnostics = diagnostics["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "pascal-lsp");
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&app.join(".lint4d.toml").display().to_string())
+    );
+
+    let position = position_of(source, "Log", 0);
+    let action_id = RequestId::from("project-sidecar-malformed-lint-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": position, "end": position},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": position, "end": position},
+                    "severity": 2,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let action_response = server.response(&action_id);
+    let action_error = action_response
+        .error
+        .expect("malformed lint must refuse code actions");
+    assert!(
+        action_error
+            .message
+            .contains(&app.join(".lint4d.toml").display().to_string())
+    );
+
+    let format_id = RequestId::from("project-sidecar-malformed-lint-format".to_string());
+    server.send_request(
+        format_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let format_response = server.response(&format_id);
+    assert!(format_response.error.is_none(), "{format_response:?}");
+    let edits = format_response.result.unwrap();
+    assert_eq!(edits.as_array().unwrap().len(), 1);
+    assert!(edits[0]["newText"].as_str().unwrap().contains("\n    Log"));
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_malformed_lint_replaces_previous_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let config = root.join(".lint4d.toml");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(&config, "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let initial = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    write_file(&config, "[rules\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&config), "type": 2}]}),
+    );
+    let replaced = server.notification("textDocument/publishDiagnostics");
+    let diagnostics = replaced["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "pascal-lsp");
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&config.display().to_string())
+    );
+
+    write_file(&config, "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&config), "type": 2}]}),
+    );
+    let recovered =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        recovered["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn configuration_watch_refreshes_open_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let config = root.join(".lint4d.toml");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(&config, "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let initial =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    write_file(&config, "[rules]\nconstant-naming = \"off\"\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&config), "type": 2}]}),
+    );
+    let published =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        !published["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn configuration_watch_tracks_absent_higher_priority_fallback_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = temp.path().join("repository");
+    let workspace_root = repository.join("nested-workspace");
+    let main = workspace_root.join("Main.pas");
+    let repository_config = repository.join(".lint4d.toml");
+    let workspace_config = workspace_root.join(".lint4d.toml");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    fs::create_dir_all(&workspace_root).unwrap();
+    write_file(&repository.join(".git"), "gitdir: /outside/worktree\n");
+    write_file(&main, source);
+    write_file(
+        &repository_config,
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&workspace_root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let initial =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    write_file(&workspace_config, "[rules]\nconstant-naming = \"off\"\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&workspace_config), "type": 1}]}),
+    );
+    let disabled =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        !disabled["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    fs::remove_file(&workspace_config).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&workspace_config), "type": 3}]}),
+    );
+    let restored =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        restored["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn configuration_watch_keeps_unrelated_project_scope_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let first = root.join("first");
+    let second = root.join("second");
+    let first_main = first.join("Main.pas");
+    let second_main = second.join("Main.pas");
+    let first_config = first.join(".lint4d.toml");
+    let second_config = second.join(".lint4d.toml");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+
+    for (directory, project_name, main) in [
+        (&first, "First", &first_main),
+        (&second, "Second", &second_main),
+    ] {
+        write_file(main, source);
+        write_file(
+            &directory.join(format!("{project_name}.dproj")),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+        write_file(
+            &directory.join(format!("{project_name}.dpr")),
+            &format!("program {project_name}; begin end.\n"),
+        );
+    }
+    write_file(
+        &first_config,
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(
+        &second_config,
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    for main in [&first_main, &second_main] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(main),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source
+                }
+            }),
+        );
+    }
+    for main in [&first_main, &second_main] {
+        let diagnostics = diagnostics_for_uri(&mut server, &uri(main));
+        assert!(
+            diagnostics["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "constant-naming"),
+            "each project scope should initially report its own naming diagnostic: {diagnostics}"
+        );
+    }
+
+    write_file(&first_config, "[rules]\nconstant-naming = \"off\"\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&first_config), "type": 2}]}),
+    );
+    let first_after = diagnostics_for_uri(&mut server, &uri(&first_main));
+    assert!(
+        !first_after["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    let second_after = diagnostics_for_uri(&mut server, &uri(&second_main));
+    assert!(
+        second_after["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming"),
+        "republishing the unrelated scope must preserve its effective settings: {second_after}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_lint_excludes_do_not_hide_rename_consumers() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let target = root.join("Target.pas");
+    let consumer = root.join("excluded/Consumer.pas");
+    let target_source = "unit Target;\ninterface\nconst\n  BadConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Target;\nimplementation\nprocedure Run;\nbegin\n  UseValue(BadConst);\nend;\nend.\n";
+    write_file(&target, target_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[lint4d]\nexclude = [\"excluded/**\"]\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let position = position_of(target_source, "BadConst", 0);
+    let request_id = RequestId::from("project-sidecar-excluded-consumer-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&target)},
+            "position": position,
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "{response:?}");
+    let edit = response.result.unwrap();
+    let edited_uris = workspace_edit_uris(&edit);
+    assert!(edited_uris.contains(&uri(&target).to_string()));
+    assert!(
+        edited_uris.contains(&uri(&consumer).to_string()),
+        "lint exclusion must not hide a rename consumer: {edit}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_sidecar_exclusion_transition_clears_diagnostics_and_preserves_rename_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let target = root.join("Target.pas");
+    let consumer = root.join("excluded/Consumer.pas");
+    let config = root.join(".lint4d.toml");
+    let target_source = "unit Target;\ninterface\nconst\n  BadConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Target;\nimplementation\nprocedure Run;\nbegin\n  UseValue(BadConst);\nend;\nend.\n";
+    write_file(&target, target_source);
+    write_file(&consumer, consumer_source);
+    write_file(&config, "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&target),
+                "languageId": "pascal",
+                "version": 1,
+                "text": target_source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(!diagnostics["diagnostics"].as_array().unwrap().is_empty());
+
+    let position = position_of(target_source, "BadConst", 0);
+    let action_id = RequestId::from("action-before-lint-exclusion".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&target)},
+            "range": {"start": position, "end": Position::new(position.line, position.character + 8)},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": position, "end": Position::new(position.line, position.character + 8)},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let action_response = server.response(&action_id);
+    assert!(action_response.error.is_none(), "{action_response:?}");
+    let action = action_response.result.unwrap()[0].clone();
+    assert!(action["edit"].is_null());
+
+    let before_id = RequestId::from("rename-before-lint-exclusion".to_string());
+    server.send_request(
+        before_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&target)},
+            "position": position_of(target_source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let before = server.response(&before_id);
+    assert!(before.error.is_none(), "{before:?}");
+    assert!(workspace_edit_uris(&before.result.unwrap()).contains(&uri(&consumer).to_string()));
+
+    write_file(
+        &config,
+        "[lint4d]\nexclude = [\"Target.pas\", \"excluded/**\"]\n[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    let resolve_id = RequestId::from("resolve-after-lint-exclusion".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolve_response = server.response(&resolve_id);
+    let resolve_error = resolve_response
+        .error
+        .expect("a newly excluded action must not resolve");
+    assert!(
+        resolve_error
+            .message
+            .contains("excluded by lint configuration")
+    );
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&config), "type": 2}]}),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        diagnostics["diagnostics"].as_array().unwrap().is_empty(),
+        "adding a lint exclusion must replace prior diagnostics: {diagnostics}"
+    );
+
+    let after_id = RequestId::from("rename-after-lint-exclusion".to_string());
+    server.send_request(
+        after_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&target)},
+            "position": position_of(target_source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let after = server.response(&after_id);
+    assert!(after.error.is_none(), "{after:?}");
+    assert!(
+        workspace_edit_uris(&after.result.unwrap()).contains(&uri(&consumer).to_string()),
+        "new lint exclusions must not hide rename consumers"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_context_keeps_malformed_configuration_as_a_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let config = root.join(".lint4d.toml");
+    write_file(&main, "unit Main; interface implementation end.");
+    write_file(
+        &root.join("Main.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&config, "[rules\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("malformed-project-config".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let context = response.result.unwrap();
+    assert!(context["lintConfigUri"].is_null());
+    assert!(
+        context["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains(".lint4d.toml"))
+    );
+    let format_id = RequestId::from("malformed-project-format".to_string());
+    server.send_request(
+        format_id.clone(),
+        "textDocument/formatting",
+        json!({"textDocument": {"uri": uri(&main)}, "options": {}}),
+    );
+    let format_response = server.response(&format_id);
+    assert!(format_response.error.is_some(), "{format_response:?}");
+    server.shutdown();
+}
+
+#[test]
+fn switching_projects_preserves_an_unsaved_overlay() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let on_disk = "unit Main; interface implementation end.\n";
+    let overlay = "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\n  S := 1; with Obj do begin end;\nend;\nend.\n";
+    write_file(&main, on_disk);
+    for name in ["A", "B"] {
+        write_file(
+            &root.join(format!("{name}.dproj")),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 7,
+                "text": overlay
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let select_id = RequestId::from("overlay-project-select".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&root.join("B.dproj"))
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert_eq!(diagnostics["version"], 7);
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "with-statement")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_context_reports_singleton_and_proven_owner_modes() {
+    let temp = tempfile::tempdir().unwrap();
+    let singleton_root = temp.path().join("singleton");
+    let singleton_main = singleton_root.join("Main.pas");
+    write_file(&singleton_main, "unit Main; interface implementation end.");
+    let singleton_project = singleton_root.join("Only.dproj");
+    write_file(
+        &singleton_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let owner_root = temp.path().join("owner");
+    let owner_source = owner_root.join("Owned.pas");
+    write_file(&owner_source, "unit Owned; interface implementation end.");
+    write_file(
+        &owner_root.join("OwnerA.dpr"),
+        "program OwnerA; uses Owned in 'Owned.pas'; begin end.",
+    );
+    write_file(&owner_root.join("OwnerB.dpr"), "program OwnerB; begin end.");
+    for name in ["OwnerA", "OwnerB"] {
+        write_file(
+            &owner_root.join(format!("{name}.dproj")),
+            &format!(
+                "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"
+            ),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (id, document, mode, selected) in [
+        (
+            "singleton-context",
+            &singleton_main,
+            "automatic",
+            Some(singleton_project),
+        ),
+        (
+            "owner-context",
+            &owner_source,
+            "automatic",
+            Some(owner_root.join("OwnerA.dproj")),
+        ),
+    ] {
+        let id = RequestId::from(id.to_string());
+        server.send_request(
+            id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(document)}}),
+        );
+        let response = server.response(&id);
+        assert!(response.error.is_none(), "{response:?}");
+        let context = response.result.unwrap();
+        assert_eq!(context["selectionMode"], mode);
+        let selected = selected.expect("expected selected project");
+        assert_eq!(context["selectedProjectUri"], uri(&selected).to_string());
+    }
+    server.shutdown();
+}
+
+#[test]
+fn selecting_a_project_switches_same_named_unit_bindings_in_its_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let a_unit = root.join("a/Shared.pas");
+    let b_unit = root.join("b/Shared.pas");
+    let main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Routine;\nend;\nend.\n";
+    let unit_source = "unit Shared;\ninterface\nprocedure Routine;\nimplementation\nprocedure Routine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&a_unit, unit_source);
+    write_file(&b_unit, unit_source);
+    for (name, path) in [("A", "a/Shared.pas"), ("B", "b/Shared.pas")] {
+        write_file(
+            &root.join(format!("{name}.dproj")),
+            &format!(
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"{path}\" /></ItemGroup></Project>"
+            ),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    for (id, project, expected) in [
+        ("select-a", root.join("A.dproj"), a_unit),
+        ("select-b", root.join("B.dproj"), b_unit),
+    ] {
+        let select_id = RequestId::from(id.to_string());
+        server.send_request(
+            select_id.clone(),
+            "pascal/selectProject",
+            json!({
+                "textDocument": {"uri": uri(&main)},
+                "projectUri": uri(&project)
+            }),
+        );
+        assert!(server.response(&select_id).error.is_none());
+        let navigation_id = RequestId::from(format!("{id}-navigation"));
+        server.send_request(
+            navigation_id.clone(),
+            "textDocument/declaration",
+            navigation_params(&main, main_source, "Routine", 0),
+        );
+        let locations = result_locations(server.response(&navigation_id));
+        assert_eq!(locations.len(), 1, "{id} should resolve one declaration");
+        assert_eq!(locations[0]["uri"], uri(&expected).to_string());
+    }
+    server.shutdown();
+}
+
+#[test]
+fn naming_code_actions_use_the_selected_project_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("app");
+    let main = project.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &project.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    write_file(
+        &project.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("project-code-action".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()[0]["title"],
+        "Rename 'badConst' to 'BadConst'"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn standalone_naming_actions_match_workspace_configuration_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let main = root.join("src/Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  BadConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(
+        &root.join("src/.lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let start = position_of(source, "BadConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming"),
+        "diagnostics must use the workspace-level standalone configuration: {diagnostics}"
+    );
+
+    let action_id = RequestId::from("standalone-config-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 2,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()[0]["title"],
+        "Rename 'BadConst' to 'BAD_CONST'"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rescheduled_diagnostics_follow_directory_override_then_configured_fallback_after_reset() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let first = root.join("Main.pas");
+    let second = root.join("other/Other.pas");
+    let chosen_project = root.join("app/Chosen.dproj");
+    let local_project = root.join("Local.dproj");
+    let source = "unit Main;\ninterface\nconst\n  BadConst = 1;\nimplementation\nend.\n";
+    let second_source = source.replace("unit Main", "unit Other");
+    write_file(&first, source);
+    write_file(&second, &second_source);
+    write_file(
+        &chosen_project,
+        "<Project><PropertyGroup><MainSource>Chosen.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &local_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    write_file(
+        &root.join("app/.lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/Chosen.dproj"}));
+    for (path, text) in [(&first, source), (&second, second_source.as_str())] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+    }
+    let first_initial = diagnostics_for_uri(&mut server, &uri(&first));
+    let second_initial = diagnostics_for_uri(&mut server, &uri(&second));
+    for diagnostics in [&first_initial, &second_initial] {
+        assert!(
+            diagnostics["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "constant-naming")
+        );
+    }
+
+    let select_id = RequestId::from("diagnostics-local-select".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&first)},
+            "projectUri": uri(&local_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    let _ = diagnostics_for_uri(&mut server, &uri(&first));
+    let second_after_select = diagnostics_for_uri(&mut server, &uri(&second));
+    assert!(
+        !second_after_select["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    let context_id = RequestId::from("diagnostics-local-context".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&second)}}),
+    );
+    let context_response = server.response(&context_id);
+    assert!(context_response.error.is_none(), "{context_response:?}");
+    assert_eq!(
+        context_response.result.unwrap()["selectedProjectUri"],
+        uri(&local_project).to_string()
+    );
+
+    let navigation_id = RequestId::from("diagnostics-local-navigation".to_string());
+    server.send_request(
+        navigation_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&second, &second_source, "BadConst", 0),
+    );
+    let _ = result_locations(server.response(&navigation_id));
+
+    let reset_id = RequestId::from("diagnostics-local-reset".to_string());
+    server.send_request(
+        reset_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&first)},
+            "projectUri": null
+        }),
+    );
+    assert!(server.response(&reset_id).error.is_none());
+    let _ = diagnostics_for_uri(&mut server, &uri(&first));
+    let second_after_reset = diagnostics_for_uri(&mut server, &uri(&second));
+    assert!(
+        second_after_reset["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
     server.shutdown();
 }
 
@@ -723,6 +3235,733 @@ fn open_dependency_keeps_its_selected_project_context_across_requests() {
 }
 
 #[test]
+fn open_shared_dependency_retains_its_owner_after_a_peer_project_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = open_shared_owner_fixture(temp.path());
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let select_a = RequestId::from("open-owner-select-a".to_string());
+    server.send_request(
+        select_a.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_a).error.is_none());
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&fixture.shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": &fixture.shared_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let select_b = RequestId::from("open-owner-select-b".to_string());
+    server.send_request(
+        select_b.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.b_main)},
+            "projectUri": uri(&fixture.b_project)
+        }),
+    );
+    assert!(server.response(&select_b).error.is_none());
+
+    let b_navigation = RequestId::from("open-owner-b-navigation".to_string());
+    server.send_request(
+        b_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.b_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&b_navigation))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let shared_navigation = RequestId::from("open-owner-shared-navigation".to_string());
+    server.send_request(
+        shared_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&shared_navigation))[0]["uri"],
+        uri(&fixture.a_config).to_string(),
+        "an open shared unit must retain A's owner after B clears disposable contexts"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn open_shared_dependency_does_not_adopt_a_peer_after_its_owner_is_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = open_shared_owner_fixture(temp.path());
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let select_a = RequestId::from("open-invalid-owner-select-a".to_string());
+    server.send_request(
+        select_a.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_a).error.is_none());
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&fixture.shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": &fixture.shared_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    fs::remove_file(&fixture.a_project).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&fixture.a_project), "type": 3}]}),
+    );
+
+    let select_b = RequestId::from("open-invalid-owner-select-b".to_string());
+    server.send_request(
+        select_b.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.b_main)},
+            "projectUri": uri(&fixture.b_project)
+        }),
+    );
+    assert!(server.response(&select_b).error.is_none());
+
+    let b_navigation = RequestId::from("open-invalid-owner-b-navigation".to_string());
+    server.send_request(
+        b_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.b_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&b_navigation))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let shared_navigation = RequestId::from("open-invalid-owner-shared-navigation".to_string());
+    server.send_request(
+        shared_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert!(
+        result_locations(server.response(&shared_navigation)).is_empty(),
+        "a removed open owner must not be replaced by B's importing context"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn directory_override_survives_peer_dependency_load_before_direct_navigation() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = open_shared_owner_fixture(temp.path());
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&fixture.shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": &fixture.shared_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let select_a = RequestId::from("override-owner-select-a".to_string());
+    server.send_request(
+        select_a.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_a).error.is_none());
+
+    let b_navigation = RequestId::from("override-owner-b-navigation".to_string());
+    server.send_request(
+        b_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.b_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&b_navigation))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let context_id = RequestId::from("override-owner-shared-context".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.shared)}}),
+    );
+    let context = server.response(&context_id);
+    assert!(context.error.is_none(), "{context:?}");
+    assert_eq!(
+        context.result.unwrap()["selectedProjectUri"],
+        uri(&fixture.a_project).to_string(),
+        "the cached shared context must follow the current A directory override"
+    );
+
+    let shared_navigation = RequestId::from("override-owner-shared-navigation".to_string());
+    server.send_request(
+        shared_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&shared_navigation))[0]["uri"],
+        uri(&fixture.a_config).to_string(),
+        "peer dependency loading must not replace the overridden shared context"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn inherited_closed_dependency_follows_new_runtime_project_selection() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let shared = root.join("Shared.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    let provider_a = root.join("A/Provider.pas");
+    let provider_b = root.join("B/Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Use;\nbegin\n  Run;\nend;\nend.\n";
+    let shared_source = "unit Shared;\ninterface\nuses Provider;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let project = |provider: &str| {
+        format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Shared.pas\" /><DCCReference Include=\"{provider}\" /></ItemGroup></Project>"
+        )
+    };
+
+    write_file(&main, main_source);
+    write_file(&shared, shared_source);
+    write_file(&project_a, &project("A/Provider.pas"));
+    write_file(&project_b, &project("B/Provider.pas"));
+    write_file(
+        &provider_a,
+        "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n",
+    );
+    write_file(
+        &provider_b,
+        "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "A.dproj"}));
+
+    let load_id = RequestId::from("inherited-runtime-override-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&shared).to_string()
+    );
+
+    let select_id = RequestId::from("inherited-runtime-override-select-b".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&project_b)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let provider_id = RequestId::from("inherited-runtime-override-provider".to_string());
+    server.send_request(
+        provider_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&shared, shared_source, "ProviderRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&provider_id))[0]["uri"],
+        uri(&provider_b).to_string(),
+        "an inherited closed dependency must follow the newly selected runtime project"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_context_retains_shared_owner_selection_outside_source_ancestry() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = shared_owner_fixture(temp.path());
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let select_a = RequestId::from("shared-context-select-a".to_string());
+    server.send_request(
+        select_a.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_a).error.is_none());
+
+    let load_shared = RequestId::from("shared-context-load".to_string());
+    server.send_request(
+        load_shared.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_shared))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let before_id = RequestId::from("shared-context-before-removal".to_string());
+    server.send_request(
+        before_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.shared)}}),
+    );
+    let before = server.response(&before_id);
+    assert!(before.error.is_none(), "{before:?}");
+    let before = before.result.unwrap();
+    assert_eq!(before["selectionMode"], "directory");
+    assert_eq!(
+        before["selectedProjectUri"],
+        uri(&fixture.a_project).to_string()
+    );
+
+    fs::remove_file(&fixture.a_project).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&fixture.a_project), "type": 3}]}),
+    );
+
+    let after_id = RequestId::from("shared-context-after-removal".to_string());
+    server.send_request(
+        after_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.shared)}}),
+    );
+    let after = server.response(&after_id);
+    assert!(after.error.is_none(), "{after:?}");
+    let after = after.result.unwrap();
+    assert_eq!(after["selectionMode"], "invalid");
+    assert_eq!(
+        after["scopeUri"],
+        uri(&root.join("A")).to_string(),
+        "an invalid retained owner must keep its selection scope"
+    );
+    assert!(
+        after["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap_or_default()
+                .contains(&fixture.a_project.display().to_string())),
+        "invalid retained owner warning must be preserved: {after}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn automatic_clears_an_advertised_inherited_owner_without_clearing_peer_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = shared_owner_fixture(temp.path());
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let select_a = RequestId::from("automatic-inherited-select-a".to_string());
+    server.send_request(
+        select_a.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_a).error.is_none());
+
+    let load_shared = RequestId::from("automatic-inherited-load-shared".to_string());
+    server.send_request(
+        load_shared.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_shared))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let select_b = RequestId::from("automatic-inherited-select-b".to_string());
+    server.send_request(
+        select_b.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.b_main)},
+            "projectUri": uri(&fixture.b_project)
+        }),
+    );
+    assert!(server.response(&select_b).error.is_none());
+
+    let automatic = RequestId::from("automatic-inherited-reset".to_string());
+    server.send_request(
+        automatic.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.shared)},
+            "projectUri": null
+        }),
+    );
+    let automatic_response = server.response(&automatic);
+    assert!(
+        automatic_response.error.is_none(),
+        "Automatic reset failed: {automatic_response:?}"
+    );
+    let automatic_context = automatic_response.result.as_ref().unwrap();
+    assert_eq!(automatic_context["selectionMode"], "standalone");
+    assert!(
+        automatic_context["selectedProjectUri"].is_null(),
+        "Automatic must clear the retained inherited project: {automatic_context}"
+    );
+
+    let peer_context_id = RequestId::from("automatic-inherited-peer-context".to_string());
+    server.send_request(
+        peer_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.b_main)}}),
+    );
+    let peer_context = server.response(&peer_context_id);
+    assert!(
+        peer_context.error.is_none(),
+        "peer context failed: {peer_context:?}"
+    );
+    assert_eq!(
+        peer_context.result.as_ref().unwrap()["selectedProjectUri"],
+        uri(&fixture.b_project).to_string(),
+        "Automatic on the shared file must preserve B's unrelated selection"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn interleaved_project_switch_preserves_shared_owner_and_removed_owner_stays_invalid() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = shared_owner_fixture(temp.path());
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let select_a = RequestId::from("shared-owner-select-a".to_string());
+    server.send_request(
+        select_a.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_a).error.is_none());
+
+    let a_navigation = RequestId::from("shared-owner-a-navigation".to_string());
+    server.send_request(
+        a_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&a_navigation))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let shared_before_switch = RequestId::from("shared-owner-before-switch".to_string());
+    server.send_request(
+        shared_before_switch.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&shared_before_switch))[0]["uri"],
+        uri(&fixture.a_config).to_string()
+    );
+
+    let select_b = RequestId::from("shared-owner-select-b".to_string());
+    server.send_request(
+        select_b.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.b_main)},
+            "projectUri": uri(&fixture.b_project)
+        }),
+    );
+    assert!(server.response(&select_b).error.is_none());
+
+    let b_navigation = RequestId::from("shared-owner-b-navigation".to_string());
+    server.send_request(
+        b_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.b_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&b_navigation))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let shared_navigation = RequestId::from("shared-owner-after-switch".to_string());
+    server.send_request(
+        shared_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&shared_navigation))[0]["uri"],
+        uri(&fixture.a_config).to_string(),
+        "the shared unit must retain A's known owner after B's cache invalidation"
+    );
+
+    fs::remove_file(&fixture.a_project).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&fixture.a_project), "type": 3}]}),
+    );
+    let select_b_again = RequestId::from("shared-owner-reselect-b".to_string());
+    server.send_request(
+        select_b_again.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.b_main)},
+            "projectUri": uri(&fixture.b_project)
+        }),
+    );
+    assert!(server.response(&select_b_again).error.is_none());
+
+    let invalid_shared_navigation = RequestId::from("invalid-shared-owner".to_string());
+    server.send_request(
+        invalid_shared_navigation.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert!(
+        result_locations(server.response(&invalid_shared_navigation)).is_empty(),
+        "a removed selected owner must not be replaced by B's importing context"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn workers_and_formatting_preserve_known_shared_owner_and_reject_removed_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = shared_owner_fixture(temp.path());
+    let root = temp.path();
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(
+        &root.join(".fmt4d.toml"),
+        "[format]\nend_of_line = \"lf\"\n",
+    );
+    write_file(
+        &fixture.a_project.parent().unwrap().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(
+        &fixture.a_project.parent().unwrap().join(".fmt4d.toml"),
+        "[format]\nend_of_line = \"crlf\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let select_id = RequestId::from("worker-shared-owner-select".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    let load_id = RequestId::from("worker-shared-owner-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let format_id = RequestId::from("worker-shared-owner-format".to_string());
+    server.send_request(
+        format_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&fixture.shared)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let format_response = server.response(&format_id);
+    let format_uses_owner = format_response.error.is_none()
+        && format_response
+            .result
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|edits| edits.first())
+            .and_then(|edit| edit["newText"].as_str())
+            .is_some_and(|text| text.contains("\r\n"));
+
+    let start = position_of(&fixture.shared_source, "BadConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+    let action_id = RequestId::from("worker-shared-owner-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&fixture.shared)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 2,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let action_response = server.response(&action_id);
+    let action_uses_owner = action_response.error.is_none()
+        && action_response
+            .result
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|actions| actions.first())
+            .is_some_and(|action| action["title"] == "Rename 'BadConst' to 'BAD_CONST'");
+
+    fs::remove_file(&fixture.a_project).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&fixture.a_project), "type": 3}]}),
+    );
+    let rename_id = RequestId::from("worker-invalid-shared-owner".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&fixture.shared)},
+            "position": start,
+            "newName": "GoodConst"
+        }),
+    );
+    let rename_response = server.response(&rename_id);
+    let removed_owner_rejected = rename_response
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == -32803 && error.message.contains("invalid"));
+    assert!(
+        format_uses_owner && action_uses_owner && removed_owner_rejected,
+        "owner checks: format={format_response:?}, action={action_response:?}, rename={rename_response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn malformed_retained_owner_fails_closed_for_shared_document_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = shared_owner_fixture(temp.path());
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let select_id = RequestId::from("malformed-owner-select-a".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let load_id = RequestId::from("malformed-owner-load-shared".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    write_file(&fixture.a_project, "<Project>");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&fixture.a_project), "type": 2}]}),
+    );
+
+    let position = position_of(&fixture.shared_source, "BadConst", 0);
+    let rename_id = RequestId::from("malformed-owner-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&fixture.shared)},
+            "position": position,
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&rename_id);
+    let error = response
+        .error
+        .expect("malformed retained owner must reject rename");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("known project owner"),
+        "rename error must identify retained-owner discovery failure: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn projectless_context_watches_each_file_ancestors_for_new_nearer_projects() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("workspace");
@@ -773,6 +4012,203 @@ fn projectless_context_watches_each_file_ancestors_for_new_nearer_projects() {
     let locations = result_locations(server.response(&request_id));
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0]["uri"], uri(&selected_config).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn automatic_owner_is_rediscovered_when_a_second_owner_appears() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let project_a = app.join("A.dproj");
+    let project_b = app.join("B.dproj");
+    let source = "unit Main;\ninterface\nconst\n  BadConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &project_a,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let initial_id = RequestId::from("automatic-owner-initial".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let initial = server.response(&initial_id);
+    assert!(
+        initial.error.is_none(),
+        "initial context failed: {initial:?}"
+    );
+    assert_eq!(
+        initial.result.as_ref().unwrap()["selectionMode"],
+        "automatic"
+    );
+    assert_eq!(
+        initial.result.as_ref().unwrap()["selectedProjectUri"],
+        uri(&project_a).to_string()
+    );
+
+    write_file(
+        &project_b,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&project_b), "type": 1}]}),
+    );
+
+    let context_id = RequestId::from("automatic-owner-ambiguous".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let context = server.response(&context_id);
+    assert!(
+        context.error.is_none(),
+        "ambiguous context failed: {context:?}"
+    );
+    let context_result = context.result.as_ref().unwrap();
+    assert_eq!(context_result["selectionMode"], "ambiguous");
+    assert!(
+        context_result["selectedProjectUri"].is_null(),
+        "automatic discovery must not retain the old project: {context_result}"
+    );
+
+    let position = position_of(source, "BadConst", 0);
+    let rename_id = RequestId::from("automatic-owner-ambiguous-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position,
+            "newName": "GOOD_CONST"
+        }),
+    );
+    let rename = server.response(&rename_id);
+    let error = rename
+        .error
+        .expect("ambiguous automatic owner must refuse rename");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("ambiguous") || error.message.contains("incomplete"),
+        "unexpected ambiguity refusal: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn automatic_owner_rechecks_nearest_scope_for_diagnostics_and_formatting() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let outer = root.join("outer");
+    let inner = outer.join("inner");
+    let main = inner.join("Main.pas");
+    let outer_project = outer.join("Outer.dproj");
+    let inner_project = inner.join("Inner.dproj");
+    let source = "unit Main;\ninterface\nconst\n  BadConst = 1;\nimplementation\nprocedure Run;\nbegin\n  BadConst := 1;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &outer_project,
+        "<Project><PropertyGroup><MainSource>inner/Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &outer.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    write_file(
+        &outer.join(".fmt4d.toml"),
+        "[format]\nend_of_line = \"lf\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    let initial_diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        initial_diagnostics["diagnostics"]
+            .as_array()
+            .expect("initial diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "constant-naming"),
+        "outer automatic project should use PascalCase: {initial_diagnostics}"
+    );
+
+    write_file(
+        &inner_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &inner.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(
+        &inner.join(".fmt4d.toml"),
+        "[format]\nend_of_line = \"crlf\"\n",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&inner_project), "type": 1}]}),
+    );
+
+    let context_id = RequestId::from("nearest-owner-context".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let context = server.response(&context_id);
+    assert!(
+        context.error.is_none(),
+        "nearest context failed: {context:?}"
+    );
+    let context_result = context.result.as_ref().unwrap();
+    assert_eq!(context_result["selectionMode"], "automatic");
+    assert_eq!(
+        context_result["selectedProjectUri"],
+        uri(&inner_project).to_string()
+    );
+    assert_eq!(context_result["scopeUri"], uri(&inner).to_string());
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("updated diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming"),
+        "nearer project diagnostics were not recomputed: {diagnostics}"
+    );
+
+    let format_id = RequestId::from("nearest-owner-format".to_string());
+    server.send_request(
+        format_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let formatting = server.response(&format_id);
+    assert!(
+        formatting.error.is_none(),
+        "nearest formatting failed: {formatting:?}"
+    );
+    assert!(
+        formatting.result.as_ref().unwrap()[0]["newText"]
+            .as_str()
+            .expect("formatting text")
+            .contains("\r\n"),
+        "formatting did not use the nearer project's configuration: {formatting:?}"
+    );
     server.shutdown();
 }
 
@@ -1118,6 +4554,259 @@ fn dynamic_watcher_registration_is_conditional_and_acknowledged() {
         registration.id,
         Value::Null,
     )));
+    server.shutdown();
+}
+
+#[test]
+fn dynamic_watcher_registration_covers_repository_parent_configuration_fallbacks() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = temp.path().join("repository");
+    let workspace = repository.join("nested-workspace");
+    fs::create_dir_all(&workspace).expect("workspace directory");
+    write_file(&repository.join(".git"), "gitdir: /outside/worktree\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_watched_registration_and_relative_patterns(
+        &workspace,
+        Value::Null,
+        true,
+    );
+    let registration = server.request("client/registerCapability");
+    let watchers = registration.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("file watchers");
+    assert!(
+        watchers.iter().any(|watcher| {
+            watcher["globPattern"]["baseUri"] == uri(&repository).to_string()
+                && watcher["globPattern"]["pattern"] == ".lint4d.toml"
+        }),
+        "repository-parent lint config needs an explicit watcher: {watchers:?}"
+    );
+    assert!(
+        watchers.iter().any(|watcher| {
+            watcher["globPattern"]["baseUri"] == uri(&repository).to_string()
+                && watcher["globPattern"]["pattern"] == ".fmt4d.toml"
+        }),
+        "repository-parent fmt config needs an explicit watcher: {watchers:?}"
+    );
+    server.send(Message::Response(Response::new_ok(
+        registration.id,
+        Value::Null,
+    )));
+    server.shutdown();
+}
+
+#[test]
+fn relative_watcher_registration_uses_the_configuration_parent_as_base_uri() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = temp.path().join("repository");
+    let workspace = repository.join("nested-workspace");
+    fs::create_dir_all(&workspace).expect("workspace directory");
+    write_file(&repository.join(".git"), "gitdir: /outside/worktree\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_watched_registration_and_relative_patterns(
+        &workspace,
+        Value::Null,
+        true,
+    );
+    let registration = server.request("client/registerCapability");
+    let watchers = registration.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("file watchers");
+    let lint_config = repository.join(".lint4d.toml");
+    let watcher = watchers
+        .iter()
+        .find(|watcher| watcher["globPattern"]["pattern"] == ".lint4d.toml")
+        .expect("repository-parent lint config watcher");
+    assert_eq!(
+        watcher["globPattern"]["baseUri"],
+        uri(&repository).to_string(),
+        "external configuration must be watched from its actual parent"
+    );
+    assert_eq!(watcher["globPattern"]["pattern"], ".lint4d.toml");
+    assert!(
+        !watchers
+            .iter()
+            .any(|watcher| { watcher["globPattern"] == lint_config.to_string_lossy().as_ref() })
+    );
+    server.send(Message::Response(Response::new_ok(
+        registration.id,
+        Value::Null,
+    )));
+    server.shutdown();
+}
+
+#[test]
+fn watcher_registration_degrades_explicit_paths_without_relative_pattern_support() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = temp.path().join("repository");
+    let workspace = repository.join("nested-workspace");
+    fs::create_dir_all(&workspace).expect("workspace directory");
+    write_file(&repository.join(".git"), "gitdir: /outside/worktree\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_watched_registration_and_relative_patterns(
+        &workspace,
+        Value::Null,
+        false,
+    );
+    let registration = server.request("client/registerCapability");
+    let watchers = registration.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("file watchers");
+    let lint_config = repository.join(".lint4d.toml");
+    assert!(
+        !watchers
+            .iter()
+            .any(|watcher| { watcher["globPattern"] == lint_config.to_string_lossy().as_ref() }),
+        "unsupported relative patterns must not be encoded as absolute string globs"
+    );
+    server.send(Message::Response(Response::new_ok(
+        registration.id,
+        Value::Null,
+    )));
+    server.shutdown();
+}
+
+#[test]
+fn dynamic_watcher_registration_adds_discovered_project_scope_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("app");
+    let main = project.join("Main.pas");
+    write_file(&main, "unit Main; interface implementation end.\n");
+    write_file(
+        &project.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&project.join("App.dpr"), "program App; begin end.\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_watched_registration_and_relative_patterns(root, Value::Null, true);
+    let initial_registration = server.request("client/registerCapability");
+    server.send(Message::Response(Response::new_ok(
+        initial_registration.id,
+        Value::Null,
+    )));
+
+    let context_id = RequestId::from("project-scope-watchers".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let context = server.response(&context_id);
+    assert!(
+        context.error.is_none(),
+        "project context failed: {context:?}"
+    );
+
+    let update = server.request("client/registerCapability");
+    let watchers = update.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("incremental file watchers");
+    for filename in [".lint4d.toml", ".fmt4d.toml"] {
+        assert!(
+            watchers.iter().any(|watcher| {
+                watcher["globPattern"]["baseUri"] == uri(&project).to_string()
+                    && watcher["globPattern"]["pattern"] == filename
+            }),
+            "discovered project candidate needs an explicit watcher: {project:?}/{filename}; {watchers:?}"
+        );
+    }
+    server.send(Message::Response(Response::new_ok(update.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn dynamic_watcher_registration_resolves_relative_configured_project_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("app");
+    let main = project.join("Main.pas");
+    write_file(&main, "unit Main; interface implementation end.\n");
+    write_file(
+        &project.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_watched_registration_and_relative_patterns(
+        root,
+        json!({"projectFile": "app/App.dproj"}),
+        true,
+    );
+    let registration = server.request("client/registerCapability");
+    let watchers = registration.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("file watchers");
+    for filename in [".lint4d.toml", ".fmt4d.toml"] {
+        assert!(
+            watchers.iter().any(|watcher| {
+                watcher["globPattern"]["baseUri"] == uri(&project).to_string()
+                    && watcher["globPattern"]["pattern"] == filename
+            }),
+            "relative configured project candidate needs an explicit watcher: {project:?}/{filename}; {watchers:?}"
+        );
+    }
+    server.send(Message::Response(Response::new_ok(
+        registration.id,
+        Value::Null,
+    )));
+    server.shutdown();
+}
+
+#[test]
+fn dynamic_watcher_registration_retries_rejected_paths_after_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = temp.path().join("repository");
+    let workspace = repository.join("nested-workspace");
+    let main = workspace.join("Main.pas");
+    fs::create_dir_all(&workspace).expect("workspace directory");
+    write_file(&repository.join(".git"), "gitdir: /outside/worktree\n");
+    write_file(&main, "unit Main; interface implementation end.\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_watched_registration_and_relative_patterns(
+        &workspace,
+        Value::Null,
+        true,
+    );
+    let initial = server.request("client/registerCapability");
+    let initial_watchers = initial.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("initial file watchers");
+    assert!(initial_watchers.iter().any(|watcher| {
+        watcher["globPattern"]["baseUri"] == uri(&repository).to_string()
+            && watcher["globPattern"]["pattern"] == ".lint4d.toml"
+    }));
+    server.send(Message::Response(Response::new_err(
+        initial.id,
+        -32603,
+        "watcher registration rejected".to_string(),
+    )));
+
+    let context_id = RequestId::from("retry-project-context".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let context = server.response(&context_id);
+    assert!(
+        context.error.is_none(),
+        "project context failed: {context:?}"
+    );
+    let retry = server.request("client/registerCapability");
+    let retry_watchers = retry.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("retry file watchers");
+    assert!(retry_watchers.iter().any(|watcher| {
+        watcher["globPattern"]["baseUri"] == uri(&repository).to_string()
+            && watcher["globPattern"]["pattern"] == ".lint4d.toml"
+    }));
+    server.send(Message::Response(Response::new_ok(retry.id, Value::Null)));
     server.shutdown();
 }
 
@@ -5359,6 +9048,88 @@ fn code_action_resolve_rejects_stale_configuration() {
     server.send_request(resolve_id.clone(), "codeAction/resolve", action);
     let response = server.response(&resolve_id);
     assert!(response.error.is_some(), "stale config must reject resolve");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_resolve_rejects_a_project_selection_switch() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    let start = position_of(source, "badConst", 0);
+    let end = Position::new(start.line, start.character + 8);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let select_a_id = RequestId::from("select-project-a-for-action".to_string());
+    server.send_request(
+        select_a_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&project_a)
+        }),
+    );
+    assert!(server.response(&select_a_id).error.is_none());
+
+    let action_id = RequestId::from("selection-switch-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": start, "end": end},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": start, "end": end},
+                    "severity": 4,
+                    "code": "constant-naming",
+                    "source": "lint4d",
+                    "message": "naming violation"
+                }],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let action_response = server.response(&action_id);
+    assert!(
+        action_response.error.is_none(),
+        "codeAction failed: {action_response:?}"
+    );
+    let action = action_response.result.expect("actions")[0].clone();
+
+    let select_b_id = RequestId::from("select-project-b-before-resolve".to_string());
+    server.send_request(
+        select_b_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&project_b)
+        }),
+    );
+    assert!(server.response(&select_b_id).error.is_none());
+
+    let resolve_id = RequestId::from("selection-switch-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "project selection changes must reject a pending action: {response:?}"
+    );
     server.shutdown();
 }
 

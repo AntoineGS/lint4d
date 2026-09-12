@@ -7,12 +7,13 @@
 //! cache or the filesystem.
 
 use super::{
-    ContextKey, DiskStamp, OpenDocument, PathStamp, Workspace, WorkspaceOptions, absolute_path,
-    canonical_file_uri, disk_stamp, is_pascal_path, path_stamp, path_starts_with_ci,
-    paths_equal_ci, read_disk_source,
+    ContextKey, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
+    WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_configuration_file,
+    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, paths_equal_ci,
+    read_disk_source,
 };
 use crate::NavigationIndex;
-use crate::project::ProjectContext;
+use crate::project::{ProjectContext, ProjectSelections, has_invalid_project_selection};
 use crate::text;
 use lsp_types::{
     DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
@@ -22,6 +23,7 @@ use pascal_core::decode_bytes;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +44,7 @@ const MAX_RENAME_INCLUDE_DIRECTIVES: usize = 16_384;
 const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
 const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
+const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const INCLUDE_BYTE_BUDGET_ERROR: &str =
     "include byte limit would be exceeded before reading the file";
 
@@ -55,6 +58,8 @@ pub(crate) struct OverlayInput {
 pub(crate) struct WorkspaceInput {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) options: WorkspaceOptions,
+    pub(crate) project_selections: ProjectSelections,
+    pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
     pub(crate) rejected_documents: HashSet<Url>,
     pub(crate) source_generation: u64,
@@ -71,16 +76,26 @@ pub(crate) struct SourceRecord {
     pub(crate) path: Option<PathBuf>,
     pub(crate) path_stamp: Option<PathStamp>,
     pub(crate) content_hash: Option<u64>,
+    pub(crate) content_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotSeed {
     pub(crate) record: SourceRecord,
+    pub(crate) consumed_configuration: Vec<SourceRecord>,
 }
 
 impl SnapshotSeed {
     pub(crate) fn new(record: SourceRecord) -> Self {
-        Self { record }
+        Self {
+            record,
+            consumed_configuration: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_consumed_configuration(mut self, records: &[SourceRecord]) -> Self {
+        self.consumed_configuration = records.to_vec();
+        self
     }
 }
 
@@ -119,6 +134,7 @@ struct Enumeration {
     baseline_paths: Vec<BaselinePath>,
     baseline_keys: HashSet<String>,
     baseline_content_hashes: HashMap<String, u64>,
+    baseline_contents: HashMap<String, Vec<u8>>,
     complete: bool,
     reason: Option<String>,
 }
@@ -155,6 +171,8 @@ impl Workspace {
         WorkspaceInput {
             roots: self.roots.iter().map(|root| root.path.clone()).collect(),
             options: self.options.clone(),
+            project_selections: self.project_selections.clone(),
+            document_owners: self.document_owners.clone(),
             overlays,
             rejected_documents,
             source_generation: self.source_generation,
@@ -337,16 +355,48 @@ fn revalidate_path_record(
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    if path_stamp(path) != record.path_stamp {
+    let actual_path_stamp = if is_configuration_file(path) {
+        path_stamp_result(path).map_err(|error| {
+            format!(
+                "could not inspect configuration candidate {}: {error}",
+                path.display()
+            )
+        })?
+    } else {
+        path_stamp(path)
+    };
+    if actual_path_stamp != record.path_stamp {
+        let kind = if is_configuration_file(path) {
+            "configuration"
+        } else {
+            "workspace"
+        };
         return Err(format!(
-            "workspace metadata or membership changed while resolving {}; retry the request",
+            "{kind} metadata or membership changed while resolving {}; retry the request",
             path.display()
         ));
     }
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    if let Some(expected) = record.content_hash {
+    if let Some(expected) = &record.content_bytes {
+        let actual = match read_exact_file_bytes(path, cancel) {
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error) => {
+                return Err(format!(
+                    "workspace content could not be revalidated for {}: {error}",
+                    path.display()
+                ));
+            }
+            Ok(actual) => actual,
+        };
+        if actual != *expected {
+            return Err(format!(
+                "configuration content changed while resolving {}; retry the request",
+                path.display()
+            ));
+        }
+    } else if let Some(expected) = record.content_hash {
         let actual = match file_content_hash(path, cancel) {
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
             Err(error) => {
@@ -385,8 +435,14 @@ fn file_content_hash(path: &Path, cancel: &AtomicBool) -> Result<u64, String> {
             path.display()
         ));
     }
-    let mut file =
-        fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let mut file = open_revalidation_file(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened {}: {error}", path.display()))?;
+    if !opened_metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut byte_count = 0usize;
@@ -441,8 +497,20 @@ fn read_scan_source(path: &Path, cancel: &AtomicBool) -> Result<ScannedSource, S
             path.display()
         ));
     }
-    let mut file =
-        fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let mut file = open_revalidation_file(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened {}: {error}", path.display()))?;
+    if !opened_metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if opened_metadata.len() > MAX_RENAME_SCAN_FILE_BYTES as u64 {
+        return Err(format!(
+            "{} exceeds the fixed rename scan file limit {MAX_RENAME_SCAN_FILE_BYTES}",
+            path.display()
+        ));
+    }
     let mut bytes = Vec::new();
     let mut content_hasher = std::collections::hash_map::DefaultHasher::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -496,6 +564,7 @@ fn path_record_at(
     path: PathBuf,
     stamp: Option<PathStamp>,
     content_hash: Option<u64>,
+    content_bytes: Option<Vec<u8>>,
 ) -> Option<SourceRecord> {
     let uri = Url::from_file_path(&path).ok()?;
     Some(SourceRecord {
@@ -507,6 +576,7 @@ fn path_record_at(
         path: Some(path),
         path_stamp: stamp,
         content_hash,
+        content_bytes,
     })
 }
 
@@ -538,6 +608,7 @@ pub(crate) fn source_for_input(
                 path: None,
                 path_stamp: None,
                 content_hash: None,
+                content_bytes: None,
             },
         ));
     }
@@ -557,6 +628,7 @@ pub(crate) fn source_for_input(
         path: None,
         path_stamp: None,
         content_hash: Some(disk.content_hash),
+        content_bytes: None,
     };
     Ok((disk.text, record))
 }
@@ -985,6 +1057,8 @@ pub(crate) fn build_snapshot(
             .saturating_mul(MAX_SNAPSHOT_DEPENDENCY_FILES),
     );
     let mut loader = Workspace::new(input.roots.clone(), loader_options);
+    loader.project_selections = input.project_selections.clone();
+    loader.document_owners = input.document_owners.clone();
     for (uri, overlay) in &input.overlays {
         loader.open_documents.insert(
             uri.clone(),
@@ -997,16 +1071,26 @@ pub(crate) fn build_snapshot(
     }
 
     let priority = priority.iter().map(canonical_file_uri).collect::<Vec<_>>();
+    if !input.project_selections.is_empty() {
+        for uri in &priority {
+            let context_key = loader.context_for_uri(uri)?;
+            if loader
+                .contexts
+                .get(&context_key)
+                .is_some_and(|state| has_invalid_project_selection(&state.context))
+            {
+                return Err(format!(
+                    "project selection is invalid; select a current project or Automatic for {uri}"
+                ));
+            }
+        }
+    }
     if mode == SnapshotMode::Workspace {
         for uri in &priority {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            let Some(context_key) = loader.context_for_uri(uri) else {
-                return Err(format!(
-                    "rename workspace scan incomplete: project context could not be resolved for {uri}"
-                ));
-            };
+            let context_key = loader.context_for_uri(uri)?;
             if !loader
                 .contexts
                 .get(&context_key)
@@ -1025,6 +1109,16 @@ pub(crate) fn build_snapshot(
     let mut baseline_paths = enumeration.baseline_paths;
     let mut baseline_keys = enumeration.baseline_keys;
     let mut baseline_content_hashes = enumeration.baseline_content_hashes;
+    let mut baseline_contents = enumeration.baseline_contents;
+    capture_consumed_configuration_baseline(
+        priority_seed
+            .as_ref()
+            .map_or(&[][..], |seed| seed.consumed_configuration.as_slice()),
+        &mut baseline_paths,
+        &mut baseline_keys,
+        &mut baseline_contents,
+        cancel,
+    )?;
     for rejected_uri in &input.rejected_documents {
         let Ok(path) = rejected_uri.to_file_path() else {
             continue;
@@ -1074,34 +1168,25 @@ pub(crate) fn build_snapshot(
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        match loader.context_for_uri(uri) {
-            Some(context_key) => {
-                capture_context_baseline(
-                    &loader,
-                    &context_key,
-                    &mut baseline_paths,
-                    &mut baseline_keys,
-                    &mut baseline_content_hashes,
-                    cancel,
-                )?;
-                contexts.insert(uri.clone(), context_key.clone());
-                if !loader
-                    .contexts
-                    .get(&context_key)
-                    .is_some_and(|state| state.context.discovery_complete)
-                {
-                    complete = false;
-                    incomplete_reason.get_or_insert_with(|| {
-                        format!("project context is ambiguous or incomplete for {uri}")
-                    });
-                }
-            }
-            None => {
-                complete = false;
-                incomplete_reason.get_or_insert_with(|| {
-                    format!("project context could not be resolved for {uri}")
-                });
-            }
+        let context_key = loader.context_for_uri(uri)?;
+        capture_context_baseline(
+            &loader,
+            &context_key,
+            &mut baseline_paths,
+            &mut baseline_keys,
+            &mut baseline_content_hashes,
+            cancel,
+        )?;
+        contexts.insert(uri.clone(), context_key.clone());
+        if !loader
+            .contexts
+            .get(&context_key)
+            .is_some_and(|state| state.context.discovery_complete)
+        {
+            complete = false;
+            incomplete_reason.get_or_insert_with(|| {
+                format!("project context is ambiguous or incomplete for {uri}")
+            });
         }
     }
     for path in paths {
@@ -1142,6 +1227,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    content_bytes: None,
                 },
                 overlay.text.len(),
             )
@@ -1196,6 +1282,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: Some(scan.content_hash),
+                    content_bytes: None,
                 },
                 scan.bytes,
             )
@@ -1261,11 +1348,7 @@ pub(crate) fn build_snapshot(
                 } else {
                     let stamp = summary_record.stamp.take();
                     summary_record.path = Some(path.clone());
-                    summary_record.path_stamp = stamp.map(|stamp| PathStamp {
-                        bytes: stamp.bytes,
-                        modified: stamp.modified,
-                        is_dir: false,
-                    });
+                    summary_record.path_stamp = stamp.and_then(|_| path_stamp(&path));
                 }
                 sources.insert(uri.clone(), summary);
                 records.insert(uri, summary_record);
@@ -1305,31 +1388,24 @@ pub(crate) fn build_snapshot(
         }
 
         if mode == SnapshotMode::Workspace && !contexts.contains_key(&uri) {
-            let context = loader.context_for_uri(&uri);
-            if let Some(context_key) = context {
-                capture_context_baseline(
-                    &loader,
-                    &context_key,
-                    &mut baseline_paths,
-                    &mut baseline_keys,
-                    &mut baseline_content_hashes,
-                    cancel,
-                )?;
-                contexts.insert(uri.clone(), context_key.clone());
-                if !loader
-                    .contexts
-                    .get(&context_key)
-                    .is_some_and(|state| state.context.discovery_complete)
-                {
-                    complete = false;
-                    incomplete_reason.get_or_insert_with(|| {
-                        format!("project context is ambiguous or incomplete for {uri}")
-                    });
-                }
-            } else {
+            let context_key = loader.context_for_uri(&uri)?;
+            capture_context_baseline(
+                &loader,
+                &context_key,
+                &mut baseline_paths,
+                &mut baseline_keys,
+                &mut baseline_content_hashes,
+                cancel,
+            )?;
+            contexts.insert(uri.clone(), context_key.clone());
+            if !loader
+                .contexts
+                .get(&context_key)
+                .is_some_and(|state| state.context.discovery_complete)
+            {
                 complete = false;
                 incomplete_reason.get_or_insert_with(|| {
-                    format!("project context could not be resolved for {uri}")
+                    format!("project context is ambiguous or incomplete for {uri}")
                 });
             }
         }
@@ -1381,7 +1457,7 @@ pub(crate) fn build_snapshot(
                 continue;
             }
             let import_count = loader.index.imports(&uri).len();
-            let dependencies = loader.load_imports(&uri, &context_key, &mut pins);
+            let dependencies = loader.load_imports(&uri, &context_key, &mut pins)?;
             if dependencies.len() < import_count {
                 complete = false;
                 incomplete_reason.get_or_insert_with(|| {
@@ -1423,6 +1499,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    content_bytes: None,
                 },
             )
         } else {
@@ -1440,11 +1517,7 @@ pub(crate) fn build_snapshot(
                 &mut baseline_paths,
                 &mut baseline_keys,
                 path.clone(),
-                Some(PathStamp {
-                    bytes: stamp.bytes,
-                    modified: stamp.modified,
-                    is_dir: false,
-                }),
+                path_stamp(&path),
             );
             add_baseline_content_hash(&path, &mut baseline_content_hashes, cancel, true)?;
             (
@@ -1458,6 +1531,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    content_bytes: None,
                 },
             )
         };
@@ -1511,7 +1585,12 @@ pub(crate) fn build_snapshot(
             let content_hash = baseline_content_hashes
                 .get(&path_key(&baseline.path))
                 .copied();
-            path_record_at(baseline.path, baseline.stamp, content_hash)
+            path_record_at(
+                baseline.path.clone(),
+                baseline.stamp,
+                content_hash,
+                baseline_contents.get(&path_key(&baseline.path)).cloned(),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -1559,31 +1638,6 @@ fn enumerate_sources(
         complete: true,
         ..Enumeration::default()
     };
-    for root in &workspace.roots {
-        let config_path = root.excludes.config_root.join(".lint4d.toml");
-        add_baseline_path(
-            &mut result.baseline_paths,
-            &mut result.baseline_keys,
-            config_path.clone(),
-        );
-        if let Err(error) = add_baseline_content_hash(
-            &config_path,
-            &mut result.baseline_content_hashes,
-            cancel,
-            config_path.is_file(),
-        ) {
-            if error == CANCELLATION_MESSAGE {
-                return Err(error);
-            }
-            result.complete = false;
-            result.reason.get_or_insert_with(|| {
-                format!(
-                    "could not fingerprint configuration {}: {error}",
-                    config_path.display()
-                )
-            });
-        }
-    }
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut path_keys = HashSet::new();
     if mode == SnapshotMode::Local {
@@ -1667,7 +1721,11 @@ fn enumerate_sources(
                     add_baseline_path(&mut result.baseline_paths, &mut result.baseline_keys, path);
                     continue;
                 }
-                if file_type.is_file() && root.accepts(&path) && is_project_metadata_path(&path) {
+                if file_type.is_file()
+                    && root.accepts(&path)
+                    && is_project_metadata_path(&path)
+                    && !is_configuration_file(&path)
+                {
                     add_baseline_path(
                         &mut result.baseline_paths,
                         &mut result.baseline_keys,
@@ -1842,6 +1900,78 @@ fn add_baseline_content_hash(
     Ok(())
 }
 
+fn add_baseline_content_bytes(
+    path: &Path,
+    contents: &mut HashMap<String, Vec<u8>>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let key = path_key(path);
+    if contents.contains_key(&key) {
+        return Ok(());
+    }
+    let bytes = read_exact_file_bytes(path, cancel)?;
+    contents.insert(key, bytes);
+    Ok(())
+}
+
+fn read_exact_file_bytes(path: &Path, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_RENAME_CONFIG_BYTES as u64 {
+        return Err(format!(
+            "{} exceeds the configuration byte limit {MAX_RENAME_CONFIG_BYTES}",
+            path.display()
+        ));
+    }
+    let file = open_revalidation_file(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened {}: {error}", path.display()))?;
+    if !opened_metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RENAME_CONFIG_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > MAX_RENAME_CONFIG_BYTES {
+        return Err(format!(
+            "{} exceeds the configuration byte limit {MAX_RENAME_CONFIG_BYTES}",
+            path.display()
+        ));
+    }
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn open_revalidation_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Protect the metadata-then-open race: a regular configuration file can
+    // be replaced by a FIFO between the two operations. O_NONBLOCK makes that
+    // replacement fail or return WouldBlock instead of stalling analysis.
+    const O_NONBLOCK: i32 = 0o4000;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_revalidation_file(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
 fn capture_context_baseline(
     workspace: &Workspace,
     context_key: &super::ContextKey,
@@ -1855,6 +1985,13 @@ fn capture_context_baseline(
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
+            if is_configuration_file(path) {
+                // Configuration paths are watched for discovery, but naming
+                // requests add only the effective resolver read-set. Reading
+                // every watched sidecar here would make shadowed or unused
+                // configurations part of workspace snapshot completeness.
+                continue;
+            }
             add_baseline_path_with_stamp(
                 baseline_paths,
                 baseline_keys,
@@ -1864,6 +2001,37 @@ fn capture_context_baseline(
             if stamp.as_ref().is_some_and(|stamp| !stamp.is_dir) {
                 add_baseline_content_hash(path, baseline_content_hashes, cancel, true)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn capture_consumed_configuration_baseline(
+    records: &[SourceRecord],
+    baseline_paths: &mut Vec<BaselinePath>,
+    baseline_keys: &mut HashSet<String>,
+    baseline_contents: &mut HashMap<String, Vec<u8>>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    for record in records {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Some(path) = record.path.as_ref() else {
+            continue;
+        };
+        if !is_configuration_file(path) {
+            continue;
+        }
+        let stamp = path_stamp_result(path).map_err(|error| {
+            format!(
+                "could not inspect configuration candidate {}: {error}",
+                path.display()
+            )
+        })?;
+        add_baseline_path_with_stamp(baseline_paths, baseline_keys, path.clone(), stamp);
+        if record.content_bytes.is_some() {
+            add_baseline_content_bytes(path, baseline_contents, cancel)?;
         }
     }
     Ok(())
@@ -2126,11 +2294,9 @@ impl IncludeAuditor<'_> {
             self.contexts.insert(uri.clone(), context_key.clone());
             Some(context_key)
         } else {
-            let context_key = self.loader.context_for_uri(uri);
-            if let Some(context_key) = &context_key {
-                self.contexts.insert(uri.clone(), context_key.clone());
-            }
-            context_key
+            let context_key = self.loader.context_for_uri(uri)?;
+            self.contexts.insert(uri.clone(), context_key.clone());
+            Some(context_key)
         };
 
         let Some(context_key) = context_key else {
@@ -2502,9 +2668,7 @@ fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> Inclu
     for directory in directories {
         observations.push(IncludeObservation {
             path: directory.clone(),
-            stamp: fs::metadata(directory)
-                .ok()
-                .map(|metadata| path_stamp_from_metadata(&metadata)),
+            stamp: path_stamp(directory),
         });
         let candidate = absolute_path(directory.join(&raw));
         if observations
@@ -2514,7 +2678,7 @@ fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> Inclu
             continue;
         }
         let metadata = fs::metadata(&candidate);
-        let stamp = metadata.as_ref().ok().map(path_stamp_from_metadata);
+        let stamp = path_stamp(&candidate);
         observations.push(IncludeObservation {
             path: candidate.clone(),
             stamp,
@@ -2536,7 +2700,7 @@ fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> Inclu
                     let actual_metadata = fs::metadata(&actual);
                     observations.push(IncludeObservation {
                         path: actual.clone(),
-                        stamp: actual_metadata.as_ref().ok().map(path_stamp_from_metadata),
+                        stamp: path_stamp(&actual),
                     });
                     match actual_metadata {
                         Ok(metadata) if metadata.is_file() => {
@@ -2588,9 +2752,7 @@ fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeL
     let mut observations = Vec::new();
     observations.push(IncludeObservation {
         path: current.clone(),
-        stamp: fs::metadata(&current)
-            .ok()
-            .map(|metadata| path_stamp_from_metadata(&metadata)),
+        stamp: path_stamp(&current),
     });
     for component in relative.components() {
         match component {
@@ -2647,7 +2809,7 @@ fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeL
                     };
                 };
                 let stamp = match next.metadata() {
-                    Ok(metadata) => Some(path_stamp_from_metadata(&metadata)),
+                    Ok(_) => path_stamp(&next),
                     Err(error) => {
                         observations.push(IncludeObservation {
                             path: next.clone(),
@@ -2675,14 +2837,6 @@ fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeL
         observations,
         selected: Some(current),
         error: None,
-    }
-}
-
-fn path_stamp_from_metadata(metadata: &fs::Metadata) -> PathStamp {
-    PathStamp {
-        bytes: metadata.len(),
-        modified: metadata.modified().ok(),
-        is_dir: metadata.is_dir(),
     }
 }
 
@@ -2850,7 +3004,19 @@ fn read_include(
     if cancel.is_some_and(is_cancelled) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut file = open_revalidation_file(path).map_err(|error| error.to_string())?;
+    let opened_metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !opened_metadata.is_file() {
+        return Err("path is not a regular file".to_string());
+    }
+    if opened_metadata.len() > max_file_bytes as u64 {
+        return Err(format!(
+            "file exceeds the configured per-file limit {max_file_bytes}"
+        ));
+    }
+    if max_total_bytes.is_some_and(|limit| opened_metadata.len() > limit as u64) {
+        return Err(INCLUDE_BYTE_BUDGET_ERROR.to_string());
+    }
     let mut bytes = Vec::with_capacity(metadata.len().min(max_file_bytes as u64) as usize);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -3195,11 +3361,18 @@ fn skip_string(bytes: &[u8], index: &mut usize) {
 mod tests {
     use super::{
         Directive, DirectiveKind, Workspace, WorkspaceOptions, contains_any_identifier,
-        directive_kind, read_include, rename_from_input, resolve_include_path, revalidate_input,
+        directive_kind, file_content_hash, read_exact_file_bytes, read_include, rename_from_input,
+        resolve_include_path, revalidate_input,
     };
     use lsp_types::{Position, Url};
     use std::fs::{self, File, FileTimes};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    use std::process::Command;
     use std::sync::atomic::AtomicBool;
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
 
     #[test]
     fn contains_any_identifier_uses_identifier_boundaries() {
@@ -3292,6 +3465,149 @@ mod tests {
                 || error.to_ascii_lowercase().contains("metadata"),
             "unexpected include revalidation error: {error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_revalidates_unchanged_symlinked_include_file_and_directory() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let project = root.join("App.dproj");
+        let real_file = root.join("real.inc");
+        let linked_file = root.join("linked.inc");
+        let real_directory = root.join("real-includes");
+        let linked_directory = root.join("include");
+        let searched_include = real_directory.join("Shared.inc");
+        let source = "unit Main;\ninterface\nconst\n  BadConst = 1;\nimplementation\n{$I linked.inc}\n{$I Shared.inc}\nend.\n";
+        fs::create_dir_all(&real_directory).expect("include directory");
+        fs::write(&real_file, b"{$DEFINE FILE}\n").expect("real include file");
+        fs::write(&searched_include, b"{$DEFINE SEARCHED}\n").expect("searched include file");
+        symlink("real.inc", &linked_file).expect("symlinked include file");
+        symlink("real-includes", &linked_directory).expect("symlinked include directory");
+        fs::write(&main, source).expect("main source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>include</DCC_IncludePath></PropertyGroup></Project>",
+        )
+        .expect("project");
+
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = rename_from_input(
+            input.clone(),
+            &main_uri,
+            Position::new(3, 2),
+            "GOOD_CONST",
+            false,
+            &cancel,
+        );
+        assert!(
+            computed.value.is_ok(),
+            "rename must succeed with readable symlinked includes: {:?}",
+            computed.value
+        );
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| { record.path.as_deref() == Some(linked_file.as_path()) }),
+            "the symlinked include file must be in the revalidation read-set"
+        );
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| { record.path.as_deref() == Some(linked_directory.as_path()) }),
+            "the symlinked include-search directory must be in the revalidation read-set"
+        );
+        assert!(
+            revalidate_input(&input, &computed.records, &cancel).is_ok(),
+            "unchanged readable symlinked includes must revalidate"
+        );
+
+        let changed_file = root.join("changed.inc");
+        fs::write(
+            &changed_file,
+            b"{$DEFINE RETARGETED}\n{$DEFINE DIFFERENT}\n",
+        )
+        .expect("retarget include file");
+        fs::remove_file(&linked_file).expect("remove old include link");
+        symlink("changed.inc", &linked_file).expect("retarget include link");
+        let error = revalidate_input(&input, &computed.records, &cancel)
+            .expect_err("retargeted symlink content must invalidate the rename");
+        assert!(
+            error.contains("changed") || error.contains("metadata"),
+            "unexpected symlink retarget error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configuration_revalidation_readers_do_not_block_on_fifo_replacement() {
+        let target = std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_TARGET");
+        if let Some(target) = target {
+            let target = std::path::PathBuf::from(target);
+            let cancel = AtomicBool::new(false);
+            for _ in 0..100_000 {
+                let _ = read_exact_file_bytes(&target, &cancel);
+                let _ = file_content_hash(&target, &cancel);
+                let _ = super::read_scan_source(&target, &cancel);
+                let _ = read_include(&target, 16 * 1024 * 1024, None, None);
+            }
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join(".lint4d.toml");
+        let held = temp.path().join("held-config");
+        let fifo = temp.path().join("config-fifo");
+        fs::write(&target, b"[rules]\n").expect("initial configuration");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo command");
+        assert!(status.success(), "mkfifo failed");
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "workspace::rename::tests::configuration_revalidation_readers_do_not_block_on_fifo_replacement",
+                "--nocapture",
+            ])
+            .env("LINT4D_EXACT_CONFIG_FIFO_TARGET", &target)
+            .spawn()
+            .expect("spawn FIFO reader child");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let replacer_stop = stop.clone();
+        let replacer = std::thread::spawn(move || {
+            while !replacer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = fs::rename(&target, &held);
+                let _ = fs::rename(&fifo, &target);
+                let _ = fs::rename(&target, &fifo);
+                let _ = fs::rename(&held, &target);
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll FIFO reader child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                replacer.join().expect("join FIFO replacer");
+                panic!("configuration revalidation reader blocked on a replaced FIFO");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        replacer.join().expect("join FIFO replacer");
+        assert!(status.success(), "FIFO reader child exited with {status}");
     }
 
     #[test]

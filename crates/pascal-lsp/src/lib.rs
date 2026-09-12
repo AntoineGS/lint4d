@@ -1,5 +1,6 @@
 //! Native Linux language-server building blocks for Delphi/Object Pascal.
 
+pub(crate) mod configuration;
 pub mod navigation;
 pub mod project;
 pub mod server;

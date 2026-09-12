@@ -1,6 +1,8 @@
 -- Neovim 0.11+. Install pascal-lsp on PATH, or set PASCAL_LSP_BIN to its full path.
 -- Load this file from init.lua using dofile('/path/to/examples/neovim.lua').
 vim.filetype.add({ extension = { pas = 'pascal', dpr = 'pascal', dpk = 'pascal' } })
+local example_file = assert(debug.getinfo(1, 'S').source:match('^@(.+)$'))
+local pascal_project = dofile(vim.fn.fnamemodify(example_file, ':h') .. '/pascal_project.lua')
 
 vim.lsp.config('pascal_lsp', {
   cmd = { vim.env.PASCAL_LSP_BIN or 'pascal-lsp', '--stdio' },
@@ -17,17 +19,13 @@ vim.lsp.config('pascal_lsp', {
     sourcePaths = {},
     exclude = {},
   },
-  on_attach = function(_, buffer)
-    vim.keymap.set('n', 'gd', vim.lsp.buf.definition,
-      { buffer = buffer, desc = 'Pascal: go to definition/body' })
-    vim.keymap.set('n', 'gD', vim.lsp.buf.declaration,
-      { buffer = buffer, desc = 'Pascal: go to declaration' })
-    vim.keymap.set('n', 'gi', vim.lsp.buf.implementation,
-      { buffer = buffer, desc = 'Pascal: go to implementation' })
-    vim.keymap.set('n', 'grn', vim.lsp.buf.rename,
-      { buffer = buffer, desc = 'Pascal: rename symbol' })
-    vim.keymap.set({ 'n', 'x' }, 'gra', vim.lsp.buf.code_action,
-      { buffer = buffer, desc = 'Pascal: code actions' })
+  on_attach = function(client, buffer)
+    vim.keymap.set('n', 'gd', vim.lsp.buf.definition, { buffer = buffer, desc = 'Pascal: go to definition/body' })
+    vim.keymap.set('n', 'gD', vim.lsp.buf.declaration, { buffer = buffer, desc = 'Pascal: go to declaration' })
+    vim.keymap.set('n', 'gi', vim.lsp.buf.implementation, { buffer = buffer, desc = 'Pascal: go to implementation' })
+    vim.keymap.set('n', 'grn', vim.lsp.buf.rename, { buffer = buffer, desc = 'Pascal: rename symbol' })
+    vim.keymap.set({ 'n', 'x' }, 'gra', vim.lsp.buf.code_action, { buffer = buffer, desc = 'Pascal: code actions' })
+    pascal_project.attach(client, buffer)
   end,
 })
 

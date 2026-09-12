@@ -1,11 +1,13 @@
 //! Naming quick-fix planning for the workspace snapshot.
 
-use super::canonical_file_uri;
 use super::rename::{
-    CANCELLATION_MESSAGE, Computed, RenameSnapshot, SnapshotMode, SnapshotSeed, WorkspaceInput,
-    build_snapshot, check_includes, identifier_at_position, input_source_is_editable, is_cancelled,
-    snapshot_records, source_for_input, workspace_edit,
+    CANCELLATION_MESSAGE, Computed, RenameSnapshot, SnapshotMode, SnapshotSeed, SourceRecord,
+    WorkspaceInput, build_snapshot, check_includes, identifier_at_position,
+    input_source_is_editable, is_cancelled, snapshot_records, source_for_input, workspace_edit,
 };
+use super::{absolute_path, canonical_file_uri, is_lint_excluded, path_stamp};
+use crate::configuration::{config_directories, resolve_lint};
+use crate::project::{has_invalid_project_selection, project_candidates};
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
 use lint4d::engine::suppress::parse_suppressions;
@@ -21,9 +23,7 @@ use pascal_core::{FileInfo, parser};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
-use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
@@ -132,11 +132,32 @@ pub(crate) fn code_actions_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    let candidates = match naming_candidates(&uri, &source, params.range, &params.context) {
+    let (config, config_fingerprint, excluded, configuration_records) =
+        match lint_configuration_for_input(&input, &uri) {
+            Ok(config) => config,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if excluded {
+        let mut records = vec![target_record];
+        append_records(&mut records, configuration_records);
+        return Computed {
+            source_generation,
+            configuration_generation,
+            value: Ok(Vec::new()),
+            records,
+        };
+    }
+    let candidates = match naming_candidates(
+        &uri,
+        &source,
+        params.range,
+        &params.context,
+        &config,
+        config_fingerprint,
+    ) {
         Ok(candidates) => candidates,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-
     if features.resolve {
         let actions = candidates
             .iter()
@@ -164,7 +185,11 @@ pub(crate) fn code_actions_from_input(
             source_generation,
             configuration_generation,
             value: Ok(actions),
-            records: vec![target_record],
+            records: {
+                let mut records = vec![target_record];
+                append_records(&mut records, configuration_records);
+                records
+            },
         };
     }
 
@@ -189,7 +214,7 @@ pub(crate) fn code_actions_from_input(
         std::slice::from_ref(&uri),
         &candidate_names,
         mode,
-        Some(SnapshotSeed::new(target_record)),
+        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&configuration_records)),
         &[],
         cancel,
     ) {
@@ -211,7 +236,6 @@ pub(crate) fn code_actions_from_input(
         );
     }
     let mut actions = Vec::new();
-    let records = snapshot_records(&snapshot);
     for candidate in candidates {
         if is_cancelled(cancel) {
             return cancelled(source_generation, configuration_generation);
@@ -258,6 +282,8 @@ pub(crate) fn code_actions_from_input(
         }
         actions.push(CodeActionOrCommand::CodeAction(action));
     }
+    let mut records = snapshot_records(&snapshot);
+    append_records(&mut records, configuration_records);
     Computed {
         source_generation,
         configuration_generation,
@@ -308,12 +334,31 @@ pub(crate) fn resolve_from_input(
     } else {
         SnapshotMode::Workspace
     };
+    let (config, current_fingerprint, excluded, configuration_records) =
+        match lint_configuration_for_input(&input, &target_uri) {
+            Ok(config) => config,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if excluded {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source is excluded by lint configuration".to_string(),
+        );
+    }
+    if current_fingerprint != data.config_fingerprint {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action configuration is stale; request code actions again".to_string(),
+        );
+    }
     let snapshot = match build_snapshot(
         &input,
         std::slice::from_ref(&target_uri),
         &candidate_names,
         mode,
-        Some(SnapshotSeed::new(target_record)),
+        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&configuration_records)),
         &[],
         cancel,
     ) {
@@ -340,23 +385,19 @@ pub(crate) fn resolve_from_input(
             ),
         );
     }
-    let fingerprint = match config_fingerprint(&target_uri) {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => return failed(source_generation, configuration_generation, error),
-    };
-    if fingerprint != data.config_fingerprint {
-        return failed(
-            source_generation,
-            configuration_generation,
-            "code action configuration is stale; request code actions again".to_string(),
-        );
-    }
     let context = CodeActionContext {
         diagnostics: action.diagnostics.clone().unwrap_or_default(),
         only: Some(vec![CodeActionKind::QUICKFIX]),
         trigger_kind: None,
     };
-    let candidates = match naming_candidates(&target_uri, source, data.anchor, &context) {
+    let candidates = match naming_candidates(
+        &target_uri,
+        source,
+        data.anchor,
+        &context,
+        &config,
+        current_fingerprint,
+    ) {
         Ok(candidates) => candidates,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -406,7 +447,11 @@ pub(crate) fn resolve_from_input(
             source_generation,
             configuration_generation,
             value: Ok(disabled_action),
-            records: snapshot_records(&snapshot),
+            records: {
+                let mut records = snapshot_records(&snapshot);
+                append_records(&mut records, configuration_records);
+                records
+            },
         };
     }
 
@@ -419,7 +464,11 @@ pub(crate) fn resolve_from_input(
                 source_generation,
                 configuration_generation,
                 value: Ok(resolved),
-                records: snapshot_records(&snapshot),
+                records: {
+                    let mut records = snapshot_records(&snapshot);
+                    append_records(&mut records, configuration_records);
+                    records
+                },
             }
         }
         Err(error) if features.disabled => {
@@ -429,7 +478,11 @@ pub(crate) fn resolve_from_input(
                 source_generation,
                 configuration_generation,
                 value: Ok(disabled_action),
-                records: snapshot_records(&snapshot),
+                records: {
+                    let mut records = snapshot_records(&snapshot);
+                    append_records(&mut records, configuration_records);
+                    records
+                },
             }
         }
         Err(error) => failed(source_generation, configuration_generation, error),
@@ -453,6 +506,31 @@ fn cancelled<T>(source_generation: u64, configuration_generation: u64) -> Comput
     )
 }
 
+fn append_records(records: &mut Vec<SourceRecord>, additional: Vec<SourceRecord>) {
+    for record in additional {
+        let duplicate = record.path.as_ref().is_some_and(|_| {
+            records
+                .iter()
+                .any(|existing| same_record_observation(existing, &record))
+        });
+        if !duplicate {
+            records.push(record);
+        }
+    }
+}
+
+fn same_record_observation(left: &SourceRecord, right: &SourceRecord) -> bool {
+    left.uri == right.uri
+        && left.text == right.text
+        && left.version == right.version
+        && left.stamp == right.stamp
+        && left.open == right.open
+        && left.path == right.path
+        && left.path_stamp == right.path_stamp
+        && left.content_hash == right.content_hash
+        && left.content_bytes == right.content_bytes
+}
+
 fn set_disabled_or_skip(action: &mut CodeAction, supported: bool, reason: String) -> bool {
     if !supported {
         return false;
@@ -460,6 +538,30 @@ fn set_disabled_or_skip(action: &mut CodeAction, supported: bool, reason: String
     action.disabled = Some(CodeActionDisabled { reason });
     true
 }
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_LINT_CONFIGURATION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_lint_configuration_hook(hook: impl FnOnce() + 'static) {
+    AFTER_LINT_CONFIGURATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_after_lint_configuration_hook() {
+    let hook = AFTER_LINT_CONFIGURATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_after_lint_configuration_hook() {}
 
 fn requests_quickfix(context: &CodeActionContext) -> bool {
     context
@@ -512,13 +614,13 @@ fn naming_candidates(
     source: &str,
     requested_range: Range,
     context: &CodeActionContext,
+    config: &Config,
+    config_fingerprint: u64,
 ) -> Result<Vec<NamingCandidate>, String> {
     let path = uri
         .to_file_path()
+        .map(absolute_path)
         .map_err(|_| format!("not a file URI: {uri}"))?;
-    let (config, _) = Config::discover(path.parent().unwrap_or_else(|| Path::new(".")))
-        .map_err(|error| format!("could not discover lint configuration: {error}"))?;
-    let config_fingerprint = config_fingerprint(uri)?;
     let (tree, _) = parser::parse_file(&FileInfo::new(path), source.as_bytes())
         .map_err(|error| format!("could not parse code-action source: {error}"))?;
     let suppressions = parse_suppressions(source.as_bytes());
@@ -531,7 +633,7 @@ fn naming_candidates(
         context,
     };
     let mut candidates = Vec::new();
-    if !rule_is_off(&config, CONSTANT_RULE) {
+    if !rule_is_off(config, CONSTANT_RULE) {
         collect_constants(
             tree.root_node(),
             config.constant_style(),
@@ -539,7 +641,7 @@ fn naming_candidates(
             &mut candidates,
         );
     }
-    if !rule_is_off(&config, LOCAL_RULE) {
+    if !rule_is_off(config, LOCAL_RULE) {
         collect_locals(
             tree.root_node(),
             config.local_variable_style(),
@@ -555,6 +657,65 @@ fn naming_candidates(
     });
     candidates.dedup_by(|left, right| left.rule == right.rule && left.anchor == right.anchor);
     Ok(candidates)
+}
+
+fn lint_configuration_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+) -> Result<(Config, u64, bool, Vec<SourceRecord>), String> {
+    let path = uri
+        .to_file_path()
+        .map(absolute_path)
+        .map_err(|_| format!("not a file URI: {uri}"))?;
+    let mut workspace = super::Workspace::new(input.roots.clone(), input.options.clone());
+    workspace.project_selections = input.project_selections.clone();
+    workspace.document_owners = input.document_owners.clone();
+    let context_key = workspace.context_for_uri(uri)?;
+    let context = workspace
+        .contexts
+        .get(&context_key)
+        .map(|state| state.context.clone())
+        .ok_or_else(|| format!("project context was not retained for {uri}"))?;
+    if has_invalid_project_selection(&context) {
+        return Err(
+            "project selection is invalid; select a current project or Automatic".to_string(),
+        );
+    }
+    let candidates = project_candidates(&path, &input.roots)?;
+    let project_directory =
+        workspace.configuration_project_directory(&path, &context, Some(&context_key), &candidates);
+    let directories = config_directories(&path, project_directory.as_deref(), &input.roots)?;
+    let resolved = resolve_lint(&directories, 4 * 1024 * 1024)?;
+    run_after_lint_configuration_hook();
+    let mut hasher = DefaultHasher::new();
+    resolved.path.hash(&mut hasher);
+    resolved.checked_paths.hash(&mut hasher);
+    resolved.checked_contents.hash(&mut hasher);
+    resolved.bytes.hash(&mut hasher);
+    if resolved.bytes.is_none() {
+        format!("{:?}", resolved.value).hash(&mut hasher);
+    }
+    let fingerprint = hasher.finish();
+    let excluded = is_lint_excluded(&path, resolved.path.as_deref(), &resolved.value.exclude);
+    let records = resolved
+        .checked_paths
+        .iter()
+        .zip(resolved.checked_contents.iter())
+        .filter_map(|(path, content_bytes)| {
+            Some(SourceRecord {
+                uri: Url::from_file_path(path).ok()?,
+                text: String::new(),
+                version: None,
+                stamp: None,
+                open: false,
+                path: Some(path.clone()),
+                path_stamp: content_bytes.as_ref().and_then(|_| path_stamp(path)),
+                content_hash: None,
+                content_bytes: content_bytes.clone(),
+            })
+        })
+        .collect();
+    Ok((resolved.value, fingerprint, excluded, records))
 }
 
 fn rule_is_off(config: &Config, rule: &str) -> bool {
@@ -831,22 +992,405 @@ fn validate_action_data(
     Ok(())
 }
 
-fn config_fingerprint(uri: &Url) -> Result<u64, String> {
-    let path = uri
-        .to_file_path()
-        .map_err(|_| format!("not a file URI: {uri}"))?;
-    let (config, root) = Config::discover(path.parent().unwrap_or_else(|| Path::new(".")))
-        .map_err(|error| format!("could not discover lint configuration: {error}"))?;
-    let config_path = root.join(".lint4d.toml");
-    let mut hasher = DefaultHasher::new();
-    config_path.to_string_lossy().hash(&mut hasher);
-    if let Ok(bytes) = fs::read(&config_path) {
-        bytes.hash(&mut hasher);
-    } else {
-        config.constant_style().hash(&mut hasher);
-        config.local_variable_style().hash(&mut hasher);
-        format!("{:?}", config.rule_severity(CONSTANT_RULE)).hash(&mut hasher);
-        format!("{:?}", config.rule_severity(LOCAL_RULE)).hash(&mut hasher);
+#[cfg(test)]
+mod tests {
+    use super::{
+        ClientActionFeatures, code_actions_from_input, lint_configuration_for_input,
+        resolve_from_input, set_after_lint_configuration_hook,
+    };
+    use crate::workspace::Workspace;
+    use crate::workspace::rename::revalidate_input;
+    use lsp_types::CodeActionOrCommand;
+    use lsp_types::Url;
+    use serde_json::json;
+    use std::fs::{self, File, FileTimes};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn local_code_actions_ignore_unused_shadowed_and_formatter_configurations() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let app = root.join("app");
+        let source_path = app.join("Main.pas");
+        let source = "unit Main;\ninterface\nimplementation\nprocedure Use;\nvar\n  BadVariable: Integer;\nbegin\n  BadVariable := 1;\nend;\nend.\n";
+        fs::create_dir_all(&app).expect("project directory");
+        fs::write(&source_path, source).expect("source");
+        fs::write(
+            app.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("project");
+        fs::write(app.join("App.dpr"), "program App; begin end.\n").expect("program");
+        fs::write(
+            app.join(".lint4d.toml"),
+            "[rules]\nlocal-variable-naming = \"warning\"\n[rules.naming]\nlocal_variable_style = \"camelCase\"\n",
+        )
+        .expect("selected lint configuration");
+        fs::write(root.join(".lint4d.toml"), vec![b'x'; 4 * 1024 * 1024 + 1])
+            .expect("shadowed lint configuration");
+        fs::write(root.join(".fmt4d.toml"), vec![b'x'; 4 * 1024 * 1024 + 1])
+            .expect("unused formatter configuration");
+
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let input = Workspace::new(vec![root.clone()], Default::default()).analysis_input();
+        let start = lsp_types::Position::new(5, 2);
+        let end = lsp_types::Position::new(5, 13);
+        let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": {"start": start, "end": end},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }))
+        .expect("code action parameters");
+        let cancel = AtomicBool::new(false);
+        let features = ClientActionFeatures {
+            resolve: false,
+            document_changes: false,
+            disabled: false,
+        };
+        let computed = code_actions_from_input(input.clone(), params, features.clone(), &cancel);
+        let actions = computed
+            .value
+            .as_ref()
+            .expect("unused configuration must not fail an eager local fix");
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected a code action");
+        };
+        assert_eq!(action.title, "Rename 'BadVariable' to 'badVariable'");
+        assert!(action.edit.is_some());
+        assert!(
+            computed.records.iter().all(|record| {
+                record.path.as_deref() != Some(root.join(".lint4d.toml").as_path())
+                    && record.path.as_deref() != Some(root.join(".fmt4d.toml").as_path())
+            }),
+            "unused configuration files must not enter the local action identity"
+        );
+
+        let resolve_params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": {"start": start, "end": end},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }))
+        .expect("resolve code action parameters");
+        let resolve_action = code_actions_from_input(
+            input.clone(),
+            resolve_params,
+            ClientActionFeatures {
+                resolve: true,
+                document_changes: false,
+                disabled: false,
+            },
+            &cancel,
+        )
+        .value
+        .expect("resolved action listing")[0]
+            .clone();
+        let CodeActionOrCommand::CodeAction(resolve_action) = resolve_action else {
+            panic!("expected an unresolved code action");
+        };
+        let resolved = resolve_from_input(
+            input,
+            resolve_action,
+            ClientActionFeatures {
+                resolve: true,
+                document_changes: false,
+                disabled: false,
+            },
+            &cancel,
+        );
+        assert!(
+            resolved.value.is_ok(),
+            "unused configurations blocked resolve: {:?}",
+            resolved.value
+        );
     }
-    Ok(hasher.finish())
+
+    #[test]
+    fn workspace_constant_code_actions_ignore_unused_shadowed_and_formatter_configurations() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let app = root.join("app");
+        let source_path = app.join("Main.pas");
+        let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+        let project_path = app.join("App.dproj");
+        let root_lint_path = root.join(".lint4d.toml");
+        let root_fmt_path = root.join(".fmt4d.toml");
+        fs::create_dir_all(&app).expect("project directory");
+        fs::write(&source_path, source).expect("source");
+        fs::write(
+            &project_path,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("project");
+        fs::write(
+            app.join(".lint4d.toml"),
+            "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+        )
+        .expect("selected lint configuration");
+        fs::write(&root_lint_path, vec![b'x'; 4 * 1024 * 1024 + 1])
+            .expect("shadowed lint configuration");
+        fs::write(&root_fmt_path, vec![b'x'; 4 * 1024 * 1024 + 1])
+            .expect("unused formatter configuration");
+
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let input = Workspace::new(vec![root], Default::default()).analysis_input();
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(3, 2),
+            lsp_types::Position::new(3, 10),
+        );
+        let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": range,
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }))
+        .expect("code action parameters");
+        let cancel = AtomicBool::new(false);
+        let eager = code_actions_from_input(
+            input.clone(),
+            params,
+            ClientActionFeatures {
+                resolve: false,
+                document_changes: false,
+                disabled: false,
+            },
+            &cancel,
+        );
+        let eager_actions = eager
+            .value
+            .as_ref()
+            .expect("unused configurations must not block an eager workspace constant fix");
+        assert_eq!(eager_actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(eager_action) = &eager_actions[0] else {
+            panic!("expected an eager code action");
+        };
+        assert_eq!(eager_action.title, "Rename 'badConst' to 'BAD_CONST'");
+        assert!(eager_action.edit.is_some());
+        assert!(eager.records.iter().all(|record| {
+            record.path.as_deref() != Some(root_lint_path.as_path())
+                && record.path.as_deref() != Some(root_fmt_path.as_path())
+        }));
+
+        let resolve_params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": range,
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }))
+        .expect("resolve code action parameters");
+        let unresolved = code_actions_from_input(
+            input.clone(),
+            resolve_params,
+            ClientActionFeatures {
+                resolve: true,
+                document_changes: false,
+                disabled: false,
+            },
+            &cancel,
+        )
+        .value
+        .expect("unused configurations must not block resolved action listing");
+        let CodeActionOrCommand::CodeAction(unresolved) = unresolved[0].clone() else {
+            panic!("expected an unresolved code action");
+        };
+        let resolved = resolve_from_input(
+            input,
+            unresolved,
+            ClientActionFeatures {
+                resolve: true,
+                document_changes: false,
+                disabled: false,
+            },
+            &cancel,
+        );
+        let resolved_action = resolved
+            .value
+            .as_ref()
+            .expect("unused configurations must not block a resolved workspace constant fix");
+        assert!(resolved_action.edit.is_some());
+        assert!(resolved.records.iter().all(|record| {
+            record.path.as_deref() != Some(root_lint_path.as_path())
+                && record.path.as_deref() != Some(root_fmt_path.as_path())
+        }));
+    }
+
+    #[test]
+    fn eager_code_action_revalidation_rejects_changed_configuration() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Main.pas");
+        let config_path = root.join(".lint4d.toml");
+        let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&source_path, source).expect("source");
+        fs::write(
+            &config_path,
+            "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+        )
+        .expect("configuration");
+
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let workspace = Workspace::new(vec![root], Default::default());
+        let input = workspace.analysis_input();
+        let validation_input = input.clone();
+        let original_bytes = fs::read(&config_path).expect("original configuration bytes");
+        let params = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": {"line": 3, "character": 2},
+                "end": {"line": 3, "character": 10}
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }))
+        .expect("code action parameters");
+        let cancel = AtomicBool::new(false);
+        let original_metadata =
+            fs::metadata(&config_path).expect("original configuration metadata");
+        let original_mtime = original_metadata
+            .modified()
+            .expect("original configuration mtime");
+        let changed_configuration = "[rules.naming]\nconstant_style = \"PascalCase\"\n".to_string();
+        assert_eq!(
+            changed_configuration.len(),
+            original_metadata.len() as usize,
+            "the mutation must keep the same byte length"
+        );
+        let config_for_hook = config_path.clone();
+        set_after_lint_configuration_hook(move || {
+            fs::write(&config_for_hook, &changed_configuration).expect("changed configuration");
+            File::options()
+                .write(true)
+                .open(&config_for_hook)
+                .expect("open changed configuration for timestamp restore")
+                .set_times(FileTimes::new().set_modified(original_mtime))
+                .expect("restore configuration mtime");
+        });
+
+        let computed = code_actions_from_input(
+            validation_input.clone(),
+            params,
+            ClientActionFeatures {
+                resolve: false,
+                document_changes: false,
+                disabled: false,
+            },
+            &cancel,
+        );
+        let actions = computed.value.as_ref().expect("computed actions");
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected a code action");
+        };
+        assert_eq!(action.title, "Rename 'badConst' to 'BAD_CONST'");
+        assert_eq!(
+            fs::metadata(&config_path)
+                .expect("changed configuration metadata")
+                .modified()
+                .expect("changed configuration mtime"),
+            original_mtime,
+            "the mutation must restore the original mtime"
+        );
+        assert_ne!(
+            fs::read(&config_path).expect("changed configuration bytes"),
+            original_bytes,
+            "configuration bytes must differ"
+        );
+        let configuration_record_count = computed
+            .records
+            .iter()
+            .filter(|record| record.path.as_deref() == Some(config_path.as_path()))
+            .count();
+        assert!(
+            configuration_record_count >= 2,
+            "parsed and snapshot configuration observations must both be retained"
+        );
+
+        let error = revalidate_input(&validation_input, &computed.records, &cancel).expect_err(
+            "configuration mutation between parse and snapshot must invalidate the action",
+        );
+        assert!(
+            error.contains("configuration") || error.contains("stale"),
+            "unexpected stale configuration error: {error}"
+        );
+    }
+
+    #[test]
+    fn absent_configuration_observation_rejects_a_later_created_candidate() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Main.pas");
+        let config_path = root.join(".lint4d.toml");
+        let source = "unit Main;\ninterface\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&source_path, source).expect("source");
+
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let workspace = Workspace::new(vec![root], Default::default());
+        let input = workspace.analysis_input();
+        let config_for_hook = config_path.clone();
+        set_after_lint_configuration_hook(move || {
+            fs::write(
+                &config_for_hook,
+                "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+            )
+            .expect("create configuration");
+        });
+
+        let (_, _, _, records) =
+            lint_configuration_for_input(&input, &uri).expect("default configuration resolution");
+        let record = records
+            .iter()
+            .find(|record| record.path.as_deref() == Some(config_path.as_path()))
+            .expect("absent configuration candidate record");
+        assert!(record.content_bytes.is_none());
+        assert!(
+            record.path_stamp.is_none(),
+            "an absent observation must not adopt metadata from a later file creation"
+        );
+
+        let cancel = AtomicBool::new(false);
+        let error = revalidate_input(&input, &records, &cancel)
+            .expect_err("a candidate created after an absent observation must invalidate it");
+        assert!(
+            error.contains("configuration") || error.contains("changed"),
+            "unexpected absent-to-present error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_configuration_observation_rejects_a_newly_dangling_symlink() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Main.pas");
+        let config_path = root.join(".lint4d.toml");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            &source_path,
+            "unit Main;\ninterface\nimplementation\nend.\n",
+        )
+        .expect("source");
+
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let workspace = Workspace::new(vec![root], Default::default());
+        let input = workspace.analysis_input();
+        let config_for_hook = config_path.clone();
+        set_after_lint_configuration_hook(move || {
+            symlink("missing-lint-config", &config_for_hook).expect("dangling configuration link");
+        });
+
+        let (_, _, _, records) =
+            lint_configuration_for_input(&input, &uri).expect("default configuration resolution");
+        let record = records
+            .iter()
+            .find(|record| record.path.as_deref() == Some(config_path.as_path()))
+            .expect("absent configuration candidate record");
+        assert!(record.content_bytes.is_none());
+        let cancel = AtomicBool::new(false);
+        let error = revalidate_input(&input, &records, &cancel)
+            .expect_err("a dangling candidate must not validate as absent");
+        assert!(
+            error.contains("configuration") || error.contains("changed"),
+            "unexpected absent-to-dangling error: {error}"
+        );
+    }
 }

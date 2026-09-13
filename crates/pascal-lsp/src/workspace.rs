@@ -1,10 +1,12 @@
 //! Workspace state, bounded source discovery, overlays, diagnostics, and formatting.
 
+use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use crate::project::{
-    PackageMetadata, ProjectCandidates, ProjectContext, ProjectOptions, ProjectSelections,
-    discover_with_selections, has_invalid_project_selection, project_candidates,
-    read_package_metadata, runtime_project_selection, selected_project_is_current,
+    PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext, ProjectOptions,
+    ProjectSelections, discover_with_selections, has_invalid_project_selection,
+    project_candidate_membership, project_candidates, read_package_metadata,
+    runtime_project_selection, selected_project_is_current,
 };
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -14,16 +16,19 @@ use lsp_types::{
 };
 use pascal_core::{FileInfo, Severity, decode_bytes, parser};
 use serde::Deserialize;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::hash::Hasher;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
 pub(crate) mod codeactions;
 pub(crate) mod projects;
+pub(crate) mod queries;
 pub(crate) mod rename;
 
 /// Maximum syntax-tree depth used before invoking the recursive lint/format pipelines.
@@ -265,6 +270,7 @@ struct ContextKey {
 struct ContextState {
     context: ProjectContext,
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
+    project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1238,6 +1244,11 @@ impl Workspace {
         }
 
         if let Some(document) = self.open_documents.get(uri) {
+            if let Some(reason) = &document.rejection {
+                return Err(format!(
+                    "document {uri} was rejected and cannot be used for analysis: {reason}"
+                ));
+            }
             let Some(source) = document.text.clone() else {
                 return Ok(false);
             };
@@ -1402,6 +1413,14 @@ impl Workspace {
     }
 
     fn context_for_uri(&mut self, uri: &Url) -> Result<ContextKey, String> {
+        self.context_for_uri_with_cancel(uri, None)
+    }
+
+    fn context_for_uri_with_cancel(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ContextKey, String> {
         let path = uri
             .to_file_path()
             .map(absolute_path)
@@ -1415,8 +1434,8 @@ impl Workspace {
 
         let mut rediscover_open_context = false;
         if let Some(existing) = self.open_document_contexts.get(uri).cloned() {
-            self.extend_context_watch_paths(&existing, &path);
-            if self.context_is_fresh(&existing)
+            self.extend_context_watch_paths(&existing, &path, cancel)?;
+            if self.context_is_fresh_with_cancel(&existing, cancel)?
                 && self.context_matches_current_selection(&path, &existing)
             {
                 self.remember_document_owner(uri, &existing);
@@ -1428,8 +1447,8 @@ impl Workspace {
 
         if !rediscover_open_context {
             if let Some(existing) = self.document_contexts.get(uri).cloned() {
-                self.extend_context_watch_paths(&existing, &path);
-                if self.context_is_fresh(&existing)
+                self.extend_context_watch_paths(&existing, &path, cancel)?;
+                if self.context_is_fresh_with_cancel(&existing, cancel)?
                     && self.context_matches_current_selection(&path, &existing)
                 {
                     self.remember_document_owner(uri, &existing);
@@ -1455,9 +1474,13 @@ impl Workspace {
                 && self.known_owner_selection_is_current(&path, &owner)
             {
                 return self
-                    .restore_known_owner(uri, &path, &owner, &roots, &project_options)
+                    .restore_known_owner(uri, &path, &owner, &roots, &project_options, cancel)
                     .map_err(|error| {
-                        format!("could not rediscover known project owner for {uri}: {error}")
+                        if error == CANCELLATION_MESSAGE {
+                            error
+                        } else {
+                            format!("could not rediscover known project owner for {uri}: {error}")
+                        }
                     });
             }
         }
@@ -1478,7 +1501,7 @@ impl Workspace {
             self.warn(warning);
         }
         let key = self.context_key_for_path(&path, Some(&context));
-        self.install_context(key.clone(), context, &path);
+        self.install_context(key.clone(), context, &path, cancel)?;
         self.select_document_context(uri, &key, self.owner_origin_for_context_key(&key));
         Ok(key)
     }
@@ -1490,15 +1513,16 @@ impl Workspace {
         owner: &KnownDocumentOwner,
         roots: &[PathBuf],
         project_options: &ProjectOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<ContextKey, String> {
-        if context_state_is_fresh(&owner.state) {
+        if context_state_is_fresh_with_cancel(&owner.state, cancel)? {
             self.contexts.insert(owner.key.clone(), owner.state.clone());
             self.select_document_context(uri, &owner.key, owner.origin);
             return Ok(owner.key.clone());
         }
 
         let (key, context) = self.rediscover_known_owner(path, owner, roots, project_options)?;
-        self.install_context(key.clone(), context, path);
+        self.install_context(key.clone(), context, path, cancel)?;
         self.select_document_context(uri, &key, owner.origin);
         Ok(key)
     }
@@ -1793,7 +1817,13 @@ impl Workspace {
             .map(|root| root.path.clone())
     }
 
-    fn install_context(&mut self, key: ContextKey, context: ProjectContext, file: &Path) {
+    fn install_context(
+        &mut self,
+        key: ContextKey,
+        context: ProjectContext,
+        file: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), String> {
         let mut watched_paths = HashMap::new();
         let mut metadata = context.metadata_files.clone();
         if let Some(project_file) = &context.project_file {
@@ -1802,7 +1832,16 @@ impl Workspace {
         if let Some(main_source) = &context.main_source {
             metadata.push(main_source.clone());
         }
-        metadata.extend(self.discovery_directories(file));
+        let mut project_candidate_memberships = HashMap::new();
+        for directory in self.discovery_directories(file) {
+            let membership = project_candidate_membership(&directory, cancel);
+            if let Err(error) = &membership {
+                if error == CANCELLATION_MESSAGE {
+                    return Err(error.clone());
+                }
+            }
+            project_candidate_memberships.insert(directory, membership);
+        }
         let project_directory = context
             .project_file
             .as_deref()
@@ -1828,27 +1867,45 @@ impl Workspace {
         if let Some(state) = self.contexts.get_mut(&key) {
             state.context = context;
             state.watched_paths.extend(watched_paths);
+            state
+                .project_candidate_memberships
+                .extend(project_candidate_memberships);
         } else {
             self.contexts.insert(
                 key,
                 ContextState {
                     context,
                     watched_paths,
+                    project_candidate_memberships,
                 },
             );
         }
+        Ok(())
     }
 
-    fn extend_context_watch_paths(&mut self, key: &ContextKey, file: &Path) {
+    fn extend_context_watch_paths(
+        &mut self,
+        key: &ContextKey,
+        file: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), String> {
         let paths = self.discovery_directories(file);
         if let Some(state) = self.contexts.get_mut(key) {
             for path in paths {
-                state
-                    .watched_paths
-                    .entry(path.clone())
-                    .or_insert_with(|| path_stamp(&path));
+                let Entry::Vacant(entry) = state.project_candidate_memberships.entry(path.clone())
+                else {
+                    continue;
+                };
+                let membership = project_candidate_membership(&path, cancel);
+                if let Err(error) = &membership {
+                    if error == CANCELLATION_MESSAGE {
+                        return Err(error.clone());
+                    }
+                }
+                entry.insert(membership);
             }
         }
+        Ok(())
     }
 
     fn discovery_directories(&self, file: &Path) -> Vec<PathBuf> {
@@ -1876,8 +1933,14 @@ impl Workspace {
         result
     }
 
-    fn context_is_fresh(&self, key: &ContextKey) -> bool {
-        self.contexts.get(key).is_some_and(context_state_is_fresh)
+    fn context_is_fresh_with_cancel(
+        &self,
+        key: &ContextKey,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        self.contexts.get(key).map_or(Ok(false), |state| {
+            context_state_is_fresh_with_cancel(state, cancel)
+        })
     }
 
     fn context_has_invalid_project_selection(&self, key: &ContextKey) -> bool {
@@ -2893,7 +2956,7 @@ impl Workspace {
                     .map_err(|error| {
                         format!("could not rediscover known project owner for {uri}: {error}")
                     })?;
-                self.install_context(key.clone(), context, &path);
+                self.install_context(key.clone(), context, &path, None)?;
                 key
             }
         } else if let Some((scope, selected)) = current_selection.as_ref() {
@@ -3275,7 +3338,14 @@ fn project_unit_stems(context: &ProjectContext, current_path: &Path) -> HashSet<
 }
 
 fn context_state_is_fresh(state: &ContextState) -> bool {
-    state.watched_paths.iter().all(|(path, stamp)| {
+    context_state_is_fresh_with_cancel(state, None).unwrap_or(false)
+}
+
+fn context_state_is_fresh_with_cancel(
+    state: &ContextState,
+    cancel: Option<&AtomicBool>,
+) -> Result<bool, String> {
+    let watched_paths_are_fresh = state.watched_paths.iter().all(|(path, stamp)| {
         if is_configuration_file(path) {
             path_stamp_result(path)
                 .map(|actual| actual == *stamp)
@@ -3283,7 +3353,19 @@ fn context_state_is_fresh(state: &ContextState) -> bool {
         } else {
             path_stamp(path) == *stamp
         }
-    })
+    });
+    if !watched_paths_are_fresh {
+        return Ok(false);
+    }
+
+    for (directory, expected) in &state.project_candidate_memberships {
+        match (expected, project_candidate_membership(directory, cancel)) {
+            (Ok(expected), Ok(actual)) if actual == *expected => {}
+            (_, Err(error)) if error == CANCELLATION_MESSAGE => return Err(error),
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> LspDiagnostic {
@@ -3760,7 +3842,10 @@ pub(crate) fn is_configuration_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticLineIndex, ResourceLimits, normalize_line_endings, scan_external_units};
+    use super::{
+        ContextState, DiagnosticLineIndex, ResourceLimits, Workspace, WorkspaceOptions,
+        context_state_is_fresh, normalize_line_endings, scan_external_units,
+    };
     use crate::project::ProjectContext;
     use lsp_types::Url;
     use std::fs;
@@ -3799,6 +3884,125 @@ mod tests {
         let uri = Url::parse("file:///tmp/Main.pas").expect("file URI");
 
         let _ = workspace.formatting_edit(&uri);
+    }
+
+    #[test]
+    fn failed_candidate_observations_are_never_fresh() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mut state = ContextState::default();
+        state.project_candidate_memberships.insert(
+            temp.path().to_path_buf(),
+            Err("directory observation failed".to_string()),
+        );
+
+        assert!(
+            !context_state_is_fresh(&state),
+            "repeated candidate-enumeration errors must not prove freshness"
+        );
+    }
+
+    #[test]
+    fn external_context_rediscovery_observes_ancestor_project_candidates() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let external = temp.path().join("library/src");
+        let source = external.join("External.pas");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::create_dir_all(&external).expect("external source directory");
+        fs::write(&source, "unit External; interface implementation end.\n")
+            .expect("external source");
+
+        let mut workspace = Workspace::new(
+            vec![root],
+            WorkspaceOptions {
+                source_paths: vec![external.to_string_lossy().into_owned()],
+                ..WorkspaceOptions::default()
+            },
+        );
+        let uri = Url::from_file_path(&source).expect("source URI");
+        let initial_key = workspace
+            .context_for_uri(&uri)
+            .expect("initial external context");
+        assert!(
+            workspace
+                .contexts
+                .get(&initial_key)
+                .expect("initial context state")
+                .context
+                .project_file
+                .is_none()
+        );
+
+        let project = temp.path().join("library/App.dproj");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>src/External.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("ancestor project");
+        let refreshed_key = workspace
+            .context_for_uri(&uri)
+            .expect("refreshed external context");
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&refreshed_key)
+                .expect("refreshed context state")
+                .context
+                .project_file
+                .as_deref(),
+            Some(project.as_path())
+        );
+    }
+
+    #[test]
+    fn internal_context_rediscovery_observes_candidates_above_an_overlapping_source_path() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let source_dir = root.join("src");
+        let source = source_dir.join("Main.pas");
+        fs::create_dir_all(&source_dir).expect("source directory");
+        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
+
+        let mut workspace = Workspace::new(
+            vec![root.clone()],
+            WorkspaceOptions {
+                source_paths: vec![source_dir.to_string_lossy().into_owned()],
+                ..WorkspaceOptions::default()
+            },
+        );
+        let uri = Url::from_file_path(&source).expect("source URI");
+        let initial_key = workspace
+            .context_for_uri(&uri)
+            .expect("initial internal context");
+        assert!(
+            workspace
+                .contexts
+                .get(&initial_key)
+                .expect("initial context state")
+                .context
+                .project_file
+                .is_none()
+        );
+
+        let project = root.join("App.dproj");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>src/Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("workspace project");
+        let refreshed_key = workspace
+            .context_for_uri(&uri)
+            .expect("refreshed internal context");
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&refreshed_key)
+                .expect("refreshed context state")
+                .context
+                .project_file
+                .as_deref(),
+            Some(project.as_path())
+        );
     }
 
     #[cfg(unix)]
@@ -3931,7 +4135,9 @@ mod tests {
             ..ProjectContext::default()
         };
 
-        workspace.install_context(key.clone(), context, &source);
+        workspace
+            .install_context(key.clone(), context, &source, None)
+            .expect("install context");
         let watched_paths = &workspace
             .contexts
             .get(&key)

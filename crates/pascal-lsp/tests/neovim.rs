@@ -265,3 +265,64 @@ fn neovim_watches_repository_parent_configuration_fallback() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("NEOVIM_EXTERNAL_WATCH_OK"));
 }
+
+#[test]
+fn neovim_standard_symbol_reference_and_highlight_queries() {
+    if Command::new("nvim").arg("--version").output().is_err() {
+        eprintln!("Neovim integration skipped: nvim is not installed");
+        return;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("pascal lsp neovim queries ")
+        .tempdir()
+        .unwrap();
+    fs::write(directory.path().join(".lint4d.toml"), "").unwrap();
+    let provider_source = "unit Provider;\ninterface\ntype\n  TWidget = class\n  private\n    FValue: Integer;\n  public\n    procedure Run;\n    property Value: Integer read FValue;\n  end;\nconst\n  SharedValue = 1;\n  DiskOnly = 2;\nprocedure PublicRoutine;\nimplementation\nprocedure TWidget.Run;\nbegin\n  FValue := 1;\nend;\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nprocedure ConsumerOnly;\nimplementation\nprocedure ConsumerOnly;\nbegin\n  Log(SharedValue);\n  Log(Provider.SharedValue);\nend;\nend.\n";
+    fs::write(directory.path().join("Provider.pas"), provider_source).unwrap();
+    fs::write(directory.path().join("Consumer.pas"), consumer_source).unwrap();
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut child = Command::new("nvim")
+        .args(["--headless", "-u", "NONE", "-l"])
+        .arg(manifest.join("tests/neovim_queries_smoke.lua"))
+        .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
+        .env("PASCAL_LSP_SMOKE_ROOT", directory.path())
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "Neovim query smoke timed out: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "Neovim query smoke failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NEOVIM_QUERY_SMOKE_OK"));
+    assert_eq!(
+        fs::read(directory.path().join("Provider.pas")).unwrap(),
+        provider_source.as_bytes()
+    );
+    assert_eq!(
+        fs::read(directory.path().join("Consumer.pas")).unwrap(),
+        consumer_source.as_bytes()
+    );
+}

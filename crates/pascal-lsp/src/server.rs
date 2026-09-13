@@ -1,21 +1,22 @@
 //! Synchronous stdio LSP protocol loop for the Pascal navigation workspace.
 
-use crate::NavigationTarget;
 use crate::workspace::codeactions::{self, ClientActionFeatures};
+use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
     FileChange, MAX_CONFIGURATION_WATCH_PATHS, Workspace, WorkspaceOptions, canonical_file_uri,
 };
+use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams,
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams, FileChangeType,
-    FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams, Registration,
-    RegistrationParams, RelativePattern, ServerInfo, TextDocumentIdentifier, Url, WatchKind,
-    WorkspaceEdit, WorkspaceFolder,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+    DocumentHighlightParams, FileChangeType, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, InitializeParams, OneOf, Position, PrepareRenameResponse,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
+    ServerInfo, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -42,6 +43,7 @@ struct ClientFeatures {
     action_resolve: bool,
     action_disabled: bool,
     document_changes: bool,
+    hierarchical_document_symbols: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +86,22 @@ enum AnalysisRequest {
     },
     CodeActions(CodeActionParams),
     Resolve(CodeAction),
+    DocumentSymbols {
+        uri: Url,
+        hierarchical: bool,
+    },
+    WorkspaceSymbols {
+        query: String,
+    },
+    References {
+        uri: Url,
+        position: Position,
+        include_declaration: bool,
+    },
+    DocumentHighlights {
+        uri: Url,
+        position: Position,
+    },
 }
 
 enum AnalysisResultValue {
@@ -91,6 +109,14 @@ enum AnalysisResultValue {
     Rename(Box<Result<WorkspaceEdit, String>>),
     CodeActions(Result<Vec<CodeActionOrCommand>, String>),
     Resolve(Box<Result<CodeAction, String>>),
+    DocumentSymbols {
+        uri: Url,
+        hierarchical: bool,
+        value: Result<Vec<lsp_types::DocumentSymbol>, String>,
+    },
+    WorkspaceSymbols(Result<Vec<lsp_types::SymbolInformation>, String>),
+    References(Result<Vec<lsp_types::Location>, String>),
+    DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
 }
 
 struct AnalysisResult {
@@ -236,6 +262,38 @@ impl AnalysisJobs {
         let sender = self.sender.clone();
         let worker_id = id.clone();
         let panic_id = id.clone();
+        let panic_value = match &request {
+            AnalysisRequest::Prepare { .. } => AnalysisResultValue::Prepare(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::Rename { .. } => AnalysisResultValue::Rename(Box::new(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            ))),
+            AnalysisRequest::CodeActions(_) => AnalysisResultValue::CodeActions(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::Resolve(_) => AnalysisResultValue::Resolve(Box::new(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            ))),
+            AnalysisRequest::DocumentSymbols { uri, hierarchical } => {
+                AnalysisResultValue::DocumentSymbols {
+                    uri: uri.clone(),
+                    hierarchical: *hierarchical,
+                    value: Err(
+                        "analysis worker failed without changing workspace state".to_string()
+                    ),
+                }
+            }
+            AnalysisRequest::WorkspaceSymbols { .. } => AnalysisResultValue::WorkspaceSymbols(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::References { .. } => AnalysisResultValue::References(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::DocumentHighlights { .. } => AnalysisResultValue::DocumentHighlights(
+                Err("analysis worker failed without changing workspace state".to_string()),
+            ),
+        };
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
             .spawn(move || {
@@ -316,15 +374,80 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::Resolve(Box::new(computed.value)),
                             }
                         }
+                        AnalysisRequest::DocumentSymbols { uri, hierarchical } => {
+                            let computed = queries::document_symbols_from_input(
+                                input,
+                                &uri,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::DocumentSymbols {
+                                    uri,
+                                    hierarchical,
+                                    value: computed.value,
+                                },
+                            }
+                        }
+                        AnalysisRequest::WorkspaceSymbols { query } => {
+                            let computed = queries::workspace_symbols_from_input(
+                                input,
+                                &query,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::WorkspaceSymbols(computed.value),
+                            }
+                        }
+                        AnalysisRequest::References {
+                            uri,
+                            position,
+                            include_declaration,
+                        } => {
+                            let computed = queries::references_from_input(
+                                input,
+                                &uri,
+                                position,
+                                include_declaration,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::References(computed.value),
+                            }
+                        }
+                        AnalysisRequest::DocumentHighlights { uri, position } => {
+                            let computed = queries::highlights_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::DocumentHighlights(computed.value),
+                            }
+                        }
                     }));
                 let mut result = result.unwrap_or_else(|_| AnalysisResult {
                     id: panic_id,
                     source_generation,
                     configuration_generation,
                     records: Vec::new(),
-                    value: AnalysisResultValue::Prepare(Err(
-                        "analysis worker failed without changing workspace state".to_string(),
-                    )),
+                    value: panic_value,
                 });
                 if let Err(error) = rename::revalidate_input(
                     &validation_input,
@@ -413,6 +536,31 @@ fn deliver_analysis_result(
             Ok(value) => send_ok(connection, result.id, value),
             Err(error) => send_analysis_error(connection, result.id, error),
         },
+        AnalysisResultValue::DocumentSymbols {
+            uri,
+            hierarchical,
+            value,
+        } => match value {
+            Ok(value) if hierarchical => send_ok(connection, result.id, value),
+            Ok(value) => send_ok(
+                connection,
+                result.id,
+                NavigationIndex::flatten_document_symbols(&uri, value),
+            ),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::WorkspaceSymbols(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::References(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::DocumentHighlights(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
     }
 }
 
@@ -422,6 +570,10 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::Rename(value) => **value = Err(error),
         AnalysisResultValue::CodeActions(value) => *value = Err(error),
         AnalysisResultValue::Resolve(value) => **value = Err(error),
+        AnalysisResultValue::DocumentSymbols { value, .. } => *value = Err(error),
+        AnalysisResultValue::WorkspaceSymbols(value) => *value = Err(error),
+        AnalysisResultValue::References(value) => *value = Err(error),
+        AnalysisResultValue::DocumentHighlights(value) => *value = Err(error),
     }
 }
 
@@ -875,6 +1027,92 @@ fn handle_request(
                 Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
             }
         }
+        "textDocument/documentSymbol" => {
+            let id = request.id.clone();
+            let params: lsp_types::DocumentSymbolParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::DocumentSymbols {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    hierarchical: client_features.hierarchical_document_symbols,
+                },
+                client_features,
+            )?;
+        }
+        "workspace/symbol" => {
+            let id = request.id.clone();
+            let params: lsp_types::WorkspaceSymbolParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::WorkspaceSymbols {
+                    query: params.query,
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/references" => {
+            let id = request.id.clone();
+            let params: ReferenceParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::References {
+                    uri: canonical_file_uri(&params.text_document_position.text_document.uri),
+                    position: params.text_document_position.position,
+                    include_declaration: params.context.include_declaration,
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/documentHighlight" => {
+            let id = request.id.clone();
+            let params: DocumentHighlightParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::DocumentHighlights {
+                    uri: canonical_file_uri(
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    position: params.text_document_position_params.position,
+                },
+                client_features,
+            )?;
+        }
         "textDocument/prepareRename" => {
             let id = request.id.clone();
             let params: PositionRequestParams = match parse_params(&request) {
@@ -1293,6 +1531,10 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
         "declarationProvider": true,
         "definitionProvider": true,
         "implementationProvider": true,
+        "documentSymbolProvider": true,
+        "workspaceSymbolProvider": true,
+        "referencesProvider": true,
+        "documentHighlightProvider": true,
         "documentFormattingProvider": true,
         "renameProvider": {"prepareProvider": true},
         "codeActionProvider": {
@@ -1329,10 +1571,15 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
     let document_changes = value["workspace"]["workspaceEdit"]["documentChanges"]
         .as_bool()
         .unwrap_or(false);
+    let hierarchical_document_symbols =
+        value["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"]
+            .as_bool()
+            .unwrap_or(false);
     ClientFeatures {
         action_resolve,
         action_disabled,
         document_changes,
+        hierarchical_document_symbols,
     }
 }
 
@@ -1389,9 +1636,9 @@ fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalysisResult, AnalysisResultValue, BoundedReader, FileWatcherRegistration,
-        MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES,
-        deliver_analysis_result,
+        AnalysisJobs, AnalysisRequest, AnalysisResult, AnalysisResultValue, BoundedReader,
+        ClientFeatures, FileWatcherRegistration, MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES,
+        MAX_WATCHER_REGISTRATION_RETRIES, deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
     use lsp_server::{Connection, Message, RequestId, Response};
@@ -1399,6 +1646,64 @@ mod tests {
     use std::fs;
     use std::io::{Cursor, ErrorKind};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    fn symbol_client_features() -> ClientFeatures {
+        ClientFeatures {
+            action_resolve: false,
+            action_disabled: false,
+            document_changes: false,
+            hierarchical_document_symbols: false,
+        }
+    }
+
+    fn receive_analysis_result(jobs: &mut AnalysisJobs, id: &RequestId) -> AnalysisResult {
+        let result = jobs.receiver.recv().expect("analysis worker result");
+        let pending = jobs.pending.remove(id).expect("pending analysis job");
+        assert!(
+            pending.handle.join().is_ok(),
+            "analysis worker must exit cleanly"
+        );
+        assert_eq!(&result.id, id);
+        result
+    }
+
+    fn deliver_successfully(workspace: &Workspace, result: AnalysisResult) {
+        let id = result.id.clone();
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, workspace, result).expect("deliver control result");
+        let Message::Response(response) = client.receiver.recv().expect("control response") else {
+            panic!("expected a control response");
+        };
+        assert_eq!(response.id, id);
+        assert!(
+            response.error.is_none(),
+            "unchanged computed result must deliver: {response:?}"
+        );
+        assert!(
+            response.result.is_some(),
+            "successful result must be delivered"
+        );
+    }
+
+    fn assert_workspace_symbols_were_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::WorkspaceSymbols(Ok(symbols)) => {
+                assert!(
+                    !symbols.is_empty(),
+                    "the computed symbol result must not be empty"
+                );
+            }
+            AnalysisResultValue::WorkspaceSymbols(Err(error)) => {
+                panic!("symbol worker failed before delivery: {error}");
+            }
+            _ => panic!("expected a workspace-symbol result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed symbol result must carry its source read set"
+        );
+    }
 
     #[test]
     fn bounded_reader_rejects_oversized_content_length_before_payload_read() {
@@ -1615,6 +1920,534 @@ mod tests {
             },
         )
         .expect("stale result response");
+
+        let Message::Response(response) = client.receiver.recv().expect("delivery response") else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.id, id);
+        assert_eq!(response.error.expect("stale result error").code, -32803);
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_symbol_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nprocedure VisibleThing;\nimplementation\nend.\n";
+        let changed = "unit Main;\ninterface\nprocedure ChangedThing;\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("symbol-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::WorkspaceSymbols {
+                query: "VisibleThing".to_string(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start control symbol request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_workspace_symbols_were_computed(&control);
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, control).expect("deliver control result");
+        let Message::Response(control_response) = client.receiver.recv().expect("control response")
+        else {
+            panic!("expected a control response");
+        };
+        assert!(
+            control_response.error.is_none(),
+            "unchanged computed symbol input must deliver: {control_response:?}"
+        );
+
+        let stale_id = RequestId::from("symbol-overlay-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::WorkspaceSymbols {
+                query: "VisibleThing".to_string(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale symbol request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_workspace_symbols_were_computed(&stale);
+
+        // The worker has completed and its result is now queued. Change the
+        // authoritative overlay before exercising the delivery boundary.
+        workspace
+            .change_document(main_uri, changed.to_string(), 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, stale).expect("deliver stale result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_symbol_result_after_a_project_switch() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let project_a = root.join("A.dproj");
+        let project_b = root.join("B.dproj");
+        let source = "unit Main;\ninterface\nprocedure VisibleThing;\nimplementation\nend.\n";
+        let project =
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, source).expect("source");
+        fs::write(&project_a, project).expect("project A");
+        fs::write(&project_b, project).expect("project B");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let project_a_uri = Url::from_file_path(&project_a).expect("project A URI");
+        let project_b_uri = Url::from_file_path(&project_b).expect("project B URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .select_project(&main_uri, Some(&project_a_uri))
+            .expect("select project A");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("symbol-project-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::WorkspaceSymbols {
+                query: "VisibleThing".to_string(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start control symbol request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_workspace_symbols_were_computed(&control);
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, control).expect("deliver control result");
+        let Message::Response(control_response) = client.receiver.recv().expect("control response")
+        else {
+            panic!("expected a control response");
+        };
+        assert!(
+            control_response.error.is_none(),
+            "unchanged computed symbol input must deliver: {control_response:?}"
+        );
+
+        let stale_id = RequestId::from("symbol-project-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::WorkspaceSymbols {
+                query: "VisibleThing".to_string(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale symbol request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_workspace_symbols_were_computed(&stale);
+        let stale_source_generation = stale.source_generation;
+        let stale_configuration_generation = stale.configuration_generation;
+
+        // The worker has completed and its result is now queued. Switch the
+        // selected project before exercising the delivery boundary.
+        workspace
+            .select_project(&main_uri, Some(&project_b_uri))
+            .expect("switch to project B");
+        assert_ne!(
+            workspace.source_generation(),
+            stale_source_generation,
+            "project switch must invalidate source generation"
+        );
+        assert_ne!(
+            workspace.configuration_generation(),
+            stale_configuration_generation,
+            "project switch must invalidate configuration generation"
+        );
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, stale).expect("deliver stale result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("project switch must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_reference_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+        let changed_consumer = consumer_source.replace("SharedValue", "ChangedValue");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(consumer_uri.clone(), consumer_source.to_string(), 1)
+            .expect("open consumer overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("reference-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::References {
+                uri: provider_uri.clone(),
+                position: Position::new(2, 6),
+                include_declaration: false,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start reference control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert!(matches!(
+            &control.value,
+            AnalysisResultValue::References(Ok(locations)) if locations.len() == 1
+        ));
+        deliver_successfully(&workspace, control);
+
+        let id = RequestId::from("reference-overlay-stale".to_string());
+        jobs.start(
+            id.clone(),
+            AnalysisRequest::References {
+                uri: provider_uri,
+                position: Position::new(2, 6),
+                include_declaration: false,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start reference request");
+        let result = receive_analysis_result(&mut jobs, &id);
+        match &result.value {
+            AnalysisResultValue::References(Ok(locations)) => {
+                assert_eq!(
+                    locations.len(),
+                    1,
+                    "reference result must be completed before mutation"
+                );
+            }
+            _ => panic!("expected completed reference result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "reference result must carry its read set"
+        );
+
+        workspace
+            .change_document(consumer_uri, changed_consumer, 2)
+            .expect("change consumer overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, result).expect("deliver stale result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed reference overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_highlight_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(Value);\nend;\nend.\n";
+        let changed = original.replace("Log(Value);", "Log(OtherValue);");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("highlight-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::DocumentHighlights {
+                uri: main_uri.clone(),
+                position: Position::new(2, 6),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start highlight control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert!(matches!(
+            &control.value,
+            AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
+        ));
+        deliver_successfully(&workspace, control);
+
+        let id = RequestId::from("highlight-overlay-stale".to_string());
+        jobs.start(
+            id.clone(),
+            AnalysisRequest::DocumentHighlights {
+                uri: main_uri.clone(),
+                position: Position::new(2, 6),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start highlight request");
+        let result = receive_analysis_result(&mut jobs, &id);
+        match &result.value {
+            AnalysisResultValue::DocumentHighlights(Ok(highlights)) => {
+                assert_eq!(
+                    highlights.len(),
+                    2,
+                    "highlight result must be completed before mutation"
+                );
+            }
+            _ => panic!("expected completed highlight result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "highlight result must carry its read set"
+        );
+
+        workspace
+            .change_document(main_uri, changed, 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, result).expect("deliver stale result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed highlight overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_computed_reference_and_highlight_results_after_a_project_switch() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let project_a = root.join("A.dproj");
+        let project_b = root.join("B.dproj");
+        let source = "unit Main;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(Value);\nend;\nend.\n";
+        let project =
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, source).expect("source");
+        fs::write(&project_a, project).expect("project A");
+        fs::write(&project_b, project).expect("project B");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let project_a_uri = Url::from_file_path(&project_a).expect("project A URI");
+        let project_b_uri = Url::from_file_path(&project_b).expect("project B URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .select_project(&main_uri, Some(&project_a_uri))
+            .expect("select project A");
+        let mut jobs = AnalysisJobs::new();
+
+        let reference_control_id = RequestId::from("project-reference-control".to_string());
+        jobs.start(
+            reference_control_id.clone(),
+            AnalysisRequest::References {
+                uri: main_uri.clone(),
+                position: Position::new(2, 6),
+                include_declaration: true,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start reference control request");
+        let reference_control = receive_analysis_result(&mut jobs, &reference_control_id);
+        assert!(matches!(
+            &reference_control.value,
+            AnalysisResultValue::References(Ok(locations)) if locations.len() == 2
+        ));
+        deliver_successfully(&workspace, reference_control);
+
+        let highlight_control_id = RequestId::from("project-highlight-control".to_string());
+        jobs.start(
+            highlight_control_id.clone(),
+            AnalysisRequest::DocumentHighlights {
+                uri: main_uri.clone(),
+                position: Position::new(2, 6),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start highlight control request");
+        let highlight_control = receive_analysis_result(&mut jobs, &highlight_control_id);
+        assert!(matches!(
+            &highlight_control.value,
+            AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
+        ));
+        deliver_successfully(&workspace, highlight_control);
+
+        let reference_id = RequestId::from("project-reference-stale".to_string());
+        jobs.start(
+            reference_id.clone(),
+            AnalysisRequest::References {
+                uri: main_uri.clone(),
+                position: Position::new(2, 6),
+                include_declaration: true,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start reference request");
+        let reference = receive_analysis_result(&mut jobs, &reference_id);
+        assert!(matches!(
+            &reference.value,
+            AnalysisResultValue::References(Ok(locations)) if locations.len() == 2
+        ));
+
+        let highlight_id = RequestId::from("project-highlight-stale".to_string());
+        jobs.start(
+            highlight_id.clone(),
+            AnalysisRequest::DocumentHighlights {
+                uri: main_uri,
+                position: Position::new(2, 6),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start highlight request");
+        let highlight = receive_analysis_result(&mut jobs, &highlight_id);
+        assert!(matches!(
+            &highlight.value,
+            AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
+        ));
+
+        workspace
+            .select_project(
+                &Url::from_file_path(&main).expect("source URI"),
+                Some(&project_b_uri),
+            )
+            .expect("switch to project B");
+
+        for result in [reference, highlight] {
+            let (server, client) = Connection::memory();
+            deliver_analysis_result(&server, &workspace, result).expect("deliver stale result");
+            let Message::Response(response) = client.receiver.recv().expect("stale response")
+            else {
+                panic!("expected a stale response");
+            };
+            assert_eq!(
+                response
+                    .error
+                    .expect("project switch must reject query result")
+                    .code,
+                -32803
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_preserves_cancellation_from_candidate_membership_revalidation() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let source = "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&provider, source).expect("provider source");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let workspace = Workspace::new(vec![root], Default::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = crate::workspace::queries::references_from_input(
+            input.clone(),
+            &provider_uri,
+            Position::new(2, 6),
+            true,
+            &cancel,
+        );
+        assert!(computed.value.is_ok(), "reference worker must complete");
+        assert!(
+            !computed.records.is_empty(),
+            "reference result must carry records"
+        );
+
+        let _guard = crate::project::test_cancel_project_scan_after_checks(0);
+        let error = crate::workspace::rename::revalidate_input(&input, &computed.records, &cancel)
+            .expect_err("membership cancellation must abort result validation");
+        assert_eq!(error, crate::workspace::rename::CANCELLATION_MESSAGE);
+
+        let id = RequestId::from("candidate-membership-cancel".to_string());
+        let mut result = AnalysisResult {
+            id: id.clone(),
+            source_generation: computed.source_generation,
+            configuration_generation: computed.configuration_generation,
+            records: computed.records,
+            value: AnalysisResultValue::References(computed.value),
+        };
+        invalidate_analysis_result(&mut result, error);
+
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, result).expect("deliver cancellation result");
+        let Message::Response(response) = client.receiver.recv().expect("cancellation response")
+        else {
+            panic!("expected a cancellation response");
+        };
+        let response_error = response.error.expect("cancellation error");
+        assert_eq!(response_error.code, -32800);
+        assert_eq!(
+            response_error.message,
+            crate::workspace::rename::CANCELLATION_MESSAGE
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_stale_workspace_symbol_result() {
+        let (server, client) = Connection::memory();
+        let workspace = Workspace::new(Vec::new(), Default::default());
+        let id = RequestId::from("stale-workspace-symbols".to_string());
+        deliver_analysis_result(
+            &server,
+            &workspace,
+            AnalysisResult {
+                id: id.clone(),
+                source_generation: workspace.source_generation().wrapping_add(1),
+                configuration_generation: workspace.configuration_generation(),
+                records: Vec::new(),
+                value: AnalysisResultValue::WorkspaceSymbols(Ok(Vec::new())),
+            },
+        )
+        .expect("stale workspace symbol response");
 
         let Message::Response(response) = client.receiver.recv().expect("delivery response") else {
             panic!("expected a response");

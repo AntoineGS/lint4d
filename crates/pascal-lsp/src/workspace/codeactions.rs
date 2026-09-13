@@ -712,6 +712,7 @@ fn lint_configuration_for_input(
                 path_stamp: content_bytes.as_ref().and_then(|_| path_stamp(path)),
                 content_hash: None,
                 content_bytes: content_bytes.clone(),
+                candidate_membership: None,
             })
         })
         .collect();

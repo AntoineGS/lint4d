@@ -9,6 +9,7 @@ use quick_xml::events::{BytesStart, Event};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
@@ -19,6 +20,7 @@ const MAX_METADATA_FILES: usize = MAX_IMPORT_COUNT + 1;
 const MAX_EXPANDED_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_PROPERTY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OWNERSHIP_CANDIDATES: usize = 32;
+const MAX_PROJECT_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_OWNERSHIP_METADATA_FILES: usize = 512;
 const MAX_OWNERSHIP_SOURCE_FILES: usize = 256;
 const MAX_OWNERSHIP_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -45,6 +47,19 @@ pub(crate) type ProjectSelections = HashMap<PathBuf, PathBuf>;
 pub(crate) struct ProjectCandidates {
     pub(crate) directory: Option<PathBuf>,
     pub(crate) files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProjectCandidateMembership {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) readable: bool,
+}
+
+#[derive(Debug, Default)]
+struct ProjectDirectoryEntries {
+    dproj: Vec<PathBuf>,
+    dpr_or_dpk: Vec<PathBuf>,
+    candidate_overflow: bool,
 }
 
 /// Metadata used to resolve units without eagerly parsing the repository.
@@ -299,8 +314,9 @@ pub(crate) fn has_invalid_project_selection(context: &ProjectContext) -> bool {
 }
 
 pub(crate) fn selected_project_is_current(scope: &Path, selected: &Path) -> Result<bool, String> {
-    let (dproj, _) = project_directory_entries(scope)?;
-    Ok(dproj
+    let entries = project_directory_entries(scope, None)?;
+    Ok(entries
+        .dproj
         .iter()
         .any(|candidate| project_paths_equal(candidate, selected)))
 }
@@ -311,9 +327,9 @@ fn find_project_candidates(
 ) -> Result<ProjectCandidates, String> {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     loop {
-        let (dproj, _) = project_directory_entries(&directory)?;
-        if !dproj.is_empty() {
-            let mut files = dproj;
+        let entries = project_directory_entries(&directory, None)?;
+        if !entries.dproj.is_empty() {
+            let mut files = entries.dproj;
             files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
             return Ok(ProjectCandidates {
                 directory: Some(directory),
@@ -332,6 +348,27 @@ fn find_project_candidates(
         directory = parent.to_path_buf();
     }
     Ok(ProjectCandidates::default())
+}
+
+pub(crate) fn project_candidate_membership(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<ProjectCandidateMembership, String> {
+    let entries = project_directory_entries(directory, cancel)?;
+    if entries.candidate_overflow {
+        return Err(format!(
+            "project candidate membership limit ({MAX_OWNERSHIP_CANDIDATES}) reached in {}",
+            directory.display()
+        ));
+    }
+    let mut dproj = entries.dproj;
+    let mut dpr_or_dpk = entries.dpr_or_dpk;
+    dproj.append(&mut dpr_or_dpk);
+    dproj.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    Ok(ProjectCandidateMembership {
+        paths: dproj,
+        readable: true,
+    })
 }
 
 fn project_path_starts_with(path: &Path, root: &Path) -> bool {
@@ -367,27 +404,111 @@ fn project_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
     }
 }
 
-fn project_directory_entries(directory: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
-    let entries = fs::read_dir(directory).map_err(|error| {
+fn project_directory_entries(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<ProjectDirectoryEntries, String> {
+    check_project_scan_cancel(cancel)?;
+    let mut entries = fs::read_dir(directory).map_err(|error| {
         format!(
             "could not inspect project directory {}: {error}",
             directory.display()
         )
     })?;
-    let mut dproj = Vec::new();
-    let mut dpr_or_dpk = Vec::new();
-    for entry in entries.flatten() {
+    let mut result = ProjectDirectoryEntries::default();
+    let mut visited_entries = 0usize;
+    loop {
+        check_project_scan_cancel(cancel)?;
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        visited_entries = visited_entries.saturating_add(1);
+        if visited_entries > MAX_PROJECT_DIRECTORY_ENTRIES {
+            return Err(format!(
+                "project directory entry limit ({MAX_PROJECT_DIRECTORY_ENTRIES}) reached in {}",
+                directory.display()
+            ));
+        }
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect project directory entry under {}: {error}",
+                directory.display()
+            )
+        })?;
         let path = entry.path();
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "could not inspect project directory entry {}: {error}",
+                path.display()
+            )
+        })?;
+        if !file_type.is_file() {
             continue;
         }
         if extension_is(&path, "dproj") {
-            push_bounded_candidate(&mut dproj, path);
+            push_bounded_candidate(&mut result.dproj, path);
+            result.candidate_overflow |= result.dproj.len() > MAX_OWNERSHIP_CANDIDATES;
         } else if extension_is(&path, "dpr") || extension_is(&path, "dpk") {
-            push_bounded_candidate(&mut dpr_or_dpk, path);
+            push_bounded_candidate(&mut result.dpr_or_dpk, path);
+            result.candidate_overflow |= result.dpr_or_dpk.len() > MAX_OWNERSHIP_CANDIDATES;
         }
     }
-    Ok((dproj, dpr_or_dpk))
+    Ok(result)
+}
+
+fn check_project_scan_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
+    #[cfg(test)]
+    let force_cancel = cancel.is_some()
+        && TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS.with(|budget| match budget.get() {
+            Some(0) => {
+                budget.set(None);
+                true
+            }
+            Some(remaining) => {
+                budget.set(Some(remaining.saturating_sub(1)));
+                false
+            }
+            None => false,
+        });
+    #[cfg(test)]
+    if force_cancel {
+        if let Some(cancel) = cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        Err("request cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestProjectScanCancellationGuard(Option<usize>);
+
+#[cfg(test)]
+pub(crate) fn test_cancel_project_scan_after_checks(
+    checks: usize,
+) -> TestProjectScanCancellationGuard {
+    let previous = TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS.with(|budget| {
+        let previous = budget.get();
+        budget.set(Some(checks));
+        previous
+    });
+    TestProjectScanCancellationGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestProjectScanCancellationGuard {
+    fn drop(&mut self) {
+        TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS.with(|budget| budget.set(self.0.take()));
+    }
 }
 
 fn normalize_workspace_roots(
@@ -488,7 +609,7 @@ fn discover_project_file(
     let mut ambiguous_fallback_dpr = None;
 
     loop {
-        let (dproj, dpr_or_dpk) = match project_directory_entries(&directory) {
+        let entries = match project_directory_entries(&directory, None) {
             Ok(entries) => entries,
             Err(error) => {
                 warnings.push(error);
@@ -497,6 +618,8 @@ fn discover_project_file(
                 };
             }
         };
+        let dproj = entries.dproj;
+        let dpr_or_dpk = entries.dpr_or_dpk;
 
         if !dproj.is_empty() {
             return choose_project_candidate(
@@ -3339,4 +3462,70 @@ fn lex_pascal(source: &str) -> Vec<PascalToken> {
         cursor += first.len_utf8();
     }
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_OWNERSHIP_CANDIDATES, MAX_PROJECT_DIRECTORY_ENTRIES, project_candidate_membership,
+        test_cancel_project_scan_after_checks,
+    };
+    use std::fs;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn candidate_membership_reports_directory_read_errors() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let file = temp.path().join("not-a-directory");
+        fs::write(&file, b"source").expect("regular file");
+        let cancel = AtomicBool::new(false);
+
+        let error = project_candidate_membership(&file, Some(&cancel))
+            .expect_err("a non-directory cannot produce a membership observation");
+        assert!(
+            error.contains("project directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn candidate_membership_reports_candidate_overflow() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        for index in 0..=MAX_OWNERSHIP_CANDIDATES {
+            fs::write(temp.path().join(format!("Project{index:02}.dproj")), b"")
+                .expect("project candidate");
+        }
+        let cancel = AtomicBool::new(false);
+
+        let error = project_candidate_membership(temp.path(), Some(&cancel))
+            .expect_err("truncated candidate membership is not a valid observation");
+        assert!(error.contains("candidate"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn candidate_membership_reports_directory_entry_budget_exhaustion() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        for index in 0..=MAX_PROJECT_DIRECTORY_ENTRIES {
+            fs::write(temp.path().join(format!("Noise{index:04}.txt")), b"").expect("noise entry");
+        }
+        let cancel = AtomicBool::new(false);
+
+        let error = project_candidate_membership(temp.path(), Some(&cancel))
+            .expect_err("an incomplete directory scan is not a valid observation");
+        assert!(error.contains("entry limit"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn candidate_membership_honors_cancellation_during_entry_scan() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        for index in 0..4 {
+            fs::write(temp.path().join(format!("Noise{index}.txt")), b"").expect("noise entry");
+        }
+        let cancel = AtomicBool::new(false);
+        let _guard = test_cancel_project_scan_after_checks(2);
+
+        let error = project_candidate_membership(temp.path(), Some(&cancel))
+            .expect_err("cancellation during enumeration must abort the observation");
+        assert_eq!(error, "request cancelled");
+    }
 }

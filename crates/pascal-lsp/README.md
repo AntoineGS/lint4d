@@ -2,7 +2,8 @@
 
 A native, source-based Delphi/Object Pascal language server. Runs on Linux
 without Windows, Wine, RAD Studio, or `DelphiLSP.exe`. This slice provides
-declaration/definition navigation, conservative symbol-aware rename, naming
+declaration/definition navigation, document and workspace symbols, semantic
+references, document highlights, conservative symbol-aware rename, naming
 quick fixes, and reuses lint4d and fmt4d for diagnostics and formatting. It is
 not a replacement for Delphi's compiler or its complete type system.
 
@@ -63,9 +64,13 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `gD` | Go to the visible declaration, such as the unit interface or class header |
 | `gi` | Go to implementation; uses the same fallback as `gd` in this slice |
 | `<C-o>` | Return to the previous jump location |
+| `grr` / `:lua vim.lsp.buf.references()` | List semantic references; the default client request includes declarations |
+| `gO` / `:lua vim.lsp.buf.document_symbol()` | List the current document's symbols |
+| `:lua vim.lsp.buf.workspace_symbol('query')` | Search workspace declarations by name |
 | `grn` / `:lua vim.lsp.buf.rename()` | Rename the symbol under the cursor |
 | `gra` / `:lua vim.lsp.buf.code_action()` | Show naming quick fixes for the requested range |
 | `:lua vim.lsp.buf.format({ name = 'pascal_lsp' })` | Explicitly format the current buffer |
+| `:lua vim.lsp.buf.document_highlight()` | Request current-document highlights explicitly |
 | `:checkhealth vim.lsp` | Inspect attachment, executable, and client configuration |
 | `:lua print(vim.lsp.log.get_filename())` | Locate the LSP log, including server stderr |
 
@@ -275,6 +280,79 @@ revalidated on demand for the requested source and dependencies it traverses,
 and watcher events are supported but not required. Navigation does not
 globally rescan a large workspace on each request.
 
+## Symbols, References and Highlights
+
+The server advertises the four standard query capabilities
+`textDocument/documentSymbol`, `workspace/symbol`,
+`textDocument/references`, and `textDocument/documentHighlight`. These queries
+are read-only: the server does not write source files.
+
+### Document outlines
+
+`textDocument/documentSymbol` returns full declaration ranges and identifier
+selection ranges. When the client advertises
+`hierarchicalDocumentSymbolSupport`, the result is nested `DocumentSymbol`
+data. Otherwise the server returns the same outline flattened to
+`SymbolInformation` entries with container names. Child ranges are contained by
+their parents; an out-of-class method implementation remains a separate source
+entry rather than being placed under the class declaration.
+
+An outline request has a hard 10,000-entry response bound and a 32-level
+hierarchy bound. Exceeding either bound returns an error instead of silently
+truncating the result.
+
+### Workspace symbols
+
+`workspace/symbol` always returns resolved flat `SymbolInformation` entries and
+does not require a separate resolve request. Queries are case-insensitive
+substring matches; an empty query requests every eligible declaration. The
+search includes unopened Pascal sources under workspace roots and configured
+`sourcePaths`, while an open buffer's unsaved text takes precedence over its
+disk bytes. Routine-local variables and parameters are excluded, while
+project-level routines and type members remain searchable. Container labels
+identify the unit or owning type.
+
+Matching declaration and implementation sites remain separate locations, as do
+overloads; declarations are not collapsed merely because their names match. A
+workspace-symbol response is capped at 10,000 entries, and exceeding the bound
+returns an error directing the client to narrow the query. Configured
+`sourcePaths` are read-only input for these queries; the server never edits or
+saves those files.
+
+### References
+
+`textDocument/references` uses the binding identity produced by the navigation
+resolver rather than textual matching or a rename-to-a-dummy-name probe.
+`context.includeDeclaration = false` excludes the binding's declaration sites;
+`true` includes every supported declaration site as well as its references.
+Open overlays are authoritative, and unopened consumers may be included. Unit
+and module identifiers are outside the supported binding subset: a references
+request returns an unsupported-binding error, while a document-highlight
+request at a unit or module identifier returns an empty list. The separate
+`textDocument/rename` limitation for units remains guarded by `RenameFile`
+support.
+
+If workspace discovery, a required source/include read, or binding resolution
+is incomplete, the request returns an actionable error rather than a partial
+location list. Unsupported or ambiguous bindings are rejected rather than
+guessed; inherited and `with` lookup, unknown class ancestors, and unsupported
+overload relationships can therefore make a reference request fail.
+
+### Document highlights
+
+`textDocument/documentHighlight` is restricted to the requested document and,
+for supported bindings, includes its declaration. Unit and module identifiers
+are unsupported and return an empty list. Highlight `kind` is intentionally unspecified
+(`None`) until a reliable read/write classifier exists. The shipped Neovim
+configuration does not install `CursorHold` or `CursorMoved` autocmds; clients
+request highlights explicitly, for example with
+`vim.lsp.buf.document_highlight()`.
+
+All four queries run in bounded analysis workers. `$/cancelRequest` is honored,
+and source/configuration generations plus the observed read set are revalidated
+before delivery. A changed input produces a stale-result error for the client
+to retry rather than returning data computed from an older snapshot.
+
 Disk discovery excludes descendants named `.git`, `.worktrees`, `target`,
 `node_modules`, `build`, `dist`, and similar generated directories. An explicit
 workspace/source root may itself live under one of these names. Symlinked files
@@ -303,6 +381,8 @@ Implemented and covered by tests:
   classes and nested procedures inside methods.
 - In-memory replacements, Unicode UTF-16 coordinates, and CRLF source files.
 - Unknown receivers do not trigger an unrelated workspace-wide name search.
+- Document/workspace symbols, semantic references, and document-local highlights
+  use the standard LSP requests and preserve UTF-16 source ranges.
 
 Not implemented or incomplete:
 
@@ -315,7 +395,9 @@ Not implemented or incomplete:
   variants and duplicate units can produce multiple candidate locations.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
-- Completion, hover, references, and document/workspace symbols.
+- Completion, hover, signature help, and type-definition requests are not
+  advertised or implemented.
+- Semantic tokens and a general Delphi type checker are not implemented.
 
 Unsupported expressions can return no location. Results should be evaluated
 against your own projects before treating navigation as compiler-equivalent.

@@ -3,12 +3,24 @@ use lsp_types::{Location, Position, Range, Url};
 use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::{FileInfo, parser};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use tree_sitter::{Node, Tree};
 
 mod rename;
+mod symbols;
 pub(crate) use rename::RenameBindingInfo;
+#[cfg(test)]
+pub(crate) use rename::test_cancel_after_checks;
+#[cfg(test)]
+pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
+
+#[cfg(test)]
+thread_local! {
+    static OWNER_TYPE_ROOT_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The navigation operation requested by an LSP client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +62,43 @@ impl NavigationIndex {
     /// Construct an empty navigation index.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Return the source-accurate outline for one indexed document.
+    pub fn document_symbols(&self, uri: &Url) -> Result<Vec<lsp_types::DocumentSymbol>, String> {
+        symbols::document_symbols(self, uri)
+    }
+
+    pub(crate) fn document_symbols_with_cancel(
+        &self,
+        uri: &Url,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<lsp_types::DocumentSymbol>, String> {
+        symbols::document_symbols_with_cancel(self, uri, cancel)
+    }
+
+    /// Return fully-resolved declarations from the indexed documents whose
+    /// names contain `query`, case-insensitively.
+    pub fn workspace_symbols(
+        &self,
+        query: &str,
+    ) -> Result<Vec<lsp_types::SymbolInformation>, String> {
+        symbols::workspace_symbols(self, query)
+    }
+
+    pub(crate) fn workspace_symbols_with_cancel(
+        &self,
+        query: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<lsp_types::SymbolInformation>, String> {
+        symbols::workspace_symbols_with_cancel(self, query, cancel)
+    }
+
+    pub(crate) fn flatten_document_symbols(
+        uri: &Url,
+        symbols: Vec<lsp_types::DocumentSymbol>,
+    ) -> Vec<lsp_types::SymbolInformation> {
+        symbols::flatten_document_symbols(uri, symbols)
     }
 
     /// Parse and replace one document.
@@ -132,6 +181,22 @@ impl NavigationIndex {
     /// Return whether this URI has a parsed document in the index.
     pub fn contains(&self, uri: &Url) -> bool {
         self.documents.contains_key(uri)
+    }
+
+    pub(crate) fn position_is_ignored_or_empty(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Result<bool, String> {
+        let document = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(true);
+        };
+        Ok(is_ignored_offset(document.tree.root_node(), offset)
+            || identifier_at(document.tree.root_node(), offset).is_none())
     }
 
     /// Number of retained parsed documents.
@@ -1214,6 +1279,28 @@ enum SymbolKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TypeKind {
+    Class,
+    Record,
+    Interface,
+    Enum,
+    Array,
+    Callable,
+    String,
+    File,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RoutineKind {
+    Procedure,
+    Function,
+    Constructor,
+    Destructor,
+    Operator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Span {
     start: usize,
     end: usize,
@@ -1247,10 +1334,16 @@ struct Scope {
 #[derive(Debug)]
 struct Symbol {
     span: Span,
+    declaration_span: Span,
+    selection_span: Span,
+    name: String,
     key: String,
     kind: SymbolKind,
+    type_kind: TypeKind,
+    routine_kind: RoutineKind,
     scope: usize,
     owner_type: Option<String>,
+    owner_type_name: Option<String>,
     type_name: Option<String>,
     region: Region,
     origin: Origin,
@@ -1320,6 +1413,7 @@ struct Document {
     imports: Vec<ImportMetadata>,
     import_bindings: Option<HashMap<String, Url>>,
     scopes: Vec<Scope>,
+    cache_unsafe_scopes: HashSet<usize>,
     symbols: Vec<Symbol>,
     opaque_ranges: Vec<Span>,
 }
@@ -1404,15 +1498,27 @@ impl Document {
 
         let definitions = collect_nodes_matching(root, "defProc");
         let (scopes, scope_by_span) = build_scopes(source.len(), &definitions, &source);
+        let cache_unsafe_scopes = cache_unsafe_scopes(root, &scope_by_span);
         let mut symbols = Vec::new();
 
         if let Some(module_name) = unit_module {
+            let span = Span::from_node(module_name);
+            let selection_span = identifier_nodes(module_name)
+                .last()
+                .map(|node| Span::from_node(*node))
+                .unwrap_or(span);
             symbols.push(Symbol {
-                span: Span::from_node(module_name),
+                span,
+                declaration_span: Span::from_node(root),
+                selection_span,
+                name: node_text(module_name, &source),
                 key: unit_name.clone(),
                 kind: SymbolKind::Unit,
+                type_kind: TypeKind::Other,
+                routine_kind: RoutineKind::Procedure,
                 scope: ROOT_SCOPE,
                 owner_type: None,
+                owner_type_name: None,
                 type_name: None,
                 region: Region::Other,
                 origin: Origin::Declaration,
@@ -1440,6 +1546,7 @@ impl Document {
             imports,
             import_bindings: None,
             scopes,
+            cache_unsafe_scopes,
             symbols,
             opaque_ranges,
         })
@@ -1501,7 +1608,22 @@ impl Document {
     }
 
     fn owner_type_at(&self, offset: usize) -> Option<String> {
-        let mut scope = self.scope_at(offset);
+        let scope = self.scope_at(offset);
+        if let Some(owner_type) = self.owner_type_for_scope(scope) {
+            return Some(owner_type);
+        }
+        #[cfg(test)]
+        OWNER_TYPE_ROOT_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
+        let identifier = identifier_at(self.tree.root_node(), offset)?;
+        enclosing_type(identifier, &self.source)
+    }
+
+    fn owner_type_at_identifier(&self, identifier: Node<'_>, scope: usize) -> Option<String> {
+        self.owner_type_for_scope(scope)
+            .or_else(|| enclosing_type(identifier, &self.source))
+    }
+
+    fn owner_type_for_scope(&self, mut scope: usize) -> Option<String> {
         loop {
             if let Some(owner_type) = &self.scopes[scope].owner_type {
                 return Some(owner_type.clone());
@@ -1511,11 +1633,7 @@ impl Document {
             };
             scope = parent;
         }
-
-        // Class declarations do not create routine scopes, but member names
-        // used by property accessors still resolve in the enclosing type.
-        identifier_at(self.tree.root_node(), offset)
-            .and_then(|identifier| enclosing_type(identifier, &self.source))
+        None
     }
 
     fn has_parser_recovery_near(&self, span: Span) -> bool {
@@ -1757,10 +1875,16 @@ fn inject_abbreviated_parameters(
             }
             symbols.push(Symbol {
                 span: Span::from_node(identifier),
+                declaration_span: Span::from_node(identifier),
+                selection_span: Span::from_node(identifier),
+                name: name.clone(),
                 key: canonical_name(&name),
                 kind: SymbolKind::Parameter,
+                type_kind: TypeKind::Other,
+                routine_kind: RoutineKind::Procedure,
                 scope: body_scope,
                 owner_type: None,
+                owner_type_name: None,
                 type_name: type_name.clone(),
                 region: Region::Implementation,
                 origin: Origin::Declaration,
@@ -1788,6 +1912,7 @@ fn add_definition_symbol(
     let Some((name, span, owner_type)) = routine_name(header, source) else {
         return;
     };
+    let owner_type_name = routine_owner_name(header, source);
     let own_scope = scope_by_span
         .get(&Span::from_node(node))
         .copied()
@@ -1796,10 +1921,16 @@ fn add_definition_symbol(
     let signature = routine_signature(header, source);
     symbols.push(Symbol {
         span,
+        declaration_span: Span::from_node(node),
+        selection_span: span,
+        name: name.clone(),
         key: canonical_name(&name),
         kind: SymbolKind::Routine,
+        type_kind: TypeKind::Other,
+        routine_kind: routine_kind(header),
         scope,
         owner_type: owner_type.clone(),
+        owner_type_name,
         type_name: None,
         region: region_for_node(node),
         origin: Origin::Definition,
@@ -1826,14 +1957,21 @@ fn add_routine_symbol(
     let Some((name, span, owner_type)) = routine_name(node, source) else {
         return;
     };
+    let owner_type_name = routine_owner_name(node, source);
     let scope = scope_for_declaration(node, scope_by_span);
     let signature = routine_signature(node, source);
     symbols.push(Symbol {
         span,
+        declaration_span: Span::from_node(node),
+        selection_span: span,
+        name: name.clone(),
         key: canonical_name(&name),
         kind: SymbolKind::Routine,
+        type_kind: TypeKind::Other,
+        routine_kind: routine_kind(node),
         scope,
         owner_type: owner_type.clone(),
+        owner_type_name,
         type_name: None,
         region: region_for_node(node),
         origin: Origin::Declaration,
@@ -1860,8 +1998,14 @@ fn add_named_symbol(
     type_name: Option<String>,
 ) {
     let owner_type = enclosing_type(node, source);
+    let owner_type_name = enclosing_type_name(node, source);
     let scope = scope_for_declaration(node, scope_by_span);
     let local_only = kind == SymbolKind::Parameter && scope == ROOT_SCOPE;
+    let type_kind = if kind == SymbolKind::Type {
+        type_kind_for_declaration(node)
+    } else {
+        TypeKind::Other
+    };
     let accessor = if kind == SymbolKind::Property {
         property_accessor(node, source)
     } else {
@@ -1875,10 +2019,16 @@ fn add_named_symbol(
         }
         symbols.push(Symbol {
             span: Span::from_node(identifier),
+            declaration_span: Span::from_node(node),
+            selection_span: Span::from_node(identifier),
+            name: name.clone(),
             key: canonical_name(&name),
             kind,
+            type_kind,
+            routine_kind: RoutineKind::Procedure,
             scope,
             owner_type: owner_type.clone(),
+            owner_type_name: owner_type_name.clone(),
             type_name: type_name.clone(),
             region: region_for_node(node),
             origin: Origin::Declaration,
@@ -1899,6 +2049,61 @@ fn property_accessor(node: Node<'_>, source: &str) -> Option<String> {
         .filter(|accessor| !accessor.is_empty())
 }
 
+fn type_kind_for_declaration(node: Node<'_>) -> TypeKind {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return TypeKind::Other;
+    };
+    let mut pending = vec![type_node];
+    while let Some(current) = pending.pop() {
+        match current.kind() {
+            "declIntf" => return TypeKind::Interface,
+            "declEnum" => return TypeKind::Enum,
+            "declRecord" => return TypeKind::Record,
+            "declArray" | "kArray" | "declSet" => return TypeKind::Array,
+            "declProcRef" | "kProcedure" | "kFunction" => return TypeKind::Callable,
+            "declString" | "kString" => return TypeKind::String,
+            "declFile" | "kFile" => return TypeKind::File,
+            "declMetaClass" => return TypeKind::Class,
+            "declClass" => {
+                let mut cursor = current.walk();
+                return current
+                    .children(&mut cursor)
+                    .find_map(|child| match child.kind() {
+                        "kRecord" => Some(TypeKind::Record),
+                        "kClass" | "kObject" => Some(TypeKind::Class),
+                        _ => None,
+                    })
+                    .unwrap_or(TypeKind::Class);
+            }
+            _ => {
+                let mut cursor = current.walk();
+                let children: Vec<_> = current.children(&mut cursor).collect();
+                pending.extend(children.into_iter().rev());
+            }
+        }
+    }
+    TypeKind::Other
+}
+
+fn routine_kind(node: Node<'_>) -> RoutineKind {
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        match current.kind() {
+            "kFunction" => return RoutineKind::Function,
+            "kConstructor" => return RoutineKind::Constructor,
+            "kDestructor" => return RoutineKind::Destructor,
+            "kOperator" => return RoutineKind::Operator,
+            "kProcedure" => return RoutineKind::Procedure,
+            _ => {
+                let mut cursor = current.walk();
+                let children: Vec<_> = current.children(&mut cursor).collect();
+                pending.extend(children.into_iter().rev());
+            }
+        }
+    }
+    RoutineKind::Procedure
+}
+
 fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<String>)> {
     let identifiers = field_identifier_nodes(node, "name");
     let last = identifiers.last().copied()?;
@@ -1911,6 +2116,16 @@ fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<St
         enclosing_type(node, source)
     };
     Some((name, Span::from_node(last), owner_type))
+}
+
+fn routine_owner_name(node: Node<'_>, source: &str) -> Option<String> {
+    let identifiers = field_identifier_nodes(node, "name");
+    if identifiers.len() > 1 {
+        return identifiers
+            .get(identifiers.len().saturating_sub(2))
+            .map(|identifier| node_text(*identifier, source));
+    }
+    enclosing_type_name(node, source)
 }
 
 fn routine_signature(node: Node<'_>, source: &str) -> String {
@@ -1970,6 +2185,24 @@ fn enclosing_type(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
+fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    let node_span = Span::from_node(node);
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "declType"
+            && parent
+                .child_by_field_name("type")
+                .is_some_and(|type_node| Span::from_node(type_node).contains(node_span))
+        {
+            return field_identifier_nodes(parent, "name")
+                .last()
+                .map(|identifier| node_text(*identifier, source));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 fn simple_type_path(node: Node<'_>, source: &str) -> Option<String> {
     let identifiers = identifier_texts(node, source);
     (!identifiers.is_empty()).then(|| canonical_path(&identifiers))
@@ -2023,6 +2256,44 @@ fn build_scopes(
         open_scopes.push(scope);
     }
     (scopes, scope_by_span)
+}
+
+fn cache_unsafe_scopes(root: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> HashSet<usize> {
+    let mut inline_declarations = collect_nodes_matching(root, "varDef");
+    inline_declarations.extend(collect_nodes_matching(root, "varAssignDef"));
+
+    let mut unsafe_scopes = HashSet::new();
+    for declaration in inline_declarations {
+        let mut current = Some(declaration);
+        let mut marked = false;
+        while let Some(node) = current {
+            match node.kind() {
+                "defProc" => {
+                    unsafe_scopes.insert(
+                        scope_by_span
+                            .get(&Span::from_node(node))
+                            .copied()
+                            .unwrap_or(ROOT_SCOPE),
+                    );
+                    marked = true;
+                    break;
+                }
+                "lambda" => {
+                    // Lambda occurrences are rejected by the per-use check;
+                    // they must not disable caching for unrelated root uses.
+                    marked = true;
+                    break;
+                }
+                _ => current = node.parent(),
+            }
+        }
+        if !marked {
+            // Inline declarations in a program/unit-level block have no
+            // distinct scope in the current model, so disable root caching.
+            unsafe_scopes.insert(ROOT_SCOPE);
+        }
+    }
+    unsafe_scopes
 }
 
 fn scope_for_declaration(node: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> usize {
@@ -2282,4 +2553,50 @@ fn location_for_span(uri: &Url, source: &str, span: Span) -> Option<Location> {
         uri: uri.clone(),
         range: Range { start, end },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    fn repeated_class_field_source(repetitions: usize) -> String {
+        let mut source = String::from(
+            "unit RepeatedClassField;\ninterface\ntype\n  TFirst = class\n    FValue: Integer;\n    procedure Touch;\n  end;\nimplementation\nprocedure TFirst.Touch;\nbegin\n",
+        );
+        for index in 0..repetitions {
+            writeln!(&mut source, "  FValue := {index};").expect("write fixture source");
+        }
+        source.push_str("end;\nend.\n");
+        source
+    }
+
+    fn query_repeated_class_field(repetitions: usize) -> (usize, usize) {
+        let source = repeated_class_field_source(repetitions);
+        let uri = Url::parse("file:///tmp/repeated-class-field.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("class-field fixture parses");
+
+        OWNER_TYPE_ROOT_LOOKUPS.with(|lookups| lookups.set(0));
+        let locations = index
+            .binding_locations(&uri, Position::new(4, 4), true)
+            .expect("class-field references resolve");
+        let root_lookups = OWNER_TYPE_ROOT_LOOKUPS.with(Cell::get);
+        (locations.len(), root_lookups)
+    }
+
+    #[test]
+    fn class_field_binding_work_does_not_repeat_root_lookup_per_occurrence() {
+        let (small_count, small_root_lookups) = query_repeated_class_field(1);
+        let (large_count, large_root_lookups) = query_repeated_class_field(128);
+
+        assert_eq!(small_count, 2);
+        assert_eq!(large_count, 129);
+        assert_eq!(
+            large_root_lookups, small_root_lookups,
+            "known class owners must not restart root lookup for each field use"
+        );
+    }
 }

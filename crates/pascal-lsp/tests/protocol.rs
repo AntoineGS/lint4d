@@ -244,6 +244,30 @@ impl TestServer {
         self.initialize_with_watched_registration(root, initialization_options, false)
     }
 
+    fn initialize_with_hierarchical_document_symbols(&mut self, root: &Path) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {
+                        "documentSymbol": {
+                            "hierarchicalDocumentSymbolSupport": true
+                        }
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
     fn initialize_with_watched_registration(
         &mut self,
         root: &Path,
@@ -494,11 +518,65 @@ fn result_locations(response: Response) -> Vec<Value> {
         .clone()
 }
 
+fn location_signature(location: &Value) -> (String, u32, u32, u32, u32) {
+    (
+        location["uri"].as_str().unwrap_or_default().to_owned(),
+        location["range"]["start"]["line"].as_u64().unwrap() as u32,
+        location["range"]["start"]["character"].as_u64().unwrap() as u32,
+        location["range"]["end"]["line"].as_u64().unwrap() as u32,
+        location["range"]["end"]["character"].as_u64().unwrap() as u32,
+    )
+}
+
+fn range_signature(location: &Value) -> (u32, u32, u32, u32) {
+    (
+        location["range"]["start"]["line"].as_u64().unwrap() as u32,
+        location["range"]["start"]["character"].as_u64().unwrap() as u32,
+        location["range"]["end"]["line"].as_u64().unwrap() as u32,
+        location["range"]["end"]["character"].as_u64().unwrap() as u32,
+    )
+}
+
+fn expected_location_signature(
+    path: &Path,
+    source: &str,
+    needle: &str,
+    occurrence: usize,
+) -> (String, u32, u32, u32, u32) {
+    let start = position_of(source, needle, occurrence);
+    (
+        uri(path).to_string(),
+        start.line,
+        start.character,
+        start.line,
+        start.character + needle.encode_utf16().count() as u32,
+    )
+}
+
+fn assert_exact_location_signatures(
+    actual: &[Value],
+    mut expected: Vec<(String, u32, u32, u32, u32)>,
+) {
+    let mut actual = actual.iter().map(location_signature).collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
 fn write_file(path: &Path, source: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create source directory");
     }
     fs::write(path, source).expect("write Pascal source");
+}
+
+fn workspace_symbol_source(unit_name: &str, variable_count: usize) -> String {
+    let mut source = format!("unit {unit_name};\ninterface\nvar\n");
+    for index in 0..variable_count {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+    source
 }
 
 fn workspace_edit_uris(edit: &Value) -> HashSet<String> {
@@ -712,6 +790,47 @@ fn assert_exact_rename_edits(
     assert_eq!(actual, expected);
 }
 
+fn assert_exact_workspace_edit(
+    edit: &Value,
+    mut expected: Vec<(String, Position, Position, String)>,
+) {
+    let changes = edit["documentChanges"]
+        .as_array()
+        .expect("document changes");
+    let mut actual = changes
+        .iter()
+        .flat_map(|change| {
+            let uri = change["textDocument"]["uri"]
+                .as_str()
+                .expect("changed document URI")
+                .to_owned();
+            change["edits"]
+                .as_array()
+                .expect("document edits")
+                .iter()
+                .map(move |edit| {
+                    let start = &edit["range"]["start"];
+                    let end = &edit["range"]["end"];
+                    (
+                        uri.clone(),
+                        Position::new(
+                            start["line"].as_u64().expect("start line") as u32,
+                            start["character"].as_u64().expect("start character") as u32,
+                        ),
+                        Position::new(
+                            end["line"].as_u64().expect("end line") as u32,
+                            end["character"].as_u64().expect("end character") as u32,
+                        ),
+                        edit["newText"].as_str().expect("replacement").to_owned(),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
 fn standard_workspace() -> (TempDir, PathBuf, PathBuf, String, String) {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("workspace with spaces");
@@ -736,8 +855,1659 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     assert_eq!(capabilities["declarationProvider"], true);
     assert_eq!(capabilities["definitionProvider"], true);
     assert_eq!(capabilities["implementationProvider"], true);
+    assert_eq!(capabilities["documentSymbolProvider"], true);
+    assert_eq!(capabilities["workspaceSymbolProvider"], true);
+    assert_eq!(capabilities["referencesProvider"], true);
+    assert_eq!(capabilities["documentHighlightProvider"], true);
     assert_eq!(capabilities["documentFormattingProvider"], true);
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[test]
+fn document_symbols_describe_class_and_method_ranges() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("Main.pas");
+    let source = "unit Main;\ninterface\ntype TWidget = class\nprocedure Run;\nend;\nimplementation\nprocedure TWidget.Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("outline".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let symbols = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Main", "TWidget", "Run", "Run"]
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol["kind"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [2, 5, 6, 6]
+    );
+    assert_eq!(
+        symbols[1]["location"]["range"],
+        json!({"start": {"line": 2, "character": 5}, "end": {"line": 4, "character": 4}})
+    );
+    assert_eq!(
+        symbols[2]["location"]["range"],
+        json!({"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 14}})
+    );
+    assert_eq!(
+        symbols[3]["location"]["range"],
+        json!({"start": {"line": 6, "character": 0}, "end": {"line": 8, "character": 4}})
+    );
+    server.shutdown();
+}
+
+#[test]
+fn document_symbols_are_hierarchical_when_the_client_supports_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("Main.pas");
+    let source = "unit Main;\ninterface\ntype TWidget = class\nprocedure Run;\nend;\nimplementation\nprocedure TWidget.Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize_with_hierarchical_document_symbols(temp.path());
+
+    let id = RequestId::from("hierarchical-outline".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let symbols = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0]["name"], "Main");
+    assert_eq!(
+        symbols[0]["selectionRange"],
+        json!({"start": {"line": 0, "character": 5}, "end": {"line": 0, "character": 9}})
+    );
+    assert_eq!(
+        symbols[0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["TWidget", "Run"]
+    );
+    let widget = &symbols[0]["children"][0];
+    assert_eq!(
+        widget["selectionRange"],
+        json!({"start": {"line": 2, "character": 5}, "end": {"line": 2, "character": 12}})
+    );
+    assert_eq!(widget["children"][0]["name"], "Run");
+    assert_eq!(
+        widget["children"][0]["selectionRange"],
+        json!({"start": {"line": 3, "character": 10}, "end": {"line": 3, "character": 13}})
+    );
+    assert_eq!(symbols[0]["children"][1]["children"], Value::Null);
+    server.shutdown();
+}
+
+#[test]
+fn document_symbol_requests_reject_excessive_hierarchy_depth() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let source_path = root.join("DeepSymbols.pas");
+    let mut source = String::from("unit DeepSymbols;\ninterface\nimplementation\nprocedure P0;\n");
+    for index in 1..40 {
+        source.push_str(&format!("{}procedure P{index};\n", "  ".repeat(index)));
+    }
+    for index in (1..40).rev() {
+        let indent = "  ".repeat(index);
+        source.push_str(&format!("{indent}begin\n{indent}end;\n"));
+    }
+    source.push_str("begin\nend;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("deep-document-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("excessive document symbol depth must fail closed");
+    assert!(error.message.contains("hierarchy"));
+    assert!(error.message.contains("32"));
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbols_search_unopened_sources_and_skip_routine_locals() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("Main.pas");
+    let other = temp.path().join("Other.pas");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nprocedure GlobalThing;\nimplementation\nprocedure GlobalThing;\nvar LocalThing: Integer;\nbegin\n  LocalThing := 1;\nend;\nend.\n",
+    );
+    write_file(
+        &other,
+        "unit Other;\ninterface\ntype TWidget = class\n  Value: Integer;\nend;\nimplementation\nend.\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let id = RequestId::from("workspace-symbols".to_string());
+    server.send_request(id.clone(), "workspace/symbol", json!({"query": "WIDGET"}));
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let symbols = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0]["name"], "TWidget");
+    assert_eq!(symbols[0]["containerName"], "Other");
+    assert_eq!(symbols[0]["location"]["uri"], uri(&other).to_string());
+
+    let id = RequestId::from("workspace-symbols-local".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "LocalThing"}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn references_include_unopened_consumers() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let unrelated = temp.path().join("Unrelated.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\n  Log(Provider.SharedValue);\nend;\nend.\n";
+    let unrelated_source =
+        "unit Unrelated;\ninterface\nconst SharedValue = 2;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&unrelated, unrelated_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("bound-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let locations = response.result.unwrap();
+    assert_eq!(locations.as_array().unwrap().len(), 2);
+    assert!(
+        locations
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|location| location["uri"] == uri(&consumer).to_string())
+    );
+
+    let id = RequestId::from("bound-references-with-declaration".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let locations = response.result.unwrap();
+    assert_eq!(locations.as_array().unwrap().len(), 3);
+    assert_eq!(locations[0]["uri"], uri(&consumer).to_string());
+    assert_eq!(locations[1]["uri"], uri(&consumer).to_string());
+    assert_eq!(locations[2]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn class_field_queries_keep_declarations_accessors_and_renames_bound() {
+    let first = "  TFirst = class\n    FValue: Integer;\n    property Value: Integer read FValue;\n  end;\n";
+    let second = "  TSecond = class\n    FValue: Integer;\n  end;\n";
+
+    for (case_name, first_before_second) in [
+        ("first-before-second", true),
+        ("second-before-first", false),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let source_path = temp.path().join("ReviewCache.pas");
+        let source = if first_before_second {
+            format!("unit ReviewCache;\ninterface\ntype\n{first}{second}implementation\nend.\n")
+        } else {
+            format!("unit ReviewCache;\ninterface\ntype\n{second}{first}implementation\nend.\n")
+        };
+        write_file(&source_path, &source);
+        let disk_source = fs::read(&source_path).expect("read fixture bytes");
+        let target_field_occurrence = if first_before_second { 0 } else { 1 };
+        let property_occurrence = if first_before_second { 1 } else { 2 };
+        let target_field =
+            expected_location_signature(&source_path, &source, "FValue", target_field_occurrence);
+        let property_accessor =
+            expected_location_signature(&source_path, &source, "FValue", property_occurrence);
+
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+
+        let references_without_id = RequestId::from(format!("{case_name}-references-without"));
+        server.send_request(
+            references_without_id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(&source, "FValue", target_field_occurrence),
+                "context": {"includeDeclaration": false}
+            }),
+        );
+        let references_without = result_locations(server.response(&references_without_id));
+        assert_exact_location_signatures(&references_without, vec![property_accessor.clone()]);
+
+        let references_with_id = RequestId::from(format!("{case_name}-references-with"));
+        server.send_request(
+            references_with_id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(&source, "FValue", target_field_occurrence),
+                "context": {"includeDeclaration": true}
+            }),
+        );
+        let references_with = result_locations(server.response(&references_with_id));
+        assert_exact_location_signatures(
+            &references_with,
+            vec![target_field.clone(), property_accessor.clone()],
+        );
+
+        let highlights_id = RequestId::from(format!("{case_name}-highlights"));
+        server.send_request(
+            highlights_id.clone(),
+            "textDocument/documentHighlight",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(&source, "FValue", target_field_occurrence)
+            }),
+        );
+        let highlights = result_locations(server.response(&highlights_id));
+        let mut highlight_ranges = highlights.iter().map(range_signature).collect::<Vec<_>>();
+        highlight_ranges.sort();
+        let mut expected_ranges = [target_field.clone(), property_accessor.clone()]
+            .into_iter()
+            .map(|(_, line, start, _, end)| (line, start, line, end))
+            .collect::<Vec<_>>();
+        expected_ranges.sort();
+        assert_eq!(highlight_ranges, expected_ranges);
+
+        let rename_id = RequestId::from(format!("{case_name}-rename"));
+        server.send_request(
+            rename_id.clone(),
+            "textDocument/rename",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(&source, "FValue", target_field_occurrence),
+                "newName": "FChanged"
+            }),
+        );
+        let rename = server.response(&rename_id);
+        assert!(rename.error.is_none(), "rename failed: {rename:?}");
+        assert_exact_workspace_edit(
+            &rename.result.expect("rename result"),
+            vec![
+                (
+                    uri(&source_path).to_string(),
+                    position_of(&source, "FValue", target_field_occurrence),
+                    Position::new(
+                        position_of(&source, "FValue", target_field_occurrence).line,
+                        position_of(&source, "FValue", target_field_occurrence).character
+                            + "FValue".encode_utf16().count() as u32,
+                    ),
+                    "FChanged".to_owned(),
+                ),
+                (
+                    uri(&source_path).to_string(),
+                    position_of(&source, "FValue", property_occurrence),
+                    Position::new(
+                        position_of(&source, "FValue", property_occurrence).line,
+                        position_of(&source, "FValue", property_occurrence).character
+                            + "FValue".encode_utf16().count() as u32,
+                    ),
+                    "FChanged".to_owned(),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            fs::read(&source_path).expect("read fixture after queries"),
+            disk_source
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn references_use_unsaved_overlay_text_and_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let disk_provider = "unit Provider;\ninterface\nconst DiskValue = 1;\nimplementation\nend.\n";
+    let overlay_provider = "unit Provider;\ninterface\nconst OverlayValue = 1;\nimplementation\nprocedure Use;\nbegin\n  Log(OverlayValue);\nend;\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(OverlayValue);\nend;\nend.\n";
+    write_file(&provider, disk_provider);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 7,
+                "text": overlay_provider
+            }
+        }),
+    );
+    let id = RequestId::from("overlay-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(overlay_provider, "OverlayValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let locations = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(locations.len(), 2);
+    assert!(locations.iter().any(|location| {
+        location["uri"] == uri(&provider).to_string() && location["range"]["start"]["line"] == 6
+    }));
+    assert!(locations.iter().any(|location| {
+        location["uri"] == uri(&consumer).to_string() && location["range"]["start"]["line"] == 6
+    }));
+    server.shutdown();
+}
+
+#[test]
+fn references_and_highlights_follow_overlay_deletions_without_writing_disk_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let highlight = temp.path().join("Highlight.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let deleted_consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    let highlight_source = "unit Highlight;\ninterface\nconst LocalValue = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(LocalValue);\nend;\nend.\n";
+    let deleted_highlight_source = highlight_source.replace("  Log(LocalValue);\n", "");
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&highlight, highlight_source);
+    let disk_provider = fs::read(&provider).unwrap();
+    let disk_consumer = fs::read(&consumer).unwrap();
+    let disk_highlight = fs::read(&highlight).unwrap();
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (path, version, text) in [
+        (&consumer, 1, consumer_source),
+        (&highlight, 1, highlight_source),
+    ] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": version,
+                    "text": text
+                }
+            }),
+        );
+    }
+
+    let id = RequestId::from("overlay-reference-before-delete".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert_eq!(result_locations(response).len(), 1);
+
+    let id = RequestId::from("overlay-highlight-before-delete".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&highlight)},
+            "position": position_of(highlight_source, "LocalValue", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert_eq!(result_locations(response).len(), 2);
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&consumer), "version": 2},
+            "contentChanges": [{"text": deleted_consumer_source}]
+        }),
+    );
+    let id = RequestId::from("overlay-reference-after-delete".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&highlight), "version": 2},
+            "contentChanges": [{"text": deleted_highlight_source}]
+        }),
+    );
+    let id = RequestId::from("overlay-highlight-after-delete".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&highlight)},
+            "position": position_of(highlight_source, "LocalValue", 0)
+        }),
+    );
+    let response = server.response(&id);
+    let highlights = result_locations(response);
+    assert_eq!(highlights.len(), 1);
+    assert_eq!(
+        highlights[0]["range"],
+        json!({
+            "start": {"line": 2, "character": 6},
+            "end": {"line": 2, "character": 16}
+        })
+    );
+
+    assert_eq!(fs::read(&provider).unwrap(), disk_provider);
+    assert_eq!(fs::read(&consumer).unwrap(), disk_consumer);
+    assert_eq!(fs::read(&highlight).unwrap(), disk_highlight);
+    server.shutdown();
+}
+
+#[test]
+fn references_and_highlights_reject_a_removed_selected_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("Main.pas");
+    let selected = temp.path().join("Selected.dproj");
+    let remaining = temp.path().join("Remaining.dproj");
+    let source = "unit Main;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(Value);\nend;\nend.\n";
+    write_file(&main, source);
+    for project in [&selected, &remaining] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let select_id = RequestId::from("select-project-for-queries".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "projectUri": uri(&selected)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    fs::remove_file(&selected).unwrap();
+
+    let references_id = RequestId::from("removed-project-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Value", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let references = server.response(&references_id);
+    let error = references
+        .error
+        .expect("references must reject a removed selected project");
+    assert!(error.message.contains("project selection") || error.message.contains("invalid"));
+    assert!(references.result.is_none());
+
+    let highlights_id = RequestId::from("removed-project-highlights".to_string());
+    server.send_request(
+        highlights_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Value", 0)
+        }),
+    );
+    let highlights = server.response(&highlights_id);
+    let error = highlights
+        .error
+        .expect("highlights must reject a removed selected project");
+    assert!(error.message.contains("project selection") || error.message.contains("invalid"));
+    assert!(highlights.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn references_respect_explicit_source_exclusions() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("excluded/Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"exclude": ["excluded/**"]}));
+    let id = RequestId::from("excluded-reference-consumer".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn document_highlights_are_local_and_include_declaration() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let provider_source = "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nprocedure Run;\nbegin\n  Log('😀', SharedValue);\n  Log('😀', SharedValue);\nend;\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("document-highlights".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let highlights = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(highlights.len(), 3);
+    assert!(highlights.iter().all(|highlight| {
+        highlight["uri"].is_null() && highlight["kind"].is_null() && highlight["range"].is_object()
+    }));
+    let starts = highlights
+        .iter()
+        .map(|highlight| {
+            (
+                highlight["range"]["start"]["line"].as_u64().unwrap(),
+                highlight["range"]["start"]["character"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts, vec![(2, 6), (6, 12), (7, 12)]);
+    assert!(!highlights.iter().any(|highlight| {
+        highlight["range"]["start"]["line"] == 7
+            && highlight["range"]["start"]["character"] == 6
+            && highlight["uri"] == uri(&consumer).to_string()
+    }));
+    server.shutdown();
+}
+
+#[test]
+fn document_highlights_retain_needed_import_bindings_without_consumer_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("imported-document-highlights".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&consumer)},
+            "position": position_of(consumer_source, "SharedValue", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let highlights = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(highlights.len(), 1);
+    assert_eq!(
+        highlights[0]["range"],
+        json!({
+            "start": {"line": 6, "character": 6},
+            "end": {"line": 6, "character": 17}
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn unit_module_reference_queries_fail_and_unit_highlights_are_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ReviewUnit.pas");
+    let source = "unit ReviewUnit;\ninterface\nimplementation\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let references_id = RequestId::from("unit-module-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "ReviewUnit", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let references = server.response(&references_id);
+    let error = references
+        .error
+        .expect("unit/module references are outside the supported binding subset");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("unit/module"));
+    assert!(references.result.is_none());
+
+    let highlights_id = RequestId::from("unit-module-highlights".to_string());
+    server.send_request(
+        highlights_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "ReviewUnit", 0)
+        }),
+    );
+    let highlights = server.response(&highlights_id);
+    assert!(highlights.error.is_none(), "{highlights:?}");
+    assert!(highlights.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn document_highlights_ignore_huge_unreadable_unrelated_trees_and_dependency_occurrences() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let main = temp.path().join("Main.pas");
+    let unrelated = temp.path().join("unrelated/Huge.pas");
+    let unreadable = temp.path().join("unrelated/Unreadable.pas");
+    let mut provider_source = String::from(
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nprocedure Noise;\nbegin\n",
+    );
+    for _ in 0..10_000 {
+        provider_source.push_str("  Log(SharedValue);\n");
+    }
+    provider_source.push_str("end;\nend.\n");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let huge_unrelated = format!(
+        "unit Huge;\ninterface\nconst SharedValue = 1;\nimplementation\n{}\n",
+        "x".repeat(2 * 1024 * 1024)
+    );
+    let unreadable_source =
+        "unit Unreadable;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    write_file(&provider, &provider_source);
+    write_file(&main, main_source);
+    write_file(&unrelated, &huge_unrelated);
+    write_file(&unreadable, unreadable_source);
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&unreadable).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&unreadable, permissions).unwrap();
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("isolated-highlight-tree".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let highlights = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(
+        highlights.len(),
+        1,
+        "dependency occurrences and unrelated unreadable/huge files must not affect local highlights"
+    );
+    assert_eq!(
+        highlights[0]["range"],
+        json!({
+            "start": {"line": 6, "character": 6},
+            "end": {"line": 6, "character": 17}
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn document_highlights_reject_incomplete_import_binding_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("Main.pas");
+    let provider_a = temp.path().join("ProviderA.pas");
+    let provider_b = temp.path().join("ProviderB.pas");
+    let main_source = "unit Main;\ninterface\nuses ProviderA, ProviderB;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let provider_source =
+        "unit ProviderA;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let provider_b_source = provider_source.replace("ProviderA", "ProviderB");
+    write_file(&main, main_source);
+    write_file(&provider_a, provider_source);
+    write_file(&provider_b, &provider_b_source);
+
+    let request = json!({
+        "textDocument": {"uri": uri(&main)},
+        "position": position_of(main_source, "SharedValue", 0)
+    });
+    let mut incomplete_server = TestServer::launch();
+    incomplete_server.initialize(temp.path(), json!({"maxFiles": 2}));
+    let incomplete_id = RequestId::from("incomplete-import-highlights".to_string());
+    incomplete_server.send_request(
+        incomplete_id.clone(),
+        "textDocument/documentHighlight",
+        request.clone(),
+    );
+    let incomplete = incomplete_server.response(&incomplete_id);
+    assert!(
+        incomplete.error.is_some(),
+        "incomplete import binding must not guess the retained provider: {incomplete:?}"
+    );
+    assert!(incomplete.result.is_none());
+    incomplete_server.shutdown();
+
+    let mut complete_server = TestServer::launch();
+    complete_server.initialize(temp.path(), json!({"maxFiles": 3}));
+    let complete_id = RequestId::from("complete-import-highlights".to_string());
+    complete_server.send_request(
+        complete_id.clone(),
+        "textDocument/documentHighlight",
+        request,
+    );
+    let complete = complete_server.response(&complete_id);
+    assert!(complete.error.is_none(), "{complete:?}");
+    assert!(complete.result.unwrap().as_array().unwrap().is_empty());
+    complete_server.shutdown();
+}
+
+#[test]
+fn reference_and_highlight_queries_return_empty_for_whitespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("WhitespaceQueries.pas");
+    let source = "unit WhitespaceQueries;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  // Value\n  Log('Value');\n  Value;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (id_text, method, params) in [
+        (
+            "whitespace-references",
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": {"line": 5, "character": 5},
+                "context": {"includeDeclaration": true}
+            }),
+        ),
+        (
+            "whitespace-highlights",
+            "textDocument/documentHighlight",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": {"line": 5, "character": 5}
+            }),
+        ),
+        (
+            "comment-references",
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(source, "Value", 1),
+                "context": {"includeDeclaration": true}
+            }),
+        ),
+        (
+            "comment-highlights",
+            "textDocument/documentHighlight",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(source, "Value", 1)
+            }),
+        ),
+        (
+            "string-references",
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(source, "Value", 2),
+                "context": {"includeDeclaration": true}
+            }),
+        ),
+        (
+            "string-highlights",
+            "textDocument/documentHighlight",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_of(source, "Value", 2)
+            }),
+        ),
+    ] {
+        let id = RequestId::from(id_text.to_string());
+        server.send_request(id.clone(), method, params);
+        let response = server.response(&id);
+        assert!(response.error.is_none(), "{response:?}");
+        assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    }
+    server.shutdown();
+}
+
+#[test]
+fn highlights_ignore_an_unrelated_unsupported_same_named_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("UnsupportedHighlight.pas");
+    let source = "unit UnsupportedHighlight;\ninterface\nconst Target = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(Target);\n  with Unknown do\n    Target := 2;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("unsupported-highlight".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "Target", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.unwrap();
+    let highlights = result.as_array().unwrap();
+    assert_eq!(highlights.len(), 2);
+    assert!(highlights.iter().all(|highlight| {
+        highlight["range"]["start"]["line"] == 2 || highlight["range"]["start"]["line"] == 6
+    }));
+
+    let id = RequestId::from("unsupported-highlight-selected-with".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "Target", 2)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(
+        response.result.unwrap().as_array().unwrap().is_empty(),
+        "an unsupported selected with occurrence must not authorize global highlights"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn document_highlights_return_empty_for_a_selected_unknown_ancestor_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("UnknownAncestorHighlight.pas");
+    let source = "unit UnknownAncestorHighlight;\ninterface\ntype\n  TChild = class(TUnknownAncestor)\n  public\n    procedure Use;\n  end;\nconst\n  Target = 1;\nimplementation\nprocedure TChild.Use;\nbegin\n  Log(Target);\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("unknown-ancestor-highlight".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "Target", 1)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(
+        response.result.unwrap().as_array().unwrap().is_empty(),
+        "an unknown ancestor occurrence must not authorize global highlights"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn document_highlights_return_empty_for_an_unbound_cursor() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("UnboundHighlight.pas");
+    let source = "unit UnboundHighlight;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Unknown;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("unbound-highlight".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "Unknown", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn references_reject_an_incomplete_workspace_without_partial_locations() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses MissingUnit;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("incomplete-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("incomplete reference discovery must fail closed");
+    assert!(error.message.contains("incomplete"));
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn references_report_the_actual_response_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ManyReferences.pas");
+    let mut source = String::from(
+        "unit ManyReferences;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..10_001 {
+        source.push_str("  Log(Value);\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("reference-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(&source, "Value", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("reference result bound must fail closed");
+    assert!(error.message.contains("10000"), "{error:?}");
+
+    let id = RequestId::from("highlight-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(&source, "Value", 0)
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("document highlight result bound must fail closed");
+    assert!(error.message.contains("10000"), "{error:?}");
+    server.shutdown();
+}
+
+#[test]
+fn references_and_highlights_enforce_exact_10000_entry_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let consumer_two = temp.path().join("ConsumerTwo.pas");
+    let highlight_exact = temp.path().join("HighlightExact.pas");
+    let highlight_overflow = temp.path().join("HighlightOverflow.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let make_consumer = |unit: &str, uses: usize| {
+        let mut source = format!(
+            "unit {unit};\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n"
+        );
+        for _ in 0..uses {
+            source.push_str("  Log(SharedValue);\n");
+        }
+        source.push_str("end;\nend.\n");
+        source
+    };
+    let make_highlight_source = |unit: &str, uses: usize| {
+        let mut source = format!(
+            "unit {unit};\ninterface\nconst Target = 1;\nimplementation\nprocedure Run;\nbegin\n"
+        );
+        for _ in 0..uses {
+            source.push_str("  Log(Target);\n");
+        }
+        source.push_str("end;\nend.\n");
+        source
+    };
+    let consumer_exact = make_consumer("Consumer", 5_000);
+    let consumer_two_exact = make_consumer("ConsumerTwo", 5_000);
+    let highlight_exact_source = make_highlight_source("HighlightExact", 9_999);
+    let highlight_overflow_source = make_highlight_source("HighlightOverflow", 10_000);
+    write_file(&provider, provider_source);
+    write_file(&consumer, &consumer_exact);
+    write_file(&consumer_two, &consumer_two_exact);
+    write_file(&highlight_exact, &highlight_exact_source);
+    write_file(&highlight_overflow, &highlight_overflow_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let id = RequestId::from("references-exact-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let locations = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(locations.len(), 10_000);
+    assert!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&consumer).to_string())
+            .count()
+            == 5_000
+    );
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&consumer_two).to_string())
+            .count(),
+        5_000
+    );
+
+    let consumer_overflow = make_consumer("Consumer", 5_001);
+    write_file(&consumer, &consumer_overflow);
+    let id = RequestId::from("references-overflow-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("10,001 reference locations must fail closed");
+    assert_eq!(
+        error.message,
+        "binding reference result exceeds the 10000-entry limit"
+    );
+    assert!(response.result.is_none());
+
+    let id = RequestId::from("highlights-exact-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&highlight_exact)},
+            "position": position_of(&highlight_exact_source, "Target", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let highlights = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(highlights.len(), 10_000);
+    assert_eq!(highlights[0]["range"]["start"]["line"], 2);
+
+    let id = RequestId::from("highlights-overflow-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&highlight_overflow)},
+            "position": position_of(&highlight_overflow_source, "Target", 0)
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("10,001 highlight locations must fail closed");
+    assert_eq!(
+        error.message,
+        "binding reference result exceeds the 10000-entry limit"
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn reference_cancellation_handles_thousands_of_occurrences() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ManyReferenceUses.pas");
+    let mut source = String::from(
+        "unit ManyReferenceUses;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..4_000 {
+        source.push_str("  Log(Value);\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("cancelled-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(&source, "Value", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": "cancelled-references"}));
+    let response = server.response(&id);
+    let error = response.error.expect("cancelled reference query must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbols_respect_exclusions_and_unsaved_overlays() {
+    let temp = tempfile::tempdir().unwrap();
+    let visible = temp.path().join("Visible.pas");
+    let excluded_dir = temp.path().join("ignored");
+    let excluded = excluded_dir.join("Excluded.pas");
+    fs::create_dir_all(&excluded_dir).unwrap();
+    write_file(
+        &visible,
+        "unit Visible;\ninterface\nprocedure DiskOnly;\nimplementation\nend.\n",
+    );
+    write_file(
+        &excluded,
+        "unit Excluded;\ninterface\nprocedure HiddenThing;\nimplementation\nend.\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"exclude": ["ignored"]}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&visible),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit Visible;\ninterface\nprocedure OverlayOnly;\nimplementation\nend.\n"
+            }
+        }),
+    );
+
+    let id = RequestId::from("workspace-symbols-overlay".to_string());
+    server.send_request(id.clone(), "workspace/symbol", json!({"query": "Only"}));
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let symbols = response.result.unwrap().as_array().unwrap().clone();
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["OverlayOnly"]
+    );
+
+    let id = RequestId::from("workspace-symbols-excluded".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "HiddenThing"}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn symbol_queries_allow_readable_external_source_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let external = temp.path().join("external-sources");
+    let main = root.join("Main.pas");
+    let external_source = external.join("External.pas");
+    write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
+    let external_text =
+        "unit External;\ninterface\nprocedure ExternalThing;\nimplementation\nend.\n";
+    write_file(&external_source, external_text);
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        &root,
+        json!({"sourcePaths": [external.to_string_lossy().to_string()]}),
+    );
+
+    let outline_id = RequestId::from("external-outline".to_string());
+    server.send_request(
+        outline_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&external_source)}}),
+    );
+    let outline = server.response(&outline_id);
+    assert!(
+        outline.error.is_none(),
+        "external outline failed: {outline:?}"
+    );
+    assert_eq!(outline.result.unwrap()[0]["name"], "External");
+
+    let search_id = RequestId::from("external-search".to_string());
+    server.send_request(
+        search_id.clone(),
+        "workspace/symbol",
+        json!({"query": "ExternalThing"}),
+    );
+    let search = server.response(&search_id);
+    assert!(search.error.is_none(), "external search failed: {search:?}");
+    assert_eq!(search.result.unwrap()[0]["name"], "ExternalThing");
+
+    let references_id = RequestId::from("external-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&external_source)},
+            "position": position_of(external_text, "ExternalThing", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let references = server.response(&references_id);
+    assert!(
+        references.error.is_none(),
+        "external references failed: {references:?}"
+    );
+    assert_eq!(references.result.unwrap().as_array().unwrap().len(), 1);
+
+    let highlights_id = RequestId::from("external-highlights".to_string());
+    server.send_request(
+        highlights_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&external_source)},
+            "position": position_of(external_text, "ExternalThing", 0)
+        }),
+    );
+    let highlights = server.response(&highlights_id);
+    assert!(
+        highlights.error.is_none(),
+        "external highlights failed: {highlights:?}"
+    );
+    assert_eq!(highlights.result.unwrap().as_array().unwrap().len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn symbol_queries_require_source_membership_for_external_documents() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let external = temp.path().join("external-sources");
+    let main = root.join("Main.pas");
+    let external_source = external.join("External.pas");
+    write_file(&main, "unit Main; interface implementation end.\n");
+    write_file(
+        &external_source,
+        "unit External; interface procedure ExternalThing; implementation end.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+
+    let outline_id = RequestId::from("unconfigured-external-outline".to_string());
+    server.send_request(
+        outline_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&external_source)}}),
+    );
+    let outline = server.response(&outline_id);
+    let error = outline
+        .error
+        .expect("unconfigured external outline must fail");
+    assert!(error.message.contains("outside configured workspace roots"));
+
+    let search_id = RequestId::from("unconfigured-external-search".to_string());
+    server.send_request(
+        search_id.clone(),
+        "workspace/symbol",
+        json!({"query": "ExternalThing"}),
+    );
+    let search = server.response(&search_id);
+    assert!(
+        search.error.is_none(),
+        "workspace search failed: {search:?}"
+    );
+    assert!(search.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn structural_symbol_queries_ignore_unresolved_include_dependencies_in_ambiguous_project_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("Main.pas");
+    write_file(
+        &source_path,
+        "unit Main;\ninterface\nprocedure VisibleThing;\n{$I missing.inc}\nimplementation\nend.\n",
+    );
+    for name in ["A", "B"] {
+        write_file(
+            &temp.path().join(format!("{name}.dproj")),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let id = RequestId::from("structural-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "VisibleThing"}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "structural search failed: {response:?}"
+    );
+    assert_eq!(response.result.unwrap()[0]["name"], "VisibleThing");
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbol_queries_report_the_actual_file_count_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write_file(
+        &root.join("First.pas"),
+        "unit First; interface procedure FirstThing; implementation end.\n",
+    );
+    write_file(
+        &root.join("Second.pas"),
+        "unit Second; interface procedure SecondThing; implementation end.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFiles": 1}));
+    let id = RequestId::from("file-count-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "SecondThing"}),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("workspace symbol file bound must fail closed");
+    assert!(error.message.contains("incomplete"));
+    assert!(error.message.contains("file limit"));
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbol_queries_report_the_actual_total_byte_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let source = "unit Bounded;\ninterface\nprocedure BoundedThing;\nimplementation\nend.\n";
+    write_file(&root.join("First.pas"), source);
+    write_file(&root.join("Second.pas"), source);
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        &root,
+        json!({"maxFiles": 4, "maxTotalBytes": source.len() + 1}),
+    );
+    let id = RequestId::from("total-byte-bound".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "BoundedThing"}),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("workspace symbol total byte bound must fail closed");
+    assert!(error.message.contains("incomplete"));
+    assert!(error.message.contains("byte limit"));
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbols_accept_exactly_the_response_bound_across_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write_file(
+        &root.join("First.pas"),
+        &workspace_symbol_source("First", 4_999),
+    );
+    write_file(
+        &root.join("Second.pas"),
+        &workspace_symbol_source("Second", 4_999),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("cross-file-exact-bound".to_string());
+    server.send_request(id.clone(), "workspace/symbol", json!({"query": ""}));
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "exact cross-file bound failed: {response:?}"
+    );
+    let result = response.result.expect("exact cross-file bound result");
+    let symbols = result.as_array().expect("workspace symbol array");
+    assert_eq!(symbols.len(), 10_000);
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|symbol| symbol["name"] == "First" || symbol["name"] == "Second")
+            .count(),
+        2,
+        "the two unit entries must be included in the shared count"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbols_reject_the_first_cross_file_result_over_the_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write_file(
+        &root.join("First.pas"),
+        &workspace_symbol_source("First", 4_999),
+    );
+    write_file(
+        &root.join("Second.pas"),
+        &workspace_symbol_source("Second", 5_000),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("cross-file-over-bound".to_string());
+    server.send_request(id.clone(), "workspace/symbol", json!({"query": ""}));
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("the first cross-file result over the bound must fail");
+    assert!(error.message.contains("10000"));
+    assert!(error.message.contains("narrow"));
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbols_return_empty_for_an_empty_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let id = RequestId::from("empty-workspace-symbols".to_string());
+    server.send_request(id.clone(), "workspace/symbol", json!({"query": "anything"}));
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbol_cancellation_handles_thousands_of_declarations() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let source_path = root.join("Many.pas");
+    let mut source = String::from("unit Many;\ninterface\nvar\n");
+    for index in 0..4_000 {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("cancelled-workspace-symbols".to_string());
+    server.send_request(id.clone(), "workspace/symbol", json!({"query": "Symbol"}));
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "cancelled-workspace-symbols"}),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("cancelled workspace symbol query must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn document_symbol_cancellation_handles_thousands_of_declarations() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let source_path = root.join("Many.pas");
+    let mut source = String::from("unit Many;\ninterface\nvar\n");
+    for index in 0..4_000 {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("cancelled-document-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "cancelled-document-symbols"}),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("cancelled document symbol query must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
     server.shutdown();
 }
 
@@ -4507,6 +6277,116 @@ fn rejected_open_dependency_without_a_disk_entry_is_not_resolved() {
         navigation_params(&main, main_source, "ProviderRoutine", 0),
     );
     assert!(result_locations(server.response(&request_id)).is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn rejected_open_required_provider_never_falls_back_to_disk_for_highlights() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(DiskValue);\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nconst DiskValue = 1;\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFileBytes": 256}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let oversized_overlay = format!("{provider_source}{}", "x".repeat(400));
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&provider), "version": 2},
+            "contentChanges": [{"text": oversized_overlay}]
+        }),
+    );
+    let rejection = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        rejection["diagnostics"][0]["message"]
+            .as_str()
+            .expect("rejection diagnostic")
+            .contains("per-file limit")
+    );
+
+    let request_id = RequestId::from("rejected-required-provider-highlights".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "DiskValue", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("required rejected provider must fail closed");
+    assert!(
+        error.message.to_ascii_lowercase().contains("rejected"),
+        "unexpected required-provider error: {error:?}"
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn unrelated_rejected_open_buffer_does_not_block_local_highlights() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let unrelated = root.join("Unrelated.pas");
+    let main_source = "unit Main;\ninterface\nconst LocalValue = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(LocalValue);\nend;\nend.\n";
+    let unrelated_source = "unit Unrelated;\ninterface\nconst Noise = 1;\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(&unrelated, unrelated_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"maxFileBytes": 256}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated),
+                "languageId": "pascal",
+                "version": 1,
+                "text": format!("{unrelated_source}{}", "x".repeat(400))
+            }
+        }),
+    );
+    let rejection = server.notification("textDocument/publishDiagnostics");
+    assert!(
+        rejection["diagnostics"][0]["message"]
+            .as_str()
+            .expect("rejection diagnostic")
+            .contains("per-file limit")
+    );
+
+    let request_id = RequestId::from("unrelated-rejected-local-highlights".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "LocalValue", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(response.result.unwrap().as_array().unwrap().len(), 2);
     server.shutdown();
 }
 

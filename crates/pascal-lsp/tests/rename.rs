@@ -1,4 +1,4 @@
-use lsp_types::{Position, PrepareRenameResponse, Range, TextEdit, Url};
+use lsp_types::{Location, Position, PrepareRenameResponse, Range, TextEdit, Url};
 use pascal_lsp::NavigationIndex;
 use std::collections::HashMap;
 
@@ -124,6 +124,27 @@ fn assert_exact_edits(
     assert_eq!(exact_edit_signatures(edits), expected_signatures);
 }
 
+fn location_signature(location: &Location) -> (String, u32, u32, u32, u32) {
+    (
+        location.uri.to_string(),
+        location.range.start.line,
+        location.range.start.character,
+        location.range.end.line,
+        location.range.end.character,
+    )
+}
+
+fn assert_exact_locations(locations: &[Location], mut expected: Vec<(Url, Range)>) {
+    let mut actual = locations.iter().map(location_signature).collect::<Vec<_>>();
+    let mut expected = expected
+        .drain(..)
+        .map(|(uri, range)| location_signature(&Location { uri, range }))
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
 fn apply_edits(source: &str, edits: &[TextEdit]) -> String {
     let mut replacements = edits
         .iter()
@@ -210,6 +231,31 @@ end.
         &edits[&consumer_uri],
         &consumer.replacen("kSQLDebugFile", "K_SQL_DEBUG_FILE", 1),
     );
+}
+
+#[test]
+fn binding_locations_filter_both_parameter_declaration_sites() {
+    let source = "unit ParameterReferences;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\n  Value := Value + 1;\nend;\nend.\n";
+    let uri = uri("ParameterReferences");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_string())
+        .expect("parameter source parses");
+
+    let without_declarations = index
+        .binding_locations(&uri, position_of(source, "Value", 0), false)
+        .expect("parameter references are resolved");
+    assert_eq!(without_declarations.len(), 2);
+    assert!(
+        without_declarations
+            .iter()
+            .all(|location| location.range.start.line == 6)
+    );
+
+    let with_declarations = index
+        .binding_locations(&uri, position_of(source, "Value", 0), true)
+        .expect("parameter declarations are resolved");
+    assert_eq!(with_declarations.len(), 4);
 }
 
 #[test]
@@ -999,6 +1045,137 @@ end.
             .replacen("Value", "Count", 1)
             .replacen("One.Value", "One.Count", 1),
     );
+}
+
+fn class_field_cache_source(first_before_second: bool) -> String {
+    let first = "  TFirst = class\n    FValue: Integer;\n    property Value: Integer read FValue;\n    procedure Touch;\n  end;\n";
+    let second = "  TSecond = class\n    FValue: Integer;\n  end;\n";
+    let declarations = if first_before_second {
+        format!("{first}{second}")
+    } else {
+        format!("{second}{first}")
+    };
+    format!(
+        "unit ClassFieldCache;\ninterface\ntype\n{declarations}var\n  FValue: Integer;\nimplementation\nprocedure TFirst.Touch;\nvar\n  FValue: Integer;\nbegin\n  FValue := 1;\n  Self.FValue := 2;\n  TFirst.FValue := 3;\nend;\nprocedure GlobalTouch;\nbegin\n  FValue := 4;\nend;\nend.\n"
+    )
+}
+
+#[test]
+fn class_field_references_and_renames_do_not_share_unqualified_cache() {
+    for (case_name, first_before_second) in [("first-first", true), ("second-first", false)] {
+        let source = class_field_cache_source(first_before_second);
+        let mut index = NavigationIndex::new();
+        let source_uri = update(&mut index, case_name, &source);
+        let target_declaration_occurrence = if first_before_second { 0 } else { 1 };
+        let target_position = range_in(
+            &source,
+            "    FValue: Integer",
+            "FValue",
+            target_declaration_occurrence,
+        )
+        .start;
+        let expected_target = vec![
+            (
+                source_uri.clone(),
+                range_in(
+                    &source,
+                    "    FValue: Integer",
+                    "FValue",
+                    target_declaration_occurrence,
+                ),
+            ),
+            (
+                source_uri.clone(),
+                range_in(&source, "property Value: Integer read FValue", "FValue", 0),
+            ),
+            (
+                source_uri.clone(),
+                range_in(&source, "Self.FValue", "FValue", 0),
+            ),
+            (
+                source_uri.clone(),
+                range_in(&source, "TFirst.FValue", "FValue", 0),
+            ),
+        ];
+
+        let without_declaration = index
+            .binding_locations(&source_uri, target_position, false)
+            .expect("class field references without declarations resolve");
+        assert_exact_locations(&without_declaration, expected_target[1..].to_vec());
+
+        let with_declaration = index
+            .binding_locations(&source_uri, target_position, true)
+            .expect("class field references with declarations resolve");
+        assert_exact_locations(&with_declaration, expected_target.clone());
+
+        let edits = index
+            .rename_edits(&source_uri, target_position, "FChanged")
+            .expect("class field rename resolves");
+        assert_exact_edits(
+            &edits,
+            expected_target
+                .into_iter()
+                .map(|(uri, range)| (uri, range, "FChanged".to_owned()))
+                .collect(),
+        );
+    }
+}
+
+#[test]
+fn class_field_cache_does_not_merge_a_distinct_record_owner() {
+    let record = "  TRecord = record\n    FValue: Integer;\n  end;\n";
+    let class = "  TClass = class\n    FValue: Integer;\n    property Value: Integer read FValue;\n  end;\n";
+
+    for (case_name, record_before_class) in [("record-first", true), ("class-first", false)] {
+        let declarations = if record_before_class {
+            format!("{record}{class}")
+        } else {
+            format!("{class}{record}")
+        };
+        let source = format!(
+            "unit RecordClassCache;\ninterface\ntype\n{declarations}implementation\nend.\n"
+        );
+        let mut index = NavigationIndex::new();
+        let source_uri = update(&mut index, case_name, &source);
+        let class_declaration_occurrence = if record_before_class { 1 } else { 0 };
+        let property_occurrence = if record_before_class { 2 } else { 1 };
+        let target = range_in(
+            &source,
+            "    FValue: Integer",
+            "FValue",
+            class_declaration_occurrence,
+        );
+        let property = range_in(&source, "property Value: Integer read FValue", "FValue", 0);
+        assert_eq!(
+            position_of(&source, "FValue", property_occurrence),
+            property.start,
+            "fixture occurrence accounting must select the class accessor"
+        );
+
+        let without_declaration = index
+            .binding_locations(&source_uri, target.start, false)
+            .expect("class field references without declarations resolve");
+        assert_exact_locations(&without_declaration, vec![(source_uri.clone(), property)]);
+
+        let with_declaration = index
+            .binding_locations(&source_uri, target.start, true)
+            .expect("class field references with declarations resolve");
+        assert_exact_locations(
+            &with_declaration,
+            vec![(source_uri.clone(), target), (source_uri.clone(), property)],
+        );
+
+        let edits = index
+            .rename_edits(&source_uri, target.start, "FChanged")
+            .expect("class field rename resolves");
+        assert_exact_edits(
+            &edits,
+            vec![
+                (source_uri.clone(), target, "FChanged".to_owned()),
+                (source_uri, property, "FChanged".to_owned()),
+            ],
+        );
+    }
 }
 
 #[test]

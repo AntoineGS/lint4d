@@ -4,9 +4,131 @@ use super::{
     identifier_nodes, is_ignored_offset, is_right_hand_member, member_expression_at, node_text,
     qualified_type_path_at, routine_name, routine_signature, use_name_at,
 };
+use crate::text::PositionIndex;
 use lsp_types::{PrepareRenameResponse, Range, TextEdit, Url};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::Node;
+
+const MAX_BINDING_LOCATIONS: usize = 10_000;
+const CANCELLATION_MESSAGE: &str = "request cancelled";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CANCEL_AFTER_CHECKS: Cell<Option<usize>> = const { Cell::new(None) };
+    static TEST_CANCEL_PHASE: Cell<Option<TestCancellationPhase>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestCancellationGuard(Option<usize>);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestCancellationPhase {
+    OccurrenceCollection,
+    LocationConversion,
+}
+
+#[cfg(test)]
+pub(crate) struct TestCancellationPhaseGuard(Option<TestCancellationPhase>);
+
+#[cfg(test)]
+pub(crate) fn test_cancel_after_checks(checks: usize) -> TestCancellationGuard {
+    let previous = TEST_CANCEL_AFTER_CHECKS.with(|budget| {
+        let previous = budget.get();
+        budget.set(Some(checks));
+        previous
+    });
+    TestCancellationGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestCancellationGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_AFTER_CHECKS.with(|budget| budget.set(self.0.take()));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_cancel_in_phase(phase: TestCancellationPhase) -> TestCancellationPhaseGuard {
+    let previous = TEST_CANCEL_PHASE.with(|current| {
+        let previous = current.get();
+        current.set(Some(phase));
+        previous
+    });
+    TestCancellationPhaseGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestCancellationPhaseGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_PHASE.with(|current| current.set(self.0.take()));
+    }
+}
+
+fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
+    #[cfg(test)]
+    let force_cancel = cancel.is_some()
+        && TEST_CANCEL_AFTER_CHECKS.with(|budget| match budget.get() {
+            Some(0) => {
+                budget.set(None);
+                true
+            }
+            Some(remaining) => {
+                budget.set(Some(remaining.saturating_sub(1)));
+                false
+            }
+            None => false,
+        });
+    #[cfg(test)]
+    if force_cancel {
+        if let Some(cancel) = cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(CANCELLATION_MESSAGE.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn check_cancel_at_phase(
+    cancel: Option<&AtomicBool>,
+    phase: TestCancellationPhase,
+) -> Result<(), String> {
+    if cancel.is_some() && TEST_CANCEL_PHASE.with(|current| current.get() == Some(phase)) {
+        if let Some(cancel) = cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    check_cancel(cancel)
+}
+
+fn check_occurrence_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        check_cancel_at_phase(cancel, TestCancellationPhase::OccurrenceCollection)
+    }
+    #[cfg(not(test))]
+    {
+        check_cancel(cancel)
+    }
+}
+
+fn check_location_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        check_cancel_at_phase(cancel, TestCancellationPhase::LocationConversion)
+    }
+    #[cfg(not(test))]
+    {
+        check_cancel(cancel)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SymbolId {
@@ -38,6 +160,15 @@ struct Occurrence {
     span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UnqualifiedReferenceCacheKey {
+    uri: Url,
+    name: String,
+    scope: usize,
+    region: super::Region,
+    owner_type: Option<String>,
+}
+
 #[derive(Debug)]
 struct RenamePlan {
     binding: Binding,
@@ -53,17 +184,114 @@ enum BindingGroup {
 }
 
 impl NavigationIndex {
+    /// Return deduplicated, binding-resolved source locations for an
+    /// identifier, optionally including every declaration site.
+    pub fn binding_locations(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        include_declaration: bool,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        self.binding_locations_impl(uri, position, include_declaration, None, true, None)
+    }
+
+    pub(crate) fn binding_locations_with_cancel(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        include_declaration: bool,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        self.binding_locations_impl(uri, position, include_declaration, None, true, Some(cancel))
+    }
+
+    pub(crate) fn binding_locations_in_document_with_cancel(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        self.binding_locations_impl(uri, position, true, Some(uri), false, Some(cancel))
+    }
+
+    fn binding_locations_impl(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        include_declaration: bool,
+        document_uri: Option<&Url>,
+        strict_resolution: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        check_cancel(cancel)?;
+        let document = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
+        let offset = super::text::position_to_offset(&document.source, position)
+            .ok_or_else(|| "position is outside the source document".to_string())?;
+        if is_ignored_offset(document.tree.root_node(), offset)
+            || identifier_at(document.tree.root_node(), offset).is_none()
+        {
+            return Ok(Vec::new());
+        }
+
+        let selected_identifier = identifier_at(document.tree.root_node(), offset)
+            .expect("identifier presence checked above");
+        if !strict_resolution
+            && document_uri.is_some()
+            && !self.selected_occurrence_is_supported(uri, document, selected_identifier, offset)
+        {
+            return Ok(Vec::new());
+        }
+
+        let (binding, _) = self.binding_plan(uri, position)?;
+        let occurrences = self.collect_occurrences_bounded(
+            &binding,
+            document_uri,
+            include_declaration,
+            strict_resolution,
+            Some(MAX_BINDING_LOCATIONS),
+            cancel,
+        )?;
+        self.locations_for_occurrences(&occurrences, cancel)
+    }
+
+    fn selected_occurrence_is_supported(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        offset: usize,
+    ) -> bool {
+        let span = Span::from_node(identifier);
+        if document
+            .opaque_ranges
+            .iter()
+            .any(|range| range.contains(span))
+            || document.has_parser_recovery_near(span)
+            || has_ancestor_kind(identifier, "ppDirective")
+            || has_ancestor_kind(identifier, "with")
+            || has_ancestor_kind(identifier, "inherited")
+        {
+            return false;
+        }
+        let candidates = self.resolve_candidates_at(uri, document, offset, identifier);
+        !candidates.is_empty()
+            && !self.is_unknown_global_fallback(uri, document, identifier, offset, &candidates)
+    }
+
     pub(crate) fn rename_binding_info(
         &self,
         uri: &Url,
         position: lsp_types::Position,
     ) -> Result<RenameBindingInfo, String> {
-        let plan = self.rename_plan(uri, position)?;
-        let mut names = plan.binding.names.iter().cloned().collect::<Vec<_>>();
+        let (binding, _) = self.binding_plan(uri, position)?;
+        let mut names = binding.names.iter().cloned().collect::<Vec<_>>();
         names.sort_by_key(|name| canonical_name(name));
         names.dedup_by(|left, right| canonical_name(left) == canonical_name(right));
-        let local = !plan.binding.members.is_empty()
-            && plan.binding.members.iter().all(|member| {
+        let local = !binding.members.is_empty()
+            && binding.members.iter().all(|member| {
                 member.uri == *uri
                     && member.scope != ROOT_SCOPE
                     && member.owner_type.is_none()
@@ -435,6 +663,23 @@ impl NavigationIndex {
     }
 
     fn rename_plan(&self, uri: &Url, position: lsp_types::Position) -> Result<RenamePlan, String> {
+        let (binding, selected_span) = self.binding_plan(uri, position)?;
+        let occurrences = self.collect_occurrences(&binding)?;
+        if occurrences.is_empty() {
+            return Err("rename binding has no source occurrences".to_string());
+        }
+        Ok(RenamePlan {
+            binding,
+            selected_span,
+            occurrences,
+        })
+    }
+
+    fn binding_plan(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+    ) -> Result<(Binding, Span), String> {
         let document = self
             .documents
             .get(uri)
@@ -455,30 +700,43 @@ impl NavigationIndex {
             return Err("forward class/completion type rename is not supported".to_string());
         }
         let selected_span = Span::from_node(identifier);
-        let occurrences = self.collect_occurrences(&binding)?;
-        if occurrences.is_empty() {
-            return Err("rename binding has no source occurrences".to_string());
-        }
-        Ok(RenamePlan {
-            binding,
-            selected_span,
-            occurrences,
-        })
+        Ok((binding, selected_span))
     }
 
     fn collect_occurrences(&self, binding: &Binding) -> Result<Vec<Occurrence>, String> {
+        self.collect_occurrences_bounded(binding, None, true, true, None, None)
+    }
+
+    fn collect_occurrences_bounded(
+        &self,
+        binding: &Binding,
+        document_uri: Option<&Url>,
+        include_declaration: bool,
+        strict_resolution: bool,
+        result_limit: Option<usize>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Occurrence>, String> {
         let mut documents: Vec<(&Url, &Document)> = self.documents.iter().collect();
         documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
 
         let mut occurrences = Vec::new();
         let mut seen = HashSet::new();
+        let mut unqualified_cache =
+            HashMap::<UnqualifiedReferenceCacheKey, (Vec<Candidate>, bool)>::new();
+        let binding_has_class_owner = self.has_class_owned_member(binding);
         for (uri, document) in documents {
-            if document.opaque_ranges.iter().any(|range| {
-                binding
-                    .names
-                    .iter()
-                    .any(|name| contains_identifier(&document.source, *range, name))
-            }) {
+            check_cancel(cancel)?;
+            if document_uri.is_some_and(|requested| requested != uri) {
+                continue;
+            }
+            if strict_resolution
+                && document.opaque_ranges.iter().any(|range| {
+                    binding
+                        .names
+                        .iter()
+                        .any(|name| contains_identifier(&document.source, *range, name))
+                })
+            {
                 return Err(format!(
                     "rename is incomplete: {:?} occurs in an opaque compiler-directive block in {uri}",
                     binding.old_key
@@ -487,18 +745,22 @@ impl NavigationIndex {
 
             let root = document.tree.root_node();
             for identifier in identifier_nodes(root) {
+                check_occurrence_cancel(cancel)?;
                 let span = Span::from_node(identifier);
                 let name = canonical_name(&node_text(identifier, &document.source));
                 let is_binding_member = binding.contains_span(uri, span);
                 if !is_binding_member && !binding.names.contains(&name) {
                     continue;
                 }
-                if is_ignored_offset(root, span.start)
-                    || has_ancestor_kind(identifier, "ppDirective")
-                {
+                if has_ancestor_kind(identifier, "ppDirective") {
                     continue;
                 }
-                if document.has_parser_recovery_near(span) {
+                if !document.parser_recovery_spans.is_empty()
+                    && document.has_parser_recovery_near(span)
+                {
+                    if !strict_resolution && !is_binding_member {
+                        continue;
+                    }
                     return Err(format!(
                         "rename cannot prove the binding of {:?} at {}:{} because parser recovery affects the identifier",
                         binding.old_key, uri, span.start
@@ -508,31 +770,85 @@ impl NavigationIndex {
                 if has_ancestor_kind(identifier, "with")
                     || has_ancestor_kind(identifier, "inherited")
                 {
+                    if !strict_resolution && !is_binding_member {
+                        continue;
+                    }
                     return Err(format!(
                         "rename does not support with/inherited references at {}:{}",
                         uri, span.start
                     ));
                 }
-                if member_expression_at(identifier).is_none()
-                    && qualified_type_path_at(identifier, &document.source).is_none()
+                if !include_declaration && is_binding_member {
+                    continue;
+                }
+                let is_direct_declaration =
+                    document.symbols.iter().any(|symbol| symbol.span == span);
+                let member_expression = member_expression_at(identifier);
+                let qualified_type_path = qualified_type_path_at(identifier, &document.source);
+                let use_name = use_name_at(identifier, &document.source);
+                if binding_has_class_owner
+                    && member_expression.is_none()
+                    && qualified_type_path.is_none()
                     && (!document.symbols.iter().any(|symbol| symbol.span == span)
                         || binding.kind == SymbolKind::Routine)
                     && self.has_foreign_class_owner(binding, uri, document, span.start)
                 {
+                    if !strict_resolution && !is_binding_member {
+                        continue;
+                    }
                     return Err(format!(
                         "rename does not support inherited class lookup at {}:{}",
                         uri, span.start
                     ));
                 }
 
-                let candidates = self.resolve_candidates_at(uri, document, span.start, identifier);
-                if self.is_unknown_global_fallback(
-                    uri,
-                    document,
-                    identifier,
-                    span.start,
-                    &candidates,
-                ) {
+                let simple_reference = !is_binding_member
+                    && !is_direct_declaration
+                    && member_expression.is_none()
+                    && qualified_type_path.is_none()
+                    && use_name.is_none();
+                let scope = document.scope_at(span.start);
+                let (candidates, unknown_global_fallback) =
+                    if simple_reference && cacheable_unqualified_use(document, identifier, scope) {
+                        let cache_key = UnqualifiedReferenceCacheKey {
+                            uri: uri.clone(),
+                            name: name.clone(),
+                            scope,
+                            region: document.region_at(span.start),
+                            owner_type: document.owner_type_at_identifier(identifier, scope),
+                        };
+                        if let Some(cached) = unqualified_cache.get(&cache_key) {
+                            cached.clone()
+                        } else {
+                            let candidates =
+                                self.resolve_candidates_at(uri, document, span.start, identifier);
+                            let unknown_global_fallback = self.is_unknown_global_fallback(
+                                uri,
+                                document,
+                                identifier,
+                                span.start,
+                                &candidates,
+                            );
+                            unqualified_cache
+                                .insert(cache_key, (candidates.clone(), unknown_global_fallback));
+                            (candidates, unknown_global_fallback)
+                        }
+                    } else {
+                        let candidates =
+                            self.resolve_candidates_at(uri, document, span.start, identifier);
+                        let unknown_global_fallback = self.is_unknown_global_fallback(
+                            uri,
+                            document,
+                            identifier,
+                            span.start,
+                            &candidates,
+                        );
+                        (candidates, unknown_global_fallback)
+                    };
+                if unknown_global_fallback {
+                    if !strict_resolution && !is_binding_member {
+                        continue;
+                    }
                     return Err(format!(
                         "rename cannot prove the binding of {:?} at {}:{} because the class ancestor is unknown",
                         binding.old_key, uri, span.start
@@ -544,6 +860,9 @@ impl NavigationIndex {
                     .count();
                 if matching > 0 {
                     if matching != candidates.len() {
+                        if !strict_resolution && !is_binding_member {
+                            continue;
+                        }
                         return Err(format!(
                             "ambiguous rename reference {:?} at {}:{}",
                             binding.old_key, uri, span.start
@@ -554,9 +873,15 @@ impl NavigationIndex {
                         span,
                     };
                     if seen.insert((occurrence.uri.clone(), occurrence.span)) {
+                        if result_limit.is_some_and(|limit| occurrences.len() >= limit) {
+                            return Err(format!(
+                                "binding reference result exceeds the {MAX_BINDING_LOCATIONS}-entry limit"
+                            ));
+                        }
                         occurrences.push(occurrence);
                     }
-                } else if candidates.is_empty()
+                } else if strict_resolution
+                    && candidates.is_empty()
                     && (!has_ancestor_kind(identifier, "moduleName")
                         || binding.kind == SymbolKind::Unit)
                 {
@@ -568,6 +893,67 @@ impl NavigationIndex {
             }
         }
         Ok(occurrences)
+    }
+
+    fn locations_for_occurrences(
+        &self,
+        occurrences: &[Occurrence],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        let mut seen = HashSet::new();
+        let mut locations = Vec::with_capacity(occurrences.len());
+        let mut group_start = 0;
+        while group_start < occurrences.len() {
+            let group_uri = occurrences[group_start].uri.clone();
+            let mut group_end = group_start + 1;
+            while group_end < occurrences.len() && occurrences[group_end].uri == group_uri {
+                group_end += 1;
+            }
+
+            // Occurrences are collected in URI order. Keep this index scoped to
+            // one contiguous document group so a large workspace response does
+            // not retain one UTF-16 table for every consumer at once.
+            {
+                let document = self
+                    .documents
+                    .get(&group_uri)
+                    .ok_or_else(|| format!("document is not indexed: {group_uri}"))?;
+                let position_index = match cancel {
+                    Some(cancel) => PositionIndex::new_with_cancel(&document.source, cancel)
+                        .map_err(|()| CANCELLATION_MESSAGE.to_string())?,
+                    None => PositionIndex::new(&document.source),
+                };
+                for occurrence in &occurrences[group_start..group_end] {
+                    check_location_cancel(cancel)?;
+                    if !seen.insert((occurrence.uri.clone(), occurrence.span)) {
+                        continue;
+                    }
+                    let start = position_index
+                        .offset_to_position(&document.source, occurrence.span.start)
+                        .ok_or_else(|| {
+                            "cannot map reference start to an LSP position".to_string()
+                        })?;
+                    let end = position_index
+                        .offset_to_position(&document.source, occurrence.span.end)
+                        .ok_or_else(|| "cannot map reference end to an LSP position".to_string())?;
+                    locations.push(lsp_types::Location {
+                        uri: occurrence.uri.clone(),
+                        range: Range { start, end },
+                    });
+                }
+            }
+            group_start = group_end;
+        }
+        locations.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+                .then_with(|| left.range.end.line.cmp(&right.range.end.line))
+                .then_with(|| left.range.end.character.cmp(&right.range.end.character))
+        });
+        Ok(locations)
     }
 
     fn has_foreign_class_owner(
@@ -1190,6 +1576,20 @@ fn contains_node_kind(node: Node<'_>, kind: &str) -> bool {
         .into_iter()
         .next()
         .is_some()
+}
+
+fn cacheable_unqualified_use(document: &Document, identifier: Node<'_>, scope: usize) -> bool {
+    // Lambda bodies are not represented in `build_scopes`, so a root scope key
+    // would incorrectly merge their captures with globals.
+    if has_ancestor_kind(identifier, "lambda") {
+        return false;
+    }
+
+    // Inline declarations (`varDef` and `varAssignDef`) change visibility, but
+    // the current scope model does not record their boundaries. Their
+    // containing scope was marked while the document was parsed, so this is a
+    // constant-time eligibility check for every occurrence.
+    !document.cache_unsafe_scopes.contains(&scope)
 }
 
 fn validate_new_name(name: &str) -> Result<(), String> {

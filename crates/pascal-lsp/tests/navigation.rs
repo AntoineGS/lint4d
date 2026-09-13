@@ -1955,6 +1955,358 @@ fn text_positions_use_utf16_and_treat_crlf_as_one_line_break() {
 }
 
 #[test]
+fn document_symbols_follow_declaration_ranges_and_containment() {
+    let source = "unit Outline;\ninterface\ntype\n  TRecord = record\n    Value: Integer;\n  end;\n  TWidget = class\n  private\n    FValue: Integer;\n  public\n    property Value: Integer read FValue;\n    procedure Run(A: Integer);\n  end;\nvar\n  Global: Integer;\nimplementation\nprocedure TWidget.Run(A: Integer);\nvar\n  Local: Integer;\nbegin\n  Local := A;\nend;\nend.\n";
+    let source_uri = uri("Outline");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("outline source parses");
+
+    let symbols = index
+        .document_symbols(&source_uri)
+        .expect("document symbols are available");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "Outline");
+    let root_children = symbols[0].children.as_ref().expect("unit children");
+    assert_eq!(
+        root_children
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        ["TRecord", "TWidget", "Global", "Run"]
+    );
+
+    let record = &root_children[0];
+    assert_eq!(record.kind, lsp_types::SymbolKind::STRUCT);
+    assert_eq!(record.selection_range.start, Position::new(3, 2));
+    assert_eq!(record.range.end, Position::new(5, 6));
+    assert_eq!(
+        record
+            .children
+            .as_ref()
+            .expect("record field")
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Value"]
+    );
+
+    let widget = &root_children[1];
+    assert_eq!(widget.kind, lsp_types::SymbolKind::CLASS);
+    assert_eq!(widget.range.start, Position::new(6, 2));
+    assert_eq!(widget.range.end, Position::new(12, 6));
+    assert_eq!(
+        widget
+            .children
+            .as_ref()
+            .expect("class members")
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("FValue", lsp_types::SymbolKind::FIELD),
+            ("Value", lsp_types::SymbolKind::PROPERTY),
+            ("Run", lsp_types::SymbolKind::METHOD),
+        ]
+    );
+    assert_eq!(
+        widget.children.as_ref().unwrap()[2].range.start,
+        Position::new(11, 4)
+    );
+    assert_eq!(
+        widget.children.as_ref().unwrap()[2].range.end,
+        Position::new(11, 30)
+    );
+
+    let implementation = &root_children[3];
+    assert_eq!(implementation.kind, lsp_types::SymbolKind::METHOD);
+    assert_eq!(implementation.range.start, Position::new(16, 0));
+    assert_eq!(implementation.range.end, Position::new(21, 4));
+    assert_eq!(
+        implementation
+            .children
+            .as_ref()
+            .expect("local variable")
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Local"]
+    );
+}
+
+#[test]
+fn workspace_symbol_result_limit_is_an_error() {
+    let mut source = String::from("unit Many;\ninterface\nvar\n");
+    for index in 0..10_000 {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+
+    let source_uri = uri("Many");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri, source)
+        .expect("large symbol source parses");
+    let error = index
+        .workspace_symbols("")
+        .expect_err("result cap must not silently truncate");
+    assert_eq!(
+        error,
+        "workspace symbol query returned more than 10000 results; narrow the query"
+    );
+}
+
+#[test]
+fn workspace_symbols_keep_overloads_and_use_container_labels() {
+    let provider_uri = uri("Provider");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, PROVIDER.to_string())
+        .expect("provider parses");
+
+    let symbols = index
+        .workspace_symbols("LOADED")
+        .expect("workspace symbols are available");
+    assert_eq!(symbols.len(), 4);
+    assert!(symbols.iter().all(|symbol| symbol.name == "Overloaded"));
+    assert!(
+        symbols
+            .iter()
+            .all(|symbol| symbol.container_name.as_deref() == Some("Provider"))
+    );
+    assert!(
+        symbols
+            .windows(2)
+            .all(|pair| pair[0].location.range.start <= pair[1].location.range.start)
+    );
+}
+
+#[test]
+fn workspace_symbols_keep_names_with_a_shared_declaration_range() {
+    let source_uri = uri("Grouped");
+    let source = "unit Grouped;\ninterface\nvar\n  Alpha, Beta: Integer;\nimplementation\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri, source.to_string())
+        .expect("grouped declarations parse");
+
+    let symbols = index
+        .workspace_symbols("a")
+        .expect("grouped declarations are searchable");
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Beta"]
+    );
+}
+
+#[test]
+fn type_aliases_use_array_and_function_symbol_kinds() {
+    let source_uri = uri("TypeAliases");
+    let source = "unit TypeAliases;\ninterface\ntype\n  TArray = array[0..1] of Integer;\n  TProc = procedure(A: Integer);\nimplementation\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("type aliases parse");
+
+    let symbols = index
+        .document_symbols(&source_uri)
+        .expect("type aliases are outlined");
+    let children = symbols[0].children.as_ref().expect("unit children");
+    assert_eq!(children[0].name, "TArray");
+    assert_eq!(children[0].kind, lsp_types::SymbolKind::ARRAY);
+    assert_eq!(children[1].name, "TProc");
+    assert_eq!(children[1].kind, lsp_types::SymbolKind::FUNCTION);
+}
+
+#[test]
+fn workspace_symbol_filtering_happens_before_the_response_bound() {
+    let mut source = String::from("unit Many;\ninterface\nvar\n");
+    for index in 0..=10_000 {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+
+    let source_uri = uri("ManyFiltered");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri, source)
+        .expect("large symbol source parses");
+    let symbols = index
+        .workspace_symbols("Symbol10000")
+        .expect("a narrow query stays below the response bound");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "Symbol10000");
+}
+
+#[test]
+fn workspace_symbols_accept_exactly_the_response_bound_including_unit() {
+    let mut source = String::from("unit Exact;\ninterface\nvar\n");
+    for index in 0..9_999 {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+
+    let source_uri = uri("Exact");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri, source)
+        .expect("exact-bound source parses");
+    assert_eq!(
+        index
+            .workspace_symbols("")
+            .expect("exactly the response bound is valid")
+            .len(),
+        10_000
+    );
+}
+
+#[test]
+fn document_symbols_report_response_bound_exhaustion() {
+    let mut source = String::from("unit ManyDocumentSymbols;\ninterface\nvar\n");
+    for index in 0..10_000 {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+
+    let source_uri = uri("ManyDocumentSymbols");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source)
+        .expect("large document-symbol source parses");
+    let error = index
+        .document_symbols(&source_uri)
+        .expect_err("document symbol results must not silently truncate");
+    assert!(error.contains("10000"));
+    assert!(error.contains("document symbol"));
+}
+
+fn document_symbol_count(symbols: &[lsp_types::DocumentSymbol]) -> usize {
+    let mut pending = symbols.iter().collect::<Vec<_>>();
+    let mut count = 0;
+    while let Some(symbol) = pending.pop() {
+        count += 1;
+        if let Some(children) = symbol.children.as_deref() {
+            pending.extend(children);
+        }
+    }
+    count
+}
+
+#[test]
+fn document_symbols_accept_exactly_the_response_bound_including_unit() {
+    let mut source = String::from("unit ExactDocumentSymbols;\ninterface\nvar\n");
+    for index in 0..9_999 {
+        source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+
+    let source_uri = uri("ExactDocumentSymbols");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source)
+        .expect("exact-bound document source parses");
+    let symbols = index
+        .document_symbols(&source_uri)
+        .expect("exactly the document response bound is valid");
+    assert_eq!(document_symbol_count(&symbols), 10_000);
+}
+
+#[test]
+fn document_symbol_selection_ranges_count_non_bmp_utf16_units() {
+    let source_uri = uri("UnicodeSymbols");
+    let source = "unit UnicodeSymbols;\ninterface\nconst {😀} Value = 1;\nimplementation\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("unicode symbol source parses");
+
+    let symbols = index
+        .document_symbols(&source_uri)
+        .expect("unicode symbols are available");
+    let value = symbols[0]
+        .children
+        .as_ref()
+        .expect("unit children")
+        .iter()
+        .find(|symbol| symbol.name == "Value")
+        .expect("Value symbol");
+    assert_eq!(value.selection_range.start, Position::new(2, 11));
+    assert_eq!(value.selection_range.end, Position::new(2, 16));
+}
+
+#[test]
+fn document_symbols_survive_parser_recovery_after_valid_declarations() {
+    let source_uri = uri("RecoveredSymbols");
+    let source = "unit RecoveredSymbols;\ninterface\ntype\n  TWidget = class\n    Value: Integer;\n  end;\nimplementation\nprocedure VisibleThing;\nbegin\n  Value := 1;\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("recoverable source parses");
+
+    let symbols = index
+        .document_symbols(&source_uri)
+        .expect("recovered symbols are available");
+    let names = symbols[0]
+        .children
+        .as_ref()
+        .expect("recovered unit children")
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"TWidget"));
+    assert!(names.contains(&"VisibleThing"));
+}
+
+fn deeply_nested_symbol_source(depth: usize) -> String {
+    let mut source = String::from("unit DeepSymbols;\ninterface\nimplementation\nprocedure P0;\n");
+    for index in 1..depth {
+        source.push_str(&format!("{}procedure P{index};\n", "  ".repeat(index)));
+    }
+    for index in (1..depth).rev() {
+        let indent = "  ".repeat(index);
+        source.push_str(&format!("{indent}begin\n{indent}end;\n"));
+    }
+    source.push_str("begin\nend;\nend.\n");
+    source
+}
+
+#[test]
+fn document_symbols_reject_hierarchy_beyond_the_modest_depth_bound() {
+    let source_uri = uri("DeepSymbols");
+    let source = deeply_nested_symbol_source(40);
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source)
+        .expect("deep symbol source parses");
+
+    let error = index
+        .document_symbols(&source_uri)
+        .expect_err("deep document symbol hierarchy must fail closed");
+    assert!(error.contains("hierarchy"));
+    assert!(error.contains("32"));
+}
+
+#[test]
+fn workspace_symbol_queries_do_not_inherit_document_hierarchy_depth() {
+    let source_uri = uri("DeepWorkspaceSymbols");
+    let source = deeply_nested_symbol_source(40);
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri, source)
+        .expect("deep symbol source parses");
+
+    let symbols = index
+        .workspace_symbols("P39")
+        .expect("flat workspace symbols do not need a hierarchy");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "P39");
+}
+
+#[test]
 fn deeply_nested_expression_does_not_overflow_navigation_or_parser_traversal() {
     let mut source = String::from(
         "unit DeepExpression;\ninterface\nimplementation\nprocedure Run;\nbegin\n  X := 1",
@@ -2131,4 +2483,210 @@ fn local_navigation_does_not_revalidate_unrelated_disk_cache() {
             .len(),
         1
     );
+}
+
+#[test]
+fn binding_locations_exclude_all_routine_declaration_sites() {
+    let source = "unit RoutineReferences;\ninterface\nprocedure Work;\nimplementation\nprocedure Work;\nbegin\n  Work;\nend;\nend.\n";
+    let source_uri = uri("RoutineReferences");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("routine reference source parses");
+
+    let without_declaration = index
+        .binding_locations(&source_uri, position_of(source, "Work", 0), false)
+        .expect("bound routine references are available");
+    assert_eq!(without_declaration.len(), 1);
+    assert_eq!(
+        without_declaration[0].range.start,
+        position_of(source, "Work", 2)
+    );
+
+    let with_declaration = index
+        .binding_locations(&source_uri, position_of(source, "Work", 0), true)
+        .expect("bound routine declarations are available");
+    assert_eq!(with_declaration.len(), 3);
+}
+
+#[test]
+fn binding_locations_ignore_comments_strings_and_whitespace() {
+    let source = "unit IgnoredReferences;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  // Value\n  Log('Value');\n  Log(Value);\nend;\nend.\n";
+    let source_uri = uri("IgnoredReferences");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("ignored reference source parses");
+
+    assert!(
+        index
+            .binding_locations(&source_uri, position_of(source, "Value", 1), true,)
+            .expect("comment position is queryable")
+            .is_empty()
+    );
+    assert!(
+        index
+            .binding_locations(&source_uri, position_of(source, "Value", 2), true,)
+            .expect("string position is queryable")
+            .is_empty()
+    );
+    assert!(
+        index
+            .binding_locations(&source_uri, Position::new(5, 5), true)
+            .expect("whitespace position is queryable")
+            .is_empty()
+    );
+}
+
+#[test]
+fn binding_locations_respect_lexical_shadowing() {
+    let source = "unit ShadowedReferences;\ninterface\nconst Value = 1;\nprocedure Run;\nimplementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n  Value := 2;\nend;\nprocedure Other;\nbegin\n  Value := 3;\nend;\nend.\n";
+    let source_uri = uri("ShadowedReferences");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("shadowing source parses");
+
+    let global_locations = index
+        .binding_locations(&source_uri, position_of(source, "Value", 0), true)
+        .expect("global binding is resolved");
+    assert_eq!(global_locations.len(), 2);
+    assert!(
+        global_locations
+            .iter()
+            .all(|location| { location.range.start.line == 2 || location.range.start.line == 13 })
+    );
+
+    let local_locations = index
+        .binding_locations(&source_uri, position_of(source, "Value", 1), true)
+        .expect("local binding is resolved");
+    assert_eq!(local_locations.len(), 2);
+    assert!(
+        local_locations
+            .iter()
+            .all(|location| { location.range.start.line == 7 || location.range.start.line == 9 })
+    );
+}
+
+#[test]
+fn binding_locations_convert_non_bmp_prefixes_to_utf16() {
+    let source = "unit UnicodeReferences;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  Log('😀', Value);\nend;\nend.\n";
+    let source_uri = uri("UnicodeReferences");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("unicode reference source parses");
+
+    let locations = index
+        .binding_locations(&source_uri, position_of(source, "Value", 0), true)
+        .expect("unicode binding is resolved");
+    let use_location = locations
+        .iter()
+        .find(|location| location.range.start.line == 6)
+        .expect("unicode use location");
+    assert_eq!(use_location.range.start.character, 12);
+    assert_eq!(use_location.range.end.character, 17);
+}
+
+#[test]
+fn binding_locations_preserve_positions_across_large_ascii_and_unicode_consumers() {
+    let provider =
+        "unit PositionProvider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let mut ascii_consumer = String::from(
+        "unit AsciiConsumer;\ninterface\nuses PositionProvider;\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..2_000 {
+        ascii_consumer.push_str("  Log(SharedValue);\n");
+    }
+    ascii_consumer.push_str("end;\nend.\n");
+
+    let mut unicode_consumer = String::from(
+        "unit UnicodeConsumer;\ninterface\nuses PositionProvider;\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..2_000 {
+        unicode_consumer.push_str("  Log('😀', SharedValue);\n");
+    }
+    unicode_consumer.push_str("end;\nend.\n");
+
+    let provider_uri = uri("PositionProvider");
+    let ascii_uri = uri("AsciiConsumer");
+    let unicode_uri = uri("UnicodeConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("provider parses");
+    index
+        .update(ascii_uri.clone(), ascii_consumer.clone())
+        .expect("ASCII consumer parses");
+    index
+        .update(unicode_uri.clone(), unicode_consumer.clone())
+        .expect("Unicode consumer parses");
+
+    let locations = index
+        .binding_locations(
+            &provider_uri,
+            position_of(provider, "SharedValue", 0),
+            false,
+        )
+        .expect("large multi-file reference query resolves");
+    assert_eq!(locations.len(), 4_000);
+
+    let ascii_locations = locations
+        .iter()
+        .filter(|location| location.uri == ascii_uri)
+        .collect::<Vec<_>>();
+    assert_eq!(ascii_locations.len(), 2_000);
+    assert_eq!(
+        ascii_locations.first().map(|location| location.range.start),
+        Some(position_of(&ascii_consumer, "SharedValue", 0))
+    );
+    assert_eq!(
+        ascii_locations.last().map(|location| location.range.start),
+        Some(position_of(&ascii_consumer, "SharedValue", 1_999))
+    );
+
+    let unicode_locations = locations
+        .iter()
+        .filter(|location| location.uri == unicode_uri)
+        .collect::<Vec<_>>();
+    assert_eq!(unicode_locations.len(), 2_000);
+    assert_eq!(
+        unicode_locations
+            .first()
+            .map(|location| location.range.start),
+        Some(position_of(&unicode_consumer, "SharedValue", 0))
+    );
+    assert_eq!(
+        unicode_locations.first().map(|location| location.range.end),
+        Some(Position::new(
+            position_of(&unicode_consumer, "SharedValue", 0).line,
+            position_of(&unicode_consumer, "SharedValue", 0)
+                .character
+                .saturating_add("SharedValue".encode_utf16().count() as u32),
+        ))
+    );
+}
+
+#[test]
+fn binding_locations_do_not_merge_distinct_overloads() {
+    let source = "unit OverloadReferences;\ninterface\nprocedure Overloaded(Value: Integer); overload;\nprocedure Overloaded(Value: string); overload;\nimplementation\nprocedure Overloaded(Value: Integer);\nbegin\nend;\nprocedure Overloaded(Value: string);\nbegin\nend;\nprocedure Run;\nbegin\n  Overloaded(1);\n  Overloaded('text');\nend;\nend.\n";
+    let source_uri = uri("OverloadReferences");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_string())
+        .expect("overload source parses");
+
+    for occurrence in [4, 5] {
+        let error = index
+            .binding_locations(
+                &source_uri,
+                position_of(source, "Overloaded", occurrence),
+                true,
+            )
+            .expect_err("unproven overload calls must fail closed");
+        assert!(
+            error.contains("ambiguous") || error.contains("unresolved"),
+            "unexpected overload error: {error}"
+        );
+    }
 }

@@ -2042,6 +2042,460 @@ fn references_include_unopened_consumers() {
 }
 
 #[test]
+fn self_contained_local_references_ignore_unrelated_broken_imports() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source_path = root.join("LocalReferences.pas");
+    let broken_import = root.join("BrokenImport.pas");
+    let broken_include = root.join("BrokenImport.inc");
+    let source = "unit LocalReferences;\ninterface\nuses BrokenImport, MissingSdkUnit;\nimplementation\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\n  Log(LocalValue);\n  LocalValue := 2;\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(
+        &broken_import,
+        "unit BrokenImport;\ninterface\n{$I BrokenImport.inc}\nimplementation\nend.\n",
+    );
+    write_file(&broken_include, "{$IFDEF NEVER_DEFINED}\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let references_without_declaration =
+        RequestId::from("local-references-without-declaration".to_string());
+    server.send_request(
+        references_without_declaration.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&references_without_declaration);
+    let references_without_declaration = result_locations(response);
+    assert_exact_location_signatures(
+        &references_without_declaration,
+        (1..=3)
+            .map(|occurrence| {
+                expected_location_signature(&source_path, source, "LocalValue", occurrence)
+            })
+            .collect(),
+    );
+
+    let references_with_declaration =
+        RequestId::from("local-references-with-declaration".to_string());
+    server.send_request(
+        references_with_declaration.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&references_with_declaration);
+    let references_with_declaration = result_locations(response);
+    assert_exact_location_signatures(
+        &references_with_declaration,
+        (0..=3)
+            .map(|occurrence| {
+                expected_location_signature(&source_path, source, "LocalValue", occurrence)
+            })
+            .collect(),
+    );
+
+    let highlights_id = RequestId::from("local-highlights".to_string());
+    server.send_request(
+        highlights_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0)
+        }),
+    );
+    let highlights = server.response(&highlights_id);
+    assert!(
+        highlights.error.is_none(),
+        "local highlights failed: {highlights:?}"
+    );
+    let highlights = highlights
+        .result
+        .expect("local highlights result")
+        .as_array()
+        .expect("local highlights array")
+        .clone();
+    let mut actual = highlights.iter().map(range_signature).collect::<Vec<_>>();
+    actual.sort();
+    let mut expected = (0..=3)
+        .map(|occurrence| {
+            let (_, line, start, _, end) =
+                expected_location_signature(&source_path, source, "LocalValue", occurrence);
+            (line, start, line, end)
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+
+    server.shutdown();
+}
+
+#[test]
+fn local_references_do_not_skip_imports_when_a_same_source_shadow_is_present() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ShadowedLocalReferences.pas");
+    let source = "unit ShadowedLocalReferences;\ninterface\nuses MissingSdkUnit;\nimplementation\nprocedure Run;\nvar\n  LocalValue: Integer;\n  procedure Nested;\n  var\n    LocalValue: Integer;\n  begin\n    LocalValue := 2;\n  end;\nbegin\n  LocalValue := 1;\n  Nested;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("shadowed-local-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("same-source shadowing must not authorize skipping imports");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("incomplete"), "{error:?}");
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn local_references_still_reject_an_unsafe_include_in_the_target_document() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("UnsafeLocalReferences.pas");
+    let include_path = temp.path().join("Unsafe.inc");
+    let source = "unit UnsafeLocalReferences;\ninterface\nimplementation\n{$I Unsafe.inc}\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(&include_path, "{$IFDEF NEVER_DEFINED}\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("unsafe-target-include-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("an unsafe target include must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("include"), "{error:?}");
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn self_contained_local_references_ignore_incomplete_project_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source_path = root.join("src/LocalReferences.pas");
+    let source = "unit LocalReferences;\ninterface\nuses MissingSdkUnit;\nimplementation\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\n  Log(LocalValue);\n  LocalValue := 2;\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(&root.join("One.dpr"), "program One; begin end.");
+    write_file(&root.join("Two.dpr"), "program Two; begin end.");
+    write_file(
+        &root.join("One.dproj"),
+        "<Project><PropertyGroup><MainSource>One.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/LocalReferences.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("Two.dproj"),
+        "<Project><PropertyGroup><MainSource>Two.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/LocalReferences.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let without_declaration_id =
+        RequestId::from("incomplete-context-without-declaration".to_string());
+    server.send_request(
+        without_declaration_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let without_declaration = result_locations(server.response(&without_declaration_id));
+    assert_exact_location_signatures(
+        &without_declaration,
+        (1..=3)
+            .map(|occurrence| {
+                expected_location_signature(&source_path, source, "LocalValue", occurrence)
+            })
+            .collect(),
+    );
+
+    let with_declaration_id = RequestId::from("incomplete-context-with-declaration".to_string());
+    server.send_request(
+        with_declaration_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let with_declaration = result_locations(server.response(&with_declaration_id));
+    assert_exact_location_signatures(
+        &with_declaration,
+        (0..=3)
+            .map(|occurrence| {
+                expected_location_signature(&source_path, source, "LocalValue", occurrence)
+            })
+            .collect(),
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn local_references_reject_project_dependent_conditional_bindings_in_incomplete_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source_path = root.join("src/ConditionalReferences.pas");
+    let source = "unit ConditionalReferences;\ninterface\nimplementation\nprocedure Run;\n{$IFDEF PROJECT_FEATURE}\nvar\n  LocalValue: Integer;\n{$ENDIF}\nbegin\n{$IFDEF PROJECT_FEATURE}\n  LocalValue := 1;\n  Log(LocalValue);\n  LocalValue := 2;\n{$ENDIF}\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(&root.join("One.dpr"), "program One; begin end.");
+    write_file(&root.join("Two.dpr"), "program Two; begin end.");
+    write_file(
+        &root.join("One.dproj"),
+        "<Project><PropertyGroup><MainSource>One.dpr</MainSource><DCC_Define>PROJECT_FEATURE</DCC_Define></PropertyGroup><ItemGroup><DCCReference Include=\"src/ConditionalReferences.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("Two.dproj"),
+        "<Project><PropertyGroup><MainSource>Two.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/ConditionalReferences.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("incomplete-conditional-local-reference".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("project-dependent conditional binding must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("conditional") || error.message.contains("incomplete"),
+        "unexpected conditional safety error: {error:?}"
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn local_references_reject_unsafe_target_includes_in_incomplete_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source_path = root.join("src/UnsafeReferences.pas");
+    let include_path = root.join("src/Unsafe.inc");
+    let source = "unit UnsafeReferences;\ninterface\nimplementation\n{$I Unsafe.inc}\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(&include_path, "{$IFDEF NEVER_DEFINED}\n");
+    write_file(&root.join("One.dpr"), "program One; begin end.");
+    write_file(&root.join("Two.dpr"), "program Two; begin end.");
+    write_file(
+        &root.join("One.dproj"),
+        "<Project><PropertyGroup><MainSource>One.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/UnsafeReferences.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("Two.dproj"),
+        "<Project><PropertyGroup><MainSource>Two.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/UnsafeReferences.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("incomplete-unsafe-target-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("unsafe target include must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("include"),
+        "unexpected include error: {error:?}"
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn local_references_do_not_use_incomplete_project_include_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source_path = root.join("src/IncludePathReferences.pas");
+    let source = "unit IncludePathReferences;\ninterface\nimplementation\n{$I Config.inc}\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(&root.join("Config.inc"), "{$DEFINE HARMLESS}\n");
+    write_file(
+        &root.join("unsafe-one/Config.inc"),
+        "{$IFDEF PROJECT_UNSAFE}\n",
+    );
+    write_file(
+        &root.join("unsafe-two/Config.inc"),
+        "{$IFDEF PROJECT_UNSAFE}\n",
+    );
+    write_file(&root.join("One.dpr"), "program One; begin end.");
+    write_file(&root.join("Two.dpr"), "program Two; begin end.");
+    write_file(
+        &root.join("One.dproj"),
+        "<Project><PropertyGroup><MainSource>One.dpr</MainSource><DCC_IncludePath>unsafe-one</DCC_IncludePath></PropertyGroup><ItemGroup><DCCReference Include=\"src/IncludePathReferences.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("Two.dproj"),
+        "<Project><PropertyGroup><MainSource>Two.dpr</MainSource><DCC_IncludePath>unsafe-two</DCC_IncludePath></PropertyGroup><ItemGroup><DCCReference Include=\"src/IncludePathReferences.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("incomplete-project-include-paths".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("incomplete project include paths must not be bypassed");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("include"),
+        "unexpected include error: {error:?}"
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn self_contained_local_references_allow_known_inactive_target_includes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source_path = root.join("src/InactiveIncludeReferences.pas");
+    let source = "unit InactiveIncludeReferences;\ninterface\nuses MissingSdkUnit;\nimplementation\n{$IF 1 = 0}\n{$I MissingConfig.inc}\n{$ENDIF}\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(&root.join("One.dpr"), "program One; begin end.");
+    write_file(&root.join("Two.dpr"), "program Two; begin end.");
+    write_file(
+        &root.join("One.dproj"),
+        "<Project><PropertyGroup><MainSource>One.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/InactiveIncludeReferences.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("Two.dproj"),
+        "<Project><PropertyGroup><MainSource>Two.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/InactiveIncludeReferences.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("incomplete-known-inactive-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "LocalValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&id));
+    assert_exact_location_signatures(
+        &references,
+        std::iter::once(expected_location_signature(
+            &source_path,
+            source,
+            "LocalValue",
+            1,
+        ))
+        .collect(),
+    );
+    server.shutdown();
+}
+
+#[test]
+fn nonlocal_references_remain_blocked_by_incomplete_project_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source_path = root.join("src/ImportedReferences.pas");
+    let provider_path = root.join("src/Provider.pas");
+    let source = "unit ImportedReferences;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(
+        &provider_path,
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+    );
+    write_file(&root.join("One.dpr"), "program One; begin end.");
+    write_file(&root.join("Two.dpr"), "program Two; begin end.");
+    write_file(
+        &root.join("One.dproj"),
+        "<Project><PropertyGroup><MainSource>One.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/ImportedReferences.pas\" /><DCCReference Include=\"src/Provider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &root.join("Two.dproj"),
+        "<Project><PropertyGroup><MainSource>Two.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"src/ImportedReferences.pas\" /><DCCReference Include=\"src/Provider.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("incomplete-nonlocal-reference".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("nonlocal reference must not bypass incomplete project context");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("incomplete"),
+        "unexpected nonlocal error: {error:?}"
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
 fn class_field_queries_keep_declarations_accessors_and_renames_bound() {
     let first = "  TFirst = class\n    FValue: Integer;\n    property Value: Integer read FValue;\n  end;\n";
     let second = "  TSecond = class\n    FValue: Integer;\n  end;\n";

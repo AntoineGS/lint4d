@@ -1,8 +1,8 @@
 use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
     WorkspaceInput, build_snapshot, input_source_is_readable, is_cancelled,
-    project_context_and_metadata_for_input, query_binding_info_for_input, snapshot_records,
-    source_for_input_with_cancel,
+    project_context_and_metadata_for_input, query_binding_info_for_input,
+    reference_binding_info_for_input, snapshot_records, source_for_input_with_cancel,
 };
 use crate::NavigationIndex;
 use lsp_types::{
@@ -240,7 +240,7 @@ pub(crate) fn references_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let classification = match query_binding_info_for_input(&input, &uri, position, cancel) {
+    let classification = match reference_binding_info_for_input(&input, &uri, position, cancel) {
         Ok(result) => result,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -300,7 +300,7 @@ pub(crate) fn highlights_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let classification = match query_binding_info_for_input(&input, &uri, position, cancel) {
+    let classification = match reference_binding_info_for_input(&input, &uri, position, cancel) {
         Ok(result) => result,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -389,7 +389,10 @@ fn binding_snapshot(
         consumed_configuration,
         ..
     } = classification;
-    let binding_info = binding_info.map(|(info, _)| info);
+    let (binding_info, self_contained) = binding_info
+        .map_or((None, false), |(info, self_contained)| {
+            (Some(info), self_contained)
+        });
     let local = binding_info.as_ref().is_some_and(|info| info.local);
     let mode = if document_local {
         if local {
@@ -402,6 +405,11 @@ fn binding_snapshot(
     } else {
         SnapshotMode::Workspace
     };
+    let skip_imports_for: &[Url] = if self_contained {
+        std::slice::from_ref(&uri)
+    } else {
+        &[]
+    };
     build_binding_snapshot(
         input,
         &uri,
@@ -410,6 +418,7 @@ fn binding_snapshot(
         binding_info,
         consumed_configuration,
         mode,
+        skip_imports_for,
         cancel,
     )
 }
@@ -455,6 +464,7 @@ fn type_definition_snapshot(
         binding_info.map(|(info, _)| info),
         consumed_configuration,
         SnapshotMode::LocalWithImports,
+        &[],
         cancel,
     )
 }
@@ -468,6 +478,7 @@ fn build_binding_snapshot(
     binding_info: Option<crate::navigation::RenameBindingInfo>,
     consumed_configuration: Vec<super::rename::SourceRecord>,
     mode: SnapshotMode,
+    skip_imports_for: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     let original_name = super::rename::identifier_at_position(&target_record.text, position)
@@ -490,7 +501,7 @@ fn build_binding_snapshot(
         &candidate_names,
         mode,
         Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
-        &[],
+        skip_imports_for,
         cancel,
     )
 }

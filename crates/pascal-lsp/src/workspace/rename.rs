@@ -811,7 +811,14 @@ pub(crate) fn binding_info_for_input(
     additional_names: &[String],
     cancel: &AtomicBool,
 ) -> Result<BindingClassification, String> {
-    binding_classification_for_input(input, uri, position, additional_names, true, cancel)
+    binding_classification_for_input(
+        input,
+        uri,
+        position,
+        additional_names,
+        SelfContainedMode::AnyBinding,
+        cancel,
+    )
 }
 
 pub(crate) fn query_binding_info_for_input(
@@ -820,7 +827,30 @@ pub(crate) fn query_binding_info_for_input(
     position: Position,
     cancel: &AtomicBool,
 ) -> Result<BindingClassification, String> {
-    binding_classification_for_input(input, uri, position, &[], false, cancel)
+    binding_classification_for_input(input, uri, position, &[], SelfContainedMode::None, cancel)
+}
+
+pub(crate) fn reference_binding_info_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    cancel: &AtomicBool,
+) -> Result<BindingClassification, String> {
+    binding_classification_for_input(
+        input,
+        uri,
+        position,
+        &[],
+        SelfContainedMode::LocalBinding,
+        cancel,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SelfContainedMode {
+    None,
+    AnyBinding,
+    LocalBinding,
 }
 
 fn binding_classification_for_input(
@@ -828,19 +858,28 @@ fn binding_classification_for_input(
     uri: &Url,
     position: Position,
     additional_names: &[String],
-    check_self_contained: bool,
+    self_contained_mode: SelfContainedMode,
     cancel: &AtomicBool,
 ) -> Result<BindingClassification, String> {
     let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
     let (context, consumed_configuration) =
         project_context_and_metadata_for_input(input, uri, cancel)?;
+    // An incomplete project context cannot establish conditional branch facts.
+    // Self-contained classification must therefore prove the local binding
+    // without inheriting defines from an ambiguous or partially read project.
+    let defines: &[String] =
+        if !context.discovery_complete && !matches!(self_contained_mode, SelfContainedMode::None) {
+            &[]
+        } else {
+            &context.defines
+        };
     let (info, ignored_or_empty) = binding_info_for_source(
         uri,
         &source,
         position,
         additional_names,
-        &context.defines,
-        check_self_contained,
+        defines,
+        self_contained_mode,
         cancel,
     )?;
     Ok(BindingClassification {
@@ -951,7 +990,7 @@ fn binding_info_for_source(
     position: Position,
     additional_names: &[String],
     defines: &[String],
-    check_self_contained: bool,
+    self_contained_mode: SelfContainedMode,
     cancel: &AtomicBool,
 ) -> Result<(Option<(crate::navigation::RenameBindingInfo, bool)>, bool), String> {
     let uri = canonical_file_uri(uri);
@@ -967,7 +1006,12 @@ fn binding_info_for_source(
             .rename_binding_info_with_cancel(&uri, position, cancel)
             .ok()
     };
-    let self_contained = check_self_contained
+    let can_check_self_contained = match self_contained_mode {
+        SelfContainedMode::None => false,
+        SelfContainedMode::AnyBinding => true,
+        SelfContainedMode::LocalBinding => info.as_ref().is_some_and(|info| info.local),
+    };
+    let self_contained = can_check_self_contained
         && index.self_contained_rename_binding_with_cancel(
             &uri,
             position,
@@ -1476,6 +1520,11 @@ pub(crate) fn build_snapshot(
     let mut retained_files = 0usize;
     let mut retained_bytes = 0usize;
     let mut scanned_bytes = 0usize;
+    let allow_incomplete_context_for: &[Url] = if mode == SnapshotMode::Local {
+        skip_imports_for
+    } else {
+        &[]
+    };
     let mut include_errors = Vec::new();
     let candidate_names_are_ascii = candidate_names
         .iter()
@@ -1745,7 +1794,17 @@ pub(crate) fn build_snapshot(
         let defines = contexts
             .get(&uri)
             .and_then(|context_key| loader.contexts.get(context_key))
-            .map(|state| state.context.defines.clone())
+            .map(|state| {
+                if allow_incomplete_context_for
+                    .iter()
+                    .any(|allowed_uri| allowed_uri == &uri)
+                    && !state.context.discovery_complete
+                {
+                    Vec::new()
+                } else {
+                    state.context.defines.clone()
+                }
+            })
             .unwrap_or_default();
         index
             .update_with_defines_with_cancel(uri.clone(), source.clone(), &defines, cancel)
@@ -1903,6 +1962,7 @@ pub(crate) fn build_snapshot(
             candidate_names,
             max_file_bytes: input.options.limits.max_file_bytes,
             observe_directory_stamps: mode == SnapshotMode::WorkspaceSymbols,
+            allow_incomplete_context_for,
             cancel,
             cache: HashMap::new(),
             active: HashSet::new(),
@@ -2613,6 +2673,7 @@ struct IncludeAuditor<'a> {
     candidate_names: &'a [String],
     max_file_bytes: usize,
     observe_directory_stamps: bool,
+    allow_incomplete_context_for: &'a [Url],
     cancel: &'a AtomicBool,
     cache: HashMap<String, IncludeAnalysis>,
     active: HashSet<String>,
@@ -2640,7 +2701,18 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         };
         let defines = context
             .as_ref()
-            .map(|context| context.defines.clone())
+            .map(|context| {
+                if !context.discovery_complete
+                    && auditor
+                        .allow_incomplete_context_for
+                        .iter()
+                        .any(|allowed_uri| allowed_uri == &uri)
+                {
+                    Vec::new()
+                } else {
+                    context.defines.clone()
+                }
+            })
             .unwrap_or_default();
         #[cfg(test)]
         if TEST_CANCEL_INCLUDE_ANALYSIS.with(Cell::get) {
@@ -2675,6 +2747,21 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             .collect::<Vec<_>>();
         if include_directives.is_empty() {
             continue;
+        }
+
+        let incomplete_context = context
+            .as_ref()
+            .is_none_or(|context| !context.discovery_complete);
+        let allow_incomplete_context = auditor
+            .allow_incomplete_context_for
+            .iter()
+            .any(|allowed_uri| allowed_uri == &uri);
+        if incomplete_context && allow_incomplete_context {
+            auditor.record_error(format!(
+                "rename cannot prove completeness because potentially active include in {uri} depends on incomplete project search paths"
+            ));
+            auditor.stopped = true;
+            break;
         }
 
         let context = auditor.context_for_source(&uri)?;
@@ -2731,7 +2818,11 @@ impl IncludeAuditor<'_> {
             return Ok(None);
         };
         let context = state.context.clone();
-        if !context.discovery_complete {
+        let allow_incomplete_context = self
+            .allow_incomplete_context_for
+            .iter()
+            .any(|allowed_uri| allowed_uri == uri);
+        if !context.discovery_complete && !allow_incomplete_context {
             self.result.incomplete_reason.get_or_insert_with(|| {
                 format!("project context is ambiguous or incomplete for {uri}")
             });

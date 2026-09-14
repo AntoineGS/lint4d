@@ -1,4 +1,6 @@
+use lsp_types::{Position, Url};
 use pascal_lsp::project::{ProjectContext, ProjectOptions};
+use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1471,6 +1473,133 @@ fn conditional_alternative_paths_are_not_exclusion_proof_for_automatic_selection
     assert!(
         context.project_file.is_none() && !context.discovery_complete,
         "conditional alternative was treated as exhaustive ownership evidence: {context:?}"
+    );
+}
+
+#[test]
+fn project_defines_select_the_active_navigation_branch_without_inventing_versions() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project = root.join("App.dproj");
+    let source = "unit Main;\ninterface\n{$IFDEF FEATURE}\nconst Target = 1;\n{$ELSE}\nconst Target = 2;\n{$ENDIF}\nimplementation\nprocedure Run;\nbegin\n  WriteLn(Target);\nend;\nend.\n";
+    write(&main, source);
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>FEATURE</DCC_Define></PropertyGroup></Project>",
+    );
+
+    let context = discover(&main, root, &options());
+    assert_eq!(context.defines, ["FEATURE"]);
+
+    let source_uri = Url::from_file_path(&main).expect("source URI");
+    let mut workspace = Workspace::new(
+        vec![root.to_path_buf()],
+        WorkspaceOptions {
+            project_file: Some(project),
+            ..WorkspaceOptions::default()
+        },
+    );
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open project source");
+    let locations = workspace.navigate(
+        &source_uri,
+        Position::new(10, 10),
+        pascal_lsp::NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].range.start.line, 3);
+}
+
+#[test]
+fn project_defines_select_the_active_local_rename_branch() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project = root.join("App.dproj");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run;\nvar\n{$IFDEF FEATURE}\n  Target: Integer;\n{$ELSE}\n  Other: Integer;\n{$ENDIF}\nbegin\n  Target := 1;\nend;\nend.\n";
+    write(&main, source);
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>FEATURE</DCC_Define></PropertyGroup></Project>",
+    );
+
+    let source_uri = Url::from_file_path(&main).expect("source URI");
+    let mut workspace = Workspace::new(
+        vec![root.to_path_buf()],
+        WorkspaceOptions {
+            project_file: Some(project),
+            ..WorkspaceOptions::default()
+        },
+    );
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open project source");
+
+    let edits = workspace
+        .rename_edits(&source_uri, Position::new(11, 2), "RenamedTarget", false)
+        .expect("project-selected local conditional rename succeeds");
+    let document_edits = edits
+        .changes
+        .expect("rename uses unversioned changes")
+        .remove(&source_uri)
+        .expect("source edits are present");
+    let mut edited_lines = document_edits
+        .iter()
+        .map(|edit| edit.range.start.line)
+        .collect::<Vec<_>>();
+    edited_lines.sort_unstable();
+    assert_eq!(edited_lines, [6, 11]);
+    assert!(
+        document_edits
+            .iter()
+            .all(|edit| edit.new_text == "RenamedTarget")
+    );
+}
+
+#[test]
+fn changing_project_defines_reindexes_open_conditional_sources_conservatively() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project = root.join("App.dproj");
+    let source = "unit Main;\ninterface\n{$IFDEF FEATURE}\nconst Target = 1;\n{$ELSE}\nconst Target = 2;\n{$ENDIF}\nimplementation\nprocedure Run;\nbegin\n  WriteLn(Target);\nend;\nend.\n";
+    write(&main, source);
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>FEATURE</DCC_Define></PropertyGroup></Project>",
+    );
+
+    let source_uri = Url::from_file_path(&main).expect("source URI");
+    let project_uri = Url::from_file_path(&project).expect("project URI");
+    let mut workspace = Workspace::new(vec![root.to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open project source");
+
+    let before = workspace.navigate(
+        &source_uri,
+        Position::new(10, 10),
+        pascal_lsp::NavigationTarget::Declaration,
+    );
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].range.start.line, 3);
+
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>OTHER</DCC_Define></PropertyGroup></Project>",
+    );
+    workspace.file_event(&project_uri, FileChange::Changed);
+
+    let after = workspace.navigate(
+        &source_uri,
+        Position::new(10, 10),
+        pascal_lsp::NavigationTarget::Declaration,
+    );
+    assert!(
+        after.is_empty(),
+        "the newly unknown project branch must not reuse the old projection"
     );
 }
 

@@ -9,10 +9,11 @@
 use super::{
     ContextKey, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
     WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_configuration_file,
-    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, paths_equal_ci,
-    read_disk_source,
+    is_pascal_path, package_paths_equal, path_stamp, path_stamp_result, path_starts_with_ci,
+    paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
 };
 use crate::NavigationIndex;
+use crate::conditional::{self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind};
 use crate::project::{
     ProjectCandidateMembership, ProjectContext, ProjectSelections, has_invalid_project_selection,
 };
@@ -22,6 +23,8 @@ use lsp_types::{
     PrepareRenameResponse, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::decode_bytes;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -49,6 +52,31 @@ const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const INCLUDE_BYTE_BUDGET_ERROR: &str =
     "include byte limit would be exceeded before reading the file";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CANCEL_INCLUDE_ANALYSIS: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestIncludeCancellationGuard(bool);
+
+#[cfg(test)]
+pub(crate) fn test_cancel_in_include_analysis() -> TestIncludeCancellationGuard {
+    let previous = TEST_CANCEL_INCLUDE_ANALYSIS.with(|cancel| {
+        let previous = cancel.get();
+        cancel.set(true);
+        previous
+    });
+    TestIncludeCancellationGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestIncludeCancellationGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_INCLUDE_ANALYSIS.with(|cancel| cancel.set(self.0));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct OverlayInput {
@@ -133,6 +161,11 @@ pub(crate) enum SnapshotMode {
     /// enumerating reverse workspace consumers. This is used by document
     /// highlights for imported bindings.
     LocalWithImports,
+    /// Retain the requested source and its bounded import closure for
+    /// name-free completion and signature help. Includes are audited for
+    /// declaration-bearing content because those features cannot filter an
+    /// include audit by a selected binding name.
+    Assistance,
     /// Search the configured workspace for reverse references.
     Workspace,
     /// Search the configured workspace for read-only symbol results.
@@ -685,10 +718,14 @@ pub(crate) fn snapshot_records(snapshot: &RenameSnapshot) -> Vec<SourceRecord> {
     records
 }
 
-pub(crate) fn source_for_input(
+pub(crate) fn source_for_input_with_cancel(
     input: &WorkspaceInput,
     uri: &Url,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(String, SourceRecord), String> {
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
     let uri = canonical_file_uri(uri);
     if input.rejected_documents.contains(&uri) {
         return Err(format!(
@@ -717,8 +754,14 @@ pub(crate) fn source_for_input(
         .to_file_path()
         .map(absolute_path)
         .map_err(|_| format!("not a file URI: {uri}"))?;
-    let disk = read_disk_source(&path, input.options.limits.max_file_bytes)
-        .map_err(|error| format!("could not read source {uri}: {error}"))?;
+    let disk = read_disk_source_with_cancel(&path, input.options.limits.max_file_bytes, cancel)
+        .map_err(|error| {
+            if error == CANCELLATION_MESSAGE {
+                error
+            } else {
+                format!("could not read source {uri}: {error}")
+            }
+        })?;
     let record = SourceRecord {
         uri: uri.clone(),
         text: disk.text.clone(),
@@ -752,39 +795,154 @@ pub(crate) fn input_source_is_readable(input: &WorkspaceInput, uri: &Url) -> boo
     workspace.accepts_path(&path) && is_readable_source_path(&workspace, &path)
 }
 
-type InputBindingInfo = (
-    String,
-    SourceRecord,
-    Option<(crate::navigation::RenameBindingInfo, bool)>,
-);
+#[derive(Debug)]
+pub(crate) struct BindingClassification {
+    pub(crate) source: String,
+    pub(crate) record: SourceRecord,
+    pub(crate) info: Option<(crate::navigation::RenameBindingInfo, bool)>,
+    pub(crate) ignored_or_empty: bool,
+    pub(crate) consumed_configuration: Vec<SourceRecord>,
+}
 
 pub(crate) fn binding_info_for_input(
     input: &WorkspaceInput,
     uri: &Url,
     position: Position,
     additional_names: &[String],
-) -> Result<InputBindingInfo, String> {
-    let (source, record) = source_for_input(input, uri)?;
-    let info = binding_info_for_source(uri, &source, position, additional_names).ok();
-    Ok((source, record, info))
+    cancel: &AtomicBool,
+) -> Result<BindingClassification, String> {
+    binding_classification_for_input(input, uri, position, additional_names, true, cancel)
 }
 
 pub(crate) fn query_binding_info_for_input(
     input: &WorkspaceInput,
     uri: &Url,
     position: Position,
-) -> Result<
-    (
-        String,
-        SourceRecord,
-        Option<crate::navigation::RenameBindingInfo>,
-        bool,
-    ),
-    String,
-> {
-    let (source, record) = source_for_input(input, uri)?;
-    let (info, ignored_or_empty) = binding_info_only_for_source(uri, &source, position)?;
-    Ok((source, record, info, ignored_or_empty))
+    cancel: &AtomicBool,
+) -> Result<BindingClassification, String> {
+    binding_classification_for_input(input, uri, position, &[], false, cancel)
+}
+
+fn binding_classification_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    additional_names: &[String],
+    check_self_contained: bool,
+    cancel: &AtomicBool,
+) -> Result<BindingClassification, String> {
+    let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
+    let (context, consumed_configuration) =
+        project_context_and_metadata_for_input(input, uri, cancel)?;
+    let (info, ignored_or_empty) = binding_info_for_source(
+        uri,
+        &source,
+        position,
+        additional_names,
+        &context.defines,
+        check_self_contained,
+        cancel,
+    )?;
+    Ok(BindingClassification {
+        source,
+        record,
+        info,
+        ignored_or_empty,
+        consumed_configuration,
+    })
+}
+
+pub(crate) fn project_context_and_metadata_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<(ProjectContext, Vec<SourceRecord>), String> {
+    let mut workspace = Workspace::new(input.roots.clone(), input.options.clone());
+    workspace.project_selections = input.project_selections.clone();
+    workspace.document_owners = input.document_owners.clone();
+    let context_key = workspace.context_for_uri_with_cancel(uri, Some(cancel))?;
+    let state = workspace
+        .contexts
+        .get(&context_key)
+        .cloned()
+        .ok_or_else(|| format!("project context was not retained for {uri}"))?;
+    let records = consumed_context_records(&state, cancel)?;
+    Ok((state.context, records))
+}
+
+fn consumed_context_records(
+    state: &super::ContextState,
+    cancel: &AtomicBool,
+) -> Result<Vec<SourceRecord>, String> {
+    let mut metadata_paths = state.context.metadata_files.clone();
+    if let Some(project_file) = &state.context.project_file {
+        metadata_paths.push(project_file.clone());
+    }
+    if let Some(main_source) = &state.context.main_source {
+        metadata_paths.push(main_source.clone());
+    }
+    metadata_paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    metadata_paths.dedup_by(|left, right| path_key(left) == path_key(right));
+
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for path in metadata_paths {
+        if !seen.insert(path_key(&path)) {
+            continue;
+        }
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let observed = state
+            .project_read_observations
+            .iter()
+            .find(|observation| path_key(&observation.path) == path_key(&path));
+        let stamp = observed
+            .map(|observation| Some(super::path_stamp_from_project_read(&observation.stamp)))
+            .or_else(|| state.watched_paths.get(&path).cloned())
+            .ok_or_else(|| {
+                format!(
+                    "project metadata observation was not retained for {}",
+                    path.display()
+                )
+            })?;
+        let content_hash = observed.map(|observation| observation.content_hash);
+        let content_bytes = observed.and_then(|observation| observation.content_bytes.clone());
+        if let Some(record) = path_record_at(path, stamp, content_hash, content_bytes, None) {
+            records.push(record);
+        }
+    }
+
+    let mut memberships = state
+        .project_candidate_memberships
+        .iter()
+        .collect::<Vec<_>>();
+    memberships
+        .sort_by(|(left, _), (right, _)| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    for (directory, membership) in memberships {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let membership = match membership {
+            Ok(membership) => membership.clone(),
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error.clone()),
+            Err(error) => {
+                return Err(format!(
+                    "could not observe project candidates in {}: {error}",
+                    directory.display()
+                ));
+            }
+        };
+        if seen.insert(path_key(directory)) {
+            if let Some(record) =
+                path_record_at(directory.clone(), None, None, None, Some(membership))
+            {
+                records.push(record);
+            }
+        }
+    }
+
+    Ok(records)
 }
 
 fn binding_info_for_source(
@@ -792,51 +950,31 @@ fn binding_info_for_source(
     source: &str,
     position: Position,
     additional_names: &[String],
-) -> Result<(crate::navigation::RenameBindingInfo, bool), String> {
+    defines: &[String],
+    check_self_contained: bool,
+    cancel: &AtomicBool,
+) -> Result<(Option<(crate::navigation::RenameBindingInfo, bool)>, bool), String> {
     let uri = canonical_file_uri(uri);
     let mut index = NavigationIndex::new();
     index
-        .update(uri.clone(), source.to_owned())
-        .map_err(|error| format!("could not index rename source {uri}: {error}"))?;
-    let info = index.rename_binding_info(&uri, position)?;
-    let self_contained = index.self_contained_rename_binding(&uri, position, additional_names);
-    Ok((info, self_contained))
-}
-
-fn binding_info_only_for_source(
-    uri: &Url,
-    source: &str,
-    position: Position,
-) -> Result<(Option<crate::navigation::RenameBindingInfo>, bool), String> {
-    let uri = canonical_file_uri(uri);
-    let mut index = NavigationIndex::new();
-    index
-        .update(uri.clone(), source.to_owned())
+        .update_with_defines_with_cancel(uri.clone(), source.to_owned(), defines, cancel)
         .map_err(|error| format!("could not index rename source {uri}: {error}"))?;
     let ignored_or_empty = index.position_is_ignored_or_empty(&uri, position)?;
     let info = if ignored_or_empty {
         None
     } else {
-        index.rename_binding_info(&uri, position).ok()
+        index
+            .rename_binding_info_with_cancel(&uri, position, cancel)
+            .ok()
     };
-    Ok((info, ignored_or_empty))
-}
-
-fn contains_identifier(source: &str, name: &str) -> bool {
-    let name = name.as_bytes();
-    if name.is_empty() {
-        return false;
-    }
-    let source = source.as_bytes();
-    source
-        .windows(name.len())
-        .enumerate()
-        .any(|(index, candidate)| {
-            candidate.eq_ignore_ascii_case(name)
-                && (index == 0 || !is_identifier_byte(source[index - 1]))
-                && (index + name.len() == source.len()
-                    || !is_identifier_byte(source[index + name.len()]))
-        })
+    let self_contained = check_self_contained
+        && index.self_contained_rename_binding_with_cancel(
+            &uri,
+            position,
+            additional_names,
+            cancel,
+        );
+    Ok((info.map(|info| (info, self_contained)), ignored_or_empty))
 }
 
 fn contains_any_identifier(source: &str, names: &[String]) -> bool {
@@ -908,7 +1046,7 @@ pub(crate) fn prepare_from_input(
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = canonical_file_uri(uri);
-    let (initial_source, _) = match source_for_input(&input, &uri) {
+    let (initial_source, _) = match source_for_input_with_cancel(&input, &uri, Some(cancel)) {
         Ok(source) => source,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -922,11 +1060,17 @@ pub(crate) fn prepare_from_input(
             );
         }
     };
-    let (planning_source, target_record, binding_info) =
-        match binding_info_for_input(&input, &uri, position, &[]) {
-            Ok(result) => result,
-            Err(error) => return failed(source_generation, configuration_generation, error),
-        };
+    let classification = match binding_info_for_input(&input, &uri, position, &[], cancel) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let BindingClassification {
+        source: planning_source,
+        record: target_record,
+        info: binding_info,
+        consumed_configuration,
+        ..
+    } = classification;
     if initial_source != planning_source {
         return failed(
             source_generation,
@@ -962,7 +1106,7 @@ pub(crate) fn prepare_from_input(
         std::slice::from_ref(&uri),
         &candidate_names,
         mode,
-        Some(SnapshotSeed::new(target_record)),
+        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
         skip_imports_for,
         cancel,
     ) {
@@ -988,7 +1132,7 @@ pub(crate) fn prepare_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    if let Err(error) = check_includes(&snapshot, &uri, position) {
+    if let Err(error) = check_includes(&snapshot, &uri, position, &candidate_names, Some(cancel)) {
         return Computed {
             source_generation,
             configuration_generation,
@@ -1017,7 +1161,7 @@ pub(crate) fn rename_from_input(
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = canonical_file_uri(uri);
-    let (initial_source, _) = match source_for_input(&input, &uri) {
+    let (initial_source, _) = match source_for_input_with_cancel(&input, &uri, Some(cancel)) {
         Ok(source) => source,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -1032,11 +1176,18 @@ pub(crate) fn rename_from_input(
         }
     };
     let additional_names = [new_name.to_owned()];
-    let (planning_source, target_record, binding_info) =
-        match binding_info_for_input(&input, &uri, position, &additional_names) {
+    let classification =
+        match binding_info_for_input(&input, &uri, position, &additional_names, cancel) {
             Ok(result) => result,
             Err(error) => return failed(source_generation, configuration_generation, error),
         };
+    let BindingClassification {
+        source: planning_source,
+        record: target_record,
+        info: binding_info,
+        consumed_configuration,
+        ..
+    } = classification;
     if initial_source != planning_source {
         return failed(
             source_generation,
@@ -1077,7 +1228,7 @@ pub(crate) fn rename_from_input(
         std::slice::from_ref(&uri),
         &candidate_names,
         mode,
-        Some(SnapshotSeed::new(target_record)),
+        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
         skip_imports_for,
         cancel,
     ) {
@@ -1114,7 +1265,7 @@ pub(crate) fn rename_from_input(
             };
         }
     };
-    if let Err(error) = check_includes(&snapshot, &uri, position) {
+    if let Err(error) = check_includes(&snapshot, &uri, position, &candidate_names, Some(cancel)) {
         return Computed {
             source_generation,
             configuration_generation,
@@ -1274,14 +1425,17 @@ pub(crate) fn build_snapshot(
             .as_ref()
             .map_or(&[][..], |seed| seed.consumed_configuration.as_slice()),
         &mut baseline,
+        &mut baseline_content_hashes,
         &mut baseline_contents,
         cancel,
     )?;
     for rejected_uri in &input.rejected_documents {
-        if matches!(mode, SnapshotMode::Local | SnapshotMode::LocalWithImports)
-            && !priority
-                .iter()
-                .any(|priority_uri| priority_uri == rejected_uri)
+        if matches!(
+            mode,
+            SnapshotMode::Local | SnapshotMode::LocalWithImports | SnapshotMode::Assistance
+        ) && !priority
+            .iter()
+            .any(|priority_uri| priority_uri == rejected_uri)
         {
             continue;
         }
@@ -1340,6 +1494,7 @@ pub(crate) fn build_snapshot(
             &context_key,
             &mut baseline,
             &mut baseline_content_hashes,
+            &mut baseline_contents,
             mode == SnapshotMode::WorkspaceSymbols,
             cancel,
         )?;
@@ -1560,6 +1715,8 @@ pub(crate) fn build_snapshot(
             SnapshotMode::Workspace
                 | SnapshotMode::WorkspaceSymbols
                 | SnapshotMode::LocalWithImports
+                | SnapshotMode::Assistance
+                | SnapshotMode::Local
         ) && !contexts.contains_key(&uri)
         {
             let context_key = loader.context_for_uri_with_cancel(&uri, Some(cancel))?;
@@ -1568,6 +1725,7 @@ pub(crate) fn build_snapshot(
                 &context_key,
                 &mut baseline,
                 &mut baseline_content_hashes,
+                &mut baseline_contents,
                 mode == SnapshotMode::WorkspaceSymbols,
                 cancel,
             )?;
@@ -1584,8 +1742,13 @@ pub(crate) fn build_snapshot(
                 });
             }
         }
+        let defines = contexts
+            .get(&uri)
+            .and_then(|context_key| loader.contexts.get(context_key))
+            .map(|state| state.context.defines.clone())
+            .unwrap_or_default();
         index
-            .update(uri.clone(), source.clone())
+            .update_with_defines_with_cancel(uri.clone(), source.clone(), &defines, cancel)
             .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
         retained_files = retained_files.saturating_add(1);
         retained_bytes = retained_bytes.saturating_add(source_bytes);
@@ -1636,7 +1799,8 @@ pub(crate) fn build_snapshot(
                     continue;
                 }
                 let import_count = loader.index.imports(&uri).len();
-                let dependencies = loader.load_imports(&uri, &context_key, &mut pins)?;
+                let dependencies =
+                    loader.load_imports_with_cancel(&uri, &context_key, &mut pins, Some(cancel))?;
                 if dependencies.len() < import_count {
                     complete = false;
                     incomplete_reason.get_or_insert_with(|| {
@@ -1742,6 +1906,8 @@ pub(crate) fn build_snapshot(
             cancel,
             cache: HashMap::new(),
             active: HashSet::new(),
+            name_free_assistance: mode == SnapshotMode::Assistance,
+            baseline_contents: &mut baseline_contents,
             files_read: 0,
             bytes_read: 0,
             directives_seen: 0,
@@ -1761,6 +1927,7 @@ pub(crate) fn build_snapshot(
             &context_key,
             &mut baseline,
             &mut baseline_content_hashes,
+            &mut baseline_contents,
             mode == SnapshotMode::WorkspaceSymbols,
             cancel,
         )?;
@@ -1830,7 +1997,10 @@ fn enumerate_sources(
     };
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut path_keys = HashSet::new();
-    if matches!(mode, SnapshotMode::Local | SnapshotMode::LocalWithImports) {
+    if matches!(
+        mode,
+        SnapshotMode::Local | SnapshotMode::LocalWithImports | SnapshotMode::Assistance
+    ) {
         for uri in priority {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -2071,20 +2241,6 @@ fn add_baseline_content_hash(
     Ok(())
 }
 
-fn add_baseline_content_bytes(
-    path: &Path,
-    contents: &mut HashMap<String, Vec<u8>>,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    let key = path_key(path);
-    if contents.contains_key(&key) {
-        return Ok(());
-    }
-    let bytes = read_exact_file_bytes(path, cancel)?;
-    contents.insert(key, bytes);
-    Ok(())
-}
-
 fn read_exact_file_bytes(path: &Path, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
@@ -2148,6 +2304,7 @@ fn capture_context_baseline(
     context_key: &super::ContextKey,
     baseline: &mut BaselineAccumulator,
     baseline_content_hashes: &mut HashMap<String, u64>,
+    baseline_contents: &mut HashMap<String, Vec<u8>>,
     observe_directory_stamps: bool,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
@@ -2181,9 +2338,27 @@ fn capture_context_baseline(
                 // configurations part of workspace snapshot completeness.
                 continue;
             }
-            add_baseline_path_with_stamp(baseline, path.clone(), stamp.clone());
-            if stamp.as_ref().is_some_and(|stamp| !stamp.is_dir) {
-                add_baseline_content_hash(path, baseline_content_hashes, cancel, true)?;
+            let observed = state
+                .project_read_observations
+                .iter()
+                .find(|observation| package_paths_equal(&observation.path, path));
+            let observed_stamp = observed
+                .map(|observation| Some(super::path_stamp_from_project_read(&observation.stamp)))
+                .unwrap_or_else(|| stamp.clone());
+            add_baseline_path_with_stamp(baseline, path.clone(), observed_stamp.clone());
+            if observed_stamp.as_ref().is_some_and(|stamp| !stamp.is_dir) {
+                if let Some(observation) = observed {
+                    baseline_content_hashes
+                        .entry(path_key(path))
+                        .or_insert(observation.content_hash);
+                    if let Some(content_bytes) = &observation.content_bytes {
+                        baseline_contents
+                            .entry(path_key(path))
+                            .or_insert_with(|| content_bytes.clone());
+                    }
+                } else {
+                    add_baseline_content_hash(path, baseline_content_hashes, cancel, true)?;
+                }
             }
         }
     }
@@ -2193,6 +2368,7 @@ fn capture_context_baseline(
 fn capture_consumed_configuration_baseline(
     records: &[SourceRecord],
     baseline: &mut BaselineAccumulator,
+    baseline_content_hashes: &mut HashMap<String, u64>,
     baseline_contents: &mut HashMap<String, Vec<u8>>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
@@ -2203,18 +2379,25 @@ fn capture_consumed_configuration_baseline(
         let Some(path) = record.path.as_ref() else {
             continue;
         };
-        if !is_configuration_file(path) {
+        if let Some(membership) = &record.candidate_membership {
+            add_baseline_candidate_membership(
+                baseline,
+                path.clone(),
+                membership.clone(),
+                record.path_stamp.is_some(),
+            );
             continue;
         }
-        let stamp = path_stamp_result(path).map_err(|error| {
-            format!(
-                "could not inspect configuration candidate {}: {error}",
-                path.display()
-            )
-        })?;
-        add_baseline_path_with_stamp(baseline, path.clone(), stamp);
-        if record.content_bytes.is_some() {
-            add_baseline_content_bytes(path, baseline_contents, cancel)?;
+        add_baseline_path_with_stamp(baseline, path.clone(), record.path_stamp.clone());
+        if let Some(content_hash) = record.content_hash {
+            baseline_content_hashes
+                .entry(path_key(path))
+                .or_insert(content_hash);
+        }
+        if let Some(content_bytes) = &record.content_bytes {
+            baseline_contents
+                .entry(path_key(path))
+                .or_insert_with(|| content_bytes.clone());
         }
     }
     Ok(())
@@ -2324,7 +2507,12 @@ pub(crate) fn check_includes(
     snapshot: &RenameSnapshot,
     uri: &Url,
     position: Position,
+    candidate_names: &[String],
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
     if let Some(error) = snapshot.include_errors.first() {
         return Err(error.clone());
     }
@@ -2333,22 +2521,37 @@ pub(crate) fn check_includes(
         .get(uri)
         .and_then(|source| identifier_at_position(source, position));
     for (source_uri, source) in &snapshot.sources {
-        let relevant = source_uri == uri
-            || target_name
-                .as_deref()
-                .is_some_and(|name| contains_identifier(source, name));
+        if cancel.is_some_and(is_cancelled) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let relevant = source_uri == uri || contains_any_identifier(source, candidate_names);
         if relevant {
-            let regions = conditional_regions(source);
-            if regions.iter().any(|(start, end)| {
-                (source_uri == uri
-                    && text::position_to_offset(source, position)
-                        .is_some_and(|offset| (*start..=*end).contains(&offset)))
-                    || target_name
-                        .as_deref()
-                        .is_some_and(|name| contains_identifier(&source[*start..*end], name))
-            }) {
+            let target_is_unknown = source_uri == uri
+                && text::position_to_offset(source, position).is_some_and(|offset| {
+                    snapshot.index.conditional_unknown_at(source_uri, offset)
+                });
+            let unknown_candidate = target_name.as_deref().is_some_and(|name| {
+                snapshot
+                    .index
+                    .conditional_unknown_contains_identifier(source_uri, name)
+            });
+            if target_is_unknown || unknown_candidate {
                 return Err(format!(
                     "rename cannot prove completeness because relevant conditional compilation affects {source_uri}"
+                ));
+            }
+            if cancel.is_some_and(is_cancelled) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if snapshot
+                .index
+                .conditional_analysis(source_uri)
+                .is_some_and(|analysis| {
+                    analysis.pascal_condition_contains_identifier(candidate_names)
+                })
+            {
+                return Err(format!(
+                    "rename cannot prove completeness because a Pascal conditional expression affects {source_uri}"
                 ));
             }
         }
@@ -2406,12 +2609,14 @@ struct IncludeAuditor<'a> {
     contexts: &'a mut HashMap<Url, ContextKey>,
     baseline: &'a mut BaselineAccumulator,
     baseline_content_hashes: &'a mut HashMap<String, u64>,
+    baseline_contents: &'a mut HashMap<String, Vec<u8>>,
     candidate_names: &'a [String],
     max_file_bytes: usize,
     observe_directory_stamps: bool,
     cancel: &'a AtomicBool,
     cache: HashMap<String, IncludeAnalysis>,
     active: HashSet<String>,
+    name_free_assistance: bool,
     files_read: usize,
     bytes_read: usize,
     directives_seen: usize,
@@ -2429,23 +2634,44 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         if is_cancelled(auditor.cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
+        let context = auditor.context_for_source(&uri)?;
         let Some(source) = auditor.sources.get(&uri) else {
             continue;
         };
-        let source_directives = directives(source);
-        if source_directives
-            .iter()
-            .any(|directive| directive.kind == DirectiveKind::Other)
-        {
+        let defines = context
+            .as_ref()
+            .map(|context| context.defines.clone())
+            .unwrap_or_default();
+        #[cfg(test)]
+        if TEST_CANCEL_INCLUDE_ANALYSIS.with(Cell::get) {
+            auditor.cancel.store(true, Ordering::Relaxed);
+        }
+        let conditional = conditional::analyze_with_cancel(source, &defines, auditor.cancel);
+        if is_cancelled(auditor.cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if !conditional.complete {
+            auditor.result.incomplete_reason.get_or_insert_with(|| {
+                format!("conditional analysis is incomplete for include owner {uri}")
+            });
+        }
+        if conditional.directives.iter().any(|directive| {
+            directive.potentially_active() && directive.kind == ConditionalDirectiveKind::Other
+        }) {
             auditor.record_error(format!(
                 "rename cannot prove completeness because include owner {uri} contains an unsupported directive"
             ));
             auditor.stopped = true;
             break;
         }
-        let include_directives = source_directives
+        let include_directives = conditional
+            .directives
             .into_iter()
-            .filter(|directive| directive.kind == DirectiveKind::Include)
+            .filter(|directive| {
+                directive.kind == ConditionalDirectiveKind::Include
+                    && directive.potentially_active()
+            })
+            .map(|directive| legacy_directive(&directive))
             .collect::<Vec<_>>();
         if include_directives.is_empty() {
             continue;
@@ -2497,6 +2723,7 @@ impl IncludeAuditor<'_> {
             &context_key,
             self.baseline,
             self.baseline_content_hashes,
+            self.baseline_contents,
             self.observe_directory_stamps,
             self.cancel,
         )?;
@@ -2678,10 +2905,31 @@ impl IncludeAuditor<'_> {
             .entry(path_key(path))
             .or_insert(include_source.content_hash);
 
-        let directive_only = directive_only_directives(&include_source.text, true);
-        let relevant = directive_only.is_none()
-            && contains_any_identifier(&include_source.text, self.candidate_names);
-        let include_directives = directive_only.unwrap_or_else(|| directives(&include_source.text));
+        // The caller's project defines are not necessarily the state at this
+        // include boundary: the owner may have DEFINE/UNDEF directives, and
+        // preceding includes may have changed the environment. Until the
+        // auditor carries that state soundly, start include analysis with
+        // unknown facts rather than resurrecting stale project facts.
+        let conditional = conditional::analyze_with_cancel(&include_source.text, &[], self.cancel);
+        if is_cancelled(self.cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let relevant = if self.name_free_assistance {
+            projected_source_contains_pascal_tokens(&conditional.projected_source)
+        } else {
+            conditional
+                .potentially_active_contains_identifier(&include_source.text, self.candidate_names)
+                || conditional.pascal_condition_contains_identifier(self.candidate_names)
+        };
+        let include_directives = conditional
+            .directives
+            .iter()
+            .filter(|directive| {
+                directive.kind == ConditionalDirectiveKind::Include
+                    && directive.potentially_active()
+            })
+            .map(legacy_directive)
+            .collect::<Vec<_>>();
         let analysis = if self.bytes_read >= MAX_RENAME_INCLUDE_BYTES {
             self.stopped = true;
             IncludeAnalysis::unsafe_with_reason(
@@ -2690,21 +2938,17 @@ impl IncludeAuditor<'_> {
                 ),
                 relevant,
             )
-        } else if include_directives
-            .iter()
-            .any(|directive| directive.kind == DirectiveKind::Other)
-        {
+        } else if !conditional.complete {
+            IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has malformed or incomplete conditional directives"),
+                relevant,
+            )
+        } else if conditional.directives.iter().any(|directive| {
+            directive.potentially_active() && directive.kind == ConditionalDirectiveKind::Other
+        }) {
             IncludeAnalysis::unsafe_with_reason(
                 format!("include {path:?} contains an unsupported directive"),
                 relevant,
-            )
-        } else if conditional_include_references_candidate(
-            &include_directives,
-            self.candidate_names,
-        ) {
-            IncludeAnalysis::unsafe_with_reason(
-                format!("include {path:?} has a Pascal-dependent conditional expression"),
-                true,
             )
         } else {
             self.active.insert(active_key.clone());
@@ -2794,6 +3038,64 @@ struct Directive {
     body: String,
     start: usize,
     end: usize,
+}
+
+fn legacy_directive(directive: &ConditionalDirective) -> Directive {
+    let kind = match directive.kind {
+        ConditionalDirectiveKind::Include => DirectiveKind::Include,
+        ConditionalDirectiveKind::ConditionalStart => DirectiveKind::ConditionalStart,
+        ConditionalDirectiveKind::ConditionalMiddle => DirectiveKind::ConditionalMiddle,
+        ConditionalDirectiveKind::ConditionalEnd => DirectiveKind::ConditionalEnd,
+        ConditionalDirectiveKind::Define | ConditionalDirectiveKind::Undef => {
+            DirectiveKind::CompilerDefine
+        }
+        ConditionalDirectiveKind::MethodInfo => DirectiveKind::MethodInfo,
+        ConditionalDirectiveKind::Harmless => DirectiveKind::Harmless,
+        ConditionalDirectiveKind::Other => DirectiveKind::Other,
+    };
+    Directive {
+        kind,
+        body: directive.body.clone(),
+        start: directive.start,
+        end: directive.end,
+    }
+}
+
+fn projected_source_contains_pascal_tokens(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'{' {
+            let Some(close) = bytes[index + 1..].iter().position(|byte| *byte == b'}') else {
+                return true;
+            };
+            index = index.saturating_add(close).saturating_add(2);
+            continue;
+        }
+        if bytes[index] == b'(' && bytes.get(index + 1) == Some(&b'*') {
+            let Some(close) = bytes[index + 2..]
+                .windows(2)
+                .position(|window| window == b"*)")
+            else {
+                return true;
+            };
+            index = index.saturating_add(close).saturating_add(4);
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 fn include_search_directories(owner_path: &Path, context: Option<&ProjectContext>) -> Vec<PathBuf> {
@@ -3074,91 +3376,11 @@ fn include_owner_summary(source: &str, owner_directives: &[Directive]) -> Option
     (!owner_directives.is_empty() && !summary.is_empty()).then_some(summary)
 }
 
-fn conditional_include_references_candidate(
-    directives: &[Directive],
-    candidate_names: &[String],
-) -> bool {
-    if candidate_names
-        .iter()
-        .any(|name| !name.trim_start_matches('&').is_ascii())
-    {
-        return true;
-    }
-    directives.iter().any(|directive| {
-        let keyword = directive_keyword(&directive.body)
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
-        if keyword != "if" && keyword != "elseif" && keyword != "elif" {
-            return false;
-        }
-        let expression = directive_arguments(&directive.body);
-        identifier_spans(expression)
-            .into_iter()
-            .any(|(start, end)| {
-                let identifier = &expression[start..end];
-                candidate_names.iter().any(|name| {
-                    identifier.eq_ignore_ascii_case(name.trim_start_matches('&'))
-                        && !is_defined_compiler_symbol(expression, start)
-                })
-            })
-    })
-}
-
-fn is_defined_compiler_symbol(expression: &str, identifier_start: usize) -> bool {
-    let prefix = expression[..identifier_start].trim_end();
-    let Some(prefix) = prefix.strip_suffix('(') else {
-        return false;
-    };
-    let prefix = prefix.trim_end();
-    let start = prefix
-        .as_bytes()
-        .iter()
-        .rposition(|byte| !is_identifier_byte(*byte))
-        .map_or(0, |index| index + 1);
-    if !prefix[start..].eq_ignore_ascii_case("defined") {
-        return false;
-    }
-    !prefix[..start].trim_end().ends_with('.')
-}
-
 fn directive_keyword(body: &str) -> Option<&str> {
     body.trim_start()
         .split(|character: char| character.is_ascii_whitespace() || character == ':')
         .next()
         .filter(|keyword| !keyword.is_empty())
-}
-
-fn directive_arguments(body: &str) -> &str {
-    let body = body.trim_start();
-    let Some(keyword) = directive_keyword(body) else {
-        return "";
-    };
-    body.get(keyword.len()..)
-        .map(str::trim_start)
-        .unwrap_or_default()
-}
-
-fn identifier_spans(source: &str) -> Vec<(usize, usize)> {
-    let bytes = source.as_bytes();
-    let mut spans = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\'' {
-            skip_string(bytes, &mut index);
-            continue;
-        }
-        if is_identifier_byte(bytes[index]) {
-            let start = index;
-            index += 1;
-            while index < bytes.len() && is_identifier_byte(bytes[index]) {
-                index += 1;
-            }
-            spans.push((start, index));
-        } else {
-            index += 1;
-        }
-    }
-    spans
 }
 
 #[derive(Debug, Clone)]
@@ -3247,105 +3469,6 @@ fn read_include(
         content_hash: hasher.finish(),
         bytes: byte_count,
     })
-}
-
-fn directive_only_directives(source: &str, allow_includes: bool) -> Option<Vec<Directive>> {
-    let bytes = source.as_bytes();
-    let mut entries = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            index = source[index..]
-                .find('\n')
-                .map_or(bytes.len(), |offset| index + offset + 1);
-            continue;
-        }
-        if bytes[index] == b'{' {
-            if bytes.get(index + 1) == Some(&b'$') {
-                let end = source[index + 2..].find('}')?;
-                let body = source[index + 2..index + 2 + end].to_string();
-                entries.push(Directive {
-                    kind: directive_kind(&body),
-                    body,
-                    start: index,
-                    end: index + end + 3,
-                });
-                index += end + 3;
-            } else {
-                let end = source[index + 1..].find('}')?;
-                index += end + 2;
-            }
-            continue;
-        }
-        if bytes[index] == b'(' && bytes.get(index + 1) == Some(&b'*') {
-            if bytes.get(index + 2) == Some(&b'$') {
-                let end = source[index + 3..].find("*)")?;
-                let body = source[index + 3..index + 3 + end].to_string();
-                entries.push(Directive {
-                    kind: directive_kind(&body),
-                    body,
-                    start: index,
-                    end: index + end + 5,
-                });
-                index += end + 5;
-            } else {
-                let end = source[index + 2..].find("*)")?;
-                index += end + 4;
-            }
-            continue;
-        }
-        return None;
-    }
-
-    let mut conditional_frames = Vec::new();
-    for directive in &entries {
-        match directive.kind {
-            DirectiveKind::ConditionalStart => conditional_frames.push(false),
-            DirectiveKind::ConditionalMiddle => {
-                let seen_else = conditional_frames.last_mut()?;
-                if directive_keyword(&directive.body)
-                    .is_some_and(|keyword| keyword.eq_ignore_ascii_case("else"))
-                {
-                    if *seen_else {
-                        return None;
-                    }
-                    *seen_else = true;
-                } else if *seen_else {
-                    return None;
-                }
-            }
-            DirectiveKind::ConditionalEnd => {
-                conditional_frames.pop()?;
-            }
-            DirectiveKind::Include if allow_includes => {}
-            DirectiveKind::CompilerDefine | DirectiveKind::MethodInfo | DirectiveKind::Harmless => {
-            }
-            DirectiveKind::Include | DirectiveKind::Other => return None,
-        }
-    }
-    conditional_frames.is_empty().then_some(entries)
-}
-
-fn conditional_regions(source: &str) -> Vec<(usize, usize)> {
-    let mut starts = Vec::new();
-    let mut regions = Vec::new();
-    for directive in directives(source) {
-        match directive.kind {
-            DirectiveKind::ConditionalStart => starts.push(directive.start),
-            DirectiveKind::ConditionalEnd => {
-                if let Some(start) = starts.pop() {
-                    regions.push((start, directive.end));
-                }
-            }
-            _ => {}
-        }
-    }
-    regions.extend(starts.into_iter().map(|start| (start, source.len())));
-    regions
 }
 
 pub(crate) fn identifier_at_position(source: &str, position: Position) -> Option<String> {
@@ -3549,11 +3672,14 @@ fn skip_string(bytes: &[u8], index: &mut usize) {
 mod tests {
     use super::{
         BaselineAccumulator, Directive, DirectiveKind, PathStamp, ProjectCandidateMembership,
-        SnapshotMode, Workspace, WorkspaceOptions, build_snapshot, contains_any_identifier,
-        directive_kind, file_content_hash, read_exact_file_bytes, read_include, rename_from_input,
-        resolve_include_path, revalidate_input, snapshot_records,
+        SnapshotMode, Workspace, WorkspaceOptions, build_snapshot,
+        capture_consumed_configuration_baseline, contains_any_identifier, directive_kind,
+        file_content_hash, path_key, path_record_at, read_exact_file_bytes, read_include,
+        rename_from_input, resolve_include_path, revalidate_input, snapshot_records,
+        test_cancel_in_include_analysis,
     };
     use lsp_types::{Position, Url};
+    use std::collections::HashMap;
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -3652,6 +3778,81 @@ mod tests {
                 .iter()
                 .any(|record| { record.path.as_deref() == Some(missing_include.as_path()) })
         );
+    }
+
+    #[test]
+    fn consumed_configuration_baseline_retains_the_classification_observation() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let path = temp.path().join("App.dproj");
+        fs::write(&path, b"actual").expect("configuration");
+        let observed_bytes = b"observed".to_vec();
+        let observed_stamp = PathStamp {
+            bytes: observed_bytes.len() as u64,
+            modified: None,
+            is_dir: false,
+            is_symlink: false,
+        };
+        let record = path_record_at(
+            path.clone(),
+            Some(observed_stamp.clone()),
+            None,
+            Some(observed_bytes.clone()),
+            None,
+        )
+        .expect("configuration record");
+        let mut baseline = BaselineAccumulator::default();
+        let mut baseline_content_hashes = HashMap::new();
+        let mut baseline_contents = HashMap::new();
+        let cancel = AtomicBool::new(false);
+
+        capture_consumed_configuration_baseline(
+            &[record],
+            &mut baseline,
+            &mut baseline_content_hashes,
+            &mut baseline_contents,
+            &cancel,
+        )
+        .expect("classification observation baseline");
+
+        assert_eq!(
+            baseline_contents.get(&path_key(&path)),
+            Some(&observed_bytes)
+        );
+        assert_eq!(baseline.paths[0].stamp, Some(observed_stamp));
+    }
+
+    #[test]
+    fn include_analysis_honors_cancellation() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Main.pas");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            &source_path,
+            "unit Main;\ninterface\nprocedure VisibleThing;\nimplementation\n{$I Nested.inc}\nend.\n",
+        )
+        .expect("source");
+        fs::write(
+            root.join("Nested.inc"),
+            "{$IFDEF MAYBE}\nHidden\n{$ENDIF}\n",
+        )
+        .expect("include");
+
+        let workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let cancel = AtomicBool::new(false);
+        let _guard = test_cancel_in_include_analysis();
+        let result = build_snapshot(
+            &input,
+            std::slice::from_ref(&uri),
+            &[],
+            SnapshotMode::LocalWithImports,
+            None,
+            &[],
+            &cancel,
+        );
+        assert_eq!(result.err().as_deref(), Some("request cancelled"));
     }
 
     #[test]

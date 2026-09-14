@@ -2,10 +2,11 @@
 
 A native, source-based Delphi/Object Pascal language server. Runs on Linux
 without Windows, Wine, RAD Studio, or `DelphiLSP.exe`. This slice provides
-declaration/definition navigation, document and workspace symbols, semantic
-references, document highlights, conservative symbol-aware rename, naming
-quick fixes, and reuses lint4d and fmt4d for diagnostics and formatting. It is
-not a replacement for Delphi's compiler or its complete type system.
+declaration/definition navigation, source-based hover and type definitions,
+document and workspace symbols, semantic references, document highlights,
+semantic completion and signature help, conservative symbol-aware rename,
+naming quick fixes, and reuses lint4d and fmt4d for diagnostics and formatting.
+It is not a replacement for Delphi's compiler or its complete type system.
 
 ## Build and Run
 
@@ -63,6 +64,10 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `gd` | Go to a routine's implementation body, falling back to its declaration |
 | `gD` | Go to the visible declaration, such as the unit interface or class header |
 | `gi` | Go to implementation; uses the same fallback as `gd` in this slice |
+| `:lua vim.lsp.buf.type_definition()` | Go from a variable, parameter, field, or property to its named type declaration |
+| `K` / `:lua vim.lsp.buf.hover()` | Show a bounded source declaration excerpt |
+| `:lua vim.lsp.buf.completion()` | Request semantic completion; Neovim may also trigger it after `.` |
+| `:lua vim.lsp.buf.signature_help()` | Show source-declared callable signatures after `(` or `,` |
 | `<C-o>` | Return to the previous jump location |
 | `grr` / `:lua vim.lsp.buf.references()` | List semantic references; the default client request includes declarations |
 | `gO` / `:lua vim.lsp.buf.document_symbol()` | List the current document's symbols |
@@ -82,8 +87,34 @@ For example, put the cursor on `MDIBDatabase` in `uses MDIBDatabase;` and press
 `gd` to open the unit. Put it on `TMDIBDatabase` in a type annotation, generic
 argument, or constructor receiver to jump to the class declaration. These use
 the standard LSP definition/declaration requests, not a new editor-specific
-command. Navigation from a variable name to its type (`textDocument/typeDefinition`)
-is a separate feature and is not advertised by this server yet.
+command. The server also advertises `textDocument/typeDefinition`: on a
+variable, parameter, field, or property it opens the source declaration of the
+named type, and on a type identifier it opens that type declaration. Unsaved
+buffers and the selected project context are used for the bounded lookup.
+
+Type-definition lookup is source-based rather than compiler-based. Type aliases
+retain their own declaration as the target, alias cycles are bounded, and
+unresolved, built-in, anonymous, or unsupported types return no location. A
+qualified or otherwise ambiguous binding retains its distinct source
+candidates; the server does not substitute an unrelated workspace-wide symbol
+with the same spelling.
+
+Completion is case-insensitive and uses the nearest lexical locals and
+parameters, visible class members, current-unit declarations, and resolved
+imported declarations. It preserves declaration casing and returns plain
+identifier `TextEdit`s; it does not insert snippets, imports, or additional
+edits. Imported private/protected members and unrelated workspace names are not
+offered. Conditional uncertainty, ambiguous receivers, and bounded candidate
+truncation are reported conservatively with `CompletionList.isIncomplete` rather
+than as a falsely complete result.
+
+Signature help reports every supported source declaration that remains viable,
+including overloads. The active parameter is counted syntactically while
+skipping nested calls, indexers, Pascal strings, and comments; grouped formal
+parameter names are expanded individually. The server does not infer argument
+types, select an active overload, resolve `with`/`inherited` receivers, or infer
+anonymous/generic callables, and returns no signature for opaque or unknown
+calls.
 
 ## Source Paths and Configuration
 
@@ -153,8 +184,9 @@ errors. Ordinary absent project-local configuration properties can evaluate as
 empty, while unavailable environment inputs and values affected by uncertain
 imports remain unknown. Compiled-only `.dcp` references do not establish source
 membership or, by themselves, make source discovery incomplete. Missing source
-references still do. Defines are collected as metadata, but source conditional
-compilation is not yet evaluated.
+references still do. Project defines are used as positive conditional facts;
+`buildConfig` and `platform` select the project context but do not synthesize
+compiler-version or host-environment facts.
 
 In the MultidevComponents example, `MDIBDatabase.pas` is genuinely shared by
 multiple packages, so automatic project selection still refuses to guess.
@@ -348,7 +380,7 @@ configuration does not install `CursorHold` or `CursorMoved` autocmds; clients
 request highlights explicitly, for example with
 `vim.lsp.buf.document_highlight()`.
 
-All four queries run in bounded analysis workers. `$/cancelRequest` is honored,
+All analysis queries run in bounded analysis workers. `$/cancelRequest` is honored,
 and source/configuration generations plus the observed read set are revalidated
 before delivery. A changed input produces a stale-result error for the client
 to retry rather than returning data computed from an older snapshot.
@@ -377,26 +409,37 @@ Implemented and covered by tests:
   abbreviated implementation headers.
 - Qualified unit/type names, namespaced units, straightforward declared-type
   member access, and `Self` members.
+- Source-based `textDocument/typeDefinition` for named variable, parameter,
+  field, property, and type declarations, including bounded aliases and
+  selected-project unit bindings.
 - Class members taking precedence over unit globals, including implementation
   classes and nested procedures inside methods.
 - In-memory replacements, Unicode UTF-16 coordinates, and CRLF source files.
 - Unknown receivers do not trigger an unrelated workspace-wide name search.
 - Document/workspace symbols, semantic references, and document-local highlights
   use the standard LSP requests and preserve UTF-16 source ranges.
+- Bounded, conservative conditional analysis recognizes `IFDEF`, `IFNDEF`,
+  `IF`, `IFOPT`, `ELSEIF`/`ELIF`, `ELSE`, `ENDIF`, local `DEFINE`/`UNDEF`, and
+  `DEFINED(...)`. Known-inactive source is omitted from the index; unknown
+  branches remain ambiguous instead of being treated as inactive or uniquely
+  resolved. Original source bytes remain authoritative for ranges and edits.
 
 Not implemented or incomplete:
 
-- Inherited-member lookup, `with` resolution, helpers, generic/type-alias
-  inference, function-result expression typing, and argument-based overload
-  selection.
+- Inherited-member lookup, `with` resolution, helpers, generic inference,
+  function-result expression typing, and argument-based overload selection.
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
-- Evaluation of `{$IFDEF}` branches or include-file expansion. Conditional
-  variants and duplicate units can produce multiple candidate locations.
+- Full compiler-equivalent conditional evaluation and include-file expansion.
+  The bounded analyzer does not infer `CompilerVersion`, `IFOPT`, or other host
+  compiler state. Unknown alternatives and relevant Pascal-dependent include
+  content can therefore produce no navigation result or block rename.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
-- Completion, hover, signature help, and type-definition requests are not
-  advertised or implemented.
+- Compiler-equivalent overload selection, generic inference, auto-imports,
+  snippets, and anonymous callable inference are not implemented. Completion
+  and signature help remain conservative when imports, conditionals, receivers,
+  or parser state are unknown.
 - Semantic tokens and a general Delphi type checker are not implemented.
 
 Unsupported expressions can return no location. Results should be evaluated
@@ -427,10 +470,12 @@ directory, evaluated `DCC_IncludePath`, then ordered unit/client source paths.
 Nested includes are audited within depth, file, directive, and byte limits;
 lookup observations and content hashes participate in stale-input checks.
 Comments and recognized compiler-only directives, including conditional compiler
-flags, do not by themselves block a rename. Pascal-dependent conditional
-expressions and relevant source-bearing includes remain unsupported; missing or
-unreadable includes cannot be treated as evidence that no reference exists.
-Source conditional compilation is not expanded. Unit/module renames (which require
+flags, do not by themselves block a rename. Known-inactive unresolved includes
+are skipped; active or unknown unresolved includes still block. Pascal-dependent
+conditional expressions and relevant source-bearing includes remain unsupported;
+missing or unreadable includes cannot be treated as evidence that no reference
+exists. Source conditional compilation is projected for analysis rather than
+textually expanded. Unit/module renames (which require
 `RenameFile`), inherited/`with` lookup, overloaded/override relationships,
 compiled-only consumers, and other unsupported bindings are also rejected by
 the shared planner. Name collisions and reference capture are rejected before
@@ -464,6 +509,24 @@ since trees and indexes require additional memory. Limit warnings are
 written to stderr. Rejected editor buffers cannot return stale navigation or
 formatting edits and recover after a newer acceptable update.
 
+Conditional analysis has additional fixed safety bounds: at most 16,384
+directives per source, 256 nested conditional frames, 4,096 bytes per
+conditional expression, 256 expression tokens, 32,768 retained environment
+entries, 1 MiB of retained environment-key bytes, 1,000,000 aggregate
+environment operations, and 16 MiB of aggregate environment copy/merge byte
+work. Exceeding a bound marks the source unknown rather than returning a
+partial proof. Includes used by rename are separately bounded by 4,096 files,
+256 MiB, 16,384 directives, and 256 nested include levels.
+
+Assistance has fixed per-request bounds: at most 256 completion items, 100,000
+scanned completion symbols, 100,000 syntax-tree nodes while locating completion
+context or a call, 128 signatures, 64 KiB of signature-argument scanning, 256
+nested parentheses/indexers, 128 KiB per rendered signature label, 4,096 formal
+parameters, and 256 KiB of aggregate signature metadata. Completion reports
+item truncation as `isIncomplete` and fails closed when context traversal cannot
+finish; signature help fails closed when its bounded parser or output limit is
+exceeded.
+
 Linting and formatting reject syntax trees deeper than 256 levels to protect
 their recursive analysis pipelines. Navigation uses iterative tree walks. LSP
 headers are capped at 8 KiB and message bodies at 8 MiB. The stdio endpoint is
@@ -477,13 +540,16 @@ cargo clippy --locked -p pascal-lsp --all-targets --no-deps -- -D warnings
 cargo fmt --manifest-path crates/pascal-lsp/Cargo.toml -- --check
 ```
 
-Tests include navigation fixtures, real-process framed LSP sessions, and a
-headless Neovim test loading the shipped example. It invokes standard
-`vim.lsp.buf.rename()` and `vim.lsp.buf.code_action()` on disposable provider
-and initially unopened consumer fixtures, verifies their exact in-memory edits,
-and verifies that neither fixture is saved. The Neovim test skips when `nvim` is
-not installed; when installed it must be version 0.11 or newer. No personal
-Neovim configuration is changed.
+Tests include navigation fixtures, real-process framed LSP sessions, and
+headless Neovim tests loading the shipped example. The assistance smoke invokes
+standard `textDocument/hover`, `textDocument/typeDefinition`,
+`textDocument/completion`, and `textDocument/signatureHelp` requests against a
+disposable unsaved overlay, verifies UTF-16 ranges and semantic results, and
+verifies that neither fixture is saved. Other Neovim tests invoke standard
+`vim.lsp.buf.rename()` and `vim.lsp.buf.code_action()` and verify exact
+in-memory edits. The Neovim tests skip when `nvim` is not installed; when
+installed it must be version 0.11 or newer. No personal Neovim configuration is
+changed.
 
 ## License
 

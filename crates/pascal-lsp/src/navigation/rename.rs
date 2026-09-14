@@ -230,6 +230,9 @@ impl NavigationIndex {
             .ok_or_else(|| format!("document is not indexed: {uri}"))?;
         let offset = super::text::position_to_offset(&document.source, position)
             .ok_or_else(|| "position is outside the source document".to_string())?;
+        if document.conditionals.is_unknown_at(offset) {
+            return Ok(Vec::new());
+        }
         if is_ignored_offset(document.tree.root_node(), offset)
             || identifier_at(document.tree.root_node(), offset).is_none()
         {
@@ -273,20 +276,23 @@ impl NavigationIndex {
             || has_ancestor_kind(identifier, "ppDirective")
             || has_ancestor_kind(identifier, "with")
             || has_ancestor_kind(identifier, "inherited")
+            || document.conditionals.is_unknown_at(offset)
         {
             return false;
         }
         let candidates = self.resolve_candidates_at(uri, document, offset, identifier);
         !candidates.is_empty()
-            && !self.is_unknown_global_fallback(uri, document, identifier, offset, &candidates)
+            && !self.is_unknown_global_fallback(document, identifier, offset, &candidates)
     }
 
-    pub(crate) fn rename_binding_info(
+    pub(crate) fn rename_binding_info_with_cancel(
         &self,
         uri: &Url,
         position: lsp_types::Position,
+        cancel: &AtomicBool,
     ) -> Result<RenameBindingInfo, String> {
-        let (binding, _) = self.binding_plan(uri, position)?;
+        check_cancel(Some(cancel))?;
+        let (binding, _) = self.binding_plan_with_cancel(uri, position, Some(cancel))?;
         let mut names = binding.names.iter().cloned().collect::<Vec<_>>();
         names.sort_by_key(|name| canonical_name(name));
         names.dedup_by(|left, right| canonical_name(left) == canonical_name(right));
@@ -303,6 +309,7 @@ impl NavigationIndex {
                             | SymbolKind::Label
                     )
             });
+        check_cancel(Some(cancel))?;
         Ok(RenameBindingInfo { local, names })
     }
 
@@ -310,14 +317,18 @@ impl NavigationIndex {
     /// documents. This is deliberately narrower than classifying a binding as
     /// local: public bindings still require the workspace snapshot and its
     /// reverse-reference checks.
-    pub(crate) fn self_contained_rename_binding(
+    pub(crate) fn self_contained_rename_binding_with_cancel(
         &mut self,
         uri: &Url,
         position: lsp_types::Position,
         additional_names: &[String],
+        cancel: &AtomicBool,
     ) -> bool {
+        if check_cancel(Some(cancel)).is_err() {
+            return false;
+        }
         self.bind_imports(uri, std::iter::empty::<(String, Url)>());
-        let Ok(plan) = self.rename_plan(uri, position) else {
+        let Ok(plan) = self.rename_plan_with_cancel(uri, position, Some(cancel)) else {
             return false;
         };
         let Some(document) = self.documents.get(uri) else {
@@ -337,6 +348,9 @@ impl NavigationIndex {
             .collect::<HashSet<_>>();
 
         for identifier in identifier_nodes(document.tree.root_node()) {
+            if check_cancel(Some(cancel)).is_err() {
+                return false;
+            }
             let span = Span::from_node(identifier);
             let name = canonical_name(&node_text(identifier, &document.source));
             if !candidate_names.contains(&name) {
@@ -362,8 +376,11 @@ impl NavigationIndex {
             if candidates.len() != 1 {
                 return false;
             }
+            if self.candidate_is_conditionally_unknown(&candidates[0]) {
+                return false;
+            }
             let candidate = &candidates[0];
-            if self.is_unknown_global_fallback(uri, document, identifier, span.start, &candidates) {
+            if self.is_unknown_global_fallback(document, identifier, span.start, &candidates) {
                 return false;
             }
             if candidate.uri != *uri
@@ -374,26 +391,52 @@ impl NavigationIndex {
             }
         }
 
-        true
+        check_cancel(Some(cancel)).is_ok()
     }
 
-    fn is_unknown_global_fallback(
+    pub(super) fn is_unknown_global_fallback(
         &self,
-        uri: &Url,
         document: &Document,
         identifier: Node<'_>,
         offset: usize,
         candidates: &[Candidate],
     ) -> bool {
-        document
-            .owner_type_at(offset)
-            .is_some_and(|owner| self.has_unknown_class_ancestor(document, &owner))
+        let owner_type = document.owner_type_at(offset);
+        self.is_unknown_global_fallback_for_owner(
+            document,
+            identifier,
+            owner_type.as_deref(),
+            candidates,
+        )
+    }
+
+    pub(super) fn is_unknown_global_fallback_for_owner(
+        &self,
+        document: &Document,
+        identifier: Node<'_>,
+        owner_type: Option<&str>,
+        candidates: &[Candidate],
+    ) -> bool {
+        let type_reference = has_ancestor_kind(identifier, "typeref");
+        owner_type.is_some_and(|owner| self.has_unknown_class_ancestor(document, owner))
             && member_expression_at(identifier).is_none()
             && qualified_type_path_at(identifier, &document.source).is_none()
             && use_name_at(identifier, &document.source).is_none()
-            && candidates
-                .iter()
-                .any(|candidate| candidate.uri == *uri && self.candidate_is_global(candidate))
+            && candidates.iter().any(|candidate| {
+                self.candidate_is_global(candidate)
+                    && (!type_reference
+                        || self
+                            .symbol(candidate)
+                            .is_none_or(|symbol| symbol.kind != SymbolKind::Type))
+            })
+    }
+
+    pub(super) fn owner_has_unknown_class_ancestor(
+        &self,
+        document: &Document,
+        owner_type: &str,
+    ) -> bool {
+        self.has_unknown_class_ancestor(document, owner_type)
     }
 
     fn candidate_is_global(&self, candidate: &Candidate) -> bool {
@@ -401,34 +444,24 @@ impl NavigationIndex {
             symbol.scope == ROOT_SCOPE
                 && symbol.owner_type.is_none()
                 && !symbol.local_only
-                && matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Constant)
+                && matches!(
+                    symbol.kind,
+                    SymbolKind::Variable | SymbolKind::Constant | SymbolKind::Routine
+                )
         })
     }
 
     fn has_unknown_class_ancestor(&self, document: &Document, owner_type: &str) -> bool {
-        let Some(type_declaration) = collect_nodes_matching(document.tree.root_node(), "declType")
-            .into_iter()
-            .find(|node| {
-                field_identifier_nodes(*node, "name")
-                    .last()
-                    .is_some_and(|name| {
-                        canonical_name(&node_text(*name, &document.source)) == owner_type
-                    })
-            })
-        else {
-            return true;
-        };
-        let Some(type_node) = type_declaration.child_by_field_name("type") else {
-            return true;
-        };
-
         // The resolver does not establish a complete inheritance or type-alias
         // chain here. A same-document parent name is therefore not proof that
         // inherited lookup is complete, and an omitted parent still has
-        // implicit TObject ancestry that is not modeled. Keep fallback globals
-        // conservative; lexical and same-class bindings are filtered before
-        // this guard is consulted.
-        type_node.kind() == "declClass"
+        // implicit TObject ancestry that is not modeled. Established
+        // non-class owners do not have class-inheritance lookup to complete;
+        // an owner missing from both caches remains unresolved and therefore
+        // conservatively unknown. The parse-time cache keeps this policy out
+        // of request-time tree walks.
+        document.unknown_class_owners.contains(owner_type)
+            || !document.known_non_class_owners.contains(owner_type)
     }
 
     /// Check whether the identifier at `position` can be renamed in the
@@ -663,8 +696,19 @@ impl NavigationIndex {
     }
 
     fn rename_plan(&self, uri: &Url, position: lsp_types::Position) -> Result<RenamePlan, String> {
-        let (binding, selected_span) = self.binding_plan(uri, position)?;
-        let occurrences = self.collect_occurrences(&binding)?;
+        self.rename_plan_with_cancel(uri, position, None)
+    }
+
+    fn rename_plan_with_cancel(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<RenamePlan, String> {
+        check_cancel(cancel)?;
+        let (binding, selected_span) = self.binding_plan_with_cancel(uri, position, cancel)?;
+        let occurrences =
+            self.collect_occurrences_bounded(&binding, None, true, true, None, cancel)?;
         if occurrences.is_empty() {
             return Err("rename binding has no source occurrences".to_string());
         }
@@ -680,6 +724,16 @@ impl NavigationIndex {
         uri: &Url,
         position: lsp_types::Position,
     ) -> Result<(Binding, Span), String> {
+        self.binding_plan_with_cancel(uri, position, None)
+    }
+
+    fn binding_plan_with_cancel(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Binding, Span), String> {
+        check_cancel(cancel)?;
         let document = self
             .documents
             .get(uri)
@@ -692,7 +746,16 @@ impl NavigationIndex {
         let identifier = identifier_at(document.tree.root_node(), offset)
             .ok_or_else(|| "no renameable identifier at position".to_string())?;
         let candidates = self.resolve_candidates_at(uri, document, offset, identifier);
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Err(
+                "rename cannot prove the binding across an unknown conditional branch".to_string(),
+            );
+        }
         let binding = binding_from_candidates(self, candidates)?;
+        check_cancel(cancel)?;
         if binding.kind == SymbolKind::Unit {
             return Err("unit/module rename requires RenameFile support".to_string());
         }
@@ -701,10 +764,6 @@ impl NavigationIndex {
         }
         let selected_span = Span::from_node(identifier);
         Ok((binding, selected_span))
-    }
-
-    fn collect_occurrences(&self, binding: &Binding) -> Result<Vec<Occurrence>, String> {
-        self.collect_occurrences_bounded(binding, None, true, true, None, None)
     }
 
     fn collect_occurrences_bounded(
@@ -823,7 +882,6 @@ impl NavigationIndex {
                             let candidates =
                                 self.resolve_candidates_at(uri, document, span.start, identifier);
                             let unknown_global_fallback = self.is_unknown_global_fallback(
-                                uri,
                                 document,
                                 identifier,
                                 span.start,
@@ -837,7 +895,6 @@ impl NavigationIndex {
                         let candidates =
                             self.resolve_candidates_at(uri, document, span.start, identifier);
                         let unknown_global_fallback = self.is_unknown_global_fallback(
-                            uri,
                             document,
                             identifier,
                             span.start,
@@ -845,6 +902,25 @@ impl NavigationIndex {
                         );
                         (candidates, unknown_global_fallback)
                     };
+                let in_unknown_branch = document
+                    .conditionals
+                    .unknown_spans
+                    .iter()
+                    .any(|range| range.start <= span.start && span.end <= range.end);
+                if in_unknown_branch
+                    && candidates.iter().any(|candidate| {
+                        binding.matches_candidate(self, candidate)
+                            && self.candidate_is_conditionally_unknown(candidate)
+                    })
+                {
+                    if !strict_resolution && !is_binding_member {
+                        continue;
+                    }
+                    return Err(format!(
+                        "rename cannot prove the binding of {:?} at {}:{} because its declaration is in an unknown conditional branch",
+                        binding.old_key, uri, span.start
+                    ));
+                }
                 if unknown_global_fallback {
                     if !strict_resolution && !is_binding_member {
                         continue;

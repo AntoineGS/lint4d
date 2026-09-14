@@ -508,6 +508,22 @@ fn navigation_params(path: &Path, source: &str, needle: &str, occurrence: usize)
     })
 }
 
+fn position_after(source: &str, needle: &str, occurrence: usize) -> Position {
+    let start = position_of(source, needle, occurrence);
+    Position::new(
+        start.line,
+        start.character + needle.encode_utf16().count() as u32,
+    )
+}
+
+fn final_qualified_type_position(source: &str, qualified_name: &str) -> Position {
+    let start = position_of(source, qualified_name, 0);
+    let prefix = qualified_name
+        .rsplit_once('.')
+        .map_or(0, |(prefix, _)| prefix.len() + 1);
+    Position::new(start.line, start.character + prefix as u32)
+}
+
 fn result_locations(response: Response) -> Vec<Value> {
     assert!(response.error.is_none(), "request failed: {response:?}");
     response
@@ -859,8 +875,946 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     assert_eq!(capabilities["workspaceSymbolProvider"], true);
     assert_eq!(capabilities["referencesProvider"], true);
     assert_eq!(capabilities["documentHighlightProvider"], true);
+    assert_eq!(capabilities["hoverProvider"], true);
+    assert_eq!(capabilities["typeDefinitionProvider"], true);
     assert_eq!(capabilities["documentFormattingProvider"], true);
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[test]
+fn initialize_advertises_standard_completion_and_signature_help() {
+    let (_temp, main, _provider, _main_source, _provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root");
+    let mut server = TestServer::launch();
+    let result = server.initialize(root, Value::Null);
+    let capabilities = &result["capabilities"];
+    assert_eq!(
+        capabilities["completionProvider"]["triggerCharacters"],
+        json!(["."])
+    );
+    assert_eq!(
+        capabilities["signatureHelpProvider"]["triggerCharacters"],
+        json!(["(", ","])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_request_returns_semantic_items_and_plain_text_edits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TWidget = class\n  private\n    Hidden: Integer;\n  public\n    Member: Integer;\n  end;\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar\n  LocalName: Integer;\n  Obj: TWidget;\nbegin\n  Loc;\n  Obj.Me;\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("completion-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "Loc", 0),
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let result = response.result.expect("completion result");
+    assert_eq!(result["isIncomplete"], false);
+    let items = result["items"].as_array().expect("completion items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["label"], "LocalName");
+    assert_eq!(items[0]["textEdit"]["newText"], "LocalName");
+    assert_eq!(
+        items[0]["textEdit"]["range"],
+        json!({
+            "start": {"line": 6, "character": 2},
+            "end": {"line": 6, "character": 11},
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_request_rejects_an_unresolved_import_without_partial_items() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("UnresolvedCompletion.pas");
+    let source = "unit UnresolvedCompletion;\ninterface\nuses MissingProvider;\nimplementation\nprocedure Run;\nvar LocalName: Integer;\nbegin\n  Loc;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("unresolved-completion-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Loc", 0),
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("unresolved import must reject completion");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error
+            .message
+            .contains("one or more imports could not be resolved")
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn signature_help_request_returns_nested_argument_selection_and_source_labels() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Signature.pas");
+    let source = "unit Signature;\ninterface\nprocedure Run(A, B: Integer; C: string; D: Integer); overload;\nprocedure Run(A: string); overload;\nprocedure Other(X, Y: Integer);\nimplementation\nprocedure Run(A, B: Integer; C: string; D: Integer);\nbegin\nend;\nprocedure Run(A: string);\nbegin\nend;\nprocedure Other(X, Y: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  Run(Other(1, 2), 'a,b', [1,2], 4);\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("signature-help-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "[1,2], ", 0),
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "signature help failed: {response:?}"
+    );
+    let result = response.result.expect("signature help result");
+    assert_eq!(result["activeSignature"], Value::Null);
+    assert_eq!(result["activeParameter"], 3);
+    let signatures = result["signatures"].as_array().expect("signatures");
+    assert_eq!(
+        signatures
+            .iter()
+            .map(|signature| signature["label"].as_str().expect("signature label"))
+            .collect::<Vec<_>>(),
+        [
+            "procedure Run(A, B: Integer; C: string; D: Integer);",
+            "procedure Run(A: string);",
+        ]
+    );
+    assert_eq!(
+        signatures[0]["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .map(|parameter| parameter["label"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!([14, 15]),
+            json!([17, 18]),
+            json!([29, 30]),
+            json!([40, 41])
+        ]
+    );
+    server.shutdown();
+}
+
+#[test]
+fn assistance_requests_follow_provider_overlays_and_newer_versions() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TWidget = class\n  public\n    DiskMember: Integer;\n  end;\nprocedure DiskRoutine(Value: Integer);\nimplementation\nprocedure DiskRoutine(Value: Integer);\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nvar\n  Obj: TWidget;\nbegin\n  Obj.Disk;\n  DiskRoutine(1);\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let provider_overlay = provider_source
+        .replace("DiskMember", "OverlayMember")
+        .replace("DiskRoutine", "OverlayRoutine");
+    let main_overlay = main_source
+        .replace("Disk", "Overlay")
+        .replace("DiskRoutine", "OverlayRoutine");
+    let provider_overlay_v2 = provider_overlay
+        .replace("OverlayMember", "UpdatedMember")
+        .replace("OverlayRoutine", "UpdatedRoutine");
+    let main_overlay_v2 = main_overlay
+        .replace("Obj.Overlay", "Obj.Updated")
+        .replace("OverlayMember", "UpdatedMember")
+        .replace("OverlayRoutine", "UpdatedRoutine");
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (path, text) in [
+        (&provider_path, provider_overlay.as_str()),
+        (&main_path, main_overlay.as_str()),
+    ] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+    }
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let completion_id = RequestId::from("overlay-completion-v1".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(&main_overlay, "Obj.Ov", 0)
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "overlay completion failed: {completion:?}"
+    );
+    let completion_result = completion.result.expect("overlay completion result");
+    let labels = completion_result["items"]
+        .as_array()
+        .expect("overlay completion items")
+        .iter()
+        .map(|item| item["label"].as_str().expect("completion label").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["OverlayMember"]);
+
+    let signature_id = RequestId::from("overlay-signature-v1".to_string());
+    server.send_request(
+        signature_id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(&main_overlay, "OverlayRoutine(", 0)
+        }),
+    );
+    let signature = server.response(&signature_id);
+    assert!(
+        signature.error.is_none(),
+        "overlay signature failed: {signature:?}"
+    );
+    assert_eq!(
+        signature.result.expect("overlay signature result")["signatures"][0]["label"],
+        "procedure OverlayRoutine(Value: Integer);"
+    );
+
+    for (path, text) in [
+        (&provider_path, provider_overlay_v2.as_str()),
+        (&main_path, main_overlay_v2.as_str()),
+    ] {
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(path), "version": 2},
+                "contentChanges": [{"text": text}]
+            }),
+        );
+    }
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let completion_id = RequestId::from("overlay-completion-v2".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(&main_overlay_v2, "Obj.Up", 0)
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "updated overlay completion failed: {completion:?}"
+    );
+    let completion_result = completion
+        .result
+        .expect("updated overlay completion result");
+    let labels = completion_result["items"]
+        .as_array()
+        .expect("updated overlay completion items")
+        .iter()
+        .map(|item| {
+            item["label"]
+                .as_str()
+                .expect("updated completion label")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["UpdatedMember"]);
+
+    let signature_id = RequestId::from("overlay-signature-v2".to_string());
+    server.send_request(
+        signature_id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(&main_overlay_v2, "UpdatedRoutine(", 0)
+        }),
+    );
+    let signature = server.response(&signature_id);
+    assert!(
+        signature.error.is_none(),
+        "updated overlay signature failed: {signature:?}"
+    );
+    assert_eq!(
+        signature.result.expect("updated overlay signature result")["signatures"][0]["label"],
+        "procedure UpdatedRoutine(Value: Integer);"
+    );
+
+    assert_eq!(
+        fs::read(&provider_path).expect("provider disk source"),
+        provider_source.as_bytes()
+    );
+    assert_eq!(
+        fs::read(&main_path).expect("main disk source"),
+        main_source.as_bytes()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn assistance_requests_follow_the_selected_project_provider() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main_path = root.join("Main.pas");
+    let provider_a_path = root.join("A/Provider.pas");
+    let provider_b_path = root.join("B/Provider.pas");
+    let project_a_path = root.join("A.dproj");
+    let project_b_path = root.join("B.dproj");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nvar\n  Obj: TWidget;\nbegin\n  Obj.;\n  Run(1);\nend;\nend.\n";
+    let provider = |member: &str, parameter: &str| {
+        format!(
+            "unit Provider;\ninterface\ntype\n  TWidget = class\n  public\n    {member}: Integer;\n  end;\nprocedure Run({parameter}: Integer);\nimplementation\nprocedure Run({parameter}: Integer);\nbegin\nend;\nend.\n"
+        )
+    };
+    let provider_a = provider("AMember", "AValue");
+    let provider_b = provider("BMember", "BValue");
+    let project = |provider_path: &str| {
+        format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"{provider_path}\" /></ItemGroup></Project>"
+        )
+    };
+    write_file(&main_path, main_source);
+    write_file(&provider_a_path, &provider_a);
+    write_file(&provider_b_path, &provider_b);
+    write_file(&project_a_path, &project("A/Provider.pas"));
+    write_file(&project_b_path, &project("B/Provider.pas"));
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "A.dproj"}));
+
+    let completion_id = RequestId::from("project-assistance-completion-a".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "Obj.", 0)
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "project A completion failed: {completion:?}"
+    );
+    let completion_result = completion.result.expect("project A completion result");
+    let labels = completion_result["items"]
+        .as_array()
+        .expect("project A completion items")
+        .iter()
+        .map(|item| item["label"].as_str().expect("project A completion label"))
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["AMember"]);
+
+    let signature_id = RequestId::from("project-assistance-signature-a".to_string());
+    server.send_request(
+        signature_id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "Run(", 0)
+        }),
+    );
+    let signature = server.response(&signature_id);
+    assert!(
+        signature.error.is_none(),
+        "project A signature failed: {signature:?}"
+    );
+    assert_eq!(
+        signature.result.expect("project A signature result")["signatures"][0]["label"],
+        "procedure Run(AValue: Integer);"
+    );
+
+    let select_id = RequestId::from("project-assistance-select-b".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "projectUri": uri(&project_b_path)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let completion_id = RequestId::from("project-assistance-completion-b".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "Obj.", 0)
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "project B completion failed: {completion:?}"
+    );
+    let completion_result = completion.result.expect("project B completion result");
+    let labels = completion_result["items"]
+        .as_array()
+        .expect("project B completion items")
+        .iter()
+        .map(|item| item["label"].as_str().expect("project B completion label"))
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["BMember"]);
+
+    let signature_id = RequestId::from("project-assistance-signature-b".to_string());
+    server.send_request(
+        signature_id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "Run(", 0)
+        }),
+    );
+    let signature = server.response(&signature_id);
+    assert!(
+        signature.error.is_none(),
+        "project B signature failed: {signature:?}"
+    );
+    assert_eq!(
+        signature.result.expect("project B signature result")["signatures"][0]["label"],
+        "procedure Run(BValue: Integer);"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn hover_request_returns_a_source_excerpt_and_identifier_range() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("Hover.pas");
+    let source = "unit Hover;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("hover-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/hover",
+        navigation_params(&source_path, source, "PublicRoutine", 1),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "hover failed: {response:?}");
+    let result = response.result.expect("hover result");
+    assert_eq!(
+        result["range"],
+        json!({
+            "start": {"line": 4, "character": 10},
+            "end": {"line": 4, "character": 23}
+        })
+    );
+    assert_eq!(result["contents"]["kind"], "plaintext");
+    assert!(
+        result["contents"]["value"]
+            .as_str()
+            .expect("hover text")
+            .contains("procedure PublicRoutine;")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn hover_negotiates_markdown_when_the_client_advertises_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("MarkdownHover.pas");
+    let source = "unit MarkdownHover;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("markdown-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(temp.path()),
+            "capabilities": {
+                "general": {"positionEncodings": ["utf-16"]},
+                "textDocument": {
+                    "hover": {"contentFormat": ["markdown", "plaintext"]}
+                }
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let id = RequestId::from("markdown-hover-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/hover",
+        navigation_params(&source_path, source, "PublicRoutine", 0),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "hover failed: {response:?}");
+    let contents = &response.result.expect("hover result")["contents"];
+    assert_eq!(contents["kind"], "markdown");
+    assert!(contents["value"].as_str().unwrap().contains("```pascal"));
+    server.shutdown();
+}
+
+#[test]
+fn hover_markdown_escapes_backtick_fences_inside_multiline_comments() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("FenceHover.pas");
+    let source = "unit FenceHover;\ninterface\nprocedure Run(\n  { Example:\n  ```\n  **This is Pascal comment text, not Markdown.**\n  ```\n  }\n  Arg: Integer);\nimplementation\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("fence-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(temp.path()),
+            "capabilities": {
+                "general": {"positionEncodings": ["utf-16"]},
+                "textDocument": {
+                    "hover": {"contentFormat": ["markdown", "plaintext"]}
+                }
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let id = RequestId::from("fence-hover-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/hover",
+        navigation_params(&source_path, source, "Run", 0),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "hover failed: {response:?}");
+    let result = response.result.expect("hover result");
+    let value = result["contents"]["value"]
+        .as_str()
+        .expect("markdown hover value");
+    let opening = value
+        .lines()
+        .find(|line| line.ends_with("pascal"))
+        .expect("Pascal code fence");
+    let fence = opening.strip_suffix("pascal").expect("fence prefix");
+    assert!(fence.len() > 3, "collision-safe fence required: {value}");
+    assert_eq!(value.lines().last(), Some(fence));
+    assert!(
+        value.contains("**This is Pascal comment text, not Markdown.**"),
+        "{value}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn hover_rejects_invalid_params_and_returns_null_for_unsupported_positions() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("UnsupportedHover.pas");
+    let source = "unit UnsupportedHover;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  // Value\n  Unknown.Value;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let invalid_id = RequestId::from("invalid-hover".to_string());
+    server.send_request(invalid_id.clone(), "textDocument/hover", json!({}));
+    let invalid = server.response(&invalid_id);
+    assert_eq!(invalid.error.expect("invalid params error").code, -32602);
+
+    for (id_text, position) in [
+        ("comment-hover", position_of(source, "Value", 1)),
+        ("unknown-receiver-hover", position_of(source, "Value", 2)),
+    ] {
+        let id = RequestId::from(id_text.to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/hover",
+            json!({"textDocument": {"uri": uri(&source_path)}, "position": position}),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "unsupported hover failed: {response:?}"
+        );
+        assert!(response.result.as_ref().is_none_or(Value::is_null));
+    }
+    server.shutdown();
+}
+
+#[test]
+fn hover_uses_an_unsaved_provider_overlay_for_imported_declarations() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let disk_provider = "unit Provider;\ninterface\ntype\n  TWidget = class\n    property DiskValue: Integer;\n  end;\nimplementation\nend.\n";
+    let overlay_provider = "unit Provider;\ninterface\ntype\n  TWidget = class\n    property OverlayValue: Integer;\n  end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Widget: Provider.TWidget;\nbegin\n  Log(Widget.OverlayValue);\nend;\nend.\n";
+    write_file(&provider, disk_provider);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 3,
+                "text": overlay_provider
+            }
+        }),
+    );
+
+    let id = RequestId::from("overlay-hover".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/hover",
+        navigation_params(&consumer, consumer_source, "OverlayValue", 0),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "hover failed: {response:?}");
+    let result = response.result.expect("hover result");
+    let value = result["contents"]["value"]
+        .as_str()
+        .expect("plaintext hover value");
+    assert!(value.contains("OverlayValue: Integer"), "{value}");
+    assert!(!value.contains("DiskValue"), "{value}");
+    server.shutdown();
+}
+
+#[test]
+fn type_definition_request_returns_the_source_type_declaration() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype\n  TFoo = class\n  end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Item: TFoo;\nbegin\n  Item := nil;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("type-definition-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&consumer, consumer_source, "Item :=", 0),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "type definition failed: {response:?}"
+    );
+    let locations = response
+        .result
+        .expect("type definition result")
+        .as_array()
+        .expect("type definition location array")
+        .clone();
+    assert_eq!(
+        locations,
+        vec![json!({
+            "uri": uri(&provider),
+            "range": {
+                "start": {"line": 3, "character": 2},
+                "end": {"line": 3, "character": 6}
+            }
+        })]
+    );
+    server.shutdown();
+}
+
+#[test]
+fn type_definition_returns_empty_for_primitives_unknowns_and_malformed_positions() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("UnsupportedTypeDefinition.pas");
+    let source = "unit UnsupportedTypeDefinition;\ninterface\nimplementation\nprocedure Run;\nvar Item: Integer; UnknownItem: MissingType;\nbegin\n  Item := 1;\n  UnknownItem := Item;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let invalid_id = RequestId::from("invalid-type-definition".to_string());
+    server.send_request(invalid_id.clone(), "textDocument/typeDefinition", json!({}));
+    let invalid = server.response(&invalid_id);
+    assert_eq!(invalid.error.expect("invalid params error").code, -32602);
+
+    for (id_text, position) in [
+        (
+            "primitive-type-definition",
+            position_of(source, "Item :=", 0),
+        ),
+        (
+            "unknown-type-definition",
+            position_of(source, "UnknownItem :=", 0),
+        ),
+        ("outside-type-definition", Position::new(100, 0)),
+    ] {
+        let id = RequestId::from(id_text.to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/typeDefinition",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position
+            }),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "unsupported type definition failed: {response:?}"
+        );
+        assert!(response.result.as_ref().is_none_or(|value| {
+            value.is_null() || value.as_array().is_some_and(Vec::is_empty)
+        }));
+    }
+    server.shutdown();
+}
+
+#[test]
+fn type_definition_uses_an_unsaved_provider_overlay() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let disk_provider =
+        "unit Provider;\ninterface\ntype\n  TDisk = class end;\nimplementation\nend.\n";
+    let overlay_provider =
+        "unit Provider;\ninterface\ntype\n  TOverlay = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Item: TOverlay;\nbegin\n  Item := nil;\nend;\nend.\n";
+    write_file(&provider, disk_provider);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 3,
+                "text": overlay_provider
+            }
+        }),
+    );
+
+    let id = RequestId::from("overlay-type-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&consumer, consumer_source, "Item :=", 0),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "overlay type definition failed: {response:?}"
+    );
+    assert_eq!(
+        response.result.as_ref().expect("overlay result")[0]["range"]["start"]["line"],
+        3
+    );
+    assert_eq!(
+        response.result.as_ref().expect("overlay result")[0]["uri"],
+        uri(&provider).to_string()
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn type_definition_rejects_anonymous_types_and_unrelated_qualified_locals() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("TypeDefinitionReview.pas");
+    let source = r#"unit TypeDefinitionReview;
+interface
+type
+  TFoo = class end;
+  TArrayAlias = array of TFoo;
+  TPointerAlias = ^TFoo;
+implementation
+procedure Hidden;
+type
+  TFoo = record end;
+begin
+end;
+procedure Run;
+var
+  Direct: TFoo;
+  Many: array of TFoo;
+  Ptr: ^TFoo;
+  NamedMany: TArrayAlias;
+  NamedPtr: TPointerAlias;
+  Qualified: TypeDefinitionReview.TFoo;
+begin
+  Direct := nil;
+  Many := nil;
+  Ptr := nil;
+  NamedMany := nil;
+  NamedPtr := nil;
+  Qualified := nil;
+end;
+end.
+"#;
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let mut locations_at = |id_text: &str, position: Position| {
+        let id = RequestId::from(id_text.to_owned());
+        server.send_request(
+            id.clone(),
+            "textDocument/typeDefinition",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position,
+            }),
+        );
+        result_locations(server.response(&id))
+    };
+
+    let direct = locations_at("review-direct", position_of(source, "Direct: TFoo", 0));
+    assert_exact_location_signatures(
+        &direct,
+        vec![expected_location_signature(&source_path, source, "TFoo", 0)],
+    );
+
+    for (id, declaration) in [
+        ("review-anonymous-array", "Many: array of TFoo"),
+        ("review-anonymous-pointer", "Ptr: ^TFoo"),
+    ] {
+        assert!(
+            locations_at(id, position_of(source, declaration, 0)).is_empty(),
+            "anonymous type {declaration:?} must not return a contained type target"
+        );
+    }
+
+    let named_array = locations_at(
+        "review-named-array-alias",
+        position_of(source, "NamedMany: TArrayAlias", 0),
+    );
+    assert_exact_location_signatures(
+        &named_array,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "TArrayAlias",
+            0,
+        )],
+    );
+
+    let named_pointer = locations_at(
+        "review-named-pointer-alias",
+        position_of(source, "NamedPtr: TPointerAlias", 0),
+    );
+    assert_exact_location_signatures(
+        &named_pointer,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "TPointerAlias",
+            0,
+        )],
+    );
+
+    let qualified_variable = locations_at(
+        "review-qualified-variable",
+        position_of(source, "Qualified: TypeDefinitionReview.TFoo", 0),
+    );
+    assert_exact_location_signatures(
+        &qualified_variable,
+        vec![expected_location_signature(&source_path, source, "TFoo", 0)],
+    );
+
+    let qualified_type = locations_at(
+        "review-qualified-type",
+        final_qualified_type_position(source, "TypeDefinitionReview.TFoo"),
+    );
+    assert_exact_location_signatures(
+        &qualified_type,
+        vec![expected_location_signature(&source_path, source, "TFoo", 0)],
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn type_definition_cancellation_handles_a_large_source_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ManyTypeDefinitionUses.pas");
+    let mut source = String::from(
+        "unit ManyTypeDefinitionUses;\ninterface\ntype TItem = record end;\nimplementation\nprocedure Run;\nvar Item: TItem;\nbegin\n",
+    );
+    for _ in 0..20_000 {
+        source.push_str("  Item := Item;\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("cancelled-type-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&source_path, &source, "Item :=", 0),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "cancelled-type-definition"}),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("cancelled type definition query must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
     server.shutdown();
 }
 
@@ -2105,6 +3059,105 @@ fn reference_cancellation_handles_thousands_of_occurrences() {
     server.send_notification("$/cancelRequest", json!({"id": "cancelled-references"}));
     let response = server.response(&id);
     let error = response.error.expect("cancelled reference query must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn hover_cancellation_handles_an_in_flight_large_source_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ManyHoverUses.pas");
+    let mut source = String::from(
+        "unit ManyHoverUses;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..20_000 {
+        source.push_str("  Log(Value);\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("cancelled-hover".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/hover",
+        navigation_params(&source_path, &source, "Value", 0),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": "cancelled-hover"}));
+    let response = server.response(&id);
+    let error = response.error.expect("cancelled hover query must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn completion_cancellation_handles_an_in_flight_large_source_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ManyCompletionUses.pas");
+    let mut source = String::from(
+        "unit ManyCompletionUses;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..20_000 {
+        source.push_str("  Log(Value);\n");
+    }
+    source.push_str("  Va;\nend;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("cancelled-completion".to_string());
+    let completion_start = position_of(&source, "  Va;", 0);
+    server.send_request(
+        id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": Position::new(completion_start.line, completion_start.character + 4)
+        }),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": "cancelled-completion"}));
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("cancelled completion query must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn signature_help_cancellation_handles_an_in_flight_large_source_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("ManySignatureUses.pas");
+    let mut source = String::from(
+        "unit ManySignatureUses;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n",
+    );
+    for _ in 0..20_000 {
+        source.push_str("  Log(1);\n");
+    }
+    source.push_str("  Run(1);\nend;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("cancelled-signature-help".to_string());
+    let call_start = position_of(&source, "  Run(1);", 0);
+    server.send_request(
+        id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": Position::new(call_start.line, call_start.character + 6)
+        }),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": "cancelled-signature-help"}));
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("cancelled signature-help query must fail");
     assert_eq!(error.code, -32800);
     assert_eq!(error.message, "request cancelled");
     server.shutdown();
@@ -4611,6 +5664,69 @@ fn selecting_a_project_switches_same_named_unit_bindings_in_its_scope() {
         let locations = result_locations(server.response(&navigation_id));
         assert_eq!(locations.len(), 1, "{id} should resolve one declaration");
         assert_eq!(locations[0]["uri"], uri(&expected).to_string());
+    }
+    server.shutdown();
+}
+
+#[test]
+fn type_definition_requests_follow_the_selected_project_unit_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let a_unit = root.join("a/Shared.pas");
+    let b_unit = root.join("b/Shared.pas");
+    let main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nvar Item: TShared;\nbegin\n  Item := nil;\nend;\nend.\n";
+    let unit_source =
+        "unit Shared;\ninterface\ntype\n  TShared = class end;\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(&a_unit, unit_source);
+    write_file(&b_unit, unit_source);
+    for (name, path) in [("A", "a/Shared.pas"), ("B", "b/Shared.pas")] {
+        write_file(
+            &root.join(format!("{name}.dproj")),
+            &format!(
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"{path}\" /></ItemGroup></Project>"
+            ),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    for (id, project, expected) in [
+        ("type-definition-select-a", root.join("A.dproj"), a_unit),
+        ("type-definition-select-b", root.join("B.dproj"), b_unit),
+    ] {
+        let select_id = RequestId::from(id.to_string());
+        server.send_request(
+            select_id.clone(),
+            "pascal/selectProject",
+            json!({
+                "textDocument": {"uri": uri(&main)},
+                "projectUri": uri(&project)
+            }),
+        );
+        assert!(server.response(&select_id).error.is_none());
+
+        let type_definition_id = RequestId::from(format!("{id}-request"));
+        server.send_request(
+            type_definition_id.clone(),
+            "textDocument/typeDefinition",
+            navigation_params(&main, main_source, "Item: TShared", 0),
+        );
+        let locations = result_locations(server.response(&type_definition_id));
+        assert_eq!(
+            locations.len(),
+            1,
+            "{id} should resolve one type declaration"
+        );
+        assert_eq!(locations[0]["uri"], uri(&expected).to_string());
+        assert_eq!(
+            locations[0]["range"],
+            json!({
+                "start": {"line": 3, "character": 2},
+                "end": {"line": 3, "character": 9}
+            })
+        );
     }
     server.shutdown();
 }
@@ -10671,6 +11787,110 @@ fn rename_refuses_sources_with_conditional_compilation() {
         error.message.to_ascii_lowercase().contains("conditional"),
         "unexpected error: {}",
         error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_a_reference_in_an_unknown_boolean_comparison_branch() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n{$IF DEFINED(A) = False}\n  Value := 2;\n{$ENDIF}\n  Value := 1;\nend;\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("unknown-comparison-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Value", 0),
+            "newName": "RenamedValue"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("unknown comparison branch must fail closed");
+    assert!(
+        error.message.to_ascii_lowercase().contains("conditional")
+            || error.message.to_ascii_lowercase().contains("binding"),
+        "unexpected unknown-comparison rename error: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_an_include_after_the_owner_undefines_a_project_define() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let include = root.join("Use.inc");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n{$UNDEF FEATURE}\n{$I Use.inc}\n  Value := 1;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(&include, "{$IFNDEF FEATURE}\n  Value := 2;\n{$ENDIF}\n");
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>FEATURE</DCC_Define></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    let request_id = RequestId::from("owner-undef-include-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Value", 0),
+            "newName": "RenamedValue"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("an include must use the owner\'s invalidated define state");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.to_ascii_lowercase().contains("include"),
+        "unexpected owner-undef include error: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_rejects_a_pascal_identifier_in_a_source_conditional_expression() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst Flag = False;\n{$IF Flag}\nconst Other = 1;\n{$ENDIF}\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("pascal-conditional-reference-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Flag", 0),
+            "newName": "NewName"
+        }),
+    );
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("a Pascal conditional reference must not be omitted from rename");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.to_ascii_lowercase().contains("conditional")
+            || error.message.to_ascii_lowercase().contains("incomplete"),
+        "unexpected Pascal conditional rename error: {error:?}"
     );
     server.shutdown();
 }

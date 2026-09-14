@@ -3,9 +3,12 @@
 use super::rename::{
     CANCELLATION_MESSAGE, Computed, RenameSnapshot, SnapshotMode, SnapshotSeed, SourceRecord,
     WorkspaceInput, build_snapshot, check_includes, identifier_at_position,
-    input_source_is_editable, is_cancelled, snapshot_records, source_for_input, workspace_edit,
+    input_source_is_editable, is_cancelled, snapshot_records, source_for_input_with_cancel,
+    workspace_edit,
 };
-use super::{absolute_path, canonical_file_uri, is_lint_excluded, path_stamp};
+use super::{
+    absolute_path, canonical_file_uri, is_configuration_file, is_lint_excluded, path_stamp,
+};
 use crate::configuration::{config_directories, resolve_lint};
 use crate::project::{has_invalid_project_selection, project_candidates};
 use crate::text;
@@ -117,7 +120,7 @@ pub(crate) fn code_actions_from_input(
         };
     }
     let uri = canonical_file_uri(&params.text_document.uri);
-    let (source, target_record) = match source_for_input(&input, &uri) {
+    let (source, target_record) = match source_for_input_with_cancel(&input, &uri, Some(cancel)) {
         Ok(source) => source,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -269,7 +272,12 @@ pub(crate) fn code_actions_from_input(
                 continue;
             }
         } else if !features.resolve {
-            match plan_candidate(&snapshot, &candidate, features.document_changes) {
+            match plan_candidate(
+                &snapshot,
+                &candidate,
+                features.document_changes,
+                Some(cancel),
+            ) {
                 Ok((edit, _edit_records)) => {
                     action.edit = Some(edit);
                 }
@@ -310,10 +318,11 @@ pub(crate) fn resolve_from_input(
         return failed(source_generation, configuration_generation, error);
     }
     let target_uri = canonical_file_uri(&data.uri);
-    let (target_source, target_record) = match source_for_input(&input, &target_uri) {
-        Ok(source) => source,
-        Err(error) => return failed(source_generation, configuration_generation, error),
-    };
+    let (target_source, target_record) =
+        match source_for_input_with_cancel(&input, &target_uri, Some(cancel)) {
+            Ok(source) => source,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
     if source_hash(&target_source) != data.source_hash {
         return failed(
             source_generation,
@@ -455,7 +464,12 @@ pub(crate) fn resolve_from_input(
         };
     }
 
-    match plan_candidate(&snapshot, &candidate, features.document_changes) {
+    match plan_candidate(
+        &snapshot,
+        &candidate,
+        features.document_changes,
+        Some(cancel),
+    ) {
         Ok((edit, _records)) => {
             let mut resolved = action;
             resolved.edit = Some(edit);
@@ -508,7 +522,10 @@ fn cancelled<T>(source_generation: u64, configuration_generation: u64) -> Comput
 
 fn append_records(records: &mut Vec<SourceRecord>, additional: Vec<SourceRecord>) {
     for record in additional {
-        let duplicate = record.path.as_ref().is_some_and(|_| {
+        let duplicate = record.path.as_ref().is_some_and(|path| {
+            if is_configuration_file(path) {
+                return false;
+            }
             records
                 .iter()
                 .any(|existing| same_record_observation(existing, &record))
@@ -574,6 +591,7 @@ fn plan_candidate(
     snapshot: &RenameSnapshot,
     candidate: &NamingCandidate,
     document_changes: bool,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(WorkspaceEdit, Vec<super::rename::SourceRecord>), String> {
     let source = snapshot.sources.get(&candidate.uri).ok_or_else(|| {
         format!(
@@ -588,7 +606,8 @@ fn plan_candidate(
     let raw = snapshot
         .index
         .rename_edits(&candidate.uri, position, &candidate.new_name)?;
-    check_includes(snapshot, &candidate.uri, position)?;
+    let candidate_names = [candidate.old_name.clone(), candidate.new_name.clone()];
+    check_includes(snapshot, &candidate.uri, position, &candidate_names, cancel)?;
     for uri in raw.keys() {
         if !snapshot.editable.contains(uri) {
             return Err(format!(

@@ -1,3 +1,4 @@
+use crate::conditional::{self, ConditionalAnalysis};
 use crate::text;
 use lsp_types::{Location, Position, Range, Url};
 use pascal_core::directive_fragment_rewrite::DirectivePatch;
@@ -7,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
+mod assistance;
 mod rename;
 mod symbols;
 pub(crate) use rename::RenameBindingInfo;
@@ -20,6 +23,31 @@ pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
 #[cfg(test)]
 thread_local! {
     static OWNER_TYPE_ROOT_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    static TEST_UNIT_URL_VECTOR_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static TEST_EXPORTED_INDEX_VECTOR_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static TEST_TYPE_INDEX_VECTOR_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static TEST_MEMBER_INDEX_VECTOR_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static TEST_NODE_SIBLING_FRONTIER_ENTRIES: Cell<usize> = const { Cell::new(0) };
+    static TEST_LEGACY_EXPORTED_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn test_record_materialization(counter: &'static std::thread::LocalKey<Cell<usize>>) {
+    counter.with(|value| value.set(value.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn test_materialization_count(counter: &'static std::thread::LocalKey<Cell<usize>>) -> usize {
+    counter.with(Cell::get)
+}
+
+#[cfg(test)]
+fn test_reset_materialization_counters() {
+    TEST_UNIT_URL_VECTOR_MATERIALIZATIONS.with(|value| value.set(0));
+    TEST_EXPORTED_INDEX_VECTOR_MATERIALIZATIONS.with(|value| value.set(0));
+    TEST_TYPE_INDEX_VECTOR_MATERIALIZATIONS.with(|value| value.set(0));
+    TEST_MEMBER_INDEX_VECTOR_MATERIALIZATIONS.with(|value| value.set(0));
+    TEST_LEGACY_EXPORTED_MATERIALIZATIONS.with(|value| value.set(0));
 }
 
 /// The navigation operation requested by an LSP client.
@@ -106,7 +134,29 @@ impl NavigationIndex {
     /// Parsing happens before the old document is replaced, so a parser error
     /// leaves the last known-good overlay available to the caller.
     pub fn update(&mut self, uri: Url, source: String) -> Result<(), String> {
-        let document = Document::parse(uri.clone(), source)?;
+        self.update_with_defines(uri, source, &[])
+    }
+
+    /// Parse and replace one document using the selected project's positive
+    /// conditional-compilation facts.
+    pub(crate) fn update_with_defines(
+        &mut self,
+        uri: Url,
+        source: String,
+        defines: &[String],
+    ) -> Result<(), String> {
+        let cancel = AtomicBool::new(false);
+        self.update_with_defines_with_cancel(uri, source, defines, &cancel)
+    }
+
+    pub(crate) fn update_with_defines_with_cancel(
+        &mut self,
+        uri: Url,
+        source: String,
+        defines: &[String],
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let document = Document::parse_with_cancel(uri.clone(), source, defines, cancel)?;
         let old_unit = self
             .documents
             .get(&uri)
@@ -183,6 +233,37 @@ impl NavigationIndex {
         self.documents.contains_key(uri)
     }
 
+    pub(crate) fn conditional_analysis(&self, uri: &Url) -> Option<&ConditionalAnalysis> {
+        self.documents
+            .get(uri)
+            .map(|document| &document.conditionals)
+    }
+
+    pub(crate) fn conditional_unknown_at(&self, uri: &Url, offset: usize) -> bool {
+        self.conditional_analysis(uri)
+            .is_some_and(|analysis| analysis.is_unknown_at(offset))
+    }
+
+    pub(crate) fn conditional_unknown_contains_identifier(&self, uri: &Url, name: &str) -> bool {
+        let Some(document) = self.documents.get(uri) else {
+            return false;
+        };
+        document
+            .conditionals
+            .unknown_contains_identifier(&document.source, name)
+    }
+
+    fn candidate_is_conditionally_unknown(&self, candidate: &Candidate) -> bool {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return true;
+        };
+        document
+            .conditional_unknown_symbols
+            .get(candidate.index)
+            .copied()
+            .unwrap_or(true)
+    }
+
     pub(crate) fn position_is_ignored_or_empty(
         &self,
         uri: &Url,
@@ -221,6 +302,9 @@ impl NavigationIndex {
         let Some(offset) = text::position_to_offset(&document.source, position) else {
             return Vec::new();
         };
+        if document.conditionals.is_unknown_at(offset) {
+            return Vec::new();
+        }
         if is_ignored_offset(document.tree.root_node(), offset) {
             return Vec::new();
         }
@@ -229,6 +313,12 @@ impl NavigationIndex {
         };
 
         let references = self.resolve_candidates_at(uri, document, offset, identifier);
+        if references
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Vec::new();
+        }
 
         self.locations_for(self.expand_property_candidates(references, target), target)
     }
@@ -260,6 +350,435 @@ impl NavigationIndex {
         }
     }
 
+    fn resolve_candidates_at_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let name = node_text_with_budget(identifier, &document.source, cancel, budget)?;
+        if let Some(unit_name) =
+            use_name_at_with_budget(identifier, &document.source, cancel, budget)?
+        {
+            self.unit_references_with_budget(document, &unit_name, cancel, budget)
+        } else if let Some(direct) =
+            self.direct_symbol_references_with_budget(uri, identifier, cancel, budget)?
+        {
+            Ok(direct)
+        } else if let Some((path, cursor_index)) =
+            qualified_type_path_at_with_budget(identifier, &document.source, cancel, budget)?
+        {
+            self.type_reference_candidates_with_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                &path,
+                cursor_index,
+                cancel,
+                budget,
+            )
+        } else if let Some(dot) = member_expression_at(identifier) {
+            if is_right_hand_member(dot, identifier) {
+                self.member_references_with_budget(
+                    uri, document, offset, dot, name, identifier, cancel, budget,
+                )
+            } else {
+                self.unqualified_references_with_budget(
+                    uri, document, offset, name, identifier, cancel, budget,
+                )
+            }
+        } else {
+            self.unqualified_references_with_budget(
+                uri, document, offset, name, identifier, cancel, budget,
+            )
+        }
+    }
+
+    fn direct_symbol_references_with_budget(
+        &self,
+        uri: &Url,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Vec<Candidate>>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(None);
+        };
+        let span = Span::from_node(identifier);
+        let Some(direct) = document.direct_symbol_indices.get(&span) else {
+            return Ok(None);
+        };
+        let mut result_capacity = 0usize;
+        for index in direct {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(*index) else {
+                continue;
+            };
+            if symbol.kind == SymbolKind::Routine {
+                if let Some(routine_key) = &symbol.routine_key {
+                    result_capacity = result_capacity.saturating_add(
+                        document
+                            .routine_symbol_indices
+                            .get(routine_key)
+                            .map_or(0, Vec::len),
+                    );
+                } else {
+                    result_capacity = result_capacity.saturating_add(1);
+                }
+            } else {
+                result_capacity = result_capacity.saturating_add(1);
+            }
+        }
+        budget.require_work(result_capacity, cancel)?;
+        budget.require_bytes(uri.as_str().len().saturating_mul(result_capacity), cancel)?;
+        let mut references = Vec::with_capacity(result_capacity);
+        for index in direct {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(*index) else {
+                continue;
+            };
+            if symbol.kind == SymbolKind::Routine {
+                if let Some(routine_key) = &symbol.routine_key {
+                    if let Some(candidate_indices) =
+                        document.routine_symbol_indices.get(routine_key)
+                    {
+                        for candidate_index in candidate_indices {
+                            check_navigation_cancel(cancel)?;
+                            references.push(Candidate {
+                                uri: uri.clone(),
+                                index: *candidate_index,
+                            });
+                        }
+                    }
+                }
+            } else {
+                references.push(Candidate {
+                    uri: uri.clone(),
+                    index: *index,
+                });
+            }
+        }
+        Ok(Some(references))
+    }
+
+    fn unit_references_with_budget(
+        &self,
+        current_document: &Document,
+        name: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_bytes(name.len(), cancel)?;
+        let key = canonical_name(name);
+        let urls = self.unit_urls_for_import_with_budget(current_document, &key, cancel, budget)?;
+        let mut result_capacity = 0usize;
+        let mut result_uri_bytes = 0usize;
+        for uri in &urls {
+            let Some(document) = self.documents.get(uri) else {
+                continue;
+            };
+            budget.require_bytes(document.unit_name.len(), cancel)?;
+            let Some(indices) = document
+                .symbol_indices_by_scope_key
+                .get(&(ROOT_SCOPE, document.unit_name.clone()))
+            else {
+                continue;
+            };
+            result_capacity = result_capacity.saturating_add(indices.len());
+            result_uri_bytes =
+                result_uri_bytes.saturating_add(uri.as_str().len().saturating_mul(indices.len()));
+        }
+        budget.require_work(result_capacity, cancel)?;
+        budget.require_bytes(result_uri_bytes, cancel)?;
+        let mut result = Vec::with_capacity(result_capacity);
+        for uri in urls {
+            let Some(document) = self.documents.get(&uri) else {
+                continue;
+            };
+            budget.require_bytes(document.unit_name.len(), cancel)?;
+            let Some(indices) = document
+                .symbol_indices_by_scope_key
+                .get(&(ROOT_SCOPE, document.unit_name.clone()))
+            else {
+                continue;
+            };
+            for index in indices {
+                check_navigation_cancel(cancel)?;
+                if document
+                    .symbols
+                    .get(*index)
+                    .is_some_and(|symbol| symbol.kind == SymbolKind::Unit)
+                {
+                    result.push(Candidate {
+                        uri: uri.clone(),
+                        index: *index,
+                    });
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unqualified_references_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        name: &str,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_bytes(name.len(), cancel)?;
+        let key = canonical_name(name);
+        budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
+        let scope = document.scope_at(offset);
+        let owner_type = document.owner_type_at_identifier(identifier, scope);
+
+        let scope_chain = document.scope_chain(offset);
+        budget.require_bytes(
+            key.len()
+                .saturating_mul(scope_chain.len().saturating_add(1)),
+            cancel,
+        )?;
+        for scope_id in scope_chain {
+            let Some(indices) = document
+                .symbol_indices_by_scope_key
+                .get(&(scope_id, key.clone()))
+            else {
+                continue;
+            };
+            budget.require_work(indices.len(), cancel)?;
+            budget.require_bytes(uri.as_str().len().saturating_mul(indices.len()), cancel)?;
+            let mut local = Vec::with_capacity(indices.len());
+            for index in indices {
+                check_navigation_cancel(cancel)?;
+                let Some(symbol) = document.symbols.get(*index) else {
+                    continue;
+                };
+                if scope_id != ROOT_SCOPE
+                    && !symbol.local_only
+                    && symbol.owner_type.is_none()
+                    && symbol.kind != SymbolKind::Unit
+                    && !symbol.unresolved_abbreviated
+                {
+                    local.push(Candidate {
+                        uri: uri.clone(),
+                        index: *index,
+                    });
+                }
+            }
+            if !local.is_empty() {
+                return Ok(local);
+            }
+        }
+
+        if let Some(owner_type) = owner_type.as_deref() {
+            let members = self.member_references_for_type_with_budget(
+                uri, owner_type, &key, true, cancel, budget,
+            )?;
+            if !members.is_empty() {
+                return Ok(members);
+            }
+        }
+
+        let region = document.region_at(offset);
+        let Some(root_indices) = document
+            .symbol_indices_by_scope_key
+            .get(&(ROOT_SCOPE, key.clone()))
+        else {
+            return self.imported_references_with_budget(
+                document,
+                region,
+                &key,
+                identifier,
+                owner_type.as_deref(),
+                cancel,
+                budget,
+            );
+        };
+        budget.require_work(root_indices.len(), cancel)?;
+        budget.require_bytes(
+            uri.as_str().len().saturating_mul(root_indices.len()),
+            cancel,
+        )?;
+        let mut current = Vec::with_capacity(root_indices.len());
+        for index in root_indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(*index) else {
+                continue;
+            };
+            if !symbol.local_only
+                && symbol.owner_type.is_none()
+                && symbol.kind != SymbolKind::Unit
+                && !symbol.unresolved_abbreviated
+                && symbol_visible_in_region(symbol, region)
+            {
+                current.push(Candidate {
+                    uri: uri.clone(),
+                    index: *index,
+                });
+            }
+        }
+        if !current.is_empty() {
+            if self.is_unknown_global_fallback_for_owner(
+                document,
+                identifier,
+                owner_type.as_deref(),
+                &current,
+            ) {
+                return Ok(Vec::new());
+            }
+            return Ok(current);
+        }
+
+        self.imported_references_with_budget(
+            document,
+            region,
+            &key,
+            identifier,
+            owner_type.as_deref(),
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn imported_references_with_budget(
+        &self,
+        document: &Document,
+        region: Region,
+        key: &str,
+        identifier: Node<'_>,
+        owner_type: Option<&str>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let active_uses = document.active_uses_with_budget(region, cancel, budget)?;
+        let mut imported = Vec::new();
+        for unit in active_uses {
+            check_navigation_cancel(cancel)?;
+            if document.unknown_imports.contains(unit.as_str()) {
+                return Ok(Vec::new());
+            }
+            for unit_uri in self.unit_urls_for_import_with_budget(document, unit, cancel, budget)? {
+                imported.extend(
+                    self.exported_references_for_key_with_budget(&unit_uri, key, cancel, budget)?,
+                );
+            }
+        }
+        if !imported.is_empty() {
+            if self
+                .is_unknown_global_fallback_for_owner(document, identifier, owner_type, &imported)
+            {
+                return Ok(Vec::new());
+            }
+            return Ok(imported);
+        }
+
+        Ok(Vec::new())
+    }
+
+    fn exported_references_for_key_with_budget(
+        &self,
+        uri: &Url,
+        key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(Vec::new());
+        };
+        budget.require_bytes(key.len(), cancel)?;
+        let key = key.to_owned();
+        let Some(indices) = document.symbol_indices_by_scope_key.get(&(ROOT_SCOPE, key)) else {
+            return Ok(Vec::new());
+        };
+        budget.require_work(indices.len(), cancel)?;
+        budget.require_bytes(uri.as_str().len().saturating_mul(indices.len()), cancel)?;
+        #[cfg(test)]
+        test_record_materialization(&TEST_EXPORTED_INDEX_VECTOR_MATERIALIZATIONS);
+        let mut result = Vec::with_capacity(indices.len());
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(*index) else {
+                continue;
+            };
+            if symbol.owner_type.is_none()
+                && symbol.kind != SymbolKind::Unit
+                && !symbol.local_only
+                && (symbol.region == Region::Interface
+                    || (symbol.kind == SymbolKind::Routine
+                        && symbol.origin == Origin::Definition
+                        && symbol.routine_key.as_ref().is_some_and(|routine_key| {
+                            document.interface_routine_keys.contains(routine_key)
+                        })))
+            {
+                result.push(Candidate {
+                    uri: uri.clone(),
+                    index: *index,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_references_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        dot: Node<'_>,
+        member_name: &str,
+        lookup_identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let Some(lhs) = dot.child_by_field_name("lhs") else {
+            return Ok(Vec::new());
+        };
+        budget.require_bytes(member_name.len(), cancel)?;
+        let key = canonical_name(member_name);
+        let receivers = self.resolve_receivers_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            lhs,
+            lookup_identifier,
+            cancel,
+            budget,
+        )?;
+        let mut references = Vec::new();
+        for receiver in receivers {
+            budget.require_work(1, cancel)?;
+            match receiver {
+                Receiver::Unit(unit_uri) => {
+                    references.extend(self.exported_references_for_key_with_budget(
+                        &unit_uri, &key, cancel, budget,
+                    )?);
+                }
+                Receiver::Type(type_uri, type_key) => {
+                    references.extend(self.member_references_for_type_with_budget(
+                        &type_uri,
+                        &type_key,
+                        &key,
+                        type_uri == *current_uri,
+                        cancel,
+                        budget,
+                    )?)
+                }
+            }
+        }
+        Ok(references)
+    }
+
     fn type_reference_candidates(
         &self,
         current_uri: &Url,
@@ -275,26 +794,133 @@ impl NavigationIndex {
             if cursor_index < prefix_len {
                 return self.unit_candidates(unit_uris);
             }
+            if cursor_index == prefix_len && parts.len() == prefix_len + 1 {
+                let Some(type_name) = parts.get(prefix_len) else {
+                    return Vec::new();
+                };
+                let allow_implementation = unit_uris.iter().any(|unit_uri| unit_uri == current_uri);
+                return unit_uris
+                    .iter()
+                    .flat_map(|unit_uri| {
+                        self.type_candidates_in_unit(unit_uri, type_name, allow_implementation)
+                    })
+                    .collect();
+            }
         }
         self.type_receivers_for_parts(current_uri, current_document, offset, parts, &mut state)
             .into_iter()
             .flat_map(|receiver| match receiver {
-                Receiver::Type(type_uri, type_key) => self
-                    .documents
-                    .get(&type_uri)
-                    .into_iter()
-                    .flat_map(|document| document.symbols.iter().enumerate())
-                    .filter(move |(_, symbol)| {
-                        symbol.kind == SymbolKind::Type && symbol.key == type_key
-                    })
-                    .map(move |(index, _)| Candidate {
-                        uri: type_uri.clone(),
-                        index,
-                    })
-                    .collect::<Vec<_>>(),
+                Receiver::Type(type_uri, type_key) => {
+                    self.type_candidates_in_unit(&type_uri, &type_key, type_uri == *current_uri)
+                }
                 Receiver::Unit(_) => Vec::new(),
             })
             .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_reference_candidates_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        lookup_identifier: Node<'_>,
+        parts: &[String],
+        cursor_index: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_work(parts.len(), cancel)?;
+        let mut state = ResolutionState::new();
+        if let Some((prefix_len, unit_uris)) = self.longest_visible_unit_prefix_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            parts,
+            cancel,
+            budget,
+        )? {
+            if cursor_index < prefix_len {
+                return self.unit_candidates_with_budget(unit_uris, cancel, budget);
+            }
+            if cursor_index == prefix_len && parts.len() == prefix_len + 1 {
+                let Some(type_name) = parts.get(prefix_len) else {
+                    return Ok(Vec::new());
+                };
+                let allow_implementation = unit_uris.iter().any(|unit_uri| unit_uri == current_uri);
+                let mut result = Vec::new();
+                for unit_uri in unit_uris {
+                    result.extend(self.type_candidates_in_unit_with_budget(
+                        &unit_uri,
+                        type_name,
+                        allow_implementation,
+                        cancel,
+                        budget,
+                    )?);
+                }
+                return Ok(result);
+            }
+        }
+        let receivers = self.resolve_qualified_receiver_path_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            parts,
+            lookup_identifier,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        let mut result = Vec::new();
+        for receiver in receivers {
+            budget.require_work(1, cancel)?;
+            if let Receiver::Type(type_uri, type_key) = receiver {
+                result.extend(self.type_candidates_in_unit_with_budget(
+                    &type_uri,
+                    &type_key,
+                    type_uri == *current_uri,
+                    cancel,
+                    budget,
+                )?);
+            }
+        }
+        Ok(result)
+    }
+
+    fn unit_candidates_with_budget(
+        &self,
+        unit_uris: Vec<Url>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let mut result = Vec::new();
+        for uri in unit_uris {
+            budget.require_work(1, cancel)?;
+            let Some(document) = self.documents.get(&uri) else {
+                continue;
+            };
+            let Some(indices) = document
+                .symbol_indices_by_scope_key
+                .get(&(ROOT_SCOPE, document.unit_name.clone()))
+            else {
+                continue;
+            };
+            for index in indices {
+                budget.require_work(1, cancel)?;
+                if document
+                    .symbols
+                    .get(*index)
+                    .is_some_and(|symbol| symbol.kind == SymbolKind::Unit)
+                {
+                    result.push(Candidate {
+                        uri: uri.clone(),
+                        index: *index,
+                    });
+                    break;
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn unit_candidates(&self, unit_uris: Vec<Url>) -> Vec<Candidate> {
@@ -325,12 +951,7 @@ impl NavigationIndex {
     fn direct_symbol_references(&self, uri: &Url, identifier: Node<'_>) -> Option<Vec<Candidate>> {
         let document = self.documents.get(uri)?;
         let span = Span::from_node(identifier);
-        let direct: Vec<usize> = document
-            .symbols
-            .iter()
-            .enumerate()
-            .filter_map(|(index, symbol)| (symbol.span == span).then_some(index))
-            .collect();
+        let direct = document.direct_symbol_indices.get(&span)?.clone();
         if direct.is_empty() {
             return None;
         }
@@ -340,15 +961,17 @@ impl NavigationIndex {
             let symbol = &document.symbols[index];
             if symbol.kind == SymbolKind::Routine {
                 if let Some(routine_key) = &symbol.routine_key {
-                    for (candidate_index, candidate) in document.symbols.iter().enumerate() {
-                        if candidate.kind == SymbolKind::Routine
-                            && candidate.routine_key.as_ref() == Some(routine_key)
-                        {
-                            references.push(Candidate {
-                                uri: uri.clone(),
-                                index: candidate_index,
-                            });
-                        }
+                    for candidate_index in document
+                        .routine_symbol_indices
+                        .get(routine_key)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                    {
+                        references.push(Candidate {
+                            uri: uri.clone(),
+                            index: candidate_index,
+                        });
                     }
                 }
             } else {
@@ -368,9 +991,16 @@ impl NavigationIndex {
             .filter_map(|uri| {
                 let document = self.documents.get(&uri)?;
                 let index = document
-                    .symbols
+                    .symbol_indices_by_scope_key
+                    .get(&(ROOT_SCOPE, document.unit_name.clone()))?
                     .iter()
-                    .position(|symbol| symbol.kind == SymbolKind::Unit)?;
+                    .copied()
+                    .find(|index| {
+                        document
+                            .symbols
+                            .get(*index)
+                            .is_some_and(|symbol| symbol.kind == SymbolKind::Unit)
+                    })?;
                 Some(Candidate {
                     uri: uri.clone(),
                     index,
@@ -380,10 +1010,49 @@ impl NavigationIndex {
     }
 
     fn unit_urls_for_import(&self, current_document: &Document, name: &str) -> Vec<Url> {
+        if current_document.unknown_imports.contains(name) {
+            return Vec::new();
+        }
         if let Some(bindings) = &current_document.import_bindings {
             return bindings.get(name).cloned().into_iter().collect();
         }
         self.units.get(name).cloned().unwrap_or_default()
+    }
+
+    fn unit_urls_for_import_with_budget(
+        &self,
+        current_document: &Document,
+        name: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Url>, String> {
+        if current_document.unknown_imports.contains(name) {
+            return Ok(Vec::new());
+        }
+        if let Some(bindings) = &current_document.import_bindings {
+            let Some(uri) = bindings.get(name) else {
+                return Ok(Vec::new());
+            };
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(uri.as_str().len(), cancel)?;
+            #[cfg(test)]
+            test_record_materialization(&TEST_UNIT_URL_VECTOR_MATERIALIZATIONS);
+            return Ok(vec![uri.clone()]);
+        }
+        let Some(urls) = self.units.get(name) else {
+            return Ok(Vec::new());
+        };
+        budget.require_work(urls.len(), cancel)?;
+        if urls.is_empty() {
+            return Ok(Vec::new());
+        }
+        budget.require_bytes(
+            urls.iter().map(|url| url.as_str().len()).sum::<usize>(),
+            cancel,
+        )?;
+        #[cfg(test)]
+        test_record_materialization(&TEST_UNIT_URL_VECTOR_MATERIALIZATIONS);
+        Ok(urls.clone())
     }
 
     fn unqualified_references(
@@ -393,29 +1062,34 @@ impl NavigationIndex {
         offset: usize,
         name: &str,
     ) -> Vec<Candidate> {
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Vec::new();
+        };
         let key = canonical_name(name);
 
         // Search lexical scopes from the innermost outward. A local symbol
         // shadows both the unit's declarations and imported declarations.
         for scope_id in document.scope_chain(offset) {
-            let local: Vec<Candidate> = document
-                .symbols
-                .iter()
-                .enumerate()
-                .filter(|(_, symbol)| {
-                    symbol.scope == scope_id
-                        && symbol.scope != ROOT_SCOPE
-                        && !symbol.local_only
-                        && symbol.owner_type.is_none()
-                        && symbol.key == key
-                        && symbol.kind != SymbolKind::Unit
-                        && !symbol.unresolved_abbreviated
+            let local = document
+                .symbol_indices_by_scope_key
+                .get(&(scope_id, key.clone()))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|index| {
+                    document.symbols.get(*index).is_some_and(|symbol| {
+                        scope_id != ROOT_SCOPE
+                            && !symbol.local_only
+                            && symbol.owner_type.is_none()
+                            && symbol.kind != SymbolKind::Unit
+                            && !symbol.unresolved_abbreviated
+                    })
                 })
-                .map(|(index, _)| Candidate {
+                .map(|index| Candidate {
                     uri: uri.clone(),
                     index,
                 })
-                .collect();
+                .collect::<Vec<_>>();
             if !local.is_empty() {
                 return local;
             }
@@ -432,33 +1106,45 @@ impl NavigationIndex {
         }
 
         let region = document.region_at(offset);
-        let current: Vec<Candidate> = document
-            .symbols
-            .iter()
-            .enumerate()
-            .filter(|(_, symbol)| {
-                symbol.scope == ROOT_SCOPE
-                    && !symbol.local_only
-                    && symbol.owner_type.is_none()
-                    && symbol.key == key
-                    && symbol.kind != SymbolKind::Unit
-                    && !symbol.unresolved_abbreviated
-                    && symbol_visible_in_region(symbol, region)
+        let current = document
+            .symbol_indices_by_scope_key
+            .get(&(ROOT_SCOPE, key.clone()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|index| {
+                document.symbols.get(*index).is_some_and(|symbol| {
+                    !symbol.local_only
+                        && symbol.owner_type.is_none()
+                        && symbol.kind != SymbolKind::Unit
+                        && !symbol.unresolved_abbreviated
+                        && symbol_visible_in_region(symbol, region)
+                })
             })
-            .map(|(index, _)| Candidate {
+            .map(|index| Candidate {
                 uri: uri.clone(),
                 index,
             })
-            .collect();
+            .collect::<Vec<_>>();
         if !current.is_empty() {
+            if self.is_unknown_global_fallback(document, identifier, offset, &current) {
+                return Vec::new();
+            }
             return current;
         }
 
         // Only the uses clauses active at this source position contribute
         // imported names. Imported implementation-only routines are excluded
         // by exported_references_for_document.
+        let active_uses = document.active_uses(region);
+        if active_uses
+            .iter()
+            .any(|unit| document.unknown_imports.contains(unit.as_str()))
+        {
+            return Vec::new();
+        }
         let mut imported = Vec::new();
-        for unit in document.active_uses(region) {
+        for unit in active_uses {
             for unit_uri in self.unit_urls_for_import(document, unit) {
                 imported.extend(
                     self.exported_references_for_document(&unit_uri)
@@ -471,6 +1157,9 @@ impl NavigationIndex {
             }
         }
         if !imported.is_empty() {
+            if self.is_unknown_global_fallback(document, identifier, offset, &imported) {
+                return Vec::new();
+            }
             return imported;
         }
 
@@ -524,6 +1213,655 @@ impl NavigationIndex {
     ) -> Vec<Receiver> {
         let mut state = ResolutionState::new();
         self.resolve_receivers_with_state(current_uri, current_document, offset, node, &mut state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_receivers_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        node: Node<'_>,
+        lookup_identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        let mut state = ResolutionState::new();
+        self.resolve_receivers_with_state_and_budget(
+            current_uri,
+            current_document,
+            offset,
+            node,
+            lookup_identifier,
+            &mut state,
+            cancel,
+            budget,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_receivers_with_state_and_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        node: Node<'_>,
+        lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        depth: usize,
+    ) -> Result<Vec<Receiver>, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
+        if depth >= MAX_RECEIVER_RECURSION_DEPTH {
+            return Ok(Vec::new());
+        }
+        budget.require_work(1, cancel)?;
+        if !state.take_receiver_work() {
+            return Ok(Vec::new());
+        }
+        match node.kind() {
+            "identifier" => self.resolve_identifier_receiver_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                node_text_with_budget(node, &current_document.source, cancel, budget)?,
+                lookup_identifier,
+                state,
+                cancel,
+                budget,
+            ),
+            "exprParens" => first_named_child(node)
+                .map(|operand| {
+                    self.resolve_receivers_with_state_and_budget(
+                        current_uri,
+                        current_document,
+                        offset,
+                        operand,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                        depth.saturating_add(1),
+                    )
+                })
+                .unwrap_or_else(|| Ok(Vec::new())),
+            "exprDot" | "genericDot" | "typerefDot" => {
+                if let Some(parts) = qualified_name_parts_with_budget(
+                    node,
+                    &current_document.source,
+                    cancel,
+                    budget,
+                )? {
+                    budget.require_work(parts.len(), cancel)?;
+                    return self.resolve_qualified_receiver_path_with_budget(
+                        current_uri,
+                        current_document,
+                        offset,
+                        &parts,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                    );
+                }
+                let Some(lhs) = node.child_by_field_name("lhs") else {
+                    return Ok(Vec::new());
+                };
+                let Some(rhs) = node.child_by_field_name("rhs") else {
+                    return Ok(Vec::new());
+                };
+                let Some(rhs_name) = qualified_name_parts_with_budget(
+                    rhs,
+                    &current_document.source,
+                    cancel,
+                    budget,
+                )?
+                .and_then(|parts| parts.last().cloned()) else {
+                    return Ok(Vec::new());
+                };
+                let receivers = self.resolve_receivers_with_state_and_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    lhs,
+                    lookup_identifier,
+                    state,
+                    cancel,
+                    budget,
+                    depth.saturating_add(1),
+                )?;
+                let mut result = Vec::new();
+                for receiver in receivers {
+                    budget.require_work(1, cancel)?;
+                    match receiver {
+                        Receiver::Unit(unit_uri) => {
+                            result.extend(self.type_receivers_in_unit_with_budget(
+                                &unit_uri,
+                                &rhs_name,
+                                unit_uri == *current_uri,
+                                cancel,
+                                budget,
+                            )?)
+                        }
+                        Receiver::Type(type_uri, type_key) => {
+                            result.extend(self.member_type_receivers_with_budget(
+                                &type_uri,
+                                &type_key,
+                                &rhs_name,
+                                type_uri == *current_uri,
+                                lookup_identifier,
+                                state,
+                                cancel,
+                                budget,
+                            )?)
+                        }
+                    }
+                }
+                Ok(result)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_qualified_receiver_path_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        parts: &[String],
+        lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        if parts.len() < 2 || parts.len() > MAX_RECEIVER_WORK {
+            return Ok(Vec::new());
+        }
+        budget.require_work(parts.len(), cancel)?;
+        let Some(first) = parts.first() else {
+            return Ok(Vec::new());
+        };
+        let first_is_bound = !self
+            .unqualified_references_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                first,
+                lookup_identifier,
+                cancel,
+                budget,
+            )?
+            .is_empty();
+        if first.eq_ignore_ascii_case("Self") || first_is_bound {
+            let mut receivers = self.resolve_identifier_receiver_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                first,
+                lookup_identifier,
+                state,
+                cancel,
+                budget,
+            )?;
+            for member_name in &parts[1..] {
+                budget.require_work(1, cancel)?;
+                receivers = receivers
+                    .into_iter()
+                    .map(|receiver| match receiver {
+                        Receiver::Type(type_uri, type_key) => self
+                            .member_type_receivers_with_budget(
+                                &type_uri,
+                                &type_key,
+                                member_name,
+                                type_uri == *current_uri,
+                                lookup_identifier,
+                                state,
+                                cancel,
+                                budget,
+                            ),
+                        Receiver::Unit(unit_uri) => self.type_receivers_in_unit_with_budget(
+                            &unit_uri,
+                            member_name,
+                            unit_uri == *current_uri,
+                            cancel,
+                            budget,
+                        ),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            }
+            return Ok(receivers);
+        }
+
+        if let Some(unit_uris) = self.visible_unit_urls_for_path_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            parts,
+            cancel,
+            budget,
+        )? {
+            return Ok(unit_uris.into_iter().map(Receiver::Unit).collect());
+        }
+
+        if let Some((prefix_len, unit_uris)) = self.longest_visible_unit_prefix_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            parts,
+            cancel,
+            budget,
+        )? {
+            let Some(type_name) = parts.get(prefix_len) else {
+                return Ok(Vec::new());
+            };
+            let allow_implementation = unit_uris.iter().any(|unit_uri| unit_uri == current_uri);
+            let mut receivers = Vec::new();
+            for unit_uri in unit_uris {
+                receivers.extend(self.type_receivers_in_unit_with_budget(
+                    &unit_uri,
+                    type_name,
+                    allow_implementation,
+                    cancel,
+                    budget,
+                )?);
+            }
+            for member_name in &parts[prefix_len + 1..] {
+                budget.require_work(1, cancel)?;
+                receivers = receivers
+                    .into_iter()
+                    .map(|receiver| match receiver {
+                        Receiver::Type(type_uri, type_key) => self
+                            .member_type_receivers_with_budget(
+                                &type_uri,
+                                &type_key,
+                                member_name,
+                                type_uri == *current_uri,
+                                lookup_identifier,
+                                state,
+                                cancel,
+                                budget,
+                            ),
+                        Receiver::Unit(_) => Ok(Vec::new()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            }
+            return Ok(receivers);
+        }
+
+        let mut receivers = self.resolve_identifier_receiver_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            first,
+            lookup_identifier,
+            state,
+            cancel,
+            budget,
+        )?;
+        for member_name in &parts[1..] {
+            budget.require_work(1, cancel)?;
+            receivers = receivers
+                .into_iter()
+                .map(|receiver| match receiver {
+                    Receiver::Type(type_uri, type_key) => self.member_type_receivers_with_budget(
+                        &type_uri,
+                        &type_key,
+                        member_name,
+                        type_uri == *current_uri,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                    ),
+                    Receiver::Unit(unit_uri) => self.type_receivers_in_unit_with_budget(
+                        &unit_uri,
+                        member_name,
+                        unit_uri == *current_uri,
+                        cancel,
+                        budget,
+                    ),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+        }
+        Ok(receivers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_identifier_receiver_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        name: &str,
+        lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        if name.eq_ignore_ascii_case("Self") {
+            let scope = self.budgeted_scope_at(current_document, offset, cancel, budget)?;
+            return Ok(current_document
+                .owner_type_at_identifier(lookup_identifier, scope)
+                .map(|owner_type| vec![Receiver::Type(current_uri.clone(), owner_type)])
+                .unwrap_or_default());
+        }
+        let references = self.unqualified_references_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            name,
+            lookup_identifier,
+            cancel,
+            budget,
+        )?;
+        if !references.is_empty() {
+            if references
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Ok(Vec::new());
+            }
+            let mut result = Vec::new();
+            for reference in references {
+                budget.require_work(1, cancel)?;
+                let Some(symbol) = self.symbol(&reference) else {
+                    continue;
+                };
+                match symbol.kind {
+                    SymbolKind::Type => {
+                        result.push(Receiver::Type(reference.uri.clone(), symbol.key.clone()));
+                    }
+                    SymbolKind::Variable
+                    | SymbolKind::Parameter
+                    | SymbolKind::Field
+                    | SymbolKind::Property => {
+                        if let Some(type_name) = &symbol.type_name {
+                            let Some(declaration_document) = self.documents.get(&reference.uri)
+                            else {
+                                continue;
+                            };
+                            result.extend(self.type_receivers_for_path_with_budget(
+                                &reference.uri,
+                                declaration_document,
+                                symbol.span.start,
+                                type_name,
+                                lookup_identifier,
+                                state,
+                                cancel,
+                                budget,
+                            )?);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(result);
+        }
+        let urls = self.visible_unit_urls_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            name,
+            cancel,
+            budget,
+        )?;
+        Ok(urls.into_iter().map(Receiver::Unit).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_receivers_for_path_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        path: &str,
+        lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        budget.require_work(
+            path.split('.').filter(|part| !part.is_empty()).count(),
+            cancel,
+        )?;
+        budget.require_bytes(path.len(), cancel)?;
+        let parts = path
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        budget.require_work(parts.len(), cancel)?;
+        self.type_receivers_for_parts_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            &parts,
+            lookup_identifier,
+            state,
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_receivers_for_parts_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        parts: &[String],
+        lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        if parts.is_empty() {
+            return Ok(Vec::new());
+        }
+        budget.require_work(parts.len(), cancel)?;
+        if parts.len() == 1 {
+            let candidates = self.unqualified_references_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &parts[0],
+                lookup_identifier,
+                cancel,
+                budget,
+            )?;
+            if candidates
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Ok(Vec::new());
+            }
+            let mut result = Vec::new();
+            for candidate in candidates {
+                budget.require_work(1, cancel)?;
+                let Some(symbol) = self.symbol(&candidate) else {
+                    continue;
+                };
+                if symbol.kind == SymbolKind::Type {
+                    result.push(Receiver::Type(candidate.uri, symbol.key.clone()));
+                }
+            }
+            return Ok(result);
+        }
+        let Some((prefix_len, unit_uris)) = self.longest_visible_unit_prefix_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            parts,
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(type_name) = parts.get(prefix_len) else {
+            return Ok(Vec::new());
+        };
+        let allow_implementation = unit_uris.iter().any(|unit_uri| unit_uri == current_uri);
+        let mut receivers = Vec::new();
+        for unit_uri in unit_uris {
+            receivers.extend(self.type_receivers_in_unit_with_budget(
+                &unit_uri,
+                type_name,
+                allow_implementation,
+                cancel,
+                budget,
+            )?);
+        }
+        for member_name in &parts[prefix_len + 1..] {
+            budget.require_work(1, cancel)?;
+            receivers = receivers
+                .into_iter()
+                .map(|receiver| match receiver {
+                    Receiver::Type(type_uri, type_key) => self.member_type_receivers_with_budget(
+                        &type_uri,
+                        &type_key,
+                        member_name,
+                        type_uri == *current_uri,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                    ),
+                    Receiver::Unit(_) => Ok(Vec::new()),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+        }
+        Ok(receivers)
+    }
+
+    fn type_receivers_in_unit_with_budget(
+        &self,
+        unit_uri: &Url,
+        name: &str,
+        allow_implementation: bool,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        let candidates = self.type_candidates_in_unit_with_budget(
+            unit_uri,
+            name,
+            allow_implementation,
+            cancel,
+            budget,
+        )?;
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        for candidate in candidates {
+            budget.require_work(1, cancel)?;
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            result.push(Receiver::Type(candidate.uri, symbol.key.clone()));
+        }
+        Ok(result)
+    }
+
+    fn budgeted_scope_at(
+        &self,
+        document: &Document,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<usize, String> {
+        budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
+        Ok(document.scope_at(offset))
+    }
+
+    fn scope_chain_with_budget(
+        &self,
+        document: &Document,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<usize>, String> {
+        budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
+        Ok(document.scope_chain(offset))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_type_receivers_with_budget(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        name: &str,
+        allow_implementation: bool,
+        lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        let member_key = canonical_name(name);
+        let resolution_key = (type_uri.clone(), type_key.to_owned(), member_key.clone());
+        if !state.active_members.insert(resolution_key.clone()) {
+            return Ok(Vec::new());
+        }
+        let candidates = self.member_references_for_type_with_budget(
+            type_uri,
+            type_key,
+            &member_key,
+            allow_implementation,
+            cancel,
+            budget,
+        )?;
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            state.active_members.remove(&resolution_key);
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        for candidate in candidates {
+            budget.require_work(1, cancel)?;
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            let Some(type_name) = symbol.type_name.as_deref() else {
+                continue;
+            };
+            let Some(document) = self.documents.get(&candidate.uri) else {
+                continue;
+            };
+            result.extend(self.type_receivers_for_path_with_budget(
+                type_uri,
+                document,
+                symbol.span.start,
+                type_name,
+                lookup_identifier,
+                state,
+                cancel,
+                budget,
+            )?);
+        }
+        state.active_members.remove(&resolution_key);
+        Ok(result)
     }
 
     fn resolve_receivers_with_state(
@@ -736,6 +2074,12 @@ impl NavigationIndex {
 
         let references = self.unqualified_references(current_uri, current_document, offset, name);
         if !references.is_empty() {
+            if references
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Vec::new();
+            }
             let mut result = Vec::new();
             for reference in references {
                 let Some(symbol) = self.symbol(&reference) else {
@@ -806,8 +2150,15 @@ impl NavigationIndex {
         }
 
         if parts.len() == 1 {
-            return self
-                .unqualified_references(current_uri, current_document, offset, &parts[0])
+            let candidates =
+                self.unqualified_references(current_uri, current_document, offset, &parts[0]);
+            if candidates
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Vec::new();
+            }
+            return candidates
                 .into_iter()
                 .filter_map(|candidate| {
                     let symbol = self.symbol(&candidate)?;
@@ -930,29 +2281,195 @@ impl NavigationIndex {
         best
     }
 
+    fn visible_unit_urls_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        name: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Url>, String> {
+        budget.require_bytes(name.len(), cancel)?;
+        let key = canonical_name(name);
+        if current_document.unit_name == key {
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(current_uri.as_str().len(), cancel)?;
+            return Ok(vec![current_uri.clone()]);
+        }
+
+        let region = current_document.region_at(offset);
+        let active_uses = current_document.active_uses_with_budget(region, cancel, budget)?;
+        if !active_uses.iter().any(|used| used.as_str() == key) {
+            return Ok(Vec::new());
+        }
+        self.unit_urls_for_import_with_budget(current_document, &key, cancel, budget)
+    }
+
+    fn visible_unit_urls_for_path_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        parts: &[String],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Vec<Url>>, String> {
+        budget.require_work(parts.len().saturating_add(1), cancel)?;
+        let path_bytes = parts
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(parts.len().saturating_sub(1));
+        budget.require_bytes(path_bytes, cancel)?;
+        let key = canonical_path(parts);
+        if current_document.unit_name == key {
+            budget.require_bytes(current_uri.as_str().len(), cancel)?;
+            return Ok(Some(vec![current_uri.clone()]));
+        }
+
+        let region = current_document.region_at(offset);
+        let active_uses = current_document.active_uses_with_budget(region, cancel, budget)?;
+        if !active_uses.iter().any(|used| used.as_str() == key) {
+            return Ok(None);
+        }
+        let urls = self.unit_urls_for_import_with_budget(current_document, &key, cancel, budget)?;
+        Ok((!urls.is_empty()).then_some(urls))
+    }
+
+    fn longest_visible_unit_prefix_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        parts: &[String],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<(usize, Vec<Url>)>, String> {
+        if parts.len() > MAX_RECEIVER_WORK {
+            return Ok(None);
+        }
+        budget.require_work(parts.len().saturating_add(1), cancel)?;
+
+        let region = current_document.region_at(offset);
+        let mut best = None;
+        if let Some(prefix_len) = matching_unit_prefix_len(&current_document.unit_name, parts) {
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(current_uri.as_str().len(), cancel)?;
+            best = Some((prefix_len, vec![current_uri.clone()]));
+        }
+
+        let active_uses = current_document.active_uses_with_budget(region, cancel, budget)?;
+        for used in active_uses {
+            check_navigation_cancel(cancel)?;
+            let Some(prefix_len) = matching_unit_prefix_len(used, parts) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_some_and(|(best_prefix_len, _)| *best_prefix_len >= prefix_len)
+            {
+                continue;
+            }
+            let unit_uris =
+                self.unit_urls_for_import_with_budget(current_document, used, cancel, budget)?;
+            if !unit_uris.is_empty() {
+                best = Some((prefix_len, unit_uris));
+            }
+        }
+        Ok(best)
+    }
+
     fn type_receivers_in_unit(
         &self,
         unit_uri: &Url,
         name: &str,
         allow_implementation: bool,
     ) -> Vec<Receiver> {
+        let candidates = self.type_candidates_in_unit(unit_uri, name, allow_implementation);
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Vec::new();
+        }
+        candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                let symbol = self.symbol(&candidate)?;
+                Some(Receiver::Type(candidate.uri, symbol.key.clone()))
+            })
+            .collect()
+    }
+
+    fn type_candidates_in_unit(
+        &self,
+        unit_uri: &Url,
+        name: &str,
+        allow_implementation: bool,
+    ) -> Vec<Candidate> {
         let key = canonical_name(name);
         let Some(document) = self.documents.get(unit_uri) else {
             return Vec::new();
         };
         document
-            .symbols
-            .iter()
-            .filter(|symbol| {
-                symbol.kind == SymbolKind::Type
-                    && symbol.owner_type.is_none()
-                    && !symbol.local_only
-                    && symbol.key == key
+            .type_symbol_indices
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|index| {
+                document.symbols.get(*index).is_some_and(|symbol| {
+                    !symbol.local_only
+                        && (symbol.region == Region::Interface
+                            || (allow_implementation && symbol.region == Region::Implementation))
+                })
+            })
+            .map(|index| Candidate {
+                uri: unit_uri.clone(),
+                index,
+            })
+            .collect()
+    }
+
+    fn type_candidates_in_unit_with_budget(
+        &self,
+        unit_uri: &Url,
+        name: &str,
+        allow_implementation: bool,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_bytes(name.len(), cancel)?;
+        let key = canonical_name(name);
+        let Some(document) = self.documents.get(unit_uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(indices) = document.type_symbol_indices.get(&key) else {
+            return Ok(Vec::new());
+        };
+        budget.require_work(indices.len(), cancel)?;
+        budget.require_bytes(
+            unit_uri.as_str().len().saturating_mul(indices.len()),
+            cancel,
+        )?;
+        #[cfg(test)]
+        test_record_materialization(&TEST_TYPE_INDEX_VECTOR_MATERIALIZATIONS);
+        let mut result = Vec::with_capacity(indices.len());
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            if document.symbols.get(*index).is_some_and(|symbol| {
+                !symbol.local_only
                     && (symbol.region == Region::Interface
                         || (allow_implementation && symbol.region == Region::Implementation))
-            })
-            .map(|symbol| Receiver::Type(unit_uri.clone(), symbol.key.clone()))
-            .collect()
+            }) {
+                result.push(Candidate {
+                    uri: unit_uri.clone(),
+                    index: *index,
+                });
+            }
+        }
+        Ok(result)
     }
 
     fn member_type_receivers(
@@ -971,8 +2488,16 @@ impl NavigationIndex {
         if !state.active_members.insert(resolution_key.clone()) {
             return Vec::new();
         }
-        let result = self
-            .member_references_for_type(type_uri, type_key, &member_key, allow_implementation)
+        let candidates =
+            self.member_references_for_type(type_uri, type_key, &member_key, allow_implementation);
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            state.active_members.remove(&resolution_key);
+            return Vec::new();
+        }
+        let result = candidates
             .into_iter()
             .filter_map(|candidate| {
                 let symbol = self.symbol(&candidate)?;
@@ -1002,91 +2527,119 @@ impl NavigationIndex {
         let Some(document) = self.documents.get(type_uri) else {
             return Vec::new();
         };
-        let interface_routine_keys: HashSet<String> = document
-            .symbols
-            .iter()
-            .filter_map(|symbol| {
-                (symbol.owner_type.as_deref() == Some(type_key)
-                    && symbol.kind == SymbolKind::Routine
-                    && symbol.origin == Origin::Declaration
-                    && (symbol.region == Region::Interface
-                        || (allow_implementation && symbol.region == Region::Implementation)))
-                    .then(|| symbol.routine_key.clone())
-                    .flatten()
-            })
-            .collect();
-
         document
-            .symbols
-            .iter()
-            .enumerate()
-            .filter(|(_, symbol)| {
-                symbol.owner_type.as_deref() == Some(type_key)
-                    && symbol.key == member_key
-                    && !symbol.local_only
-                    && match symbol.kind {
-                        SymbolKind::Routine => {
-                            (symbol.origin == Origin::Declaration
-                                && (symbol.region == Region::Interface
+            .member_symbol_indices
+            .get(&(type_key.to_owned(), member_key.to_owned()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|index| {
+                document.symbols.get(*index).is_some_and(|symbol| {
+                    !symbol.local_only
+                        && match symbol.kind {
+                            SymbolKind::Routine => {
+                                (symbol.origin == Origin::Declaration
+                                    && (symbol.region == Region::Interface
+                                        || (allow_implementation
+                                            && symbol.region == Region::Implementation)))
+                                    || (symbol.origin == Origin::Definition
+                                        && symbol.routine_key.as_ref().is_some_and(|key| {
+                                            document
+                                                .interface_member_routine_keys
+                                                .get(type_key)
+                                                .is_some_and(|keys| keys.contains(key))
+                                        }))
+                            }
+                            _ => {
+                                symbol.region == Region::Interface
                                     || (allow_implementation
-                                        && symbol.region == Region::Implementation)))
-                                || (symbol.origin == Origin::Definition
-                                    && symbol
-                                        .routine_key
-                                        .as_ref()
-                                        .is_some_and(|key| interface_routine_keys.contains(key)))
+                                        && symbol.region == Region::Implementation)
+                            }
                         }
-                        _ => {
-                            symbol.region == Region::Interface
-                                || (allow_implementation && symbol.region == Region::Implementation)
-                        }
-                    }
+                })
             })
-            .map(|(index, _)| Candidate {
+            .map(|index| Candidate {
                 uri: type_uri.clone(),
                 index,
             })
             .collect()
     }
 
+    fn member_references_for_type_with_budget(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        member_key: &str,
+        allow_implementation: bool,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let Some(document) = self.documents.get(type_uri) else {
+            return Ok(Vec::new());
+        };
+        budget.require_bytes(type_key.len().saturating_add(member_key.len()), cancel)?;
+        let lookup_key = (type_key.to_owned(), member_key.to_owned());
+        let Some(indices) = document.member_symbol_indices.get(&lookup_key) else {
+            return Ok(Vec::new());
+        };
+        budget.require_work(indices.len(), cancel)?;
+        budget.require_bytes(
+            type_uri.as_str().len().saturating_mul(indices.len()),
+            cancel,
+        )?;
+        #[cfg(test)]
+        test_record_materialization(&TEST_MEMBER_INDEX_VECTOR_MATERIALIZATIONS);
+        let interface_routine_keys = document.interface_member_routine_keys.get(type_key);
+        let mut result = Vec::with_capacity(indices.len());
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(*index) else {
+                continue;
+            };
+            let visible = !symbol.local_only
+                && match symbol.kind {
+                    SymbolKind::Routine => {
+                        (symbol.origin == Origin::Declaration
+                            && (symbol.region == Region::Interface
+                                || (allow_implementation
+                                    && symbol.region == Region::Implementation)))
+                            || (symbol.origin == Origin::Definition
+                                && symbol.routine_key.as_ref().is_some_and(|key| {
+                                    interface_routine_keys.is_some_and(|keys| keys.contains(key))
+                                }))
+                    }
+                    _ => {
+                        symbol.region == Region::Interface
+                            || (allow_implementation && symbol.region == Region::Implementation)
+                    }
+                };
+            if visible {
+                result.push(Candidate {
+                    uri: type_uri.clone(),
+                    index: *index,
+                });
+            }
+        }
+        Ok(result)
+    }
+
     fn exported_references_for_document(&self, uri: &Url) -> Vec<Candidate> {
         let Some(document) = self.documents.get(uri) else {
             return Vec::new();
         };
-        let interface_routines: HashSet<String> = document
-            .symbols
-            .iter()
-            .filter_map(|symbol| {
-                (symbol.kind == SymbolKind::Routine
-                    && symbol.owner_type.is_none()
-                    && !symbol.local_only
-                    && symbol.origin == Origin::Declaration
-                    && symbol.region == Region::Interface)
-                    .then(|| symbol.routine_key.clone())
-                    .flatten()
-            })
-            .collect();
-
+        #[cfg(test)]
+        TEST_LEGACY_EXPORTED_MATERIALIZATIONS.with(|count| {
+            count.set(
+                count
+                    .get()
+                    .saturating_add(document.exported_symbol_indices.len()),
+            );
+        });
         document
-            .symbols
+            .exported_symbol_indices
             .iter()
-            .enumerate()
-            .filter(|(_, symbol)| {
-                if symbol.owner_type.is_some()
-                    || symbol.kind == SymbolKind::Unit
-                    || symbol.local_only
-                {
-                    return false;
-                }
-                symbol.region == Region::Interface
-                    || (symbol.kind == SymbolKind::Routine
-                        && symbol.origin == Origin::Definition
-                        && symbol
-                            .routine_key
-                            .as_ref()
-                            .is_some_and(|key| interface_routines.contains(key)))
-            })
-            .map(|(index, _)| Candidate {
+            .filter_map(|index| document.symbols.get(*index).map(|_| *index))
+            .map(|index| Candidate {
                 uri: uri.clone(),
                 index,
             })
@@ -1332,6 +2885,93 @@ struct Scope {
 }
 
 #[derive(Debug)]
+pub(super) struct AssistanceBudget {
+    remaining_work: usize,
+    remaining_bytes: usize,
+    work_limit: usize,
+    byte_limit: usize,
+    operation: &'static str,
+}
+
+fn check_navigation_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err("request cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+impl AssistanceBudget {
+    pub(super) fn new(work_limit: usize, byte_limit: usize, operation: &'static str) -> Self {
+        Self {
+            remaining_work: work_limit,
+            remaining_bytes: byte_limit,
+            work_limit,
+            byte_limit,
+            operation,
+        }
+    }
+
+    pub(super) fn take_work(&mut self, amount: usize, cancel: &AtomicBool) -> Result<bool, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
+        if amount > self.remaining_work {
+            self.remaining_work = 0;
+            return Ok(false);
+        }
+        self.remaining_work -= amount;
+        Ok(true)
+    }
+
+    pub(super) fn take_bytes(
+        &mut self,
+        amount: usize,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
+        if amount > self.remaining_bytes {
+            self.remaining_bytes = 0;
+            return Ok(false);
+        }
+        self.remaining_bytes -= amount;
+        Ok(true)
+    }
+
+    pub(super) fn require_work(
+        &mut self,
+        amount: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if self.take_work(amount, cancel)? {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} exceeds the {}-node traversal limit",
+                self.operation, self.work_limit
+            ))
+        }
+    }
+
+    pub(super) fn require_bytes(
+        &mut self,
+        amount: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if self.take_bytes(amount, cancel)? {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} exceeds the {}-byte scan limit",
+                self.operation, self.byte_limit
+            ))
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Symbol {
     span: Span,
     declaration_span: Span,
@@ -1350,6 +2990,9 @@ struct Symbol {
     local_only: bool,
     routine_key: Option<String>,
     routine_signature: Option<String>,
+    routine_header_span: Option<Span>,
+    routine_parameter_spans: Vec<Span>,
+    type_excerpt_end: Option<usize>,
     body_scope: Option<usize>,
     unresolved_abbreviated: bool,
     accessor: Option<String>,
@@ -1368,6 +3011,7 @@ enum Receiver {
 
 const MAX_RECEIVER_WORK: usize = 256;
 const MAX_TYPE_RESOLUTION_WORK: usize = 256;
+const MAX_RECEIVER_RECURSION_DEPTH: usize = 64;
 
 struct ResolutionState {
     receiver_work: usize,
@@ -1406,26 +3050,52 @@ struct Document {
     tree: Tree,
     parser_recovery_spans: Vec<Span>,
     unit_name: String,
+    unit_display_name: String,
     interface_range: Option<Span>,
     implementation_range: Option<Span>,
     interface_uses: Vec<String>,
     implementation_uses: Vec<String>,
     imports: Vec<ImportMetadata>,
+    unknown_imports: HashSet<String>,
     import_bindings: Option<HashMap<String, Url>>,
+    interface_routine_keys: HashSet<String>,
     scopes: Vec<Scope>,
     cache_unsafe_scopes: HashSet<usize>,
     symbols: Vec<Symbol>,
     opaque_ranges: Vec<Span>,
+    conditionals: ConditionalAnalysis,
+    conditional_unknown_symbols: Vec<bool>,
+    unknown_class_owners: HashSet<String>,
+    known_non_class_owners: HashSet<String>,
+    symbol_indices_by_scope_key: HashMap<(usize, String), Vec<usize>>,
+    scope_symbol_indices: HashMap<usize, Vec<usize>>,
+    member_symbol_indices: HashMap<(String, String), Vec<usize>>,
+    member_symbol_indices_by_owner: HashMap<String, Vec<usize>>,
+    type_symbol_indices: HashMap<String, Vec<usize>>,
+    direct_symbol_indices: HashMap<Span, Vec<usize>>,
+    routine_symbol_indices: HashMap<String, Vec<usize>>,
+    exported_symbol_indices: Vec<usize>,
+    routine_declaration_spans: HashMap<String, Span>,
+    interface_member_routine_keys: HashMap<String, HashSet<String>>,
 }
 
 impl Document {
-    fn parse(uri: Url, source: String) -> Result<Self, String> {
+    fn parse_with_cancel(
+        uri: Url,
+        source: String,
+        defines: &[String],
+        cancel: &AtomicBool,
+    ) -> Result<Self, String> {
         let path = uri
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));
         let info = FileInfo::new(path);
+        let conditionals = conditional::analyze_with_cancel(&source, defines, cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
         let (tree, _diagnostics, patches) =
-            parser::parse_file_with_patches(&info, source.as_bytes())?;
+            parser::parse_file_with_patches(&info, conditionals.projected_source.as_bytes())?;
         let root = tree.root_node();
         let parser_recovery_spans = collect_parser_recovery_spans(root);
         let opaque_ranges = patches
@@ -1459,6 +3129,10 @@ impl Document {
             .map(|node| canonical_path(&identifier_texts(node, &source)))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| fallback_unit_name(&uri));
+        let unit_display_name = unit_module
+            .map(|node| identifier_texts(node, &source).join("."))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| unit_name.clone());
 
         let interface_range = sections
             .iter()
@@ -1495,6 +3169,16 @@ impl Document {
         interface_uses.dedup();
         implementation_uses.sort();
         implementation_uses.dedup();
+        let unknown_imports = imports
+            .iter()
+            .filter(|import| {
+                conditionals
+                    .unknown_spans
+                    .iter()
+                    .any(|span| span.start <= import.span.start && import.span.end <= span.end)
+            })
+            .map(|import| canonical_name(&import.name))
+            .collect();
 
         let definitions = collect_nodes_matching(root, "defProc");
         let (scopes, scope_by_span) = build_scopes(source.len(), &definitions, &source);
@@ -1525,6 +3209,9 @@ impl Document {
                 local_only: false,
                 routine_key: None,
                 routine_signature: None,
+                routine_header_span: None,
+                routine_parameter_spans: Vec::new(),
+                type_excerpt_end: None,
                 body_scope: None,
                 unresolved_abbreviated: false,
                 accessor: None,
@@ -1533,22 +3220,159 @@ impl Document {
 
         collect_symbols(root, &source, &scopes, &scope_by_span, &mut symbols);
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
+        let conditional_unknown_symbols =
+            conditional_unknown_symbols(root, &conditionals, &symbols);
+        let unknown_class_owners = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind == SymbolKind::Type
+                    && symbol.owner_type.is_none()
+                    && symbol.type_kind == TypeKind::Class
+            })
+            .map(|symbol| symbol.key.clone())
+            .collect();
+        let known_non_class_owners = symbols
+            .iter()
+            .enumerate()
+            .filter(|(index, symbol)| {
+                symbol.kind == SymbolKind::Type
+                    && symbol.owner_type.is_none()
+                    && symbol.type_kind != TypeKind::Class
+                    && !conditional_unknown_symbols[*index]
+            })
+            .map(|(_, symbol)| symbol.key.clone())
+            .collect();
+        let interface_routine_keys: HashSet<String> = symbols
+            .iter()
+            .filter_map(|symbol| {
+                (symbol.kind == SymbolKind::Routine
+                    && symbol.owner_type.is_none()
+                    && !symbol.local_only
+                    && symbol.origin == Origin::Declaration
+                    && symbol.region == Region::Interface)
+                    .then(|| symbol.routine_key.clone())
+                    .flatten()
+            })
+            .collect();
+        let exported_symbol_indices = symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| {
+                if symbol.owner_type.is_some()
+                    || symbol.kind == SymbolKind::Unit
+                    || symbol.local_only
+                {
+                    return false;
+                }
+                symbol.region == Region::Interface
+                    || (symbol.kind == SymbolKind::Routine
+                        && symbol.origin == Origin::Definition
+                        && symbol
+                            .routine_key
+                            .as_ref()
+                            .is_some_and(|key| interface_routine_keys.contains(key)))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut symbol_indices_by_scope_key = HashMap::new();
+        let mut scope_symbol_indices = HashMap::new();
+        let mut member_symbol_indices = HashMap::new();
+        let mut member_symbol_indices_by_owner = HashMap::new();
+        let mut type_symbol_indices = HashMap::new();
+        let mut direct_symbol_indices = HashMap::new();
+        let mut routine_symbol_indices = HashMap::new();
+        let mut routine_declaration_spans = HashMap::new();
+        let mut interface_member_routine_keys = HashMap::<String, HashSet<String>>::new();
+        for (index, symbol) in symbols.iter().enumerate() {
+            symbol_indices_by_scope_key
+                .entry((symbol.scope, symbol.key.clone()))
+                .or_insert_with(Vec::new)
+                .push(index);
+            scope_symbol_indices
+                .entry(symbol.scope)
+                .or_insert_with(Vec::new)
+                .push(index);
+            direct_symbol_indices
+                .entry(symbol.span)
+                .or_insert_with(Vec::new)
+                .push(index);
+            if let Some(owner_type) = &symbol.owner_type {
+                member_symbol_indices
+                    .entry((owner_type.clone(), symbol.key.clone()))
+                    .or_insert_with(Vec::new)
+                    .push(index);
+                member_symbol_indices_by_owner
+                    .entry(owner_type.clone())
+                    .or_insert_with(Vec::new)
+                    .push(index);
+                if symbol.kind == SymbolKind::Routine
+                    && symbol.origin == Origin::Declaration
+                    && symbol.region == Region::Interface
+                {
+                    if let Some(routine_key) = &symbol.routine_key {
+                        interface_member_routine_keys
+                            .entry(owner_type.clone())
+                            .or_default()
+                            .insert(routine_key.clone());
+                    }
+                }
+            }
+            if symbol.kind == SymbolKind::Type
+                && symbol.scope == ROOT_SCOPE
+                && symbol.owner_type.is_none()
+            {
+                type_symbol_indices
+                    .entry(symbol.key.clone())
+                    .or_insert_with(Vec::new)
+                    .push(index);
+            }
+            if symbol.kind == SymbolKind::Routine {
+                if let Some(routine_key) = &symbol.routine_key {
+                    routine_symbol_indices
+                        .entry(routine_key.clone())
+                        .or_insert_with(Vec::new)
+                        .push(index);
+                    if symbol.origin == Origin::Declaration {
+                        routine_declaration_spans
+                            .entry(routine_key.clone())
+                            .or_insert(symbol.declaration_span);
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             source,
             tree,
             parser_recovery_spans,
             unit_name,
+            unit_display_name,
             interface_range,
             implementation_range,
             interface_uses,
             implementation_uses,
             imports,
+            unknown_imports,
             import_bindings: None,
+            interface_routine_keys,
             scopes,
             cache_unsafe_scopes,
             symbols,
             opaque_ranges,
+            conditionals,
+            conditional_unknown_symbols,
+            unknown_class_owners,
+            known_non_class_owners,
+            symbol_indices_by_scope_key,
+            scope_symbol_indices,
+            member_symbol_indices,
+            member_symbol_indices_by_owner,
+            type_symbol_indices,
+            direct_symbol_indices,
+            routine_symbol_indices,
+            exported_symbol_indices,
+            routine_declaration_spans,
+            interface_member_routine_keys,
         })
     }
 
@@ -1577,6 +3401,30 @@ impl Document {
                 .chain(self.implementation_uses.iter())
                 .collect(),
         }
+    }
+
+    fn active_uses_with_budget<'a>(
+        &'a self,
+        region: Region,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<&'a String>, String> {
+        let count = match region {
+            Region::Interface => self.interface_uses.len(),
+            Region::Implementation | Region::Other => self
+                .interface_uses
+                .len()
+                .saturating_add(self.implementation_uses.len()),
+        };
+        budget.require_work(count, cancel)?;
+        Ok(match region {
+            Region::Interface => self.interface_uses.iter().collect(),
+            Region::Implementation | Region::Other => self
+                .interface_uses
+                .iter()
+                .chain(self.implementation_uses.iter())
+                .collect(),
+        })
     }
 
     fn scope_at(&self, offset: usize) -> usize {
@@ -1875,7 +3723,7 @@ fn inject_abbreviated_parameters(
             }
             symbols.push(Symbol {
                 span: Span::from_node(identifier),
-                declaration_span: Span::from_node(identifier),
+                declaration_span: Span::from_node(node),
                 selection_span: Span::from_node(identifier),
                 name: name.clone(),
                 key: canonical_name(&name),
@@ -1891,6 +3739,9 @@ fn inject_abbreviated_parameters(
                 local_only: false,
                 routine_key: None,
                 routine_signature: None,
+                routine_header_span: None,
+                routine_parameter_spans: Vec::new(),
+                type_excerpt_end: None,
                 body_scope: None,
                 unresolved_abbreviated: false,
                 accessor: None,
@@ -1942,6 +3793,9 @@ fn add_definition_symbol(
             scope,
         )),
         routine_signature: Some(signature),
+        routine_header_span: Some(Span::from_node(header)),
+        routine_parameter_spans: direct_routine_parameter_spans(header),
+        type_excerpt_end: None,
         body_scope: Some(own_scope),
         unresolved_abbreviated: false,
         accessor: None,
@@ -1983,6 +3837,9 @@ fn add_routine_symbol(
             scope,
         )),
         routine_signature: Some(signature),
+        routine_header_span: Some(Span::from_node(node)),
+        routine_parameter_spans: direct_routine_parameter_spans(node),
+        type_excerpt_end: None,
         body_scope: None,
         unresolved_abbreviated: false,
         accessor: None,
@@ -2005,6 +3862,11 @@ fn add_named_symbol(
         type_kind_for_declaration(node)
     } else {
         TypeKind::Other
+    };
+    let type_excerpt_end = if kind == SymbolKind::Type {
+        type_declaration_excerpt_end(node, type_kind)
+    } else {
+        None
     };
     let accessor = if kind == SymbolKind::Property {
         property_accessor(node, source)
@@ -2035,11 +3897,41 @@ fn add_named_symbol(
             local_only,
             routine_key: None,
             routine_signature: None,
+            routine_header_span: None,
+            routine_parameter_spans: Vec::new(),
+            type_excerpt_end,
             body_scope: None,
             unresolved_abbreviated: false,
             accessor: accessor.clone(),
         });
     }
+}
+
+fn type_declaration_excerpt_end(node: Node<'_>, type_kind: TypeKind) -> Option<usize> {
+    if !matches!(
+        type_kind,
+        TypeKind::Class | TypeKind::Record | TypeKind::Interface
+    ) {
+        return None;
+    }
+    let type_node = node.child_by_field_name("type")?;
+    let mut body_start: Option<usize> = None;
+    collect_nodes(type_node, &mut |child| {
+        if matches!(
+            child.kind(),
+            "declSection"
+                | "declField"
+                | "declProc"
+                | "declProp"
+                | "declTypes"
+                | "declVariant"
+                | "declEnum"
+        ) {
+            body_start =
+                Some(body_start.map_or(child.start_byte(), |start| start.min(child.start_byte())));
+        }
+    });
+    Some(body_start.unwrap_or_else(|| type_node.end_byte()))
 }
 
 fn property_accessor(node: Node<'_>, source: &str) -> Option<String> {
@@ -2133,10 +4025,7 @@ fn routine_signature(node: Node<'_>, source: &str) -> String {
         return String::new();
     };
     let mut types = Vec::new();
-    collect_nodes(arguments, &mut |child| {
-        if child.kind() != "declArg" {
-            return;
-        }
+    for child in direct_routine_argument_groups(arguments) {
         let count = field_identifier_nodes(child, "name").len().max(1);
         let type_name = child
             .child_by_field_name("type")
@@ -2145,8 +4034,29 @@ fn routine_signature(node: Node<'_>, source: &str) -> String {
         for _ in 0..count {
             types.push(type_name.clone());
         }
-    });
+    }
     types.join(",")
+}
+
+fn direct_routine_argument_groups<'a>(arguments: Node<'a>) -> Vec<Node<'a>> {
+    (0..arguments.named_child_count())
+        .filter_map(|index| arguments.named_child(index))
+        .filter(|child| child.kind() == "declArg")
+        .collect()
+}
+
+fn direct_routine_parameter_spans(node: Node<'_>) -> Vec<Span> {
+    let Some(arguments) = node.child_by_field_name("args") else {
+        return Vec::new();
+    };
+    direct_routine_argument_groups(arguments)
+        .into_iter()
+        .flat_map(|group| {
+            field_identifier_nodes(group, "name")
+                .into_iter()
+                .map(Span::from_node)
+        })
+        .collect()
 }
 
 fn routine_key_with_owner(
@@ -2204,8 +4114,12 @@ fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn simple_type_path(node: Node<'_>, source: &str) -> Option<String> {
-    let identifiers = identifier_texts(node, source);
-    (!identifiers.is_empty()).then(|| canonical_path(&identifiers))
+    let mut type_node = node;
+    while matches!(type_node.kind(), "type" | "typeref") {
+        type_node = first_named_child(type_node)?;
+    }
+    let parts = qualified_name_parts(&type_node, source)?;
+    (!parts.is_empty()).then(|| canonical_path(&parts))
 }
 
 fn build_scopes(
@@ -2335,6 +4249,47 @@ fn is_definition_header(node: Node<'_>) -> bool {
     })
 }
 
+fn conditional_unknown_symbols(
+    root: Node<'_>,
+    conditionals: &ConditionalAnalysis,
+    symbols: &[Symbol],
+) -> Vec<bool> {
+    let mut declaration_type_spans = HashMap::new();
+    collect_nodes(root, &mut |node| {
+        if matches!(
+            node.kind(),
+            "declVar" | "declArg" | "declField" | "declProp"
+        ) {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                declaration_type_spans.insert(Span::from_node(node), Span::from_node(type_node));
+            }
+        }
+    });
+
+    symbols
+        .iter()
+        .map(|symbol| {
+            let symbol_unknown = conditionals.unknown_spans.iter().any(|unknown| {
+                unknown.start <= symbol.span.start && symbol.span.end <= unknown.end
+            });
+            let type_unknown = declaration_type_spans
+                .get(&symbol.declaration_span)
+                .is_some_and(|type_span| {
+                    conditionals.unknown_spans.iter().any(|unknown| {
+                        unknown.start < type_span.end && type_span.start < unknown.end
+                    })
+                });
+            let header_unknown = symbol.routine_header_span.is_some_and(|header| {
+                conditionals
+                    .unknown_spans
+                    .iter()
+                    .any(|unknown| unknown.start < header.end && header.start < unknown.end)
+            });
+            symbol_unknown || type_unknown || header_unknown
+        })
+        .collect()
+}
+
 fn collect_nodes_matching<'a>(root: Node<'a>, kind: &str) -> Vec<Node<'a>> {
     let mut result = Vec::new();
     collect_nodes(root, &mut |node| {
@@ -2407,6 +4362,215 @@ fn qualified_name_parts(node: &Node<'_>, source: &str) -> Option<Vec<String>> {
         }
     }
     Some(parts)
+}
+
+fn qualified_name_parts_with_budget(
+    node: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Vec<String>>, String> {
+    budget.require_work(1, cancel)?;
+    let mut pending = vec![node];
+    let mut parts = Vec::new();
+    while let Some(current) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        match current.kind() {
+            "identifier" => {
+                let text = node_text_with_budget(current, source, cancel, budget)?;
+                parts.push(text.to_owned());
+            }
+            "exprDot" | "genericDot" | "typerefDot" => {
+                let Some(lhs) = current.child_by_field_name("lhs") else {
+                    return Ok(None);
+                };
+                let Some(rhs) = current.child_by_field_name("rhs") else {
+                    return Ok(None);
+                };
+                pending.push(rhs);
+                pending.push(lhs);
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(parts))
+}
+
+fn matching_unit_prefix_len(unit_name: &str, parts: &[String]) -> Option<usize> {
+    let unit_parts = unit_name.split('.').filter(|part| !part.is_empty());
+    let unit_part_count = unit_parts.clone().count();
+    if unit_part_count >= parts.len()
+        || !unit_parts
+            .zip(parts)
+            .all(|(unit_part, path_part)| canonical_name_eq(unit_part, path_part))
+    {
+        return None;
+    }
+    Some(unit_part_count)
+}
+
+fn canonical_name_eq(left: &str, right: &str) -> bool {
+    left.trim_start_matches('&')
+        .eq_ignore_ascii_case(right.trim_start_matches('&'))
+}
+
+fn node_text_with_budget<'a>(
+    node: Node<'_>,
+    source: &'a str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<&'a str, String> {
+    let text = source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default();
+    budget.require_bytes(text.len(), cancel)?;
+    Ok(text)
+}
+
+fn use_name_at_with_budget(
+    identifier: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.kind() == "moduleName"
+            && has_ancestor_kind_with_budget(node, "declUses", cancel, budget)?
+        {
+            let span = Span::from_node(node);
+            let node_count = count_nodes_with_budget(node, cancel, budget)?;
+            budget.require_work(node_count.saturating_mul(3).saturating_add(1), cancel)?;
+            budget.require_bytes(
+                span.end.saturating_sub(span.start).saturating_mul(2),
+                cancel,
+            )?;
+            return Ok(Some(canonical_path(&identifier_texts(node, source))));
+        }
+        current = node.parent();
+    }
+    Ok(None)
+}
+
+fn has_ancestor_kind_with_budget(
+    node: Node<'_>,
+    kind: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if ancestor.kind() == kind {
+            return Ok(true);
+        }
+        current = ancestor.parent();
+    }
+    Ok(false)
+}
+
+fn count_nodes_with_budget(
+    node: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<usize, String> {
+    let mut cursor = node.walk();
+    let mut count = 0usize;
+    loop {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        count = count.saturating_add(1);
+
+        if cursor.goto_first_child() {
+            #[cfg(test)]
+            TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(|entries| {
+                entries.set(entries.get().saturating_add(1));
+            });
+            continue;
+        }
+
+        loop {
+            if cursor.goto_next_sibling() {
+                #[cfg(test)]
+                TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(|entries| {
+                    entries.set(entries.get().saturating_add(1));
+                });
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(count);
+            }
+        }
+    }
+}
+
+fn qualified_type_path_at_with_budget(
+    identifier: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Vec<String>, usize)>, String> {
+    let mut current = identifier.parent();
+    let mut qualified_node = None;
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        if matches!(node.kind(), "typerefDot" | "genericDot") {
+            if let Some(parts) = qualified_name_parts_with_budget(node, source, cancel, budget)? {
+                if parts.len() > 1 {
+                    qualified_node = Some((node, parts));
+                }
+            }
+        }
+        current = node.parent();
+    }
+    let Some((node, parts)) = qualified_node else {
+        return Ok(None);
+    };
+    let Some(cursor_index) =
+        qualified_identifier_index_with_budget(node, identifier, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((parts, cursor_index)))
+}
+
+fn qualified_identifier_index_with_budget(
+    node: Node<'_>,
+    target: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<usize>, String> {
+    let target_span = Span::from_node(target);
+    let mut pending = vec![node];
+    let mut index = 0usize;
+    while let Some(current) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        match current.kind() {
+            "identifier" => {
+                if Span::from_node(current) == target_span {
+                    return Ok(Some(index));
+                }
+                index = index.saturating_add(1);
+            }
+            "exprDot" | "genericDot" | "typerefDot" => {
+                let Some(lhs) = current.child_by_field_name("lhs") else {
+                    return Ok(None);
+                };
+                let Some(rhs) = current.child_by_field_name("rhs") else {
+                    return Ok(None);
+                };
+                pending.push(rhs);
+                pending.push(lhs);
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 fn qualified_type_path_at(identifier: Node<'_>, source: &str) -> Option<(Vec<String>, usize)> {
@@ -2598,5 +4762,156 @@ mod tests {
             large_root_lookups, small_root_lookups,
             "known class owners must not restart root lookup for each field use"
         );
+    }
+
+    #[test]
+    fn budgeted_uses_lookup_charges_ast_traversal_before_identifier_materialization() {
+        let source =
+            "unit UsesBudgetConsumer;\ninterface\nuses BudgetProvider;\nimplementation\nend.\n";
+        let uri = Url::parse("file:///tmp/uses-budget-consumer.pas").expect("fixture URI");
+        let cancel = AtomicBool::new(false);
+        let document = Document::parse_with_cancel(uri, source.to_owned(), &[], &cancel)
+            .expect("uses-budget fixture parses");
+        let module_name = collect_nodes_matching(document.tree.root_node(), "moduleName")
+            .into_iter()
+            .find(|node| has_ancestor_kind(*node, "declUses"))
+            .expect("uses module name");
+
+        let mut count_budget = AssistanceBudget::new(4096, 4096, "uses traversal");
+        let node_count = count_nodes_with_budget(module_name, &cancel, &mut count_budget)
+            .expect("count uses nodes");
+        let exact_work = node_count
+            .saturating_add(node_count.saturating_mul(3))
+            .saturating_add(3);
+        let mut exact_budget = AssistanceBudget::new(exact_work, 4096, "uses lookup");
+        assert_eq!(
+            use_name_at_with_budget(module_name, &document.source, &cancel, &mut exact_budget,)
+                .expect("exact uses lookup budget"),
+            Some("budgetprovider".to_owned())
+        );
+        assert_eq!(exact_budget.remaining_work, 0);
+    }
+
+    #[test]
+    fn wide_uses_lookup_charges_each_child_before_materializing_a_frontier() {
+        let parts = (0..64)
+            .map(|index| format!("UnitPart{index}"))
+            .collect::<Vec<_>>();
+        let source = format!(
+            "unit WideUsesBudget;\ninterface\nuses {};\nimplementation\nend.\n",
+            parts.join(".")
+        );
+        let uri = Url::parse("file:///tmp/wide-uses-budget.pas").expect("fixture URI");
+        let cancel = AtomicBool::new(false);
+        let document = Document::parse_with_cancel(uri, source, &[], &cancel)
+            .expect("wide uses fixture parses");
+        let module_name = collect_nodes_matching(document.tree.root_node(), "moduleName")
+            .into_iter()
+            .find(|node| has_ancestor_kind(*node, "declUses"))
+            .expect("wide uses module name");
+        assert!(
+            module_name.named_child_count() >= 8,
+            "wide module name was not parsed"
+        );
+
+        TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(|entries| entries.set(0));
+        let mut zero_budget = AssistanceBudget::new(0, 4096, "wide uses zero budget");
+        assert!(count_nodes_with_budget(module_name, &cancel, &mut zero_budget).is_err());
+        assert_eq!(
+            TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(Cell::get),
+            0,
+            "zero remaining work must reject before entering the module children"
+        );
+
+        TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(|entries| entries.set(0));
+        let mut one_budget = AssistanceBudget::new(1, 4096, "wide uses one budget");
+        assert!(count_nodes_with_budget(module_name, &cancel, &mut one_budget).is_err());
+        assert!(
+            TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(Cell::get) <= 1,
+            "one remaining unit must not materialize the whole sibling frontier"
+        );
+
+        let mut count_budget = AssistanceBudget::new(4096, 4096, "wide uses count");
+        let node_count = count_nodes_with_budget(module_name, &cancel, &mut count_budget)
+            .expect("count wide uses nodes");
+        TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(|entries| entries.set(0));
+        let mut exact_budget = AssistanceBudget::new(node_count, 4096, "wide uses exact budget");
+        assert_eq!(
+            count_nodes_with_budget(module_name, &cancel, &mut exact_budget)
+                .expect("exact wide uses budget"),
+            node_count
+        );
+        assert_eq!(exact_budget.remaining_work, 0);
+
+        let cancelled = AtomicBool::new(true);
+        TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(|entries| entries.set(0));
+        let mut cancelled_budget = AssistanceBudget::new(4096, 4096, "wide uses cancelled");
+        assert!(count_nodes_with_budget(module_name, &cancelled, &mut cancelled_budget).is_err());
+        assert_eq!(
+            TEST_NODE_SIBLING_FRONTIER_ENTRIES.with(Cell::get),
+            0,
+            "cancelled traversal must not enter a child frontier"
+        );
+    }
+
+    #[test]
+    fn conditional_unknown_status_is_precomputed_per_symbol() {
+        let source = "unit CachedConditionalStatus;\ninterface\nvar\n{$IFDEF MAYBE}\n  Hidden: Integer;\n{$ENDIF}\n  Visible: Integer;\nimplementation\nend.\n";
+        let uri = Url::parse("file:///tmp/cached-conditional-status.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("conditional symbol fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let hidden = document
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name.eq_ignore_ascii_case("Hidden"))
+            .expect("hidden symbol");
+        let visible = document
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name.eq_ignore_ascii_case("Visible"))
+            .expect("visible symbol");
+
+        assert_eq!(
+            document.conditional_unknown_symbols.len(),
+            document.symbols.len()
+        );
+        assert!(document.conditional_unknown_symbols[hidden]);
+        assert!(!document.conditional_unknown_symbols[visible]);
+        assert!(index.candidate_is_conditionally_unknown(&Candidate {
+            uri: uri.clone(),
+            index: hidden,
+        }));
+        assert!(!index.candidate_is_conditionally_unknown(&Candidate {
+            uri,
+            index: visible
+        }));
+    }
+
+    #[test]
+    fn unknown_class_owner_cache_survives_a_large_method_body() {
+        let mut source = String::from(
+            "unit CachedUnknownOwner;\ninterface\ntype\n  TObj = class(TUnknown)\n    procedure Caller;\n  end;\nconst\n  GlobalName = 1;\nimplementation\nprocedure TObj.Caller;\nbegin\n  Glo;\n",
+        );
+        for _ in 0..120_000 {
+            source.push_str("  WriteLn(1);\n");
+        }
+        source.push_str("end;\nend.\n");
+        let uri = Url::parse("file:///tmp/cached-unknown-owner.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("large unknown-owner fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let offset = source.find("  Glo;").expect("global prefix") + "  Glo;".len();
+        assert_eq!(
+            document.owner_type_at(offset).as_deref(),
+            Some("tobj"),
+            "scopes: {:?}",
+            document.scopes
+        );
+        assert!(document.unknown_class_owners.contains("tobj"));
     }
 }

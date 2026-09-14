@@ -3,10 +3,13 @@
 use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use crate::project::{
-    PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext, ProjectOptions,
-    ProjectSelections, discover_with_selections, has_invalid_project_selection,
-    project_candidate_membership, project_candidates, read_package_metadata,
-    runtime_project_selection, selected_project_is_current,
+    PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
+    ProjectDiscovery, ProjectOptions, ProjectReadObservation, ProjectReadStamp, ProjectSelections,
+    discover_with_selections, discover_with_selections_and_observations,
+    discover_with_selections_and_observations_with_cancel, has_invalid_project_selection,
+    project_candidate_membership, project_candidates, project_candidates_with_cancel,
+    read_package_metadata, runtime_project_selection, selected_project_is_current,
+    selected_project_is_current_with_cancel,
 };
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -22,7 +25,7 @@ use std::fs::{self, File};
 use std::hash::Hasher;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
@@ -56,6 +59,14 @@ const MAX_DOCUMENT_OWNERS: usize = 4_096;
 const MAX_FORMAT_EXTERNAL_TRAVERSAL_ENTRIES: usize = 1_048_576;
 pub(crate) const MAX_CONFIGURATION_WATCH_PATHS: usize = 256;
 const CONFIGURATION_FILENAMES: [&str; 2] = [".lint4d.toml", ".fmt4d.toml"];
+
+fn check_workspace_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        Err(CANCELLATION_MESSAGE.to_string())
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceLimits {
@@ -244,6 +255,7 @@ struct PackageCatalogueScan {
 struct CachedPackageMetadata {
     metadata_stamps: Vec<(PathBuf, Option<PathStamp>)>,
     result: Result<PackageMetadata, String>,
+    observations: Vec<ProjectReadObservation>,
     last_used: u64,
 }
 
@@ -251,6 +263,7 @@ struct CachedPackageMetadata {
 struct PackageLookup {
     candidates: Vec<PathBuf>,
     metadata_paths: Vec<PathBuf>,
+    observations: Vec<ProjectReadObservation>,
     warnings: Vec<String>,
     complete: bool,
 }
@@ -271,6 +284,7 @@ struct ContextState {
     context: ProjectContext,
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+    project_read_observations: Vec<ProjectReadObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1180,6 +1194,17 @@ impl Workspace {
         context_key: &ContextKey,
         pinned: &mut HashSet<Url>,
     ) -> Result<Vec<Url>, String> {
+        self.load_imports_with_cancel(uri, context_key, pinned, None)
+    }
+
+    fn load_imports_with_cancel(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &mut HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Url>, String> {
+        check_workspace_cancel(cancel)?;
         let imports = self.index.imports(uri);
         let effective_context_key = self
             .document_contexts
@@ -1196,14 +1221,19 @@ impl Workspace {
         let mut bindings = HashMap::new();
         let mut dependencies = Vec::new();
         for import in imports {
+            check_workspace_cancel(cancel)?;
+            if self.index.conditional_unknown_at(uri, import.span.start) {
+                continue;
+            }
             let lookup_name = aliased_unit_name(&context, &import.name);
-            let Some(dependency) = self.resolve_unit(
+            let Some(dependency) = self.resolve_unit_with_cancel(
                 uri,
                 &import.name,
                 &lookup_name,
                 &context,
                 &effective_context_key,
                 pinned,
+                cancel,
             )?
             else {
                 self.warn(format!(
@@ -1218,6 +1248,7 @@ impl Workspace {
                 dependencies.push(dependency);
             }
         }
+        check_workspace_cancel(cancel)?;
         self.index.bind_imports(uri, bindings);
         Ok(dependencies)
     }
@@ -1228,6 +1259,17 @@ impl Workspace {
         context_key: &ContextKey,
         pinned: &HashSet<Url>,
     ) -> Result<bool, String> {
+        self.load_source_with_cancel(uri, context_key, pinned, None)
+    }
+
+    fn load_source_with_cancel(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        check_workspace_cancel(cancel)?;
         let path = match uri.to_file_path() {
             Ok(path) => absolute_path(path),
             Err(()) => {
@@ -1253,11 +1295,12 @@ impl Workspace {
                 return Ok(false);
             };
             if self.index.contains(uri) {
+                check_workspace_cancel(cancel)?;
                 self.touch(uri);
                 self.set_document_context(uri, context_key)?;
                 return Ok(true);
             }
-            return self.index_source(uri, source, None, context_key, pinned);
+            return self.index_source_with_cancel(uri, source, None, context_key, pinned, cancel);
         }
 
         let Some(current_stamp) = disk_stamp(&path) else {
@@ -1269,21 +1312,31 @@ impl Workspace {
             return Ok(false);
         }
         if self.index.contains(uri) && self.disk_stamps.get(uri) == Some(&current_stamp) {
+            check_workspace_cancel(cancel)?;
             self.touch(uri);
             self.set_document_context(uri, context_key)?;
             return Ok(true);
         }
-        let source = match read_disk_source(&path, self.options.limits.max_file_bytes) {
-            Ok(source) => source,
-            Err(error) => {
-                self.warn(format!("skipping {}: {error}", path.display()));
-                self.remove_indexed(uri);
-                return Ok(false);
-            }
-        };
+        let source =
+            match read_disk_source_with_cancel(&path, self.options.limits.max_file_bytes, cancel) {
+                Ok(source) => source,
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(error) => {
+                    self.warn(format!("skipping {}: {error}", path.display()));
+                    self.remove_indexed(uri);
+                    return Ok(false);
+                }
+            };
+        check_workspace_cancel(cancel)?;
         let stamp = source.stamp;
-        let indexed =
-            self.index_source(uri, source.text, Some(source.bytes), context_key, pinned)?;
+        let indexed = self.index_source_with_cancel(
+            uri,
+            source.text,
+            Some(source.bytes),
+            context_key,
+            pinned,
+            cancel,
+        )?;
         if indexed {
             self.disk_stamps.insert(uri.clone(), stamp);
         }
@@ -1298,6 +1351,19 @@ impl Workspace {
         context_key: &ContextKey,
         pinned: &HashSet<Url>,
     ) -> Result<bool, String> {
+        self.index_source_with_cancel(uri, source, disk_size, context_key, pinned, None)
+    }
+
+    fn index_source_with_cancel(
+        &mut self,
+        uri: &Url,
+        source: String,
+        disk_size: Option<usize>,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        check_workspace_cancel(cancel)?;
         let size = disk_size.unwrap_or(source.len());
         if !self.make_room_for(uri, size, pinned, 0) {
             if !self.open_documents.contains_key(uri) {
@@ -1308,11 +1374,29 @@ impl Workspace {
             }
             return Ok(false);
         }
-        if let Err(error) = self.index.update(uri.clone(), source) {
+        let defines = self
+            .contexts
+            .get(context_key)
+            .map(|state| state.context.defines.clone())
+            .unwrap_or_default();
+        let update = match cancel {
+            Some(cancel) => {
+                self.index
+                    .update_with_defines_with_cancel(uri.clone(), source, &defines, cancel)
+            }
+            None => self
+                .index
+                .update_with_defines(uri.clone(), source, &defines),
+        };
+        if let Err(error) = update {
+            if error == CANCELLATION_MESSAGE {
+                return Err(error);
+            }
             self.remove_indexed(uri);
             self.warn(format!("cannot index {uri}: {error}"));
             return Ok(false);
         }
+        check_workspace_cancel(cancel)?;
 
         let old_size = self.indexed_sizes.insert(uri.clone(), size);
         if let Some(old_size) = old_size {
@@ -1436,7 +1520,7 @@ impl Workspace {
         if let Some(existing) = self.open_document_contexts.get(uri).cloned() {
             self.extend_context_watch_paths(&existing, &path, cancel)?;
             if self.context_is_fresh_with_cancel(&existing, cancel)?
-                && self.context_matches_current_selection(&path, &existing)
+                && self.context_matches_current_selection_with_cancel(&path, &existing, cancel)?
             {
                 self.remember_document_owner(uri, &existing);
                 return Ok(existing);
@@ -1449,7 +1533,8 @@ impl Workspace {
             if let Some(existing) = self.document_contexts.get(uri).cloned() {
                 self.extend_context_watch_paths(&existing, &path, cancel)?;
                 if self.context_is_fresh_with_cancel(&existing, cancel)?
-                    && self.context_matches_current_selection(&path, &existing)
+                    && self
+                        .context_matches_current_selection_with_cancel(&path, &existing, cancel)?
                 {
                     self.remember_document_owner(uri, &existing);
                     return Ok(existing);
@@ -1471,7 +1556,7 @@ impl Workspace {
         };
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
-                && self.known_owner_selection_is_current(&path, &owner)
+                && self.known_owner_selection_is_current_with_cancel(&path, &owner, cancel)?
             {
                 return self
                     .restore_known_owner(uri, &path, &owner, &roots, &project_options, cancel)
@@ -1484,24 +1569,49 @@ impl Workspace {
                     });
             }
         }
-        let context = match discover_with_selections(
-            &path,
-            &roots,
-            &project_options,
-            &self.project_selections,
-        ) {
-            Ok(context) => context,
+        let discovered = match cancel {
+            Some(cancel) => discover_with_selections_and_observations_with_cancel(
+                &path,
+                &roots,
+                &project_options,
+                &self.project_selections,
+                cancel,
+            ),
+            None => discover_with_selections_and_observations(
+                &path,
+                &roots,
+                &project_options,
+                &self.project_selections,
+            ),
+        };
+        let discovery = match discovered {
+            Ok(discovery) => discovery,
             Err(error) => {
+                if error == CANCELLATION_MESSAGE {
+                    return Err(error);
+                }
                 return Err(format!(
                     "could not discover project context for {path:?}: {error}"
                 ));
             }
         };
+        let ProjectDiscovery {
+            context,
+            observations,
+            candidate_memberships,
+        } = discovery;
         for warning in context.warnings.iter().cloned() {
             self.warn(warning);
         }
-        let key = self.context_key_for_path(&path, Some(&context));
-        self.install_context(key.clone(), context, &path, cancel)?;
+        let key = self.context_key_for_path_with_cancel(&path, Some(&context), cancel)?;
+        self.install_context(
+            key.clone(),
+            context,
+            observations,
+            candidate_memberships,
+            &path,
+            cancel,
+        )?;
         self.select_document_context(uri, &key, self.owner_origin_for_context_key(&key));
         Ok(key)
     }
@@ -1521,8 +1631,16 @@ impl Workspace {
             return Ok(owner.key.clone());
         }
 
-        let (key, context) = self.rediscover_known_owner(path, owner, roots, project_options)?;
-        self.install_context(key.clone(), context, path, cancel)?;
+        let (key, discovery) =
+            self.rediscover_known_owner(path, owner, roots, project_options, cancel)?;
+        self.install_context(
+            key.clone(),
+            discovery.context,
+            discovery.observations,
+            discovery.candidate_memberships,
+            path,
+            cancel,
+        )?;
         self.select_document_context(uri, &key, owner.origin);
         Ok(key)
     }
@@ -1533,13 +1651,24 @@ impl Workspace {
         owner: &KnownDocumentOwner,
         roots: &[PathBuf],
         project_options: &ProjectOptions,
-    ) -> Result<(ContextKey, ProjectContext), String> {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(ContextKey, ProjectDiscovery), String> {
         let mut options = project_options.clone();
         if let (Some(scope), Some(selected)) = (
             owner.key.selection_scope.as_deref(),
             owner.key.selection_project.as_deref(),
         ) {
-            let candidate_status = selected_project_is_current(scope, selected);
+            let candidate_status = match cancel {
+                Some(cancel) => {
+                    selected_project_is_current_with_cancel(scope, selected, Some(cancel))
+                }
+                None => selected_project_is_current(scope, selected),
+            };
+            if let Err(error) = &candidate_status {
+                if error == CANCELLATION_MESSAGE {
+                    return Err(error.clone());
+                }
+            }
             if !matches!(candidate_status, Ok(true)) {
                 let mut warnings = vec![format!(
                     "selected project {} is not a current candidate in {}",
@@ -1549,33 +1678,86 @@ impl Workspace {
                 if let Err(error) = candidate_status {
                     warnings.push(error);
                 }
-                let context = ProjectContext {
-                    metadata_files: vec![selected.to_path_buf()],
-                    warnings,
-                    ..ProjectContext::default()
+                let discovery = ProjectDiscovery {
+                    context: ProjectContext {
+                        metadata_files: vec![selected.to_path_buf()],
+                        warnings,
+                        ..ProjectContext::default()
+                    },
+                    observations: Vec::new(),
+                    candidate_memberships: HashMap::new(),
                 };
                 let mut key = owner.key.clone();
                 key.project_file = None;
                 key.config = None;
                 key.platform = None;
                 key.project_scope = Some(scope.to_path_buf());
-                return Ok((key, context));
+                return Ok((key, discovery));
             }
             options.project_file = Some(selected.to_path_buf());
-            let context =
-                discover_with_selections(path, roots, &options, &ProjectSelections::new())?;
-            return Ok((self.key_for_known_owner(path, owner, &context), context));
+            let context = match cancel {
+                Some(cancel) => discover_with_selections_and_observations_with_cancel(
+                    path,
+                    roots,
+                    &options,
+                    &ProjectSelections::new(),
+                    cancel,
+                )?,
+                None => discover_with_selections_and_observations(
+                    path,
+                    roots,
+                    &options,
+                    &ProjectSelections::new(),
+                )?,
+            };
+            return Ok((
+                self.key_for_known_owner(path, owner, &context.context),
+                context,
+            ));
         }
 
         if let Some(project_file) = &owner.key.project_file {
             options.project_file = Some(project_file.clone());
-            let context =
-                discover_with_selections(path, roots, &options, &ProjectSelections::new())?;
-            return Ok((self.key_for_known_owner(path, owner, &context), context));
+            let context = match cancel {
+                Some(cancel) => discover_with_selections_and_observations_with_cancel(
+                    path,
+                    roots,
+                    &options,
+                    &ProjectSelections::new(),
+                    cancel,
+                )?,
+                None => discover_with_selections_and_observations(
+                    path,
+                    roots,
+                    &options,
+                    &ProjectSelections::new(),
+                )?,
+            };
+            return Ok((
+                self.key_for_known_owner(path, owner, &context.context),
+                context,
+            ));
         }
 
-        let context = discover_with_selections(path, roots, &options, &self.project_selections)?;
-        Ok((self.key_for_known_owner(path, owner, &context), context))
+        let context = match cancel {
+            Some(cancel) => discover_with_selections_and_observations_with_cancel(
+                path,
+                roots,
+                &options,
+                &self.project_selections,
+                cancel,
+            )?,
+            None => discover_with_selections_and_observations(
+                path,
+                roots,
+                &options,
+                &self.project_selections,
+            )?,
+        };
+        Ok((
+            self.key_for_known_owner(path, owner, &context.context),
+            context,
+        ))
     }
 
     fn key_for_known_owner(
@@ -1606,7 +1788,9 @@ impl Workspace {
                 if context_state_is_fresh(&owner.state) {
                     return Ok((owner.key.clone(), owner.state.context.clone()));
                 }
-                return self.rediscover_known_owner(path, owner, roots, project_options);
+                let discovery =
+                    self.rediscover_known_owner(path, owner, roots, project_options, None)?;
+                return Ok((discovery.0, discovery.1.context));
             }
         }
         let context =
@@ -1616,11 +1800,21 @@ impl Workspace {
     }
 
     fn known_owner_selection_is_current(&self, path: &Path, owner: &KnownDocumentOwner) -> bool {
+        self.known_owner_selection_is_current_with_cancel(path, owner, None)
+            .unwrap_or(false)
+    }
+
+    fn known_owner_selection_is_current_with_cancel(
+        &self,
+        path: &Path,
+        owner: &KnownDocumentOwner,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
         if owner.origin == OwnerOrigin::Automatic {
             // Automatic discovery must be rerun after invalidation. Retaining
             // its old project here would turn a discovered owner into an
             // implicit explicit selection.
-            return false;
+            return Ok(false);
         }
 
         let Some(scope) = owner.key.selection_scope.as_deref() else {
@@ -1628,37 +1822,48 @@ impl Workspace {
             // selection becomes applicable to this document. Inherited owners
             // follow the same precedence: retain their project identity only
             // when no runtime selection applies to the document.
-            return self.runtime_selection_for_path_default(path).is_none();
+            return Ok(self
+                .runtime_selection_for_path_with_cancel(path, &self.workspace_root_paths(), cancel)?
+                .is_none());
         };
         let Some(selected) = owner.key.selection_project.as_deref() else {
-            return false;
+            return Ok(false);
         };
 
         // A selection only applies within its nearest candidate directory.
         // A newly-created nearer project scope therefore invalidates the old
         // retained selection even while the session mapping still exists.
-        let candidates = match project_candidates(path, &self.workspace_root_paths()) {
-            Ok(candidates) => candidates,
-            Err(_) => return false,
-        };
+        let candidates =
+            project_candidates_with_cancel(path, &self.workspace_root_paths(), cancel)?;
         if candidates
             .directory
             .as_deref()
             .is_some_and(|directory| !paths_equal_ci(directory, scope))
         {
-            return false;
+            return Ok(false);
         }
 
-        self.project_selections
+        Ok(self
+            .project_selections
             .get(scope)
-            .is_some_and(|current| paths_equal_ci(current, selected))
+            .is_some_and(|current| paths_equal_ci(current, selected)))
     }
 
-    fn context_matches_current_selection(&self, path: &Path, key: &ContextKey) -> bool {
-        let Some((scope, selected)) = self.runtime_selection_for_path_default(path) else {
-            return true;
+    fn context_matches_current_selection_with_cancel(
+        &self,
+        path: &Path,
+        key: &ContextKey,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        let Some((scope, selected)) = self.runtime_selection_for_path_with_cancel(
+            path,
+            &self.workspace_root_paths(),
+            cancel,
+        )?
+        else {
+            return Ok(true);
         };
-        self.context_matches_selection(key, &scope, &selected)
+        Ok(self.context_matches_selection(key, &scope, &selected))
     }
 
     fn context_matches_selection(&self, key: &ContextKey, scope: &Path, selected: &Path) -> bool {
@@ -1769,6 +1974,36 @@ impl Workspace {
         }
     }
 
+    fn context_key_for_path_with_cancel(
+        &self,
+        path: &Path,
+        context: Option<&ProjectContext>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ContextKey, String> {
+        let selection = self.runtime_selection_for_path_with_cancel(
+            path,
+            &self.workspace_root_paths(),
+            cancel,
+        )?;
+        let project_scope = if let Some(scope) = context
+            .and_then(|context| context.project_file.as_deref())
+            .and_then(Path::parent)
+        {
+            Some(scope.to_path_buf())
+        } else {
+            self.project_scope_for_path_with_cancel(path, context, cancel)?
+        };
+        Ok(ContextKey {
+            project_file: context.and_then(|context| context.project_file.clone()),
+            workspace_root: self.root_for_path(path),
+            project_scope,
+            selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
+            selection_project: selection.map(|(_, project)| project),
+            config: context.and_then(|context| context.config.clone()),
+            platform: context.and_then(|context| context.platform.clone()),
+        })
+    }
+
     fn runtime_selection_for_path(
         &self,
         path: &Path,
@@ -1776,6 +2011,20 @@ impl Workspace {
     ) -> Option<(PathBuf, PathBuf)> {
         let candidates = project_candidates(path, roots).ok()?;
         runtime_project_selection(path, &candidates, &self.project_selections)
+    }
+
+    fn runtime_selection_for_path_with_cancel(
+        &self,
+        path: &Path,
+        roots: &[PathBuf],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        let candidates = project_candidates_with_cancel(path, roots, cancel)?;
+        Ok(runtime_project_selection(
+            path,
+            &candidates,
+            &self.project_selections,
+        ))
     }
 
     fn runtime_selection_for_path_default(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -1809,6 +2058,27 @@ impl Workspace {
             .or(candidates.directory)
     }
 
+    fn project_scope_for_path_with_cancel(
+        &self,
+        path: &Path,
+        context: Option<&ProjectContext>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<PathBuf>, String> {
+        if let Some(scope) = context
+            .and_then(|context| context.project_file.as_deref())
+            .and_then(Path::parent)
+        {
+            return Ok(Some(scope.to_path_buf()));
+        }
+        let roots = self.workspace_root_paths();
+        let candidates = project_candidates_with_cancel(path, &roots, cancel)?;
+        Ok(
+            runtime_project_selection(path, &candidates, &self.project_selections)
+                .map(|(scope, _)| scope)
+                .or(candidates.directory),
+        )
+    }
+
     fn root_for_path(&self, path: &Path) -> Option<PathBuf> {
         self.roots
             .iter()
@@ -1821,6 +2091,8 @@ impl Workspace {
         &mut self,
         key: ContextKey,
         context: ProjectContext,
+        observations: Vec<ProjectReadObservation>,
+        mut candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
         file: &Path,
         cancel: Option<&AtomicBool>,
     ) -> Result<(), String> {
@@ -1834,7 +2106,8 @@ impl Workspace {
         }
         let mut project_candidate_memberships = HashMap::new();
         for directory in self.discovery_directories(file) {
-            let membership = project_candidate_membership(&directory, cancel);
+            let membership = take_candidate_membership(&mut candidate_memberships, &directory)
+                .unwrap_or_else(|| project_candidate_membership(&directory, cancel));
             if let Err(error) = &membership {
                 if error == CANCELLATION_MESSAGE {
                     return Err(error.clone());
@@ -1861,15 +2134,20 @@ impl Workspace {
         metadata.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
         metadata.dedup_by(|left, right| package_paths_equal(left, right));
         for path in metadata {
-            let stamp = path_stamp(&path);
+            let stamp = self
+                .project_read_observation_for_path(&key, &path, &observations)
+                .map(|observation| Some(path_stamp_from_project_read(&observation.stamp)))
+                .unwrap_or_else(|| path_stamp(&path));
             watched_paths.insert(path, stamp);
         }
         if let Some(state) = self.contexts.get_mut(&key) {
             state.context = context;
+            merge_project_read_observations(&mut state.project_read_observations, observations);
             state.watched_paths.extend(watched_paths);
-            state
-                .project_candidate_memberships
-                .extend(project_candidate_memberships);
+            merge_candidate_memberships(
+                &mut state.project_candidate_memberships,
+                project_candidate_memberships,
+            );
         } else {
             self.contexts.insert(
                 key,
@@ -1877,10 +2155,30 @@ impl Workspace {
                     context,
                     watched_paths,
                     project_candidate_memberships,
+                    project_read_observations: observations,
                 },
             );
         }
         Ok(())
+    }
+
+    fn project_read_observation_for_path<'a>(
+        &'a self,
+        key: &ContextKey,
+        path: &Path,
+        new_observations: &'a [ProjectReadObservation],
+    ) -> Option<&'a ProjectReadObservation> {
+        new_observations
+            .iter()
+            .find(|observation| package_paths_equal(&observation.path, path))
+            .or_else(|| {
+                self.contexts.get(key).and_then(|state| {
+                    state
+                        .project_read_observations
+                        .iter()
+                        .find(|observation| package_paths_equal(&observation.path, path))
+                })
+            })
     }
 
     fn extend_context_watch_paths(
@@ -1962,8 +2260,11 @@ impl Workspace {
                 .filter_map(|(uri, document_key)| (document_key == key).then_some(uri.clone())),
         );
         for uri in affected {
-            self.index.clear_import_bindings(&uri);
-            self.document_contexts.remove(&uri);
+            // Project defines participate in the parser projection, so a
+            // context change invalidates the indexed source itself, not only
+            // its import bindings. Open buffers remain authoritative and are
+            // re-indexed from `open_documents` on the next request.
+            self.remove_indexed(&uri);
         }
     }
 
@@ -2040,7 +2341,8 @@ impl Workspace {
                 .any(|root| path_starts_with_ci(path, root))
     }
 
-    fn resolve_unit(
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_unit_with_cancel(
         &mut self,
         current_uri: &Url,
         requested_name: &str,
@@ -2048,7 +2350,9 @@ impl Workspace {
         context: &ProjectContext,
         context_key: &ContextKey,
         pinned: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
     ) -> Result<Option<Url>, String> {
+        check_workspace_cancel(cancel)?;
         let mut groups: Vec<Vec<PathBuf>> = Vec::new();
         if let Some(explicit) = context.explicit_units.get(lookup_name) {
             groups.push(explicit.clone());
@@ -2059,6 +2363,7 @@ impl Workspace {
             .ok()
             .and_then(|path| absolute_path(path).parent().map(Path::to_path_buf));
         if let Some(directory) = current_directory {
+            check_workspace_cancel(cancel)?;
             groups.extend(self.directory_unit_candidate_groups(
                 &directory,
                 lookup_name,
@@ -2067,6 +2372,7 @@ impl Workspace {
             ));
         }
         for directory in &context.search_paths {
+            check_workspace_cancel(cancel)?;
             groups.extend(self.directory_unit_candidate_groups(
                 directory,
                 lookup_name,
@@ -2075,10 +2381,12 @@ impl Workspace {
             ));
         }
         if context.project_file.is_none() {
+            check_workspace_cancel(cancel)?;
             groups.push(self.filename_unit_candidates(lookup_name, context, context_key));
         }
 
         for candidates in groups {
+            check_workspace_cancel(cancel)?;
             let mut paths = candidates;
             let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
             for path in paths.drain(..) {
@@ -2091,13 +2399,14 @@ impl Workspace {
             }
             let mut valid = Vec::new();
             for path in unique_paths {
+                check_workspace_cancel(cancel)?;
                 let Ok(candidate_uri) = Url::from_file_path(&path) else {
                     continue;
                 };
                 if candidate_uri == *current_uri {
                     continue;
                 }
-                if !self.load_source(&candidate_uri, context_key, pinned)? {
+                if !self.load_source_with_cancel(&candidate_uri, context_key, pinned, cancel)? {
                     continue;
                 }
                 let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
@@ -2125,7 +2434,10 @@ impl Workspace {
                 }
             }
         }
-        let package_lookup = self.package_unit_candidates(requested_name, lookup_name, context);
+        check_workspace_cancel(cancel)?;
+        let package_lookup =
+            self.package_unit_candidates(requested_name, lookup_name, context, cancel)?;
+        self.retain_package_observations(context_key, package_lookup.observations.clone());
         for path in &package_lookup.metadata_paths {
             self.watch_package_path(context_key, path);
         }
@@ -2137,13 +2449,14 @@ impl Workspace {
         }
         let mut valid = Vec::new();
         for path in package_lookup.candidates {
+            check_workspace_cancel(cancel)?;
             let Ok(candidate_uri) = Url::from_file_path(&path) else {
                 continue;
             };
             if candidate_uri == *current_uri {
                 continue;
             }
-            if !self.load_source(&candidate_uri, context_key, pinned)? {
+            if !self.load_source_with_cancel(&candidate_uri, context_key, pinned, cancel)? {
                 continue;
             }
             let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
@@ -2223,33 +2536,36 @@ impl Workspace {
         requested_name: &str,
         lookup_name: &str,
         context: &ProjectContext,
-    ) -> PackageLookup {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PackageLookup, String> {
+        check_workspace_cancel(cancel)?;
         let mut lookup = PackageLookup {
             complete: true,
             ..PackageLookup::default()
         };
         if context.packages.is_empty() {
-            return lookup;
+            return Ok(lookup);
         }
         if context.packages.len() > MAX_PACKAGE_LOOKUPS {
             lookup.complete = false;
             lookup.warnings.push(format!(
                 "named package lookup limit ({MAX_PACKAGE_LOOKUPS}) reached while resolving {requested_name}"
             ));
-            return lookup;
+            return Ok(lookup);
         }
 
         let package_names = context.packages.to_vec();
         for package_name in &package_names {
+            check_workspace_cancel(cancel)?;
             let (descriptors, catalogue_complete) =
-                self.package_descriptors(&package_names, package_name);
+                self.package_descriptors(&package_names, package_name, cancel)?;
             if !catalogue_complete {
                 lookup.complete = false;
                 lookup.warnings.push(format!(
                     "source for package {package_name} was not found because its bounded source catalogue was incomplete; compiled-only package skipped"
                 ));
                 lookup.candidates.clear();
-                return lookup;
+                return Ok(lookup);
             }
             if descriptors.is_empty() {
                 lookup.warnings.push(format!(
@@ -2270,8 +2586,9 @@ impl Workspace {
             }
 
             let descriptor = &descriptors[0];
-            let metadata = match self.cached_package_metadata(descriptor) {
+            let (metadata, observations) = match self.cached_package_metadata(descriptor, cancel) {
                 Ok(metadata) => metadata,
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                 Err(error) => {
                     lookup.warnings.push(format!(
                         "source package {package_name} was skipped: {error}"
@@ -2279,6 +2596,7 @@ impl Workspace {
                     continue;
                 }
             };
+            merge_project_read_observations(&mut lookup.observations, observations);
             lookup.metadata_paths.push(descriptor.clone());
             lookup
                 .metadata_paths
@@ -2317,7 +2635,7 @@ impl Workspace {
                             "package unit candidate limit ({MAX_PACKAGE_UNIT_CANDIDATES}) reached while resolving {requested_name}"
                         ));
                         lookup.candidates.clear();
-                        return lookup;
+                        return Ok(lookup);
                     }
                     lookup.candidates.push(path.clone());
                 }
@@ -2329,14 +2647,16 @@ impl Workspace {
             }
             lookup.warnings.extend(metadata.warnings.iter().cloned());
         }
-        lookup
+        Ok(lookup)
     }
 
     fn package_descriptors(
         &mut self,
         requested_names: &[String],
         package_name: &str,
-    ) -> (Vec<PathBuf>, bool) {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Vec<PathBuf>, bool), String> {
+        check_workspace_cancel(cancel)?;
         let requested_names: HashSet<String> = requested_names
             .iter()
             .map(|name| name.to_ascii_lowercase())
@@ -2345,13 +2665,14 @@ impl Workspace {
         let roots = self.package_catalogue_roots();
 
         for root in &roots {
-            self.package_catalogue(root, &requested_names);
+            self.package_catalogue(root, &requested_names, cancel)?;
         }
+        check_workspace_cancel(cancel)?;
         let (mut descriptors, complete) = self.catalogued_package_descriptors(&roots, &key);
 
         descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
         descriptors.dedup_by(|left, right| package_paths_equal(left, right));
-        (descriptors, complete)
+        Ok((descriptors, complete))
     }
 
     fn catalogued_package_descriptors(
@@ -2403,7 +2724,12 @@ impl Workspace {
         })
     }
 
-    fn cached_package_metadata(&mut self, path: &Path) -> Result<PackageMetadata, String> {
+    fn cached_package_metadata(
+        &mut self,
+        path: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(PackageMetadata, Vec<ProjectReadObservation>), String> {
+        check_workspace_cancel(cancel)?;
         let stamp = path_stamp(path);
         if let Some(cached) = self.package_metadata_cache.get(path) {
             if cached
@@ -2412,11 +2738,13 @@ impl Workspace {
                 .all(|(metadata_path, metadata_stamp)| path_stamp(metadata_path) == *metadata_stamp)
             {
                 let result = cached.result.clone();
+                let observations = cached.observations.clone();
                 self.use_clock = self.use_clock.saturating_add(1);
                 if let Some(cached) = self.package_metadata_cache.get_mut(path) {
                     cached.last_used = self.use_clock;
                 }
-                return result;
+                check_workspace_cancel(cancel)?;
+                return result.map(|metadata| (metadata, observations));
             }
         }
         let previous_metadata_paths = self
@@ -2430,7 +2758,12 @@ impl Workspace {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![path.to_path_buf()]);
-        let result = read_package_metadata(path);
+        let read = read_package_metadata(path);
+        check_workspace_cancel(cancel)?;
+        let (result, observations) = match read {
+            Ok(read) => (Ok(read.metadata), read.observations),
+            Err(error) => (Err(error), Vec::new()),
+        };
         let metadata_paths = result
             .as_ref()
             .map(|metadata| metadata.metadata_files.clone())
@@ -2440,6 +2773,11 @@ impl Workspace {
             .map(|metadata_path| {
                 let metadata_stamp = if package_paths_equal(&metadata_path, path) {
                     stamp.clone()
+                } else if let Some(observation) = observations
+                    .iter()
+                    .find(|observation| package_paths_equal(&observation.path, &metadata_path))
+                {
+                    Some(path_stamp_from_project_read(&observation.stamp))
                 } else {
                     path_stamp(&metadata_path)
                 };
@@ -2452,11 +2790,12 @@ impl Workspace {
             CachedPackageMetadata {
                 metadata_stamps,
                 result: result.clone(),
+                observations: observations.clone(),
                 last_used: self.use_clock,
             },
         );
         self.trim_package_metadata_cache();
-        result
+        result.map(|metadata| (metadata, observations))
     }
 
     fn trim_package_metadata_cache(&mut self) {
@@ -2491,11 +2830,23 @@ impl Workspace {
         }
     }
 
+    fn retain_package_observations(
+        &mut self,
+        context_key: &ContextKey,
+        observations: Vec<ProjectReadObservation>,
+    ) {
+        if let Some(state) = self.contexts.get_mut(context_key) {
+            merge_project_read_observations(&mut state.project_read_observations, observations);
+        }
+    }
+
     fn package_catalogue(
         &mut self,
         root: &Path,
         requested_names: &HashSet<String>,
-    ) -> PackageCatalogue {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PackageCatalogue, String> {
+        check_workspace_cancel(cancel)?;
         let root = absolute_path(root.to_path_buf());
         let requested_names: HashSet<String> = requested_names
             .iter()
@@ -2514,7 +2865,7 @@ impl Workspace {
             if let Some(catalogue) = self.package_catalogues.get_mut(&root) {
                 catalogue.validated_epoch = self.package_catalogue_epoch;
                 catalogue.last_used = self.use_clock;
-                return catalogue.clone();
+                return Ok(catalogue.clone());
             }
         }
 
@@ -2522,7 +2873,7 @@ impl Workspace {
         if let Some(catalogue) = self.package_catalogues.get(&root) {
             scan_names.extend(catalogue.requested_names.iter().cloned());
         }
-        let scan = self.scan_package_catalogue(&root, &scan_names);
+        let scan = self.scan_package_catalogue(&root, &scan_names, cancel)?;
 
         self.use_clock = self.use_clock.saturating_add(1);
         let catalogue = PackageCatalogue {
@@ -2535,14 +2886,16 @@ impl Workspace {
         };
         self.package_catalogues.insert(root, catalogue.clone());
         self.trim_package_catalogues();
-        catalogue
+        Ok(catalogue)
     }
 
     fn scan_package_catalogue(
         &mut self,
         root: &Path,
         requested_names: &HashSet<String>,
-    ) -> PackageCatalogueScan {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PackageCatalogueScan, String> {
+        check_workspace_cancel(cancel)?;
         let root = absolute_path(root.to_path_buf());
         let excludes = self
             .roots
@@ -2558,6 +2911,7 @@ impl Workspace {
         let mut visited = 1usize;
 
         'directories: while let Some(directory) = pending.pop_front() {
+            check_workspace_cancel(cancel)?;
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(_) => {
@@ -2567,6 +2921,7 @@ impl Workspace {
             };
             let mut children = Vec::new();
             for result in read_dir {
+                check_workspace_cancel(cancel)?;
                 if visited >= MAX_PACKAGE_CATALOGUE_ENTRIES {
                     scan.complete = false;
                     break 'directories;
@@ -2586,6 +2941,7 @@ impl Workspace {
 
             let mut descriptors_by_stem: HashMap<String, PackageDescriptorFiles> = HashMap::new();
             for entry in children {
+                check_workspace_cancel(cancel)?;
                 let path = entry.path();
                 let Ok(file_type) = entry.file_type() else {
                     scan.complete = false;
@@ -2635,6 +2991,7 @@ impl Workspace {
             }
 
             for files in descriptors_by_stem.into_values() {
+                check_workspace_cancel(cancel)?;
                 let selected = if files.has_dpk {
                     files.dpk
                 } else {
@@ -2652,10 +3009,11 @@ impl Workspace {
         }
 
         for paths in scan.entries.values_mut() {
+            check_workspace_cancel(cancel)?;
             paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
             paths.dedup_by(|left, right| package_paths_equal(left, right));
         }
-        scan
+        Ok(scan)
     }
 
     fn trim_package_catalogues(&mut self) {
@@ -2951,12 +3309,19 @@ impl Workspace {
                         .map_err(|_| format!("document context requires a file URI: {uri}"))?,
                 );
                 let roots = self.workspace_root_paths();
-                let (key, context) = self
-                    .rediscover_known_owner(&path, owner, &roots, &self.project_options())
+                let (key, discovery) = self
+                    .rediscover_known_owner(&path, owner, &roots, &self.project_options(), None)
                     .map_err(|error| {
                         format!("could not rediscover known project owner for {uri}: {error}")
                     })?;
-                self.install_context(key.clone(), context, &path, None)?;
+                self.install_context(
+                    key.clone(),
+                    discovery.context,
+                    discovery.observations,
+                    discovery.candidate_memberships,
+                    &path,
+                    None,
+                )?;
                 key
             }
         } else if let Some((scope, selected)) = current_selection.as_ref() {
@@ -3341,6 +3706,56 @@ fn context_state_is_fresh(state: &ContextState) -> bool {
     context_state_is_fresh_with_cancel(state, None).unwrap_or(false)
 }
 
+fn path_stamp_from_project_read(stamp: &ProjectReadStamp) -> PathStamp {
+    PathStamp {
+        bytes: stamp.bytes,
+        modified: stamp.modified,
+        is_dir: stamp.is_dir,
+        is_symlink: stamp.is_symlink,
+    }
+}
+
+fn take_candidate_membership(
+    memberships: &mut HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+    directory: &Path,
+) -> Option<Result<ProjectCandidateMembership, String>> {
+    let key = memberships
+        .keys()
+        .find(|candidate| package_paths_equal(candidate, directory))
+        .cloned()?;
+    memberships.remove(&key)
+}
+
+fn merge_project_read_observations(
+    target: &mut Vec<ProjectReadObservation>,
+    observations: Vec<ProjectReadObservation>,
+) {
+    for observation in observations {
+        if target
+            .iter()
+            .any(|existing| package_paths_equal(&existing.path, &observation.path))
+        {
+            continue;
+        }
+        target.push(observation);
+    }
+}
+
+fn merge_candidate_memberships(
+    target: &mut HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+    memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+) {
+    for (path, membership) in memberships {
+        if target
+            .keys()
+            .any(|existing| package_paths_equal(existing, &path))
+        {
+            continue;
+        }
+        target.insert(path, membership);
+    }
+}
+
 fn context_state_is_fresh_with_cancel(
     state: &ContextState,
     cancel: Option<&AtomicBool>,
@@ -3478,6 +3893,15 @@ fn path_to_glob(path: &Path) -> String {
 }
 
 fn read_disk_source(path: &Path, max_bytes: usize) -> Result<DiskSource, String> {
+    read_disk_source_with_cancel(path, max_bytes, None)
+}
+
+fn read_disk_source_with_cancel(
+    path: &Path,
+    max_bytes: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<DiskSource, String> {
+    check_workspace_cancel(cancel)?;
     let metadata = fs::metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     if !metadata.is_file() {
@@ -3491,18 +3915,27 @@ fn read_disk_source(path: &Path, max_bytes: usize) -> Result<DiskSource, String>
         ));
     }
 
-    let file =
+    let mut file =
         File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    if bytes.len() > max_bytes {
-        return Err(format!(
-            "{} is larger than the configured per-file limit {max_bytes}",
-            path.display()
-        ));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_workspace_cancel(cancel)?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() > max_bytes {
+            return Err(format!(
+                "{} is larger than the configured per-file limit {max_bytes}",
+                path.display()
+            ));
+        }
     }
+    check_workspace_cancel(cancel)?;
     let text = decode_bytes(&bytes).into_owned();
     if text.len() > max_bytes {
         return Err(format!(
@@ -3510,6 +3943,7 @@ fn read_disk_source(path: &Path, max_bytes: usize) -> Result<DiskSource, String>
             path.display()
         ));
     }
+    check_workspace_cancel(cancel)?;
     Ok(DiskSource {
         text,
         bytes: bytes.len(),
@@ -3848,7 +4282,9 @@ mod tests {
     };
     use crate::project::ProjectContext;
     use lsp_types::Url;
+    use std::collections::HashSet;
     use std::fs;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn diagnostic_line_index_reuses_utf16_prefixes_for_unicode_and_bare_cr() {
@@ -3899,6 +4335,41 @@ mod tests {
             !context_state_is_fresh(&state),
             "repeated candidate-enumeration errors must not prove freshness"
         );
+    }
+
+    #[test]
+    fn cancellable_dependency_loading_honors_request_cancellation() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let consumer = temp.path().join("Consumer.pas");
+        let provider = temp.path().join("Provider.pas");
+        fs::write(
+            &consumer,
+            "unit Consumer; interface uses Provider; implementation end.\n",
+        )
+        .expect("consumer source");
+        fs::write(&provider, "unit Provider; interface implementation end.\n")
+            .expect("provider source");
+
+        let mut workspace =
+            Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let context_key = workspace
+            .context_for_uri(&consumer_uri)
+            .expect("consumer context");
+        workspace
+            .index
+            .update(
+                consumer_uri.clone(),
+                fs::read_to_string(&consumer).expect("consumer text"),
+            )
+            .expect("consumer index");
+        let mut pinned = HashSet::new();
+        let cancel = AtomicBool::new(true);
+
+        let error = workspace
+            .load_imports_with_cancel(&consumer_uri, &context_key, &mut pinned, Some(&cancel))
+            .expect_err("cancelled dependency loading must not read dependencies");
+        assert_eq!(error, "request cancelled");
     }
 
     #[test]
@@ -4136,7 +4607,14 @@ mod tests {
         };
 
         workspace
-            .install_context(key.clone(), context, &source, None)
+            .install_context(
+                key.clone(),
+                context,
+                Vec::new(),
+                std::collections::HashMap::new(),
+                &source,
+                None,
+            )
             .expect("install context");
         let watched_paths = &workspace
             .contexts

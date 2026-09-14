@@ -10,13 +10,14 @@ use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
-    DocumentHighlightParams, FileChangeType, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, InitializeParams, OneOf, Position, PrepareRenameResponse,
-    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
-    ServerInfo, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
+    ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionParams,
+    CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
+    MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
+    Registration, RegistrationParams, RelativePattern, ServerInfo, SignatureHelpParams,
+    TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -44,6 +45,7 @@ struct ClientFeatures {
     action_disabled: bool,
     document_changes: bool,
     hierarchical_document_symbols: bool,
+    hover_markdown: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +77,23 @@ struct SelectProjectRequestParams {
 }
 
 enum AnalysisRequest {
+    Hover {
+        uri: Url,
+        position: Position,
+        format: MarkupKind,
+    },
+    Completion {
+        uri: Url,
+        position: Position,
+    },
+    SignatureHelp {
+        uri: Url,
+        position: Position,
+    },
+    TypeDefinitions {
+        uri: Url,
+        position: Position,
+    },
     Prepare {
         uri: Url,
         position: Position,
@@ -105,6 +124,10 @@ enum AnalysisRequest {
 }
 
 enum AnalysisResultValue {
+    Hover(Result<Option<lsp_types::Hover>, String>),
+    Completion(Result<lsp_types::CompletionList, String>),
+    SignatureHelp(Result<Option<lsp_types::SignatureHelp>, String>),
+    TypeDefinitions(Result<Vec<lsp_types::Location>, String>),
     Prepare(Result<PrepareRenameResponse, String>),
     Rename(Box<Result<WorkspaceEdit, String>>),
     CodeActions(Result<Vec<CodeActionOrCommand>, String>),
@@ -263,6 +286,18 @@ impl AnalysisJobs {
         let worker_id = id.clone();
         let panic_id = id.clone();
         let panic_value = match &request {
+            AnalysisRequest::Hover { .. } => AnalysisResultValue::Hover(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::Completion { .. } => AnalysisResultValue::Completion(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::SignatureHelp { .. } => AnalysisResultValue::SignatureHelp(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::TypeDefinitions { .. } => AnalysisResultValue::TypeDefinitions(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
             AnalysisRequest::Prepare { .. } => AnalysisResultValue::Prepare(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
@@ -300,6 +335,71 @@ impl AnalysisJobs {
                 let validation_input = input.clone();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
+                        AnalysisRequest::Hover {
+                            uri,
+                            position,
+                            format,
+                        } => {
+                            let computed = queries::hover_from_input(
+                                input,
+                                &uri,
+                                position,
+                                format,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::Hover(computed.value),
+                            }
+                        }
+                        AnalysisRequest::Completion { uri, position } => {
+                            let computed = queries::completion_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::Completion(computed.value),
+                            }
+                        }
+                        AnalysisRequest::SignatureHelp { uri, position } => {
+                            let computed = queries::signature_help_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::SignatureHelp(computed.value),
+                            }
+                        }
+                        AnalysisRequest::TypeDefinitions { uri, position } => {
+                            let computed = queries::type_definitions_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::TypeDefinitions(computed.value),
+                            }
+                        }
                         AnalysisRequest::Prepare { uri, position } => {
                             let computed = rename::prepare_from_input(
                                 input,
@@ -483,7 +583,17 @@ impl AnalysisJobs {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Ok(result) = self.receiver.try_recv() {
             if let Some(job) = self.pending.remove(&result.id) {
+                let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
                 let _ = job.handle.join();
+                if cancelled {
+                    let mut result = result;
+                    invalidate_analysis_result(
+                        &mut result,
+                        rename::CANCELLATION_MESSAGE.to_string(),
+                    );
+                    deliver_analysis_result(connection, workspace, result)?;
+                    continue;
+                }
             }
             deliver_analysis_result(connection, workspace, result)?;
         }
@@ -520,6 +630,22 @@ fn deliver_analysis_result(
         );
     }
     match result.value {
+        AnalysisResultValue::Hover(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::Completion(value) => match value {
+            Ok(value) => send_ok(connection, result.id, CompletionResponse::List(value)),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::SignatureHelp(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::TypeDefinitions(value) => match value {
+            Ok(value) => send_ok(connection, result.id, GotoDefinitionResponse::Array(value)),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
         AnalysisResultValue::Prepare(value) => match value {
             Ok(value) => send_ok(connection, result.id, value),
             Err(error) => send_analysis_error(connection, result.id, error),
@@ -566,6 +692,10 @@ fn deliver_analysis_result(
 
 fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
     match &mut result.value {
+        AnalysisResultValue::Hover(value) => *value = Err(error),
+        AnalysisResultValue::Completion(value) => *value = Err(error),
+        AnalysisResultValue::SignatureHelp(value) => *value = Err(error),
+        AnalysisResultValue::TypeDefinitions(value) => *value = Err(error),
         AnalysisResultValue::Prepare(value) => *value = Err(error),
         AnalysisResultValue::Rename(value) => **value = Err(error),
         AnalysisResultValue::CodeActions(value) => *value = Err(error),
@@ -1026,6 +1156,101 @@ fn handle_request(
                 Ok(context) => send_ok(connection, id, context)?,
                 Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
             }
+        }
+        "textDocument/hover" => {
+            let id = request.id.clone();
+            let params: HoverParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Hover {
+                    uri: canonical_file_uri(
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    position: params.text_document_position_params.position,
+                    format: if client_features.hover_markdown {
+                        MarkupKind::Markdown
+                    } else {
+                        MarkupKind::PlainText
+                    },
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/completion" => {
+            let id = request.id.clone();
+            let params: CompletionParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Completion {
+                    uri: canonical_file_uri(&params.text_document_position.text_document.uri),
+                    position: params.text_document_position.position,
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/signatureHelp" => {
+            let id = request.id.clone();
+            let params: SignatureHelpParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::SignatureHelp {
+                    uri: canonical_file_uri(
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    position: params.text_document_position_params.position,
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/typeDefinition" => {
+            let id = request.id.clone();
+            let params: GotoDefinitionParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::TypeDefinitions {
+                    uri: canonical_file_uri(
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    position: params.text_document_position_params.position,
+                },
+                client_features,
+            )?;
         }
         "textDocument/documentSymbol" => {
             let id = request.id.clone();
@@ -1528,6 +1753,10 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
             "change": 1,
             "save": true
         },
+        "hoverProvider": true,
+        "completionProvider": {"triggerCharacters": ["."]},
+        "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
+        "typeDefinitionProvider": true,
         "declarationProvider": true,
         "definitionProvider": true,
         "implementationProvider": true,
@@ -1575,11 +1804,19 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
         value["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"]
             .as_bool()
             .unwrap_or(false);
+    let hover_markdown = value["textDocument"]["hover"]["contentFormat"]
+        .as_array()
+        .is_some_and(|formats| {
+            formats
+                .iter()
+                .any(|format| format.as_str() == Some("markdown"))
+        });
     ClientFeatures {
         action_resolve,
         action_disabled,
         document_changes,
         hierarchical_document_symbols,
+        hover_markdown,
     }
 }
 
@@ -1642,7 +1879,7 @@ mod tests {
     };
     use crate::workspace::Workspace;
     use lsp_server::{Connection, Message, RequestId, Response};
-    use lsp_types::{Position, PrepareRenameResponse, Range, Url};
+    use lsp_types::{MarkupKind, Position, PrepareRenameResponse, Range, Url};
     use std::fs;
     use std::io::{Cursor, ErrorKind};
     use std::path::PathBuf;
@@ -1654,6 +1891,7 @@ mod tests {
             action_disabled: false,
             document_changes: false,
             hierarchical_document_symbols: false,
+            hover_markdown: false,
         }
     }
 
@@ -1702,6 +1940,197 @@ mod tests {
         assert!(
             !result.records.is_empty(),
             "the computed symbol result must carry its source read set"
+        );
+    }
+
+    fn assert_hover_was_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::Hover(Ok(Some(hover))) => {
+                assert!(
+                    hover.range.is_some(),
+                    "hover result must carry its identifier range"
+                );
+            }
+            AnalysisResultValue::Hover(Ok(None)) => panic!("hover worker returned no result"),
+            AnalysisResultValue::Hover(Err(error)) => {
+                panic!("hover worker failed before delivery: {error}")
+            }
+            _ => panic!("expected a hover result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed hover result must carry its source read set"
+        );
+    }
+
+    fn assert_completion_was_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::Completion(Ok(completion)) => {
+                assert!(
+                    !completion.items.is_empty(),
+                    "the computed completion result must not be empty"
+                );
+            }
+            AnalysisResultValue::Completion(Err(error)) => {
+                panic!("completion worker failed before delivery: {error}");
+            }
+            _ => panic!("expected a completion result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed completion result must carry its source read set"
+        );
+    }
+
+    fn assert_signature_help_was_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::SignatureHelp(Ok(Some(signature_help))) => {
+                assert!(
+                    !signature_help.signatures.is_empty(),
+                    "the computed signature-help result must not be empty"
+                );
+            }
+            AnalysisResultValue::SignatureHelp(Ok(None)) => {
+                panic!("signature-help worker returned no result")
+            }
+            AnalysisResultValue::SignatureHelp(Err(error)) => {
+                panic!("signature-help worker failed before delivery: {error}");
+            }
+            _ => panic!("expected a signature-help result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed signature-help result must carry its source read set"
+        );
+    }
+
+    struct AssistanceDeliveryFixture {
+        _temp: tempfile::TempDir,
+        workspace: Workspace,
+        main_uri: Url,
+        provider_uri: Url,
+        project_b_uri: Url,
+        provider_source: String,
+    }
+
+    #[derive(Clone, Copy)]
+    enum AssistanceRequestKind {
+        Completion,
+        SignatureHelp,
+    }
+
+    fn assistance_delivery_fixture() -> AssistanceDeliveryFixture {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let main = root.join("Main.pas");
+        let provider = root.join("Provider.pas");
+        let project_a = root.join("A.dproj");
+        let project_b = root.join("B.dproj");
+        let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nbegin\n  Provided(1);\nend;\nend.\n";
+        let provider_source = "unit Provider;\ninterface\nprocedure Provided(Value: Integer);\nimplementation\nprocedure Provided(Value: Integer);\nbegin\nend;\nend.\n".to_string();
+        let project_source = "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Provider.pas\" /></ItemGroup></Project>";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, main_source).expect("main source");
+        fs::write(&provider, &provider_source).expect("provider source");
+        fs::write(&project_a, project_source).expect("project A");
+        fs::write(&project_b, project_source).expect("project B");
+
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let project_a_uri = Url::from_file_path(&project_a).expect("project A URI");
+        let project_b_uri = Url::from_file_path(&project_b).expect("project B URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(provider_uri.clone(), provider_source.clone(), 1)
+            .expect("provider overlay");
+        workspace
+            .select_project(&main_uri, Some(&project_a_uri))
+            .expect("select project A");
+
+        AssistanceDeliveryFixture {
+            _temp: temp,
+            workspace,
+            main_uri,
+            provider_uri,
+            project_b_uri,
+            provider_source,
+        }
+    }
+
+    fn assistance_request(
+        kind: AssistanceRequestKind,
+        main_uri: Url,
+        position: Position,
+    ) -> AnalysisRequest {
+        match kind {
+            AssistanceRequestKind::Completion => AnalysisRequest::Completion {
+                uri: main_uri,
+                position,
+            },
+            AssistanceRequestKind::SignatureHelp => AnalysisRequest::SignatureHelp {
+                uri: main_uri,
+                position,
+            },
+        }
+    }
+
+    fn assistance_position(source: &str, needle: &str) -> Position {
+        let offset = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not found in assistance fixture"))
+            .saturating_add(needle.len());
+        crate::text::offset_to_position(source, offset).expect("assistance position")
+    }
+
+    fn assert_stale_delivery(workspace: &Workspace, result: AnalysisResult) {
+        let id = result.id.clone();
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, workspace, result).expect("deliver stale result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(response.id, id);
+        assert_eq!(response.error.expect("stale result error").code, -32803);
+    }
+
+    fn start_assistance_for_delivery(
+        fixture: &AssistanceDeliveryFixture,
+        kind: AssistanceRequestKind,
+        id: &str,
+    ) -> AnalysisResult {
+        let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nbegin\n  Provided(1);\nend;\nend.\n";
+        let position = match kind {
+            AssistanceRequestKind::Completion => assistance_position(main_source, "  Pro"),
+            AssistanceRequestKind::SignatureHelp => assistance_position(main_source, "Provided("),
+        };
+        let request_id = RequestId::from(id.to_string());
+        let mut jobs = AnalysisJobs::new();
+        jobs.start(
+            request_id.clone(),
+            assistance_request(kind, fixture.main_uri.clone(), position),
+            &fixture.workspace,
+            symbol_client_features(),
+        )
+        .expect("start assistance request");
+        receive_analysis_result(&mut jobs, &request_id)
+    }
+
+    fn assert_type_definitions_were_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::TypeDefinitions(Ok(locations)) => {
+                assert!(
+                    !locations.is_empty(),
+                    "the computed type-definition result must not be empty"
+                );
+            }
+            AnalysisResultValue::TypeDefinitions(Err(error)) => {
+                panic!("type-definition worker failed before delivery: {error}");
+            }
+            _ => panic!("expected a type-definition result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed type-definition result must carry its source read set"
         );
     }
 
@@ -1995,6 +2424,269 @@ mod tests {
             response
                 .error
                 .expect("changed overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_hover_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nprocedure VisibleThing;\nimplementation\nend.\n";
+        let changed = "unit Main;\ninterface\nprocedure ChangedThing;\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("hover-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::Hover {
+                uri: main_uri.clone(),
+                position: Position::new(2, 10),
+                format: MarkupKind::PlainText,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start hover control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_hover_was_computed(&control);
+        deliver_successfully(&workspace, control);
+
+        let id = RequestId::from("hover-overlay-stale".to_string());
+        jobs.start(
+            id.clone(),
+            AnalysisRequest::Hover {
+                uri: main_uri.clone(),
+                position: Position::new(2, 10),
+                format: MarkupKind::PlainText,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start hover request");
+        let result = receive_analysis_result(&mut jobs, &id);
+        assert_hover_was_computed(&result);
+
+        workspace
+            .change_document(main_uri, changed.to_string(), 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, result).expect("deliver stale hover result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed hover overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_type_definition_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\ntype\n  TOverlay = class end;\nimplementation\nend.\n";
+        let changed_provider =
+            "unit Provider;\ninterface\ntype\n  TChanged = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Item: TOverlay;\nbegin\n  Item := nil;\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(provider_uri.clone(), provider_source.to_string(), 1)
+            .expect("open provider overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("type-definition-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::TypeDefinitions {
+                uri: consumer_uri.clone(),
+                position: Position::new(5, 4),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start type-definition control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_type_definitions_were_computed(&control);
+        deliver_successfully(&workspace, control);
+
+        let stale_id = RequestId::from("type-definition-overlay-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::TypeDefinitions {
+                uri: consumer_uri,
+                position: Position::new(5, 4),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale type-definition request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_type_definitions_were_computed(&stale);
+
+        workspace
+            .change_document(provider_uri, changed_provider.to_string(), 2)
+            .expect("change provider overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, stale)
+            .expect("deliver stale type-definition result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed type-definition overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_completion_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nimplementation\nprocedure Run;\nvar\n  LocalName: Integer;\nbegin\n  Loc;\nend;\nend.\n";
+        let changed = original.replace("LocalName", "ChangedName");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("completion-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::Completion {
+                uri: main_uri.clone(),
+                position: Position::new(7, 5),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start completion control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_completion_was_computed(&control);
+        deliver_successfully(&workspace, control);
+
+        let stale_id = RequestId::from("completion-overlay-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::Completion {
+                uri: main_uri.clone(),
+                position: Position::new(7, 5),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale completion request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_completion_was_computed(&stale);
+
+        workspace
+            .change_document(main_uri, changed, 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, stale)
+            .expect("deliver stale completion result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed completion overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_signature_help_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  Run(1);\nend;\nend.\n";
+        let changed = original.replace("Run", "Changed");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("signature-help-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::SignatureHelp {
+                uri: main_uri.clone(),
+                position: Position::new(9, 6),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start signature-help control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_signature_help_was_computed(&control);
+        deliver_successfully(&workspace, control);
+
+        let stale_id = RequestId::from("signature-help-overlay-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::SignatureHelp {
+                uri: main_uri.clone(),
+                position: Position::new(9, 6),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale signature-help request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_signature_help_was_computed(&stale);
+
+        workspace
+            .change_document(main_uri, changed, 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, stale)
+            .expect("deliver stale signature-help result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed signature-help overlay must reject result")
                 .code,
             -32803
         );
@@ -2454,5 +3146,145 @@ mod tests {
         };
         assert_eq!(response.id, id);
         assert_eq!(response.error.expect("stale result error").code, -32803);
+    }
+
+    #[test]
+    fn delivery_rejects_completion_and_signature_after_provider_overlay_change() {
+        for (kind, name) in [
+            (
+                AssistanceRequestKind::Completion,
+                "provider-overlay-completion",
+            ),
+            (
+                AssistanceRequestKind::SignatureHelp,
+                "provider-overlay-signature",
+            ),
+        ] {
+            let mut fixture = assistance_delivery_fixture();
+            let result = start_assistance_for_delivery(&fixture, kind, name);
+            match kind {
+                AssistanceRequestKind::Completion => assert_completion_was_computed(&result),
+                AssistanceRequestKind::SignatureHelp => assert_signature_help_was_computed(&result),
+            }
+            let changed_provider = fixture.provider_source.replace("Provided", "Changed");
+            fixture
+                .workspace
+                .change_document(fixture.provider_uri.clone(), changed_provider, 2)
+                .expect("change provider overlay");
+            assert_stale_delivery(&fixture.workspace, result);
+        }
+    }
+
+    #[test]
+    fn delivery_rejects_completion_and_signature_after_project_selection_change() {
+        for (kind, name) in [
+            (
+                AssistanceRequestKind::Completion,
+                "project-switch-completion",
+            ),
+            (
+                AssistanceRequestKind::SignatureHelp,
+                "project-switch-signature",
+            ),
+        ] {
+            let mut fixture = assistance_delivery_fixture();
+            let result = start_assistance_for_delivery(&fixture, kind, name);
+            match kind {
+                AssistanceRequestKind::Completion => assert_completion_was_computed(&result),
+                AssistanceRequestKind::SignatureHelp => assert_signature_help_was_computed(&result),
+            }
+            fixture
+                .workspace
+                .select_project(&fixture.main_uri, Some(&fixture.project_b_uri))
+                .expect("switch selected project");
+            assert_stale_delivery(&fixture.workspace, result);
+        }
+    }
+
+    #[test]
+    fn cancelled_empty_and_null_assistance_results_are_suppressed_before_delivery() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let main = root.join("Main.pas");
+        let source = "unit Main;\ninterface\nimplementation\nprocedure Caller;\nbegin\n  // no assistance result\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, source).expect("source");
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = Workspace::new(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), source.to_owned(), 1)
+            .expect("open source overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let completion_id = RequestId::from("cancelled-empty-completion".to_string());
+        jobs.start(
+            completion_id.clone(),
+            AnalysisRequest::Completion {
+                uri: main_uri.clone(),
+                position: Position::new(5, 24),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start empty completion request");
+        let completion = jobs.receiver.recv().expect("computed completion result");
+        assert!(matches!(
+            &completion.value,
+            AnalysisResultValue::Completion(Ok(value)) if value.items.is_empty()
+        ));
+        jobs.sender
+            .send(completion)
+            .expect("requeue computed completion result");
+        jobs.pending
+            .get(&completion_id)
+            .expect("pending completion")
+            .cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (server, client) = Connection::memory();
+        jobs.poll(&server, &workspace)
+            .expect("poll cancelled completion");
+        let Message::Response(response) = client.receiver.recv().expect("completion response")
+        else {
+            panic!("expected a completion response");
+        };
+        assert_eq!(response.id, completion_id);
+        assert_eq!(
+            response.error.expect("completion cancellation").code,
+            -32800
+        );
+
+        let signature_id = RequestId::from("cancelled-null-signature".to_string());
+        jobs.start(
+            signature_id.clone(),
+            AnalysisRequest::SignatureHelp {
+                uri: main_uri,
+                position: Position::new(5, 24),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start null signature request");
+        let signature = jobs.receiver.recv().expect("computed signature result");
+        assert!(matches!(
+            &signature.value,
+            AnalysisResultValue::SignatureHelp(Ok(None))
+        ));
+        jobs.sender
+            .send(signature)
+            .expect("requeue computed signature result");
+        jobs.pending
+            .get(&signature_id)
+            .expect("pending signature")
+            .cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (server, client) = Connection::memory();
+        jobs.poll(&server, &workspace)
+            .expect("poll cancelled signature");
+        let Message::Response(response) = client.receiver.recv().expect("signature response")
+        else {
+            panic!("expected a signature response");
+        };
+        assert_eq!(response.id, signature_id);
+        assert_eq!(response.error.expect("signature cancellation").code, -32800);
     }
 }

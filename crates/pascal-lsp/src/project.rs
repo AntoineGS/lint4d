@@ -8,8 +8,10 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::Hasher;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
@@ -94,6 +96,78 @@ pub struct ProjectContext {
     pub warnings: Vec<String>,
 }
 
+/// One file observation captured at the read which supplied bytes to project
+/// discovery. Consumers use this instead of reopening the file after parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectReadObservation {
+    pub(crate) path: PathBuf,
+    pub(crate) stamp: ProjectReadStamp,
+    pub(crate) content_hash: u64,
+    pub(crate) content_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectReadStamp {
+    pub(crate) bytes: u64,
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) is_dir: bool,
+    pub(crate) is_symlink: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectDiscovery {
+    pub(crate) context: ProjectContext,
+    pub(crate) observations: Vec<ProjectReadObservation>,
+    pub(crate) candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectReadTracker {
+    observations: Vec<ProjectReadObservation>,
+    candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+}
+
+impl ProjectReadTracker {
+    fn record(&mut self, path: &Path, stamp: ProjectReadStamp, bytes: &[u8]) {
+        if self
+            .observations
+            .iter()
+            .any(|observation| project_paths_equal(&observation.path, path))
+        {
+            return;
+        }
+        self.observations.push(ProjectReadObservation {
+            path: path.to_path_buf(),
+            stamp,
+            content_hash: project_content_hash(bytes),
+            content_bytes: (!is_pascal_source_path(path)).then(|| bytes.to_vec()),
+        });
+    }
+
+    fn record_candidate_membership(
+        &mut self,
+        path: PathBuf,
+        membership: Result<ProjectCandidateMembership, String>,
+    ) {
+        if self
+            .candidate_memberships
+            .keys()
+            .any(|existing| project_paths_equal(existing, &path))
+        {
+            return;
+        }
+        self.candidate_memberships.insert(path, membership);
+    }
+
+    fn into_discovery(self, context: ProjectContext) -> ProjectDiscovery {
+        ProjectDiscovery {
+            context,
+            observations: self.observations,
+            candidate_memberships: self.candidate_memberships,
+        }
+    }
+}
+
 /// Metadata extracted from one source package descriptor. The descriptor is
 /// parsed only after a project import has failed the ordinary unit lookup;
 /// `metadata_files` contains every project/option-set dependency used to
@@ -103,6 +177,12 @@ pub(crate) struct PackageMetadata {
     pub units: HashMap<String, Vec<PathBuf>>,
     pub warnings: Vec<String>,
     pub metadata_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PackageMetadataRead {
+    pub(crate) metadata: PackageMetadata,
+    pub(crate) observations: Vec<ProjectReadObservation>,
 }
 
 impl ProjectContext {
@@ -134,12 +214,21 @@ pub(crate) fn project_candidates(
     file: &Path,
     workspace_roots: &[PathBuf],
 ) -> Result<ProjectCandidates, String> {
+    project_candidates_with_cancel(file, workspace_roots, None)
+}
+
+pub(crate) fn project_candidates_with_cancel(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+) -> Result<ProjectCandidates, String> {
+    check_project_scan_cancel(cancel)?;
     let mut warnings = Vec::new();
     let absolute_file = absolute_lexical(file)?;
     let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
     let relevant_root = relevant_workspace_root(&file_path, &roots);
-    find_project_candidates(&file_path, relevant_root.as_deref())
+    find_project_candidates(&file_path, relevant_root.as_deref(), cancel)
 }
 
 pub(crate) fn discover_with_selections(
@@ -148,7 +237,27 @@ pub(crate) fn discover_with_selections(
     options: &ProjectOptions,
     selections: &ProjectSelections,
 ) -> Result<ProjectContext, String> {
-    discover_context_with_selections(file, workspace_roots, options, selections)
+    discover_with_selections_and_observations(file, workspace_roots, options, selections)
+        .map(|discovery| discovery.context)
+}
+
+pub(crate) fn discover_with_selections_and_observations(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+) -> Result<ProjectDiscovery, String> {
+    discover_context_with_selections(file, workspace_roots, options, selections, None)
+}
+
+pub(crate) fn discover_with_selections_and_observations_with_cancel(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+    cancel: &AtomicBool,
+) -> Result<ProjectDiscovery, String> {
+    discover_context_with_selections(file, workspace_roots, options, selections, Some(cancel))
 }
 
 fn discover_context(
@@ -156,7 +265,14 @@ fn discover_context(
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
 ) -> Result<ProjectContext, String> {
-    discover_context_with_selections(file, workspace_roots, options, &ProjectSelections::new())
+    discover_context_with_selections(
+        file,
+        workspace_roots,
+        options,
+        &ProjectSelections::new(),
+        None,
+    )
+    .map(|discovery| discovery.context)
 }
 
 fn discover_context_with_selections(
@@ -164,28 +280,40 @@ fn discover_context_with_selections(
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
     selections: &ProjectSelections,
-) -> Result<ProjectContext, String> {
+    cancel: Option<&AtomicBool>,
+) -> Result<ProjectDiscovery, String> {
+    check_project_scan_cancel(cancel)?;
+    let mut read_tracker = ProjectReadTracker::default();
     let absolute_file = absolute_lexical(file)?;
     let mut warnings = Vec::new();
     let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
     let relevant_root = relevant_workspace_root(&file_path, &roots);
+    record_candidate_memberships(
+        &file_path,
+        relevant_root.as_deref(),
+        &mut read_tracker,
+        cancel,
+    )?;
 
     let runtime_selection = if selections.is_empty() {
         None
     } else {
-        let candidates = match find_project_candidates(&file_path, relevant_root.as_deref()) {
+        let candidates = match find_project_candidates(&file_path, relevant_root.as_deref(), cancel)
+        {
             Ok(candidates) => candidates,
             Err(error) => {
                 warnings.push(error);
-                return Ok(build_standalone_context(
+                return build_standalone_context(
                     &file_path,
                     &roots,
                     options,
                     warnings,
                     false,
                     Vec::new(),
-                ));
+                    cancel,
+                )
+                .map(|context| read_tracker.into_discovery(context));
             }
         };
         runtime_project_selection(&file_path, &candidates, selections).map(|(scope, requested)| {
@@ -206,9 +334,10 @@ fn discover_context_with_selections(
                 requested.display(),
                 scope.display()
             ));
-            return Ok(build_standalone_context(
-                &file_path, &roots, options, warnings, false, candidates,
-            ));
+            return build_standalone_context(
+                &file_path, &roots, options, warnings, false, candidates, cancel,
+            )
+            .map(|context| read_tracker.into_discovery(context));
         };
         ProjectSelection::Selected {
             path: project_file,
@@ -224,8 +353,11 @@ fn discover_context_with_selections(
             &roots,
             options,
             &mut warnings,
+            &mut read_tracker,
+            cancel,
         )
     };
+    check_project_scan_cancel(cancel)?;
 
     match selected_project {
         ProjectSelection::Selected {
@@ -240,24 +372,29 @@ fn discover_context_with_selections(
             warnings,
             explicit,
             metadata_files,
+            &mut read_tracker,
+            cancel,
         ),
-        ProjectSelection::Standalone { metadata_files } => Ok(build_standalone_context(
+        ProjectSelection::Standalone { metadata_files } => build_standalone_context(
             &file_path,
             &roots,
             options,
             warnings,
             true,
             metadata_files,
-        )),
-        ProjectSelection::Incomplete { metadata_files } => Ok(build_standalone_context(
+            cancel,
+        ),
+        ProjectSelection::Incomplete { metadata_files } => build_standalone_context(
             &file_path,
             &roots,
             options,
             warnings,
             false,
             metadata_files,
-        )),
+            cancel,
+        ),
     }
+    .map(|context| read_tracker.into_discovery(context))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,7 +451,15 @@ pub(crate) fn has_invalid_project_selection(context: &ProjectContext) -> bool {
 }
 
 pub(crate) fn selected_project_is_current(scope: &Path, selected: &Path) -> Result<bool, String> {
-    let entries = project_directory_entries(scope, None)?;
+    selected_project_is_current_with_cancel(scope, selected, None)
+}
+
+pub(crate) fn selected_project_is_current_with_cancel(
+    scope: &Path,
+    selected: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<bool, String> {
+    let entries = project_directory_entries(scope, cancel)?;
     Ok(entries
         .dproj
         .iter()
@@ -324,10 +469,12 @@ pub(crate) fn selected_project_is_current(scope: &Path, selected: &Path) -> Resu
 fn find_project_candidates(
     file: &Path,
     workspace_root: Option<&Path>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ProjectCandidates, String> {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     loop {
-        let entries = project_directory_entries(&directory, None)?;
+        check_project_scan_cancel(cancel)?;
+        let entries = project_directory_entries(&directory, cancel)?;
         if !entries.dproj.is_empty() {
             let mut files = entries.dproj;
             files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
@@ -348,6 +495,34 @@ fn find_project_candidates(
         directory = parent.to_path_buf();
     }
     Ok(ProjectCandidates::default())
+}
+
+fn record_candidate_memberships(
+    file: &Path,
+    boundary: Option<&Path>,
+    tracker: &mut ProjectReadTracker,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+    loop {
+        check_project_scan_cancel(cancel)?;
+        let membership = project_candidate_membership(&directory, cancel);
+        if matches!(&membership, Err(error) if error == "request cancelled") {
+            return Err("request cancelled".to_string());
+        }
+        tracker.record_candidate_membership(directory.clone(), membership);
+        if boundary.is_some_and(|root| paths_equal_ci(&directory, root)) {
+            break;
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    Ok(())
 }
 
 pub(crate) fn project_candidate_membership(
@@ -484,9 +659,16 @@ fn check_project_scan_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> 
 }
 
 #[cfg(test)]
+type ProjectReadHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static TEST_AFTER_PROJECT_READ:
+        std::cell::RefCell<Option<ProjectReadHook>> = std::cell::RefCell::new(None);
+    static TEST_AFTER_PROJECT_READ_AT:
+        std::cell::RefCell<Option<(PathBuf, ProjectReadHook)>> = std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -510,6 +692,65 @@ impl Drop for TestProjectScanCancellationGuard {
         TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS.with(|budget| budget.set(self.0.take()));
     }
 }
+
+#[cfg(test)]
+pub(crate) struct TestAfterProjectReadGuard(Option<ProjectReadHook>);
+
+#[cfg(test)]
+pub(crate) fn test_after_project_read(
+    hook: impl FnOnce(&Path) + 'static,
+) -> TestAfterProjectReadGuard {
+    let previous = TEST_AFTER_PROJECT_READ.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+    TestAfterProjectReadGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestAfterProjectReadGuard {
+    fn drop(&mut self) {
+        TEST_AFTER_PROJECT_READ.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestAfterProjectReadAtGuard(Option<(PathBuf, ProjectReadHook)>);
+
+#[cfg(test)]
+pub(crate) fn test_after_project_read_at(
+    path: PathBuf,
+    hook: impl FnOnce(&Path) + 'static,
+) -> TestAfterProjectReadAtGuard {
+    let previous =
+        TEST_AFTER_PROJECT_READ_AT.with(|slot| slot.borrow_mut().replace((path, Box::new(hook))));
+    TestAfterProjectReadAtGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestAfterProjectReadAtGuard {
+    fn drop(&mut self) {
+        TEST_AFTER_PROJECT_READ_AT.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+fn run_after_project_read(path: &Path) {
+    let hook = TEST_AFTER_PROJECT_READ.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+    let targeted_hook = TEST_AFTER_PROJECT_READ_AT.with(|slot| {
+        let matches = slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|(target, _)| target == path);
+        matches.then(|| slot.borrow_mut().take()).flatten()
+    });
+    if let Some((_, hook)) = targeted_hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(test))]
+fn run_after_project_read(_path: &Path) {}
 
 fn normalize_workspace_roots(
     roots: &[PathBuf],
@@ -603,13 +844,21 @@ fn discover_project_file(
     roots: &[PathBuf],
     options: &ProjectOptions,
     warnings: &mut Vec<String>,
+    tracker: &mut ProjectReadTracker,
+    cancel: Option<&AtomicBool>,
 ) -> ProjectSelection {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     let mut fallback_dpr = None;
     let mut ambiguous_fallback_dpr = None;
 
     loop {
-        let entries = match project_directory_entries(&directory, None) {
+        if let Err(error) = check_project_scan_cancel(cancel) {
+            warnings.push(error);
+            return ProjectSelection::Incomplete {
+                metadata_files: Vec::new(),
+            };
+        }
+        let entries = match project_directory_entries(&directory, cancel) {
             Ok(entries) => entries,
             Err(error) => {
                 warnings.push(error);
@@ -630,6 +879,8 @@ fn discover_project_file(
                 roots,
                 options,
                 warnings,
+                tracker,
+                cancel,
             );
         }
         if fallback_dpr.is_none() && ambiguous_fallback_dpr.is_none() && !dpr_or_dpk.is_empty() {
@@ -660,6 +911,8 @@ fn discover_project_file(
             roots,
             options,
             warnings,
+            tracker,
+            cancel,
         );
     }
     fallback_dpr.map_or(
@@ -680,6 +933,7 @@ fn push_bounded_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn choose_project_candidate(
     mut candidates: Vec<PathBuf>,
     directory: &Path,
@@ -688,6 +942,8 @@ fn choose_project_candidate(
     roots: &[PathBuf],
     options: &ProjectOptions,
     warnings: &mut Vec<String>,
+    tracker: &mut ProjectReadTracker,
+    cancel: Option<&AtomicBool>,
 ) -> ProjectSelection {
     if candidates.len() == 1 {
         return ProjectSelection::Selected {
@@ -719,7 +975,20 @@ fn choose_project_candidate(
     let mut incomplete = false;
     let mut candidate_warnings = Vec::new();
     for candidate in &candidates {
-        let evaluation = inspect_project_candidate(candidate, file, roots, options, &mut budget);
+        if check_project_scan_cancel(cancel).is_err() {
+            return ProjectSelection::Incomplete {
+                metadata_files: consulted_metadata,
+            };
+        }
+        let evaluation = inspect_project_candidate(
+            candidate,
+            file,
+            roots,
+            options,
+            &mut budget,
+            tracker,
+            cancel,
+        );
         if !budget.reserve_metadata_files(evaluation.metadata_files.len()) {
             incomplete = true;
         }
@@ -871,6 +1140,8 @@ fn inspect_project_candidate(
     roots: &[PathBuf],
     options: &ProjectOptions,
     budget: &mut OwnershipProbeBudget,
+    tracker: &mut ProjectReadTracker,
+    cancel: Option<&AtomicBool>,
 ) -> CandidateEvaluation {
     let mut metadata_files = vec![project_file.to_path_buf()];
     match build_project_context(
@@ -881,6 +1152,8 @@ fn inspect_project_candidate(
         Vec::new(),
         false,
         Vec::new(),
+        tracker,
+        cancel,
     ) {
         Ok(context) => {
             for metadata_file in &context.metadata_files {
@@ -893,7 +1166,7 @@ fn inspect_project_candidate(
                     warnings: context.warnings,
                 };
             }
-            let membership = inspect_source_membership(&context, budget);
+            let membership = inspect_source_membership(&context, budget, tracker, cancel);
             for metadata_file in &membership.metadata_files {
                 add_unique_path(&mut metadata_files, metadata_file.clone());
             }
@@ -940,6 +1213,8 @@ struct SourceMembershipInspection {
 fn inspect_source_membership(
     context: &ProjectContext,
     budget: &mut OwnershipProbeBudget,
+    tracker: &mut ProjectReadTracker,
+    cancel: Option<&AtomicBool>,
 ) -> SourceMembershipInspection {
     let mut inspection = SourceMembershipInspection {
         complete: true,
@@ -954,6 +1229,11 @@ fn inspect_source_membership(
     let mut cursor = 0;
 
     while let Some(source_path) = pending.get(cursor).cloned() {
+        if check_project_scan_cancel(cancel).is_err() {
+            inspection.complete = false;
+            inspection.warnings.push("request cancelled".to_string());
+            break;
+        }
         cursor += 1;
         if !queued.insert(source_path.clone()) {
             continue;
@@ -989,11 +1269,8 @@ fn inspect_source_membership(
             ));
             break;
         }
-        let contents = match fs::read(&source_path)
-            .map_err(|error| format!("could not read file: {error}"))
-            .and_then(|bytes| {
-                String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))
-            }) {
+        let contents = match read_bounded_with_tracker(&source_path, MAX_MAIN_SOURCE_BYTES, tracker)
+        {
             Ok(contents) => contents,
             Err(error) => {
                 inspection.complete = false;
@@ -1023,6 +1300,11 @@ fn inspect_source_membership(
             continue;
         };
         for (_, raw_path) in parsed.explicit_paths {
+            if check_project_scan_cancel(cancel).is_err() {
+                inspection.complete = false;
+                inspection.warnings.push("request cancelled".to_string());
+                break;
+            }
             if is_compiled_reference(&raw_path) {
                 continue;
             }
@@ -1185,6 +1467,7 @@ fn fallback_main_source(project_file: &Path, warnings: &mut Vec<String>) -> Opti
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_project_context(
     project_file: PathBuf,
     file: &Path,
@@ -1193,14 +1476,18 @@ fn build_project_context(
     warnings: Vec<String>,
     explicit: bool,
     consulted_metadata_files: Vec<PathBuf>,
+    tracker: &mut ProjectReadTracker,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ProjectContext, String> {
+    check_project_scan_cancel(cancel)?;
     let project_dir = project_file
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let mut builder = ProjectBuilder::new(options, warnings, project_dir.clone());
     let project_is_dproj = extension_is(&project_file, "dproj");
     if project_is_dproj {
-        builder.process_root_dproj(&project_file)?;
+        builder.process_root_dproj(&project_file, tracker)?;
+        check_project_scan_cancel(cancel)?;
     }
 
     let main_source = if project_is_dproj {
@@ -1238,6 +1525,7 @@ fn build_project_context(
     add_unique_path(&mut search_paths, project_dir.clone());
     if let Some(search_path) = builder.property("dcc_unitsearchpath") {
         for item in search_path.split(';') {
+            check_project_scan_cancel(cancel)?;
             add_resolved_search_path(
                 item,
                 &project_dir,
@@ -1251,6 +1539,7 @@ fn build_project_context(
     let mut include_paths = Vec::new();
     if let Some(include_path) = builder.property("dcc_includepath") {
         for item in include_path.split(';') {
+            check_project_scan_cancel(cancel)?;
             add_resolved_search_path(
                 item,
                 &project_dir,
@@ -1265,6 +1554,7 @@ fn build_project_context(
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| project_dir.clone());
     for item in &options.source_paths {
+        check_project_scan_cancel(cancel)?;
         add_resolved_search_path(
             item,
             &option_base,
@@ -1276,9 +1566,16 @@ fn build_project_context(
 
     let mut explicit_units = HashMap::new();
     if let Some(main_source) = &main_source {
-        add_explicit_units_from_source(main_source, &mut explicit_units, &mut builder.warnings);
+        check_project_scan_cancel(cancel)?;
+        add_explicit_units_from_source(
+            main_source,
+            &mut explicit_units,
+            &mut builder.warnings,
+            tracker,
+        );
     }
     for reference in &builder.references {
+        check_project_scan_cancel(cancel)?;
         if is_compiled_reference(&reference.include) {
             continue;
         }
@@ -1324,6 +1621,7 @@ fn build_project_context(
         }
     }
     for metadata_file in consulted_metadata_files {
+        check_project_scan_cancel(cancel)?;
         if !metadata_files.iter().any(|path| path == &metadata_file) {
             metadata_files.push(metadata_file);
         }
@@ -1355,7 +1653,9 @@ fn build_standalone_context(
     mut warnings: Vec<String>,
     discovery_complete: bool,
     metadata_files: Vec<PathBuf>,
-) -> ProjectContext {
+    cancel: Option<&AtomicBool>,
+) -> Result<ProjectContext, String> {
+    check_project_scan_cancel(cancel)?;
     let mut search_paths = Vec::new();
     if let Some(parent) = file.parent() {
         if let Some(actual) = resolve_existing_path(parent, &mut warnings, "source directory") {
@@ -1371,6 +1671,7 @@ fn build_standalone_context(
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_default();
     for item in &options.source_paths {
+        check_project_scan_cancel(cancel)?;
         add_resolved_search_path(
             item,
             &option_base,
@@ -1380,7 +1681,7 @@ fn build_standalone_context(
         );
     }
 
-    ProjectContext {
+    Ok(ProjectContext {
         discovery_complete,
         project_file: None,
         main_source: None,
@@ -1395,7 +1696,7 @@ fn build_standalone_context(
         packages: Vec::new(),
         metadata_files,
         warnings,
-    }
+    })
 }
 
 fn project_context_warnings_incomplete(warnings: &[String], explicit: bool) -> bool {
@@ -1572,8 +1873,9 @@ fn add_explicit_units_from_source(
     source_path: &Path,
     units: &mut HashMap<String, Vec<PathBuf>>,
     warnings: &mut Vec<String>,
+    tracker: &mut ProjectReadTracker,
 ) {
-    let contents = match read_bounded(source_path, MAX_MAIN_SOURCE_BYTES) {
+    let contents = match read_bounded_with_tracker(source_path, MAX_MAIN_SOURCE_BYTES, tracker) {
         Ok(contents) => contents,
         Err(error) => {
             warnings.push(format!(
@@ -1793,36 +2095,92 @@ fn is_compiled_reference(raw: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("dcp"))
 }
 
-fn read_bounded(path: &Path, limit: u64) -> Result<String, String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("could not stat file: {error}"))?;
-    if metadata.len() > limit {
+#[derive(Debug)]
+struct BoundedRead {
+    stamp: ProjectReadStamp,
+    bytes: Vec<u8>,
+}
+
+fn read_bounded_with_tracker(
+    path: &Path,
+    limit: u64,
+    tracker: &mut ProjectReadTracker,
+) -> Result<String, String> {
+    let read = read_bounded_bytes(path, limit)?;
+    let text =
+        String::from_utf8(read.bytes).map_err(|error| format!("file is not UTF-8: {error}"))?;
+    tracker.record(path, read.stamp, text.as_bytes());
+    Ok(text)
+}
+
+fn read_bounded_bytes(path: &Path, limit: u64) -> Result<BoundedRead, String> {
+    let stamp = project_read_stamp(path)?;
+    if stamp.bytes > limit {
         return Err(format!(
             "file is {} bytes, exceeding the {} byte safety limit",
-            metadata.len(),
-            limit
+            stamp.bytes, limit
         ));
     }
     let bytes = fs::read(path).map_err(|error| format!("could not read file: {error}"))?;
-    String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))
+    run_after_project_read(path);
+    Ok(BoundedRead { stamp, bytes })
 }
 
-pub(crate) fn read_package_metadata(path: &Path) -> Result<PackageMetadata, String> {
-    let contents = read_bounded(path, MAX_PACKAGE_METADATA_BYTES).map_err(|error| {
-        format!(
-            "could not read package metadata {}: {error}",
+fn project_read_stamp(path: &Path) -> Result<ProjectReadStamp, String> {
+    let link_metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("could not stat file: {error}"))?;
+    let is_symlink = link_metadata.file_type().is_symlink();
+    let metadata = if is_symlink {
+        fs::metadata(path).map_err(|error| format!("could not stat file: {error}"))?
+    } else {
+        link_metadata
+    };
+    Ok(ProjectReadStamp {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        is_dir: metadata.is_dir(),
+        is_symlink,
+    })
+}
+
+fn project_content_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.write_usize(bytes.len());
+    hasher.finish()
+}
+
+fn is_pascal_source_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("pas")
+            || extension.eq_ignore_ascii_case("dpr")
+            || extension.eq_ignore_ascii_case("dpk")
+    })
+}
+
+pub(crate) fn read_package_metadata(path: &Path) -> Result<PackageMetadataRead, String> {
+    let mut tracker = ProjectReadTracker::default();
+    let contents = read_bounded_with_tracker(path, MAX_PACKAGE_METADATA_BYTES, &mut tracker)
+        .map_err(|error| {
+            format!(
+                "could not read package metadata {}: {error}",
+                path.display()
+            )
+        })?;
+    let metadata = if extension_is(path, "dpk") {
+        parse_dpk_metadata(path, &contents)
+    } else if extension_is(path, "dproj") {
+        parse_dproj_package_metadata(path, &contents, &mut tracker)
+    } else {
+        Err(format!(
+            "unsupported package descriptor extension: {}",
             path.display()
-        )
-    })?;
-    if extension_is(path, "dpk") {
-        return parse_dpk_metadata(path, &contents);
-    }
-    if extension_is(path, "dproj") {
-        return parse_dproj_package_metadata(path, &contents);
-    }
-    Err(format!(
-        "unsupported package descriptor extension: {}",
-        path.display()
-    ))
+        ))
+    }?;
+    Ok(PackageMetadataRead {
+        metadata,
+        observations: tracker.observations,
+    })
 }
 
 fn parse_dpk_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, String> {
@@ -1856,7 +2214,11 @@ fn parse_dpk_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, St
     Ok(metadata)
 }
 
-fn parse_dproj_package_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, String> {
+fn parse_dproj_package_metadata(
+    path: &Path,
+    contents: &str,
+    tracker: &mut ProjectReadTracker,
+) -> Result<PackageMetadata, String> {
     let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut builder = ProjectBuilder::new(
         &ProjectOptions::default(),
@@ -1864,7 +2226,7 @@ fn parse_dproj_package_metadata(path: &Path, contents: &str) -> Result<PackageMe
         project_dir.to_path_buf(),
     );
     let operations = parse_xml_operations(contents, path)?;
-    builder.process_operations(operations, path);
+    builder.process_operations(operations, path, tracker);
 
     let Some(main_source) = builder.property("mainsource") else {
         return Err(format!(
@@ -2031,16 +2393,25 @@ impl ProjectBuilder {
         self.properties.get(&name.to_ascii_lowercase()).cloned()
     }
 
-    fn process_root_dproj(&mut self, path: &Path) -> Result<(), String> {
+    fn process_root_dproj(
+        &mut self,
+        path: &Path,
+        tracker: &mut ProjectReadTracker,
+    ) -> Result<(), String> {
         self.metadata_files.push(path.to_path_buf());
-        let contents = read_bounded(path, MAX_PROJECT_BYTES)
+        let contents = read_bounded_with_tracker(path, MAX_PROJECT_BYTES, tracker)
             .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
         let operations = parse_xml_operations(&contents, path)?;
-        self.process_operations(operations, path);
+        self.process_operations(operations, path, tracker);
         Ok(())
     }
 
-    fn process_operations(&mut self, operations: Vec<XmlOperation>, source_file: &Path) {
+    fn process_operations(
+        &mut self,
+        operations: Vec<XmlOperation>,
+        source_file: &Path,
+        tracker: &mut ProjectReadTracker,
+    ) {
         let base = source_file.parent().unwrap_or_else(|| Path::new("."));
         for operation in operations {
             match operation {
@@ -2074,7 +2445,9 @@ impl ProjectBuilder {
                         TruthValue::Unknown => self.incomplete = true,
                     }
                 }
-                XmlOperation::Import(import) => self.process_import(import, source_file, base),
+                XmlOperation::Import(import) => {
+                    self.process_import(import, source_file, base, tracker)
+                }
                 XmlOperation::Unsupported(message) => self.warnings.push(message),
             }
         }
@@ -2214,7 +2587,13 @@ impl ProjectBuilder {
         self.unknown_properties.insert(name.to_ascii_lowercase());
     }
 
-    fn process_import(&mut self, import: Import, source_file: &Path, base: &Path) {
+    fn process_import(
+        &mut self,
+        import: Import,
+        source_file: &Path,
+        base: &Path,
+        tracker: &mut ProjectReadTracker,
+    ) {
         if !looks_like_optset(&import.project) {
             self.warnings.push(format!(
                 "ignored non-optset project import in {} (targets are not executed): {}",
@@ -2310,10 +2689,10 @@ impl ProjectBuilder {
             return;
         }
         self.import_count += 1;
-        let result = read_bounded(&path, MAX_IMPORT_BYTES)
+        let result = read_bounded_with_tracker(&path, MAX_IMPORT_BYTES, tracker)
             .and_then(|contents| parse_xml_operations(&contents, &path));
         match result {
-            Ok(operations) => self.process_operations(operations, &path),
+            Ok(operations) => self.process_operations(operations, &path, tracker),
             Err(error) => {
                 self.incomplete = true;
                 self.taint_unknown_import();
@@ -3470,8 +3849,8 @@ fn lex_pascal(source: &str) -> Vec<PascalToken> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_OWNERSHIP_CANDIDATES, MAX_PROJECT_DIRECTORY_ENTRIES, project_candidate_membership,
-        test_cancel_project_scan_after_checks,
+        MAX_OWNERSHIP_CANDIDATES, MAX_PROJECT_DIRECTORY_ENTRIES, ProjectContext, ProjectReadStamp,
+        ProjectReadTracker, project_candidate_membership, test_cancel_project_scan_after_checks,
     };
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -3530,5 +3909,34 @@ mod tests {
         let error = project_candidate_membership(temp.path(), Some(&cancel))
             .expect_err("cancellation during enumeration must abort the observation");
         assert_eq!(error, "request cancelled");
+    }
+
+    #[test]
+    fn project_read_tracker_preserves_the_first_observation() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("App.dproj");
+        let first_stamp = ProjectReadStamp {
+            bytes: 5,
+            modified: None,
+            is_dir: false,
+            is_symlink: false,
+        };
+        let second_stamp = ProjectReadStamp {
+            bytes: 6,
+            modified: None,
+            is_dir: false,
+            is_symlink: false,
+        };
+        let mut tracker = ProjectReadTracker::default();
+        tracker.record(&path, first_stamp.clone(), b"first");
+        tracker.record(&path, second_stamp, b"second");
+
+        let discovery = tracker.into_discovery(ProjectContext::default());
+        assert_eq!(discovery.observations.len(), 1);
+        assert_eq!(discovery.observations[0].stamp, first_stamp);
+        assert_eq!(
+            discovery.observations[0].content_bytes,
+            Some(b"first".to_vec())
+        );
     }
 }

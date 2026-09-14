@@ -1,6 +1,8 @@
 use lsp_types::{Location, Position, PrepareRenameResponse, Range, TextEdit, Url};
 use pascal_lsp::NavigationIndex;
+use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
 use std::collections::HashMap;
+use std::fs;
 
 fn uri(name: &str) -> Url {
     Url::parse(&format!("file:///workspace/{name}.pas")).expect("valid test URI")
@@ -2042,5 +2044,157 @@ end.
         source,
         &edits[&source_uri],
         &source.replacen("Value", "NewValue", 2),
+    );
+}
+
+#[test]
+fn known_inactive_conditional_rename_preserves_utf16_ranges_and_active_edits() {
+    let source = "unit ConditionalUtf16Rename;
+interface
+procedure Run;
+implementation
+procedure Run;
+var
+  Value: Integer;
+begin
+{$UNDEF OFF}
+{$IFDEF OFF}
+  Value := 0;
+{$ENDIF}
+  WriteLn('😀'); Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ConditionalUtf16Rename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value: Integer", 0),
+            "RenamedValue",
+        )
+        .expect("known-inactive conditional rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 0),
+                "RenamedValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Value", 2),
+                "RenamedValue".to_owned(),
+            ),
+        ],
+    );
+    assert_document_after_edits(
+        source,
+        &edits[&source_uri],
+        &source
+            .replacen("Value: Integer", "RenamedValue: Integer", 1)
+            .replacen("Value := 1", "RenamedValue := 1", 1),
+    );
+}
+
+#[test]
+fn rename_skips_an_unresolved_include_in_a_known_inactive_branch() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("ConditionalInclude.pas");
+    let source = "unit ConditionalInclude;\ninterface\n{$UNDEF OFF}\n{$IFDEF OFF}\n{$I Missing.inc}\n{$ENDIF}\nimplementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n  Value := 1;\nend;\nend.\n";
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+    fs::create_dir_all(temp.path()).expect("workspace directory");
+    fs::write(&source_path, source).expect("source");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open conditional source");
+    let edit = workspace
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value: Integer", 0),
+            "RenamedValue",
+            false,
+        )
+        .expect("known-inactive unresolved include must not block a safe rename");
+    let edits = edit.changes.expect("plain workspace edit changes");
+    let edits = edits.get(&source_uri).expect("target edits");
+    assert_eq!(edits.len(), 2);
+    assert_document_after_edits(
+        source,
+        edits,
+        &source
+            .replacen("Value: Integer", "RenamedValue: Integer", 1)
+            .replacen("Value :=", "RenamedValue :=", 1),
+    );
+}
+
+#[test]
+fn active_or_unknown_unresolved_includes_still_block_rename() {
+    for (name, directives) in [
+        (
+            "ActiveInclude",
+            "{$IFDEF ENABLED}\n{$I Missing.inc}\n{$ENDIF}\n",
+        ),
+        (
+            "UnknownInclude",
+            "{$IF CompilerVersion >= 24}\n{$I Missing.inc}\n{$ENDIF}\n",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let source_path = temp.path().join(format!("{name}.pas"));
+        let source = format!(
+            "unit {name};\ninterface\n{directives}implementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n  Value := 1;\nend;\nend.\n"
+        );
+        let source_uri = Url::from_file_path(&source_path).expect("source URI");
+        fs::write(&source_path, &source).expect("source");
+        let mut workspace =
+            Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(source_uri.clone(), source.clone(), 1)
+            .expect("open conditional source");
+        assert!(
+            workspace
+                .rename_edits(
+                    &source_uri,
+                    position_of(&source, "Value: Integer", 0),
+                    "RenamedValue",
+                    false,
+                )
+                .is_err(),
+            "{name} unresolved include must keep rename conservative"
+        );
+    }
+}
+
+#[test]
+fn mixed_boolean_and_comparison_precedence_keeps_the_active_include_audited() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("MixedOperators.pas");
+    let source = "unit MixedOperators;\ninterface\n{$IF True or False = False}\nconst ThenBranch = 1;\n{$ELSE}\n{$I Missing.inc}\n{$ENDIF}\nimplementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n  Value := 1;\nend;\nend.\n";
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+    fs::create_dir_all(temp.path()).expect("workspace directory");
+    fs::write(&source_path, source).expect("source");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open conditional source");
+
+    assert!(
+        workspace
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Value: Integer", 0),
+                "RenamedValue",
+                false,
+            )
+            .is_err(),
+        "Pascal's lower-precedence comparison must leave the ELSE include active"
     );
 }

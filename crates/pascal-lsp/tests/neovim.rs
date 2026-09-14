@@ -326,3 +326,64 @@ fn neovim_standard_symbol_reference_and_highlight_queries() {
         consumer_source.as_bytes()
     );
 }
+
+#[test]
+fn neovim_standard_assistance_requests_use_overlays_without_saving() {
+    if Command::new("nvim").arg("--version").output().is_err() {
+        eprintln!("Neovim integration skipped: nvim is not installed");
+        return;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("pascal lsp neovim assistance ")
+        .tempdir()
+        .unwrap();
+    let provider_source = "unit Provider;\ninterface\ntype\n  TWidget = class\n  private\n    Hidden: Integer;\n  public\n    Member: Integer;\n  end;\nprocedure PublicRoutine(A, B: Integer; C: string; D: Integer); overload;\nprocedure PublicRoutine(A: string); overload;\nimplementation\nprocedure PublicRoutine(A, B: Integer; C: string; D: Integer);\nbegin\nend;\nprocedure PublicRoutine(A: string);\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nvar\n  GlobalName: Integer;\nimplementation\nprocedure Other(X, Y: Integer);\nvar\n  LocalName: Integer;\n  Shadowed: Integer;\nbegin\n  LocalName := X;\nend;\nprocedure Caller;\nvar\n  Obj: TWidget;\n  DiskName: Integer;\nbegin\n  Loc;\n  Obj.Me;\n  PublicRoutine(Other(1, 2), 'a,b', [1,2], 4);\nend;\nend.\n";
+    fs::write(directory.path().join(".lint4d.toml"), "").unwrap();
+    fs::write(directory.path().join("Provider.pas"), provider_source).unwrap();
+    fs::write(directory.path().join("Main.pas"), main_source).unwrap();
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut child = Command::new("nvim")
+        .args(["--headless", "-u", "NONE", "-l"])
+        .arg(manifest.join("tests/neovim_assistance_smoke.lua"))
+        .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
+        .env("PASCAL_LSP_SMOKE_ROOT", directory.path())
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "Neovim assistance smoke timed out: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "Neovim assistance smoke failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NEOVIM_ASSISTANCE_OK"));
+    assert_eq!(
+        fs::read(directory.path().join("Provider.pas")).unwrap(),
+        provider_source.as_bytes()
+    );
+    assert_eq!(
+        fs::read(directory.path().join("Main.pas")).unwrap(),
+        main_source.as_bytes()
+    );
+}

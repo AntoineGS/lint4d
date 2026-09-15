@@ -619,6 +619,7 @@ impl NavigationIndex {
                             accumulator.is_incomplete = true;
                         }
                     }
+                    super::Receiver::Builtin(_) => {}
                 }
                 if accumulator.exhausted {
                     break;
@@ -2986,6 +2987,7 @@ mod tests {
             kind: SymbolKind::Variable,
             type_kind: TypeKind::Other,
             routine_kind: RoutineKind::Procedure,
+            parameter_mode: None,
             scope: 0,
             owner_type: None,
             owner_type_name: None,

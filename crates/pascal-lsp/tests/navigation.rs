@@ -1231,6 +1231,497 @@ end.
 }
 
 #[test]
+fn overload_selection_rejects_properties_and_const_arguments_for_var_and_out() {
+    let source = r#"unit NonAssignableOverloads;
+interface
+type
+  TVarResult = class
+    VarMember: Integer;
+  end;
+  TConstResult = class
+    ConstMember: Integer;
+  end;
+  TOutResult = class
+    OutMember: Integer;
+  end;
+  TWidget = class
+    FValue: Integer;
+    property P: Integer read FValue;
+  end;
+function Pick(var Value: Integer): TVarResult; overload;
+function Pick(const Value: Integer): TConstResult; overload;
+function Store(out Value: Integer): TOutResult; overload;
+function Store(const Value: Integer): TConstResult; overload;
+implementation
+procedure Caller(const C: Integer; Widget: TWidget);
+begin
+  Pick(C).ConstMember;
+  Pick(Widget.P).ConstMember;
+  Store(C).ConstMember;
+  Store(Widget.P).ConstMember;
+end;
+end.
+"#;
+    let source_uri = uri("NonAssignableOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("non-assignable overload source parses");
+
+    for (call, declaration) in [
+        ("Pick(C)", "Pick(const Value: Integer)"),
+        ("Pick(Widget.P)", "Pick(const Value: Integer)"),
+        ("Store(C)", "Store(const Value: Integer)"),
+        ("Store(Widget.P)", "Store(const Value: Integer)"),
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(navigation.len(), 1, "{call} must have one viable overload");
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, declaration, 0),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_requires_exact_types_for_var_and_out_parameters() {
+    let source = r#"unit ExactVarOutTypes;
+interface
+type
+  TGrand = class
+  end;
+  TBase = class(TGrand)
+  end;
+  TChild = class(TBase)
+  end;
+  TGrandResult = class
+    GrandMember: Integer;
+  end;
+  TBaseResult = class
+    BaseMember: Integer;
+  end;
+function Pick(var Value: TBase): TBaseResult; overload;
+function Pick(Value: TGrand): TGrandResult; overload;
+implementation
+procedure Caller(const C: TChild);
+begin
+  Pick(C).GrandMember;
+end;
+end.
+"#;
+    let source_uri = uri("ExactVarOutTypes");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("exact var/out source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(C)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: TGrand)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_resolves_builtins_after_lexical_and_unit_bindings() {
+    let arbitrary = r#"unit ArbitraryInteger;
+interface
+type
+  Integer = class
+  end;
+end.
+"#;
+    let source = r#"unit BuiltinShadowing;
+interface
+uses ArbitraryInteger;
+type
+  Integer = class
+  end;
+  TShadowResult = class
+    ShadowMember: Integer;
+  end;
+  TSystemResult = class
+    SystemMember: Integer;
+  end;
+  TUnitResult = class
+    UnitMember: Integer;
+  end;
+function Pick(Value: Integer): TShadowResult; overload;
+function Pick(Value: System.Integer): TSystemResult; overload;
+function UnitPick(Value: ArbitraryInteger.Integer): TUnitResult; overload;
+function UnitPick(Value: System.Integer): TSystemResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(1).SystemMember;
+  UnitPick(1).SystemMember;
+end;
+end.
+"#;
+    let arbitrary_uri = uri("ArbitraryInteger");
+    let source_uri = uri("BuiltinShadowing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(arbitrary_uri, arbitrary.to_owned())
+        .expect("arbitrary integer source parses");
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("builtin shadowing source parses");
+
+    for call in ["Pick(1)", "UnitPick(1)"] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(navigation.len(), 1, "{call} must select System.Integer");
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(
+                source,
+                if call == "Pick(1)" {
+                    "Pick(Value: System.Integer)"
+                } else {
+                    "UnitPick(Value: System.Integer)"
+                },
+                0,
+            ),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_parses_radix_literals_before_exponents() {
+    let source = r#"unit RadixOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TRealResult = class
+    RealMember: Integer;
+  end;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: Real): TRealResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick($FE).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("RadixOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("radix overload source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick($FE)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_distinguishes_string_fragments_from_characters() {
+    let source = r#"unit LiteralFragments;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+implementation
+procedure Caller(CharValue: Char);
+begin
+  Pick('A'#66).StringMember;
+  Pick(#65).IntMember;
+  Pick(CharValue).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("LiteralFragments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("literal fragment source parses");
+
+    let string_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick('A'#66)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(string_navigation.len(), 1);
+    assert_location_start(
+        &string_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: string)", 0),
+    );
+
+    for call in ["Pick(#65)", "Pick(CharValue)"] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            navigation.len(),
+            1,
+            "{call} must use character-to-integer widening"
+        );
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, "Pick(Value: Integer)", 0),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_keeps_unsupported_integer_aliases_unknown() {
+    let source = r#"unit IntegerAliasOverloads;
+interface
+type
+  TNum = Integer;
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+implementation
+procedure Caller(Number: TNum);
+begin
+  Pick(Number).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("IntegerAliasOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("integer alias source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(Number)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        navigation.len(),
+        2,
+        "an unsupported integer alias relationship must remain ambiguous"
+    );
+}
+
+#[test]
+fn overload_selection_preserves_integer_width_and_literal_ranges() {
+    let source = r#"unit IntegerKinds;
+interface
+type
+  TByteResult = class
+    ByteMember: Integer;
+  end;
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TInt64Result = class
+    Int64Member: Integer;
+  end;
+function RangePick(Value: Byte): TByteResult; overload;
+function RangePick(Value: Integer): TIntResult; overload;
+function WidthPick(Value: Integer): TIntResult; overload;
+function WidthPick(Value: Int64): TInt64Result; overload;
+implementation
+procedure Caller(Number: Integer; Wide: Int64);
+begin
+  RangePick(1000).IntMember;
+  WidthPick(Number).IntMember;
+  WidthPick(Wide).Int64Member;
+end;
+end.
+"#;
+    let source_uri = uri("IntegerKinds");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("integer kinds source parses");
+
+    for (call, declaration) in [
+        ("RangePick(1000)", "RangePick(Value: Integer)"),
+        ("WidthPick(Number)", "WidthPick(Value: Integer)"),
+        ("WidthPick(Wide)", "WidthPick(Value: Int64)"),
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            navigation.len(),
+            1,
+            "{call} must select one integer-kind overload"
+        );
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, declaration, 0),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_does_not_charge_omitted_defaults_as_conversion_cost() {
+    let source = r#"unit DefaultCosts;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TRealResult = class
+    RealMember: Integer;
+  end;
+function Pick(Value: Real): TRealResult; overload;
+function Pick(Value: Integer; Extra: Integer = 0): TIntResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(1).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("DefaultCosts");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("default cost source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer; Extra", 0),
+    );
+}
+
+#[test]
+fn overload_selection_extends_method_overloads_through_inheritance() {
+    let source = r#"unit ExtendedMethodOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TDoubleResult = class
+    DoubleMember: Integer;
+  end;
+  TBase = class
+    function Pick(Value: Integer): TIntResult; overload;
+  end;
+  TChild = class(TBase)
+    function Pick(Value: Double): TDoubleResult; overload;
+  end;
+implementation
+procedure Caller(Value: TChild);
+begin
+  Value.Pick(1).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("ExtendedMethodOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("extended method overload source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_infers_primitive_nested_call_results() {
+    let source = r#"unit PrimitiveNestedResults;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+function GetInt: Integer;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+implementation
+function GetInt: Integer;
+begin
+  Result := 1;
+end;
+procedure Caller;
+begin
+  Pick(GetInt()).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("PrimitiveNestedResults");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("primitive nested result source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(GetInt())", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 0),
+    );
+}
+
+#[test]
 fn overload_selection_preserves_cross_unit_type_identity() {
     const FIRST: &str = r#"unit DistinctFirst;
 interface

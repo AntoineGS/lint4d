@@ -1,7 +1,8 @@
 use super::{
-    AncestryResolutionState, AncestryStatus, AssistanceBudget, Candidate, Document,
-    NavigationIndex, Origin, ParameterMode, Receiver, Region, ResolutionState, RoutineParameter,
-    Span, Symbol, SymbolKind, TypeKind, assistance, canonical_name, check_navigation_cancel,
+    AncestryResolutionState, AncestryStatus, AssistanceBudget, BuiltinType, Candidate, Document,
+    IntegerKind, NavigationIndex, Origin, ParameterMode, Receiver, Region, ResolutionState,
+    RoutineParameter, Span, Symbol, SymbolKind, TypeKind, assistance, canonical_name,
+    check_navigation_cancel,
 };
 use lsp_types::Url;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,17 +25,9 @@ pub(super) struct Selection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum BuiltinType {
-    Integer,
-    Real,
-    String,
-    Character,
-    Boolean,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeIdentity {
     Builtin(BuiltinType),
+    IntegerLiteral(i128),
     Named {
         uri: Url,
         key: String,
@@ -307,7 +300,7 @@ fn score_group(
         return Ok(None);
     }
 
-    let mut cost = parameters.len().saturating_sub(arguments.len()) as u32;
+    let mut cost: u32 = 0;
     let mut uncertain = false;
     for (argument, parameter) in arguments.iter().zip(parameters) {
         check_navigation_cancel(cancel)?;
@@ -336,10 +329,16 @@ fn score_group(
         match (&argument.ty, expected) {
             (None, _) | (_, None) => uncertain = true,
             (Some(actual), Some(expected)) => {
-                match conversion(index, actual, &expected, ancestry, cancel, budget)? {
-                    Conversion::Cost(value) => cost = cost.saturating_add(value),
-                    Conversion::Unknown => uncertain = true,
-                    Conversion::Incompatible => return Ok(None),
+                if matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out) {
+                    if !exact_type_match(actual, &expected) {
+                        return Ok(None);
+                    }
+                } else {
+                    match conversion(index, actual, &expected, ancestry, cancel, budget)? {
+                        Conversion::Cost(value) => cost = cost.saturating_add(value),
+                        Conversion::Unknown => uncertain = true,
+                        Conversion::Incompatible => return Ok(None),
+                    }
                 }
             }
         }
@@ -360,9 +359,6 @@ fn parameter_type(
     let Some(type_name) = parameter.type_name.as_deref() else {
         return Ok(None);
     };
-    if let Some(builtin) = builtin_type(type_name) {
-        return Ok(Some(TypeIdentity::Builtin(builtin)));
-    }
     let Some(document) = index.documents.get(&candidate.uri) else {
         return Ok(None);
     };
@@ -377,7 +373,7 @@ fn parameter_type(
         "overload selection",
     )?
     else {
-        return Ok(None);
+        return Ok(builtin_type(type_name).map(TypeIdentity::Builtin));
     };
     let receivers = index.type_receivers_for_path_with_budget_at_scope(
         &candidate.uri,
@@ -407,24 +403,16 @@ fn infer_argument(
     let kind = node.kind();
     if matches!(kind, "literalNumber") {
         let text = node_text(index, current_document, node, cancel, budget)?;
-        let builtin = if text.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
-            BuiltinType::Real
-        } else {
-            BuiltinType::Integer
-        };
+        let ty = infer_numeric_literal(&text);
         return Ok(ArgumentInfo {
-            ty: Some(TypeIdentity::Builtin(builtin)),
+            ty: Some(ty),
             assignable: false,
             nil_literal: false,
         });
     }
     if matches!(kind, "literalString" | "literalChar") {
-        let is_character = kind == "literalChar"
-            || (kind == "literalString"
-                && node.named_child_count() == 1
-                && node
-                    .named_child(0)
-                    .is_some_and(|child| child.kind() == "literalChar"));
+        let text = node_text(index, current_document, node, cancel, budget)?;
+        let is_character = kind == "literalChar" || text.trim_start().starts_with('#');
         return Ok(ArgumentInfo {
             ty: Some(TypeIdentity::Builtin(if is_character {
                 BuiltinType::Character
@@ -449,49 +437,38 @@ fn infer_argument(
             nil_literal: true,
         });
     }
-    if kind == "exprParens" {
-        return node
-            .named_child(0)
-            .map(|child| {
-                infer_argument(
-                    index,
-                    current_uri,
-                    current_document,
-                    child,
-                    state,
-                    depth,
-                    cancel,
-                    budget,
-                )
-            })
-            .unwrap_or_else(|| {
-                Ok(ArgumentInfo {
-                    ty: None,
-                    assignable: false,
-                    nil_literal: false,
-                })
-            });
+    let mut node = node;
+    let mut force_non_assignable = false;
+    loop {
+        check_navigation_cancel(cancel)?;
+        if node.kind() == "exprParens" {
+            let Some(operand) = node.named_child(0) else {
+                return Ok(unknown_argument());
+            };
+            budget.require_work(1, cancel)?;
+            node = operand;
+            continue;
+        }
+        if node.kind() == "exprUnary" {
+            let Some(operand) = node.named_child(0) else {
+                return Ok(unknown_argument());
+            };
+            budget.require_work(1, cancel)?;
+            force_non_assignable = true;
+            node = operand;
+            continue;
+        }
+        break;
     }
-    if kind == "exprUnary" {
-        let Some(operand) = node.named_child(0) else {
-            return Ok(ArgumentInfo {
-                ty: None,
-                assignable: false,
-                nil_literal: false,
-            });
-        };
-        let mut result = infer_argument(
-            index,
-            current_uri,
-            current_document,
-            operand,
-            state,
-            depth,
-            cancel,
-            budget,
-        )?;
-        result.assignable = false;
-        return Ok(result);
+    let kind = node.kind();
+    if matches!(kind, "literalNumber") {
+        let text = node_text(index, current_document, node, cancel, budget)?;
+        let ty = infer_numeric_literal(&text);
+        return Ok(ArgumentInfo {
+            ty: Some(ty),
+            assignable: false,
+            nil_literal: false,
+        });
     }
     if kind == "exprCall" || kind == "exprAs" {
         let receivers = index.resolve_receivers_with_state_and_budget(
@@ -529,18 +506,12 @@ fn infer_argument(
         cancel,
         budget,
     )?;
-    let assignable = candidates.iter().any(|candidate| {
-        index.symbol(candidate).is_some_and(|symbol| {
-            matches!(
-                symbol.kind,
-                SymbolKind::Variable
-                    | SymbolKind::Parameter
-                    | SymbolKind::Field
-                    | SymbolKind::Property
-            )
-        })
-    }) || node_text(index, current_document, identifier, cancel, budget)?
-        .eq_ignore_ascii_case("Result");
+    let assignable = !force_non_assignable
+        && (candidates
+            .iter()
+            .any(|candidate| index.symbol(candidate).is_some_and(is_assignable_symbol))
+            || node_text(index, current_document, identifier, cancel, budget)?
+                .eq_ignore_ascii_case("Result"));
 
     if candidates
         .iter()
@@ -587,6 +558,105 @@ fn infer_argument(
     })
 }
 
+fn unknown_argument() -> ArgumentInfo {
+    ArgumentInfo {
+        ty: None,
+        assignable: false,
+        nil_literal: false,
+    }
+}
+
+fn is_assignable_symbol(symbol: &Symbol) -> bool {
+    match symbol.kind {
+        SymbolKind::Variable | SymbolKind::Field => true,
+        SymbolKind::Parameter => matches!(
+            symbol.parameter_mode,
+            Some(ParameterMode::Var | ParameterMode::Out)
+        ),
+        // Properties are deliberately treated as non-assignable.  Their
+        // accessor metadata cannot prove that the property has a writable
+        // setter, and passing a read-only property to var/out must never
+        // select the mutating overload.
+        SymbolKind::Property => false,
+        _ => false,
+    }
+}
+
+fn exact_type_match(actual: &TypeIdentity, expected: &TypeIdentity) -> bool {
+    match (actual, expected) {
+        (TypeIdentity::Builtin(actual), TypeIdentity::Builtin(expected)) => actual == expected,
+        (
+            TypeIdentity::Named {
+                uri: actual_uri,
+                key: actual_key,
+                ..
+            },
+            TypeIdentity::Named {
+                uri: expected_uri,
+                key: expected_key,
+                ..
+            },
+        ) => actual_uri == expected_uri && actual_key == expected_key,
+        _ => false,
+    }
+}
+
+fn infer_numeric_literal(text: &str) -> TypeIdentity {
+    let text = text.trim();
+    if is_radix_integer(text) {
+        return parse_integer_literal(text)
+            .map(TypeIdentity::IntegerLiteral)
+            .unwrap_or(TypeIdentity::Builtin(BuiltinType::Integer(
+                IntegerKind::Literal,
+            )));
+    }
+    if text.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        return TypeIdentity::Builtin(BuiltinType::Real);
+    }
+    parse_integer_literal(text)
+        .map(TypeIdentity::IntegerLiteral)
+        .unwrap_or(TypeIdentity::Builtin(BuiltinType::Integer(
+            IntegerKind::Literal,
+        )))
+}
+
+fn is_radix_integer(text: &str) -> bool {
+    let text = text
+        .strip_prefix('+')
+        .or_else(|| text.strip_prefix('-'))
+        .unwrap_or(text);
+    text.starts_with('$') || text.starts_with('%')
+}
+
+fn parse_integer_literal(text: &str) -> Option<i128> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (radix, digits) = if let Some(rest) = digits.strip_prefix('$') {
+        (16, rest)
+    } else if let Some(rest) = digits.strip_prefix('%') {
+        (2, rest)
+    } else {
+        (10, digits)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let value = u128::from_str_radix(digits, radix).ok()?;
+    if negative {
+        (value <= (i128::MAX as u128).saturating_add(1)).then(|| {
+            if value == (i128::MAX as u128).saturating_add(1) {
+                i128::MIN
+            } else {
+                -(value as i128)
+            }
+        })
+    } else {
+        i128::try_from(value).ok()
+    }
+}
+
 fn expression_identifier(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() == "identifier" {
         return Some(node);
@@ -611,9 +681,6 @@ fn symbol_type(
     let Some(type_name) = symbol.type_name.as_deref() else {
         return Ok(None);
     };
-    if let Some(builtin) = builtin_type(type_name) {
-        return Ok(Some(TypeIdentity::Builtin(builtin)));
-    }
     let Some(document) = index.documents.get(&candidate.uri) else {
         return Ok(None);
     };
@@ -625,7 +692,7 @@ fn symbol_type(
         "overload selection",
     )?
     else {
-        return Ok(None);
+        return Ok(builtin_type(type_name).map(TypeIdentity::Builtin));
     };
     let receivers = index.type_receivers_for_path_with_budget_at_scope(
         &candidate.uri,
@@ -647,13 +714,16 @@ fn receiver_type(
 ) -> Result<Option<TypeIdentity>, String> {
     let mut result = None;
     for receiver in receivers {
-        let Receiver::Type(uri, key, _) = receiver else {
-            return Ok(None);
+        let identity = match receiver {
+            Receiver::Builtin(builtin) => TypeIdentity::Builtin(builtin),
+            Receiver::Type(uri, key, _) => {
+                let Some(kind) = index.type_kind(&uri, &key) else {
+                    return Ok(None);
+                };
+                TypeIdentity::Named { uri, key, kind }
+            }
+            Receiver::Unit(_) => return Ok(None),
         };
-        let Some(kind) = index.type_kind(&uri, &key) else {
-            return Ok(None);
-        };
-        let identity = TypeIdentity::Named { uri, key, kind };
         if result.as_ref().is_some_and(|current| current != &identity) {
             return Ok(None);
         }
@@ -662,17 +732,30 @@ fn receiver_type(
     Ok(result)
 }
 
-fn builtin_type(name: &str) -> Option<BuiltinType> {
-    let name = name
-        .rsplit('.')
-        .next()
-        .map(canonical_name)
-        .unwrap_or_default();
+pub(super) fn builtin_type(name: &str) -> Option<BuiltinType> {
+    let parts = name
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let first = parts.first()?;
+    let name = parts.last()?;
+    if parts.len() > 1 && !first.eq_ignore_ascii_case("System") {
+        return None;
+    }
+    let name = canonical_name(name);
     match name.as_str() {
-        "integer" | "shortint" | "smallint" | "byte" | "word" | "longint" | "int64"
-        | "cardinal" | "longword" | "nativeint" | "uint64" | "nativeuint" => {
-            Some(BuiltinType::Integer)
-        }
+        "integer" => Some(BuiltinType::Integer(IntegerKind::Integer)),
+        "shortint" => Some(BuiltinType::Integer(IntegerKind::ShortInt)),
+        "smallint" => Some(BuiltinType::Integer(IntegerKind::SmallInt)),
+        "byte" => Some(BuiltinType::Integer(IntegerKind::Byte)),
+        "word" => Some(BuiltinType::Integer(IntegerKind::Word)),
+        "longint" => Some(BuiltinType::Integer(IntegerKind::LongInt)),
+        "int64" => Some(BuiltinType::Integer(IntegerKind::Int64)),
+        "cardinal" => Some(BuiltinType::Integer(IntegerKind::Cardinal)),
+        "longword" => Some(BuiltinType::Integer(IntegerKind::LongWord)),
+        "nativeint" => Some(BuiltinType::Integer(IntegerKind::NativeInt)),
+        "uint64" => Some(BuiltinType::Integer(IntegerKind::UInt64)),
+        "nativeuint" => Some(BuiltinType::Integer(IntegerKind::NativeUInt)),
         "real" | "real48" | "single" | "double" | "extended" | "currency" | "comp" => {
             Some(BuiltinType::Real)
         }
@@ -682,6 +765,45 @@ fn builtin_type(name: &str) -> Option<BuiltinType> {
         "char" | "ansichar" | "widechar" => Some(BuiltinType::Character),
         "boolean" | "bytebool" | "wordbool" | "longbool" => Some(BuiltinType::Boolean),
         _ => None,
+    }
+}
+
+fn integer_literal_conversion(value: i128, expected: IntegerKind) -> Conversion {
+    integer_range(expected).map_or(Conversion::Unknown, |(minimum, maximum)| {
+        if (minimum..=maximum).contains(&value) {
+            Conversion::Cost(0)
+        } else {
+            Conversion::Incompatible
+        }
+    })
+}
+
+fn integer_conversion(actual: IntegerKind, expected: IntegerKind) -> Conversion {
+    if actual == expected {
+        return Conversion::Cost(0);
+    }
+    match (integer_range(actual), integer_range(expected)) {
+        (Some((actual_minimum, actual_maximum)), Some((expected_minimum, expected_maximum)))
+            if expected_minimum <= actual_minimum && actual_maximum <= expected_maximum =>
+        {
+            Conversion::Cost(1)
+        }
+        (Some(_), Some(_)) => Conversion::Incompatible,
+        _ => Conversion::Unknown,
+    }
+}
+
+fn integer_range(kind: IntegerKind) -> Option<(i128, i128)> {
+    match kind {
+        IntegerKind::Literal => None,
+        IntegerKind::ShortInt => Some((i8::MIN as i128, i8::MAX as i128)),
+        IntegerKind::SmallInt => Some((i16::MIN as i128, i16::MAX as i128)),
+        IntegerKind::Integer | IntegerKind::LongInt => Some((i32::MIN as i128, i32::MAX as i128)),
+        IntegerKind::Byte => Some((u8::MIN as i128, u8::MAX as i128)),
+        IntegerKind::Word => Some((u16::MIN as i128, u16::MAX as i128)),
+        IntegerKind::Cardinal | IntegerKind::LongWord => Some((u32::MIN as i128, u32::MAX as i128)),
+        IntegerKind::Int64 | IntegerKind::NativeInt => Some((i64::MIN as i128, i64::MAX as i128)),
+        IntegerKind::UInt64 | IntegerKind::NativeUInt => Some((0, u64::MAX as i128)),
     }
 }
 
@@ -695,12 +817,20 @@ fn conversion(
     budget: &mut AssistanceBudget,
 ) -> Result<Conversion, String> {
     match (actual, expected) {
+        (TypeIdentity::IntegerLiteral(value), TypeIdentity::Builtin(expected)) => match expected {
+            BuiltinType::Integer(kind) => Ok(integer_literal_conversion(*value, *kind)),
+            BuiltinType::Real => Ok(Conversion::Cost(1)),
+            _ => Ok(Conversion::Incompatible),
+        },
         (TypeIdentity::Builtin(actual), TypeIdentity::Builtin(expected)) => {
             let result = match (actual, expected) {
                 (left, right) if left == right => Conversion::Cost(0),
-                (BuiltinType::Integer, BuiltinType::Real)
-                | (BuiltinType::Character, BuiltinType::Integer) => Conversion::Cost(1),
+                (BuiltinType::Integer(_), BuiltinType::Real)
+                | (BuiltinType::Character, BuiltinType::Integer(_)) => Conversion::Cost(1),
                 (BuiltinType::Character, BuiltinType::Real) => Conversion::Cost(2),
+                (BuiltinType::Integer(actual), BuiltinType::Integer(expected)) => {
+                    integer_conversion(*actual, *expected)
+                }
                 _ => Conversion::Incompatible,
             };
             Ok(result)
@@ -744,8 +874,22 @@ fn conversion(
             Upcast::No => Ok(Conversion::Incompatible),
             Upcast::Unknown => Ok(Conversion::Unknown),
         },
+        (TypeIdentity::Builtin(_), TypeIdentity::Named { kind, .. })
+        | (TypeIdentity::Named { kind, .. }, TypeIdentity::Builtin(_))
+            if matches!(kind, TypeKind::Other | TypeKind::String) =>
+        {
+            Ok(Conversion::Unknown)
+        }
         (TypeIdentity::Builtin(_), TypeIdentity::Named { .. })
         | (TypeIdentity::Named { .. }, TypeIdentity::Builtin(_)) => Ok(Conversion::Incompatible),
+        (TypeIdentity::IntegerLiteral(_), TypeIdentity::IntegerLiteral(_)) => {
+            Ok(Conversion::Unknown)
+        }
+        (TypeIdentity::IntegerLiteral(_), TypeIdentity::Named { .. })
+        | (TypeIdentity::Named { .. }, TypeIdentity::IntegerLiteral(_))
+        | (TypeIdentity::Builtin(_), TypeIdentity::IntegerLiteral(_)) => {
+            Ok(Conversion::Incompatible)
+        }
     }
 }
 

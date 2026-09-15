@@ -1659,6 +1659,53 @@ fn deep_method_receiver_completion_stays_stack_safe_and_keeps_server_responsive(
 }
 
 #[test]
+fn deeply_parenthesized_overload_request_survives_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepParenthesizedOverload.pas");
+    let mut argument = String::new();
+    for _ in 0..65_536 {
+        argument.push('(');
+    }
+    argument.push('1');
+    for _ in 0..65_536 {
+        argument.push(')');
+    }
+    let source = format!(
+        "unit DeepParenthesizedOverload;\ninterface\ntype\n  TIntResult = class\n    IntMember: Integer;\n  end;\n  TStringResult = class\n    StringMember: Integer;\n  end;\nfunction Pick(Value: Integer): TIntResult; overload;\nfunction Pick(Value: string): TStringResult; overload;\nimplementation\nprocedure Caller;\nbegin\n  Pick({argument}).IntMember;\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let definition_id = RequestId::from("deep-parenthesized-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &source, "Pick(", 0),
+    );
+    let definition = result_locations(server.response(&definition_id));
+    assert_eq!(
+        definition.len(),
+        1,
+        "deep parenthesized integer call must resolve"
+    );
+
+    let responsive_id = RequestId::from("deep-parenthesized-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep parenthesized overload selection: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn completion_request_marks_unqualified_unknown_ancestry_incomplete() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("UnknownUnqualifiedProtocol.pas");

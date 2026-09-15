@@ -141,7 +141,15 @@ selection as completion and navigation.
 
 Overload matching is intentionally conservative and source-based. It recognizes
 Delphi built-in integer, real, string, character, Boolean, and `nil` literals,
-typed variables/parameters, defaults, and `var`/`out` lvalue requirements.
+including radix integers and concatenated string fragments, typed
+variables/parameters, defaults, and `var`/`out` lvalue requirements. Integer
+literal ranges and declared integer widths are preserved; `var`/`out` matches
+require an exact known type and a writable argument, while omitted defaults do
+not make an otherwise less-specific overload win. Inherited routine overloads
+are considered alongside direct methods, but direct fields and properties still
+shadow inherited members. Deep parenthesized arguments are traversed
+iteratively under the existing work/byte budgets and honor request
+cancellation.
 Explicit named types retain their declaring-unit identity, so same-spelled types
 from different units do not match. Generic inference, anonymous callable types,
 full pointer/variant/record compatibility, and compiler-level overload rules are

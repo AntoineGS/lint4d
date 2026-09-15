@@ -51,6 +51,32 @@ fn test_reset_materialization_counters() {
     TEST_LEGACY_EXPORTED_MATERIALIZATIONS.with(|value| value.set(0));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum IntegerKind {
+    Literal,
+    ShortInt,
+    SmallInt,
+    Integer,
+    LongInt,
+    Byte,
+    Word,
+    Cardinal,
+    LongWord,
+    Int64,
+    UInt64,
+    NativeInt,
+    NativeUInt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum BuiltinType {
+    Integer(IntegerKind),
+    Real,
+    String,
+    Character,
+    Boolean,
+}
+
 /// The navigation operation requested by an LSP client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NavigationTarget {
@@ -857,6 +883,7 @@ impl NavigationIndex {
                         budget,
                     )?)
                 }
+                Receiver::Builtin(_) => {}
             }
         }
         Ok(references)
@@ -904,6 +931,7 @@ impl NavigationIndex {
                 self.type_candidates_in_unit(&type_uri, &type_key, type_uri == *current_uri)
             }
             Receiver::Unit(_) => Vec::new(),
+            Receiver::Builtin(_) => Vec::new(),
         })
         .collect()
     }
@@ -1356,6 +1384,7 @@ impl NavigationIndex {
                     );
                     references.extend(members)
                 }
+                Receiver::Builtin(_) => {}
             }
         }
         references
@@ -1529,6 +1558,7 @@ impl NavigationIndex {
                                 budget,
                             )?)
                         }
+                        Receiver::Builtin(_) => {}
                     }
                 }
                 Ok(result)
@@ -1553,7 +1583,7 @@ impl NavigationIndex {
         else {
             return Ok(Vec::new());
         };
-        self.type_receivers_for_parts_with_budget(
+        let receivers = self.type_receivers_for_parts_with_budget(
             current_uri,
             current_document,
             offset,
@@ -1563,7 +1593,13 @@ impl NavigationIndex {
             state,
             cancel,
             budget,
-        )
+        )?;
+        if receivers.is_empty() {
+            if let Some(builtin) = overload::builtin_type(&parts.join(".")) {
+                return Ok(vec![Receiver::Builtin(builtin)]);
+            }
+        }
+        Ok(receivers)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1776,6 +1812,7 @@ impl NavigationIndex {
                             cancel,
                             budget,
                         ),
+                        Receiver::Builtin(_) => Ok(Vec::new()),
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
@@ -1836,6 +1873,7 @@ impl NavigationIndex {
                                 budget,
                             ),
                         Receiver::Unit(_) => Ok(Vec::new()),
+                        Receiver::Builtin(_) => Ok(Vec::new()),
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
@@ -1879,6 +1917,7 @@ impl NavigationIndex {
                         cancel,
                         budget,
                     ),
+                    Receiver::Builtin(_) => Ok(Vec::new()),
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
@@ -2006,7 +2045,9 @@ impl NavigationIndex {
             "receiver result type",
         )?
         else {
-            return Ok(Vec::new());
+            return Ok(overload::builtin_type(&annotation.name)
+                .map(|builtin| vec![Receiver::Builtin(builtin)])
+                .unwrap_or_default());
         };
         self.type_receivers_for_path_with_budget_at_scope(
             current_uri,
@@ -2070,7 +2111,7 @@ impl NavigationIndex {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         budget.require_work(parts.len(), cancel)?;
-        self.type_receivers_for_parts_with_budget(
+        let receivers = self.type_receivers_for_parts_with_budget(
             current_uri,
             current_document,
             offset,
@@ -2080,7 +2121,13 @@ impl NavigationIndex {
             state,
             cancel,
             budget,
-        )
+        )?;
+        if receivers.is_empty() {
+            if let Some(builtin) = overload::builtin_type(path) {
+                return Ok(vec![Receiver::Builtin(builtin)]);
+            }
+        }
+        Ok(receivers)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2208,6 +2255,7 @@ impl NavigationIndex {
                                 budget,
                             ),
                         Receiver::Unit(_) => Ok(Vec::new()),
+                        Receiver::Builtin(_) => Ok(Vec::new()),
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
@@ -2260,6 +2308,7 @@ impl NavigationIndex {
                             budget,
                         ),
                     Receiver::Unit(_) => Ok(Vec::new()),
+                    Receiver::Builtin(_) => Ok(Vec::new()),
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
@@ -2480,14 +2529,20 @@ impl NavigationIndex {
             .filter(|part| !part.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        self.type_receivers_for_parts(
+        let receivers = self.type_receivers_for_parts(
             current_uri,
             current_document,
             offset,
             &parts,
             scope_override,
             state,
-        )
+        );
+        if receivers.is_empty() {
+            if let Some(builtin) = overload::builtin_type(path) {
+                return vec![Receiver::Builtin(builtin)];
+            }
+        }
+        receivers
     }
 
     fn type_receivers_for_parts(
@@ -2594,6 +2649,7 @@ impl NavigationIndex {
                                 state,
                             ),
                         Receiver::Unit(_) => Vec::new(),
+                        Receiver::Builtin(_) => Vec::new(),
                     })
                     .collect();
             }
@@ -2630,6 +2686,7 @@ impl NavigationIndex {
                         state,
                     ),
                     Receiver::Unit(_) => Vec::new(),
+                    Receiver::Builtin(_) => Vec::new(),
                 })
                 .collect();
         }
@@ -3058,44 +3115,35 @@ impl NavigationIndex {
                 member_key,
                 allow_implementation,
             );
-            if member_key.is_some() && !direct.is_empty() {
-                if !self.type_requires_ancestry(type_uri, type_key) {
-                    MemberLookup::known(direct)
-                } else {
-                    let ancestry = self.resolve_type_ancestry(type_uri, type_key, state);
-                    if ancestry.status == AncestryStatus::Complete {
-                        MemberLookup::known(direct)
-                    } else {
-                        MemberLookup::unknown(direct)
-                    }
-                }
+            let ancestry = if self.type_requires_ancestry(type_uri, type_key) {
+                self.resolve_type_ancestry(type_uri, type_key, state)
             } else {
-                let ancestry = self.resolve_type_ancestry(type_uri, type_key, state);
-                if ancestry.status != AncestryStatus::Complete {
-                    MemberLookup::unknown(direct)
+                complete_ancestry(Vec::new())
+            };
+            if ancestry.status != AncestryStatus::Complete {
+                MemberLookup::unknown(direct)
+            } else {
+                let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
+                let mut ancestry_known = true;
+                for (parent_uri, parent_key) in ancestry.parents {
+                    let lookup = self.member_candidates_for_type_with_state(
+                        &parent_uri,
+                        &parent_key,
+                        ROOT_SCOPE,
+                        member_key,
+                        allow_implementation,
+                        state,
+                    );
+                    if !lookup.ancestry_known {
+                        ancestry_known = false;
+                        break;
+                    }
+                    parent_lookups.push(lookup);
+                }
+                if ancestry_known {
+                    self.merge_member_candidates(direct, parent_lookups, member_key)
                 } else {
-                    let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
-                    let mut ancestry_known = true;
-                    for (parent_uri, parent_key) in ancestry.parents {
-                        let lookup = self.member_candidates_for_type_with_state(
-                            &parent_uri,
-                            &parent_key,
-                            ROOT_SCOPE,
-                            member_key,
-                            allow_implementation,
-                            state,
-                        );
-                        if !lookup.ancestry_known {
-                            ancestry_known = false;
-                            break;
-                        }
-                        parent_lookups.push(lookup);
-                    }
-                    if ancestry_known {
-                        self.merge_member_candidates(direct, parent_lookups, member_key)
-                    } else {
-                        MemberLookup::unknown(direct)
-                    }
+                    MemberLookup::unknown(direct)
                 }
             }
         };
@@ -3144,21 +3192,11 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?;
-            if member_key.is_some() && !direct.is_empty() {
-                if !self.type_requires_ancestry(type_uri, type_key) {
-                    return Ok(MemberLookup::known(direct));
-                }
-                let ancestry = self
-                    .resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?;
-                return Ok(if ancestry.status == AncestryStatus::Complete {
-                    MemberLookup::known(direct)
-                } else {
-                    MemberLookup::unknown(direct)
-                });
-            }
-
-            let ancestry =
-                self.resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?;
+            let ancestry = if self.type_requires_ancestry(type_uri, type_key) {
+                self.resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?
+            } else {
+                complete_ancestry(Vec::new())
+            };
             if ancestry.status != AncestryStatus::Complete {
                 return Ok(MemberLookup::unknown(direct));
             }
@@ -3733,9 +3771,27 @@ impl NavigationIndex {
         member_key: Option<&str>,
     ) -> MemberLookup {
         if member_key.is_some() {
+            let direct_has_routine = direct.iter().any(|candidate| {
+                self.symbol(candidate)
+                    .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+            });
+            if !direct.is_empty() && !direct_has_routine {
+                return MemberLookup::known(direct);
+            }
             let mut selected: Option<Vec<Candidate>> = None;
             for lookup in parent_lookups {
-                let candidates = dedup_candidates(lookup.candidates);
+                let candidates = dedup_candidates(
+                    lookup
+                        .candidates
+                        .into_iter()
+                        .filter(|candidate| {
+                            !direct_has_routine
+                                || self
+                                    .symbol(candidate)
+                                    .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+                        })
+                        .collect(),
+                );
                 if candidates.is_empty() {
                     continue;
                 }
@@ -4190,6 +4246,7 @@ struct Symbol {
     kind: SymbolKind,
     type_kind: TypeKind,
     routine_kind: RoutineKind,
+    parameter_mode: Option<ParameterMode>,
     scope: usize,
     owner_type: Option<String>,
     owner_type_name: Option<String>,
@@ -4352,6 +4409,7 @@ impl AncestryResolutionState {
 enum Receiver {
     Unit(Url),
     Type(Url, String, usize),
+    Builtin(BuiltinType),
 }
 
 const MAX_RECEIVER_WORK: usize = 256;
@@ -4560,6 +4618,7 @@ impl Document {
                 kind: SymbolKind::Unit,
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
+                parameter_mode: None,
                 scope: ROOT_SCOPE,
                 owner_type: None,
                 owner_type_name: None,
@@ -5221,6 +5280,7 @@ fn inject_abbreviated_parameters(
                 kind: SymbolKind::Parameter,
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
+                parameter_mode: Some(parameter_mode(node)),
                 scope: body_scope,
                 owner_type: None,
                 owner_type_name: None,
@@ -5275,6 +5335,7 @@ fn add_definition_symbol(
         kind: SymbolKind::Routine,
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(header),
+        parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
@@ -5327,6 +5388,7 @@ fn add_routine_symbol(
         kind: SymbolKind::Routine,
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(node),
+        parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
@@ -5398,6 +5460,7 @@ fn add_named_symbol(
             kind,
             type_kind,
             routine_kind: RoutineKind::Procedure,
+            parameter_mode: (kind == SymbolKind::Parameter).then(|| parameter_mode(node)),
             scope,
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),

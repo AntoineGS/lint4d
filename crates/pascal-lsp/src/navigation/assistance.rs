@@ -1,6 +1,7 @@
 use super::{
-    AssistanceBudget, Candidate, Document, NavigationIndex, Origin, Region, RoutineKind, Span,
-    Symbol, SymbolKind, canonical_name, location_for_span, node_text, symbol_visible_in_region,
+    AssistanceBudget, Candidate, Document, NavigationIndex, Origin, ROOT_SCOPE, Region,
+    RoutineKind, Span, Symbol, SymbolKind, canonical_name, location_for_span, node_text,
+    symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
@@ -1154,19 +1155,25 @@ impl NavigationIndex {
         }
 
         check_cancel(cancel)?;
-        let references = self
+        let mut references = self
             .resolve_candidates_at_with_budget(uri, document, offset, identifier, cancel, budget)?;
-        let result_annotation = if node_text(identifier, &document.source)
-            .eq_ignore_ascii_case("Result")
-            && !super::member_expression_at(identifier)
-                .is_some_and(|dot| super::is_right_hand_member(dot, identifier))
-            && references.is_empty()
-        {
-            let scope = self.budgeted_scope_at(document, offset, cancel, budget)?;
-            document.result_type_annotation_for_body_scope(scope)
-        } else {
-            None
-        };
+        let result_annotation =
+            if is_implicit_result_reference_with_budget(document, identifier, cancel, budget)?
+                && !references.iter().any(|candidate| {
+                    candidate.uri == *uri
+                        && self.symbol(candidate).is_some_and(|symbol| {
+                            symbol.scope != ROOT_SCOPE && symbol.owner_type.is_none()
+                        })
+                })
+            {
+                let scope = self.budgeted_scope_at(document, offset, cancel, budget)?;
+                document.result_type_annotation_for_body_scope(scope)
+            } else {
+                None
+            };
+        if result_annotation.is_some() {
+            references.clear();
+        }
         if references
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -2514,6 +2521,37 @@ fn unsupported_context_at(
             return Ok(true);
         }
     }
+    Ok(false)
+}
+
+fn is_implicit_result_reference_with_budget(
+    document: &Document,
+    identifier: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    if !node_text(identifier, &document.source).eq_ignore_ascii_case("Result") {
+        return Ok(false);
+    }
+
+    let identifier_span = Span::from_node(identifier);
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if matches!(node.kind(), "genericDot" | "typerefDot")
+            || (node.kind() == "exprDot" && super::is_right_hand_member(node, identifier))
+        {
+            return Ok(false);
+        }
+        if node.kind() == "defProc" {
+            return Ok(node
+                .child_by_field_name("body")
+                .is_some_and(|body| Span::from_node(body).contains(identifier_span)));
+        }
+        current = node.parent();
+    }
+
     Ok(false)
 }
 

@@ -2572,6 +2572,119 @@ end.
 }
 
 #[test]
+fn implicit_result_type_definitions_out_rank_class_and_unit_bindings() {
+    let source = r#"unit Precedence;
+interface
+type
+  TFieldType = class end;
+  TReturnType = class end;
+  TBox = class
+    Result: TFieldType;
+    function Make: TReturnType;
+  end;
+var
+  Result: TFieldType;
+implementation
+function TBox.Make: TReturnType;
+begin
+  Self.Result := nil;
+  Result := nil;
+end;
+function FreeMake: TReturnType;
+begin
+  Result := nil;
+end;
+function LocalMake: TReturnType;
+var
+  Result: TFieldType;
+begin
+  Result := nil;
+end;
+end.
+"#;
+    let source_uri = uri("ResultPrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("result precedence source parses");
+
+    let field_declaration =
+        index.type_definitions(&source_uri, position_of(source, "Result: TFieldType", 0));
+    assert_exact_type_location(&field_declaration, &source_uri, source, "TFieldType", 0);
+
+    let unit_declaration =
+        index.type_definitions(&source_uri, position_of(source, "Result: TFieldType", 1));
+    assert_exact_type_location(&unit_declaration, &source_uri, source, "TFieldType", 0);
+
+    let member = index.type_definitions(&source_uri, position_of(source, "Result", 2));
+    assert_exact_type_location(&member, &source_uri, source, "TFieldType", 0);
+
+    let method_result = index.type_definitions(&source_uri, position_of(source, "Result", 3));
+    assert_exact_type_location(&method_result, &source_uri, source, "TReturnType", 0);
+
+    let free_result = index.type_definitions(&source_uri, position_of(source, "Result", 4));
+    assert_exact_type_location(&free_result, &source_uri, source, "TReturnType", 0);
+
+    let local_result = index.type_definitions(&source_uri, position_of(source, "Result", 6));
+    assert_exact_type_location(&local_result, &source_uri, source, "TFieldType", 0);
+}
+
+#[test]
+fn implicit_result_type_definitions_out_rank_imported_bindings() {
+    let provider = r#"unit ImportedProvider;
+interface
+type
+  TImportedField = class end;
+var
+  Result: TImportedField;
+implementation
+end.
+"#;
+    let consumer = r#"unit ImportedConsumer;
+interface
+uses ImportedProvider;
+type
+  TReturnType = class end;
+function Make: TReturnType;
+implementation
+function Make: TReturnType;
+begin
+  Result := nil;
+end;
+end.
+"#;
+    let provider_uri = uri("ImportedProvider");
+    let consumer_uri = uri("ImportedConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("imported result provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("imported result consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("ImportedProvider".to_owned(), provider_uri.clone())],
+    );
+
+    let result_position = position_of(consumer, "Result", 0);
+    let definition = index.navigate(
+        &consumer_uri,
+        result_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(definition.len(), 1);
+    assert_location_start(
+        &definition[0],
+        &provider_uri,
+        position_of(provider, "Result: TImportedField", 0),
+    );
+
+    let result = index.type_definitions(&consumer_uri, result_position);
+    assert_exact_type_location(&result, &consumer_uri, consumer, "TReturnType", 0);
+}
+
+#[test]
 fn inherited_methods_preserve_their_result_type_context() {
     let source = r#"unit InheritedResultContext;
 interface

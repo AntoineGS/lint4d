@@ -1,6 +1,6 @@
 use super::{
     AssistanceBudget, Candidate, Document, NavigationIndex, Origin, Region, RoutineKind, Span,
-    Symbol, SymbolKind, canonical_name, location_for_span, symbol_visible_in_region,
+    Symbol, SymbolKind, canonical_name, location_for_span, node_text, symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
@@ -1154,8 +1154,20 @@ impl NavigationIndex {
         }
 
         check_cancel(cancel)?;
-        let references = self
-            .resolve_candidates_at_with_budget(uri, document, offset, identifier, cancel, budget)?;
+        let result_annotation =
+            if node_text(identifier, &document.source).eq_ignore_ascii_case("Result") {
+                let scope = self.budgeted_scope_at(document, offset, cancel, budget)?;
+                document.result_type_annotation_for_body_scope(scope)
+            } else {
+                None
+            };
+        let references = if result_annotation.is_some() {
+            Vec::new()
+        } else {
+            self.resolve_candidates_at_with_budget(
+                uri, document, offset, identifier, cancel, budget,
+            )?
+        };
         if references
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -1164,6 +1176,29 @@ impl NavigationIndex {
         }
         let mut targets = Vec::new();
         let mut state = super::ResolutionState::new();
+        if let Some(annotation) = result_annotation {
+            let Some(lookup_identifier) = identifier_at_with_budget(
+                document.tree.root_node(),
+                annotation.offset,
+                cancel,
+                budget,
+                "type definition",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            targets.extend(self.type_declaration_candidates_with_budget(
+                uri,
+                document,
+                annotation.offset,
+                &annotation.name,
+                lookup_identifier,
+                Some(annotation.scope),
+                &mut state,
+                cancel,
+                budget,
+            )?);
+        }
         for reference in references {
             check_cancel(cancel)?;
             budget.require_work(1, cancel)?;

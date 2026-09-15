@@ -1104,7 +1104,87 @@ end.
             ),
             (
                 consumer_uri.clone(),
+                range_of(consumer, "Name", 1),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
                 range_of(consumer, "Name", 2),
+                "RenamedName".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn nested_function_result_rename_keeps_the_declaration_type_scope() {
+    let provider_uri = uri("NestedResultRenameSource");
+    let consumer_uri = uri("NestedResultRenameConsumer");
+    let provider = r#"unit NestedResultRenameSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit NestedResultRenameConsumer;
+interface
+uses NestedResultRenameSource;
+implementation
+procedure Outer;
+type
+  TResult = record
+    Name: string;
+  end;
+  function Make: TResult;
+  type
+    TResult = record
+      Name: Boolean;
+    end;
+  begin
+    Result.Name := False;
+  end;
+begin
+  Make().Name := '';
+end;
+end.
+"#;
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("nested rename provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("nested rename consumer parses");
+    let mut bindings = HashMap::new();
+    bindings.insert("NestedResultRenameSource".to_owned(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+
+    let edits = index
+        .rename_edits(
+            &consumer_uri,
+            position_of(consumer, "Name", 0),
+            "RenamedName",
+        )
+        .expect("nested result rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Name", 0),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Name", 2),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri,
+                range_of(consumer, "Name", 3),
                 "RenamedName".to_owned(),
             ),
         ],

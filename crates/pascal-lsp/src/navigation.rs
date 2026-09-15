@@ -1622,7 +1622,7 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
 
-        let mut result_type_source: Option<(Url, usize, usize, String)> = None;
+        let mut result_type_source: Option<(Url, ResultTypeAnnotation)> = None;
         let mut constructor = false;
         for candidate in routine_candidates {
             check_navigation_cancel(cancel)?;
@@ -1631,28 +1631,19 @@ impl NavigationIndex {
                 continue;
             };
             constructor |= symbol.routine_kind == RoutineKind::Constructor;
-            if let Some(result_type_name) = symbol.result_type_name.as_deref() {
+            if let Some(annotation) = symbol.result_type_annotation() {
                 if result_type_source
                     .as_ref()
-                    .is_some_and(|(_, _, _, current)| current != result_type_name)
+                    .is_some_and(|(_, current)| current.name != annotation.name)
                 {
                     state.mark_receiver_uncertain();
                     return Ok(Vec::new());
                 }
-                result_type_source = Some((
-                    candidate.uri.clone(),
-                    symbol
-                        .result_type_span
-                        .map_or(symbol.span.start, |span| span.start),
-                    symbol.scope,
-                    result_type_name.to_owned(),
-                ));
+                result_type_source = Some((candidate.uri.clone(), annotation));
             }
         }
 
-        let Some((result_uri, result_offset, result_scope_offset, result_type_name)) =
-            result_type_source
-        else {
+        let Some((result_uri, annotation)) = result_type_source else {
             if !constructor {
                 return Ok(Vec::new());
             }
@@ -1674,23 +1665,10 @@ impl NavigationIndex {
         let Some(result_document) = self.documents.get(&result_uri) else {
             return Ok(Vec::new());
         };
-        let Some(result_identifier) = assistance::identifier_at_with_budget(
-            result_document.tree.root_node(),
-            result_offset,
-            cancel,
-            budget,
-            "receiver result type",
-        )?
-        else {
-            return Ok(Vec::new());
-        };
-        self.type_receivers_for_path_with_budget_at_scope(
+        self.result_type_receivers_with_budget(
             &result_uri,
             result_document,
-            result_offset,
-            &result_type_name,
-            result_identifier,
-            Some(result_scope_offset),
+            &annotation,
             state,
             cancel,
             budget,
@@ -1895,14 +1873,12 @@ impl NavigationIndex {
         }
         if name.eq_ignore_ascii_case("Result") {
             let scope = self.budgeted_scope_at(current_document, offset, cancel, budget)?;
-            if let Some(type_name) = current_document.result_type_name_for_body_scope(scope) {
-                let type_name = type_name.to_owned();
-                return self.type_receivers_for_path_with_budget(
+            if let Some(annotation) = current_document.result_type_annotation_for_body_scope(scope)
+            {
+                return self.result_type_receivers_with_budget(
                     current_uri,
                     current_document,
-                    offset,
-                    &type_name,
-                    lookup_identifier,
+                    &annotation,
                     state,
                     cancel,
                     budget,
@@ -1974,6 +1950,56 @@ impl NavigationIndex {
             budget,
         )?;
         Ok(urls.into_iter().map(Receiver::Unit).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn result_type_receivers_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        annotation: &ResultTypeAnnotation,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+            current_document.tree.root_node(),
+            annotation.offset,
+            cancel,
+            budget,
+            "receiver result type",
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        self.type_receivers_for_path_with_budget_at_scope(
+            current_uri,
+            current_document,
+            annotation.offset,
+            &annotation.name,
+            lookup_identifier,
+            Some(annotation.scope),
+            state,
+            cancel,
+            budget,
+        )
+    }
+
+    fn result_type_receivers(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        annotation: &ResultTypeAnnotation,
+        state: &mut ResolutionState,
+    ) -> Vec<Receiver> {
+        self.type_receivers_for_path_at_scope(
+            current_uri,
+            current_document,
+            annotation.offset,
+            &annotation.name,
+            Some(annotation.scope),
+            state,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2572,34 +2598,25 @@ impl NavigationIndex {
             return Vec::new();
         }
 
-        let mut result_type_source: Option<(Url, usize, usize, String)> = None;
+        let mut result_type_source: Option<(Url, ResultTypeAnnotation)> = None;
         let mut constructor = false;
         for candidate in routine_candidates {
             let Some(symbol) = self.symbol(&candidate) else {
                 continue;
             };
             constructor |= symbol.routine_kind == RoutineKind::Constructor;
-            if let Some(result_type_name) = symbol.result_type_name.as_deref() {
+            if let Some(annotation) = symbol.result_type_annotation() {
                 if result_type_source
                     .as_ref()
-                    .is_some_and(|(_, _, _, current)| current != result_type_name)
+                    .is_some_and(|(_, current)| current.name != annotation.name)
                 {
                     return Vec::new();
                 }
-                result_type_source = Some((
-                    candidate.uri.clone(),
-                    symbol
-                        .result_type_span
-                        .map_or(symbol.span.start, |span| span.start),
-                    symbol.scope,
-                    result_type_name.to_owned(),
-                ));
+                result_type_source = Some((candidate.uri.clone(), annotation));
             }
         }
 
-        let Some((result_uri, _result_offset, result_scope_offset, result_type_name)) =
-            result_type_source
-        else {
+        let Some((result_uri, annotation)) = result_type_source else {
             if !constructor {
                 return Vec::new();
             }
@@ -2617,14 +2634,7 @@ impl NavigationIndex {
         let Some(result_document) = self.documents.get(&result_uri) else {
             return Vec::new();
         };
-        self.type_receivers_for_path_at_scope(
-            &result_uri,
-            result_document,
-            _result_offset,
-            &result_type_name,
-            Some(result_scope_offset),
-            state,
-        )
+        self.result_type_receivers(&result_uri, result_document, &annotation, state)
     }
 
     fn resolve_qualified_receiver_path(
@@ -2757,12 +2767,12 @@ impl NavigationIndex {
         }
         if name.eq_ignore_ascii_case("Result") {
             let scope = current_document.scope_at(offset);
-            if let Some(type_name) = current_document.result_type_name_for_body_scope(scope) {
-                return self.type_receivers_for_path(
+            if let Some(annotation) = current_document.result_type_annotation_for_body_scope(scope)
+            {
+                return self.result_type_receivers(
                     current_uri,
                     current_document,
-                    offset,
-                    type_name,
+                    &annotation,
                     state,
                 );
             }
@@ -4608,6 +4618,27 @@ struct Symbol {
 }
 
 #[derive(Debug, Clone)]
+struct ResultTypeAnnotation {
+    name: String,
+    offset: usize,
+    scope: usize,
+}
+
+impl Symbol {
+    fn result_type_annotation(&self) -> Option<ResultTypeAnnotation> {
+        self.result_type_name
+            .as_ref()
+            .map(|name| ResultTypeAnnotation {
+                name: name.clone(),
+                offset: self
+                    .result_type_span
+                    .map_or(self.span.start, |span| span.start),
+                scope: self.scope,
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Candidate {
     uri: Url,
     index: usize,
@@ -5186,16 +5217,12 @@ impl Document {
         result
     }
 
-    fn result_type_name_for_body_scope(&self, scope: usize) -> Option<&str> {
+    fn result_type_annotation_for_body_scope(&self, scope: usize) -> Option<ResultTypeAnnotation> {
         self.routine_symbol_indices_by_body_scope
             .get(&scope)
             .into_iter()
             .flatten()
-            .find_map(|index| {
-                self.symbols
-                    .get(*index)
-                    .and_then(|symbol| symbol.result_type_name.as_deref())
-            })
+            .find_map(|index| self.symbols.get(*index)?.result_type_annotation())
     }
 
     fn owner_type_at(&self, offset: usize) -> Option<String> {

@@ -2368,6 +2368,34 @@ end.
         [("TypeSource".to_owned(), provider_uri.clone())],
     );
 
+    let result_member_position = position_of(consumer, "Name", 1);
+    let result_member = index.navigate(
+        &consumer_uri,
+        result_member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(result_member.len(), 1);
+    assert_location_start(
+        &result_member[0],
+        &provider_uri,
+        position_of(provider, "Name", 0),
+    );
+
+    let result_hover = index
+        .hover(&consumer_uri, result_member_position)
+        .expect("provider Result member hover");
+    assert!(hover_text(&result_hover).contains("Name: Integer"));
+    assert!(!hover_text(&result_hover).contains("Name: string"));
+
+    let result_type_definition =
+        index.type_definitions(&consumer_uri, position_of(consumer, "Result", 3));
+    assert_eq!(result_type_definition.len(), 1);
+    assert_location_start(
+        &result_type_definition[0],
+        &provider_uri,
+        position_of(provider, "TResult", 0),
+    );
+
     let member_position = position_of(consumer, "Name", 2);
     let member = index.navigate(
         &consumer_uri,
@@ -2436,6 +2464,35 @@ end.
     index.bind_imports(
         &consumer_uri,
         [("NestedTypeSource".to_owned(), provider_uri.clone())],
+    );
+
+    let result_member_position = position_of(consumer, "Name", 2);
+    let result_member = index.navigate(
+        &consumer_uri,
+        result_member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(result_member.len(), 1);
+    assert_location_start(
+        &result_member[0],
+        &consumer_uri,
+        position_of(consumer, "Name", 0),
+    );
+
+    let result_hover = index
+        .hover(&consumer_uri, result_member_position)
+        .expect("outer Result member hover");
+    assert!(hover_text(&result_hover).contains("Name: string"));
+    assert!(!hover_text(&result_hover).contains("Name: Boolean"));
+    assert!(!hover_text(&result_hover).contains("Name: Integer"));
+
+    let result_type_definition =
+        index.type_definitions(&consumer_uri, position_of(consumer, "Result", 4));
+    assert_eq!(result_type_definition.len(), 1);
+    assert_location_start(
+        &result_type_definition[0],
+        &consumer_uri,
+        position_of(consumer, "TResult", 0),
     );
 
     let member_position = position_of(consumer, "Name", 3);

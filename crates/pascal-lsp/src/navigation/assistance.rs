@@ -232,11 +232,10 @@ impl NavigationIndex {
             cancel,
             &mut budget,
         )?;
-        let unqualified = matches!(&member, CompletionMember::Unqualified);
         if matches!(member, CompletionMember::Unsupported) {
             return Ok(CompletionList::default());
         }
-        let (mut candidates, mut is_incomplete) = self.completion_candidates(
+        let (candidates, mut is_incomplete) = self.completion_candidates(
             uri,
             document,
             anchor,
@@ -246,28 +245,6 @@ impl NavigationIndex {
             cancel,
             &mut budget,
         )?;
-        if unqualified {
-            let scope = self.budgeted_scope_at(document, offset, cancel, &mut budget)?;
-            let owner_type = document.owner_type_for_scope(scope);
-            if owner_type
-                .as_deref()
-                .is_some_and(|owner| self.owner_has_unknown_class_ancestor(document, owner))
-            {
-                candidates.retain(|candidate| {
-                    let Some(symbol) = self.symbol(candidate) else {
-                        return false;
-                    };
-                    (symbol.scope != super::ROOT_SCOPE
-                        && symbol.owner_type.is_none()
-                        && !symbol.local_only)
-                        || owner_type
-                            .as_deref()
-                            .zip(symbol.owner_type.as_deref())
-                            .is_some_and(|(owner, candidate_owner)| owner == candidate_owner)
-                });
-            }
-        }
-
         let range = Range {
             start: text::offset_to_position(&document.source, prefix_start)
                 .ok_or_else(|| "completion prefix start is not a UTF-16 boundary".to_string())?,
@@ -498,6 +475,8 @@ impl NavigationIndex {
     ) -> Result<(Vec<Candidate>, bool), String> {
         let mut accumulator = CompletionAccumulator::new(prefix, budget);
         let mut private_spans = HashMap::new();
+        let unqualified = matches!(&member, CompletionMember::Unqualified);
+        let mut suppress_unqualified_globals = false;
         let member_receivers = match member {
             CompletionMember::Unqualified => None,
             CompletionMember::Node(dot) => {
@@ -556,7 +535,7 @@ impl NavigationIndex {
                         )?;
                     }
                     super::Receiver::Type(type_uri, type_key) => {
-                        self.add_member_completion_candidates(
+                        let ancestry_known = self.add_member_completion_candidates(
                             &mut accumulator,
                             &type_uri,
                             &type_key,
@@ -565,6 +544,9 @@ impl NavigationIndex {
                             0,
                             cancel,
                         )?;
+                        if !ancestry_known {
+                            accumulator.is_incomplete = true;
+                        }
                     }
                 }
                 if accumulator.exhausted {
@@ -596,7 +578,7 @@ impl NavigationIndex {
 
             if !accumulator.exhausted {
                 if let Some(owner_type) = current_document.owner_type_at(offset) {
-                    self.add_member_completion_candidates(
+                    let ancestry_known = self.add_member_completion_candidates(
                         &mut accumulator,
                         current_uri,
                         &owner_type,
@@ -605,96 +587,101 @@ impl NavigationIndex {
                         precedence,
                         cancel,
                     )?;
+                    if !ancestry_known && unqualified {
+                        suppress_unqualified_globals = true;
+                    }
                     precedence += 1;
                 }
             }
 
-            let region = current_document.region_at(offset);
-            for index in current_document
-                .scope_symbol_indices
-                .get(&super::ROOT_SCOPE)
-                .into_iter()
-                .flatten()
-            {
-                check_cancel(cancel)?;
-                if !accumulator.take_scan_slot(cancel)? {
-                    break;
-                }
-                let Some(symbol) = current_document.symbols.get(*index) else {
-                    continue;
-                };
-                if symbol.scope != super::ROOT_SCOPE
-                    || symbol.owner_type.is_some()
-                    || symbol.local_only
-                    || !symbol_visible_in_region(symbol, region)
+            if !suppress_unqualified_globals {
+                let region = current_document.region_at(offset);
+                for index in current_document
+                    .scope_symbol_indices
+                    .get(&super::ROOT_SCOPE)
+                    .into_iter()
+                    .flatten()
                 {
-                    continue;
-                }
-                self.add_completion_candidate(
-                    &mut accumulator,
-                    Candidate {
-                        uri: current_uri.clone(),
-                        index: *index,
-                    },
-                    current_uri,
-                    false,
-                    &mut private_spans,
-                    precedence,
-                    cancel,
-                )?;
-            }
-
-            for unit in current_document.active_uses(region) {
-                if accumulator.exhausted {
-                    break;
-                }
-                check_cancel(cancel)?;
-                if current_document.unknown_imports.contains(unit.as_str()) {
-                    continue;
-                }
-                for unit_uri in self.unit_urls_for_import(current_document, unit) {
-                    self.add_exported_completion_candidates(
+                    check_cancel(cancel)?;
+                    if !accumulator.take_scan_slot(cancel)? {
+                        break;
+                    }
+                    let Some(symbol) = current_document.symbols.get(*index) else {
+                        continue;
+                    };
+                    if symbol.scope != super::ROOT_SCOPE
+                        || symbol.owner_type.is_some()
+                        || symbol.local_only
+                        || !symbol_visible_in_region(symbol, region)
+                    {
+                        continue;
+                    }
+                    self.add_completion_candidate(
                         &mut accumulator,
-                        &unit_uri,
+                        Candidate {
+                            uri: current_uri.clone(),
+                            index: *index,
+                        },
                         current_uri,
                         false,
                         &mut private_spans,
-                        precedence.saturating_add(1),
+                        precedence,
                         cancel,
                     )?;
-                    if let Some(document) = self.documents.get(&unit_uri) {
-                        if let Some(index) = document
-                            .symbol_indices_by_scope_key
-                            .get(&(super::ROOT_SCOPE, document.unit_name.clone()))
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                            .find(|index| {
-                                document
-                                    .symbols
-                                    .get(*index)
-                                    .is_some_and(|symbol| symbol.kind == SymbolKind::Unit)
-                            })
-                        {
-                            if !accumulator.take_scan_slot(cancel)? {
-                                break;
-                            }
-                            self.add_completion_candidate(
-                                &mut accumulator,
-                                Candidate {
-                                    uri: unit_uri.clone(),
-                                    index,
-                                },
-                                current_uri,
-                                false,
-                                &mut private_spans,
-                                precedence.saturating_add(1),
-                                cancel,
-                            )?;
-                        }
-                    }
+                }
+
+                for unit in current_document.active_uses(region) {
                     if accumulator.exhausted {
                         break;
+                    }
+                    check_cancel(cancel)?;
+                    if current_document.unknown_imports.contains(unit.as_str()) {
+                        continue;
+                    }
+                    for unit_uri in self.unit_urls_for_import(current_document, unit) {
+                        self.add_exported_completion_candidates(
+                            &mut accumulator,
+                            &unit_uri,
+                            current_uri,
+                            false,
+                            &mut private_spans,
+                            precedence.saturating_add(1),
+                            cancel,
+                        )?;
+                        if let Some(document) = self.documents.get(&unit_uri) {
+                            if let Some(index) = document
+                                .symbol_indices_by_scope_key
+                                .get(&(super::ROOT_SCOPE, document.unit_name.clone()))
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .find(|index| {
+                                    document
+                                        .symbols
+                                        .get(*index)
+                                        .is_some_and(|symbol| symbol.kind == SymbolKind::Unit)
+                                })
+                            {
+                                if !accumulator.take_scan_slot(cancel)? {
+                                    break;
+                                }
+                                self.add_completion_candidate(
+                                    &mut accumulator,
+                                    Candidate {
+                                        uri: unit_uri.clone(),
+                                        index,
+                                    },
+                                    current_uri,
+                                    false,
+                                    &mut private_spans,
+                                    precedence.saturating_add(1),
+                                    cancel,
+                                )?;
+                            }
+                        }
+                        if accumulator.exhausted {
+                            break;
+                        }
                     }
                 }
             }
@@ -882,7 +869,7 @@ impl NavigationIndex {
         private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
         cancel: &AtomicBool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let lookup = self.member_candidates_for_completion_with_budget(
             type_uri,
             type_key,
@@ -923,13 +910,13 @@ impl NavigationIndex {
                     index: candidate.index,
                 },
                 current_uri,
-                type_uri != current_uri,
+                candidate.uri != *current_uri,
                 private_spans,
                 precedence,
                 cancel,
             )?;
         }
-        Ok(())
+        Ok(lookup.ancestry_known)
     }
 
     #[allow(clippy::too_many_arguments)]

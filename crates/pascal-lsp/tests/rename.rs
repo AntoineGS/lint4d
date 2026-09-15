@@ -1579,6 +1579,67 @@ end.
 }
 
 #[test]
+fn nested_member_rename_uses_the_declaring_type_context() {
+    let provider = r#"unit NestedMemberRenameProvider;
+interface
+type
+  TP = class
+    Shared: Integer;
+  end;
+  TBase = class
+    F: TP;
+  end;
+implementation
+end.
+"#;
+    let consumer = r#"unit NestedMemberRenameConsumer;
+interface
+uses NestedMemberRenameProvider;
+type
+  TP = class
+    Shared: string;
+  end;
+  TChild = class(NestedMemberRenameProvider.TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.F.Shared;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "NestedMemberRenameProvider", provider);
+    let consumer_uri = update(&mut index, "NestedMemberRenameConsumer", consumer);
+
+    let edits = index
+        .rename_edits(
+            &consumer_uri,
+            position_of(consumer, "Shared", 1),
+            "RenamedShared",
+        )
+        .expect("nested member rename resolves its declaring type");
+    assert_eq!(
+        exact_edit_signatures(&edits),
+        vec![
+            edit_signature(
+                &consumer_uri,
+                range_of(consumer, "Shared", 1),
+                "RenamedShared",
+            ),
+            edit_signature(
+                &provider_uri,
+                range_of(provider, "Shared", 0),
+                "RenamedShared",
+            ),
+        ],
+        "nested member rename must not edit the consumer's unrelated TP.Shared"
+    );
+}
+
+#[test]
 fn inherited_unqualified_homonym_fallback_aborts_without_partial_edits() {
     let source = "unit InheritedHomonymRename;
 interface

@@ -1874,7 +1874,7 @@ impl NavigationIndex {
                 continue;
             };
             result.extend(self.type_receivers_for_path_with_budget(
-                type_uri,
+                &candidate.uri,
                 document,
                 symbol.span.start,
                 type_name,
@@ -2504,9 +2504,6 @@ impl NavigationIndex {
         allow_implementation: bool,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
-        let Some(document) = self.documents.get(type_uri) else {
-            return Vec::new();
-        };
         let member_key = canonical_name(name);
         let resolution_key = (type_uri.clone(), type_key.to_owned(), member_key.clone());
         if !state.active_members.insert(resolution_key.clone()) {
@@ -2526,8 +2523,9 @@ impl NavigationIndex {
             .filter_map(|candidate| {
                 let symbol = self.symbol(&candidate)?;
                 let type_name = symbol.type_name.as_deref()?;
+                let document = self.documents.get(&candidate.uri)?;
                 self.type_receivers_for_path(
-                    type_uri,
+                    &candidate.uri,
                     document,
                     symbol.span.start,
                     type_name,
@@ -2610,41 +2608,67 @@ impl NavigationIndex {
         allow_implementation: bool,
         state: &mut AncestryResolutionState,
     ) -> MemberLookup {
-        let direct =
-            self.direct_member_candidates(type_uri, type_key, member_key, allow_implementation);
-        if member_key.is_some() && !direct.is_empty() {
-            if !self.type_requires_ancestry(type_uri, type_key) {
-                return MemberLookup::known(direct);
-            }
-            let ancestry = self.resolve_type_ancestry(type_uri, type_key, state);
-            return if ancestry.status == AncestryStatus::Complete {
-                MemberLookup::known(direct)
+        let identity = (
+            type_uri.clone(),
+            type_key.to_owned(),
+            member_key.map(str::to_owned),
+            allow_implementation,
+        );
+        if let Some(resolved) = state.resolved_members.get(&identity) {
+            return resolved.clone();
+        }
+        if !state.active_members.insert(identity.clone()) {
+            return MemberLookup::unknown(Vec::new());
+        }
+
+        let result = if !state.take_work() {
+            MemberLookup::unknown(Vec::new())
+        } else {
+            let direct =
+                self.direct_member_candidates(type_uri, type_key, member_key, allow_implementation);
+            if member_key.is_some() && !direct.is_empty() {
+                if !self.type_requires_ancestry(type_uri, type_key) {
+                    MemberLookup::known(direct)
+                } else {
+                    let ancestry = self.resolve_type_ancestry(type_uri, type_key, state);
+                    if ancestry.status == AncestryStatus::Complete {
+                        MemberLookup::known(direct)
+                    } else {
+                        MemberLookup::unknown(direct)
+                    }
+                }
             } else {
-                MemberLookup::unknown(direct)
-            };
-        }
-
-        let ancestry = self.resolve_type_ancestry(type_uri, type_key, state);
-        if ancestry.status != AncestryStatus::Complete {
-            return MemberLookup::unknown(direct);
-        }
-
-        let mut parent_candidates = Vec::with_capacity(ancestry.parents.len());
-        for (parent_uri, parent_key) in ancestry.parents {
-            let lookup = self.member_candidates_for_type_with_state(
-                &parent_uri,
-                &parent_key,
-                member_key,
-                allow_implementation,
-                state,
-            );
-            if !lookup.ancestry_known {
-                return MemberLookup::unknown(direct);
+                let ancestry = self.resolve_type_ancestry(type_uri, type_key, state);
+                if ancestry.status != AncestryStatus::Complete {
+                    MemberLookup::unknown(direct)
+                } else {
+                    let mut parent_candidates = Vec::with_capacity(ancestry.parents.len());
+                    let mut ancestry_known = true;
+                    for (parent_uri, parent_key) in ancestry.parents {
+                        let lookup = self.member_candidates_for_type_with_state(
+                            &parent_uri,
+                            &parent_key,
+                            member_key,
+                            allow_implementation,
+                            state,
+                        );
+                        if !lookup.ancestry_known {
+                            ancestry_known = false;
+                            break;
+                        }
+                        parent_candidates.push(lookup.candidates);
+                    }
+                    if ancestry_known {
+                        self.merge_member_candidates(direct, parent_candidates, member_key)
+                    } else {
+                        MemberLookup::unknown(direct)
+                    }
+                }
             }
-            parent_candidates.push(lookup.candidates);
-        }
-
-        self.merge_member_candidates(direct, parent_candidates, member_key)
+        };
+        state.active_members.remove(&identity);
+        state.resolved_members.insert(identity, result.clone());
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2658,51 +2682,80 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<MemberLookup, String> {
-        let direct = self.direct_member_candidates_with_budget(
-            type_uri,
-            type_key,
-            member_key,
+        let identity = (
+            type_uri.clone(),
+            type_key.to_owned(),
+            member_key.map(str::to_owned),
             allow_implementation,
-            cancel,
-            budget,
-        )?;
-        if member_key.is_some() && !direct.is_empty() {
-            if !self.type_requires_ancestry(type_uri, type_key) {
-                return Ok(MemberLookup::known(direct));
+        );
+        if let Some(resolved) = state.resolved_members.get(&identity) {
+            return Ok(resolved.clone());
+        }
+        if !state.active_members.insert(identity.clone()) {
+            return Ok(MemberLookup::unknown(Vec::new()));
+        }
+
+        let result = (|| {
+            check_navigation_cancel(cancel)?;
+            if !state.take_work() {
+                return Ok(MemberLookup::unknown(Vec::new()));
             }
-            let ancestry =
-                self.resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?;
-            return Ok(if ancestry.status == AncestryStatus::Complete {
-                MemberLookup::known(direct)
-            } else {
-                MemberLookup::unknown(direct)
-            });
-        }
-
-        let ancestry =
-            self.resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?;
-        if ancestry.status != AncestryStatus::Complete {
-            return Ok(MemberLookup::unknown(direct));
-        }
-
-        let mut parent_candidates = Vec::with_capacity(ancestry.parents.len());
-        for (parent_uri, parent_key) in ancestry.parents {
-            let lookup = self.member_candidates_for_type_with_state_and_budget(
-                &parent_uri,
-                &parent_key,
+            let direct = self.direct_member_candidates_with_budget(
+                type_uri,
+                type_key,
                 member_key,
                 allow_implementation,
-                state,
                 cancel,
                 budget,
             )?;
-            if !lookup.ancestry_known {
+            if member_key.is_some() && !direct.is_empty() {
+                if !self.type_requires_ancestry(type_uri, type_key) {
+                    return Ok(MemberLookup::known(direct));
+                }
+                let ancestry = self
+                    .resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?;
+                return Ok(if ancestry.status == AncestryStatus::Complete {
+                    MemberLookup::known(direct)
+                } else {
+                    MemberLookup::unknown(direct)
+                });
+            }
+
+            let ancestry =
+                self.resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?;
+            if ancestry.status != AncestryStatus::Complete {
                 return Ok(MemberLookup::unknown(direct));
             }
-            parent_candidates.push(lookup.candidates);
-        }
 
-        Ok(self.merge_member_candidates(direct, parent_candidates, member_key))
+            let mut parent_candidates = Vec::with_capacity(ancestry.parents.len());
+            let mut ancestry_known = true;
+            for (parent_uri, parent_key) in ancestry.parents {
+                let lookup = self.member_candidates_for_type_with_state_and_budget(
+                    &parent_uri,
+                    &parent_key,
+                    member_key,
+                    allow_implementation,
+                    state,
+                    cancel,
+                    budget,
+                )?;
+                if !lookup.ancestry_known {
+                    ancestry_known = false;
+                    break;
+                }
+                parent_candidates.push(lookup.candidates);
+            }
+            Ok(if ancestry_known {
+                self.merge_member_candidates(direct, parent_candidates, member_key)
+            } else {
+                MemberLookup::unknown(direct)
+            })
+        })();
+        state.active_members.remove(&identity);
+        if let Ok(resolved) = &result {
+            state.resolved_members.insert(identity, resolved.clone());
+        }
+        result
     }
 
     fn direct_member_candidates(
@@ -2877,7 +2930,16 @@ impl NavigationIndex {
         }
 
         let mut parents = Vec::with_capacity(entry.parents.len());
-        for parent in &entry.parents {
+        for parent in entry.parents.iter().filter(|parent| {
+            matches!(
+                (entry.kind, parent.relation),
+                (TypeKind::Class, ParentRelation::Superclass)
+                    | (TypeKind::Interface, ParentRelation::InterfaceParent)
+            )
+        }) {
+            if parent.path.is_empty() {
+                return unknown_ancestry();
+            }
             let candidates = dedup_candidates(self.type_parent_candidates(
                 type_uri,
                 document,
@@ -2895,9 +2957,18 @@ impl NavigationIndex {
             let Some(symbol) = self.symbol(candidate) else {
                 return unknown_ancestry();
             };
-            if symbol.kind != SymbolKind::Type
-                || !matches!(symbol.type_kind, TypeKind::Class | TypeKind::Interface)
-            {
+            if symbol.kind != SymbolKind::Type {
+                return unknown_ancestry();
+            }
+            if entry.kind == TypeKind::Class && symbol.type_kind == TypeKind::Interface {
+                continue;
+            }
+            let expected_kind = match entry.kind {
+                TypeKind::Class => TypeKind::Class,
+                TypeKind::Interface => TypeKind::Interface,
+                _ => continue,
+            };
+            if symbol.type_kind != expected_kind {
                 return unknown_ancestry();
             }
             parents.push((candidate.uri.clone(), symbol.key.clone()));
@@ -3078,9 +3149,18 @@ impl NavigationIndex {
         }
 
         let mut parents = Vec::with_capacity(entry.parents.len());
-        for parent in &entry.parents {
+        for parent in entry.parents.iter().filter(|parent| {
+            matches!(
+                (entry.kind, parent.relation),
+                (TypeKind::Class, ParentRelation::Superclass)
+                    | (TypeKind::Interface, ParentRelation::InterfaceParent)
+            )
+        }) {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
+            if parent.path.is_empty() {
+                return Ok(unknown_ancestry());
+            }
             let candidates = dedup_candidates(self.type_parent_candidates_with_budget(
                 type_uri,
                 document,
@@ -3101,9 +3181,18 @@ impl NavigationIndex {
             let Some(symbol) = self.symbol(candidate) else {
                 return Ok(unknown_ancestry());
             };
-            if symbol.kind != SymbolKind::Type
-                || !matches!(symbol.type_kind, TypeKind::Class | TypeKind::Interface)
-            {
+            if symbol.kind != SymbolKind::Type {
+                return Ok(unknown_ancestry());
+            }
+            if entry.kind == TypeKind::Class && symbol.type_kind == TypeKind::Interface {
+                continue;
+            }
+            let expected_kind = match entry.kind {
+                TypeKind::Class => TypeKind::Class,
+                TypeKind::Interface => TypeKind::Interface,
+                _ => continue,
+            };
+            if symbol.type_kind != expected_kind {
                 return Ok(unknown_ancestry());
             }
             parents.push((candidate.uri.clone(), symbol.key.clone()));
@@ -3229,6 +3318,7 @@ impl NavigationIndex {
             .collect();
         let mut key_order = Vec::new();
         let mut seen_keys = HashSet::new();
+        let mut ambiguous_member = false;
         let branch_maps: Vec<HashMap<String, Vec<Candidate>>> = parent_candidates
             .into_iter()
             .map(|candidates| {
@@ -3265,6 +3355,7 @@ impl NavigationIndex {
                     .is_some_and(|current| !candidate_sets_equal(current, candidates))
                 {
                     ambiguous = true;
+                    ambiguous_member = true;
                     break;
                 }
                 selected = Some(candidates.clone());
@@ -3275,7 +3366,11 @@ impl NavigationIndex {
                 }
             }
         }
-        MemberLookup::known(result)
+        if ambiguous_member {
+            MemberLookup::unknown(result)
+        } else {
+            MemberLookup::known(result)
+        }
     }
 
     fn exported_references_for_document(&self, uri: &Url) -> Vec<Candidate> {
@@ -3662,6 +3757,14 @@ struct Candidate {
 #[derive(Debug, Clone)]
 struct ParentType {
     path: Vec<String>,
+    relation: ParentRelation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentRelation {
+    Superclass,
+    ImplementedInterface,
+    InterfaceParent,
 }
 
 #[derive(Debug, Clone)]
@@ -3710,6 +3813,8 @@ struct AncestryResolutionState {
     remaining_work: usize,
     active_types: HashSet<(Url, String)>,
     resolved_types: HashMap<(Url, String), TypeAncestryResolution>,
+    active_members: HashSet<(Url, String, Option<String>, bool)>,
+    resolved_members: HashMap<(Url, String, Option<String>, bool), MemberLookup>,
 }
 
 impl AncestryResolutionState {
@@ -3718,6 +3823,8 @@ impl AncestryResolutionState {
             remaining_work: MAX_ANCESTRY_WORK,
             active_types: HashSet::new(),
             resolved_types: HashMap::new(),
+            active_members: HashSet::new(),
+            resolved_members: HashMap::new(),
         }
     }
 
@@ -4811,6 +4918,7 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
         let parent_declared = !parent_fields.is_empty();
         let mut parent_spans = HashSet::new();
         let mut parents = Vec::new();
+        let mut parent_position = 0usize;
         for field in parent_fields {
             let fields = if field.kind() == "typeref" {
                 vec![field]
@@ -4822,21 +4930,31 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
                     .collect()
             };
             for parent in fields {
+                let relation = match type_kind {
+                    TypeKind::Class => {
+                        if parent_position == 0 {
+                            ParentRelation::Superclass
+                        } else {
+                            ParentRelation::ImplementedInterface
+                        }
+                    }
+                    TypeKind::Interface => ParentRelation::InterfaceParent,
+                    _ => ParentRelation::ImplementedInterface,
+                };
+                parent_position = parent_position.saturating_add(1);
                 let span = Span::from_node(parent);
                 if !parent_spans.insert(span) {
                     continue;
                 }
-                let Some(path) = simple_type_path(parent, source) else {
-                    continue;
-                };
-                let path = path
-                    .split('.')
-                    .filter(|part| !part.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                if !path.is_empty() {
-                    parents.push(ParentType { path });
-                }
+                let path = simple_type_path(parent, source)
+                    .map(|path| {
+                        path.split('.')
+                            .filter(|part| !part.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                parents.push(ParentType { path, relation });
             }
         }
 
@@ -5807,5 +5925,61 @@ mod tests {
             document.scopes
         );
         assert!(document.unknown_class_owners.contains("tobj"));
+    }
+
+    #[test]
+    fn inherited_member_dag_uses_bounded_memoized_expansion() {
+        const DAG_WIDTH: usize = 37;
+        let mut source = String::from(
+            "unit InheritedMemberDag;\ninterface\ntype\n  I0 = interface\n    procedure Hit;\n  end;\n",
+        );
+        for index in 1..DAG_WIDTH {
+            if index == 1 {
+                writeln!(&mut source, "  I{index} = interface(I0)\n  end;")
+                    .expect("write DAG node");
+            } else {
+                writeln!(
+                    &mut source,
+                    "  I{index} = interface(I{}, I{})\n  end;",
+                    index - 1,
+                    index - 2
+                )
+                .expect("write DAG node");
+            }
+        }
+        source.push_str(
+            "implementation\nprocedure Caller;\nvar\n  Obj: I36;\nbegin\n  Obj.Hit;\nend;\nend.\n",
+        );
+        let uri = Url::parse("file:///tmp/inherited-member-dag.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("inherited member DAG parses");
+
+        let mut state = AncestryResolutionState::new();
+        assert_eq!(
+            index.resolve_type_ancestry(&uri, "i36", &mut state).status,
+            AncestryStatus::Complete
+        );
+        let lookup = index.member_candidates_for_type_with_state(
+            &uri,
+            "i36",
+            Some("hit"),
+            false,
+            &mut state,
+        );
+        assert!(lookup.ancestry_known);
+        assert_eq!(lookup.candidates.len(), 1);
+        assert_eq!(
+            index
+                .symbol(&lookup.candidates[0])
+                .map(|symbol| symbol.name.as_str()),
+            Some("Hit")
+        );
+        assert_eq!(
+            state.remaining_work,
+            MAX_ANCESTRY_WORK.saturating_sub(DAG_WIDTH.saturating_mul(2)),
+            "each type and type/member pair must consume one bounded expansion"
+        );
     }
 }

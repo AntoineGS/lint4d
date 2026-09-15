@@ -431,14 +431,6 @@ impl NavigationIndex {
             })
     }
 
-    pub(super) fn owner_has_unknown_class_ancestor(
-        &self,
-        document: &Document,
-        owner_type: &str,
-    ) -> bool {
-        self.has_unknown_class_ancestor(document, owner_type)
-    }
-
     fn candidate_is_global(&self, candidate: &Candidate) -> bool {
         self.symbol(candidate).is_some_and(|symbol| {
             symbol.scope == ROOT_SCOPE

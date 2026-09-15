@@ -782,6 +782,64 @@ end;
 end.
 "#;
 
+const DECLARED_MEMBER_TYPE_PROVIDER: &str = r#"unit DeclaredMemberTypeProvider;
+interface
+type
+  TP = class
+    Shared: Integer;
+  end;
+  TBase = class
+    F: TP;
+  end;
+implementation
+end.
+"#;
+
+const DECLARED_MEMBER_TYPE_CONSUMER: &str = r#"unit DeclaredMemberTypeConsumer;
+interface
+uses DeclaredMemberTypeProvider;
+type
+  TP = class
+    Shared: string;
+  end;
+  TChild = class(DeclaredMemberTypeProvider.TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.F.Shared;
+end;
+end.
+"#;
+
+const CLASS_INTERFACE_PARENTS: &str = r#"unit ClassInterfaceParents;
+interface
+type
+  IFoo = interface
+    procedure ContractOnly;
+    procedure Shared;
+  end;
+  TBase = class
+    procedure Shared;
+  end;
+  TChild = class(TBase, IFoo)
+  end;
+implementation
+procedure TBase.Shared;
+begin
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.ContractOnly;
+  Obj.Shared;
+end;
+end.
+"#;
+
 const ASSISTANCE_PROVIDER: &str = r#"unit AssistanceProvider;
 interface
 type
@@ -2781,6 +2839,237 @@ fn inherited_interface_members_resolve_from_a_derived_interface() {
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>(),
         ["BaseMethod"]
+    );
+}
+
+#[test]
+fn nested_member_type_lookup_uses_the_declaring_unit_context() {
+    let provider_uri = uri("DeclaredMemberTypeProvider");
+    let consumer_uri = uri("DeclaredMemberTypeConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(
+            provider_uri.clone(),
+            DECLARED_MEMBER_TYPE_PROVIDER.to_owned(),
+        )
+        .expect("declared member type provider parses");
+    index
+        .update(
+            consumer_uri.clone(),
+            DECLARED_MEMBER_TYPE_CONSUMER.to_owned(),
+        )
+        .expect("declared member type consumer parses");
+
+    let usage = position_of(DECLARED_MEMBER_TYPE_CONSUMER, "Shared", 1);
+    let locations = index.navigate(&consumer_uri, usage, NavigationTarget::Declaration);
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &provider_uri,
+        position_of(DECLARED_MEMBER_TYPE_PROVIDER, "Shared", 0),
+    );
+
+    let hover = index
+        .hover(&consumer_uri, usage)
+        .expect("declared member type hover");
+    let text = hover_text(&hover);
+    assert!(text.contains("Shared: Integer"), "unexpected hover: {text}");
+    assert!(!text.contains("Shared: string"), "wrong hover: {text}");
+}
+
+#[test]
+fn class_lookup_excludes_implemented_interface_members() {
+    let source_uri = uri("ClassInterfaceParents");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), CLASS_INTERFACE_PARENTS.to_owned())
+        .expect("class/interface parent source parses");
+
+    let contract = index.navigate(
+        &source_uri,
+        position_of(CLASS_INTERFACE_PARENTS, "ContractOnly", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        contract.is_empty(),
+        "implemented interface contract leaked into class lookup: {contract:?}"
+    );
+
+    let base_method = index.navigate(
+        &source_uri,
+        position_of(CLASS_INTERFACE_PARENTS, "Shared", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_method.len(), 1);
+    assert_location_start(
+        &base_method[0],
+        &source_uri,
+        position_of(CLASS_INTERFACE_PARENTS, "Shared", 1),
+    );
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(CLASS_INTERFACE_PARENTS, "Obj.Co", 0),
+        )
+        .expect("class/interface parent completion");
+    assert!(
+        completion.items.is_empty(),
+        "implemented interface contract completion leaked: {:?}",
+        completion.items
+    );
+}
+
+#[test]
+fn cross_unit_inherited_private_members_are_not_completion_visible() {
+    let provider = r#"unit PrivateInheritedProvider;
+interface
+type
+  TBase = class
+  private
+    Hidden: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit PrivateInheritedConsumer;
+interface
+uses PrivateInheritedProvider;
+type
+  TChild = class(PrivateInheritedProvider.TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Hid;
+end;
+end.
+"#;
+    let provider_uri = uri("PrivateInheritedProvider");
+    let consumer_uri = uri("PrivateInheritedConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("private inherited provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("private inherited consumer parses");
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Obj.Hid", 0))
+        .expect("private inherited completion");
+    assert!(
+        completion.items.is_empty(),
+        "private inherited member leaked into completion: {:?}",
+        completion.items
+    );
+}
+
+#[test]
+fn unqualified_inherited_member_completion_keeps_proven_members() {
+    let source = r#"unit UnqualifiedInheritedCompletion;
+interface
+type
+  TBase = class
+    BaseField: Integer;
+  end;
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  BaseF;
+end;
+end.
+"#;
+    let source_uri = uri("UnqualifiedInheritedCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unqualified inherited completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "  BaseF", 1))
+        .expect("unqualified inherited completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseField"]
+    );
+}
+
+#[test]
+fn unknown_ancestry_completion_is_reported_incomplete() {
+    let source = r#"unit UnknownAncestryCompletion;
+interface
+type
+  TChild = class(TMissing)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Un;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownAncestryCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown ancestry completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Obj.Un", 0))
+        .expect("unknown ancestry completion");
+    assert!(completion.items.is_empty());
+    assert!(
+        completion.is_incomplete,
+        "unknown ancestry was reported as complete"
+    );
+}
+
+#[test]
+fn ambiguous_interface_completion_is_reported_incomplete() {
+    let source = r#"unit AmbiguousInterfaceCompletion;
+interface
+type
+  IA = interface
+    procedure Shared;
+  end;
+  IB = interface
+    procedure Shared;
+  end;
+  IChild = interface(IA, IB)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: IChild;
+begin
+  Obj.Sh;
+end;
+end.
+"#;
+    let source_uri = uri("AmbiguousInterfaceCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ambiguous interface completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Obj.Sh", 0))
+        .expect("ambiguous interface completion");
+    assert!(completion.items.is_empty());
+    assert!(
+        completion.is_incomplete,
+        "ambiguous interface lookup was reported as complete"
     );
 }
 

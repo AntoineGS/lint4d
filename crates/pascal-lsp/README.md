@@ -111,6 +111,14 @@ offered. Conditional uncertainty, ambiguous receivers, and bounded candidate
 truncation are reported conservatively with `CompletionList.isIncomplete` rather
 than as a falsely complete result.
 
+Class and interface member lookup follows the source ancestry retained for each
+indexed type, including inherited fields and routines and parents in imported
+units. A direct member shadows an inherited member, while missing, ambiguous,
+cyclic, or conditionally uncertain ancestry does not justify guessing a member
+from an unrelated type or global declaration. Rename remains conservative and
+rejects inherited class-member references until the complete override model is
+available.
+
 Signature help reports every supported source declaration that remains viable,
 including overloads. The active parameter is counted syntactically while
 skipping nested calls, indexers, Pascal strings, and comments; grouped formal

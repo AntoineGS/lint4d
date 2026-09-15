@@ -691,6 +691,97 @@ end;
 end.
 "#;
 
+const INHERITED_CLASS_MEMBERS: &str = r#"unit InheritedClassMembers;
+interface
+type
+  TBase = class
+  private
+    BaseField: Integer;
+  public
+    procedure BaseMethod;
+  end;
+  TChild = class(TBase)
+    procedure ChildMethod;
+  end;
+implementation
+procedure TBase.BaseMethod;
+begin
+  BaseField := 1;
+end;
+procedure TChild.ChildMethod;
+begin
+  BaseField := 2;
+  BaseMethod;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.BaseField;
+  Obj.BaseMethod;
+end;
+end.
+"#;
+
+const INHERITED_PROVIDER: &str = r#"unit InheritedProvider;
+interface
+type
+  TBase = class
+  public
+    CrossField: Integer;
+    procedure CrossMethod;
+  end;
+implementation
+procedure TBase.CrossMethod;
+begin
+  CrossField := 1;
+end;
+end.
+"#;
+
+const INHERITED_CONSUMER: &str = r#"unit InheritedConsumer;
+interface
+uses InheritedProvider;
+type
+  TChild = class(InheritedProvider.TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  CrossField := 1;
+  CrossMethod;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.CrossField;
+  Obj.CrossMethod;
+end;
+end.
+"#;
+
+const INHERITED_INTERFACE_MEMBERS: &str = r#"unit InheritedInterfaceMembers;
+interface
+type
+  IBase = interface
+    procedure BaseMethod;
+  end;
+  IChild = interface(IBase)
+    procedure ChildMethod;
+  end;
+implementation
+procedure Caller;
+var
+  Obj: IChild;
+begin
+  Obj.BaseMethod;
+  Obj.ChildMethod;
+end;
+end.
+"#;
+
 const ASSISTANCE_PROVIDER: &str = r#"unit AssistanceProvider;
 interface
 type
@@ -2550,6 +2641,357 @@ fn method_declaration_definition_fields_properties_and_self_are_scope_aware() {
         &self_method[0],
         &provider_uri,
         position_of(PROVIDER, "FValue", 0),
+    );
+}
+
+#[test]
+fn inherited_class_members_resolve_for_navigation_completion_and_hover() {
+    let source_uri = uri("InheritedClassMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), INHERITED_CLASS_MEMBERS.to_owned())
+        .expect("inherited class source parses");
+
+    let field = index.navigate(
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseField := 2", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(field.len(), 1);
+    assert_location_start(
+        &field[0],
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseField", 0),
+    );
+
+    let method = index.navigate(
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseMethod;\nend;", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(method.len(), 1);
+    assert_location_start(
+        &method[0],
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseMethod", 0),
+    );
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(INHERITED_CLASS_MEMBERS, "Obj.Ba", 0),
+        )
+        .expect("inherited member completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseField", "BaseMethod"]
+    );
+
+    let hover = index
+        .hover(
+            &source_uri,
+            position_of(INHERITED_CLASS_MEMBERS, "BaseField := 2", 0),
+        )
+        .expect("inherited member hover");
+    assert!(hover_text(&hover).contains("BaseField: Integer"));
+}
+
+#[test]
+fn inherited_members_resolve_through_a_cross_unit_ancestor() {
+    let provider_uri = uri("InheritedProvider");
+    let consumer_uri = uri("InheritedConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), INHERITED_PROVIDER.to_owned())
+        .expect("inherited provider parses");
+    index
+        .update(consumer_uri.clone(), INHERITED_CONSUMER.to_owned())
+        .expect("inherited consumer parses");
+
+    let field = index.navigate(
+        &consumer_uri,
+        position_of(INHERITED_CONSUMER, "CrossField := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(field.len(), 1);
+    assert_location_start(
+        &field[0],
+        &provider_uri,
+        position_of(INHERITED_PROVIDER, "CrossField", 0),
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(INHERITED_CONSUMER, "Obj.Cross", 0),
+        )
+        .expect("cross-unit inherited completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["CrossField", "CrossMethod"]
+    );
+
+    let hover = index
+        .hover(
+            &consumer_uri,
+            position_of(INHERITED_CONSUMER, "CrossMethod;\nend;", 0),
+        )
+        .expect("cross-unit inherited hover");
+    assert!(hover_text(&hover).contains("procedure CrossMethod;"));
+}
+
+#[test]
+fn inherited_interface_members_resolve_from_a_derived_interface() {
+    let source_uri = uri("InheritedInterfaceMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), INHERITED_INTERFACE_MEMBERS.to_owned())
+        .expect("inherited interface source parses");
+
+    let base_method = index.navigate(
+        &source_uri,
+        position_of(INHERITED_INTERFACE_MEMBERS, "BaseMethod", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_method.len(), 1);
+    assert_location_start(
+        &base_method[0],
+        &source_uri,
+        position_of(INHERITED_INTERFACE_MEMBERS, "BaseMethod", 0),
+    );
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(INHERITED_INTERFACE_MEMBERS, "Obj.Ba", 0),
+        )
+        .expect("inherited interface completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseMethod"]
+    );
+}
+
+#[test]
+fn direct_derived_members_shadow_inherited_members_and_completions() {
+    let source = r#"unit DerivedShadow;
+interface
+type
+  TBase = class
+    Shared: Integer;
+    procedure Run;
+  end;
+  TChild = class(TBase)
+    Shared: string;
+    procedure Run;
+  end;
+implementation
+procedure TBase.Run;
+begin
+end;
+procedure TChild.Run;
+begin
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Shared;
+  Obj.Run;
+end;
+end.
+"#;
+    let source_uri = uri("DerivedShadow");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("derived shadow source parses");
+
+    let shared = index.navigate(
+        &source_uri,
+        position_of(source, "Shared", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shared.len(), 1);
+    assert_location_start(&shared[0], &source_uri, position_of(source, "Shared", 1));
+
+    let shared_completion = index
+        .completion(&source_uri, position_after(source, "Obj.Sh", 0))
+        .expect("derived shadow field completion");
+    assert_eq!(
+        shared_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Shared"]
+    );
+
+    let run_completion = index
+        .completion(&source_uri, position_after(source, "Obj.Ru", 0))
+        .expect("derived override completion");
+    assert_eq!(
+        run_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Run"]
+    );
+}
+
+#[test]
+fn unresolved_ancestry_does_not_fall_back_to_unrelated_members() {
+    let source = r#"unit MissingAncestor;
+interface
+type
+  TChild = class(TMissing)
+    procedure Run;
+  end;
+const
+  GlobalName = 1;
+implementation
+procedure TChild.Run;
+begin
+  GlobalName;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.UnknownMember;
+end;
+end.
+"#;
+    let source_uri = uri("MissingAncestor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("missing ancestor source parses");
+
+    assert!(
+        index
+            .navigate(
+                &source_uri,
+                position_of(source, "GlobalName", 1),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert!(
+        index
+            .completion(&source_uri, position_after(source, "Obj.Un", 0))
+            .expect("missing ancestor completion")
+            .items
+            .is_empty()
+    );
+}
+
+#[test]
+fn cyclic_ancestry_fails_closed_without_recursive_lookup() {
+    let source = r#"unit CyclicAncestor;
+interface
+type
+  TA = class(TB)
+    procedure Run;
+  end;
+  TB = class(TA)
+    CycleField: Integer;
+  end;
+implementation
+procedure TA.Run;
+begin
+  CycleField;
+end;
+procedure Caller;
+var
+  Obj: TA;
+begin
+  Obj.CycleField;
+end;
+end.
+"#;
+    let source_uri = uri("CyclicAncestor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("cyclic ancestor source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "CycleField", 2),
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn ambiguous_ancestry_fails_closed_without_selecting_a_parent() {
+    let parent_a = r#"unit ParentA;
+interface
+type
+  TBase = class
+    Shared: Integer;
+  end;
+end.
+"#;
+    let parent_b = r#"unit ParentB;
+interface
+type
+  TBase = class
+    Shared: string;
+  end;
+end.
+"#;
+    let consumer = r#"unit AmbiguousAncestor;
+interface
+uses ParentA, ParentB;
+type
+  TChild = class(TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Shared;
+end;
+end.
+"#;
+    let parent_a_uri = uri("ParentA");
+    let parent_b_uri = uri("ParentB");
+    let consumer_uri = uri("AmbiguousAncestor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(parent_a_uri, parent_a.to_owned())
+        .expect("first ambiguous parent parses");
+    index
+        .update(parent_b_uri, parent_b.to_owned())
+        .expect("second ambiguous parent parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("ambiguous consumer parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Shared", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
     );
 }
 
@@ -5035,7 +5477,7 @@ fn hover_fails_closed_for_unqualified_routines_in_unknown_class_ancestors() {
     let source = r#"unit InheritedRoutine;
 interface
 type
-  TParent = class
+  TParent = class(TMissing)
     procedure Reset(X: Integer);
   end;
   TChild = class(TParent)
@@ -5094,7 +5536,7 @@ end.
 interface
 uses ImportedProvider;
 type
-  TChild = class
+  TChild = class(TMissing)
     procedure Run;
   end;
 implementation

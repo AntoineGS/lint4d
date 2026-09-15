@@ -883,28 +883,23 @@ impl NavigationIndex {
         precedence: usize,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        let Some(document) = self.documents.get(type_uri) else {
-            return Ok(());
-        };
-        let allow_implementation = type_uri == current_uri;
+        let lookup = self.member_candidates_for_completion_with_budget(
+            type_uri,
+            type_key,
+            type_uri == current_uri,
+            cancel,
+            accumulator.budget,
+        )?;
         let mut routine_keys = HashSet::new();
-        let indices = document
-            .member_symbol_indices_by_owner
-            .get(type_key)
-            .into_iter()
-            .flatten();
-        for index in indices {
+        for candidate in lookup.candidates {
             check_cancel(cancel)?;
             if !accumulator.take_scan_slot(cancel)? {
                 break;
             }
-            let Some(symbol) = document.symbols.get(*index) else {
+            let Some(symbol) = self.symbol(&candidate) else {
                 continue;
             };
-            if symbol.owner_type.as_deref() != Some(type_key)
-                || symbol.local_only
-                || !member_visible_in_region(symbol, allow_implementation)
-            {
+            if symbol.local_only {
                 continue;
             }
             if symbol.kind == SymbolKind::Routine
@@ -924,8 +919,8 @@ impl NavigationIndex {
             self.add_completion_candidate(
                 accumulator,
                 Candidate {
-                    uri: type_uri.clone(),
-                    index: *index,
+                    uri: candidate.uri.clone(),
+                    index: candidate.index,
                 },
                 current_uri,
                 type_uri != current_uri,
@@ -1710,11 +1705,6 @@ fn completion_symbol_kind_supported(kind: SymbolKind) -> bool {
             | SymbolKind::EnumValue
             | SymbolKind::Label
     )
-}
-
-fn member_visible_in_region(symbol: &Symbol, allow_implementation: bool) -> bool {
-    symbol.region == Region::Interface
-        || (allow_implementation && symbol.region == Region::Implementation)
 }
 
 fn private_declaration_spans(

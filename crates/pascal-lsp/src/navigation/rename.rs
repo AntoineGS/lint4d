@@ -452,14 +452,10 @@ impl NavigationIndex {
     }
 
     fn has_unknown_class_ancestor(&self, document: &Document, owner_type: &str) -> bool {
-        // The resolver does not establish a complete inheritance or type-alias
-        // chain here. A same-document parent name is therefore not proof that
-        // inherited lookup is complete, and an omitted parent still has
-        // implicit TObject ancestry that is not modeled. Established
-        // non-class owners do not have class-inheritance lookup to complete;
-        // an owner missing from both caches remains unresolved and therefore
-        // conservatively unknown. The parse-time cache keeps this policy out
-        // of request-time tree walks.
+        // Task 01 does not establish a complete override/rename model. Even
+        // a source-visible parent is not proof that every inherited binding
+        // and override family can be edited safely, so keep rename/reference
+        // operations conservative until that model is implemented.
         document.unknown_class_owners.contains(owner_type)
             || !document.known_non_class_owners.contains(owner_type)
     }
@@ -934,6 +930,21 @@ impl NavigationIndex {
                     .iter()
                     .filter(|candidate| binding.matches_candidate(self, candidate))
                     .count();
+                if matching > 0 && binding_has_class_owner && !is_direct_declaration {
+                    if let Some(dot) = member_expression {
+                        if self.member_reference_uses_inherited_class_owner(
+                            binding, uri, document, span.start, dot,
+                        ) {
+                            if !strict_resolution && !is_binding_member {
+                                continue;
+                            }
+                            return Err(format!(
+                                "rename does not support inherited class lookup at {}:{}",
+                                uri, span.start
+                            ));
+                        }
+                    }
+                }
                 if matching > 0 {
                     if matching != candidates.len() {
                         if !strict_resolution && !is_binding_member {
@@ -1062,6 +1073,38 @@ impl NavigationIndex {
         document
             .owner_type_at(offset)
             .is_some_and(|owner| !owners.contains(&(occurrence_uri.clone(), owner)))
+    }
+
+    fn member_reference_uses_inherited_class_owner(
+        &self,
+        binding: &Binding,
+        occurrence_uri: &Url,
+        document: &Document,
+        offset: usize,
+        dot: Node<'_>,
+    ) -> bool {
+        let Some(lhs) = dot.child_by_field_name("lhs") else {
+            return true;
+        };
+        let receivers = self.resolve_receivers(occurrence_uri, document, offset, lhs);
+        for receiver in receivers {
+            let super::Receiver::Type(type_uri, type_key) = receiver else {
+                continue;
+            };
+            let direct = self.direct_member_candidates(
+                &type_uri,
+                &type_key,
+                Some(&binding.old_key),
+                type_uri == *occurrence_uri,
+            );
+            if direct
+                .iter()
+                .any(|candidate| binding.matches_candidate(self, candidate))
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn check_declaration_collisions(&self, binding: &Binding, new_key: &str) -> Result<(), String> {

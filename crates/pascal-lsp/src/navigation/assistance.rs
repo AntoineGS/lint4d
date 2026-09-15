@@ -50,6 +50,7 @@ fn record_assistance_helper_entry(counter: &'static std::thread::LocalKey<Cell<u
 #[derive(Debug)]
 struct CompletionAccumulator<'a> {
     prefix: String,
+    completion_is_declaration: bool,
     candidates: HashMap<String, (Candidate, usize)>,
     uncertain: HashMap<String, usize>,
     scanned: usize,
@@ -73,9 +74,14 @@ enum TrailingMemberDot {
 }
 
 impl<'a> CompletionAccumulator<'a> {
-    fn new(prefix: &str, budget: &'a mut AssistanceBudget) -> Self {
+    fn new(
+        prefix: &str,
+        completion_is_declaration: bool,
+        budget: &'a mut AssistanceBudget,
+    ) -> Self {
         Self {
             prefix: canonical_name(prefix),
+            completion_is_declaration,
             candidates: HashMap::new(),
             uncertain: HashMap::new(),
             scanned: 0,
@@ -572,7 +578,12 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<(Vec<Candidate>, bool), String> {
-        let mut accumulator = CompletionAccumulator::new(prefix, budget);
+        let completion_is_declaration = current_document.symbols.iter().any(|current| {
+            current.declaration_ordered
+                && current.span.start <= offset
+                && offset <= current.span.end
+        });
+        let mut accumulator = CompletionAccumulator::new(prefix, completion_is_declaration, budget);
         let mut private_spans = HashMap::new();
         let unqualified = matches!(&member, CompletionMember::Unqualified);
         let mut suppress_unqualified_globals = false;
@@ -659,6 +670,7 @@ impl NavigationIndex {
                             false,
                             &mut private_spans,
                             0,
+                            offset,
                             cancel,
                         )?;
                     }
@@ -672,6 +684,7 @@ impl NavigationIndex {
                                 current_uri,
                                 &mut private_spans,
                                 0,
+                                offset,
                                 cancel,
                             )?;
                         if !ancestry_known || has_ambiguous_names {
@@ -699,6 +712,7 @@ impl NavigationIndex {
                     scope,
                     precedence,
                     &mut private_spans,
+                    offset,
                     cancel,
                 )?;
                 if accumulator.exhausted {
@@ -718,6 +732,7 @@ impl NavigationIndex {
                             current_uri,
                             &mut private_spans,
                             precedence,
+                            offset,
                             cancel,
                         )?;
                     if !ancestry_known || has_ambiguous_names {
@@ -762,6 +777,7 @@ impl NavigationIndex {
                         false,
                         &mut private_spans,
                         precedence,
+                        offset,
                         cancel,
                     )?;
                 }
@@ -782,6 +798,7 @@ impl NavigationIndex {
                             false,
                             &mut private_spans,
                             precedence.saturating_add(1),
+                            offset,
                             cancel,
                         )?;
                         if let Some(document) = self.documents.get(&unit_uri) {
@@ -811,6 +828,7 @@ impl NavigationIndex {
                                     false,
                                     &mut private_spans,
                                     precedence.saturating_add(1),
+                                    offset,
                                     cancel,
                                 )?;
                             }
@@ -826,29 +844,10 @@ impl NavigationIndex {
         if !accumulator.uncertain.is_empty() {
             accumulator.is_incomplete = true;
         }
-        let candidates = std::mem::take(&mut accumulator.candidates)
+        let mut candidates = std::mem::take(&mut accumulator.candidates)
             .into_values()
             .map(|(candidate, _)| candidate)
             .collect::<Vec<_>>();
-        let mut access_state = super::ResolutionState::new();
-        let mut accessible = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            check_cancel(cancel)?;
-            match self.candidate_access_decision_with_budget(
-                current_uri,
-                current_document,
-                offset,
-                &candidate,
-                &mut access_state,
-                cancel,
-                accumulator.budget,
-            )? {
-                super::AccessDecision::Visible => accessible.push(candidate),
-                super::AccessDecision::Unknown => accumulator.is_incomplete = true,
-                super::AccessDecision::Inaccessible => {}
-            }
-        }
-        let mut candidates = accessible;
         candidates.sort_by(|left, right| {
             let left_symbol = self.symbol(left);
             let right_symbol = self.symbol(right);
@@ -925,6 +924,7 @@ impl NavigationIndex {
         scope: usize,
         precedence: usize,
         private_spans: &mut HashMap<Url, HashSet<Span>>,
+        offset: usize,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
         let indices = document
@@ -957,6 +957,7 @@ impl NavigationIndex {
                 false,
                 private_spans,
                 precedence,
+                offset,
                 cancel,
             )?;
         }
@@ -972,6 +973,7 @@ impl NavigationIndex {
         member_access: bool,
         private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
+        offset: usize,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
         let Some(document) = self.documents.get(uri) else {
@@ -1008,6 +1010,7 @@ impl NavigationIndex {
                 member_access,
                 private_spans,
                 precedence,
+                offset,
                 cancel,
             )?;
         }
@@ -1024,6 +1027,7 @@ impl NavigationIndex {
         current_uri: &Url,
         private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
+        offset: usize,
         cancel: &AtomicBool,
     ) -> Result<(bool, bool), String> {
         let lookup = self.member_candidates_for_completion_with_budget(
@@ -1071,6 +1075,7 @@ impl NavigationIndex {
                 candidate.uri != *current_uri,
                 private_spans,
                 precedence,
+                offset,
                 cancel,
             )?;
         }
@@ -1082,10 +1087,11 @@ impl NavigationIndex {
         &self,
         accumulator: &mut CompletionAccumulator,
         candidate: Candidate,
-        _current_uri: &Url,
+        current_uri: &Url,
         _member_access: bool,
         _private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
+        offset: usize,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
         check_cancel(cancel)?;
@@ -1101,6 +1107,37 @@ impl NavigationIndex {
         if self.candidate_is_conditionally_unknown(&candidate) {
             accumulator.mark_uncertain(&symbol.key, precedence);
             return Ok(());
+        }
+        let Some(current_document) = self.documents.get(current_uri) else {
+            return Ok(());
+        };
+        let access = if accumulator.completion_is_declaration
+            && candidate.uri == *current_uri
+            && symbol.owner_type.is_none()
+            && symbol.declaration_ordered
+            && symbol.span.start > offset
+        {
+            super::AccessDecision::Visible
+        } else {
+            let mut access_state = super::ResolutionState::new();
+            self.candidate_access_decision_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                &mut access_state,
+                cancel,
+                accumulator.budget,
+            )?
+        };
+        match access {
+            super::AccessDecision::Visible => {}
+            super::AccessDecision::Unknown => {
+                accumulator.mark_uncertain(&symbol.key, precedence);
+                accumulator.is_incomplete = true;
+                return Ok(());
+            }
+            super::AccessDecision::Inaccessible => return Ok(()),
         }
         accumulator.insert(candidate, symbol, precedence);
         Ok(())
@@ -4068,14 +4105,14 @@ mod tests {
         let candidate = Candidate { uri, index: 0 };
 
         let mut same_scope_budget = AssistanceBudget::new(16, 16, "test");
-        let mut same_scope = CompletionAccumulator::new("same", &mut same_scope_budget);
+        let mut same_scope = CompletionAccumulator::new("same", false, &mut same_scope_budget);
         same_scope.mark_uncertain(&symbol.key, 2);
         same_scope.insert(candidate.clone(), &symbol, 2);
         assert!(same_scope.candidates.is_empty());
         assert_eq!(same_scope.uncertain.get(&symbol.key), Some(&2));
 
         let mut shadowed_budget = AssistanceBudget::new(16, 16, "test");
-        let mut shadowed = CompletionAccumulator::new("same", &mut shadowed_budget);
+        let mut shadowed = CompletionAccumulator::new("same", false, &mut shadowed_budget);
         shadowed.insert(candidate, &symbol, 0);
         shadowed.mark_uncertain(&symbol.key, 1);
         assert!(shadowed.candidates.contains_key(&symbol.key));

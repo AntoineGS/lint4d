@@ -2818,3 +2818,199 @@ end.
         "strict-private access from another class must reject a partial rename"
     );
 }
+
+#[test]
+fn inline_variable_rename_stays_within_each_nested_block() {
+    let source = r#"unit BlockInlineRename;
+interface
+var
+  Value: Integer;
+implementation
+procedure Run;
+begin
+  Value := 1;
+  if True then
+  begin
+    var Value: Integer;
+    Value := 2;
+    if True then
+    begin
+      var Value: Integer;
+      Value := 3;
+    end;
+    Value := 4;
+  end;
+  Value := 5;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "BlockInlineRename", source);
+
+    let global_declaration = range_in(source, "Value: Integer", "Value", 0);
+    let outer_declaration = range_in(source, "Value: Integer", "Value", 1);
+    let inner_declaration = range_in(source, "Value: Integer", "Value", 2);
+
+    let global_edits = index
+        .rename_edits(&source_uri, global_declaration.start, "GlobalValue")
+        .expect("global inline-shadow rename succeeds");
+    assert_exact_edits(
+        &global_edits,
+        vec![
+            (
+                source_uri.clone(),
+                global_declaration,
+                "GlobalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 1", "Value", 0),
+                "GlobalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 5", "Value", 0),
+                "GlobalValue".to_owned(),
+            ),
+        ],
+    );
+
+    let outer_edits = index
+        .rename_edits(&source_uri, outer_declaration.start, "OuterValue")
+        .expect("outer inline rename succeeds");
+    assert_exact_edits(
+        &outer_edits,
+        vec![
+            (
+                source_uri.clone(),
+                outer_declaration,
+                "OuterValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 2", "Value", 0),
+                "OuterValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 4", "Value", 0),
+                "OuterValue".to_owned(),
+            ),
+        ],
+    );
+
+    let inner_edits = index
+        .rename_edits(&source_uri, inner_declaration.start, "InnerValue")
+        .expect("inner inline rename succeeds");
+    assert_exact_edits(
+        &inner_edits,
+        vec![
+            (
+                source_uri.clone(),
+                inner_declaration,
+                "InnerValue".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "Value := 3", "Value", 0),
+                "InnerValue".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn local_declaration_rename_respects_prior_initializer_bindings() {
+    let source = r#"unit DeclarationOrderRename;
+interface
+const
+  Value = 1;
+type
+  TGlobal = Integer;
+implementation
+procedure Run;
+const
+  BeforeValue = Value;
+  Value = 2;
+type
+  TBefore = TGlobal;
+  TGlobal = string;
+var
+  BeforeVar: TGlobal;
+begin
+  WriteLn(Value);
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "DeclarationOrderRename", source);
+
+    let global_value_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value = 1", 0),
+            "GlobalValue",
+        )
+        .expect("global constant rename succeeds");
+    assert_exact_edits(
+        &global_value_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "Value = 1", "Value", 0),
+                "GlobalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in_occurrence(source, "BeforeValue = Value", "Value", 0, 1),
+                "GlobalValue".to_owned(),
+            ),
+        ],
+    );
+
+    let local_value_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value = 2", 0),
+            "LocalValue",
+        )
+        .expect("local constant rename succeeds");
+    assert_exact_edits(
+        &local_value_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "Value = 2", "Value", 0),
+                "LocalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "WriteLn(Value)", "Value", 0),
+                "LocalValue".to_owned(),
+            ),
+        ],
+    );
+
+    let local_type_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "TGlobal = string", 0),
+            "LocalType",
+        )
+        .expect("local type rename succeeds");
+    assert_exact_edits(
+        &local_type_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "TGlobal = string", "TGlobal", 0),
+                "LocalType".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "BeforeVar: TGlobal", "TGlobal", 0),
+                "LocalType".to_owned(),
+            ),
+        ],
+    );
+}

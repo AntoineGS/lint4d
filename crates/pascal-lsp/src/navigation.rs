@@ -421,11 +421,10 @@ impl NavigationIndex {
             return AccessDecision::Unknown;
         }
         let mut ancestry_state = AncestryResolutionState::new();
-        if self
+        let status = self
             .resolve_type_ancestry(current_uri, &current_owner, &mut ancestry_state)
-            .status
-            == AncestryStatus::Unknown
-        {
+            .status;
+        if status == AncestryStatus::Unknown {
             AccessDecision::Unknown
         } else {
             AccessDecision::Inaccessible
@@ -545,18 +544,21 @@ impl NavigationIndex {
         candidates: Vec<Candidate>,
         state: &mut ResolutionState,
     ) -> Vec<Candidate> {
-        candidates
-            .into_iter()
-            .filter(|candidate| {
-                self.candidate_access_decision(
-                    current_uri,
-                    current_document,
-                    offset,
-                    candidate,
-                    state,
-                ) == AccessDecision::Visible
-            })
-            .collect()
+        let mut result = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            match self.candidate_access_decision(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                state,
+            ) {
+                AccessDecision::Visible => result.push(candidate),
+                AccessDecision::Unknown => state.mark_receiver_uncertain(),
+                AccessDecision::Inaccessible => {}
+            }
+        }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -747,7 +749,13 @@ impl NavigationIndex {
         } else {
             self.unqualified_references(uri, document, offset, &name)
         };
-        self.filter_accessible_candidates_with_state(uri, document, offset, candidates, state)
+        let candidates =
+            self.filter_accessible_candidates_with_state(uri, document, offset, candidates, state);
+        if state.receiver_resolution_uncertain() {
+            Vec::new()
+        } else {
+            candidates
+        }
     }
 
     fn resolve_candidates_at_with_budget(
@@ -818,9 +826,14 @@ impl NavigationIndex {
                 uri, document, offset, name, identifier, cancel, budget,
             )
         }?;
-        self.filter_accessible_candidates_with_state_and_budget(
+        let candidates = self.filter_accessible_candidates_with_state_and_budget(
             uri, document, offset, candidates, state, cancel, budget,
-        )
+        )?;
+        Ok(if state.receiver_resolution_uncertain() {
+            Vec::new()
+        } else {
+            candidates
+        })
     }
 
     fn direct_symbol_references_with_budget(
@@ -2460,6 +2473,15 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        let references = self.filter_accessible_candidates_with_state_and_budget(
+            current_uri,
+            current_document,
+            offset,
+            references,
+            state,
+            cancel,
+            budget,
+        )?;
         if !references.is_empty() {
             if references
                 .iter()
@@ -3503,6 +3525,10 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        if state.receiver_resolution_uncertain() {
+            state.active_members.remove(&resolution_key);
+            return Ok(Vec::new());
+        }
         let constructor_keys = candidates
             .iter()
             .filter_map(|candidate| {
@@ -4064,6 +4090,10 @@ impl NavigationIndex {
             }
         }
         let candidates = accessible;
+        if state.receiver_resolution_uncertain() {
+            state.active_members.remove(&resolution_key);
+            return Vec::new();
+        }
         let constructor_keys = candidates
             .iter()
             .filter_map(|candidate| {
@@ -5972,7 +6002,7 @@ impl Document {
             .collect();
 
         let definitions = collect_nodes_matching(root, "defProc");
-        let (scopes, scope_by_span) = build_scopes(source.len(), &definitions, &source);
+        let (scopes, scope_by_span) = build_scopes(source.len(), root, &definitions, &source);
         let cache_unsafe_scopes = cache_unsafe_scopes(root, &scope_by_span);
         let mut symbols = Vec::new();
 
@@ -6269,11 +6299,20 @@ impl Document {
     }
 
     fn result_type_annotation_for_body_scope(&self, scope: usize) -> Option<ResultTypeAnnotation> {
-        self.routine_symbol_indices_by_body_scope
-            .get(&scope)
-            .into_iter()
-            .flatten()
-            .find_map(|index| self.symbols.get(*index)?.result_type_annotation())
+        let mut current = Some(scope);
+        while let Some(scope) = current {
+            if let Some(annotation) = self
+                .routine_symbol_indices_by_body_scope
+                .get(&scope)
+                .into_iter()
+                .flatten()
+                .find_map(|index| self.symbols.get(*index)?.result_type_annotation())
+            {
+                return Some(annotation);
+            }
+            current = self.scopes[scope].parent;
+        }
+        None
     }
 
     fn owner_type_at(&self, offset: usize) -> Option<String> {
@@ -7049,7 +7088,7 @@ fn add_named_symbol(
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),
             visibility: visibility_for_declaration(node, source),
-            declaration_ordered: matches!(node.kind(), "varDef" | "varAssignDef"),
+            declaration_ordered: scope != ROOT_SCOPE && owner_type.is_none(),
             generic_parameters: generic_parameters.clone(),
             generic_parameter: None,
             type_name: type_name.clone(),
@@ -7690,10 +7729,13 @@ fn generic_constraint_type_node(node: Node<'_>) -> Option<Node<'_>> {
 
 fn build_scopes(
     source_len: usize,
+    root: Node<'_>,
     definitions: &[Node<'_>],
     source: &str,
 ) -> (Vec<Scope>, HashMap<Span, usize>) {
-    let mut seeds: Vec<(Span, Option<String>)> = definitions
+    let mut scope_nodes = definitions.to_vec();
+    scope_nodes.extend(collect_nodes_matching(root, "block"));
+    let mut seeds: Vec<(Span, Option<String>)> = scope_nodes
         .iter()
         .map(|node| {
             let owner_type = node
@@ -7739,25 +7781,22 @@ fn build_scopes(
 }
 
 fn cache_unsafe_scopes(root: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> HashSet<usize> {
-    let mut inline_declarations = collect_nodes_matching(root, "varDef");
-    inline_declarations.extend(collect_nodes_matching(root, "varAssignDef"));
+    let declarations = ["declConst", "declType", "declVar", "varDef", "varAssignDef"]
+        .into_iter()
+        .flat_map(|kind| collect_nodes_matching(root, kind))
+        .collect::<Vec<_>>();
 
     let mut unsafe_scopes = HashSet::new();
-    for declaration in inline_declarations {
+    for declaration in declarations {
         let mut current = Some(declaration);
         let mut marked = false;
         while let Some(node) = current {
+            if let Some(scope) = scope_by_span.get(&Span::from_node(node)).copied() {
+                unsafe_scopes.insert(scope);
+                marked = true;
+                break;
+            }
             match node.kind() {
-                "defProc" => {
-                    unsafe_scopes.insert(
-                        scope_by_span
-                            .get(&Span::from_node(node))
-                            .copied()
-                            .unwrap_or(ROOT_SCOPE),
-                    );
-                    marked = true;
-                    break;
-                }
                 "lambda" => {
                     // Lambda occurrences are rejected by the per-use check;
                     // they must not disable caching for unrelated root uses.
@@ -7779,11 +7818,8 @@ fn cache_unsafe_scopes(root: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> 
 fn scope_for_declaration(node: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> usize {
     let mut current = Some(node);
     while let Some(item) = current {
-        if item.kind() == "defProc" {
-            return scope_by_span
-                .get(&Span::from_node(item))
-                .copied()
-                .unwrap_or(ROOT_SCOPE);
+        if let Some(scope) = scope_by_span.get(&Span::from_node(item)).copied() {
+            return scope;
         }
         current = item.parent();
     }

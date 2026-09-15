@@ -1,4 +1,7 @@
-use lsp_types::{CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range, Url};
+use lsp_types::{
+    CompletionItemKind, CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range,
+    Url,
+};
 use pascal_core::delphi_overrides::OverrideSession;
 use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
@@ -2817,6 +2820,180 @@ end.
     assert_eq!(
         known_header.signatures[0].parameters.as_ref().map(Vec::len),
         Some(1)
+    );
+}
+
+#[test]
+fn inline_variables_are_visible_only_inside_their_blocks() {
+    let source = r#"unit BlockInline;
+interface
+var
+  Value: Integer;
+  Inferred: Integer;
+implementation
+procedure Run;
+begin
+  Value := 1;
+  if True then
+  begin
+    var Value: Integer;
+    Value := 2;
+    if True then
+    begin
+      var Inferred := Value;
+      Inferred := 3;
+    end;
+  end;
+  Value := 4;
+  Inferred := 5;
+end;
+end.
+"#;
+    let source_uri = uri("BlockInline");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inline variable source parses");
+
+    let global_value = position_of(source, "Value: Integer", 0);
+    let local_value = position_of(source, "Value: Integer", 1);
+    let global_inferred = position_of(source, "Inferred: Integer", 0);
+    let nested_inferred = position_of(source, "Inferred := 3", 0);
+
+    let before_block = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(before_block.len(), 1);
+    assert_location_start(&before_block[0], &source_uri, global_value);
+
+    let inside_block = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 2", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(inside_block.len(), 1);
+    assert_location_start(&inside_block[0], &source_uri, local_value);
+
+    let nested_use = index.navigate(&source_uri, nested_inferred, NavigationTarget::Declaration);
+    assert_eq!(nested_use.len(), 1);
+    assert_location_start(
+        &nested_use[0],
+        &source_uri,
+        position_of(source, "Inferred :=", 0),
+    );
+
+    let after_block = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 4", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(after_block.len(), 1);
+    assert_location_start(&after_block[0], &source_uri, global_value);
+
+    let after_nested_block = index.navigate(
+        &source_uri,
+        position_of(source, "Inferred := 5", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(after_nested_block.len(), 1);
+    assert_location_start(&after_nested_block[0], &source_uri, global_inferred);
+}
+
+#[test]
+fn unknown_member_access_keeps_overload_and_result_resolution_uncertain() {
+    let provider = r#"unit UnknownOverloadProvider;
+interface
+type
+  TProtectedResult = class
+    ProtectedMember: Integer;
+  end;
+  TPublicResult = class
+    PublicMember: Integer;
+  end;
+  TBase = class
+  strict protected
+    function Pick(Value: Integer): TProtectedResult; overload;
+  public
+    function Pick(Value: Int64): TPublicResult; overload;
+  end;
+implementation
+function TBase.Pick(Value: Integer): TProtectedResult;
+begin
+  Result := TProtectedResult.Create;
+end;
+function TBase.Pick(Value: Int64): TPublicResult;
+begin
+  Result := TPublicResult.Create;
+end;
+end.
+"#;
+    let consumer = r#"unit UnknownOverloadConsumer;
+interface
+uses UnknownOverloadProvider;
+type
+  TChild = class(MissingBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+var
+  Obj: TBase;
+  N: Integer;
+begin
+  Obj.Pick(N);
+  Obj.Pick(N).PublicMember;
+end;
+end.
+"#;
+    let provider_uri = uri("UnknownOverloadProvider");
+    let consumer_uri = uri("UnknownOverloadConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("unknown overload provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("unknown overload consumer parses");
+
+    let navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Pick(N)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        navigation.is_empty(),
+        "unknown access selected a public overload: {navigation:?}"
+    );
+
+    let signature = index
+        .signature_help(&consumer_uri, position_after(consumer, "Obj.Pick(N", 0))
+        .expect("unknown access signature help");
+    assert!(
+        signature.is_none(),
+        "unknown access produced a definite signature: {signature:?}"
+    );
+
+    let result_navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "PublicMember", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        result_navigation.is_empty(),
+        "unknown access selected a public result: {result_navigation:?}"
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "Obj.Pick(N).Pub", 0),
+        )
+        .expect("unknown access result completion");
+    assert!(
+        completion.items.is_empty() && completion.is_incomplete,
+        "unknown access produced a definite result completion: {completion:?}"
     );
 }
 
@@ -11969,6 +12146,161 @@ end.
 }
 
 #[test]
+fn local_const_type_and_var_initializers_use_only_prior_bindings() {
+    let source = r#"unit LocalDeclarationOrder;
+interface
+const
+  Value = 1;
+type
+  TGlobal = Integer;
+implementation
+procedure Run;
+const
+  BeforeValue = Value;
+  Value = 2;
+type
+  TBefore = TGlobal;
+  TGlobal = string;
+var
+  BeforeVar: TGlobal;
+begin
+  WriteLn(Value);
+end;
+end.
+"#;
+    let source_uri = uri("LocalDeclarationOrder");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("local declaration order source parses");
+
+    let before_value = index.navigate(
+        &source_uri,
+        position_after(source, "BeforeValue = ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(before_value.len(), 1);
+    assert_location_start(
+        &before_value[0],
+        &source_uri,
+        position_of(source, "Value = 1", 0),
+    );
+
+    let local_value = index.navigate(
+        &source_uri,
+        position_after(source, "WriteLn(", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local_value.len(), 1);
+    assert_location_start(
+        &local_value[0],
+        &source_uri,
+        position_of(source, "Value = 2", 0),
+    );
+
+    let before_type = index.navigate(
+        &source_uri,
+        position_of(source, "TGlobal;", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(before_type.len(), 1);
+    assert_location_start(
+        &before_type[0],
+        &source_uri,
+        position_of(source, "TGlobal = Integer", 0),
+    );
+
+    let local_type = index.navigate(
+        &source_uri,
+        position_after(source, "BeforeVar: ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local_type.len(), 1);
+    assert_location_start(
+        &local_type[0],
+        &source_uri,
+        position_of(source, "TGlobal = string", 0),
+    );
+}
+
+#[test]
+fn completion_filters_future_bindings_before_shadowing_precedence() {
+    let source = r#"unit CompletionDeclarationOrder;
+interface
+const
+  Value = 1;
+implementation
+procedure Run;
+begin
+  if True then
+  begin
+    Val;
+    var Value: Integer;
+    Value := 2;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("CompletionDeclarationOrder");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("completion declaration order source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Val", 1))
+        .expect("completion before future local declaration");
+    assert_eq!(completion.items.len(), 1);
+    assert_eq!(completion.items[0].label, "Value");
+    assert_eq!(completion.items[0].kind, Some(CompletionItemKind::CONSTANT));
+}
+
+#[test]
+fn completion_filters_inaccessible_members_before_shadowing_precedence() {
+    let provider = r#"unit CompletionAccessProvider;
+interface
+type
+  TBase = class
+  private
+    Value: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit CompletionAccessConsumer;
+interface
+uses CompletionAccessProvider;
+const
+  Value = 1;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Val
+end;
+end.
+"#;
+    let provider_uri = uri("CompletionAccessProvider");
+    let consumer_uri = uri("CompletionAccessConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("completion access provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("completion access consumer parses");
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Val", 1))
+        .expect("completion with inaccessible member collision");
+    assert_eq!(completion.items.len(), 1);
+    assert_eq!(completion.items[0].label, "Value");
+    assert_eq!(completion.items[0].kind, Some(CompletionItemKind::CONSTANT));
+}
+
+#[test]
 fn inaccessible_member_cannot_be_used_as_a_receiver_for_nested_lookup() {
     let provider = r#"unit NestedAccessProvider;
 interface
@@ -12030,6 +12362,74 @@ end.
     assert!(
         completion.items.iter().all(|item| item.label != "Exposed"),
         "nested lookup leaked an inaccessible receiver into completion"
+    );
+}
+
+#[test]
+fn unqualified_inaccessible_receiver_is_filtered_before_nested_lookup() {
+    let provider = r#"unit UnqualifiedReceiverProvider;
+interface
+type
+  TPayload = class
+    Exposed: Integer;
+  end;
+  TBase = class
+  private
+    Hidden: TPayload;
+  end;
+end.
+"#;
+    let consumer = r#"unit UnqualifiedReceiverConsumer;
+interface
+uses UnqualifiedReceiverProvider;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Hidden.Exposed := 1;
+end;
+end.
+"#;
+    let provider_uri = uri("UnqualifiedReceiverProvider");
+    let consumer_uri = uri("UnqualifiedReceiverConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("unqualified receiver provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("unqualified receiver consumer parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Hidden", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "inaccessible unqualified receiver was exposed"
+    );
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Exposed", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "nested member lookup traversed an inaccessible unqualified receiver"
+    );
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Hidden.Exp", 0))
+        .expect("unqualified receiver completion");
+    assert!(
+        completion.items.is_empty(),
+        "inaccessible unqualified receiver leaked nested members: {completion:?}"
     );
 }
 

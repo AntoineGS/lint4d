@@ -400,43 +400,6 @@ fn infer_argument(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<ArgumentInfo, String> {
-    let kind = node.kind();
-    if matches!(kind, "literalNumber") {
-        let text = node_text(index, current_document, node, cancel, budget)?;
-        let ty = infer_numeric_literal(&text);
-        return Ok(ArgumentInfo {
-            ty: Some(ty),
-            assignable: false,
-            nil_literal: false,
-        });
-    }
-    if matches!(kind, "literalString" | "literalChar") {
-        let text = node_text(index, current_document, node, cancel, budget)?;
-        let is_character = kind == "literalChar" || text.trim_start().starts_with('#');
-        return Ok(ArgumentInfo {
-            ty: Some(TypeIdentity::Builtin(if is_character {
-                BuiltinType::Character
-            } else {
-                BuiltinType::String
-            })),
-            assignable: false,
-            nil_literal: false,
-        });
-    }
-    if kind == "kTrue" || kind == "kFalse" {
-        return Ok(ArgumentInfo {
-            ty: Some(TypeIdentity::Builtin(BuiltinType::Boolean)),
-            assignable: false,
-            nil_literal: false,
-        });
-    }
-    if kind == "kNil" {
-        return Ok(ArgumentInfo {
-            ty: None,
-            assignable: false,
-            nil_literal: true,
-        });
-    }
     let mut node = node;
     let mut force_non_assignable = false;
     loop {
@@ -468,6 +431,33 @@ fn infer_argument(
             ty: Some(ty),
             assignable: false,
             nil_literal: false,
+        });
+    }
+    if matches!(kind, "literalString" | "literalChar") {
+        let text = node_text(index, current_document, node, cancel, budget)?;
+        let is_character = kind == "literalChar" || is_single_character_codepoint(&text);
+        return Ok(ArgumentInfo {
+            ty: Some(TypeIdentity::Builtin(if is_character {
+                BuiltinType::Character
+            } else {
+                BuiltinType::String
+            })),
+            assignable: false,
+            nil_literal: false,
+        });
+    }
+    if kind == "kTrue" || kind == "kFalse" {
+        return Ok(ArgumentInfo {
+            ty: Some(TypeIdentity::Builtin(BuiltinType::Boolean)),
+            assignable: false,
+            nil_literal: false,
+        });
+    }
+    if kind == "kNil" {
+        return Ok(ArgumentInfo {
+            ty: None,
+            assignable: false,
+            nil_literal: true,
         });
     }
     if kind == "exprCall" || kind == "exprAs" {
@@ -571,7 +561,7 @@ fn is_assignable_symbol(symbol: &Symbol) -> bool {
         SymbolKind::Variable | SymbolKind::Field => true,
         SymbolKind::Parameter => matches!(
             symbol.parameter_mode,
-            Some(ParameterMode::Var | ParameterMode::Out)
+            Some(ParameterMode::Value | ParameterMode::Var | ParameterMode::Out)
         ),
         // Properties are deliberately treated as non-assignable.  Their
         // accessor metadata cannot prove that the property has a writable
@@ -618,6 +608,53 @@ fn infer_numeric_literal(text: &str) -> TypeIdentity {
         .unwrap_or(TypeIdentity::Builtin(BuiltinType::Integer(
             IntegerKind::Literal,
         )))
+}
+
+fn is_single_character_codepoint(text: &str) -> bool {
+    let mut remaining = text.trim();
+    let mut fragments = 0usize;
+    let mut only_codepoint = false;
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start();
+        if let Some(after_hash) = remaining.strip_prefix('#') {
+            let length = after_hash
+                .as_bytes()
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if length == 0 {
+                return false;
+            }
+            remaining = &after_hash[length..];
+            fragments += 1;
+            only_codepoint = true;
+            continue;
+        }
+        if remaining.starts_with('\'') {
+            let bytes = remaining.as_bytes();
+            let mut index = 1;
+            while index < bytes.len() {
+                if bytes[index] != b'\'' {
+                    index += 1;
+                    continue;
+                }
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                remaining = &remaining[index + 1..];
+                fragments += 1;
+                only_codepoint = false;
+                break;
+            }
+            if index >= bytes.len() {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    fragments == 1 && only_codepoint
 }
 
 fn is_radix_integer(text: &str) -> bool {
@@ -749,7 +786,7 @@ pub(super) fn builtin_type(name: &str) -> Option<BuiltinType> {
         "smallint" => Some(BuiltinType::Integer(IntegerKind::SmallInt)),
         "byte" => Some(BuiltinType::Integer(IntegerKind::Byte)),
         "word" => Some(BuiltinType::Integer(IntegerKind::Word)),
-        "longint" => Some(BuiltinType::Integer(IntegerKind::LongInt)),
+        "longint" => Some(BuiltinType::Integer(IntegerKind::Integer)),
         "int64" => Some(BuiltinType::Integer(IntegerKind::Int64)),
         "cardinal" => Some(BuiltinType::Integer(IntegerKind::Cardinal)),
         "longword" => Some(BuiltinType::Integer(IntegerKind::LongWord)),
@@ -798,7 +835,7 @@ fn integer_range(kind: IntegerKind) -> Option<(i128, i128)> {
         IntegerKind::Literal => None,
         IntegerKind::ShortInt => Some((i8::MIN as i128, i8::MAX as i128)),
         IntegerKind::SmallInt => Some((i16::MIN as i128, i16::MAX as i128)),
-        IntegerKind::Integer | IntegerKind::LongInt => Some((i32::MIN as i128, i32::MAX as i128)),
+        IntegerKind::Integer => Some((i32::MIN as i128, i32::MAX as i128)),
         IntegerKind::Byte => Some((u8::MIN as i128, u8::MAX as i128)),
         IntegerKind::Word => Some((u16::MIN as i128, u16::MAX as i128)),
         IntegerKind::Cardinal | IntegerKind::LongWord => Some((u32::MIN as i128, u32::MAX as i128)),
@@ -825,9 +862,8 @@ fn conversion(
         (TypeIdentity::Builtin(actual), TypeIdentity::Builtin(expected)) => {
             let result = match (actual, expected) {
                 (left, right) if left == right => Conversion::Cost(0),
-                (BuiltinType::Integer(_), BuiltinType::Real)
-                | (BuiltinType::Character, BuiltinType::Integer(_)) => Conversion::Cost(1),
-                (BuiltinType::Character, BuiltinType::Real) => Conversion::Cost(2),
+                (BuiltinType::Integer(_), BuiltinType::Real) => Conversion::Cost(1),
+                (BuiltinType::Character, BuiltinType::String) => Conversion::Cost(1),
                 (BuiltinType::Integer(actual), BuiltinType::Integer(expected)) => {
                     integer_conversion(*actual, *expected)
                 }
@@ -885,6 +921,13 @@ fn conversion(
         (TypeIdentity::IntegerLiteral(_), TypeIdentity::IntegerLiteral(_)) => {
             Ok(Conversion::Unknown)
         }
+        (
+            TypeIdentity::IntegerLiteral(_),
+            TypeIdentity::Named {
+                kind: TypeKind::Other | TypeKind::String,
+                ..
+            },
+        ) => Ok(Conversion::Unknown),
         (TypeIdentity::IntegerLiteral(_), TypeIdentity::Named { .. })
         | (TypeIdentity::Named { .. }, TypeIdentity::IntegerLiteral(_))
         | (TypeIdentity::Builtin(_), TypeIdentity::IntegerLiteral(_)) => {

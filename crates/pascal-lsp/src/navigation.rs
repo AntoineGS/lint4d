@@ -57,7 +57,6 @@ pub(super) enum IntegerKind {
     ShortInt,
     SmallInt,
     Integer,
-    LongInt,
     Byte,
     Word,
     Cardinal,
@@ -3778,6 +3777,25 @@ impl NavigationIndex {
             if !direct.is_empty() && !direct_has_routine {
                 return MemberLookup::known(direct);
             }
+            let direct_routines = direct
+                .iter()
+                .filter_map(|candidate| {
+                    self.symbol(candidate)
+                        .filter(|symbol| symbol.kind == SymbolKind::Routine)
+                })
+                .collect::<Vec<_>>();
+            let direct_reintroduces = direct_routines
+                .iter()
+                .any(|symbol| symbol.routine_directives.reintroduce);
+            let direct_overrides = direct_routines
+                .iter()
+                .filter(|symbol| symbol.routine_directives.override_)
+                .filter_map(|symbol| symbol.routine_signature.clone())
+                .collect::<HashSet<_>>();
+            let direct_overload_set = !direct_routines.is_empty()
+                && direct_routines
+                    .iter()
+                    .all(|symbol| symbol.routine_directives.overload);
             let mut selected: Option<Vec<Candidate>> = None;
             for lookup in parent_lookups {
                 let candidates = dedup_candidates(
@@ -3785,10 +3803,26 @@ impl NavigationIndex {
                         .candidates
                         .into_iter()
                         .filter(|candidate| {
-                            !direct_has_routine
-                                || self
-                                    .symbol(candidate)
-                                    .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+                            if direct_routines.is_empty() {
+                                return true;
+                            }
+                            if direct_reintroduces || !direct_overload_set {
+                                return false;
+                            }
+                            self.symbol(candidate).is_some_and(|symbol| {
+                                if symbol.kind != SymbolKind::Routine
+                                    || !symbol.routine_directives.overload
+                                {
+                                    return false;
+                                }
+                                let overridden =
+                                    symbol.routine_signature.as_ref().is_some_and(|signature| {
+                                        direct_overrides.contains(signature)
+                                            && (symbol.routine_directives.virtual_
+                                                || symbol.routine_directives.dynamic)
+                                    });
+                                !overridden
+                            })
                         })
                         .collect(),
                 );
@@ -4246,6 +4280,7 @@ struct Symbol {
     kind: SymbolKind,
     type_kind: TypeKind,
     routine_kind: RoutineKind,
+    routine_directives: RoutineDirectives,
     parameter_mode: Option<ParameterMode>,
     scope: usize,
     owner_type: Option<String>,
@@ -4274,6 +4309,15 @@ struct RoutineParameter {
     type_name: Option<String>,
     mode: ParameterMode,
     has_default: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RoutineDirectives {
+    overload: bool,
+    virtual_: bool,
+    dynamic: bool,
+    override_: bool,
+    reintroduce: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4618,6 +4662,7 @@ impl Document {
                 kind: SymbolKind::Unit,
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
+                routine_directives: RoutineDirectives::default(),
                 parameter_mode: None,
                 scope: ROOT_SCOPE,
                 owner_type: None,
@@ -5200,6 +5245,8 @@ fn pair_abbreviated_definitions(
         };
         let body_scope = symbols[definition_index].body_scope;
         symbols[definition_index].routine_key = Some(routine_key.clone());
+        symbols[definition_index].routine_directives =
+            symbols[declaration_index].routine_directives;
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
         symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
@@ -5247,6 +5294,8 @@ fn pair_abbreviated_definitions(
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
         symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
+        symbols[definition_index].routine_directives =
+            symbols[declaration_index].routine_directives;
     }
 }
 
@@ -5280,6 +5329,7 @@ fn inject_abbreviated_parameters(
                 kind: SymbolKind::Parameter,
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
+                routine_directives: RoutineDirectives::default(),
                 parameter_mode: Some(parameter_mode(node)),
                 scope: body_scope,
                 owner_type: None,
@@ -5335,6 +5385,7 @@ fn add_definition_symbol(
         kind: SymbolKind::Routine,
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(header),
+        routine_directives: routine_directives(header),
         parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
@@ -5388,6 +5439,7 @@ fn add_routine_symbol(
         kind: SymbolKind::Routine,
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(node),
+        routine_directives: routine_directives(node),
         parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
@@ -5460,6 +5512,7 @@ fn add_named_symbol(
             kind,
             type_kind,
             routine_kind: RoutineKind::Procedure,
+            routine_directives: RoutineDirectives::default(),
             parameter_mode: (kind == SymbolKind::Parameter).then(|| parameter_mode(node)),
             scope,
             owner_type: owner_type.clone(),
@@ -5676,6 +5729,19 @@ fn routine_kind(node: Node<'_>) -> RoutineKind {
         }
     }
     RoutineKind::Procedure
+}
+
+fn routine_directives(node: Node<'_>) -> RoutineDirectives {
+    let mut directives = RoutineDirectives::default();
+    collect_nodes(node, &mut |child| match child.kind() {
+        "kOverload" => directives.overload = true,
+        "kVirtual" => directives.virtual_ = true,
+        "kDynamic" => directives.dynamic = true,
+        "kOverride" => directives.override_ = true,
+        "kReintroduce" => directives.reintroduce = true,
+        _ => {}
+    });
+    directives
 }
 
 fn routine_result_type(node: Node<'_>, source: &str) -> Option<(String, Span)> {

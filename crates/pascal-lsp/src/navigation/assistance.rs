@@ -376,6 +376,31 @@ impl NavigationIndex {
         if candidates.is_empty() {
             return Ok(None);
         }
+        let owner_receivers = super::callable_owner_node(entity)
+            .map(|owner| {
+                self.resolve_receivers_with_state_and_budget(
+                    uri,
+                    document,
+                    entity.start_byte(),
+                    owner,
+                    owner,
+                    &mut overload_state,
+                    cancel,
+                    &mut budget,
+                    0,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let owner_instances = owner_receivers
+            .iter()
+            .filter_map(|receiver| match receiver {
+                super::Receiver::Type(instance) => Some(instance.clone()),
+                super::Receiver::Unit(_)
+                | super::Receiver::Builtin(_)
+                | super::Receiver::IntegerLiteral(_) => None,
+            })
+            .collect::<Vec<_>>();
         let selected_group = super::overload::select(
             self,
             uri,
@@ -383,6 +408,7 @@ impl NavigationIndex {
             call,
             &candidates,
             &super::GenericSubstitution::empty(),
+            &owner_instances,
             &mut overload_state,
             0,
             cancel,

@@ -355,6 +355,32 @@ impl NavigationIndex {
                 MAX_NAVIGATION_OVERLOAD_BYTES,
                 "navigation overload selection",
             );
+            let owner_receivers = call
+                .child_by_field_name("entity")
+                .and_then(callable_owner_node)
+                .map(|owner| {
+                    self.resolve_receivers_with_state_and_budget(
+                        uri,
+                        document,
+                        offset,
+                        owner,
+                        owner,
+                        &mut state,
+                        &cancel,
+                        &mut budget,
+                        0,
+                    )
+                })
+                .transpose()
+                .unwrap_or_default()
+                .unwrap_or_default();
+            let owner_instances = owner_receivers
+                .iter()
+                .filter_map(|receiver| match receiver {
+                    Receiver::Type(instance) => Some(instance.clone()),
+                    Receiver::Unit(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => None,
+                })
+                .collect::<Vec<_>>();
             let selection = overload::select(
                 self,
                 uri,
@@ -362,6 +388,7 @@ impl NavigationIndex {
                 call,
                 &references,
                 &GenericSubstitution::empty(),
+                &owner_instances,
                 &mut state,
                 0,
                 &cancel,
@@ -1638,7 +1665,7 @@ impl NavigationIndex {
         let Some(entity) = call.child_by_field_name("entity") else {
             return Ok(Vec::new());
         };
-        let owner_substitution = callable_owner_node(entity)
+        let owner_receivers = callable_owner_node(entity)
             .map(|lhs| {
                 self.resolve_receivers_with_state_and_budget(
                     current_uri,
@@ -1653,8 +1680,16 @@ impl NavigationIndex {
                 )
             })
             .transpose()?
-            .and_then(substitution_from_receivers)
-            .unwrap_or_else(GenericSubstitution::empty);
+            .unwrap_or_default();
+        let owner_instances = owner_receivers
+            .iter()
+            .filter_map(|receiver| match receiver {
+                Receiver::Type(instance) => Some(instance.clone()),
+                Receiver::Unit(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let owner_substitution =
+            substitution_from_receivers(owner_receivers).unwrap_or_else(GenericSubstitution::empty);
         let callable_identifier = callable_lookup_identifier(entity);
         let candidates = self.resolve_candidates_at_with_state_and_budget(
             current_uri,
@@ -1711,6 +1746,7 @@ impl NavigationIndex {
             call,
             &routine_candidates,
             &owner_substitution,
+            &owner_instances,
             state,
             depth,
             cancel,
@@ -2293,8 +2329,20 @@ impl NavigationIndex {
         if symbol.generic_parameters.is_empty() {
             return Ok(true);
         }
+        let resolution_key = (
+            instance.uri.clone(),
+            instance.key.clone(),
+            instance.substitution.clone(),
+        );
+        if !state
+            .active_generic_constraints
+            .insert(resolution_key.clone())
+        {
+            state.mark_receiver_uncertain();
+            return Ok(false);
+        }
         let mut ancestry = AncestryResolutionState::new();
-        overload::generic_constraints_satisfied(
+        let result = overload::generic_constraints_satisfied(
             self,
             &candidate,
             symbol,
@@ -2303,7 +2351,9 @@ impl NavigationIndex {
             &mut ancestry,
             cancel,
             budget,
-        )
+        );
+        state.active_generic_constraints.remove(&resolution_key);
+        result
     }
 
     fn generic_type_constraints_satisfied(
@@ -2747,6 +2797,50 @@ impl NavigationIndex {
             state,
             &mut active,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn routine_owner_substitution_with_budget(
+        &self,
+        candidate: &Candidate,
+        fallback: &GenericSubstitution,
+        owner_instances: &[TypeInstance],
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<GenericSubstitution>, String> {
+        let Some(symbol) = self.symbol(candidate) else {
+            return Ok(None);
+        };
+        let Some(owner_key) = symbol.owner_type.as_deref() else {
+            return Ok(Some(fallback.clone()));
+        };
+        let mut result = None;
+        for instance in owner_instances {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(substitution) = self.member_owner_substitution_with_budget(
+                &instance.uri,
+                &instance.key,
+                &instance.substitution,
+                &candidate.uri,
+                owner_key,
+                state,
+                cancel,
+                budget,
+            )?
+            else {
+                continue;
+            };
+            if result
+                .as_ref()
+                .is_some_and(|current: &GenericSubstitution| current != &substitution)
+            {
+                return Ok(None);
+            }
+            result = Some(substitution);
+        }
+        Ok(result.or_else(|| Some(fallback.clone())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4730,6 +4824,7 @@ struct GenericParameter {
     name: String,
     span: Span,
     constraint: Option<TypeRef>,
+    constraint_unsupported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4746,6 +4841,10 @@ impl GenericSubstitution {
 
     fn insert(&mut self, name: &str, value: ResolvedType) {
         self.0.insert(canonical_name(name), value);
+    }
+
+    fn remove(&mut self, name: &str) {
+        self.0.remove(&canonical_name(name));
     }
 }
 
@@ -5206,6 +5305,7 @@ struct ResolutionState {
     receiver_work: usize,
     type_work: usize,
     active_members: HashSet<(Url, String, String, usize, GenericSubstitution)>,
+    active_generic_constraints: HashSet<(Url, String, GenericSubstitution)>,
     receiver_uncertain: bool,
 }
 
@@ -5215,6 +5315,7 @@ impl ResolutionState {
             receiver_work: MAX_RECEIVER_WORK,
             type_work: MAX_TYPE_RESOLUTION_WORK,
             active_members: HashSet::new(),
+            active_generic_constraints: HashSet::new(),
             receiver_uncertain: false,
         }
     }
@@ -6871,13 +6972,16 @@ fn generic_parameters_for_node(node: Node<'_>, source: &str) -> Vec<GenericParam
             if group.kind() != "genericArg" {
                 continue;
             }
-            let constraint = generic_constraint_type_node(group)
-                .and_then(|type_node| type_ref_from_node(type_node, source));
+            let constraint_node = generic_constraint_type_node(group);
+            let constraint =
+                constraint_node.and_then(|type_node| type_ref_from_node(type_node, source));
+            let constraint_unsupported = constraint_node.is_some() && constraint.is_none();
             for identifier in field_identifier_nodes(group, "name") {
                 result.push(GenericParameter {
                     name: canonical_name(&node_text(identifier, source)),
                     span: Span::from_node(identifier),
                     constraint: constraint.clone(),
+                    constraint_unsupported,
                 });
             }
         }

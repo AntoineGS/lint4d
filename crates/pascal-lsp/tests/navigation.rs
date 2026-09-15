@@ -6726,6 +6726,45 @@ end.
 }
 
 #[test]
+fn unsupported_generic_constraints_fail_closed() {
+    let source = r#"unit UnsupportedGenericConstraint;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+function Bad<U: ^TWidget>(Value: U): U;
+implementation
+function Bad<U: ^TWidget>(Value: U): U;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Bad(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnsupportedGenericConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unsupported generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
 fn generic_routine_inference_preserves_specialized_actual_types() {
     let source = r#"unit GenericNestedInference;
 interface
@@ -7258,6 +7297,181 @@ end.
 
     let type_definition = index.type_definitions(&source_uri, position_of(source, "Value", 4));
     assert_exact_type_location(&type_definition, &source_uri, source, "TWidget", 0);
+}
+
+#[test]
+fn inherited_generic_routine_result_preserves_parent_specialization() {
+    let source = r#"unit GenericInheritedRoutine;
+interface
+type
+  TBox<T> = class
+    function GetValue: T;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TChild = class(TBox<TWidget>)
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+end;
+procedure Caller;
+var
+  Child: TChild;
+begin
+  Child.GetValue().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInheritedRoutine");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inherited routine source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "WidgetMember: Integer", 0),
+    );
+}
+
+#[test]
+fn uninferred_generic_method_does_not_use_the_owner_specialization() {
+    let source = r#"unit GenericMethodInference;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    function Shadow<T>: T;
+  end;
+implementation
+function TBox<T>.Shadow<T>: T;
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.Shadow().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodInference");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method inference source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn generic_receiver_specialization_selects_the_compatible_overload() {
+    let source = r#"unit GenericOverloadSpecialization;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+  end;
+function Choose(B: TBox<TOther>; N: Integer): TOther; overload;
+function Choose(B: TBox<TWidget>; N: Real): TWidget; overload;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Choose(Box, 1).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericOverloadSpecialization");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic overload specialization source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "WidgetMember: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_call_with_wrong_explicit_arity_fails_closed() {
+    let source = r#"unit GenericCallArity;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Identity<TWidget, TOther>(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericCallArity");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic call arity source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
 }
 
 #[test]

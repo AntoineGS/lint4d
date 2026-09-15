@@ -105,6 +105,7 @@ pub(super) fn select(
     call: Node<'_>,
     candidates: &[Candidate],
     receiver_substitution: &GenericSubstitution,
+    owner_instances: &[TypeInstance],
     state: &mut ResolutionState,
     depth: usize,
     cancel: &AtomicBool,
@@ -159,6 +160,7 @@ pub(super) fn select(
             current_uri,
             current_document,
             receiver_substitution,
+            owner_instances,
             state,
             &mut ancestry,
             cancel,
@@ -290,6 +292,7 @@ fn score_group(
     current_uri: &Url,
     current_document: &Document,
     receiver_substitution: &GenericSubstitution,
+    owner_instances: &[TypeInstance],
     state: &mut ResolutionState,
     ancestry: &mut AncestryResolutionState,
     cancel: &AtomicBool,
@@ -313,6 +316,7 @@ fn score_group(
         current_uri,
         current_document,
         receiver_substitution,
+        owner_instances,
         state,
         ancestry,
         cancel,
@@ -390,16 +394,35 @@ fn generic_substitution_for_group(
     current_uri: &Url,
     current_document: &Document,
     receiver_substitution: &GenericSubstitution,
+    owner_instances: &[TypeInstance],
     state: &mut ResolutionState,
     ancestry: &mut AncestryResolutionState,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<GenericSubstitution>, String> {
+    let Some(owner_substitution) = index.routine_owner_substitution_with_budget(
+        candidate,
+        receiver_substitution,
+        owner_instances,
+        state,
+        cancel,
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
     if symbol.generic_parameters.is_empty() {
-        return Ok(Some(receiver_substitution.clone()));
+        return Ok(Some(owner_substitution));
     }
 
-    let mut substitution = receiver_substitution.clone();
+    let mut substitution = owner_substitution;
+    for parameter in &symbol.generic_parameters {
+        // Routine parameters shadow parameters from an enclosing generic
+        // type.  Do not let the owner's substitution silently satisfy a
+        // routine parameter that still needs explicit arguments or
+        // argument-based inference.
+        substitution.remove(&parameter.name);
+    }
     if let Some(explicit_arguments) = generic_call_arguments(call) {
         if explicit_arguments.len() != symbol.generic_parameters.len() {
             return Ok(None);
@@ -442,6 +465,14 @@ fn generic_substitution_for_group(
         }
     }
 
+    if symbol
+        .generic_parameters
+        .iter()
+        .any(|parameter| substitution.get(&parameter.name).is_none())
+    {
+        return Ok(None);
+    }
+
     if !generic_constraints_satisfied(
         index,
         candidate,
@@ -472,6 +503,9 @@ pub(super) fn generic_constraints_satisfied(
         return Ok(false);
     };
     for parameter in &symbol.generic_parameters {
+        if parameter.constraint_unsupported {
+            return Ok(false);
+        }
         let Some(constraint) = parameter.constraint.as_ref() else {
             continue;
         };
@@ -598,7 +632,15 @@ fn generic_call_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {
                 .collect(),
         )
     } else {
-        Some(vec![arguments])
+        Some(
+            (0..entity.named_child_count())
+                .filter_map(|index| entity.named_child(index))
+                .filter(|argument| {
+                    argument.start_byte() >= arguments.start_byte()
+                        && !matches!(argument.kind(), "kLt" | "kGt")
+                })
+                .collect(),
+        )
     }
 }
 
@@ -943,22 +985,7 @@ fn is_assignable_symbol(symbol: &Symbol) -> bool {
 }
 
 fn exact_type_match(actual: &TypeIdentity, expected: &TypeIdentity) -> bool {
-    match (actual, expected) {
-        (TypeIdentity::Builtin(actual), TypeIdentity::Builtin(expected)) => actual == expected,
-        (
-            TypeIdentity::Named {
-                uri: actual_uri,
-                key: actual_key,
-                ..
-            },
-            TypeIdentity::Named {
-                uri: expected_uri,
-                key: expected_key,
-                ..
-            },
-        ) => actual_uri == expected_uri && actual_key == expected_key,
-        _ => false,
-    }
+    actual == expected
 }
 
 fn infer_numeric_literal(text: &str) -> TypeIdentity {
@@ -1269,15 +1296,22 @@ fn conversion(
             TypeIdentity::Named {
                 uri: actual_uri,
                 key: actual_key,
+                args: actual_args,
                 ..
             },
             TypeIdentity::Named {
                 uri: expected_uri,
                 key: expected_key,
-                kind: _,
+                args: expected_args,
                 ..
             },
-        ) if actual_uri == expected_uri && actual_key == expected_key => Ok(Conversion::Cost(0)),
+        ) if actual_uri == expected_uri && actual_key == expected_key => {
+            if actual_args == expected_args {
+                Ok(Conversion::Cost(0))
+            } else {
+                Ok(Conversion::Incompatible)
+            }
+        }
         (
             TypeIdentity::Named {
                 uri: actual_uri,

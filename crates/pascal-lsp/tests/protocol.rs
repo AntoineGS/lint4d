@@ -1787,6 +1787,51 @@ fn cyclic_generic_member_types_fail_closed_and_keep_the_server_responsive() {
 }
 
 #[test]
+fn cyclic_generic_constraints_fail_closed_and_keep_the_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("CyclicGenericConstraint.pas");
+    let source = "unit CyclicGenericConstraint;\ninterface\ntype\n  TNode<T: TNode<T>> = class\n    Value: T;\n  end;\n  TImpl = class(TNode<TImpl>)\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: TNode<TImpl>;\nbegin\n  Box.Value.Member;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let completion_id = RequestId::from("cyclic-generic-constraint-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Box.Value.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "cyclic generic constraint completion failed: {completion:?}"
+    );
+    assert_eq!(
+        completion
+            .result
+            .expect("cyclic generic constraint completion result")["items"],
+        json!([])
+    );
+
+    let responsive_id = RequestId::from("cyclic-generic-constraint-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after cyclic generic constraint completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn deeply_parenthesized_overload_request_survives_and_keeps_server_responsive() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("DeepParenthesizedOverload.pas");

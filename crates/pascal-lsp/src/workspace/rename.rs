@@ -3395,7 +3395,7 @@ fn capture_context_baseline(
                 baseline,
                 directory.clone(),
                 membership.clone(),
-                observe_directory_stamps,
+                observe_directory_stamps && workspace.accepts_path(directory),
             );
         }
         for observation in &state.project_read_observations {
@@ -6021,6 +6021,62 @@ mod tests {
                     && baseline.candidate_membership == Some(membership.clone())
             }));
         }
+    }
+
+    #[test]
+    fn candidate_membership_outside_workspace_does_not_capture_a_directory_stamp() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let workspace_root = temp.path().join("workspace");
+        let directory = temp.path().join("external");
+        fs::create_dir(&workspace_root).expect("workspace root");
+        fs::create_dir(&directory).expect("candidate directory");
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: None,
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let membership = ProjectCandidateMembership {
+            paths: Vec::new(),
+            readable: true,
+        };
+        let mut workspace = test_workspace(vec![workspace_root], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                project_candidate_memberships: HashMap::from([(
+                    directory.clone(),
+                    Ok(membership.clone()),
+                )]),
+                ..ContextState::default()
+            },
+        );
+        let mut baseline = BaselineAccumulator::default();
+        let mut hashes = HashMap::new();
+        let mut contents = HashMap::new();
+
+        capture_context_baseline(
+            &workspace,
+            &key,
+            &mut baseline,
+            &mut hashes,
+            &mut contents,
+            true,
+            &AtomicBool::new(false),
+        )
+        .expect("candidate membership baseline");
+
+        let baseline_path = baseline
+            .paths
+            .iter()
+            .find(|path| path.path == directory)
+            .expect("candidate directory baseline");
+        assert_eq!(baseline_path.candidate_membership, Some(membership));
+        assert_eq!(baseline_path.stamp, None);
     }
 
     #[test]

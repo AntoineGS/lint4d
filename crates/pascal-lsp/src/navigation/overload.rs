@@ -435,7 +435,14 @@ fn infer_argument(
     }
     if matches!(kind, "literalString" | "literalChar") {
         let text = node_text(index, current_document, node, cancel, budget)?;
-        let is_character = kind == "literalChar" || is_single_character_codepoint(&text);
+        let is_character = if kind == "literalChar" {
+            true
+        } else {
+            let Some(is_character) = classify_literal_fragments(&text) else {
+                return Ok(unknown_argument());
+            };
+            is_character
+        };
         return Ok(ArgumentInfo {
             ty: Some(TypeIdentity::Builtin(if is_character {
                 BuiltinType::Character
@@ -610,22 +617,29 @@ fn infer_numeric_literal(text: &str) -> TypeIdentity {
         )))
 }
 
-fn is_single_character_codepoint(text: &str) -> bool {
+fn classify_literal_fragments(text: &str) -> Option<bool> {
     let mut remaining = text.trim();
     let mut fragments = 0usize;
     let mut only_codepoint = false;
     while !remaining.is_empty() {
         remaining = remaining.trim_start();
         if let Some(after_hash) = remaining.strip_prefix('#') {
-            let length = after_hash
+            let digits = after_hash.strip_prefix('$').unwrap_or(after_hash);
+            let length = digits
                 .as_bytes()
                 .iter()
-                .take_while(|byte| byte.is_ascii_digit())
+                .take_while(|byte| {
+                    if after_hash.starts_with('$') {
+                        byte.is_ascii_hexdigit()
+                    } else {
+                        byte.is_ascii_digit()
+                    }
+                })
                 .count();
             if length == 0 {
-                return false;
+                return None;
             }
-            remaining = &after_hash[length..];
+            remaining = &digits[length..];
             fragments += 1;
             only_codepoint = true;
             continue;
@@ -648,13 +662,13 @@ fn is_single_character_codepoint(text: &str) -> bool {
                 break;
             }
             if index >= bytes.len() {
-                return false;
+                return None;
             }
             continue;
         }
-        return false;
+        return None;
     }
-    fragments == 1 && only_codepoint
+    Some(fragments == 1 && only_codepoint)
 }
 
 fn is_radix_integer(text: &str) -> bool {

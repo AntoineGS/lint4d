@@ -1520,6 +1520,98 @@ end.
 }
 
 #[test]
+fn overload_selection_classifies_hex_codepoint_fragments_conservatively() {
+    let source = r#"unit HexCodepointFragments;
+interface
+type
+  TCharResult = class
+    CharMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+function Pick(Value: Char; Extra: Integer): TCharResult; overload;
+function Pick(Value: string; Extra: Integer): TStringResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(#65, 1).CharMember;
+  Pick(#$41, 1).CharMember;
+  Pick(#$41#66, 1).StringMember;
+  Pick(#$41'B', 1).StringMember;
+  Pick(#$41#$42, 1).StringMember;
+  Pick(#$GG, 1).StringMember;
+end;
+end.
+"#;
+    let source_uri = uri("HexCodepointFragments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("hex codepoint source parses");
+
+    for (call, declaration) in [
+        ("Pick(#65, 1)", "Pick(Value: Char; Extra: Integer)"),
+        ("Pick(#$41, 1)", "Pick(Value: Char; Extra: Integer)"),
+        ("Pick(#$41#66, 1)", "Pick(Value: string; Extra: Integer)"),
+        ("Pick(#$41'B', 1)", "Pick(Value: string; Extra: Integer)"),
+        ("Pick(#$41#$42, 1)", "Pick(Value: string; Extra: Integer)"),
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(navigation.len(), 1, "{call} must select one overload");
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, declaration, 0),
+        );
+    }
+
+    let hex_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Pick(#$41, 1).CharM", 0),
+        )
+        .expect("hex codepoint result completion");
+    assert_eq!(
+        hex_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["CharMember"]
+    );
+
+    let hex_signature_result = index
+        .signature_help(&source_uri, position_after(source, "Pick(#$41, 1", 0))
+        .expect("hex codepoint signature help");
+    let hex_signature = hex_signature_result.expect("hex codepoint call signature");
+    let char_signature = hex_signature.signatures.iter().position(|signature| {
+        signature
+            .label
+            .contains("Pick(Value: Char; Extra: Integer)")
+    });
+    assert!(char_signature.is_some());
+    assert_eq!(hex_signature.signatures.len(), 2);
+    assert_eq!(
+        hex_signature.active_signature,
+        char_signature.map(|index| index as u32)
+    );
+
+    let unsupported_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Pick(#$GG, 1).StringM", 0),
+        )
+        .expect("unsupported codepoint result completion");
+    assert!(unsupported_completion.items.is_empty());
+    assert!(unsupported_completion.is_incomplete);
+}
+
+#[test]
 fn overload_selection_keeps_integer_alias_parameters_unknown_for_literals() {
     let source = r#"unit IntegerAliasOverloads;
 interface
@@ -1791,6 +1883,154 @@ end.
         &navigation[0],
         &source_uri,
         position_of(source, "Pick(Value: Double)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_keeps_reintroduced_overloads_across_assistance() {
+    let provider = r#"unit ReintroducedOverloadProvider;
+interface
+type
+  TBaseResult = class
+    BaseMember: Integer;
+  end;
+  TChildResult = class
+    ChildMember: Integer;
+  end;
+  THiddenResult = class
+    HiddenMember: Integer;
+  end;
+  TBase = class
+    function Pick(Value: Integer): TBaseResult; overload;
+  end;
+  TChild = class(TBase)
+    function Pick(Value: Double): TChildResult; reintroduce; overload;
+  end;
+  THiddenChild = class(TBase)
+    function Pick(Value: Double): THiddenResult; reintroduce;
+  end;
+implementation
+function TBase.Pick(Value: Integer): TBaseResult;
+begin
+end;
+function TChild.Pick(Value: Double): TChildResult;
+begin
+end;
+function THiddenChild.Pick(Value: Double): THiddenResult;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit ReintroducedOverloadConsumer;
+interface
+uses ReintroducedOverloadProvider;
+procedure Caller(C: TChild; H: THiddenChild);
+implementation
+procedure Caller(C: TChild; H: THiddenChild);
+begin
+  C.Pick(1).BaseMember;
+  C.Pick(1.0).ChildMember;
+  H.Pick(1).HiddenMember;
+end;
+end.
+"#;
+    let provider_uri = uri("ReintroducedOverloadProvider");
+    let consumer_uri = uri("ReintroducedOverloadConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("reintroduced overload provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("reintroduced overload consumer parses");
+
+    let integer_navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(integer_navigation.len(), 1);
+    assert_location_start(
+        &integer_navigation[0],
+        &provider_uri,
+        position_of(provider, "Pick(Value: Integer)", 0),
+    );
+
+    let base_completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "C.Pick(1).BaseM", 0),
+        )
+        .expect("base inherited result completion");
+    assert_eq!(
+        base_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseMember"]
+    );
+
+    let child_completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "C.Pick(1.0).ChildM", 0),
+        )
+        .expect("child reintroduced result completion");
+    assert_eq!(
+        child_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ChildMember"]
+    );
+
+    let integer_signature = index
+        .signature_help(&consumer_uri, position_after(consumer, "C.Pick(1", 0))
+        .expect("inherited overload signature help")
+        .expect("inherited overload call signature");
+    let integer_signature_index = integer_signature
+        .signatures
+        .iter()
+        .position(|signature| signature.label.contains("Pick(Value: Integer)"));
+    let double_signature_index = integer_signature
+        .signatures
+        .iter()
+        .position(|signature| signature.label.contains("Pick(Value: Double)"));
+    assert!(integer_signature_index.is_some());
+    assert!(double_signature_index.is_some());
+    assert_eq!(integer_signature.signatures.len(), 2);
+    assert_eq!(
+        integer_signature.active_signature,
+        integer_signature_index.map(|index| index as u32)
+    );
+
+    let hidden_navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Pick(1)", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(hidden_navigation.len(), 1);
+    assert_location_start(
+        &hidden_navigation[0],
+        &provider_uri,
+        position_of(provider, "Pick(Value: Double)", 1),
+    );
+
+    let hidden_completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "H.Pick(1).HiddenM", 0),
+        )
+        .expect("reintroduced hidden result completion");
+    assert_eq!(
+        hidden_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["HiddenMember"]
     );
 }
 

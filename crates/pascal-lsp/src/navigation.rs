@@ -3784,9 +3784,6 @@ impl NavigationIndex {
                         .filter(|symbol| symbol.kind == SymbolKind::Routine)
                 })
                 .collect::<Vec<_>>();
-            let direct_reintroduces = direct_routines
-                .iter()
-                .any(|symbol| symbol.routine_directives.reintroduce);
             let direct_overrides = direct_routines
                 .iter()
                 .filter(|symbol| symbol.routine_directives.override_)
@@ -3806,7 +3803,7 @@ impl NavigationIndex {
                             if direct_routines.is_empty() {
                                 return true;
                             }
-                            if direct_reintroduces || !direct_overload_set {
+                            if !direct_overload_set {
                                 return false;
                             }
                             self.symbol(candidate).is_some_and(|symbol| {

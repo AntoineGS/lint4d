@@ -1154,19 +1154,18 @@ impl NavigationIndex {
         }
 
         check_cancel(cancel)?;
-        let result_annotation =
-            if node_text(identifier, &document.source).eq_ignore_ascii_case("Result") {
-                let scope = self.budgeted_scope_at(document, offset, cancel, budget)?;
-                document.result_type_annotation_for_body_scope(scope)
-            } else {
-                None
-            };
-        let references = if result_annotation.is_some() {
-            Vec::new()
+        let references = self
+            .resolve_candidates_at_with_budget(uri, document, offset, identifier, cancel, budget)?;
+        let result_annotation = if node_text(identifier, &document.source)
+            .eq_ignore_ascii_case("Result")
+            && !super::member_expression_at(identifier)
+                .is_some_and(|dot| super::is_right_hand_member(dot, identifier))
+            && references.is_empty()
+        {
+            let scope = self.budgeted_scope_at(document, offset, cancel, budget)?;
+            document.result_type_annotation_for_body_scope(scope)
         } else {
-            self.resolve_candidates_at_with_budget(
-                uri, document, offset, identifier, cancel, budget,
-            )?
+            None
         };
         if references
             .iter()

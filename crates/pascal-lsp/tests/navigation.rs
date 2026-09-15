@@ -2521,6 +2521,57 @@ end.
 }
 
 #[test]
+fn type_definitions_distinguish_result_members_from_implicit_function_results() {
+    let source = r#"unit MemberTypeDefinition;
+interface
+type
+  TFieldType = class end;
+  TReturnType = class end;
+  TBox = record
+    Result: TFieldType;
+  end;
+function Make: TReturnType;
+implementation
+function Make: TReturnType;
+var
+  Box: TBox;
+begin
+  Box.Result := nil;
+  Result := nil;
+end;
+end.
+"#;
+    let source_uri = uri("ResultMemberTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("result member type-definition source parses");
+
+    let declaration =
+        index.type_definitions(&source_uri, position_of(source, "Result: TFieldType", 0));
+    assert_exact_type_location(&declaration, &source_uri, source, "TFieldType", 0);
+
+    let qualified_member = index.type_definitions(&source_uri, position_of(source, "Result", 1));
+    assert_exact_type_location(&qualified_member, &source_uri, source, "TFieldType", 0);
+
+    let implicit_result = index.type_definitions(&source_uri, position_of(source, "Result", 2));
+    assert_exact_type_location(&implicit_result, &source_uri, source, "TReturnType", 0);
+
+    let member_position = position_of(source, "Result", 1);
+    let definition = index.navigate(&source_uri, member_position, NavigationTarget::Declaration);
+    assert_eq!(definition.len(), 1);
+    assert_location_start(
+        &definition[0],
+        &source_uri,
+        position_of(source, "Result: TFieldType", 0),
+    );
+    let hover = index
+        .hover(&source_uri, member_position)
+        .expect("Result field hover");
+    assert!(hover_text(&hover).contains("Result: TFieldType"));
+}
+
+#[test]
 fn inherited_methods_preserve_their_result_type_context() {
     let source = r#"unit InheritedResultContext;
 interface

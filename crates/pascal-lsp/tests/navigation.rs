@@ -72,10 +72,9 @@ interface
 
 type
   TWidget = class
-  private
+  public
     FValue: Integer;
     procedure DoThing;
-  public
     property Value: Integer read FValue;
   end;
 
@@ -11461,4 +11460,673 @@ end.
         final_qualified_type_position(source, "QualifiedTypeShadow.TFoo"),
     );
     assert_exact_type_location(&qualified_type, &source_uri, source, "TFoo", 0);
+}
+
+#[test]
+fn accessibility_is_shared_across_navigation_assistance_and_type_definition() {
+    let provider = r#"unit AccessibilityProvider;
+interface
+type
+  TPayload = class
+  end;
+  TBase = class
+    DefaultField: Integer;
+    procedure Check;
+  private
+    PrivateField: TPayload;
+    procedure PrivateMethod(Value: Integer);
+  protected
+    ProtectedField: Integer;
+    procedure ProtectedMethod(Value: Integer);
+  strict private
+    StrictPrivateSlot: Integer;
+    procedure StrictPrivateCall(Value: Integer);
+  strict protected
+    StrictProtectedSlot: Integer;
+    procedure StrictProtectedCall(Value: Integer);
+  public
+    PublicField: Integer;
+    procedure PublicMethod(Value: Integer);
+  published
+    PublishedField: Integer;
+  end;
+  TRecord = record
+    RecordField: Integer;
+  end;
+  IContract = interface
+    procedure InterfaceMethod;
+  end;
+implementation
+procedure TBase.Check;
+var
+  Obj: TBase;
+begin
+  Self.PrivateField;
+  Self.ProtectedField;
+  Self.StrictPrivateSlot;
+  Self.StrictProtectedSlot;
+end;
+procedure SameUnit;
+var
+  Obj: TBase;
+begin
+  Obj.PrivateField;
+  Obj.ProtectedField;
+  Obj.StrictPrivateSlot;
+  Obj.StrictProtectedSlot;
+end;
+end.
+"#;
+    let consumer = r#"unit AccessibilityConsumer;
+interface
+uses AccessibilityProvider;
+type
+  TChild = class(AccessibilityProvider.TBase)
+    procedure Check;
+  end;
+  TUnrelated = class
+    procedure Check;
+  end;
+implementation
+procedure TChild.Check;
+var
+  Obj: TBase;
+  R: TRecord;
+  Contract: IContract;
+begin
+  Obj.ProtectedField;
+  Obj.StrictProtectedSlot;
+  Obj.PrivateField;
+  Obj.StrictPrivateSlot;
+  Obj.DefaultField;
+  Obj.PublicField;
+  Obj.PublishedField;
+  Obj.ProtectedMethod(1);
+  Obj.StrictProtectedCall(1);
+  Obj.PrivateMethod(1);
+  Obj.StrictPrivateCall(1);
+  R.RecordField;
+  Contract.InterfaceMethod;
+end;
+procedure TUnrelated.Check;
+var
+  Obj: TBase;
+begin
+  Obj.ProtectedField;
+  Obj.StrictProtectedSlot;
+  Obj.PrivateField;
+  Obj.StrictPrivateSlot;
+  Obj.DefaultField;
+  Obj.PublicField;
+  Obj.PublishedField;
+end;
+end.
+"#;
+    let provider_uri = uri("AccessibilityProvider");
+    let consumer_uri = uri("AccessibilityConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("accessibility provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("accessibility consumer parses");
+
+    let assert_access = |source_uri: &Url,
+                         source: &str,
+                         member: &str,
+                         member_occurrence: usize,
+                         completion_prefix: &str,
+                         completion_occurrence: usize,
+                         accessible: bool| {
+        let position = position_of(source, member, member_occurrence);
+        let navigation = index.navigate(source_uri, position, NavigationTarget::Declaration);
+        assert_eq!(
+            navigation.len(),
+            usize::from(accessible),
+            "unexpected navigation for {member} at {source_uri}: {navigation:?}"
+        );
+        if accessible {
+            assert_location_start(
+                &navigation[0],
+                &provider_uri,
+                position_of(provider, member, 0),
+            );
+        }
+
+        let completion = index
+            .completion(
+                source_uri,
+                position_after(source, completion_prefix, completion_occurrence),
+            )
+            .expect("accessibility completion");
+        let labels = completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        if accessible {
+            assert_eq!(labels, [member], "unexpected completion for {member}");
+        } else {
+            assert!(
+                labels.is_empty(),
+                "inaccessible member {member} leaked into completion: {labels:?}"
+            );
+        }
+    };
+
+    // A declaring class can use every class member, while another routine in
+    // the same unit gets ordinary private/protected access but not strict access.
+    assert_access(
+        &provider_uri,
+        provider,
+        "PrivateField",
+        1,
+        "Self.PrivateF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictPrivateSlot",
+        1,
+        "Self.StrictPrivateS",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "PrivateField",
+        2,
+        "Obj.PrivateF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictPrivateSlot",
+        2,
+        "Obj.StrictPrivateS",
+        0,
+        false,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "ProtectedField",
+        1,
+        "Self.ProtectedF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictProtectedSlot",
+        1,
+        "Self.StrictProtectedS",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "ProtectedField",
+        2,
+        "Obj.ProtectedF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictProtectedSlot",
+        2,
+        "Obj.StrictProtectedS",
+        0,
+        false,
+    );
+
+    // A descendant in another unit gets protected access, including strict
+    // protected access, but neither form of private access.
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "ProtectedField",
+        0,
+        "Obj.ProtectedF",
+        0,
+        true,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictProtectedSlot",
+        0,
+        "Obj.StrictProtectedS",
+        0,
+        true,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "PrivateField",
+        0,
+        "Obj.PrivateF",
+        0,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictPrivateSlot",
+        0,
+        "Obj.StrictPrivateS",
+        0,
+        false,
+    );
+    for (member, prefix) in [
+        ("DefaultField", "Obj.DefaultF"),
+        ("PublicField", "Obj.PublicF"),
+        ("PublishedField", "Obj.PublishedF"),
+        ("RecordField", "R.RecordF"),
+        ("InterfaceMethod", "Contract.InterfaceM"),
+    ] {
+        assert_access(&consumer_uri, consumer, member, 0, prefix, 0, true);
+    }
+
+    // An unrelated cross-unit caller cannot see restricted members, even when
+    // the receiver's static type is the declaring class.
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "ProtectedField",
+        1,
+        "Obj.ProtectedF",
+        1,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictProtectedSlot",
+        1,
+        "Obj.StrictProtectedS",
+        1,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "PrivateField",
+        1,
+        "Obj.PrivateF",
+        1,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictPrivateSlot",
+        1,
+        "Obj.StrictPrivateS",
+        1,
+        false,
+    );
+    for (member, prefix) in [
+        ("DefaultField", "Obj.DefaultF"),
+        ("PublicField", "Obj.PublicF"),
+        ("PublishedField", "Obj.PublishedF"),
+    ] {
+        assert_access(&consumer_uri, consumer, member, 0, prefix, 1, true);
+    }
+
+    let private_field_position = position_of(consumer, "PrivateField", 0);
+    assert!(
+        index.hover(&consumer_uri, private_field_position).is_none(),
+        "inaccessible member leaked into hover"
+    );
+    assert!(
+        index
+            .type_definitions(&consumer_uri, private_field_position)
+            .is_empty(),
+        "inaccessible member leaked into type definition"
+    );
+
+    let private_method_position = position_of(consumer, "PrivateMethod", 0);
+    assert!(
+        index
+            .signature_help(
+                &consumer_uri,
+                position_after(consumer, "Obj.PrivateMethod(1", 0),
+            )
+            .expect("inaccessible signature help")
+            .is_none(),
+        "inaccessible member leaked into signature help"
+    );
+    assert!(
+        index
+            .hover(&consumer_uri, private_method_position)
+            .is_none(),
+        "inaccessible method leaked into hover"
+    );
+
+    let protected_method_position = position_of(consumer, "ProtectedMethod", 0);
+    assert!(
+        index
+            .hover(&consumer_uri, protected_method_position)
+            .is_some(),
+        "accessible protected method lost hover"
+    );
+    assert!(
+        index
+            .signature_help(
+                &consumer_uri,
+                position_after(consumer, "Obj.ProtectedMethod(1", 0),
+            )
+            .expect("accessible signature help")
+            .is_some(),
+        "accessible protected method lost signature help"
+    );
+}
+
+#[test]
+fn lexical_declaration_order_keeps_future_bindings_out_of_scope() {
+    let source = r#"unit DeclarationOrder;
+interface
+var
+  Value: Integer;
+type
+  TWidget = class
+    property ReadLater: Integer read LaterField;
+    LaterField: Integer;
+  end;
+  TInterface = class
+    Field: TImplementationOnly;
+  end;
+implementation
+type
+  TImplementationOnly = class
+  end;
+procedure TWidget.Check;
+begin
+  Self.LaterField;
+end;
+procedure Outer;
+  procedure Forwarded; forward;
+  procedure Uses;
+  begin
+    Forwarded;
+    Later;
+  end;
+  procedure Forwarded;
+  begin
+  end;
+  procedure Later;
+  begin
+  end;
+begin
+  Uses;
+  Later;
+end;
+procedure Inline;
+begin
+  Value := 1;
+  var Value: Integer;
+  Value := 2;
+end;
+end.
+"#;
+    let source_uri = uri("DeclarationOrder");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("declaration order source parses");
+
+    let early_later = index.navigate(
+        &source_uri,
+        position_of(source, "Later;", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        early_later.is_empty(),
+        "future nested routine captured an earlier call: {early_later:?}"
+    );
+
+    let forwarded = index.navigate(
+        &source_uri,
+        position_of(source, "Forwarded;", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        !forwarded.is_empty(),
+        "forward-declared nested routine was not available"
+    );
+
+    let later = index.navigate(
+        &source_uri,
+        position_of(source, "Later;", 2),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        !later.is_empty(),
+        "declared nested routine was not available after its declaration"
+    );
+
+    let inline_before = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        inline_before.len(),
+        1,
+        "the earlier use should resolve the unit-level declaration"
+    );
+    assert_location_start(
+        &inline_before[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let inline_after = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 2", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(inline_after.len(), 1);
+    assert_location_start(
+        &inline_after[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 1),
+    );
+
+    let class_member = index.navigate(
+        &source_uri,
+        position_of(source, "LaterField", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(class_member.len(), 1);
+    assert_location_start(
+        &class_member[0],
+        &source_uri,
+        position_of(source, "LaterField", 1),
+    );
+
+    assert!(
+        index
+            .navigate(
+                &source_uri,
+                position_of(source, "TImplementationOnly", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "interface code captured an implementation-only type"
+    );
+}
+
+#[test]
+fn inaccessible_member_cannot_be_used_as_a_receiver_for_nested_lookup() {
+    let provider = r#"unit NestedAccessProvider;
+interface
+type
+  TPayload = class
+    Exposed: Integer;
+  end;
+  TBase = class
+  private
+    Hidden: TPayload;
+  end;
+end.
+"#;
+    let consumer = r#"unit NestedAccessConsumer;
+interface
+uses NestedAccessProvider;
+procedure ReadValue;
+implementation
+procedure ReadValue;
+var
+  Obj: TBase;
+begin
+  Obj.Hidden.Exposed;
+end;
+end.
+"#;
+    let provider_uri = uri("NestedAccessProvider");
+    let consumer_uri = uri("NestedAccessConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("nested access provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("nested access consumer parses");
+
+    let exposed_position = position_of(consumer, "Exposed", 0);
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                exposed_position,
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "nested lookup traversed an inaccessible receiver"
+    );
+    assert!(
+        index.hover(&consumer_uri, exposed_position).is_none(),
+        "nested lookup leaked an inaccessible receiver into hover"
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "Obj.Hidden.Expos", 0),
+        )
+        .expect("nested access completion");
+    assert!(
+        completion.items.iter().all(|item| item.label != "Exposed"),
+        "nested lookup leaked an inaccessible receiver into completion"
+    );
+}
+
+#[test]
+fn unknown_access_ancestry_is_hidden_and_marks_completion_incomplete() {
+    let provider = r#"unit UnknownAccessProvider;
+interface
+type
+  TBase = class
+  protected
+    ProtectedField: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit UnknownAccessConsumer;
+interface
+uses UnknownAccessProvider;
+type
+  TUnknownChild = class(MissingBase)
+    procedure ReadValue;
+  end;
+implementation
+procedure TUnknownChild.ReadValue;
+var
+  Obj: TBase;
+begin
+  Obj.ProtectedField;
+end;
+end.
+"#;
+    let provider_uri = uri("UnknownAccessProvider");
+    let consumer_uri = uri("UnknownAccessConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("unknown access provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("unknown access consumer parses");
+
+    let position = position_of(consumer, "ProtectedField", 0);
+    assert!(
+        index
+            .navigate(&consumer_uri, position, NavigationTarget::Declaration)
+            .is_empty(),
+        "unknown ancestry guessed protected access"
+    );
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Obj.ProtectedF", 0))
+        .expect("unknown access completion");
+    assert!(
+        completion
+            .items
+            .iter()
+            .all(|item| item.label != "ProtectedField"),
+        "unknown ancestry leaked protected completion"
+    );
+    assert!(
+        completion.is_incomplete,
+        "unknown ancestry should make completion conservative"
+    );
+}
+
+#[test]
+fn generic_descendant_proves_strict_protected_access() {
+    let source = r#"unit GenericAccess;
+interface
+type
+  TBase<T> = class
+  strict protected
+    ProtectedField: Integer;
+  end;
+  TChild<T> = class(TBase<T>)
+    procedure ReadValue;
+  end;
+implementation
+procedure TChild<T>.ReadValue;
+var
+  Obj: TBase<Integer>;
+begin
+  Obj.ProtectedField;
+end;
+end.
+"#;
+    let source_uri = uri("GenericAccess");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic access source parses");
+
+    let position = position_of(source, "ProtectedField", 1);
+    let navigation = index.navigate(&source_uri, position, NavigationTarget::Declaration);
+    assert_eq!(navigation.len(), 1, "generic descendant lost strict access");
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "ProtectedField", 0),
+    );
 }

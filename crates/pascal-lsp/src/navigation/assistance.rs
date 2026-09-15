@@ -826,11 +826,29 @@ impl NavigationIndex {
         if !accumulator.uncertain.is_empty() {
             accumulator.is_incomplete = true;
         }
-        let mut candidates = accumulator
-            .candidates
+        let candidates = std::mem::take(&mut accumulator.candidates)
             .into_values()
             .map(|(candidate, _)| candidate)
             .collect::<Vec<_>>();
+        let mut access_state = super::ResolutionState::new();
+        let mut accessible = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            check_cancel(cancel)?;
+            match self.candidate_access_decision_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                &mut access_state,
+                cancel,
+                accumulator.budget,
+            )? {
+                super::AccessDecision::Visible => accessible.push(candidate),
+                super::AccessDecision::Unknown => accumulator.is_incomplete = true,
+                super::AccessDecision::Inaccessible => {}
+            }
+        }
+        let mut candidates = accessible;
         candidates.sort_by(|left, right| {
             let left_symbol = self.symbol(left);
             let right_symbol = self.symbol(right);
@@ -1064,9 +1082,9 @@ impl NavigationIndex {
         &self,
         accumulator: &mut CompletionAccumulator,
         candidate: Candidate,
-        current_uri: &Url,
-        member_access: bool,
-        private_spans: &mut HashMap<Url, HashSet<Span>>,
+        _current_uri: &Url,
+        _member_access: bool,
+        _private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
@@ -1080,54 +1098,12 @@ impl NavigationIndex {
         {
             return Ok(());
         }
-        if member_access
-            && candidate.uri != *current_uri
-            && self.symbol_is_private_or_protected(
-                &candidate,
-                private_spans,
-                accumulator.budget,
-                cancel,
-            )?
-        {
-            return Ok(());
-        }
         if self.candidate_is_conditionally_unknown(&candidate) {
             accumulator.mark_uncertain(&symbol.key, precedence);
             return Ok(());
         }
         accumulator.insert(candidate, symbol, precedence);
         Ok(())
-    }
-
-    fn symbol_is_private_or_protected(
-        &self,
-        candidate: &Candidate,
-        private_spans: &mut HashMap<Url, HashSet<Span>>,
-        budget: &mut AssistanceBudget,
-        cancel: &AtomicBool,
-    ) -> Result<bool, String> {
-        let Some(document) = self.documents.get(&candidate.uri) else {
-            return Ok(true);
-        };
-        let Some(symbol) = document.symbols.get(candidate.index) else {
-            return Ok(true);
-        };
-        let declaration_span = if symbol.origin == Origin::Definition {
-            symbol
-                .routine_key
-                .as_ref()
-                .and_then(|key| document.routine_declaration_spans.get(key).copied())
-                .unwrap_or(symbol.declaration_span)
-        } else {
-            symbol.declaration_span
-        };
-        if !private_spans.contains_key(&candidate.uri) {
-            let spans = private_declaration_spans(document, budget, cancel)?;
-            private_spans.insert(candidate.uri.clone(), spans);
-        }
-        Ok(private_spans
-            .get(&candidate.uri)
-            .is_some_and(|spans| spans.contains(&declaration_span)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1163,25 +1139,6 @@ impl NavigationIndex {
                 symbol.kind == SymbolKind::Routine && !symbol.unresolved_abbreviated
             })
         });
-        if entity.kind() == "exprDot" {
-            let mut private_spans = HashMap::new();
-            let mut visible = Vec::with_capacity(candidates.len());
-            for candidate in candidates {
-                check_cancel(cancel)?;
-                budget.require_work(1, cancel)?;
-                if candidate.uri == *current_uri
-                    || !self.symbol_is_private_or_protected(
-                        &candidate,
-                        &mut private_spans,
-                        budget,
-                        cancel,
-                    )?
-                {
-                    visible.push(candidate);
-                }
-            }
-            candidates = visible;
-        }
         check_cancel(cancel)?;
         let _ = call;
         Ok(candidates)
@@ -2296,62 +2253,6 @@ fn completion_symbol_kind_supported(kind: SymbolKind) -> bool {
             | SymbolKind::EnumValue
             | SymbolKind::Label
     )
-}
-
-fn private_declaration_spans(
-    document: &Document,
-    budget: &mut AssistanceBudget,
-    cancel: &AtomicBool,
-) -> Result<HashSet<Span>, String> {
-    let mut spans = HashSet::new();
-    let mut cursor = document.tree.root_node().walk();
-    loop {
-        check_cancel(cancel)?;
-        budget.require_work(1, cancel)?;
-        let node = cursor.node();
-        if !matches!(node.kind(), "declField" | "declProc" | "declProp") {
-            if cursor.goto_first_child() {
-                continue;
-            }
-            if !advance_cursor(&mut cursor) {
-                break;
-            }
-            continue;
-        }
-        let mut parent = node.parent();
-        while let Some(section) = parent {
-            check_cancel(cancel)?;
-            if matches!(section.kind(), "declSection" | "ppDeclSection") {
-                let mut restricted = false;
-                for index in 0..section.named_child_count() {
-                    check_cancel(cancel)?;
-                    budget.require_work(1, cancel)?;
-                    if section
-                        .named_child(index)
-                        .is_some_and(|child| matches!(child.kind(), "kPrivate" | "kProtected"))
-                    {
-                        restricted = true;
-                        break;
-                    }
-                }
-                if restricted {
-                    spans.insert(Span::from_node(node));
-                }
-                break;
-            }
-            if matches!(section.kind(), "declType" | "defProc") {
-                break;
-            }
-            parent = section.parent();
-        }
-        if cursor.goto_first_child() {
-            continue;
-        }
-        if !advance_cursor(&mut cursor) {
-            break;
-        }
-    }
-    Ok(spans)
 }
 
 fn call_at_offset<'a>(
@@ -3609,7 +3510,7 @@ mod tests {
         ROOT_SCOPE, RoutineKind, TEST_EXPORTED_INDEX_VECTOR_MATERIALIZATIONS,
         TEST_LEGACY_EXPORTED_MATERIALIZATIONS, TEST_MEMBER_INDEX_VECTOR_MATERIALIZATIONS,
         TEST_TYPE_INDEX_VECTOR_MATERIALIZATIONS, TEST_UNIT_URL_VECTOR_MATERIALIZATIONS, TypeKind,
-        test_materialization_count, test_reset_materialization_counters,
+        Visibility, test_materialization_count, test_reset_materialization_counters,
     };
     use crate::text;
     use lsp_types::Url;
@@ -3678,6 +3579,8 @@ mod tests {
             scope: 0,
             owner_type: None,
             owner_type_name: None,
+            visibility: Visibility::Public,
+            declaration_ordered: false,
             generic_parameters: Vec::new(),
             generic_parameter: None,
             type_name: None,

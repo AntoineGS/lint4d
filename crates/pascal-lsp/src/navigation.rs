@@ -290,6 +290,307 @@ impl NavigationIndex {
             .unwrap_or(true)
     }
 
+    fn candidate_access_decision(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        candidate: &Candidate,
+        state: &mut ResolutionState,
+    ) -> AccessDecision {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return AccessDecision::Inaccessible;
+        };
+        let Some(symbol) = document.symbols.get(candidate.index) else {
+            return AccessDecision::Inaccessible;
+        };
+        if !symbol_is_available_at(document, symbol, &candidate.uri, current_uri, offset) {
+            return AccessDecision::Inaccessible;
+        }
+        let Some(owner_type) = symbol.owner_type.as_deref() else {
+            return AccessDecision::Visible;
+        };
+        match symbol.visibility {
+            Visibility::Public | Visibility::Published => AccessDecision::Visible,
+            Visibility::Private | Visibility::Protected if candidate.uri == *current_uri => {
+                AccessDecision::Visible
+            }
+            Visibility::Private => AccessDecision::Inaccessible,
+            Visibility::StrictPrivate => match current_document.owner_type_at(offset) {
+                Some(current_owner)
+                    if candidate.uri == *current_uri && current_owner == owner_type =>
+                {
+                    AccessDecision::Visible
+                }
+                Some(_) => AccessDecision::Inaccessible,
+                None => AccessDecision::Unknown,
+            },
+            Visibility::StrictProtected | Visibility::Protected => self.descendant_access_decision(
+                current_uri,
+                current_document,
+                offset,
+                candidate,
+                owner_type,
+                state,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn candidate_access_decision_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        candidate: &Candidate,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<AccessDecision, String> {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return Ok(AccessDecision::Inaccessible);
+        };
+        let Some(symbol) = document.symbols.get(candidate.index) else {
+            return Ok(AccessDecision::Inaccessible);
+        };
+        if !symbol_is_available_at(document, symbol, &candidate.uri, current_uri, offset) {
+            return Ok(AccessDecision::Inaccessible);
+        }
+        let Some(owner_type) = symbol.owner_type.as_deref() else {
+            return Ok(AccessDecision::Visible);
+        };
+        match symbol.visibility {
+            Visibility::Public | Visibility::Published => Ok(AccessDecision::Visible),
+            Visibility::Private | Visibility::Protected if candidate.uri == *current_uri => {
+                Ok(AccessDecision::Visible)
+            }
+            Visibility::Private => Ok(AccessDecision::Inaccessible),
+            Visibility::StrictPrivate => match current_document.owner_type_at(offset) {
+                Some(current_owner)
+                    if candidate.uri == *current_uri && current_owner == owner_type =>
+                {
+                    Ok(AccessDecision::Visible)
+                }
+                Some(_) => Ok(AccessDecision::Inaccessible),
+                None => Ok(AccessDecision::Unknown),
+            },
+            Visibility::StrictProtected | Visibility::Protected => self
+                .descendant_access_decision_with_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    candidate,
+                    owner_type,
+                    state,
+                    cancel,
+                    budget,
+                ),
+        }
+    }
+
+    fn descendant_access_decision(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        candidate: &Candidate,
+        owner_type: &str,
+        state: &mut ResolutionState,
+    ) -> AccessDecision {
+        let Some(current_owner) = current_document.owner_type_at(offset) else {
+            return AccessDecision::Unknown;
+        };
+        let current_substitution = self
+            .owner_type_substitution(current_uri, &current_owner)
+            .unwrap_or_else(GenericSubstitution::empty);
+        let uncertain_before = state.receiver_resolution_uncertain();
+        if self
+            .member_owner_substitution(
+                current_uri,
+                &current_owner,
+                &current_substitution,
+                &candidate.uri,
+                owner_type,
+                state,
+            )
+            .is_some()
+        {
+            return AccessDecision::Visible;
+        }
+        if !uncertain_before && state.receiver_resolution_uncertain() {
+            return AccessDecision::Unknown;
+        }
+        let mut ancestry_state = AncestryResolutionState::new();
+        if self
+            .resolve_type_ancestry(current_uri, &current_owner, &mut ancestry_state)
+            .status
+            == AncestryStatus::Unknown
+        {
+            AccessDecision::Unknown
+        } else {
+            AccessDecision::Inaccessible
+        }
+    }
+
+    fn owner_type_substitution(
+        &self,
+        current_uri: &Url,
+        owner_type: &str,
+    ) -> Option<GenericSubstitution> {
+        let document = self.documents.get(current_uri)?;
+        let indices = document.type_symbol_indices.get(owner_type)?;
+        if indices.len() != 1 {
+            return None;
+        }
+        let symbol = document.symbols.get(*indices.first()?)?;
+        let mut substitution = GenericSubstitution::empty();
+        for parameter in &symbol.generic_parameters {
+            substitution.insert(
+                &parameter.name,
+                ResolvedType::Named(TypeInstance {
+                    uri: current_uri.clone(),
+                    key: parameter.name.clone(),
+                    kind: TypeKind::Other,
+                    scope: symbol.scope,
+                    parameter_names: Vec::new(),
+                    substitution: GenericSubstitution::empty(),
+                }),
+            );
+        }
+        Some(substitution)
+    }
+
+    fn owner_type_substitution_with_budget(
+        &self,
+        current_uri: &Url,
+        owner_type: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<GenericSubstitution>, String> {
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(
+            current_uri.as_str().len().saturating_add(owner_type.len()),
+            cancel,
+        )?;
+        let substitution = self.owner_type_substitution(current_uri, owner_type);
+        if let Some(substitution) = &substitution {
+            budget.require_work(substitution.0.len(), cancel)?;
+            budget.require_bytes(
+                substitution.0.keys().map(String::len).sum::<usize>(),
+                cancel,
+            )?;
+        }
+        Ok(substitution)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn descendant_access_decision_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        candidate: &Candidate,
+        owner_type: &str,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<AccessDecision, String> {
+        let Some(current_owner) = current_document.owner_type_at(offset) else {
+            return Ok(AccessDecision::Unknown);
+        };
+        let current_substitution = self
+            .owner_type_substitution_with_budget(current_uri, &current_owner, cancel, budget)?
+            .unwrap_or_else(GenericSubstitution::empty);
+        let uncertain_before = state.receiver_resolution_uncertain();
+        if self
+            .member_owner_substitution_with_budget(
+                current_uri,
+                &current_owner,
+                &current_substitution,
+                &candidate.uri,
+                owner_type,
+                state,
+                cancel,
+                budget,
+            )?
+            .is_some()
+        {
+            return Ok(AccessDecision::Visible);
+        }
+        if !uncertain_before && state.receiver_resolution_uncertain() {
+            return Ok(AccessDecision::Unknown);
+        }
+        let mut ancestry_state = AncestryResolutionState::new();
+        let status = self
+            .resolve_type_ancestry_with_budget(
+                current_uri,
+                &current_owner,
+                &mut ancestry_state,
+                cancel,
+                budget,
+            )?
+            .status;
+        Ok(if status == AncestryStatus::Unknown {
+            AccessDecision::Unknown
+        } else {
+            AccessDecision::Inaccessible
+        })
+    }
+
+    fn filter_accessible_candidates_with_state(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        candidates: Vec<Candidate>,
+        state: &mut ResolutionState,
+    ) -> Vec<Candidate> {
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                self.candidate_access_decision(
+                    current_uri,
+                    current_document,
+                    offset,
+                    candidate,
+                    state,
+                ) == AccessDecision::Visible
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn filter_accessible_candidates_with_state_and_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        candidates: Vec<Candidate>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_work(candidates.len(), cancel)?;
+        let mut result = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            check_navigation_cancel(cancel)?;
+            match self.candidate_access_decision_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                state,
+                cancel,
+                budget,
+            )? {
+                AccessDecision::Visible => result.push(candidate),
+                AccessDecision::Unknown => state.mark_receiver_uncertain(),
+                AccessDecision::Inaccessible => {}
+            }
+        }
+        Ok(result)
+    }
+
     pub(crate) fn position_is_ignored_or_empty(
         &self,
         uri: &Url,
@@ -427,7 +728,7 @@ impl NavigationIndex {
         state: &mut ResolutionState,
     ) -> Vec<Candidate> {
         let name = node_text(identifier, &document.source);
-        if let Some(unit_name) = use_name_at(identifier, &document.source) {
+        let candidates = if let Some(unit_name) = use_name_at(identifier, &document.source) {
             self.unit_references(document, &unit_name)
         } else if let Some(direct) = self.direct_symbol_references(uri, identifier) {
             direct
@@ -445,7 +746,8 @@ impl NavigationIndex {
             }
         } else {
             self.unqualified_references(uri, document, offset, &name)
-        }
+        };
+        self.filter_accessible_candidates_with_state(uri, document, offset, candidates, state)
     }
 
     fn resolve_candidates_at_with_budget(
@@ -476,7 +778,7 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
         let name = node_text_with_budget(identifier, &document.source, cancel, budget)?;
-        if let Some(unit_name) =
+        let candidates = if let Some(unit_name) =
             use_name_at_with_budget(identifier, &document.source, cancel, budget)?
         {
             self.unit_references_with_budget(document, &unit_name, cancel, budget)
@@ -515,7 +817,10 @@ impl NavigationIndex {
             self.unqualified_references_with_budget(
                 uri, document, offset, name, identifier, cancel, budget,
             )
-        }
+        }?;
+        self.filter_accessible_candidates_with_state_and_budget(
+            uri, document, offset, candidates, state, cancel, budget,
+        )
     }
 
     fn direct_symbol_references_with_budget(
@@ -721,6 +1026,7 @@ impl NavigationIndex {
                     && symbol.generic_parameter.is_none()
                     && symbol.kind != SymbolKind::Unit
                     && !symbol.unresolved_abbreviated
+                    && symbol_is_available_at(document, symbol, uri, uri, offset)
                 {
                     local.push(Candidate {
                         uri: uri.clone(),
@@ -773,6 +1079,7 @@ impl NavigationIndex {
                 && symbol.generic_parameter.is_none()
                 && symbol.kind != SymbolKind::Unit
                 && !symbol.unresolved_abbreviated
+                && symbol_is_available_at(document, symbol, uri, uri, offset)
                 && symbol_visible_in_region(symbol, region)
             {
                 current.push(Candidate {
@@ -1359,6 +1666,7 @@ impl NavigationIndex {
                             && symbol.generic_parameter.is_none()
                             && symbol.kind != SymbolKind::Unit
                             && !symbol.unresolved_abbreviated
+                            && symbol_is_available_at(document, symbol, uri, uri, offset)
                     })
                 })
                 .map(|index| Candidate {
@@ -1395,6 +1703,7 @@ impl NavigationIndex {
                         && symbol.generic_parameter.is_none()
                         && symbol.kind != SymbolKind::Unit
                         && !symbol.unresolved_abbreviated
+                        && symbol_is_available_at(document, symbol, uri, uri, offset)
                         && symbol_visible_in_region(symbol, region)
                 })
             })
@@ -1681,6 +1990,9 @@ impl NavigationIndex {
                         }
                         Receiver::Type(instance) => {
                             result.extend(self.member_type_receivers_with_budget(
+                                current_uri,
+                                current_document,
+                                offset,
                                 &instance.uri,
                                 &instance.key,
                                 &rhs_name,
@@ -1954,6 +2266,9 @@ impl NavigationIndex {
                     .into_iter()
                     .map(|receiver| match receiver {
                         Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                            current_uri,
+                            current_document,
+                            offset,
                             &instance.uri,
                             &instance.key,
                             member_name,
@@ -2021,6 +2336,9 @@ impl NavigationIndex {
                     .into_iter()
                     .map(|receiver| match receiver {
                         Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                            current_uri,
+                            current_document,
+                            offset,
                             &instance.uri,
                             &instance.key,
                             member_name,
@@ -2059,6 +2377,9 @@ impl NavigationIndex {
                 .into_iter()
                 .map(|receiver| match receiver {
                     Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                        current_uri,
+                        current_document,
+                        offset,
                         &instance.uri,
                         &instance.key,
                         member_name,
@@ -2746,6 +3067,9 @@ impl NavigationIndex {
                     .into_iter()
                     .map(|receiver| match receiver {
                         Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                            current_uri,
+                            current_document,
+                            offset,
                             &instance.uri,
                             &instance.key,
                             member_name,
@@ -2799,6 +3123,9 @@ impl NavigationIndex {
                 .into_iter()
                 .map(|receiver| match receiver {
                     Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                        current_uri,
+                        current_document,
+                        offset,
                         &instance.uri,
                         &instance.key,
                         member_name,
@@ -3126,6 +3453,9 @@ impl NavigationIndex {
     #[allow(clippy::too_many_arguments)]
     fn member_type_receivers_with_budget(
         &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
         type_uri: &Url,
         type_key: &str,
         name: &str,
@@ -3164,6 +3494,15 @@ impl NavigationIndex {
             state.active_members.remove(&resolution_key);
             return Ok(Vec::new());
         }
+        let candidates = self.filter_accessible_candidates_with_state_and_budget(
+            current_uri,
+            current_document,
+            offset,
+            candidates,
+            state,
+            cancel,
+            budget,
+        )?;
         let constructor_keys = candidates
             .iter()
             .filter_map(|candidate| {
@@ -3374,6 +3713,9 @@ impl NavigationIndex {
                     .into_iter()
                     .flat_map(|receiver| match receiver {
                         Receiver::Type(instance) => self.member_type_receivers(
+                            current_uri,
+                            current_document,
+                            offset,
                             &instance.uri,
                             &instance.key,
                             member_name,
@@ -3412,6 +3754,9 @@ impl NavigationIndex {
                 .into_iter()
                 .flat_map(|receiver| match receiver {
                     Receiver::Type(instance) => self.member_type_receivers(
+                        current_uri,
+                        current_document,
+                        offset,
                         &instance.uri,
                         &instance.key,
                         member_name,
@@ -3668,6 +4013,9 @@ impl NavigationIndex {
     #[allow(clippy::too_many_arguments)]
     fn member_type_receivers(
         &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
         type_uri: &Url,
         type_key: &str,
         name: &str,
@@ -3701,6 +4049,21 @@ impl NavigationIndex {
             state.active_members.remove(&resolution_key);
             return Vec::new();
         }
+        let mut accessible = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            match self.candidate_access_decision(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                state,
+            ) {
+                AccessDecision::Visible => accessible.push(candidate),
+                AccessDecision::Unknown => state.mark_receiver_uncertain(),
+                AccessDecision::Inaccessible => {}
+            }
+        }
+        let candidates = accessible;
         let constructor_keys = candidates
             .iter()
             .filter_map(|candidate| {
@@ -4878,6 +5241,23 @@ enum SymbolKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Visibility {
+    Public,
+    Published,
+    Private,
+    Protected,
+    StrictPrivate,
+    StrictProtected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessDecision {
+    Visible,
+    Inaccessible,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum TypeKind {
     Class,
     Record,
@@ -5124,6 +5504,8 @@ struct Symbol {
     scope: usize,
     owner_type: Option<String>,
     owner_type_name: Option<String>,
+    visibility: Visibility,
+    declaration_ordered: bool,
     generic_parameters: Vec<GenericParameter>,
     generic_parameter: Option<String>,
     type_name: Option<String>,
@@ -5162,6 +5544,7 @@ struct RoutineDirectives {
     dynamic: bool,
     override_: bool,
     reintroduce: bool,
+    forward: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5484,7 +5867,6 @@ struct Document {
     routine_symbol_indices: HashMap<String, Vec<usize>>,
     routine_symbol_indices_by_body_scope: HashMap<usize, Vec<usize>>,
     exported_symbol_indices: Vec<usize>,
-    routine_declaration_spans: HashMap<String, Span>,
     interface_member_routine_keys: HashMap<String, HashSet<String>>,
 }
 
@@ -5614,6 +5996,8 @@ impl Document {
                 scope: ROOT_SCOPE,
                 owner_type: None,
                 owner_type_name: None,
+                visibility: Visibility::Public,
+                declaration_ordered: false,
                 generic_parameters: Vec::new(),
                 generic_parameter: None,
                 type_name: None,
@@ -5638,6 +6022,7 @@ impl Document {
 
         collect_symbols(root, &source, &scopes, &scope_by_span, &mut symbols);
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
+        inherit_member_routine_visibility(&mut symbols);
         let conditional_unknown_symbols =
             conditional_unknown_symbols(root, &conditionals, &symbols);
         let type_ancestry = collect_type_ancestry(root, &source);
@@ -5704,7 +6089,6 @@ impl Document {
         let mut direct_symbol_indices = HashMap::new();
         let mut routine_symbol_indices = HashMap::new();
         let mut routine_symbol_indices_by_body_scope = HashMap::new();
-        let mut routine_declaration_spans = HashMap::new();
         let mut interface_member_routine_keys = HashMap::<String, HashSet<String>>::new();
         for (index, symbol) in symbols.iter().enumerate() {
             symbol_indices_by_scope_key
@@ -5756,11 +6140,6 @@ impl Document {
                         .entry(routine_key.clone())
                         .or_insert_with(Vec::new)
                         .push(index);
-                    if symbol.origin == Origin::Declaration {
-                        routine_declaration_spans
-                            .entry(routine_key.clone())
-                            .or_insert(symbol.declaration_span);
-                    }
                 }
                 if let Some(body_scope) = symbol.body_scope {
                     routine_symbol_indices_by_body_scope
@@ -5803,7 +6182,6 @@ impl Document {
             routine_symbol_indices,
             routine_symbol_indices_by_body_scope,
             exported_symbol_indices,
-            routine_declaration_spans,
             interface_member_routine_keys,
         })
     }
@@ -5944,6 +6322,96 @@ fn symbol_visible_in_region(symbol: &Symbol, region: Region) -> bool {
     }
 }
 
+fn symbol_is_available_at(
+    document: &Document,
+    symbol: &Symbol,
+    candidate_uri: &Url,
+    current_uri: &Url,
+    offset: usize,
+) -> bool {
+    if candidate_uri != current_uri || symbol.owner_type.is_some() || !symbol.declaration_ordered {
+        return true;
+    }
+    if symbol.span.start <= offset {
+        return true;
+    }
+    symbol.kind == SymbolKind::Routine
+        && symbol.origin == Origin::Definition
+        && symbol.routine_key.as_ref().is_some_and(|routine_key| {
+            document.symbols.iter().any(|declaration| {
+                declaration.kind == SymbolKind::Routine
+                    && declaration.origin == Origin::Declaration
+                    && declaration.routine_key.as_ref() == Some(routine_key)
+                    && (declaration.region == Region::Interface
+                        || declaration.routine_directives.forward)
+                    && declaration.span.start <= offset
+            })
+        })
+}
+
+fn visibility_for_declaration(node: Node<'_>, source: &str) -> Visibility {
+    if enclosing_type(node, source).is_none() {
+        return Visibility::Public;
+    }
+
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "declSection" | "ppDeclSection" => {
+                let strict = has_direct_child_kind(parent, "kStrict");
+                let visibility = [
+                    ("kPublished", Visibility::Published),
+                    ("kPublic", Visibility::Public),
+                    ("kProtected", Visibility::Protected),
+                    ("kPrivate", Visibility::Private),
+                ]
+                .into_iter()
+                .find_map(|(kind, visibility)| {
+                    has_direct_child_kind(parent, kind).then_some(visibility)
+                })
+                .unwrap_or(Visibility::Public);
+                return match (strict, visibility) {
+                    (true, Visibility::Private) => Visibility::StrictPrivate,
+                    (true, Visibility::Protected) => Visibility::StrictProtected,
+                    _ => visibility,
+                };
+            }
+            "declType" => break,
+            _ => current = parent.parent(),
+        }
+    }
+    Visibility::Public
+}
+
+fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == kind)
+}
+
+fn inherit_member_routine_visibility(symbols: &mut [Symbol]) {
+    let declarations = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.kind == SymbolKind::Routine
+                && symbol.origin == Origin::Declaration
+                && symbol.owner_type.is_some()
+        })
+        .filter_map(|symbol| Some((symbol.routine_key.as_ref()?.clone(), symbol.visibility)))
+        .collect::<HashMap<_, _>>();
+
+    for symbol in symbols.iter_mut().filter(|symbol| {
+        symbol.kind == SymbolKind::Routine
+            && symbol.origin == Origin::Definition
+            && symbol.owner_type.is_some()
+    }) {
+        if let Some(routine_key) = &symbol.routine_key {
+            if let Some(visibility) = declarations.get(routine_key) {
+                symbol.visibility = *visibility;
+            }
+        }
+    }
+}
+
 fn member_symbol_is_visible(
     document: &Document,
     symbol: &Symbol,
@@ -6028,7 +6496,7 @@ fn collect_symbols(
         "declType" => {
             add_named_symbol(node, source, scope_by_span, symbols, SymbolKind::Type, None)
         }
-        "declVar" => {
+        "declVar" | "varDef" | "varAssignDef" => {
             let type_name = node
                 .child_by_field_name("type")
                 .and_then(|type_node| simple_type_path(type_node, source));
@@ -6300,6 +6768,8 @@ fn inject_abbreviated_parameters(
                 scope: body_scope,
                 owner_type: None,
                 owner_type_name: None,
+                visibility: Visibility::Public,
+                declaration_ordered: false,
                 generic_parameters: Vec::new(),
                 generic_parameter: None,
                 type_name: type_name.clone(),
@@ -6365,6 +6835,8 @@ fn add_definition_symbol(
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
+        visibility: Visibility::Public,
+        declaration_ordered: scope != ROOT_SCOPE || region_for_node(node) != Region::Interface,
         generic_parameters: generic_parameters.clone(),
         generic_parameter: None,
         type_name: None,
@@ -6430,6 +6902,8 @@ fn add_routine_symbol(
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
+        visibility: visibility_for_declaration(node, source),
+        declaration_ordered: scope != ROOT_SCOPE || region_for_node(node) != Region::Interface,
         generic_parameters: generic_parameters.clone(),
         generic_parameter: None,
         type_name: None,
@@ -6484,6 +6958,8 @@ fn push_routine_generic_parameter_symbols(
             scope,
             owner_type: None,
             owner_type_name: None,
+            visibility: Visibility::Public,
+            declaration_ordered: false,
             generic_parameters: Vec::new(),
             generic_parameter: Some(parameter.name.clone()),
             type_name: parameter.constraint.as_ref().map(TypeRef::display),
@@ -6544,6 +7020,8 @@ fn add_named_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let identifiers = if kind == SymbolKind::Type {
         declaration_name_identifiers(node)
+    } else if matches!(node.kind(), "varDef" | "varAssignDef") {
+        identifier_nodes(node).into_iter().take(1).collect()
     } else {
         field_identifier_nodes(node, "name")
     };
@@ -6570,6 +7048,8 @@ fn add_named_symbol(
             scope,
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),
+            visibility: visibility_for_declaration(node, source),
+            declaration_ordered: matches!(node.kind(), "varDef" | "varAssignDef"),
             generic_parameters: generic_parameters.clone(),
             generic_parameter: None,
             type_name: type_name.clone(),
@@ -6608,6 +7088,8 @@ fn add_named_symbol(
                 scope,
                 owner_type: declared_type_key.clone(),
                 owner_type_name: declared_type_key.clone(),
+                visibility: Visibility::Public,
+                declaration_ordered: false,
                 generic_parameters: Vec::new(),
                 generic_parameter: Some(parameter.name),
                 type_name: parameter.constraint.as_ref().map(TypeRef::display),
@@ -6836,6 +7318,7 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kDynamic" => directives.dynamic = true,
         "kOverride" => directives.override_ = true,
         "kReintroduce" => directives.reintroduce = true,
+        "kForward" => directives.forward = true,
         _ => {}
     });
     directives
@@ -7341,7 +7824,7 @@ fn conditional_unknown_symbols(
     collect_nodes(root, &mut |node| {
         if matches!(
             node.kind(),
-            "declVar" | "declArg" | "declField" | "declProp"
+            "declVar" | "varDef" | "varAssignDef" | "declArg" | "declField" | "declProp"
         ) {
             if let Some(type_node) = node.child_by_field_name("type") {
                 declaration_type_spans.insert(Span::from_node(node), Span::from_node(type_node));

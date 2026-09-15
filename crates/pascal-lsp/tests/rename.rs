@@ -2711,3 +2711,110 @@ end.
         ],
     );
 }
+
+#[test]
+fn rename_respects_private_protected_and_strict_private_access() {
+    let provider = r#"unit RenameAccessibilityProvider;
+interface
+type
+  TBase = class
+  private
+    PrivateField: Integer;
+  protected
+    ProtectedField: Integer;
+  strict private
+    StrictSecretField: Integer;
+  end;
+  procedure SameUnit;
+implementation
+procedure SameUnit;
+var
+  Obj: TBase;
+begin
+  Obj.PrivateField := 1;
+end;
+end.
+"#;
+    let consumer = r#"unit RenameAccessibilityConsumer;
+interface
+uses RenameAccessibilityProvider;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+  TUnrelated = class
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+var
+  Obj: TBase;
+begin
+  Obj.ProtectedField := 1;
+end;
+procedure TUnrelated.Run;
+var
+  Obj: TBase;
+begin
+  Obj.StrictSecretField := 1;
+end;
+end.
+"#;
+    let provider_uri = uri("RenameAccessibilityProvider");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("rename accessibility provider parses");
+    let consumer_uri = update(&mut index, "RenameAccessibilityConsumer", consumer);
+
+    let private_declaration = position_of(provider, "PrivateField", 0);
+    let private_edits = index
+        .rename_edits(&provider_uri, private_declaration, "RenamedPrivate")
+        .expect("ordinary private rename within its unit succeeds");
+    assert_exact_edits(
+        &private_edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "PrivateField", 0),
+                "RenamedPrivate".to_owned(),
+            ),
+            (
+                provider_uri.clone(),
+                range_of(provider, "PrivateField", 1),
+                "RenamedPrivate".to_owned(),
+            ),
+        ],
+    );
+
+    let protected_declaration = position_of(provider, "ProtectedField", 0);
+    let protected_edits = index
+        .rename_edits(&provider_uri, protected_declaration, "RenamedProtected")
+        .expect("protected rename from a descendant succeeds");
+    assert_exact_edits(
+        &protected_edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "ProtectedField", 0),
+                "RenamedProtected".to_owned(),
+            ),
+            (
+                consumer_uri,
+                range_of(consumer, "ProtectedField", 0),
+                "RenamedProtected".to_owned(),
+            ),
+        ],
+    );
+
+    assert!(
+        index
+            .rename_edits(
+                &provider_uri,
+                position_of(provider, "StrictSecretField", 0),
+                "RenamedStrictPrivate",
+            )
+            .is_err(),
+        "strict-private access from another class must reject a partial rename"
+    );
+}

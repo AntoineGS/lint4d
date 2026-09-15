@@ -63,11 +63,7 @@ pub fn parse_msbuild_output(output: &str, base_dir: &Path) -> MsbuildPaths {
                 continue;
             }
 
-            let path = if Path::new(segment).is_relative() {
-                base_dir.join(segment)
-            } else {
-                PathBuf::from(segment)
-            };
+            let path = resolve_msbuild_path(segment, base_dir);
 
             if seen.insert(path.clone()) {
                 result.paths.push(path);
@@ -76,6 +72,31 @@ pub fn parse_msbuild_output(output: &str, base_dir: &Path) -> MsbuildPaths {
     }
 
     result
+}
+
+fn resolve_msbuild_path(segment: &str, base_dir: &Path) -> PathBuf {
+    if Path::new(segment).is_absolute() || is_windows_absolute_path(segment) {
+        return PathBuf::from(segment);
+    }
+    if is_windows_path(base_dir) {
+        let base = base_dir.to_string_lossy();
+        let base = base.trim_end_matches(['\\', '/']);
+        let segment = segment.trim_start_matches(['\\', '/']);
+        return PathBuf::from(format!("{base}\\{segment}"));
+    }
+    base_dir.join(segment)
+}
+
+fn is_windows_path(path: &Path) -> bool {
+    is_windows_absolute_path(&path.to_string_lossy())
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    path.starts_with("\\\\")
+        || (path.len() >= 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+            && matches!(path.as_bytes()[2], b'\\' | b'/'))
 }
 
 /// Generate the MSBuild `.targets` XML content that imports a dproj and

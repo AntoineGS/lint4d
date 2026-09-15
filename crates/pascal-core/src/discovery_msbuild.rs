@@ -74,29 +74,83 @@ pub fn parse_msbuild_output(output: &str, base_dir: &Path) -> MsbuildPaths {
     result
 }
 
+#[cfg(windows)]
 fn resolve_msbuild_path(segment: &str, base_dir: &Path) -> PathBuf {
-    if Path::new(segment).is_absolute() || is_windows_absolute_path(segment) {
+    base_dir.join(segment)
+}
+
+#[cfg(not(windows))]
+fn resolve_msbuild_path(segment: &str, base_dir: &Path) -> PathBuf {
+    if is_windows_absolute_path(segment) || is_windows_drive_relative_path(segment) {
         return PathBuf::from(segment);
     }
     if is_windows_path(base_dir) {
-        let base = base_dir.to_string_lossy();
-        let base = base.trim_end_matches(['\\', '/']);
-        let segment = segment.trim_start_matches(['\\', '/']);
-        return PathBuf::from(format!("{base}\\{segment}"));
+        return resolve_foreign_windows_path(segment, base_dir);
+    }
+    if Path::new(segment).is_absolute() || is_windows_rooted_path(segment) {
+        return PathBuf::from(segment);
     }
     base_dir.join(segment)
 }
 
+#[cfg(not(windows))]
+fn resolve_foreign_windows_path(segment: &str, base_dir: &Path) -> PathBuf {
+    if is_windows_rooted_path(segment) {
+        let segment = segment.trim_start_matches(['\\', '/']);
+        if let Some(root) = foreign_windows_root(base_dir) {
+            return PathBuf::from(format!("{root}\\{segment}"));
+        }
+        return PathBuf::from(segment);
+    }
+
+    let base = base_dir.to_string_lossy();
+    let base = base.trim_end_matches(['\\', '/']);
+    PathBuf::from(format!("{base}\\{segment}"))
+}
+
+#[cfg(not(windows))]
+fn foreign_windows_root(path: &Path) -> Option<String> {
+    let path = path.to_string_lossy();
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some(path[..2].to_string());
+    }
+    if let Some(path) = path.strip_prefix("\\\\") {
+        let mut components = path
+            .split(['\\', '/'])
+            .filter(|component| !component.is_empty());
+        let server = components.next()?;
+        let share = components.next()?;
+        return Some(format!("\\\\{server}\\{share}"));
+    }
+    None
+}
+
+#[cfg(not(windows))]
 fn is_windows_path(path: &Path) -> bool {
     is_windows_absolute_path(&path.to_string_lossy())
 }
 
+#[cfg(not(windows))]
 fn is_windows_absolute_path(path: &str) -> bool {
     path.starts_with("\\\\")
         || (path.len() >= 3
             && path.as_bytes()[0].is_ascii_alphabetic()
             && path.as_bytes()[1] == b':'
             && matches!(path.as_bytes()[2], b'\\' | b'/'))
+}
+
+#[cfg(not(windows))]
+fn is_windows_drive_relative_path(path: &str) -> bool {
+    path.len() >= 2
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1] == b':'
+        && !matches!(path.as_bytes().get(2), Some(b'\\' | b'/'))
+}
+
+#[cfg(not(windows))]
+fn is_windows_rooted_path(path: &str) -> bool {
+    path.starts_with(['\\', '/'])
 }
 
 /// Generate the MSBuild `.targets` XML content that imports a dproj and

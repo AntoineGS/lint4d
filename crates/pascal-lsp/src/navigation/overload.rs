@@ -687,16 +687,14 @@ fn has_proven_constructor(
     Ok(if has_constructor {
         ConstraintOutcome::Proven
     } else {
-        ConstraintOutcome::Contradictory
+        ConstraintOutcome::Unknown
     })
 }
 
 fn generic_call_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {
     let entity = call.child_by_field_name("entity")?;
-    if entity.kind() != "exprTpl" {
-        return None;
-    }
-    let arguments = entity.child_by_field_name("args")?;
+    let template = generic_template_for_callable(entity)?;
+    let arguments = template.child_by_field_name("args")?;
     if matches!(arguments.kind(), "genericArgs" | "typerefArgs" | "exprArgs") {
         Some(
             (0..arguments.named_child_count())
@@ -714,6 +712,16 @@ fn generic_call_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {
                 })
                 .collect(),
         )
+    }
+}
+
+fn generic_template_for_callable(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "exprTpl" => Some(node),
+        "exprDot" | "genericDot" | "typerefDot" => node
+            .child_by_field_name("rhs")
+            .and_then(generic_template_for_callable),
+        _ => None,
     }
 }
 

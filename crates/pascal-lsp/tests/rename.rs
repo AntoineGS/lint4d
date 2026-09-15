@@ -2619,6 +2619,58 @@ end.
 }
 
 #[test]
+fn field_rename_resolves_call_expression_members_without_capturing_formals() {
+    let source = r#"unit ExpressionReceiverRename;
+interface
+type
+  THolder = class
+    T: Integer;
+  end;
+function GetHolder: THolder;
+procedure Run<T>(Value: T);
+implementation
+function GetHolder: THolder;
+begin
+end;
+procedure Run<T>(Value: T);
+begin
+  GetHolder().T := 1;
+  THolder(GetHolder()).T := 2;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ExpressionReceiverRename", source);
+    let declaration = range_in(source, "T: Integer", "T", 0);
+    let use_range = range_in(source, "GetHolder().T", "T", 0);
+    let cast_range = range_in_occurrence(source, "THolder(GetHolder()).T", "T", 0, 1);
+
+    let edits = index
+        .rename_edits(&source_uri, declaration.start, "Renamed")
+        .expect("field rename through a call receiver succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (source_uri.clone(), declaration, "Renamed".to_owned()),
+            (source_uri.clone(), use_range, "Renamed".to_owned()),
+            (source_uri.clone(), cast_range, "Renamed".to_owned()),
+        ],
+    );
+
+    let bindings = index
+        .binding_locations(&source_uri, use_range.start, true)
+        .expect("call receiver field bindings resolve");
+    assert_exact_locations(
+        &bindings,
+        vec![
+            (source_uri.clone(), declaration),
+            (source_uri.clone(), use_range),
+            (source_uri, cast_range),
+        ],
+    );
+}
+
+#[test]
 fn class_field_rename_keeps_qualified_type_and_routine_formals_disjoint() {
     let source = r#"unit QualifiedFieldRename;
 interface

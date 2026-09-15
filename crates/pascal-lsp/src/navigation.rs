@@ -2912,7 +2912,11 @@ impl NavigationIndex {
             return Ok(None);
         };
         let Some(owner_key) = symbol.owner_type.as_deref() else {
-            return Ok(Some(fallback.clone()));
+            let mut result = fallback.clone();
+            for parameter in &symbol.generic_parameters {
+                result.remove(&parameter.name);
+            }
+            return Ok(Some(result));
         };
         let mut result = None;
         for instance in owner_instances {
@@ -2939,7 +2943,11 @@ impl NavigationIndex {
             }
             result = Some(substitution);
         }
-        Ok(result.or_else(|| Some(fallback.clone())))
+        let mut result = result.unwrap_or_else(|| fallback.clone());
+        for parameter in &symbol.generic_parameters {
+            result.remove(&parameter.name);
+        }
+        Ok(Some(result))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7033,16 +7041,15 @@ fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Op
             let args = if matches!(args_node.kind(), "genericArgs" | "typerefArgs" | "exprArgs") {
                 (0..args_node.named_child_count())
                     .filter_map(|index| args_node.named_child(index))
-                    .filter_map(|arg| type_ref_from_node_at_depth(arg, source, next_depth))
-                    .collect::<Vec<_>>()
+                    .map(|arg| type_ref_from_node_at_depth(arg, source, next_depth))
+                    .collect::<Option<Vec<_>>>()?
             } else {
                 (0..type_node.named_child_count())
                     .filter_map(|index| type_node.named_child(index))
                     .filter(|argument| argument.start_byte() >= args_node.start_byte())
-                    .filter_map(|argument| {
-                        type_ref_from_node_at_depth(argument, source, next_depth)
-                    })
-                    .collect::<Vec<_>>()
+                    .filter(|argument| !matches!(argument.kind(), "kLt" | "kGt"))
+                    .map(|argument| type_ref_from_node_at_depth(argument, source, next_depth))
+                    .collect::<Option<Vec<_>>>()?
             };
             if args.is_empty() {
                 return None;
@@ -7133,9 +7140,14 @@ fn generic_parameters_for_node(node: Node<'_>, source: &str) -> Vec<GenericParam
             let constraint_node = generic_constraint_type_node(group);
             let constraint =
                 constraint_node.and_then(|type_node| type_ref_from_node(type_node, source));
-            let has_constraint_syntax = source
-                .get(group.start_byte()..group.end_byte())
-                .is_some_and(|text| text.contains(':'));
+            let has_constraint_syntax = contains_uncommented_byte(
+                source,
+                Span {
+                    start: group.start_byte(),
+                    end: group.end_byte(),
+                },
+                b':',
+            );
             let constraint_unsupported = has_constraint_syntax
                 && constraint_node.is_none_or(|type_node| {
                     constraint.is_none()
@@ -7159,9 +7171,14 @@ fn generic_constraint_has_trailing_tokens(
     constraint: Node<'_>,
     source: &str,
 ) -> bool {
-    source
-        .get(constraint.end_byte()..group.end_byte())
-        .is_some_and(|trailing| trailing.contains(','))
+    contains_uncommented_byte(
+        source,
+        Span {
+            start: constraint.end_byte(),
+            end: group.end_byte(),
+        },
+        b',',
+    )
 }
 
 fn generic_constraint_type_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -7423,13 +7440,12 @@ fn qualified_name_parts(node: &Node<'_>, source: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
-fn is_identifier_in_qualified_path(identifier: Node<'_>, source: &str) -> bool {
+fn is_identifier_in_qualified_path(identifier: Node<'_>, _source: &str) -> bool {
     let span = Span::from_node(identifier);
     let mut current = identifier.parent();
     while let Some(node) = current {
         if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
             && Span::from_node(node).contains(span)
-            && qualified_name_parts(&node, source).is_some()
         {
             return node
                 .child_by_field_name("rhs")
@@ -7438,6 +7454,73 @@ fn is_identifier_in_qualified_path(identifier: Node<'_>, source: &str) -> bool {
         current = node.parent();
     }
     false
+}
+
+fn contains_uncommented_byte(source: &str, span: Span, needle: u8) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = span.start.min(bytes.len());
+    let end = span.end.min(bytes.len());
+    while index < end {
+        index = match bytes[index] {
+            b'\'' => skip_source_string(bytes, index, end),
+            b'{' => skip_source_brace_comment(bytes, index, end),
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                skip_source_line_comment(bytes, index, end)
+            }
+            b'(' if bytes.get(index + 1) == Some(&b'*') => {
+                skip_source_paren_star_comment(bytes, index, end)
+            }
+            byte if byte == needle => return true,
+            _ => index.saturating_add(1),
+        };
+    }
+    false
+}
+
+fn skip_source_string(bytes: &[u8], mut index: usize, end: usize) -> usize {
+    index = index.saturating_add(1);
+    while index < end {
+        if bytes[index] == b'\'' {
+            if bytes.get(index + 1) == Some(&b'\'') && index + 1 < end {
+                index = index.saturating_add(2);
+            } else {
+                return index.saturating_add(1);
+            }
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+    end
+}
+
+fn skip_source_brace_comment(bytes: &[u8], mut index: usize, end: usize) -> usize {
+    index = index.saturating_add(1);
+    while index < end {
+        if bytes[index] == b'}' {
+            return index.saturating_add(1);
+        }
+        index = index.saturating_add(1);
+    }
+    end
+}
+
+fn skip_source_line_comment(bytes: &[u8], mut index: usize, end: usize) -> usize {
+    index = index.saturating_add(2);
+    while index < end && !matches!(bytes[index], b'\n' | b'\r') {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn skip_source_paren_star_comment(bytes: &[u8], mut index: usize, end: usize) -> usize {
+    index = index.saturating_add(2);
+    while index < end {
+        if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b')') && index + 1 < end {
+            return index.saturating_add(2);
+        }
+        index = index.saturating_add(1);
+    }
+    end
 }
 
 fn callable_lookup_identifier(node: Node<'_>) -> Node<'_> {

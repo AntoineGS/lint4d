@@ -421,6 +421,7 @@ impl NavigationIndex {
             &mut budget,
         )?;
         let selected_group = selection.selected_group;
+        let selected_substitution = selection.generic_substitution;
         let mut selected = BTreeMap::<(String, String), Candidate>::new();
         for candidate in candidates {
             check_cancel(cancel)?;
@@ -467,7 +468,7 @@ impl NavigationIndex {
             let Some(document) = self.documents.get(&candidate.uri) else {
                 continue;
             };
-            let candidate_substitution = self.routine_owner_substitution_with_budget(
+            let owner_substitution = self.routine_owner_substitution_with_budget(
                 &candidate,
                 &GenericSubstitution::empty(),
                 &owner_instances,
@@ -475,11 +476,21 @@ impl NavigationIndex {
                 cancel,
                 &mut budget,
             )?;
+            let candidate_substitution = if symbol.owner_type.is_some()
+                && selected_group.as_ref().is_some_and(|group| {
+                    super::overload::candidate_in_group(self, &candidate, group)
+                }) {
+                selected_substitution
+                    .as_ref()
+                    .or(owner_substitution.as_ref())
+            } else {
+                owner_substitution.as_ref()
+            };
             let signature = specialized_routine_signature_label(
                 self,
                 document,
                 symbol,
-                candidate_substitution.as_ref(),
+                candidate_substitution,
                 cancel,
                 &mut budget,
             )?;
@@ -1266,6 +1277,52 @@ impl NavigationIndex {
         }
         let mut targets = Vec::new();
         let mut state = super::ResolutionState::new();
+        let call_selection = if let Some(call) = super::overload::call_for_identifier(identifier) {
+            let owner_receivers = call
+                .child_by_field_name("entity")
+                .and_then(super::callable_owner_node)
+                .map(|owner| {
+                    self.resolve_receivers_with_state_and_budget(
+                        uri,
+                        document,
+                        call.child_by_field_name("entity")
+                            .map_or(offset, |entity| entity.start_byte()),
+                        owner,
+                        owner,
+                        &mut state,
+                        cancel,
+                        budget,
+                        0,
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let owner_instances = owner_receivers
+                .into_iter()
+                .filter_map(|receiver| match receiver {
+                    super::Receiver::Type(instance) => Some(instance),
+                    super::Receiver::Unit(_)
+                    | super::Receiver::Builtin(_)
+                    | super::Receiver::IntegerLiteral(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let selection = super::overload::select(
+                self,
+                uri,
+                document,
+                call,
+                &references,
+                &super::GenericSubstitution::empty(),
+                &owner_instances,
+                &mut state,
+                0,
+                cancel,
+                budget,
+            )?;
+            Some((selection.selected_group, selection.generic_substitution))
+        } else {
+            None
+        };
         if let Some(annotation) = result_annotation {
             let Some(lookup_identifier) = identifier_at_with_budget(
                 document.tree.root_node(),
@@ -1441,6 +1498,18 @@ impl NavigationIndex {
                                     else {
                                         continue;
                                     };
+                                    let result_substitution = call_selection
+                                        .as_ref()
+                                        .and_then(|(group, substitution)| {
+                                            group.as_ref().and_then(|group| {
+                                                super::overload::candidate_in_group(
+                                                    self, &reference, group,
+                                                )
+                                                .then_some(substitution.as_ref())
+                                                .flatten()
+                                            })
+                                        })
+                                        .unwrap_or(&member_substitution);
                                     let Some(annotation) = symbol.result_type_annotation() else {
                                         continue;
                                     };
@@ -1462,7 +1531,7 @@ impl NavigationIndex {
                                             &annotation.type_ref,
                                             lookup_identifier,
                                             Some(annotation.scope),
-                                            &member_substitution,
+                                            result_substitution,
                                             &mut state,
                                             cancel,
                                             budget,
@@ -1777,6 +1846,26 @@ impl NavigationIndex {
             Vec::new()
         };
 
+        let (selected_group, selected_substitution) =
+            if let Some(call) = super::overload::call_for_identifier(identifier) {
+                let selection = super::overload::select(
+                    self,
+                    uri,
+                    document,
+                    call,
+                    &candidates,
+                    &GenericSubstitution::empty(),
+                    &owner_instances,
+                    &mut resolution_state,
+                    0,
+                    cancel,
+                    &mut budget,
+                )?;
+                (selection.selected_group, selection.generic_substitution)
+            } else {
+                (None, None)
+            };
+
         let selected = self.select_display_candidates(candidates);
         let mut displays = Vec::with_capacity(selected.len());
         let mut seen = HashSet::new();
@@ -1786,7 +1875,7 @@ impl NavigationIndex {
             let Some(symbol) = self.symbol(&candidate) else {
                 continue;
             };
-            let substitution = if matches!(
+            let owner_substitution = if matches!(
                 symbol.kind,
                 SymbolKind::Routine
                     | SymbolKind::Variable
@@ -1805,8 +1894,18 @@ impl NavigationIndex {
             } else {
                 None
             };
+            let substitution = if symbol.owner_type.is_some()
+                && selected_group.as_ref().is_some_and(|group| {
+                    super::overload::candidate_in_group(self, &candidate, group)
+                }) {
+                selected_substitution
+                    .as_ref()
+                    .or(owner_substitution.as_ref())
+            } else {
+                owner_substitution.as_ref()
+            };
             let Some(display) =
-                self.declaration_display(&candidate, substitution.as_ref(), cancel, &mut budget)?
+                self.declaration_display(&candidate, substitution, cancel, &mut budget)?
             else {
                 continue;
             };
@@ -2736,7 +2835,7 @@ struct LabelReplacement {
 
 fn specialized_type_text(
     index: &NavigationIndex,
-    symbol: &Symbol,
+    _symbol: &Symbol,
     type_ref: Option<&super::TypeRef>,
     substitution: &GenericSubstitution,
     cancel: &AtomicBool,
@@ -2746,13 +2845,6 @@ fn specialized_type_text(
         return Ok(None);
     };
     if type_ref.path.len() != 1 || !type_ref.args.is_empty() {
-        return Ok(None);
-    }
-    if symbol
-        .generic_parameters
-        .iter()
-        .any(|parameter| parameter.name == type_ref.path[0])
-    {
         return Ok(None);
     }
     let Some(resolved) = substitution.get(&type_ref.path[0]) else {

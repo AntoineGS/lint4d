@@ -6960,6 +6960,79 @@ end.
 }
 
 #[test]
+fn generic_method_assistance_uses_explicit_and_inferred_method_substitutions() {
+    let source = r#"unit GenericMethodAssistance;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    function Shadow<T>(Value: T): T;
+  end;
+implementation
+function TBox<T>.Shadow<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  B: TBox<TWidget>;
+  Other: TOther;
+begin
+  B.Shadow<TOther>(Other).OtherMember;
+  B.Shadow(Other).OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method assistance source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "OtherMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "OtherMember", 0);
+    }
+
+    for occurrence in [2, 3] {
+        let position = position_of(source, "Shadow", occurrence);
+        let type_definition = index.type_definitions(&source_uri, position);
+        assert_exact_type_location(&type_definition, &source_uri, source, "TOther", 0);
+
+        let hover = index
+            .hover(&source_uri, position)
+            .expect("generic method hover");
+        assert!(
+            hover_text(&hover).contains("function Shadow<T>(Value: TOther): TOther;"),
+            "{}",
+            hover_text(&hover)
+        );
+    }
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "B.Shadow(", 0))
+        .expect("generic method signature help")
+        .expect("generic method signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].label,
+        "function Shadow<T>(Value: TOther): TOther;"
+    );
+}
+
+#[test]
 fn generic_type_constraints_reject_invalid_specializations() {
     let source = r#"unit GenericTypeConstraints;
 interface
@@ -7884,6 +7957,66 @@ end.
 }
 
 #[test]
+fn unproven_constructor_constraints_do_not_select_a_fallback_overload() {
+    let source = r#"unit UnknownConstructorConstraint;
+interface
+type
+  TBase = class
+  end;
+  TChild = class(TBase)
+  end;
+  TGood = class
+    GoodMember: Integer;
+  end;
+  TBad = class
+    BadMember: Integer;
+  end;
+function Choose<T: constructor>(Value: T): TGood; overload;
+function Choose(Value: TBase): TBad; overload;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Choose(Obj).GoodMember;
+  Choose(Obj).BadMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownConstructorConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unproven constructor constraint source parses");
+
+    let good = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "GoodMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        good.is_empty(),
+        "an unproven constructor constraint must not select the generic overload"
+    );
+
+    let bad = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BadMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        bad.is_empty(),
+        "an unproven constructor constraint must not select the fallback overload"
+    );
+}
+
+#[test]
 fn generic_ancestry_preserves_instantiated_parent_arguments() {
     let source = r#"unit GenericInstantiatedAncestry;
 interface
@@ -8029,6 +8162,71 @@ end.
 }
 
 #[test]
+fn unsupported_generic_type_actuals_preserve_arity_and_nested_failure() {
+    let source = r#"unit UnsupportedGenericTypeActuals;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function Create: TBox<T>;
+  end;
+  TPair<T; U> = class
+    Value: U;
+  end;
+implementation
+function TBox<T>.Create: TBox<T>;
+begin
+end;
+procedure Caller;
+var
+  Other: TOther;
+begin
+  TBox<^TOther, TWidget>.Create().Value.WidgetMember;
+  TBox<TWidget, ^TOther>.Create().Value.WidgetMember;
+  TBox<TBox<^TOther, TWidget>>.Create().Value.Value.WidgetMember;
+  TPair<TWidget, TOther>.Value.OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnsupportedGenericTypeActuals");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unsupported generic type actual source parses");
+
+    for occurrence in [1, 2, 3] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "unsupported actual occurrence {occurrence} must fail closed"
+        );
+    }
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&valid, &source_uri, source, "OtherMember", 0);
+}
+
+#[test]
 fn generic_call_arguments_ignore_comments_but_preserve_arity() {
     let source = r#"unit GenericCommentArguments;
 interface
@@ -8077,6 +8275,73 @@ end.
         source,
         "WidgetMember",
         3,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn generic_declaration_comments_do_not_create_constraints_or_reenable_recovery() {
+    let source = r#"unit GenericDeclarationComments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Pick<T {note: harmless}, U>(Value: U): U;
+function PickStar<T (*block: harmless*), U>(Value: U): U;
+function Bad<T: class, record>(Value: T): T;
+implementation
+function Pick<T {note: harmless}, U>(Value: U): U;
+begin
+  Result := Value;
+end;
+function PickStar<T (*block: harmless*), U>(Value: U): U;
+begin
+  Result := Value;
+end;
+function Bad<T: class, record>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+  Other: TOther;
+begin
+  Pick<TWidget, TOther>(Other).OtherMember;
+  PickStar<TWidget, TOther>(Other).OtherMember;
+  Bad<TWidget, TWidget>(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericDeclarationComments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic declaration comment source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "OtherMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "OtherMember", 0);
+    }
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
         NavigationTarget::Declaration,
     );
     assert!(invalid.is_empty());

@@ -288,8 +288,9 @@ impl NavigationIndex {
     }
 
     /// Return source-declared callable signatures for the call containing
-    /// `position`. Argument selection is syntactic and deliberately does not
-    /// infer argument types or choose an overload winner.
+    /// `position`. Argument selection uses conservative source-resolved types
+    /// when they identify one overload; otherwise the full overload set is
+    /// retained and no active signature is guessed.
     pub fn signature_help(
         &self,
         uri: &Url,
@@ -362,11 +363,31 @@ impl NavigationIndex {
             return Ok(None);
         };
 
-        let candidates =
-            self.callable_candidates(uri, document, call, entity, cancel, &mut budget)?;
+        let mut overload_state = super::ResolutionState::new();
+        let candidates = self.callable_candidates(
+            uri,
+            document,
+            call,
+            entity,
+            &mut overload_state,
+            cancel,
+            &mut budget,
+        )?;
         if candidates.is_empty() {
             return Ok(None);
         }
+        let selected_group = super::overload::select(
+            self,
+            uri,
+            document,
+            call,
+            &candidates,
+            &mut overload_state,
+            0,
+            cancel,
+            &mut budget,
+        )?
+        .selected_group;
         let mut selected = BTreeMap::<(String, String), Candidate>::new();
         for candidate in candidates {
             check_cancel(cancel)?;
@@ -450,22 +471,32 @@ impl NavigationIndex {
                     "signature help exceeds the {MAX_SIGNATURE_PARAMETERS}-parameter limit"
                 ));
             }
-            signatures.push(SignatureInformation {
-                label,
-                documentation: None,
-                parameters: Some(parameters),
-                active_parameter: None,
-            });
+            signatures.push((
+                super::overload::key_for_candidate(self, &candidate),
+                SignatureInformation {
+                    label,
+                    documentation: None,
+                    parameters: Some(parameters),
+                    active_parameter: None,
+                },
+            ));
         }
-        signatures.sort_by(|left, right| left.label.cmp(&right.label));
+        signatures.sort_by(|left, right| left.1.label.cmp(&right.1.label));
         if signatures.is_empty() {
             return Ok(None);
         }
+        let active_signature = selected_group.and_then(|group| {
+            signatures
+                .iter()
+                .position(|(key, _)| key.as_ref() == Some(&group))
+                .map(|index| index as u32)
+        });
         Ok(Some(SignatureHelp {
-            signatures,
-            // There may be several source overloads and no argument-type
-            // inference is performed, so selecting one would be misleading.
-            active_signature: None,
+            signatures: signatures
+                .into_iter()
+                .map(|(_, signature)| signature)
+                .collect(),
+            active_signature,
             active_parameter: Some(active_parameter as u32),
         }))
     }
@@ -1039,21 +1070,25 @@ impl NavigationIndex {
             .is_some_and(|spans| spans.contains(&declaration_span)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn callable_candidates(
         &self,
         current_uri: &Url,
         document: &Document,
         call: Node<'_>,
         entity: Node<'_>,
+        state: &mut super::ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
         let lookup_identifier = callable_lookup_identifier(entity);
-        let mut candidates = self.resolve_candidates_at_with_budget(
+        let mut candidates = self.resolve_candidates_at_with_state_and_budget(
             current_uri,
             document,
             lookup_identifier.start_byte(),
             lookup_identifier,
+            state,
+            0,
             cancel,
             budget,
         )?;
@@ -2964,6 +2999,7 @@ mod tests {
             routine_signature: None,
             routine_header_span: None,
             routine_parameter_spans: Vec::new(),
+            routine_parameters: Vec::new(),
             type_excerpt_end: None,
             body_scope: None,
             unresolved_abbreviated: false,

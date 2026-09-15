@@ -935,6 +935,676 @@ end.
 "#;
 
 #[test]
+fn overload_selection_drives_navigation_completion_and_signature_help() {
+    let source = r#"unit OverloadSelection;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: string;
+  end;
+function Select(Value: Integer): TIntResult; overload;
+function Select(Value: string): TStringResult; overload;
+implementation
+function Select(Value: Integer): TIntResult;
+begin
+  Result := TIntResult.Create;
+end;
+function Select(Value: string): TStringResult;
+begin
+  Result := TStringResult.Create;
+end;
+procedure Caller;
+begin
+  Select(1).IntMember;
+  Select('text' ).StringMember;
+end;
+end.
+"#;
+    let source_uri = uri("OverloadSelection");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("overload selection source parses");
+
+    let integer_call = position_of(source, "Select(1)", 0);
+    let integer_navigation =
+        index.navigate(&source_uri, integer_call, NavigationTarget::Declaration);
+    assert_eq!(integer_navigation.len(), 1);
+    assert_location_start(
+        &integer_navigation[0],
+        &source_uri,
+        position_of(source, "Select(Value: Integer)", 0),
+    );
+
+    let string_call = position_of(source, "Select('text' )", 0);
+    let string_navigation = index.navigate(&source_uri, string_call, NavigationTarget::Declaration);
+    assert_eq!(string_navigation.len(), 1);
+    assert_location_start(
+        &string_navigation[0],
+        &source_uri,
+        position_of(source, "Select(Value: string)", 0),
+    );
+
+    let integer_completion = index
+        .completion(&source_uri, position_after(source, "Select(1).IntM", 0))
+        .expect("integer result completion");
+    assert_eq!(
+        integer_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["IntMember"]
+    );
+
+    let string_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Select('text' ).StringM", 0),
+        )
+        .expect("string result completion");
+    assert_eq!(
+        string_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["StringMember"]
+    );
+
+    let integer_signature = index
+        .signature_help(&source_uri, position_after(source, "Select(1", 0))
+        .expect("integer signature help")
+        .expect("integer call signature");
+    assert_eq!(integer_signature.active_signature, Some(0));
+    assert_eq!(integer_signature.signatures.len(), 2);
+
+    let string_signature = index
+        .signature_help(&source_uri, position_after(source, "Select('text' ", 0))
+        .expect("string signature help")
+        .expect("string call signature");
+    assert_eq!(string_signature.active_signature, Some(1));
+    assert_eq!(string_signature.signatures.len(), 2);
+}
+
+#[test]
+fn nil_selects_reference_overloads_but_preserves_nil_ambiguity() {
+    let source = r#"unit NilOverloads;
+interface
+type
+  TClassArgument = class
+  end;
+  TOtherClassArgument = class
+  end;
+  TClassResult = class
+    ClassMember: Integer;
+  end;
+  TIntegerResult = class
+    IntegerMember: Integer;
+  end;
+  TOtherResult = class
+    OtherMember: Integer;
+  end;
+function Select(Value: TClassArgument): TClassResult; overload;
+function Select(Value: Integer): TIntegerResult; overload;
+function Ambiguous(Value: TClassArgument): TClassResult; overload;
+function Ambiguous(Value: TOtherClassArgument): TOtherResult; overload;
+implementation
+procedure Caller;
+begin
+  Select(nil).ClassMember;
+  Ambiguous(nil).ClassMember;
+end;
+end.
+"#;
+    let source_uri = uri("NilOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nil overload source parses");
+
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Select(nil)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(selected.len(), 1);
+    assert_location_start(
+        &selected[0],
+        &source_uri,
+        position_of(source, "Select(Value: TClassArgument)", 0),
+    );
+
+    let ambiguous = index.navigate(
+        &source_uri,
+        position_of(source, "Ambiguous(nil)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(ambiguous.len(), 2);
+}
+
+#[test]
+fn overload_selection_handles_typed_nested_calls_defaults_and_parameter_modes() {
+    let source = r#"unit TypedOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+  TVarResult = class
+    VarMember: Integer;
+  end;
+  TConstResult = class
+    ConstMember: Integer;
+  end;
+function Pick(Value: Integer; Extra: Integer = 0): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+function Wrap(Value: TIntResult): TVarResult; overload;
+function Wrap(Value: TStringResult): TConstResult; overload;
+function Mutate(var Value: Integer): TVarResult; overload;
+function Mutate(const Value: Integer): TConstResult; overload;
+function Store(out Value: Integer): TVarResult; overload;
+function Store(const Value: Integer): TConstResult; overload;
+implementation
+procedure Caller(Number: Integer; Text: string);
+var
+  Local: Integer;
+begin
+  Pick(Number).IntMember;
+  Pick(1, 2).IntMember;
+  Pick(Text).StringMember;
+  Wrap(Pick(Number)).VarMember;
+  Wrap(Pick(Text)).ConstMember;
+  Mutate(1).ConstMember;
+  Store(1).ConstMember;
+  Mutate(Local).VarMember;
+end;
+end.
+"#;
+    let source_uri = uri("TypedOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("typed overload source parses");
+
+    let number_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(Number)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(number_navigation.len(), 1);
+    assert_location_start(
+        &number_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer; Extra", 0),
+    );
+
+    let default_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1, 2)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(default_navigation.len(), 1);
+    assert_location_start(
+        &default_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer; Extra", 0),
+    );
+
+    let string_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(Text)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(string_navigation.len(), 1);
+    assert_location_start(
+        &string_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: string)", 0),
+    );
+
+    let nested_number_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Wrap(Pick(Number)).VarM", 0),
+        )
+        .expect("nested number overload completion");
+    assert_eq!(
+        nested_number_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["VarMember"]
+    );
+
+    let nested_string_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Wrap(Pick(Text)).ConstM", 0),
+        )
+        .expect("nested string overload completion");
+    assert_eq!(
+        nested_string_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ConstMember"]
+    );
+
+    let literal_var_completion = index
+        .completion(&source_uri, position_after(source, "Mutate(1).ConstM", 0))
+        .expect("var overload literal completion");
+    assert_eq!(
+        literal_var_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ConstMember"]
+    );
+
+    let literal_out_completion = index
+        .completion(&source_uri, position_after(source, "Store(1).ConstM", 0))
+        .expect("out overload literal completion");
+    assert_eq!(
+        literal_out_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ConstMember"]
+    );
+
+    let lvalue_completion = index
+        .completion(&source_uri, position_after(source, "Mutate(Local).VarM", 0))
+        .expect("var overload lvalue completion");
+    assert!(lvalue_completion.items.is_empty());
+    assert!(lvalue_completion.is_incomplete);
+}
+
+#[test]
+fn overload_selection_preserves_cross_unit_type_identity() {
+    const FIRST: &str = r#"unit DistinctFirst;
+interface
+type
+  TValue = class
+  end;
+  TFirstResult = class
+    FirstMember: Integer;
+  end;
+function Choose(Value: TValue): TFirstResult; overload;
+implementation
+function Choose(Value: TValue): TFirstResult;
+begin
+end;
+end.
+"#;
+    const SECOND: &str = r#"unit DistinctSecond;
+interface
+type
+  TValue = class
+  end;
+  TSecondResult = class
+    SecondMember: Integer;
+  end;
+function Choose(Value: TValue): TSecondResult; overload;
+implementation
+function Choose(Value: TValue): TSecondResult;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit DistinctConsumer;
+interface
+uses DistinctFirst, DistinctSecond;
+implementation
+procedure Caller;
+var
+  Value: DistinctFirst.TValue;
+begin
+  Choose(Value).FirstMember;
+end;
+end.
+"#;
+    let first_uri = uri("DistinctFirst");
+    let second_uri = uri("DistinctSecond");
+    let consumer_uri = uri("DistinctConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(first_uri.clone(), FIRST.to_owned())
+        .expect("first distinct type source parses");
+    index
+        .update(second_uri, SECOND.to_owned())
+        .expect("second distinct type source parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("cross-unit overload source parses");
+
+    let navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Choose(Value)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &first_uri,
+        position_of(FIRST, "Choose(Value: TValue)", 0),
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "Choose(Value).FirstM", 0),
+        )
+        .expect("cross-unit overload completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["FirstMember"]
+    );
+}
+
+#[test]
+fn overload_selection_handles_inherited_methods_and_constructors() {
+    let source = r#"unit MethodOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+  TBase = class
+    function Make(Value: Integer): TIntResult; overload;
+    function Make(Value: string): TStringResult; overload;
+  end;
+  TChild = class(TBase)
+    ChildMember: Integer;
+    constructor Create(Value: Integer); overload;
+    constructor Create(Value: string); overload;
+  end;
+implementation
+function TBase.Make(Value: Integer): TIntResult;
+begin
+end;
+function TBase.Make(Value: string): TStringResult;
+begin
+end;
+constructor TChild.Create(Value: Integer);
+begin
+end;
+constructor TChild.Create(Value: string);
+begin
+end;
+procedure Caller;
+var
+  Value: TChild;
+begin
+  Value.Make(1).IntMember;
+  Value.Make('text').StringMember;
+  TChild.Create(1).ChildMember;
+  TChild.Create('text').ChildMember;
+end;
+end.
+"#;
+    let source_uri = uri("MethodOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("method overload source parses");
+
+    let base_method = index.navigate(
+        &source_uri,
+        position_of(source, "Make(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_method.len(), 1);
+    assert_location_start(
+        &base_method[0],
+        &source_uri,
+        position_of(source, "Make(Value: Integer)", 0),
+    );
+
+    let child_method = index.navigate(
+        &source_uri,
+        position_of(source, "Make('text')", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child_method.len(), 1);
+    assert_location_start(
+        &child_method[0],
+        &source_uri,
+        position_of(source, "Make(Value: string)", 0),
+    );
+
+    let base_completion = index
+        .completion(&source_uri, position_after(source, "Value.Make(1).IntM", 0))
+        .expect("inherited method result completion");
+    assert_eq!(
+        base_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["IntMember"]
+    );
+
+    let child_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Value.Make('text').StringM", 0),
+        )
+        .expect("child method result completion");
+    assert_eq!(
+        child_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["StringMember"]
+    );
+
+    let integer_constructor = index.navigate(
+        &source_uri,
+        position_of(source, "Create(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(integer_constructor.len(), 1);
+    assert_location_start(
+        &integer_constructor[0],
+        &source_uri,
+        position_of(source, "Create(Value: Integer)", 0),
+    );
+
+    let string_constructor = index.navigate(
+        &source_uri,
+        position_of(source, "Create('text')", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(string_constructor.len(), 1);
+    assert_location_start(
+        &string_constructor[0],
+        &source_uri,
+        position_of(source, "Create(Value: string)", 0),
+    );
+
+    let constructor_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "TChild.Create(1).ChildM", 0),
+        )
+        .expect("constructor result completion");
+    assert_eq!(
+        constructor_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ChildMember"]
+    );
+}
+
+#[test]
+fn overload_selection_keeps_equal_and_unknown_matches_ambiguous() {
+    let source = r#"unit AmbiguousOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TCardinalResult = class
+    CardinalMember: Integer;
+  end;
+  TRealResult = class
+    RealMember: Integer;
+  end;
+function Tie(Value: Integer): TIntResult; overload;
+function Tie(Value: Cardinal): TCardinalResult; overload;
+function Prefer(Value: Integer): TIntResult; overload;
+function Prefer(Value: Real): TRealResult; overload;
+function Solo(Value: Integer): TIntResult; overload;
+implementation
+procedure Caller;
+begin
+  Tie(1).IntMember;
+  Prefer(1).IntMember;
+  Prefer(UnknownValue).IntMember;
+  Solo(UnknownValue).IntMember;
+  Solo('text').IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("AmbiguousOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ambiguous overload source parses");
+
+    let equal_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Tie(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(equal_navigation.len(), 2);
+
+    let widening_completion = index
+        .completion(&source_uri, position_after(source, "Prefer(1).IntM", 0))
+        .expect("widening overload completion");
+    assert_eq!(
+        widening_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["IntMember"]
+    );
+
+    let unknown_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Prefer(UnknownValue).IntM", 0),
+        )
+        .expect("unknown overload completion");
+    assert!(unknown_completion.items.is_empty());
+    assert!(unknown_completion.is_incomplete);
+
+    let single_unknown_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Solo(UnknownValue).IntM", 0),
+        )
+        .expect("single unknown overload completion");
+    assert!(single_unknown_completion.items.is_empty());
+    assert!(single_unknown_completion.is_incomplete);
+
+    let incompatible_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Solo('text')", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(incompatible_navigation.is_empty());
+
+    let unknown_signature = index
+        .signature_help(
+            &source_uri,
+            position_after(source, "Prefer(UnknownValue", 0),
+        )
+        .expect("unknown overload signature help")
+        .expect("unknown overload signatures");
+    assert_eq!(unknown_signature.signatures.len(), 2);
+    assert_eq!(unknown_signature.active_signature, None);
+}
+
+#[test]
+fn signature_help_keeps_overloads_for_an_incomplete_known_call() {
+    let source = r#"unit IncompleteOverloads;
+interface
+type
+  TIntResult = class
+  end;
+  TStringResult = class
+  end;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(1
+end;
+end.
+"#;
+    let source_uri = uri("IncompleteOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("incomplete overload source parses");
+
+    let help = index
+        .signature_help(&source_uri, position_after(source, "Pick(1", 0))
+        .expect("incomplete overload signature help")
+        .expect("incomplete overload call");
+    assert_eq!(help.signatures.len(), 2);
+    assert_eq!(help.active_signature, Some(0));
+    assert_eq!(help.active_parameter, Some(0));
+}
+
+#[test]
+fn signature_help_rejects_an_oversized_overload_selection() {
+    let mut source = String::from("unit OverloadSelectionLimit;\ninterface\n");
+    for index in 0..129 {
+        writeln!(&mut source, "procedure Run(Value: T{index}); overload;")
+            .expect("write overload declaration");
+    }
+    source.push_str("implementation\nprocedure Caller;\nbegin\n  Run(UnknownValue);\nend;\nend.\n");
+    let source_uri = uri("OverloadSelectionLimit");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("overload selection limit source parses");
+
+    let error = index
+        .signature_help(&source_uri, position_after(&source, "  Run(", 0))
+        .expect_err("overload selection must be bounded");
+    assert!(
+        error.contains("overload selection exceeds the 128-group limit"),
+        "{error}"
+    );
+}
+
+#[test]
 fn completion_projection_is_scope_aware_and_uses_plain_identifier_edits() {
     let mut index = NavigationIndex::new();
     let main_uri = uri("AssistanceMain");
@@ -2726,7 +3396,7 @@ end.
 }
 
 #[test]
-fn ambiguous_function_results_do_not_guess_an_overload_receiver() {
+fn known_argument_selects_an_overload_receiver() {
     let source = r#"unit AmbiguousFunctionResult;
 interface
 type
@@ -2757,34 +3427,43 @@ end.
         .update(source_uri.clone(), source.to_owned())
         .expect("ambiguous function result source parses");
 
-    assert!(
-        index
-            .navigate(
-                &source_uri,
-                position_of(source, "Member", 1),
-                NavigationTarget::Declaration,
-            )
-            .is_empty(),
-        "ambiguous overloads must not select a receiver type"
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Member", 0),
     );
 
     let completion = index
         .completion(&source_uri, position_after(source, "Make(1).Me", 0))
-        .expect("ambiguous function result completion");
-    assert!(
-        completion.items.is_empty(),
-        "ambiguous overloads must not expose receiver members"
+        .expect("integer overload result completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
     );
-    assert!(
-        completion.is_incomplete,
-        "ambiguous receiver resolution must be reported as uncertain"
-    );
+    assert!(!completion.is_incomplete);
 
     let string_completion = index
         .completion(&source_uri, position_after(source, "Make('text').Me", 0))
-        .expect("ambiguous string overload completion");
-    assert!(string_completion.items.is_empty());
-    assert!(string_completion.is_incomplete);
+        .expect("string overload result completion");
+    assert_eq!(
+        string_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+    assert!(!string_completion.is_incomplete);
 }
 
 #[test]
@@ -5860,7 +6539,7 @@ fn uses_unit_and_case_insensitive_navigation_are_supported() {
 }
 
 #[test]
-fn overloads_return_all_viable_candidates() {
+fn overload_navigation_selects_a_known_argument_candidate() {
     let mut index = NavigationIndex::new();
     let main_uri = uri("Main");
     let provider_uri = uri("Provider");
@@ -5879,9 +6558,38 @@ fn overloads_return_all_viable_candidates() {
         0,
         NavigationTarget::Declaration,
     );
-    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates.len(), 1);
+    assert_location_start(
+        &candidates[0],
+        &provider_uri,
+        position_of(PROVIDER, "Overloaded(Value: Integer)", 0),
+    );
+
+    let unknown_uri = uri("UnknownOverloadCall");
+    let unknown_source = r#"unit UnknownOverloadCall;
+interface
+uses Provider;
+implementation
+procedure Run;
+begin
+  Overloaded(UnknownValue);
+end;
+end.
+"#;
+    index
+        .update(unknown_uri.clone(), unknown_source.to_owned())
+        .expect("unknown overload source parses");
+    let unknown_candidates = locations_at(
+        &index,
+        &unknown_uri,
+        unknown_source,
+        "Overloaded",
+        0,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(unknown_candidates.len(), 2);
     assert!(
-        candidates
+        unknown_candidates
             .iter()
             .all(|location| location.uri == provider_uri)
     );

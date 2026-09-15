@@ -79,9 +79,10 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `:checkhealth vim.lsp` | Inspect attachment, executable, and client configuration |
 | `:lua print(vim.lsp.log.get_filename())` | Locate the LSP log, including server stderr |
 
-If several overloads/candidates remain, Neovim presents multiple locations
-rather than the server guessing based on argument types. Keep the cursor on the
-identifier, not on whitespace following it.
+If argument types identify one supported overload, Neovim receives that
+declaration/result; otherwise it presents the retained overload set rather than
+the server guessing. Keep the cursor on the identifier, not on whitespace
+following it.
 
 Neovim 0.13-dev may show a quickfix list even for a singleton `gi` result; use
 `:cfirst` and choose the entry to navigate. Older clients may jump directly.
@@ -126,15 +127,26 @@ from an unrelated type or global declaration. Rename remains conservative and
 rejects inherited class-member references until the complete override model is
 available.
 
-Signature help reports every supported source declaration that remains viable,
-including overloads. The active parameter is counted syntactically while
-skipping nested calls, indexers, Pascal strings, and comments; grouped formal
-parameter names are expanded individually. The server does not infer argument
-types, select an active overload, resolve `with`/`inherited` receivers, or infer
-anonymous/generic callables, and returns no signature for opaque or unknown
-calls. It does resolve callable members reached through the same source-backed
-function-result, constructor, cast, and nested expression receivers used by
-completion and navigation.
+Signature help reports every supported source declaration, including overloads.
+When source-resolved argument types identify one exact, safe widening, or safe
+class upcast match, `active_signature` identifies that overload while retaining
+the complete candidate list. Unknown arguments, equal-ranked matches,
+unsupported relationships, `with`/`inherited` receivers, and anonymous or
+generic callables remain unselected; opaque calls return no signature. The
+active parameter is counted syntactically while skipping nested calls, indexers,
+Pascal strings, and comments; grouped formal parameter names are expanded
+individually. Callable members reached through source-backed function results,
+constructors, casts, and nested expression receivers use the same bounded
+selection as completion and navigation.
+
+Overload matching is intentionally conservative and source-based. It recognizes
+Delphi built-in integer, real, string, character, Boolean, and `nil` literals,
+typed variables/parameters, defaults, and `var`/`out` lvalue requirements.
+Explicit named types retain their declaring-unit identity, so same-spelled types
+from different units do not match. Generic inference, anonymous callable types,
+full pointer/variant/record compatibility, and compiler-level overload rules are
+outside this source-only model; ambiguous or unsupported calls stay incomplete
+instead of selecting arbitrarily.
 
 ## Source Paths and Configuration
 

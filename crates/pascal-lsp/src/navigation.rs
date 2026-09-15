@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
 mod assistance;
+mod overload;
 mod rename;
 mod symbols;
 pub(crate) use rename::RenameBindingInfo;
@@ -312,12 +313,42 @@ impl NavigationIndex {
             return Vec::new();
         };
 
-        let references = self.resolve_candidates_at(uri, document, offset, identifier);
+        let mut state = ResolutionState::new();
+        let mut references =
+            self.resolve_candidates_at_with_state(uri, document, offset, identifier, &mut state);
         if references
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
         {
             return Vec::new();
+        }
+
+        if let Some(call) = overload::call_for_identifier(identifier) {
+            let cancel = AtomicBool::new(false);
+            let mut budget = AssistanceBudget::new(
+                MAX_NAVIGATION_OVERLOAD_WORK,
+                MAX_NAVIGATION_OVERLOAD_BYTES,
+                "navigation overload selection",
+            );
+            let selection = overload::select(
+                self,
+                uri,
+                document,
+                call,
+                &references,
+                &mut state,
+                0,
+                &cancel,
+                &mut budget,
+            )
+            .unwrap_or_default();
+            if let Some(group) = selection.selected_group {
+                references
+                    .retain(|candidate| overload::candidate_in_group(self, candidate, &group));
+            } else if selection.no_viable_group {
+                references
+                    .retain(|candidate| overload::key_for_candidate(self, candidate).is_none());
+            }
         }
 
         self.locations_for(self.expand_property_candidates(references, target), target)
@@ -1607,20 +1638,25 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
 
-        let mut routine_groups = HashSet::new();
-        for candidate in &routine_candidates {
-            let Some(symbol) = self.symbol(candidate) else {
-                continue;
-            };
-            let Some(routine_key) = symbol.routine_key.as_ref() else {
-                return Ok(Vec::new());
-            };
-            routine_groups.insert((candidate.uri.clone(), routine_key.clone()));
-        }
-        if routine_groups.len() != 1 {
+        let selection = overload::select(
+            self,
+            current_uri,
+            current_document,
+            call,
+            &routine_candidates,
+            state,
+            depth,
+            cancel,
+            budget,
+        )?;
+        let Some(selected_group) = selection.selected_group else {
             state.mark_receiver_uncertain();
             return Ok(Vec::new());
-        }
+        };
+        let routine_candidates = routine_candidates
+            .into_iter()
+            .filter(|candidate| overload::candidate_in_group(self, candidate, &selected_group))
+            .collect::<Vec<_>>();
 
         let mut result_type_source: Option<(Url, ResultTypeAnnotation)> = None;
         let mut constructor = false;
@@ -1982,23 +2018,6 @@ impl NavigationIndex {
             state,
             cancel,
             budget,
-        )
-    }
-
-    fn result_type_receivers(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        annotation: &ResultTypeAnnotation,
-        state: &mut ResolutionState,
-    ) -> Vec<Receiver> {
-        self.type_receivers_for_path_at_scope(
-            current_uri,
-            current_document,
-            annotation.offset,
-            &annotation.name,
-            Some(annotation.scope),
-            state,
         )
     }
 
@@ -2409,426 +2428,24 @@ impl NavigationIndex {
         node: Node<'_>,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
-        if !state.take_receiver_work() {
-            return Vec::new();
-        }
-        match node.kind() {
-            "identifier" => self.resolve_identifier_receiver(
-                current_uri,
-                current_document,
-                offset,
-                &node_text(node, &current_document.source),
-                state,
-            ),
-            "exprParens" => first_named_child(node)
-                .map(|operand| {
-                    self.resolve_receivers_with_state(
-                        current_uri,
-                        current_document,
-                        offset,
-                        operand,
-                        state,
-                    )
-                })
-                .unwrap_or_default(),
-            "exprCall" => {
-                self.resolve_call_receivers(current_uri, current_document, offset, node, state)
-            }
-            "exprBinary" | "exprAs" => {
-                let Some(operator) = node.child_by_field_name("operator") else {
-                    return Vec::new();
-                };
-                if node_text(operator, &current_document.source).eq_ignore_ascii_case("as") {
-                    node.child_by_field_name("rhs")
-                        .map(|rhs| {
-                            self.resolve_cast_receivers_with_state(
-                                current_uri,
-                                current_document,
-                                offset,
-                                rhs,
-                                state,
-                            )
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            }
-            "exprDot" | "genericDot" | "typerefDot" => {
-                if let Some(parts) = qualified_name_parts(&node, &current_document.source) {
-                    return self.resolve_qualified_receiver_path(
-                        current_uri,
-                        current_document,
-                        offset,
-                        &parts,
-                        state,
-                    );
-                }
-                let Some(lhs) = node.child_by_field_name("lhs") else {
-                    return Vec::new();
-                };
-                let Some(rhs) = node.child_by_field_name("rhs") else {
-                    return Vec::new();
-                };
-                let Some(rhs_name) = qualified_name_parts(&rhs, &current_document.source)
-                    .and_then(|parts| parts.last().cloned())
-                else {
-                    return Vec::new();
-                };
-                let mut result = Vec::new();
-                for receiver in self.resolve_receivers_with_state(
-                    current_uri,
-                    current_document,
-                    offset,
-                    lhs,
-                    state,
-                ) {
-                    match receiver {
-                        Receiver::Unit(unit_uri) => {
-                            result.extend(self.type_receivers_in_unit(
-                                &unit_uri,
-                                &rhs_name,
-                                unit_uri == *current_uri,
-                            ));
-                        }
-                        Receiver::Type(type_uri, type_key, type_scope) => {
-                            result.extend(self.member_type_receivers(
-                                &type_uri,
-                                &type_key,
-                                &rhs_name,
-                                type_uri == *current_uri,
-                                type_scope,
-                                state,
-                            ));
-                        }
-                    }
-                }
-                result
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    fn resolve_cast_receivers_with_state(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        type_node: Node<'_>,
-        state: &mut ResolutionState,
-    ) -> Vec<Receiver> {
-        let Some(parts) = qualified_name_parts(&type_node, &current_document.source) else {
-            return Vec::new();
-        };
-        self.type_receivers_for_parts(current_uri, current_document, offset, &parts, None, state)
-    }
-
-    fn resolve_call_receivers(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        call: Node<'_>,
-        state: &mut ResolutionState,
-    ) -> Vec<Receiver> {
-        let Some(entity) = call.child_by_field_name("entity") else {
-            return Vec::new();
-        };
-        let callable_identifier = callable_lookup_identifier(entity);
-        let candidates = self.resolve_candidates_at_with_state(
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            MAX_NAVIGATION_OVERLOAD_WORK,
+            MAX_NAVIGATION_OVERLOAD_BYTES,
+            "receiver resolution",
+        );
+        self.resolve_receivers_with_state_and_budget(
             current_uri,
             current_document,
-            entity.start_byte(),
-            callable_identifier,
+            offset,
+            node,
+            node,
             state,
-        );
-        if candidates
-            .iter()
-            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
-        {
-            return Vec::new();
-        }
-
-        let mut type_candidates = Vec::new();
-        let mut routine_candidates = Vec::new();
-        for candidate in candidates {
-            let Some(symbol) = self.symbol(&candidate) else {
-                continue;
-            };
-            match symbol.kind {
-                SymbolKind::Type => type_candidates.push(candidate),
-                SymbolKind::Routine if !symbol.unresolved_abbreviated => {
-                    routine_candidates.push(candidate)
-                }
-                _ => {}
-            }
-        }
-
-        if !type_candidates.is_empty() {
-            if !routine_candidates.is_empty() {
-                return Vec::new();
-            }
-            return type_candidates
-                .into_iter()
-                .filter_map(|candidate| {
-                    let symbol = self.symbol(&candidate)?;
-                    Some(Receiver::Type(
-                        candidate.uri,
-                        symbol.key.clone(),
-                        symbol.scope,
-                    ))
-                })
-                .collect();
-        }
-        if routine_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        let mut routine_groups = HashSet::new();
-        for candidate in &routine_candidates {
-            let Some(symbol) = self.symbol(candidate) else {
-                continue;
-            };
-            let Some(routine_key) = symbol.routine_key.as_ref() else {
-                return Vec::new();
-            };
-            routine_groups.insert((candidate.uri.clone(), routine_key.clone()));
-        }
-        if routine_groups.len() != 1 {
-            return Vec::new();
-        }
-
-        let mut result_type_source: Option<(Url, ResultTypeAnnotation)> = None;
-        let mut constructor = false;
-        for candidate in routine_candidates {
-            let Some(symbol) = self.symbol(&candidate) else {
-                continue;
-            };
-            constructor |= symbol.routine_kind == RoutineKind::Constructor;
-            if let Some(annotation) = symbol.result_type_annotation() {
-                if result_type_source
-                    .as_ref()
-                    .is_some_and(|(_, current)| current.name != annotation.name)
-                {
-                    return Vec::new();
-                }
-                result_type_source = Some((candidate.uri.clone(), annotation));
-            }
-        }
-
-        let Some((result_uri, annotation)) = result_type_source else {
-            if !constructor {
-                return Vec::new();
-            }
-            let Some(lhs) = entity.child_by_field_name("lhs") else {
-                return Vec::new();
-            };
-            return self.resolve_receivers_with_state(
-                current_uri,
-                current_document,
-                offset,
-                lhs,
-                state,
-            );
-        };
-        let Some(result_document) = self.documents.get(&result_uri) else {
-            return Vec::new();
-        };
-        self.result_type_receivers(&result_uri, result_document, &annotation, state)
-    }
-
-    fn resolve_qualified_receiver_path(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        parts: &[String],
-        state: &mut ResolutionState,
-    ) -> Vec<Receiver> {
-        if parts.len() < 2 || parts.len() > MAX_RECEIVER_WORK {
-            return Vec::new();
-        }
-
-        let Some(first) = parts.first() else {
-            return Vec::new();
-        };
-        let first_is_bound = !self
-            .unqualified_references(current_uri, current_document, offset, first)
-            .is_empty();
-        if first.eq_ignore_ascii_case("Self") || first_is_bound {
-            let mut receivers = self.resolve_identifier_receiver(
-                current_uri,
-                current_document,
-                offset,
-                first,
-                state,
-            );
-            for member_name in &parts[1..] {
-                receivers = receivers
-                    .into_iter()
-                    .flat_map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key, type_scope) => self
-                            .member_type_receivers(
-                                &type_uri,
-                                &type_key,
-                                member_name,
-                                type_uri == *current_uri,
-                                type_scope,
-                                state,
-                            ),
-                        Receiver::Unit(unit_uri) => self.type_receivers_in_unit(
-                            &unit_uri,
-                            member_name,
-                            unit_uri == *current_uri,
-                        ),
-                    })
-                    .collect();
-            }
-            return receivers;
-        }
-
-        if let Some(unit_uris) =
-            self.visible_unit_urls_for_path(current_uri, current_document, offset, parts)
-        {
-            return unit_uris.into_iter().map(Receiver::Unit).collect();
-        }
-
-        if let Some((prefix_len, unit_uris)) =
-            self.longest_visible_unit_prefix(current_uri, current_document, offset, parts)
-        {
-            let Some(type_name) = parts.get(prefix_len) else {
-                return Vec::new();
-            };
-            let allow_implementation = unit_uris.iter().any(|unit_uri| unit_uri == current_uri);
-            let mut receivers = unit_uris
-                .iter()
-                .flat_map(|unit_uri| {
-                    self.type_receivers_in_unit(unit_uri, type_name, allow_implementation)
-                })
-                .collect::<Vec<_>>();
-            for member_name in &parts[prefix_len + 1..] {
-                receivers = receivers
-                    .into_iter()
-                    .flat_map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key, type_scope) => self
-                            .member_type_receivers(
-                                &type_uri,
-                                &type_key,
-                                member_name,
-                                type_uri == *current_uri,
-                                type_scope,
-                                state,
-                            ),
-                        Receiver::Unit(_) => Vec::new(),
-                    })
-                    .collect();
-            }
-            return receivers;
-        }
-
-        let mut receivers =
-            self.resolve_identifier_receiver(current_uri, current_document, offset, first, state);
-        for member_name in &parts[1..] {
-            receivers = receivers
-                .into_iter()
-                .flat_map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key, type_scope) => self.member_type_receivers(
-                        &type_uri,
-                        &type_key,
-                        member_name,
-                        type_uri == *current_uri,
-                        type_scope,
-                        state,
-                    ),
-                    Receiver::Unit(unit_uri) => self.type_receivers_in_unit(
-                        &unit_uri,
-                        member_name,
-                        unit_uri == *current_uri,
-                    ),
-                })
-                .collect();
-        }
-        receivers
-    }
-
-    fn resolve_identifier_receiver(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        name: &str,
-        state: &mut ResolutionState,
-    ) -> Vec<Receiver> {
-        if name.eq_ignore_ascii_case("Self") {
-            return current_document
-                .owner_type_at(offset)
-                .map(|owner_type| vec![Receiver::Type(current_uri.clone(), owner_type, ROOT_SCOPE)])
-                .unwrap_or_default();
-        }
-        if name.eq_ignore_ascii_case("Result") {
-            let scope = current_document.scope_at(offset);
-            if let Some(annotation) = current_document.result_type_annotation_for_body_scope(scope)
-            {
-                return self.result_type_receivers(
-                    current_uri,
-                    current_document,
-                    &annotation,
-                    state,
-                );
-            }
-        }
-
-        let references = self.unqualified_references(current_uri, current_document, offset, name);
-        if !references.is_empty() {
-            if references
-                .iter()
-                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
-            {
-                return Vec::new();
-            }
-            let mut result = Vec::new();
-            for reference in references {
-                let Some(symbol) = self.symbol(&reference) else {
-                    continue;
-                };
-                match symbol.kind {
-                    SymbolKind::Type => {
-                        result.push(Receiver::Type(
-                            reference.uri.clone(),
-                            symbol.key.clone(),
-                            symbol.scope,
-                        ));
-                    }
-                    SymbolKind::Variable
-                    | SymbolKind::Parameter
-                    | SymbolKind::Field
-                    | SymbolKind::Property => {
-                        if let Some(type_name) = &symbol.type_name {
-                            let Some(declaration_document) = self.documents.get(&reference.uri)
-                            else {
-                                continue;
-                            };
-                            result.extend(self.type_receivers_for_path(
-                                &reference.uri,
-                                declaration_document,
-                                symbol.span.start,
-                                type_name,
-                                state,
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // A visible local/imported binding shadows a unit with the same
-            // spelling even when its type is currently unknown.
-            return result;
-        }
-
-        self.visible_unit_urls(current_uri, current_document, offset, name)
-            .into_iter()
-            .map(Receiver::Unit)
-            .collect()
+            &cancel,
+            &mut budget,
+            0,
+        )
+        .unwrap_or_default()
     }
 
     fn type_receivers_for_path(
@@ -3017,41 +2634,6 @@ impl NavigationIndex {
                 .collect();
         }
         receivers
-    }
-
-    fn visible_unit_urls(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        name: &str,
-    ) -> Vec<Url> {
-        let parts = vec![name.to_owned()];
-        self.visible_unit_urls_for_path(current_uri, current_document, offset, &parts)
-            .unwrap_or_default()
-    }
-
-    fn visible_unit_urls_for_path(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        parts: &[String],
-    ) -> Option<Vec<Url>> {
-        let key = canonical_path(parts);
-        if current_document.unit_name == key {
-            return Some(vec![current_uri.clone()]);
-        }
-        let region = current_document.region_at(offset);
-        if !current_document
-            .active_uses(region)
-            .iter()
-            .any(|used| used.as_str() == key)
-        {
-            return None;
-        }
-        let urls = self.unit_urls_for_import(current_document, &key);
-        (!urls.is_empty()).then_some(urls)
     }
 
     fn longest_visible_unit_prefix(
@@ -4269,6 +3851,16 @@ impl NavigationIndex {
             .and_then(|document| document.symbols.get(candidate.index))
     }
 
+    fn type_kind(&self, uri: &Url, key: &str) -> Option<TypeKind> {
+        let document = self.documents.get(uri)?;
+        let indices = document.type_symbol_indices.get(key)?;
+        if indices.len() != 1 {
+            return None;
+        }
+        let symbol = document.symbols.get(*indices.first()?)?;
+        (symbol.kind == SymbolKind::Type).then_some(symbol.type_kind)
+    }
+
     fn expand_property_candidates(
         &self,
         references: Vec<Candidate>,
@@ -4611,10 +4203,29 @@ struct Symbol {
     routine_signature: Option<String>,
     routine_header_span: Option<Span>,
     routine_parameter_spans: Vec<Span>,
+    routine_parameters: Vec<RoutineParameter>,
     type_excerpt_end: Option<usize>,
     body_scope: Option<usize>,
     unresolved_abbreviated: bool,
     accessor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RoutineParameter {
+    span: Span,
+    type_span: Option<Span>,
+    type_name: Option<String>,
+    mode: ParameterMode,
+    has_default: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterMode {
+    Value,
+    Var,
+    Out,
+    Const,
+    ConstRef,
 }
 
 #[derive(Debug, Clone)]
@@ -4747,6 +4358,8 @@ const MAX_RECEIVER_WORK: usize = 256;
 const MAX_TYPE_RESOLUTION_WORK: usize = 256;
 const MAX_RECEIVER_RECURSION_DEPTH: usize = 64;
 const MAX_ANCESTRY_WORK: usize = 256;
+const MAX_NAVIGATION_OVERLOAD_WORK: usize = 100_000;
+const MAX_NAVIGATION_OVERLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 struct ResolutionState {
     receiver_work: usize,
@@ -4960,6 +4573,7 @@ impl Document {
                 routine_signature: None,
                 routine_header_span: None,
                 routine_parameter_spans: Vec::new(),
+                routine_parameters: Vec::new(),
                 type_excerpt_end: None,
                 body_scope: None,
                 unresolved_abbreviated: false,
@@ -5620,6 +5234,7 @@ fn inject_abbreviated_parameters(
                 routine_signature: None,
                 routine_header_span: None,
                 routine_parameter_spans: Vec::new(),
+                routine_parameters: Vec::new(),
                 type_excerpt_end: None,
                 body_scope: None,
                 unresolved_abbreviated: false,
@@ -5650,6 +5265,7 @@ fn add_definition_symbol(
     let scope = scopes[own_scope].parent.unwrap_or(ROOT_SCOPE);
     let signature = routine_signature(header, source);
     let result_type = routine_result_type(header, source);
+    let routine_parameters = direct_routine_parameters(header, source);
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -5676,7 +5292,11 @@ fn add_definition_symbol(
         )),
         routine_signature: Some(signature),
         routine_header_span: Some(Span::from_node(header)),
-        routine_parameter_spans: direct_routine_parameter_spans(header),
+        routine_parameter_spans: routine_parameters
+            .iter()
+            .map(|parameter| parameter.span)
+            .collect(),
+        routine_parameters,
         type_excerpt_end: None,
         body_scope: Some(own_scope),
         unresolved_abbreviated: false,
@@ -5697,6 +5317,7 @@ fn add_routine_symbol(
     let scope = scope_for_declaration(node, scope_by_span);
     let signature = routine_signature(node, source);
     let result_type = routine_result_type(node, source);
+    let routine_parameters = direct_routine_parameters(node, source);
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -5723,7 +5344,11 @@ fn add_routine_symbol(
         )),
         routine_signature: Some(signature),
         routine_header_span: Some(Span::from_node(node)),
-        routine_parameter_spans: direct_routine_parameter_spans(node),
+        routine_parameter_spans: routine_parameters
+            .iter()
+            .map(|parameter| parameter.span)
+            .collect(),
+        routine_parameters,
         type_excerpt_end: None,
         body_scope: None,
         unresolved_abbreviated: false,
@@ -5786,6 +5411,7 @@ fn add_named_symbol(
             routine_signature: None,
             routine_header_span: None,
             routine_parameter_spans: Vec::new(),
+            routine_parameters: Vec::new(),
             type_excerpt_end,
             body_scope: None,
             unresolved_abbreviated: false,
@@ -6026,12 +5652,19 @@ fn routine_signature(node: Node<'_>, source: &str) -> String {
     let mut types = Vec::new();
     for child in direct_routine_argument_groups(arguments) {
         let count = field_identifier_nodes(child, "name").len().max(1);
+        let mode = match parameter_mode(child) {
+            ParameterMode::Value => "",
+            ParameterMode::Var => "var ",
+            ParameterMode::Out => "out ",
+            ParameterMode::Const => "const ",
+            ParameterMode::ConstRef => "constref ",
+        };
         let type_name = child
             .child_by_field_name("type")
             .and_then(|type_node| simple_type_path(type_node, source))
             .unwrap_or_else(|| "?".to_string());
         for _ in 0..count {
-            types.push(type_name.clone());
+            types.push(format!("{mode}{type_name}"));
         }
     }
     types.join(",")
@@ -6044,18 +5677,43 @@ fn direct_routine_argument_groups(arguments: Node<'_>) -> Vec<Node<'_>> {
         .collect()
 }
 
-fn direct_routine_parameter_spans(node: Node<'_>) -> Vec<Span> {
+fn direct_routine_parameters(node: Node<'_>, source: &str) -> Vec<RoutineParameter> {
     let Some(arguments) = node.child_by_field_name("args") else {
         return Vec::new();
     };
     direct_routine_argument_groups(arguments)
         .into_iter()
         .flat_map(|group| {
+            let type_node = group.child_by_field_name("type");
+            let type_span = type_node.map(Span::from_node);
+            let type_name = type_node.and_then(|node| simple_type_path(node, source));
+            let mode = parameter_mode(group);
+            let has_default = group.child_by_field_name("defaultValue").is_some();
             field_identifier_nodes(group, "name")
                 .into_iter()
-                .map(Span::from_node)
+                .map(move |identifier| RoutineParameter {
+                    span: Span::from_node(identifier),
+                    type_span,
+                    type_name: type_name.clone(),
+                    mode,
+                    has_default,
+                })
         })
         .collect()
+}
+
+fn parameter_mode(node: Node<'_>) -> ParameterMode {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "kVar" => return ParameterMode::Var,
+            "kOut" => return ParameterMode::Out,
+            "kConstref" => return ParameterMode::ConstRef,
+            "kConst" => return ParameterMode::Const,
+            _ => {}
+        }
+    }
+    ParameterMode::Value
 }
 
 fn routine_key_with_owner(
@@ -6116,6 +5774,9 @@ fn simple_type_path(node: Node<'_>, source: &str) -> Option<String> {
     let mut type_node = node;
     while matches!(type_node.kind(), "type" | "typeref") {
         type_node = first_named_child(type_node)?;
+    }
+    if type_node.kind() == "declString" {
+        return Some("string".to_owned());
     }
     let parts = qualified_name_parts(&type_node, source)?;
     (!parts.is_empty()).then(|| canonical_path(&parts))

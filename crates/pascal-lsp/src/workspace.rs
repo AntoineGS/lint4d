@@ -4002,15 +4002,13 @@ impl Workspace {
                 .cloned()
                 .expect("open document context is initialized");
             self.document_contexts.insert(uri.clone(), selected);
+        } else if owner_is_effective {
+            self.document_contexts
+                .insert(uri.clone(), effective_context_key.clone());
         } else {
-            if owner_is_effective {
-                self.document_contexts
-                    .insert(uri.clone(), effective_context_key.clone());
-            } else {
-                self.document_contexts
-                    .entry(uri.clone())
-                    .or_insert_with(|| effective_context_key.clone());
-            }
+            self.document_contexts
+                .entry(uri.clone())
+                .or_insert_with(|| effective_context_key.clone());
         }
         let selected = self
             .open_document_contexts
@@ -4100,13 +4098,17 @@ impl Workspace {
         if self.warnings.iter().any(|warning| warning == &message) {
             return;
         }
-        if self.warnings.len() < MAX_WORKSPACE_WARNINGS {
-            eprintln!("pascal-lsp: warning: {message}");
-            self.warnings.push(message);
-        } else if self.warnings.len() == MAX_WORKSPACE_WARNINGS {
-            eprintln!("pascal-lsp: warning: workspace warning limit reached");
-            self.warnings
-                .push("workspace warning limit reached".to_string());
+        match self.warnings.len().cmp(&MAX_WORKSPACE_WARNINGS) {
+            std::cmp::Ordering::Less => {
+                eprintln!("pascal-lsp: warning: {message}");
+                self.warnings.push(message);
+            }
+            std::cmp::Ordering::Equal => {
+                eprintln!("pascal-lsp: warning: workspace warning limit reached");
+                self.warnings
+                    .push("workspace warning limit reached".to_string());
+            }
+            std::cmp::Ordering::Greater => {}
         }
     }
 

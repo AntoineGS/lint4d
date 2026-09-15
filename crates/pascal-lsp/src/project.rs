@@ -2445,14 +2445,14 @@ fn build_project_context(
         ));
     }
 
-    if let Some(main_source_entry) = &main_source_entry
-        && !builder.read_policy.allows_entry(main_source_entry)
-    {
-        builder.incomplete = true;
-        builder.warnings.push(format!(
-            "ignored main source outside authorized read roots: {}",
-            main_source_entry.path.display()
-        ));
+    if let Some(main_source_entry) = &main_source_entry {
+        if !builder.read_policy.allows_entry(main_source_entry) {
+            builder.incomplete = true;
+            builder.warnings.push(format!(
+                "ignored main source outside authorized read roots: {}",
+                main_source_entry.path.display()
+            ));
+        }
     }
 
     let mut search_path_entries = vec![ProjectPathEntry::legacy(project_dir.clone())];
@@ -5091,20 +5091,18 @@ fn expand_condition_value(
             }
             missing |= replacement.contains(UNRESOLVED_MARKER)
                 || unknown_properties.contains(&name.to_ascii_lowercase());
-        } else {
-            if unknown_import_taint || !is_known_project_local_configuration_property(name) {
-                missing = true;
-                if !append_expansion(
-                    &mut expanded,
-                    &UNRESOLVED_MARKER.to_string(),
-                    warnings,
-                    source_file,
-                ) {
-                    return ConditionValue {
-                        value: String::new(),
-                        unknown: true,
-                    };
-                }
+        } else if unknown_import_taint || !is_known_project_local_configuration_property(name) {
+            missing = true;
+            if !append_expansion(
+                &mut expanded,
+                &UNRESOLVED_MARKER.to_string(),
+                warnings,
+                source_file,
+            ) {
+                return ConditionValue {
+                    value: String::new(),
+                    unknown: true,
+                };
             }
         }
         cursor = end + 1;

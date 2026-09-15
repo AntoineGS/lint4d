@@ -4038,7 +4038,7 @@ fn routine_signature(node: Node<'_>, source: &str) -> String {
     types.join(",")
 }
 
-fn direct_routine_argument_groups<'a>(arguments: Node<'a>) -> Vec<Node<'a>> {
+fn direct_routine_argument_groups(arguments: Node<'_>) -> Vec<Node<'_>> {
     (0..arguments.named_child_count())
         .filter_map(|index| arguments.named_child(index))
         .filter(|child| child.kind() == "declArg")
@@ -4320,7 +4320,7 @@ fn collect_parser_recovery_spans(root: Node<'_>) -> Vec<Span> {
     spans
 }
 
-fn identifier_nodes<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+fn identifier_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     let mut result = Vec::new();
     collect_nodes(node, &mut |child| {
         if child.kind() == "identifier" {
@@ -4339,7 +4339,7 @@ fn field_identifier_nodes<'a>(node: Node<'a>, field: &str) -> Vec<Node<'a>> {
     result
 }
 
-fn identifier_texts<'a>(node: Node<'a>, source: &str) -> Vec<String> {
+fn identifier_texts(node: Node<'_>, source: &str) -> Vec<String> {
     identifier_nodes(node)
         .into_iter()
         .map(|identifier| node_text(identifier, source))
@@ -4644,7 +4644,7 @@ fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
-fn identifier_at<'a>(root: Node<'a>, offset: usize) -> Option<Node<'a>> {
+fn identifier_at(root: Node<'_>, offset: usize) -> Option<Node<'_>> {
     if !Span::from_node(root).contains_offset(offset) {
         return None;
     }
@@ -4691,7 +4691,7 @@ fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn member_expression_at<'a>(identifier: Node<'a>) -> Option<Node<'a>> {
+fn member_expression_at(identifier: Node<'_>) -> Option<Node<'_>> {
     let mut current = identifier.parent();
     while let Some(node) = current {
         if node.kind() == "exprDot" {

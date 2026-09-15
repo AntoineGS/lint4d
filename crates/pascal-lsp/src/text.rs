@@ -20,7 +20,7 @@ impl<'a> Line<'a> {
     }
 }
 
-fn lines<'a>(source: &'a str) -> Vec<Line<'a>> {
+fn lines(source: &str) -> Vec<Line<'_>> {
     let mut result = Vec::new();
     let mut start = 0;
     let bytes = source.as_bytes();

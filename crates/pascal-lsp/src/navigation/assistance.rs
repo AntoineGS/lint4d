@@ -571,12 +571,13 @@ impl NavigationIndex {
                             cancel,
                         )?;
                     }
-                    super::Receiver::Type(type_uri, type_key) => {
+                    super::Receiver::Type(type_uri, type_key, type_scope) => {
                         let (ancestry_known, has_ambiguous_names) = self
                             .add_member_completion_candidates(
                                 &mut accumulator,
                                 &type_uri,
                                 &type_key,
+                                type_scope,
                                 current_uri,
                                 &mut private_spans,
                                 0,
@@ -621,6 +622,7 @@ impl NavigationIndex {
                             &mut accumulator,
                             current_uri,
                             &owner_type,
+                            super::ROOT_SCOPE,
                             current_uri,
                             &mut private_spans,
                             precedence,
@@ -908,6 +910,7 @@ impl NavigationIndex {
         accumulator: &mut CompletionAccumulator,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         current_uri: &Url,
         private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
@@ -916,6 +919,7 @@ impl NavigationIndex {
         let lookup = self.member_candidates_for_completion_with_budget(
             type_uri,
             type_key,
+            type_scope,
             type_uri == current_uri,
             cancel,
             accumulator.budget,
@@ -1195,6 +1199,7 @@ impl NavigationIndex {
                         symbol.span.start,
                         &type_name,
                         lookup_identifier,
+                        None,
                         &mut state,
                         cancel,
                         budget,
@@ -1223,7 +1228,8 @@ impl NavigationIndex {
                                 )?;
                                 let mut constructed_targets = Vec::new();
                                 for receiver in receivers {
-                                    let super::Receiver::Type(type_uri, type_key) = receiver else {
+                                    let super::Receiver::Type(type_uri, type_key, _) = receiver
+                                    else {
                                         continue;
                                     };
                                     constructed_targets.extend(
@@ -1266,6 +1272,7 @@ impl NavigationIndex {
                         type_offset,
                         type_name,
                         lookup_identifier,
+                        Some(symbol.scope),
                         &mut state,
                         cancel,
                         budget,
@@ -1320,6 +1327,7 @@ impl NavigationIndex {
         offset: usize,
         type_name: &str,
         lookup_identifier: Node<'_>,
+        scope_override: Option<usize>,
         state: &mut super::ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
@@ -1333,8 +1341,19 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
         if parts.len() == 1 {
-            let references = self
-                .unqualified_references_with_budget(
+            let references = if let Some(scope) = scope_override {
+                self.unqualified_references_with_budget_at_scope(
+                    current_uri,
+                    current_document,
+                    offset,
+                    &parts[0],
+                    lookup_identifier,
+                    scope,
+                    cancel,
+                    budget,
+                )?
+            } else {
+                self.unqualified_references_with_budget(
                     current_uri,
                     current_document,
                     offset,
@@ -1343,12 +1362,13 @@ impl NavigationIndex {
                     cancel,
                     budget,
                 )?
-                .into_iter()
-                .filter(|candidate| {
-                    self.symbol(candidate)
-                        .is_some_and(|symbol| symbol.kind == SymbolKind::Type)
-                })
-                .collect();
+            }
+            .into_iter()
+            .filter(|candidate| {
+                self.symbol(candidate)
+                    .is_some_and(|symbol| symbol.kind == SymbolKind::Type)
+            })
+            .collect();
             return Ok(references);
         }
 
@@ -2968,6 +2988,7 @@ mod tests {
                 .member_references_for_type_with_budget(
                     &provider_uri,
                     "twidget",
+                    ROOT_SCOPE,
                     "member",
                     true,
                     &cancel,
@@ -3074,6 +3095,7 @@ mod tests {
                 .member_references_for_type_with_budget(
                     &provider_uri,
                     "twidget",
+                    ROOT_SCOPE,
                     "member",
                     true,
                     &cancel,
@@ -3183,6 +3205,7 @@ mod tests {
                     item_symbol.span.start,
                     &item_type,
                     lookup_identifier,
+                    None,
                     &mut state,
                     &cancel,
                     &mut exhausted_budget,
@@ -3208,6 +3231,7 @@ mod tests {
                     item_symbol.span.start,
                     &item_type,
                     lookup_identifier,
+                    None,
                     &mut state,
                     &cancelled,
                     &mut cancellation_budget,

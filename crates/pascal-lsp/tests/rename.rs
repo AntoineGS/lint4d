@@ -1043,6 +1043,126 @@ end.
 }
 
 #[test]
+fn implementation_only_function_result_rename_excludes_its_body_type_member() {
+    let provider_uri = uri("ImplementationOnlyRenameSource");
+    let consumer_uri = uri("ImplementationOnlyRenameConsumer");
+    let provider = "unit ImplementationOnlyRenameSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+";
+    let consumer = "unit ImplementationOnlyRenameConsumer;
+interface
+uses ImplementationOnlyRenameSource;
+implementation
+function Make: TResult;
+type
+  TResult = record
+    Name: string;
+  end;
+begin
+  Result.Name := '';
+end;
+procedure Caller;
+begin
+  Make().Name := 1;
+end;
+end.
+";
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("rename provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("rename consumer parses");
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "ImplementationOnlyRenameSource".to_owned(),
+        provider_uri.clone(),
+    );
+    index.bind_imports(&consumer_uri, bindings);
+
+    let edits = index
+        .rename_edits(
+            &provider_uri,
+            position_of(provider, "Name", 0),
+            "RenamedName",
+        )
+        .expect("implementation-only result rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "Name", 0),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Name", 2),
+                "RenamedName".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn shadowed_qualified_cast_type_root_does_not_authorize_a_member_rename() {
+    let provider_uri = uri("ShadowedCastRenameSource");
+    let consumer_uri = uri("ShadowedCastRenameConsumer");
+    let provider = "unit ShadowedCastRenameSource;
+interface
+type
+  TResult = class
+    Member: Integer;
+  end;
+end.
+";
+    let consumer = "unit ShadowedCastRenameConsumer;
+interface
+uses ShadowedCastRenameSource;
+type
+  TWidget = class
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  ShadowedCastRenameSource: Integer;
+begin
+  (Obj as ShadowedCastRenameSource.TResult).Member := 1;
+end;
+end.
+";
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("shadowed cast rename provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("shadowed cast rename consumer parses");
+    let mut bindings = HashMap::new();
+    bindings.insert("ShadowedCastRenameSource".to_owned(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+
+    assert!(
+        index
+            .rename_edits(
+                &provider_uri,
+                position_of(provider, "Member", 0),
+                "RenamedMember",
+            )
+            .is_err(),
+        "a shadowed cast root must not authorize a partial member rename"
+    );
+}
+
+#[test]
 fn invalid_cast_variable_rhs_does_not_authorize_a_member_rename() {
     let source = "unit InvalidCastVariableRename;
 interface

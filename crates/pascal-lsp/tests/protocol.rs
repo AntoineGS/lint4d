@@ -1567,6 +1567,98 @@ fn completion_request_returns_semantic_items_and_plain_text_edits() {
 }
 
 #[test]
+fn deep_method_receiver_completion_stays_stack_safe_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepMethodReceivers.pas");
+    let method_chain = |count: usize| {
+        let mut expression = String::from("Obj");
+        for _ in 0..count {
+            expression.push_str(".Next()");
+        }
+        expression.push_str(".Me");
+        expression
+    };
+    let chain_256 = method_chain(256);
+    let chain_512 = method_chain(512);
+    let source = format!(
+        "unit DeepMethodReceivers;\ninterface\ntype\n  TObj = class\n    function Next: TObj;\n    Member: Integer;\n  end;\nimplementation\nfunction TObj.Next: TObj;\nbegin\n  Result := Self;\nend;\nprocedure Run256;\nvar\n  Obj: TObj;\nbegin\n  {chain_256};\nend;\nprocedure Run512;\nvar\n  Obj: TObj;\nbegin\n  {chain_512};\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let outline_id = RequestId::from("deep-method-outline".to_string());
+    server.send_request(
+        outline_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let outline = server.response(&outline_id);
+    assert!(
+        outline.error.is_none(),
+        "document symbols failed: {outline:?}"
+    );
+
+    for (request_name, chain) in [
+        ("deep-method-completion-256", &chain_256),
+        ("deep-method-completion-512", &chain_512),
+    ] {
+        let id = RequestId::from(request_name.to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(&source, chain, 0),
+            }),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "deep completion failed: {response:?}"
+        );
+        assert_eq!(
+            response.result.expect("deep completion result")["isIncomplete"],
+            true
+        );
+    }
+
+    let cancelled_id = RequestId::from("deep-method-completion-cancelled".to_string());
+    server.send_request(
+        cancelled_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(&source, &chain_512, 0),
+        }),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "deep-method-completion-cancelled"}),
+    );
+    let cancelled = server.response(&cancelled_id);
+    let error = cancelled
+        .error
+        .expect("cancelled deep completion must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+
+    let responsive_id = RequestId::from("deep-method-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn completion_request_marks_unqualified_unknown_ancestry_incomplete() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("UnknownUnqualifiedProtocol.pas");
@@ -2778,6 +2870,37 @@ fn references_reject_a_variable_rhs_in_a_cast_receiver() {
     assert!(
         response.error.is_some(),
         "an unresolved cast receiver must not return references"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn references_reject_a_shadowed_qualified_cast_type_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider_path = temp.path().join("CastTypes.pas");
+    let consumer_path = temp.path().join("QualifiedCastRootShadow.pas");
+    let provider =
+        "unit CastTypes;\ninterface\ntype\n  TResult = class\n    Member: Integer;\n  end;\nend.\n";
+    let consumer = "unit QualifiedCastRootShadow;\ninterface\nuses CastTypes;\ntype\n  TWidget = class\n  end;\nprocedure Caller;\nvar\n  Obj: TWidget;\n  CastTypes: Integer;\nbegin\n  (Obj as CastTypes.TResult).Member := 1;\nend;\nend.\n";
+    write_file(&provider_path, provider);
+    write_file(&consumer_path, consumer);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("shadowed-qualified-cast-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&consumer_path)},
+            "position": position_of(consumer, "Member", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "a shadowed cast root must not return imported references"
     );
     server.shutdown();
 }

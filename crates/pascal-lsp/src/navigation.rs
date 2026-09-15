@@ -373,7 +373,7 @@ impl NavigationIndex {
     ) -> Result<Vec<Candidate>, String> {
         let mut state = ResolutionState::new();
         self.resolve_candidates_at_with_state_and_budget(
-            uri, document, offset, identifier, &mut state, cancel, budget,
+            uri, document, offset, identifier, &mut state, 0, cancel, budget,
         )
     }
 
@@ -385,6 +385,7 @@ impl NavigationIndex {
         offset: usize,
         identifier: Node<'_>,
         state: &mut ResolutionState,
+        depth: usize,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
@@ -413,7 +414,7 @@ impl NavigationIndex {
         } else if let Some(dot) = member_expression_at(identifier) {
             if is_right_hand_member(dot, identifier) {
                 self.member_references_with_state_and_budget(
-                    uri, document, offset, dot, name, identifier, state, cancel, budget,
+                    uri, document, offset, dot, name, identifier, state, depth, cancel, budget,
                 )
             } else {
                 self.unqualified_references_with_budget(
@@ -564,13 +565,30 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
+        let scope = document.scope_at(offset);
+        self.unqualified_references_with_budget_at_scope(
+            uri, document, offset, name, identifier, scope, cancel, budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unqualified_references_with_budget_at_scope(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        name: &str,
+        identifier: Node<'_>,
+        scope: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
         budget.require_bytes(name.len(), cancel)?;
         let key = canonical_name(name);
         budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
-        let scope = document.scope_at(offset);
         let owner_type = document.owner_type_at_identifier(identifier, scope);
 
-        let scope_chain = document.scope_chain(offset);
+        let scope_chain = document.scope_chain_from(scope);
         budget.require_bytes(
             key.len()
                 .saturating_mul(scope_chain.len().saturating_add(1)),
@@ -610,7 +628,7 @@ impl NavigationIndex {
 
         if let Some(owner_type) = owner_type.as_deref() {
             let members = self.member_references_for_type_with_budget(
-                uri, owner_type, &key, true, cancel, budget,
+                uri, owner_type, ROOT_SCOPE, &key, true, cancel, budget,
             )?;
             if !members.is_empty() {
                 return Ok(members);
@@ -768,6 +786,7 @@ impl NavigationIndex {
         member_name: &str,
         lookup_identifier: Node<'_>,
         state: &mut ResolutionState,
+        depth: usize,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
@@ -785,7 +804,7 @@ impl NavigationIndex {
             state,
             cancel,
             budget,
-            0,
+            depth.saturating_add(1),
         )?;
         let mut references = Vec::new();
         for receiver in receivers {
@@ -796,10 +815,11 @@ impl NavigationIndex {
                         &unit_uri, &key, cancel, budget,
                     )?);
                 }
-                Receiver::Type(type_uri, type_key) => {
+                Receiver::Type(type_uri, type_key, type_scope) => {
                     references.extend(self.member_references_for_type_with_budget(
                         &type_uri,
                         &type_key,
+                        type_scope,
                         &key,
                         type_uri == *current_uri,
                         cancel,
@@ -839,15 +859,22 @@ impl NavigationIndex {
                     .collect();
             }
         }
-        self.type_receivers_for_parts(current_uri, current_document, offset, parts, &mut state)
-            .into_iter()
-            .flat_map(|receiver| match receiver {
-                Receiver::Type(type_uri, type_key) => {
-                    self.type_candidates_in_unit(&type_uri, &type_key, type_uri == *current_uri)
-                }
-                Receiver::Unit(_) => Vec::new(),
-            })
-            .collect()
+        self.type_receivers_for_parts(
+            current_uri,
+            current_document,
+            offset,
+            parts,
+            None,
+            &mut state,
+        )
+        .into_iter()
+        .flat_map(|receiver| match receiver {
+            Receiver::Type(type_uri, type_key, _) => {
+                self.type_candidates_in_unit(&type_uri, &type_key, type_uri == *current_uri)
+            }
+            Receiver::Unit(_) => Vec::new(),
+        })
+        .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -930,7 +957,7 @@ impl NavigationIndex {
         let mut result = Vec::new();
         for receiver in receivers {
             budget.require_work(1, cancel)?;
-            if let Receiver::Type(type_uri, type_key) = receiver {
+            if let Receiver::Type(type_uri, type_key, _) = receiver {
                 result.extend(self.type_candidates_in_unit_with_budget(
                     &type_uri,
                     &type_key,
@@ -1121,11 +1148,30 @@ impl NavigationIndex {
         let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
             return Vec::new();
         };
+        self.unqualified_references_at_scope(
+            uri,
+            document,
+            offset,
+            name,
+            identifier,
+            document.scope_at(offset),
+        )
+    }
+
+    fn unqualified_references_at_scope(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        name: &str,
+        identifier: Node<'_>,
+        scope: usize,
+    ) -> Vec<Candidate> {
         let key = canonical_name(name);
 
         // Search lexical scopes from the innermost outward. A local symbol
         // shadows both the unit's declarations and imported declarations.
-        for scope_id in document.scope_chain(offset) {
+        for scope_id in document.scope_chain_from(scope) {
             let local = document
                 .symbol_indices_by_scope_key
                 .get(&(scope_id, key.clone()))
@@ -1155,7 +1201,7 @@ impl NavigationIndex {
         // considered before unit globals and imported declarations, and the
         // owner lookup also covers nested procedures inside a class method.
         if let Some(owner_type) = document.owner_type_at(offset) {
-            let members = self.member_references_for_type(uri, &owner_type, &key, true);
+            let members = self.member_references_for_type(uri, &owner_type, ROOT_SCOPE, &key, true);
             if !members.is_empty() {
                 return members;
             }
@@ -1256,9 +1302,9 @@ impl NavigationIndex {
         };
         let key = canonical_name(member_name);
         let mut references = Vec::new();
-        for receiver in
-            self.resolve_receivers_with_state(current_uri, current_document, offset, lhs, state)
-        {
+        let receivers =
+            self.resolve_receivers_with_state(current_uri, current_document, offset, lhs, state);
+        for receiver in receivers {
             match receiver {
                 Receiver::Unit(unit_uri) => references.extend(
                     self.exported_references_for_document(&unit_uri)
@@ -1269,13 +1315,15 @@ impl NavigationIndex {
                             })
                         }),
                 ),
-                Receiver::Type(type_uri, type_key) => {
-                    references.extend(self.member_references_for_type(
+                Receiver::Type(type_uri, type_key, type_scope) => {
+                    let members = self.member_references_for_type(
                         &type_uri,
                         &type_key,
+                        type_scope,
                         &key,
                         type_uri == *current_uri,
-                    ))
+                    );
+                    references.extend(members)
                 }
             }
         }
@@ -1310,10 +1358,12 @@ impl NavigationIndex {
             return Err("request cancelled".to_string());
         }
         if depth >= MAX_RECEIVER_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
             return Ok(Vec::new());
         }
         budget.require_work(1, cancel)?;
         if !state.take_receiver_work() {
+            state.mark_receiver_uncertain();
             return Ok(Vec::new());
         }
         match node.kind() {
@@ -1349,6 +1399,7 @@ impl NavigationIndex {
                 node,
                 lookup_identifier,
                 state,
+                depth,
                 cancel,
                 budget,
             ),
@@ -1434,12 +1485,13 @@ impl NavigationIndex {
                                 budget,
                             )?)
                         }
-                        Receiver::Type(type_uri, type_key) => {
+                        Receiver::Type(type_uri, type_key, type_scope) => {
                             result.extend(self.member_type_receivers_with_budget(
                                 &type_uri,
                                 &type_key,
                                 &rhs_name,
                                 type_uri == *current_uri,
+                                type_scope,
                                 lookup_identifier,
                                 state,
                                 cancel,
@@ -1476,6 +1528,7 @@ impl NavigationIndex {
             offset,
             &parts,
             type_node,
+            None,
             state,
             cancel,
             budget,
@@ -1491,6 +1544,7 @@ impl NavigationIndex {
         call: Node<'_>,
         _lookup_identifier: Node<'_>,
         state: &mut ResolutionState,
+        depth: usize,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Receiver>, String> {
@@ -1504,6 +1558,7 @@ impl NavigationIndex {
             entity.start_byte(),
             callable_identifier,
             state,
+            depth.saturating_add(1),
             cancel,
             budget,
         )?;
@@ -1540,7 +1595,11 @@ impl NavigationIndex {
                 .into_iter()
                 .filter_map(|candidate| {
                     let symbol = self.symbol(&candidate)?;
-                    Some(Receiver::Type(candidate.uri, symbol.key.clone()))
+                    Some(Receiver::Type(
+                        candidate.uri,
+                        symbol.key.clone(),
+                        symbol.scope,
+                    ))
                 })
                 .collect());
         }
@@ -1563,7 +1622,7 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
 
-        let mut result_type_source = None;
+        let mut result_type_source: Option<(Url, usize, usize, String)> = None;
         let mut constructor = false;
         for candidate in routine_candidates {
             check_navigation_cancel(cancel)?;
@@ -1575,7 +1634,7 @@ impl NavigationIndex {
             if let Some(result_type_name) = symbol.result_type_name.as_deref() {
                 if result_type_source
                     .as_ref()
-                    .is_some_and(|(_, _, current)| current != result_type_name)
+                    .is_some_and(|(_, _, _, current)| current != result_type_name)
                 {
                     state.mark_receiver_uncertain();
                     return Ok(Vec::new());
@@ -1585,12 +1644,15 @@ impl NavigationIndex {
                     symbol
                         .result_type_span
                         .map_or(symbol.span.start, |span| span.start),
+                    symbol.scope,
                     result_type_name.to_owned(),
                 ));
             }
         }
 
-        let Some((result_uri, result_offset, result_type_name)) = result_type_source else {
+        let Some((result_uri, result_offset, result_scope_offset, result_type_name)) =
+            result_type_source
+        else {
             if !constructor {
                 return Ok(Vec::new());
             }
@@ -1606,7 +1668,7 @@ impl NavigationIndex {
                 state,
                 cancel,
                 budget,
-                1,
+                depth.saturating_add(1),
             );
         };
         let Some(result_document) = self.documents.get(&result_uri) else {
@@ -1622,12 +1684,13 @@ impl NavigationIndex {
         else {
             return Ok(Vec::new());
         };
-        self.type_receivers_for_path_with_budget(
+        self.type_receivers_for_path_with_budget_at_scope(
             &result_uri,
             result_document,
             result_offset,
             &result_type_name,
             result_identifier,
+            Some(result_scope_offset),
             state,
             cancel,
             budget,
@@ -1680,12 +1743,13 @@ impl NavigationIndex {
                 receivers = receivers
                     .into_iter()
                     .map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key) => self
+                        Receiver::Type(type_uri, type_key, type_scope) => self
                             .member_type_receivers_with_budget(
                                 &type_uri,
                                 &type_key,
                                 member_name,
                                 type_uri == *current_uri,
+                                type_scope,
                                 lookup_identifier,
                                 state,
                                 cancel,
@@ -1745,12 +1809,13 @@ impl NavigationIndex {
                 receivers = receivers
                     .into_iter()
                     .map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key) => self
+                        Receiver::Type(type_uri, type_key, type_scope) => self
                             .member_type_receivers_with_budget(
                                 &type_uri,
                                 &type_key,
                                 member_name,
                                 type_uri == *current_uri,
+                                type_scope,
                                 lookup_identifier,
                                 state,
                                 cancel,
@@ -1781,16 +1846,18 @@ impl NavigationIndex {
             receivers = receivers
                 .into_iter()
                 .map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key) => self.member_type_receivers_with_budget(
-                        &type_uri,
-                        &type_key,
-                        member_name,
-                        type_uri == *current_uri,
-                        lookup_identifier,
-                        state,
-                        cancel,
-                        budget,
-                    ),
+                    Receiver::Type(type_uri, type_key, type_scope) => self
+                        .member_type_receivers_with_budget(
+                            &type_uri,
+                            &type_key,
+                            member_name,
+                            type_uri == *current_uri,
+                            type_scope,
+                            lookup_identifier,
+                            state,
+                            cancel,
+                            budget,
+                        ),
                     Receiver::Unit(unit_uri) => self.type_receivers_in_unit_with_budget(
                         &unit_uri,
                         member_name,
@@ -1823,8 +1890,24 @@ impl NavigationIndex {
             let scope = self.budgeted_scope_at(current_document, offset, cancel, budget)?;
             return Ok(current_document
                 .owner_type_at_identifier(lookup_identifier, scope)
-                .map(|owner_type| vec![Receiver::Type(current_uri.clone(), owner_type)])
+                .map(|owner_type| vec![Receiver::Type(current_uri.clone(), owner_type, ROOT_SCOPE)])
                 .unwrap_or_default());
+        }
+        if name.eq_ignore_ascii_case("Result") {
+            let scope = self.budgeted_scope_at(current_document, offset, cancel, budget)?;
+            if let Some(type_name) = current_document.result_type_name_for_body_scope(scope) {
+                let type_name = type_name.to_owned();
+                return self.type_receivers_for_path_with_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    &type_name,
+                    lookup_identifier,
+                    state,
+                    cancel,
+                    budget,
+                );
+            }
         }
         let references = self.unqualified_references_with_budget(
             current_uri,
@@ -1850,7 +1933,11 @@ impl NavigationIndex {
                 };
                 match symbol.kind {
                     SymbolKind::Type => {
-                        result.push(Receiver::Type(reference.uri.clone(), symbol.key.clone()));
+                        result.push(Receiver::Type(
+                            reference.uri.clone(),
+                            symbol.key.clone(),
+                            symbol.scope,
+                        ));
                     }
                     SymbolKind::Variable
                     | SymbolKind::Parameter
@@ -1901,6 +1988,32 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Receiver>, String> {
+        self.type_receivers_for_path_with_budget_at_scope(
+            current_uri,
+            current_document,
+            offset,
+            path,
+            lookup_identifier,
+            None,
+            state,
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_receivers_for_path_with_budget_at_scope(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        path: &str,
+        lookup_identifier: Node<'_>,
+        scope_override: Option<usize>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
         budget.require_work(
             path.split('.').filter(|part| !part.is_empty()).count(),
             cancel,
@@ -1918,6 +2031,7 @@ impl NavigationIndex {
             offset,
             &parts,
             lookup_identifier,
+            scope_override,
             state,
             cancel,
             budget,
@@ -1932,6 +2046,7 @@ impl NavigationIndex {
         offset: usize,
         parts: &[String],
         lookup_identifier: Node<'_>,
+        scope_override: Option<usize>,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
@@ -1941,15 +2056,28 @@ impl NavigationIndex {
         }
         budget.require_work(parts.len(), cancel)?;
         if parts.len() == 1 {
-            let candidates = self.unqualified_references_with_budget(
-                current_uri,
-                current_document,
-                offset,
-                &parts[0],
-                lookup_identifier,
-                cancel,
-                budget,
-            )?;
+            let candidates = if let Some(scope) = scope_override {
+                self.unqualified_references_with_budget_at_scope(
+                    current_uri,
+                    current_document,
+                    offset,
+                    &parts[0],
+                    lookup_identifier,
+                    scope,
+                    cancel,
+                    budget,
+                )?
+            } else {
+                self.unqualified_references_with_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    &parts[0],
+                    lookup_identifier,
+                    cancel,
+                    budget,
+                )?
+            };
             if candidates
                 .iter()
                 .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -1963,11 +2091,87 @@ impl NavigationIndex {
                     continue;
                 };
                 if symbol.kind == SymbolKind::Type {
-                    result.push(Receiver::Type(candidate.uri, symbol.key.clone()));
+                    result.push(Receiver::Type(
+                        candidate.uri,
+                        symbol.key.clone(),
+                        symbol.scope,
+                    ));
                 }
             }
             return Ok(result);
         }
+
+        let root_candidates = if let Some(scope) = scope_override {
+            self.unqualified_references_with_budget_at_scope(
+                current_uri,
+                current_document,
+                offset,
+                &parts[0],
+                lookup_identifier,
+                scope,
+                cancel,
+                budget,
+            )?
+        } else {
+            self.unqualified_references_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &parts[0],
+                lookup_identifier,
+                cancel,
+                budget,
+            )?
+        };
+        if !root_candidates.is_empty() {
+            if root_candidates
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Ok(Vec::new());
+            }
+            let mut receivers = Vec::new();
+            for candidate in root_candidates {
+                budget.require_work(1, cancel)?;
+                let Some(symbol) = self.symbol(&candidate) else {
+                    continue;
+                };
+                if symbol.kind != SymbolKind::Type {
+                    return Ok(Vec::new());
+                }
+                receivers.push(Receiver::Type(
+                    candidate.uri,
+                    symbol.key.clone(),
+                    symbol.scope,
+                ));
+            }
+            for member_name in &parts[1..] {
+                budget.require_work(1, cancel)?;
+                receivers = receivers
+                    .into_iter()
+                    .map(|receiver| match receiver {
+                        Receiver::Type(type_uri, type_key, type_scope) => self
+                            .member_type_receivers_with_budget(
+                                &type_uri,
+                                &type_key,
+                                member_name,
+                                type_uri == *current_uri,
+                                type_scope,
+                                lookup_identifier,
+                                state,
+                                cancel,
+                                budget,
+                            ),
+                        Receiver::Unit(_) => Ok(Vec::new()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            }
+            return Ok(receivers);
+        }
+
         let Some((prefix_len, unit_uris)) = self.longest_visible_unit_prefix_with_budget(
             current_uri,
             current_document,
@@ -1998,16 +2202,18 @@ impl NavigationIndex {
             receivers = receivers
                 .into_iter()
                 .map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key) => self.member_type_receivers_with_budget(
-                        &type_uri,
-                        &type_key,
-                        member_name,
-                        type_uri == *current_uri,
-                        lookup_identifier,
-                        state,
-                        cancel,
-                        budget,
-                    ),
+                    Receiver::Type(type_uri, type_key, type_scope) => self
+                        .member_type_receivers_with_budget(
+                            &type_uri,
+                            &type_key,
+                            member_name,
+                            type_uri == *current_uri,
+                            type_scope,
+                            lookup_identifier,
+                            state,
+                            cancel,
+                            budget,
+                        ),
                     Receiver::Unit(_) => Ok(Vec::new()),
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -2045,7 +2251,11 @@ impl NavigationIndex {
             let Some(symbol) = self.symbol(&candidate) else {
                 continue;
             };
-            result.push(Receiver::Type(candidate.uri, symbol.key.clone()));
+            result.push(Receiver::Type(
+                candidate.uri,
+                symbol.key.clone(),
+                symbol.scope,
+            ));
         }
         Ok(result)
     }
@@ -2079,19 +2289,26 @@ impl NavigationIndex {
         type_key: &str,
         name: &str,
         allow_implementation: bool,
+        type_scope: usize,
         lookup_identifier: Node<'_>,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Receiver>, String> {
         let member_key = canonical_name(name);
-        let resolution_key = (type_uri.clone(), type_key.to_owned(), member_key.clone());
+        let resolution_key = (
+            type_uri.clone(),
+            type_key.to_owned(),
+            member_key.clone(),
+            type_scope,
+        );
         if !state.active_members.insert(resolution_key.clone()) {
             return Ok(Vec::new());
         }
         let candidates = self.member_references_for_type_with_budget(
             type_uri,
             type_key,
+            type_scope,
             &member_key,
             allow_implementation,
             cancel,
@@ -2129,7 +2346,11 @@ impl NavigationIndex {
             if symbol.kind == SymbolKind::Routine && symbol.routine_kind == RoutineKind::Constructor
             {
                 if constructor_is_unique {
-                    result.push(Receiver::Type(type_uri.clone(), type_key.to_owned()));
+                    result.push(Receiver::Type(
+                        type_uri.clone(),
+                        type_key.to_owned(),
+                        type_scope,
+                    ));
                 }
                 continue;
             }
@@ -2244,12 +2465,13 @@ impl NavigationIndex {
                                 unit_uri == *current_uri,
                             ));
                         }
-                        Receiver::Type(type_uri, type_key) => {
+                        Receiver::Type(type_uri, type_key, type_scope) => {
                             result.extend(self.member_type_receivers(
                                 &type_uri,
                                 &type_key,
                                 &rhs_name,
                                 type_uri == *current_uri,
+                                type_scope,
                                 state,
                             ));
                         }
@@ -2272,7 +2494,7 @@ impl NavigationIndex {
         let Some(parts) = qualified_name_parts(&type_node, &current_document.source) else {
             return Vec::new();
         };
-        self.type_receivers_for_parts(current_uri, current_document, offset, &parts, state)
+        self.type_receivers_for_parts(current_uri, current_document, offset, &parts, None, state)
     }
 
     fn resolve_call_receivers(
@@ -2324,7 +2546,11 @@ impl NavigationIndex {
                 .into_iter()
                 .filter_map(|candidate| {
                     let symbol = self.symbol(&candidate)?;
-                    Some(Receiver::Type(candidate.uri, symbol.key.clone()))
+                    Some(Receiver::Type(
+                        candidate.uri,
+                        symbol.key.clone(),
+                        symbol.scope,
+                    ))
                 })
                 .collect();
         }
@@ -2346,7 +2572,7 @@ impl NavigationIndex {
             return Vec::new();
         }
 
-        let mut result_type_source = None;
+        let mut result_type_source: Option<(Url, usize, usize, String)> = None;
         let mut constructor = false;
         for candidate in routine_candidates {
             let Some(symbol) = self.symbol(&candidate) else {
@@ -2356,7 +2582,7 @@ impl NavigationIndex {
             if let Some(result_type_name) = symbol.result_type_name.as_deref() {
                 if result_type_source
                     .as_ref()
-                    .is_some_and(|(_, _, current)| current != result_type_name)
+                    .is_some_and(|(_, _, _, current)| current != result_type_name)
                 {
                     return Vec::new();
                 }
@@ -2365,12 +2591,15 @@ impl NavigationIndex {
                     symbol
                         .result_type_span
                         .map_or(symbol.span.start, |span| span.start),
+                    symbol.scope,
                     result_type_name.to_owned(),
                 ));
             }
         }
 
-        let Some((result_uri, result_offset, result_type_name)) = result_type_source else {
+        let Some((result_uri, _result_offset, result_scope_offset, result_type_name)) =
+            result_type_source
+        else {
             if !constructor {
                 return Vec::new();
             }
@@ -2388,11 +2617,12 @@ impl NavigationIndex {
         let Some(result_document) = self.documents.get(&result_uri) else {
             return Vec::new();
         };
-        self.type_receivers_for_path(
+        self.type_receivers_for_path_at_scope(
             &result_uri,
             result_document,
-            result_offset,
+            _result_offset,
             &result_type_name,
+            Some(result_scope_offset),
             state,
         )
     }
@@ -2427,13 +2657,15 @@ impl NavigationIndex {
                 receivers = receivers
                     .into_iter()
                     .flat_map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key) => self.member_type_receivers(
-                            &type_uri,
-                            &type_key,
-                            member_name,
-                            type_uri == *current_uri,
-                            state,
-                        ),
+                        Receiver::Type(type_uri, type_key, type_scope) => self
+                            .member_type_receivers(
+                                &type_uri,
+                                &type_key,
+                                member_name,
+                                type_uri == *current_uri,
+                                type_scope,
+                                state,
+                            ),
                         Receiver::Unit(unit_uri) => self.type_receivers_in_unit(
                             &unit_uri,
                             member_name,
@@ -2468,13 +2700,15 @@ impl NavigationIndex {
                 receivers = receivers
                     .into_iter()
                     .flat_map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key) => self.member_type_receivers(
-                            &type_uri,
-                            &type_key,
-                            member_name,
-                            type_uri == *current_uri,
-                            state,
-                        ),
+                        Receiver::Type(type_uri, type_key, type_scope) => self
+                            .member_type_receivers(
+                                &type_uri,
+                                &type_key,
+                                member_name,
+                                type_uri == *current_uri,
+                                type_scope,
+                                state,
+                            ),
                         Receiver::Unit(_) => Vec::new(),
                     })
                     .collect();
@@ -2488,11 +2722,12 @@ impl NavigationIndex {
             receivers = receivers
                 .into_iter()
                 .flat_map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key) => self.member_type_receivers(
+                    Receiver::Type(type_uri, type_key, type_scope) => self.member_type_receivers(
                         &type_uri,
                         &type_key,
                         member_name,
                         type_uri == *current_uri,
+                        type_scope,
                         state,
                     ),
                     Receiver::Unit(unit_uri) => self.type_receivers_in_unit(
@@ -2517,8 +2752,20 @@ impl NavigationIndex {
         if name.eq_ignore_ascii_case("Self") {
             return current_document
                 .owner_type_at(offset)
-                .map(|owner_type| vec![Receiver::Type(current_uri.clone(), owner_type)])
+                .map(|owner_type| vec![Receiver::Type(current_uri.clone(), owner_type, ROOT_SCOPE)])
                 .unwrap_or_default();
+        }
+        if name.eq_ignore_ascii_case("Result") {
+            let scope = current_document.scope_at(offset);
+            if let Some(type_name) = current_document.result_type_name_for_body_scope(scope) {
+                return self.type_receivers_for_path(
+                    current_uri,
+                    current_document,
+                    offset,
+                    type_name,
+                    state,
+                );
+            }
         }
 
         let references = self.unqualified_references(current_uri, current_document, offset, name);
@@ -2536,7 +2783,11 @@ impl NavigationIndex {
                 };
                 match symbol.kind {
                     SymbolKind::Type => {
-                        result.push(Receiver::Type(reference.uri.clone(), symbol.key.clone()));
+                        result.push(Receiver::Type(
+                            reference.uri.clone(),
+                            symbol.key.clone(),
+                            symbol.scope,
+                        ));
                     }
                     SymbolKind::Variable
                     | SymbolKind::Parameter
@@ -2578,12 +2829,38 @@ impl NavigationIndex {
         path: &str,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
+        self.type_receivers_for_path_at_scope(
+            current_uri,
+            current_document,
+            offset,
+            path,
+            None,
+            state,
+        )
+    }
+
+    fn type_receivers_for_path_at_scope(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        path: &str,
+        scope_override: Option<usize>,
+        state: &mut ResolutionState,
+    ) -> Vec<Receiver> {
         let parts = path
             .split('.')
             .filter(|part| !part.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        self.type_receivers_for_parts(current_uri, current_document, offset, &parts, state)
+        self.type_receivers_for_parts(
+            current_uri,
+            current_document,
+            offset,
+            &parts,
+            scope_override,
+            state,
+        )
     }
 
     fn type_receivers_for_parts(
@@ -2592,15 +2869,34 @@ impl NavigationIndex {
         current_document: &Document,
         offset: usize,
         parts: &[String],
+        scope_override: Option<usize>,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
-        if parts.is_empty() || !state.take_type_work(parts.len()) {
+        if parts.is_empty() {
+            return Vec::new();
+        }
+        if !state.take_type_work(parts.len()) {
+            state.mark_receiver_uncertain();
             return Vec::new();
         }
 
         if parts.len() == 1 {
-            let candidates =
-                self.unqualified_references(current_uri, current_document, offset, &parts[0]);
+            let candidates = if let Some(scope) = scope_override {
+                let Some(identifier) = identifier_at(current_document.tree.root_node(), offset)
+                else {
+                    return Vec::new();
+                };
+                self.unqualified_references_at_scope(
+                    current_uri,
+                    current_document,
+                    offset,
+                    &parts[0],
+                    identifier,
+                    scope,
+                )
+            } else {
+                self.unqualified_references(current_uri, current_document, offset, &parts[0])
+            };
             if candidates
                 .iter()
                 .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -2611,10 +2907,70 @@ impl NavigationIndex {
                 .into_iter()
                 .filter_map(|candidate| {
                     let symbol = self.symbol(&candidate)?;
-                    (symbol.kind == SymbolKind::Type)
-                        .then(|| Receiver::Type(candidate.uri.clone(), symbol.key.clone()))
+                    (symbol.kind == SymbolKind::Type).then(|| {
+                        Receiver::Type(candidate.uri.clone(), symbol.key.clone(), symbol.scope)
+                    })
                 })
                 .collect();
+        }
+
+        let root_candidates = if let Some(scope) = scope_override {
+            let Some(identifier) = identifier_at(current_document.tree.root_node(), offset) else {
+                return Vec::new();
+            };
+            self.unqualified_references_at_scope(
+                current_uri,
+                current_document,
+                offset,
+                &parts[0],
+                identifier,
+                scope,
+            )
+        } else {
+            self.unqualified_references(current_uri, current_document, offset, &parts[0])
+        };
+        if !root_candidates.is_empty() {
+            if root_candidates
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Vec::new();
+            }
+            if root_candidates.iter().any(|candidate| {
+                self.symbol(candidate)
+                    .is_none_or(|symbol| symbol.kind != SymbolKind::Type)
+            }) {
+                return Vec::new();
+            }
+            let mut receivers = root_candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    let symbol = self.symbol(&candidate)?;
+                    Some(Receiver::Type(
+                        candidate.uri,
+                        symbol.key.clone(),
+                        symbol.scope,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for member_name in &parts[1..] {
+                receivers = receivers
+                    .into_iter()
+                    .flat_map(|receiver| match receiver {
+                        Receiver::Type(type_uri, type_key, type_scope) => self
+                            .member_type_receivers(
+                                &type_uri,
+                                &type_key,
+                                member_name,
+                                type_uri == *current_uri,
+                                type_scope,
+                                state,
+                            ),
+                        Receiver::Unit(_) => Vec::new(),
+                    })
+                    .collect();
+            }
+            return receivers;
         }
 
         let Some((prefix_len, unit_uris)) =
@@ -2638,11 +2994,12 @@ impl NavigationIndex {
             receivers = receivers
                 .into_iter()
                 .flat_map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key) => self.member_type_receivers(
+                    Receiver::Type(type_uri, type_key, type_scope) => self.member_type_receivers(
                         &type_uri,
                         &type_key,
                         member_name,
                         type_uri == *current_uri,
+                        type_scope,
                         state,
                     ),
                     Receiver::Unit(_) => Vec::new(),
@@ -2846,7 +3203,11 @@ impl NavigationIndex {
             .into_iter()
             .filter_map(|candidate| {
                 let symbol = self.symbol(&candidate)?;
-                Some(Receiver::Type(candidate.uri, symbol.key.clone()))
+                Some(Receiver::Type(
+                    candidate.uri,
+                    symbol.key.clone(),
+                    symbol.scope,
+                ))
             })
             .collect()
     }
@@ -2927,15 +3288,26 @@ impl NavigationIndex {
         type_key: &str,
         name: &str,
         allow_implementation: bool,
+        type_scope: usize,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
         let member_key = canonical_name(name);
-        let resolution_key = (type_uri.clone(), type_key.to_owned(), member_key.clone());
+        let resolution_key = (
+            type_uri.clone(),
+            type_key.to_owned(),
+            member_key.clone(),
+            type_scope,
+        );
         if !state.active_members.insert(resolution_key.clone()) {
             return Vec::new();
         }
-        let candidates =
-            self.member_references_for_type(type_uri, type_key, &member_key, allow_implementation);
+        let candidates = self.member_references_for_type(
+            type_uri,
+            type_key,
+            type_scope,
+            &member_key,
+            allow_implementation,
+        );
         if candidates
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -2967,7 +3339,11 @@ impl NavigationIndex {
             if symbol.kind == SymbolKind::Routine && symbol.routine_kind == RoutineKind::Constructor
             {
                 if constructor_is_unique {
-                    result.push(Receiver::Type(type_uri.clone(), type_key.to_owned()));
+                    result.push(Receiver::Type(
+                        type_uri.clone(),
+                        type_key.to_owned(),
+                        type_scope,
+                    ));
                 }
                 continue;
             }
@@ -2993,6 +3369,7 @@ impl NavigationIndex {
         &self,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         member_key: &str,
         allow_implementation: bool,
     ) -> Vec<Candidate> {
@@ -3000,6 +3377,7 @@ impl NavigationIndex {
         self.member_candidates_for_type_with_state(
             type_uri,
             type_key,
+            type_scope,
             Some(member_key),
             allow_implementation,
             &mut state,
@@ -3007,10 +3385,12 @@ impl NavigationIndex {
         .candidates
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn member_references_for_type_with_budget(
         &self,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         member_key: &str,
         allow_implementation: bool,
         cancel: &AtomicBool,
@@ -3021,6 +3401,7 @@ impl NavigationIndex {
             .member_candidates_for_type_with_state_and_budget(
                 type_uri,
                 type_key,
+                type_scope,
                 Some(member_key),
                 allow_implementation,
                 &mut state,
@@ -3034,6 +3415,7 @@ impl NavigationIndex {
         &self,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         allow_implementation: bool,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
@@ -3042,6 +3424,7 @@ impl NavigationIndex {
         self.member_candidates_for_type_with_state_and_budget(
             type_uri,
             type_key,
+            type_scope,
             None,
             allow_implementation,
             &mut state,
@@ -3054,6 +3437,7 @@ impl NavigationIndex {
         &self,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         member_key: Option<&str>,
         allow_implementation: bool,
         state: &mut AncestryResolutionState,
@@ -3061,6 +3445,7 @@ impl NavigationIndex {
         let identity = (
             type_uri.clone(),
             type_key.to_owned(),
+            type_scope,
             member_key.map(str::to_owned),
             allow_implementation,
         );
@@ -3074,8 +3459,13 @@ impl NavigationIndex {
         let result = if !state.take_work() {
             MemberLookup::unknown(Vec::new())
         } else {
-            let direct =
-                self.direct_member_candidates(type_uri, type_key, member_key, allow_implementation);
+            let direct = self.direct_member_candidates(
+                type_uri,
+                type_key,
+                type_scope,
+                member_key,
+                allow_implementation,
+            );
             if member_key.is_some() && !direct.is_empty() {
                 if !self.type_requires_ancestry(type_uri, type_key) {
                     MemberLookup::known(direct)
@@ -3098,6 +3488,7 @@ impl NavigationIndex {
                         let lookup = self.member_candidates_for_type_with_state(
                             &parent_uri,
                             &parent_key,
+                            ROOT_SCOPE,
                             member_key,
                             allow_implementation,
                             state,
@@ -3126,6 +3517,7 @@ impl NavigationIndex {
         &self,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         member_key: Option<&str>,
         allow_implementation: bool,
         state: &mut AncestryResolutionState,
@@ -3135,6 +3527,7 @@ impl NavigationIndex {
         let identity = (
             type_uri.clone(),
             type_key.to_owned(),
+            type_scope,
             member_key.map(str::to_owned),
             allow_implementation,
         );
@@ -3153,6 +3546,7 @@ impl NavigationIndex {
             let direct = self.direct_member_candidates_with_budget(
                 type_uri,
                 type_key,
+                type_scope,
                 member_key,
                 allow_implementation,
                 cancel,
@@ -3183,6 +3577,7 @@ impl NavigationIndex {
                 let lookup = self.member_candidates_for_type_with_state_and_budget(
                     &parent_uri,
                     &parent_key,
+                    ROOT_SCOPE,
                     member_key,
                     allow_implementation,
                     state,
@@ -3212,6 +3607,7 @@ impl NavigationIndex {
         &self,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         member_key: Option<&str>,
         allow_implementation: bool,
     ) -> Vec<Candidate> {
@@ -3231,20 +3627,22 @@ impl NavigationIndex {
             .iter()
             .filter_map(|index| {
                 let symbol = document.symbols.get(*index)?;
-                member_symbol_is_visible(document, symbol, type_key, allow_implementation).then(
-                    || Candidate {
+                (member_symbol_is_visible(document, symbol, type_key, allow_implementation)
+                    && (type_scope == ROOT_SCOPE || symbol.scope == type_scope))
+                    .then(|| Candidate {
                         uri: type_uri.clone(),
                         index: *index,
-                    },
-                )
+                    })
             })
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn direct_member_candidates_with_budget(
         &self,
         type_uri: &Url,
         type_key: &str,
+        type_scope: usize,
         member_key: Option<&str>,
         allow_implementation: bool,
         cancel: &AtomicBool,
@@ -3281,7 +3679,9 @@ impl NavigationIndex {
             let Some(symbol) = document.symbols.get(*index) else {
                 continue;
             };
-            if member_symbol_is_visible(document, symbol, type_key, allow_implementation) {
+            if member_symbol_is_visible(document, symbol, type_key, allow_implementation)
+                && (type_scope == ROOT_SCOPE || symbol.scope == type_scope)
+            {
                 result.push(Candidate {
                     uri: type_uri.clone(),
                     index: *index,
@@ -4283,8 +4683,8 @@ struct AncestryResolutionState {
     remaining_work: usize,
     active_types: HashSet<(Url, String)>,
     resolved_types: HashMap<(Url, String), TypeAncestryResolution>,
-    active_members: HashSet<(Url, String, Option<String>, bool)>,
-    resolved_members: HashMap<(Url, String, Option<String>, bool), MemberLookup>,
+    active_members: HashSet<(Url, String, usize, Option<String>, bool)>,
+    resolved_members: HashMap<(Url, String, usize, Option<String>, bool), MemberLookup>,
 }
 
 impl AncestryResolutionState {
@@ -4309,7 +4709,7 @@ impl AncestryResolutionState {
 
 enum Receiver {
     Unit(Url),
-    Type(Url, String),
+    Type(Url, String, usize),
 }
 
 const MAX_RECEIVER_WORK: usize = 256;
@@ -4320,7 +4720,7 @@ const MAX_ANCESTRY_WORK: usize = 256;
 struct ResolutionState {
     receiver_work: usize,
     type_work: usize,
-    active_members: HashSet<(Url, String, String)>,
+    active_members: HashSet<(Url, String, String, usize)>,
     receiver_uncertain: bool,
 }
 
@@ -4389,6 +4789,7 @@ struct Document {
     type_symbol_indices: HashMap<String, Vec<usize>>,
     direct_symbol_indices: HashMap<Span, Vec<usize>>,
     routine_symbol_indices: HashMap<String, Vec<usize>>,
+    routine_symbol_indices_by_body_scope: HashMap<usize, Vec<usize>>,
     exported_symbol_indices: Vec<usize>,
     routine_declaration_spans: HashMap<String, Span>,
     interface_member_routine_keys: HashMap<String, HashSet<String>>,
@@ -4599,6 +5000,7 @@ impl Document {
         let mut type_symbol_indices = HashMap::new();
         let mut direct_symbol_indices = HashMap::new();
         let mut routine_symbol_indices = HashMap::new();
+        let mut routine_symbol_indices_by_body_scope = HashMap::new();
         let mut routine_declaration_spans = HashMap::new();
         let mut interface_member_routine_keys = HashMap::<String, HashSet<String>>::new();
         for (index, symbol) in symbols.iter().enumerate() {
@@ -4656,6 +5058,12 @@ impl Document {
                             .or_insert(symbol.declaration_span);
                     }
                 }
+                if let Some(body_scope) = symbol.body_scope {
+                    routine_symbol_indices_by_body_scope
+                        .entry(body_scope)
+                        .or_insert_with(Vec::new)
+                        .push(index);
+                }
             }
         }
 
@@ -4689,6 +5097,7 @@ impl Document {
             type_symbol_indices,
             direct_symbol_indices,
             routine_symbol_indices,
+            routine_symbol_indices_by_body_scope,
             exported_symbol_indices,
             routine_declaration_spans,
             interface_member_routine_keys,
@@ -4762,8 +5171,11 @@ impl Document {
     }
 
     fn scope_chain(&self, offset: usize) -> Vec<usize> {
+        self.scope_chain_from(self.scope_at(offset))
+    }
+
+    fn scope_chain_from(&self, mut current: usize) -> Vec<usize> {
         let mut result = Vec::new();
-        let mut current = self.scope_at(offset);
         loop {
             result.push(current);
             let Some(parent) = self.scopes[current].parent else {
@@ -4772,6 +5184,18 @@ impl Document {
             current = parent;
         }
         result
+    }
+
+    fn result_type_name_for_body_scope(&self, scope: usize) -> Option<&str> {
+        self.routine_symbol_indices_by_body_scope
+            .get(&scope)
+            .into_iter()
+            .flatten()
+            .find_map(|index| {
+                self.symbols
+                    .get(*index)
+                    .and_then(|symbol| symbol.result_type_name.as_deref())
+            })
     }
 
     fn owner_type_at(&self, offset: usize) -> Option<String> {
@@ -6516,6 +6940,7 @@ mod tests {
         let lookup = index.member_candidates_for_type_with_state(
             &uri,
             "i36",
+            ROOT_SCOPE,
             Some("hit"),
             false,
             &mut state,

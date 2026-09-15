@@ -1080,12 +1080,13 @@ impl NavigationIndex {
         };
         let receivers = self.resolve_receivers(occurrence_uri, document, offset, lhs);
         for receiver in receivers {
-            let super::Receiver::Type(type_uri, type_key) = receiver else {
+            let super::Receiver::Type(type_uri, type_key, type_scope) = receiver else {
                 continue;
             };
             let direct = self.direct_member_candidates(
                 &type_uri,
                 &type_key,
+                type_scope,
                 Some(&binding.old_key),
                 type_uri == *occurrence_uri,
             );

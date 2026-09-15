@@ -2182,6 +2182,33 @@ fn nested_constructor_call_receivers_stop_at_the_receiver_work_bound() {
 }
 
 #[test]
+fn deep_constructor_receiver_completion_reports_receiver_uncertainty() {
+    let chain_length = 14;
+    let mut expression = String::from("TObj");
+    for _ in 0..chain_length {
+        expression.push_str(".Create()");
+    }
+    expression.push_str(".Me");
+    let source = format!(
+        "unit DeepConstructorCompletion;\ninterface\ntype\n  TObj = class\n    constructor Create;\n    Member: Integer;\n  end;\nimplementation\nconstructor TObj.Create;\nbegin\nend;\nprocedure Caller;\nbegin\n  {expression};\nend;\nend.\n"
+    );
+    let source_uri = uri("DeepConstructorCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("deep constructor completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(&source, &expression, 0))
+        .expect("deep constructor completion");
+    assert!(completion.items.is_empty());
+    assert!(
+        completion.is_incomplete,
+        "receiver work/depth exhaustion must remain incomplete"
+    );
+}
+
+#[test]
 fn function_result_types_keep_the_declaring_unit_context() {
     let provider = r#"unit ResultProvider;
 interface
@@ -2296,6 +2323,143 @@ end.
         &type_definition[0],
         &provider_uri,
         position_of(provider, "TResult", 0),
+    );
+}
+
+#[test]
+fn implementation_only_function_result_excludes_its_own_body_type_scope() {
+    let provider = r#"unit TypeSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit ImplementationOnlyResult;
+interface
+uses TypeSource;
+implementation
+function Make: TResult;
+type
+  TResult = record
+    Name: string;
+  end;
+begin
+  Result.Name := '';
+end;
+procedure Caller;
+begin
+  Make().Name;
+end;
+end.
+"#;
+    let provider_uri = uri("TypeSource");
+    let consumer_uri = uri("ImplementationOnlyResult");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("type source parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("implementation-only result source parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("TypeSource".to_owned(), provider_uri.clone())],
+    );
+
+    let member_position = position_of(consumer, "Name", 2);
+    let member = index.navigate(
+        &consumer_uri,
+        member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(&member[0], &provider_uri, position_of(provider, "Name", 0));
+
+    let hover = index
+        .hover(&consumer_uri, member_position)
+        .expect("provider result member hover");
+    assert!(hover_text(&hover).contains("Name: Integer"));
+    assert!(!hover_text(&hover).contains("Name: string"));
+
+    let type_definition = index.type_definitions(&consumer_uri, position_of(consumer, "Make", 1));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &provider_uri,
+        position_of(provider, "TResult", 0),
+    );
+}
+
+#[test]
+fn nested_function_result_excludes_its_own_body_but_keeps_outer_type_scope() {
+    let provider = r#"unit NestedTypeSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit NestedImplementationOnlyResult;
+interface
+uses NestedTypeSource;
+implementation
+procedure Outer;
+type
+  TResult = record
+    Name: string;
+  end;
+  function Make: TResult;
+  type
+    TResult = record
+      Name: Boolean;
+    end;
+  begin
+    Result.Name := False;
+  end;
+begin
+  Make().Name;
+end;
+end.
+"#;
+    let provider_uri = uri("NestedTypeSource");
+    let consumer_uri = uri("NestedImplementationOnlyResult");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("nested type source parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("nested implementation-only result source parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("NestedTypeSource".to_owned(), provider_uri.clone())],
+    );
+
+    let member_position = position_of(consumer, "Name", 3);
+    let member = index.navigate(
+        &consumer_uri,
+        member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(&member[0], &consumer_uri, position_of(consumer, "Name", 0));
+
+    let hover = index
+        .hover(&consumer_uri, member_position)
+        .expect("outer result member hover");
+    assert!(hover_text(&hover).contains("Name: string"));
+    assert!(!hover_text(&hover).contains("Name: Boolean"));
+    assert!(!hover_text(&hover).contains("Name: Integer"));
+
+    let type_definition = index.type_definitions(&consumer_uri, position_of(consumer, "Make", 1));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &consumer_uri,
+        position_of(consumer, "TResult", 0),
     );
 }
 
@@ -2564,6 +2728,61 @@ end.
             position_after(source, "(Obj as OtherObj).Me", 0),
         )
         .expect("invalid cast completion");
+    assert!(completion.items.is_empty());
+}
+
+#[test]
+fn qualified_cast_type_root_respects_a_shadowing_local_value() {
+    let provider = r#"unit CastTypes;
+interface
+type
+  TResult = class
+    Member: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit QualifiedCastRootShadow;
+interface
+uses CastTypes;
+type
+  TWidget = class
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  CastTypes: Integer;
+begin
+  (Obj as CastTypes.TResult).Member;
+end;
+end.
+"#;
+    let provider_uri = uri("CastTypes");
+    let consumer_uri = uri("QualifiedCastRootShadow");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("cast type provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("qualified cast shadow source parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("CastTypes".to_owned(), provider_uri.clone())],
+    );
+
+    let member = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Member", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(member.is_empty(), "a value shadow must block the unit root");
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "(Obj as CastTypes.TResult).Me", 0),
+        )
+        .expect("qualified cast shadow completion");
     assert!(completion.items.is_empty());
 }
 

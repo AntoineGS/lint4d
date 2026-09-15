@@ -1,6 +1,6 @@
 use super::{
-    AssistanceBudget, Candidate, Document, NavigationIndex, Origin, Region, Span, Symbol,
-    SymbolKind, canonical_name, location_for_span, symbol_visible_in_region,
+    AssistanceBudget, Candidate, Document, NavigationIndex, Origin, Region, RoutineKind, Span,
+    Symbol, SymbolKind, canonical_name, location_for_span, symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
@@ -59,6 +59,7 @@ struct CompletionAccumulator<'a> {
 enum CompletionMember<'a> {
     Unqualified,
     Node(Node<'a>),
+    Expression(Node<'a>),
     Bare { path: &'a str, end: usize },
     Unsupported,
 }
@@ -493,6 +494,15 @@ impl NavigationIndex {
                     accumulator.budget,
                 )?)
             }
+            CompletionMember::Expression(receiver) => Some(self.resolve_receivers_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                receiver,
+                receiver,
+                cancel,
+                accumulator.budget,
+            )?),
             CompletionMember::Bare { path, end } => {
                 let lookup_identifier = lookup_identifier.or(identifier_at_with_budget(
                     current_document.tree.root_node(),
@@ -1162,6 +1172,39 @@ impl NavigationIndex {
                         budget,
                     )?);
                 }
+                SymbolKind::Routine => {
+                    let type_name = if symbol.routine_kind == RoutineKind::Constructor {
+                        symbol.owner_type_name.as_deref()
+                    } else {
+                        symbol.result_type_name.as_deref()
+                    };
+                    let Some(type_name) = type_name else {
+                        continue;
+                    };
+                    let Some(declaration_document) = self.documents.get(&reference.uri) else {
+                        continue;
+                    };
+                    let Some(lookup_identifier) = identifier_at_with_budget(
+                        declaration_document.tree.root_node(),
+                        symbol.span.start,
+                        cancel,
+                        budget,
+                        "type definition",
+                    )?
+                    else {
+                        continue;
+                    };
+                    targets.extend(self.type_declaration_candidates_with_budget(
+                        &reference.uri,
+                        declaration_document,
+                        symbol.span.start,
+                        type_name,
+                        lookup_identifier,
+                        &mut state,
+                        cancel,
+                        budget,
+                    )?);
+                }
                 _ => {}
             }
         }
@@ -1576,7 +1619,7 @@ fn member_expression_for_completion<'a>(
     // The parser may omit the RHS identifier while the user is typing `Obj.`.
     // In that case locate an expression whose dot is immediately before the
     // completion prefix (allowing source whitespace between the two).
-    let mut result = None;
+    let mut result: Option<CompletionMember<'a>> = None;
     let mut cursor = document.tree.root_node().walk();
     loop {
         check_cancel(cancel)?;
@@ -1594,9 +1637,33 @@ fn member_expression_for_completion<'a>(
                             .child_by_field_name("rhs")
                             .map_or(operator.end_byte(), |rhs| rhs.end_byte());
                         if prefix_start >= operator.end_byte() && offset >= end {
-                            result = Some(node);
+                            result = Some(CompletionMember::Node(node));
                         }
                     }
+                }
+            }
+        }
+        if result.is_none()
+            && node.kind() == "ERROR"
+            && node.end_byte() == prefix_start
+            && document
+                .source
+                .get(node.start_byte()..node.end_byte())
+                .is_some_and(|text| text == ".")
+        {
+            if let Some(parent) = node.parent() {
+                budget.require_work(parent.named_child_count(), cancel)?;
+                let mut receiver = None;
+                for index in 0..parent.named_child_count() {
+                    let Some(candidate) = parent.named_child(index) else {
+                        continue;
+                    };
+                    if candidate.end_byte() <= node.start_byte() {
+                        receiver = Some(candidate);
+                    }
+                }
+                if let Some(receiver) = receiver {
+                    result = Some(CompletionMember::Expression(receiver));
                 }
             }
         }
@@ -1610,11 +1677,7 @@ fn member_expression_for_completion<'a>(
             break;
         }
     }
-    if let Some(node) = result {
-        Ok(CompletionMember::Node(node))
-    } else {
-        Ok(CompletionMember::Unsupported)
-    }
+    Ok(result.unwrap_or(CompletionMember::Unsupported))
 }
 
 fn trailing_member_dot_with_budget(
@@ -2346,7 +2409,7 @@ fn node_at_offset<'a>(
     }
 }
 
-fn identifier_at_with_budget<'a>(
+pub(super) fn identifier_at_with_budget<'a>(
     root: Node<'a>,
     offset: usize,
     cancel: &AtomicBool,
@@ -2708,6 +2771,7 @@ mod tests {
             owner_type: None,
             owner_type_name: None,
             type_name: None,
+            result_type_name: None,
             region: Region::Interface,
             origin: Origin::Declaration,
             local_only: false,

@@ -2243,6 +2243,48 @@ fn type_definition_request_returns_the_source_type_declaration() {
 }
 
 #[test]
+fn type_definition_request_resolves_a_function_result_with_utf16_positions() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("ResultProvider.pas");
+    let consumer = temp.path().join("ResultConsumer.pas");
+    let provider_source = "unit ResultProvider;\ninterface\ntype\n  TResult = class\n    Member: Integer;\n  end;\nfunction MakeValue: TResult;\nimplementation\nfunction MakeValue: TResult;\nbegin\n  Result := TResult.Create;\nend;\nend.\n";
+    let consumer_source = "unit ResultConsumer;\ninterface\nuses ResultProvider;\nimplementation\nprocedure Run;\nbegin\n  {é} ResultProvider.MakeValue().Member := 1;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("function-result-type-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&consumer, consumer_source, "MakeValue", 0),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "function result type definition failed: {response:?}"
+    );
+    let result = response
+        .result
+        .expect("function result type definition result");
+    let locations = result
+        .as_array()
+        .expect("function result type definition locations");
+    assert_eq!(
+        locations,
+        &vec![json!({
+            "uri": uri(&provider),
+            "range": {
+                "start": {"line": 3, "character": 2},
+                "end": {"line": 3, "character": 9}
+            }
+        })]
+    );
+    server.shutdown();
+}
+
+#[test]
 fn type_definition_returns_empty_for_primitives_unknowns_and_malformed_positions() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("UnsupportedTypeDefinition.pas");

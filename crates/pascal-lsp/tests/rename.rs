@@ -996,6 +996,53 @@ end.
 }
 
 #[test]
+fn function_result_member_uses_are_renamed_without_guessing_a_type() {
+    let source = "unit FunctionResultMemberRename;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Member := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "FunctionResultMemberRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Member", 1),
+            "RenamedMember",
+        )
+        .expect("function result member rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Member", 1),
+                "RenamedMember".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Member", 2),
+                "RenamedMember".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
 fn unrelated_class_homonyms_are_not_renamed() {
     let source = "unit ClassHomonyms;
 interface

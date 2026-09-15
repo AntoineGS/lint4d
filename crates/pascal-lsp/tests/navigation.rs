@@ -1840,6 +1840,514 @@ end.
 }
 
 #[test]
+fn completion_bare_dot_resolves_a_source_typed_function_call_receiver() {
+    let marked = r#"unit SourceTypedExpressionReceiver;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().|;
+end;
+end.
+"#;
+    let cursor_offset = marked.find('|').expect("function receiver cursor");
+    let source = marked.replacen('|', "", 1);
+    let source_uri = uri("SourceTypedExpressionReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source-typed expression receiver parses");
+
+    let completion = index
+        .completion(
+            &source_uri,
+            text::offset_to_position(&source, cursor_offset).expect("function receiver position"),
+        )
+        .expect("source-typed expression receiver completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+}
+
+#[test]
+fn navigation_resolves_a_source_typed_function_call_receiver() {
+    let source = r#"unit SourceTypedNavigationReceiver;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Member;
+end;
+end.
+"#;
+    let source_uri = uri("SourceTypedNavigationReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source-typed navigation receiver parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Member", 0));
+}
+
+#[test]
+fn navigation_resolves_constructor_and_cast_expression_receivers() {
+    let source = r#"unit ConstructorAndCastReceivers;
+interface
+type
+  TWidget = class
+    constructor Create;
+    Member: Integer;
+  end;
+procedure Caller;
+implementation
+constructor TWidget.Create;
+begin
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  TWidget.Create.Member;
+  TWidget(Obj).Member;
+  (Obj as TWidget).Member;
+end;
+end.
+"#;
+    let source_uri = uri("ConstructorAndCastReceivers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("constructor and cast source parses");
+
+    for occurrence in 1..=3 {
+        let locations = index.navigate(
+            &source_uri,
+            position_of(source, "Member", occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "Member occurrence {occurrence}");
+        assert_location_start(&locations[0], &source_uri, position_of(source, "Member", 0));
+    }
+
+    let constructor_type = index.type_definitions(&source_uri, position_of(source, "Create", 2));
+    assert_eq!(constructor_type.len(), 1);
+    assert_location_start(
+        &constructor_type[0],
+        &source_uri,
+        position_of(source, "TWidget", 0),
+    );
+}
+
+#[test]
+fn navigation_resolves_nested_function_result_member_chains() {
+    let source = r#"unit NestedFunctionResultChain;
+interface
+type
+  TLeaf = class
+    Name: Integer;
+  end;
+  TFactory = class
+    Child: TLeaf;
+  end;
+function Factory: TFactory;
+implementation
+function Factory: TFactory;
+begin
+  Result := TFactory.Create;
+end;
+procedure Caller;
+begin
+  Factory().Child.Name;
+end;
+end.
+"#;
+    let source_uri = uri("NestedFunctionResultChain");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested function result source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Name", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Name", 0));
+}
+
+#[test]
+fn function_result_types_keep_the_declaring_unit_context() {
+    let provider = r#"unit ResultProvider;
+interface
+type
+  TResult = class
+    ProviderMember: Integer;
+  end;
+function MakeResult: TResult;
+implementation
+function MakeResult: TResult;
+begin
+  Result := TResult.Create;
+end;
+end.
+"#;
+    let consumer = r#"unit ResultConsumer;
+interface
+uses ResultProvider;
+type
+  TResult = class
+    ConsumerMember: Integer;
+  end;
+implementation
+procedure Caller;
+begin
+  ResultProvider.MakeResult().ProviderMember;
+end;
+end.
+"#;
+    let provider_uri = uri("ResultProvider");
+    let consumer_uri = uri("ResultConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("result provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("result consumer parses");
+
+    let locations = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "ProviderMember", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &provider_uri,
+        position_of(provider, "ProviderMember", 0),
+    );
+}
+
+#[test]
+fn inherited_methods_preserve_their_result_type_context() {
+    let source = r#"unit InheritedResultContext;
+interface
+type
+  TResult = class
+    Member: Integer;
+  end;
+  TBase = class
+    function Build: TResult;
+  end;
+  TChild = class(TBase)
+  end;
+implementation
+function TBase.Build: TResult;
+begin
+  Result := TResult.Create;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Build().Member;
+end;
+end.
+"#;
+    let source_uri = uri("InheritedResultContext");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited result source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Member", 0));
+}
+
+#[test]
+fn ambiguous_function_results_do_not_guess_an_overload_receiver() {
+    let source = r#"unit AmbiguousFunctionResult;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function Make(Value: Integer): TObj; overload;
+function Make(Value: string): TObj; overload;
+implementation
+function Make(Value: Integer): TObj;
+begin
+  Result := TObj.Create;
+end;
+function Make(Value: string): TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  Make(1).Member;
+end;
+end.
+"#;
+    let source_uri = uri("AmbiguousFunctionResult");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ambiguous function result source parses");
+
+    assert!(
+        index
+            .navigate(
+                &source_uri,
+                position_of(source, "Member", 1),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "ambiguous overloads must not select a receiver type"
+    );
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Make(1).Me", 0))
+        .expect("ambiguous function result completion");
+    assert!(
+        completion.items.is_empty(),
+        "ambiguous overloads must not expose receiver members"
+    );
+}
+
+#[test]
+fn type_definition_resolves_a_function_result_type() {
+    let source = r#"unit FunctionResultTypeDefinition;
+interface
+type
+  TObj = class
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Create;
+end;
+end.
+"#;
+    let source_uri = uri("FunctionResultTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("function result type definition source parses");
+
+    let locations = index.type_definitions(&source_uri, position_of(source, "MakeValue", 2));
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "TObj", 0));
+}
+
+#[test]
+fn completion_resolves_cast_and_nested_result_receivers() {
+    let source = r#"unit CompletionExpressionReceivers;
+interface
+type
+  TLeaf = class
+    Name: Integer;
+  end;
+  TFactory = class
+    Child: TLeaf;
+  end;
+  TWidget = class
+    Member: Integer;
+    constructor Create;
+  end;
+function Factory: TFactory;
+implementation
+function Factory: TFactory;
+begin
+  Result := TFactory.Create;
+end;
+constructor TWidget.Create;
+begin
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  TWidget.Create.Me;
+  TWidget(Obj).Me;
+  (Obj as TWidget).Me;
+  Factory().Child.Na;
+end;
+end.
+"#;
+    let source_uri = uri("CompletionExpressionReceivers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("completion expression receiver source parses");
+
+    let cast_completion = index
+        .completion(&source_uri, position_after(source, "TWidget(Obj).Me", 0))
+        .expect("cast completion");
+    assert_eq!(
+        cast_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let constructor_completion = index
+        .completion(&source_uri, position_after(source, "TWidget.Create.Me", 0))
+        .expect("constructor completion");
+    assert_eq!(
+        constructor_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let as_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "(Obj as TWidget).Me", 0),
+        )
+        .expect("as completion");
+    assert_eq!(
+        as_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let chain_completion = index
+        .completion(&source_uri, position_after(source, "Factory().Child.Na", 0))
+        .expect("nested result completion");
+    assert_eq!(
+        chain_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Name"]
+    );
+}
+
+#[test]
+fn signature_help_resolves_a_function_result_method_receiver() {
+    let source = r#"unit SignatureFunctionResultReceiver;
+interface
+type
+  TObj = class
+    procedure Run(Value: Integer);
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure TObj.Run(Value: Integer);
+begin
+end;
+procedure Caller;
+begin
+  MakeValue().Run(1);
+end;
+end.
+"#;
+    let source_uri = uri("SignatureFunctionResultReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("signature function result source parses");
+
+    let result = index
+        .signature_help(&source_uri, position_after(source, "MakeValue().Run(1", 0))
+        .expect("function result signature projection");
+    let help = result.expect("function result method call must resolve");
+    assert_eq!(
+        help.signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(Value: Integer);"]
+    );
+}
+
+#[test]
+fn hover_resolves_a_function_result_member_receiver() {
+    let source = r#"unit HoverFunctionResultReceiver;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Member := 1;
+end;
+end.
+"#;
+    let source_uri = uri("HoverFunctionResultReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("hover function result source parses");
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Member", 1))
+        .expect("function result member hover");
+    assert!(hover_text(&hover).contains("Member: Integer"));
+}
+
+#[test]
 fn signature_help_rejects_lookup_inside_a_with_receiver_context() {
     let source = r#"unit WithSignature;
 interface

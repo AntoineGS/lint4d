@@ -92,8 +92,10 @@ argument, or constructor receiver to jump to the class declaration. These use
 the standard LSP definition/declaration requests, not a new editor-specific
 command. The server also advertises `textDocument/typeDefinition`: on a
 variable, parameter, field, or property it opens the source declaration of the
-named type, and on a type identifier it opens that type declaration. Unsaved
-buffers and the selected project context are used for the bounded lookup.
+named type, on a type identifier it opens that type declaration, and on a
+source-backed function or constructor it opens the declared result/constructed
+type. Unsaved buffers and the selected project context are used for the bounded
+lookup.
 
 Type-definition lookup is source-based rather than compiler-based. Type aliases
 retain their own declaration as the target, alias cycles are bounded, and
@@ -109,7 +111,12 @@ identifier `TextEdit`s; it does not insert snippets, imports, or additional
 edits. Imported private/protected members and unrelated workspace names are not
 offered. Conditional uncertainty, ambiguous receivers, and bounded candidate
 truncation are reported conservatively with `CompletionList.isIncomplete` rather
-than as a falsely complete result.
+than as a falsely complete result. Expression receivers are resolved source-first
+as well: calls such as `MakeValue().Member`, constructors such as
+`TWidget.Create.Member`, casts such as `TWidget(Value).Member` and
+`(Value as TWidget).Member`, and nested result chains are supported when their
+named types are unambiguous. The receiver's declaring unit is retained when a
+result type has the same spelling as a type in the consuming unit.
 
 Class and interface member lookup follows the source ancestry retained for each
 indexed type, including inherited fields and routines and parents in imported
@@ -125,7 +132,9 @@ skipping nested calls, indexers, Pascal strings, and comments; grouped formal
 parameter names are expanded individually. The server does not infer argument
 types, select an active overload, resolve `with`/`inherited` receivers, or infer
 anonymous/generic callables, and returns no signature for opaque or unknown
-calls.
+calls. It does resolve callable members reached through the same source-backed
+function-result, constructor, cast, and nested expression receivers used by
+completion and navigation.
 
 ## Source Paths and Configuration
 

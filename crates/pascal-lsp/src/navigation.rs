@@ -1313,6 +1313,42 @@ impl NavigationIndex {
                     )
                 })
                 .unwrap_or_else(|| Ok(Vec::new())),
+            "exprCall" => self.resolve_call_receivers_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                node,
+                lookup_identifier,
+                state,
+                cancel,
+                budget,
+            ),
+            "exprBinary" | "exprAs" => {
+                let Some(operator) = node.child_by_field_name("operator") else {
+                    return Ok(Vec::new());
+                };
+                if node_text_with_budget(operator, &current_document.source, cancel, budget)?
+                    .eq_ignore_ascii_case("as")
+                {
+                    node.child_by_field_name("rhs")
+                        .map(|rhs| {
+                            self.resolve_receivers_with_state_and_budget(
+                                current_uri,
+                                current_document,
+                                offset,
+                                rhs,
+                                lookup_identifier,
+                                state,
+                                cancel,
+                                budget,
+                                depth.saturating_add(1),
+                            )
+                        })
+                        .unwrap_or_else(|| Ok(Vec::new()))
+                } else {
+                    Ok(Vec::new())
+                }
+            }
             "exprDot" | "genericDot" | "typerefDot" => {
                 if let Some(parts) = qualified_name_parts_with_budget(
                     node,
@@ -1389,6 +1425,152 @@ impl NavigationIndex {
             }
             _ => Ok(Vec::new()),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_call_receivers_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        call: Node<'_>,
+        _lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        let Some(entity) = call.child_by_field_name("entity") else {
+            return Ok(Vec::new());
+        };
+        let callable_identifier = callable_lookup_identifier(entity);
+        let candidates = self.resolve_candidates_at_with_budget(
+            current_uri,
+            current_document,
+            entity.start_byte(),
+            callable_identifier,
+            cancel,
+            budget,
+        )?;
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Ok(Vec::new());
+        }
+
+        let mut type_candidates = Vec::new();
+        let mut routine_candidates = Vec::new();
+        for candidate in candidates {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            match symbol.kind {
+                SymbolKind::Type => type_candidates.push(candidate),
+                SymbolKind::Routine if !symbol.unresolved_abbreviated => {
+                    routine_candidates.push(candidate)
+                }
+                _ => {}
+            }
+        }
+
+        if !type_candidates.is_empty() {
+            if !routine_candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Ok(type_candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    let symbol = self.symbol(&candidate)?;
+                    Some(Receiver::Type(candidate.uri, symbol.key.clone()))
+                })
+                .collect());
+        }
+        if routine_candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut routine_groups = HashSet::new();
+        for candidate in &routine_candidates {
+            let Some(symbol) = self.symbol(candidate) else {
+                continue;
+            };
+            let Some(routine_key) = symbol.routine_key.as_ref() else {
+                return Ok(Vec::new());
+            };
+            routine_groups.insert((candidate.uri.clone(), routine_key.clone()));
+        }
+        if routine_groups.len() != 1 {
+            return Ok(Vec::new());
+        }
+
+        let mut result_type_source = None;
+        let mut constructor = false;
+        for candidate in routine_candidates {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            constructor |= symbol.routine_kind == RoutineKind::Constructor;
+            if let Some(result_type_name) = symbol.result_type_name.as_deref() {
+                if result_type_source
+                    .as_ref()
+                    .is_some_and(|(_, _, current)| current != result_type_name)
+                {
+                    return Ok(Vec::new());
+                }
+                result_type_source = Some((
+                    candidate.uri.clone(),
+                    symbol.span.start,
+                    result_type_name.to_owned(),
+                ));
+            }
+        }
+
+        let Some((result_uri, result_offset, result_type_name)) = result_type_source else {
+            if !constructor {
+                return Ok(Vec::new());
+            }
+            let Some(lhs) = entity.child_by_field_name("lhs") else {
+                return Ok(Vec::new());
+            };
+            return self.resolve_receivers_with_state_and_budget(
+                current_uri,
+                current_document,
+                offset,
+                lhs,
+                callable_identifier,
+                state,
+                cancel,
+                budget,
+                1,
+            );
+        };
+        let Some(result_document) = self.documents.get(&result_uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(result_identifier) = assistance::identifier_at_with_budget(
+            result_document.tree.root_node(),
+            result_offset,
+            cancel,
+            budget,
+            "receiver result type",
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        self.type_receivers_for_path_with_budget(
+            &result_uri,
+            result_document,
+            result_offset,
+            &result_type_name,
+            result_identifier,
+            state,
+            cancel,
+            budget,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1861,12 +2043,35 @@ impl NavigationIndex {
             state.active_members.remove(&resolution_key);
             return Ok(Vec::new());
         }
+        let constructor_keys = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let symbol = self.symbol(candidate)?;
+                (symbol.kind == SymbolKind::Routine
+                    && symbol.routine_kind == RoutineKind::Constructor)
+                    .then(|| {
+                        symbol
+                            .routine_key
+                            .clone()
+                            .map(|key| (candidate.uri.clone(), key))
+                    })
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
+        let constructor_is_unique = constructor_keys.len() == 1;
         let mut result = Vec::new();
         for candidate in candidates {
             budget.require_work(1, cancel)?;
             let Some(symbol) = self.symbol(&candidate) else {
                 continue;
             };
+            if symbol.kind == SymbolKind::Routine && symbol.routine_kind == RoutineKind::Constructor
+            {
+                if constructor_is_unique {
+                    result.push(Receiver::Type(type_uri.clone(), type_key.to_owned()));
+                }
+                continue;
+            }
             let Some(type_name) = symbol.type_name.as_deref() else {
                 continue;
             };
@@ -1918,6 +2123,29 @@ impl NavigationIndex {
                     )
                 })
                 .unwrap_or_default(),
+            "exprCall" => {
+                self.resolve_call_receivers(current_uri, current_document, offset, node, state)
+            }
+            "exprBinary" | "exprAs" => {
+                let Some(operator) = node.child_by_field_name("operator") else {
+                    return Vec::new();
+                };
+                if node_text(operator, &current_document.source).eq_ignore_ascii_case("as") {
+                    node.child_by_field_name("rhs")
+                        .map(|rhs| {
+                            self.resolve_receivers_with_state(
+                                current_uri,
+                                current_document,
+                                offset,
+                                rhs,
+                                state,
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
             "exprDot" | "genericDot" | "typerefDot" => {
                 if let Some(parts) = qualified_name_parts(&node, &current_document.source) {
                     return self.resolve_qualified_receiver_path(
@@ -1970,6 +2198,125 @@ impl NavigationIndex {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn resolve_call_receivers(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        call: Node<'_>,
+        state: &mut ResolutionState,
+    ) -> Vec<Receiver> {
+        let Some(entity) = call.child_by_field_name("entity") else {
+            return Vec::new();
+        };
+        let callable_identifier = callable_lookup_identifier(entity);
+        let candidates = self.resolve_candidates_at(
+            current_uri,
+            current_document,
+            entity.start_byte(),
+            callable_identifier,
+        );
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Vec::new();
+        }
+
+        let mut type_candidates = Vec::new();
+        let mut routine_candidates = Vec::new();
+        for candidate in candidates {
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            match symbol.kind {
+                SymbolKind::Type => type_candidates.push(candidate),
+                SymbolKind::Routine if !symbol.unresolved_abbreviated => {
+                    routine_candidates.push(candidate)
+                }
+                _ => {}
+            }
+        }
+
+        if !type_candidates.is_empty() {
+            if !routine_candidates.is_empty() {
+                return Vec::new();
+            }
+            return type_candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    let symbol = self.symbol(&candidate)?;
+                    Some(Receiver::Type(candidate.uri, symbol.key.clone()))
+                })
+                .collect();
+        }
+        if routine_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut routine_groups = HashSet::new();
+        for candidate in &routine_candidates {
+            let Some(symbol) = self.symbol(candidate) else {
+                continue;
+            };
+            let Some(routine_key) = symbol.routine_key.as_ref() else {
+                return Vec::new();
+            };
+            routine_groups.insert((candidate.uri.clone(), routine_key.clone()));
+        }
+        if routine_groups.len() != 1 {
+            return Vec::new();
+        }
+
+        let mut result_type_source = None;
+        let mut constructor = false;
+        for candidate in routine_candidates {
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            constructor |= symbol.routine_kind == RoutineKind::Constructor;
+            if let Some(result_type_name) = symbol.result_type_name.as_deref() {
+                if result_type_source
+                    .as_ref()
+                    .is_some_and(|(_, _, current)| current != result_type_name)
+                {
+                    return Vec::new();
+                }
+                result_type_source = Some((
+                    candidate.uri.clone(),
+                    symbol.span.start,
+                    result_type_name.to_owned(),
+                ));
+            }
+        }
+
+        let Some((result_uri, result_offset, result_type_name)) = result_type_source else {
+            if !constructor {
+                return Vec::new();
+            }
+            let Some(lhs) = entity.child_by_field_name("lhs") else {
+                return Vec::new();
+            };
+            return self.resolve_receivers_with_state(
+                current_uri,
+                current_document,
+                offset,
+                lhs,
+                state,
+            );
+        };
+        let Some(result_document) = self.documents.get(&result_uri) else {
+            return Vec::new();
+        };
+        self.type_receivers_for_path(
+            &result_uri,
+            result_document,
+            result_offset,
+            &result_type_name,
+            state,
+        )
     }
 
     fn resolve_qualified_receiver_path(
@@ -2518,23 +2865,48 @@ impl NavigationIndex {
             state.active_members.remove(&resolution_key);
             return Vec::new();
         }
-        let result = candidates
-            .into_iter()
+        let constructor_keys = candidates
+            .iter()
             .filter_map(|candidate| {
-                let symbol = self.symbol(&candidate)?;
-                let type_name = symbol.type_name.as_deref()?;
-                let document = self.documents.get(&candidate.uri)?;
-                self.type_receivers_for_path(
-                    &candidate.uri,
-                    document,
-                    symbol.span.start,
-                    type_name,
-                    state,
-                )
-                .into_iter()
-                .next()
+                let symbol = self.symbol(candidate)?;
+                (symbol.kind == SymbolKind::Routine
+                    && symbol.routine_kind == RoutineKind::Constructor)
+                    .then(|| {
+                        symbol
+                            .routine_key
+                            .clone()
+                            .map(|key| (candidate.uri.clone(), key))
+                    })
+                    .flatten()
             })
-            .collect();
+            .collect::<HashSet<_>>();
+        let constructor_is_unique = constructor_keys.len() == 1;
+        let mut result = Vec::new();
+        for candidate in candidates {
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            if symbol.kind == SymbolKind::Routine && symbol.routine_kind == RoutineKind::Constructor
+            {
+                if constructor_is_unique {
+                    result.push(Receiver::Type(type_uri.clone(), type_key.to_owned()));
+                }
+                continue;
+            }
+            let Some(type_name) = symbol.type_name.as_deref() else {
+                continue;
+            };
+            let Some(document) = self.documents.get(&candidate.uri) else {
+                continue;
+            };
+            result.extend(self.type_receivers_for_path(
+                &candidate.uri,
+                document,
+                symbol.span.start,
+                type_name,
+                state,
+            ));
+        }
         state.active_members.remove(&resolution_key);
         result
     }
@@ -3742,6 +4114,7 @@ struct Symbol {
     owner_type: Option<String>,
     owner_type_name: Option<String>,
     type_name: Option<String>,
+    result_type_name: Option<String>,
     region: Region,
     origin: Origin,
     local_only: bool,
@@ -4057,6 +4430,7 @@ impl Document {
                 owner_type: None,
                 owner_type_name: None,
                 type_name: None,
+                result_type_name: None,
                 region: Region::Other,
                 origin: Origin::Declaration,
                 local_only: false,
@@ -4612,6 +4986,8 @@ fn pair_abbreviated_definitions(
         };
         let body_scope = symbols[definition_index].body_scope;
         symbols[definition_index].routine_key = Some(routine_key.clone());
+        symbols[definition_index].result_type_name =
+            symbols[declaration_index].result_type_name.clone();
         let declaration_node = declaration_nodes_by_key
             .get(&routine_key)
             .and_then(|nodes| nodes.first().copied());
@@ -4658,6 +5034,7 @@ fn inject_abbreviated_parameters(
                 owner_type: None,
                 owner_type_name: None,
                 type_name: type_name.clone(),
+                result_type_name: None,
                 region: Region::Implementation,
                 origin: Origin::Declaration,
                 local_only: false,
@@ -4707,6 +5084,7 @@ fn add_definition_symbol(
         owner_type: owner_type.clone(),
         owner_type_name,
         type_name: None,
+        result_type_name: routine_result_type(header, source),
         region: region_for_node(node),
         origin: Origin::Definition,
         local_only: false,
@@ -4751,6 +5129,7 @@ fn add_routine_symbol(
         owner_type: owner_type.clone(),
         owner_type_name,
         type_name: None,
+        result_type_name: routine_result_type(node, source),
         region: region_for_node(node),
         origin: Origin::Declaration,
         local_only: false,
@@ -4816,6 +5195,7 @@ fn add_named_symbol(
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),
             type_name: type_name.clone(),
+            result_type_name: None,
             region: region_for_node(node),
             origin: Origin::Declaration,
             local_only,
@@ -5024,6 +5404,11 @@ fn routine_kind(node: Node<'_>) -> RoutineKind {
         }
     }
     RoutineKind::Procedure
+}
+
+fn routine_result_type(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("type")
+        .and_then(|type_node| simple_type_path(type_node, source))
 }
 
 fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<String>)> {
@@ -5392,6 +5777,22 @@ fn qualified_name_parts(node: &Node<'_>, source: &str) -> Option<Vec<String>> {
         }
     }
     Some(parts)
+}
+
+fn callable_lookup_identifier(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => return current,
+            "exprDot" | "genericDot" | "typerefDot" => {
+                let Some(rhs) = current.child_by_field_name("rhs") else {
+                    return node;
+                };
+                current = rhs;
+            }
+            _ => return node,
+        }
+    }
 }
 
 fn qualified_name_parts_with_budget(

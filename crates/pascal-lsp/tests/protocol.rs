@@ -1659,6 +1659,134 @@ fn deep_method_receiver_completion_stays_stack_safe_and_keeps_server_responsive(
 }
 
 #[test]
+fn deeply_nested_generic_receiver_completion_stays_bounded_and_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepGenericReceivers.pas");
+    let depth = 512;
+    let mut nested_type = String::from("TWidget");
+    for _ in 0..depth {
+        nested_type = format!("TBox<{nested_type}>");
+    }
+    let mut expression = String::from("Box");
+    for _ in 0..depth {
+        expression.push_str(".Value");
+    }
+    expression.push_str(".Me");
+    let source = format!(
+        "unit DeepGenericReceivers;\ninterface\ntype\n  TBox<T> = class\n    Value: T;\n  end;\n  TWidget = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: {nested_type};\nbegin\n  {expression};\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let outline_id = RequestId::from("deep-generic-outline".to_string());
+    server.send_request(
+        outline_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let outline = server.response(&outline_id);
+    assert!(
+        outline.error.is_none(),
+        "deep generic document symbols failed: {outline:?}"
+    );
+
+    let id = RequestId::from("deep-generic-completion".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(&source, &expression, 0),
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "deep generic completion failed: {response:?}"
+    );
+    let result = response.result.expect("deep generic completion result");
+    assert_eq!(result["items"], json!([]));
+
+    let cancelled_id = RequestId::from("deep-generic-completion-cancelled".to_string());
+    server.send_request(
+        cancelled_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(&source, &expression, 0),
+        }),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "deep-generic-completion-cancelled"}),
+    );
+    let cancelled = server.response(&cancelled_id);
+    let error = cancelled
+        .error
+        .expect("cancelled deep generic completion must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+
+    let responsive_id = RequestId::from("deep-generic-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep generic completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn cyclic_generic_member_types_fail_closed_and_keep_the_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("CyclicGeneric.pas");
+    let source = "unit CyclicGeneric;\ninterface\ntype\n  TNode<T> = class\n    Next: TNode<T>;\n  end;\nimplementation\nprocedure Run;\nvar\n  Node: TNode<Integer>;\nbegin\n  Node.Next.Mis;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let completion_id = RequestId::from("cyclic-generic-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Node.Next.Mis", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "cyclic generic completion failed: {completion:?}"
+    );
+    assert_eq!(
+        completion.result.expect("cyclic generic completion result")["items"],
+        json!([])
+    );
+
+    let responsive_id = RequestId::from("cyclic-generic-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after cyclic generic completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn deeply_parenthesized_overload_request_survives_and_keeps_server_responsive() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("DeepParenthesizedOverload.pas");
@@ -1832,6 +1960,39 @@ fn signature_help_request_returns_nested_argument_selection_and_source_labels() 
             json!([29, 30]),
             json!([40, 41])
         ]
+    );
+    server.shutdown();
+}
+
+#[test]
+fn generic_signature_help_request_returns_the_generic_source_label() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("GenericSignature.pas");
+    let source = "unit GenericSignature;\ninterface\nfunction Identity<T>(Value: T): T;\nimplementation\nfunction Identity<T>(Value: T): T;\nbegin\n  Result := Value;\nend;\nprocedure Caller;\nbegin\n  Identity(1);\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("generic-signature-help-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Identity(1", 0),
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "generic signature help failed: {response:?}"
+    );
+    let result = response.result.expect("generic signature help result");
+    assert_eq!(result["activeSignature"], 0);
+    assert_eq!(result["activeParameter"], 0);
+    assert_eq!(
+        result["signatures"][0]["label"],
+        "function Identity<T>(Value: T): T;"
     );
     server.shutdown();
 }

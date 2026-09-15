@@ -6366,6 +6366,901 @@ fn conditional_method_attributes_preserve_cross_unit_type_navigation() {
 }
 
 #[test]
+fn generic_field_specialization_resolves_nested_member_navigation() {
+    let source = r#"unit GenericField;
+interface
+type
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+    property Item: T read Value;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+procedure Caller;
+implementation
+function TBox<T>.GetValue: T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Nested: TBox<TBox<TWidget>>;
+begin
+  Box.Value.Member;
+  Box.GetValue().Member;
+  Box.Item.Member;
+  Nested.Value.Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericField");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic field source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let result_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(result_locations.len(), 1);
+    assert_location_start(
+        &result_locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let property_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(property_locations.len(), 1);
+    assert_location_start(
+        &property_locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let nested_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        4,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(nested_locations.len(), 1);
+    assert_location_start(
+        &nested_locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_inherited_specialization_resolves_members() {
+    let source = r#"unit GenericInherited;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+  TChild = class(TBox<TWidget>)
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Child: TChild;
+begin
+  Child.Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInherited");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inherited source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_constructor_result_preserves_specialization() {
+    let source = r#"unit GenericConstructor;
+interface
+type
+  TBox<T> = class
+    constructor Create(Value: T);
+    Value: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+implementation
+constructor TBox<T>.Create(Value: T);
+begin
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  TBox<TWidget>.Create(Widget).Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericConstructor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic constructor source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_routine_explicit_and_inferred_results_resolve_members() {
+    let source = r#"unit GenericRoutine;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Identity<TWidget>(Widget).Member;
+  Identity(Widget).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericRoutine");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic routine source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "Member",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            locations.len(),
+            1,
+            "generic routine occurrence {occurrence}"
+        );
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "Member: Integer", 0),
+        );
+    }
+}
+
+#[test]
+fn generic_routine_inference_requires_consistent_type_arguments() {
+    let source = r#"unit GenericInference;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    Member: Integer;
+  end;
+function Same<T>(Left: T; Right: T): T;
+implementation
+function Same<T>(Left: T; Right: T): T;
+begin
+  Result := Left;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+  Other: TOther;
+begin
+  Same(Widget, Widget).Member;
+  Same(Widget, Other).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInference");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inference source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let ambiguous = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(ambiguous.is_empty());
+}
+
+#[test]
+fn generic_routine_constraints_reject_unproven_actual_types() {
+    let source = r#"unit GenericConstraints;
+interface
+type
+  TBase = class
+    BaseMember: Integer;
+  end;
+  TChild = class(TBase)
+  end;
+  TUnrelated = class
+    Member: Integer;
+  end;
+function Need<T: TBase>(Value: T): T;
+implementation
+function Need<T: TBase>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Child: TChild;
+  Unrelated: TUnrelated;
+begin
+  Need(Child).BaseMember;
+  Need(Unrelated).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BaseMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "BaseMember: Integer", 0),
+    );
+
+    let rejected = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(rejected.is_empty());
+}
+
+#[test]
+fn generic_routine_inference_preserves_specialized_actual_types() {
+    let source = r#"unit GenericNestedInference;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Identity(Box).Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericNestedInference");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested generic inference source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_specialization_preserves_same_spelling_cross_unit_types() {
+    let provider_a = r#"unit GenericProviderA;
+interface
+type
+  TWidget = class
+    AMember: Integer;
+  end;
+implementation
+end.
+"#;
+    let provider_b = r#"unit GenericProviderB;
+interface
+type
+  TWidget = class
+    BMember: Integer;
+  end;
+implementation
+end.
+"#;
+    let consumer = r#"unit GenericCrossConsumer;
+interface
+uses GenericProviderA, GenericProviderB;
+type
+  TBox<T> = class
+    Value: T;
+  end;
+implementation
+procedure Caller;
+var
+  Box: TBox<GenericProviderA.TWidget>;
+begin
+  Box.Value.AMember;
+  Box.Value.BMember;
+end;
+end.
+"#;
+    let provider_a_uri = uri("GenericProviderA");
+    let provider_b_uri = uri("GenericProviderB");
+    let consumer_uri = uri("GenericCrossConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_a_uri, provider_a.to_owned())
+        .expect("generic provider A parses");
+    index
+        .update(provider_b_uri, provider_b.to_owned())
+        .expect("generic provider B parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("generic cross-unit consumer parses");
+
+    let a_member = locations_at(
+        &index,
+        &consumer_uri,
+        consumer,
+        "AMember",
+        0,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(a_member.len(), 1);
+    assert_location_start(
+        &a_member[0],
+        &uri("GenericProviderA"),
+        position_of(provider_a, "AMember: Integer", 0),
+    );
+
+    let b_member = locations_at(
+        &index,
+        &consumer_uri,
+        consumer,
+        "BMember",
+        0,
+        NavigationTarget::Declaration,
+    );
+    assert!(b_member.is_empty());
+}
+
+#[test]
+fn generic_method_parameters_shadow_and_retain_owner_parameters() {
+    let source = r#"unit GenericMethodShadowing;
+interface
+type
+  TBox<T> = class
+    function Shadow<T>(Value: T): T;
+    function Keep<U>(Value: U): T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+implementation
+function TBox<T>.Shadow<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+function TBox<T>.Keep<U>(Value: U): T;
+begin
+  Result := Default(T);
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Other: TOther;
+begin
+  Box.Shadow<TOther>(Other).OtherMember;
+  Box.Keep<TOther>(Other).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodShadowing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method shadowing source parses");
+
+    let shadowed = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shadowed.len(), 1);
+    assert_location_start(
+        &shadowed[0],
+        &source_uri,
+        position_of(source, "OtherMember: Integer", 0),
+    );
+
+    let owner = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(owner.len(), 1);
+    assert_location_start(
+        &owner[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_type_constraints_reject_invalid_specializations() {
+    let source = r#"unit GenericTypeConstraints;
+interface
+type
+  TBase = class
+    BaseMember: Integer;
+  end;
+  TBox<T: TBase> = class
+    Value: T;
+  end;
+  TChild = class(TBase)
+  end;
+  TUnrelated = class
+    Member: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Valid: TBox<TChild>;
+  Invalid: TBox<TUnrelated>;
+begin
+  Valid.Value.BaseMember;
+  Invalid.Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericTypeConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic type constraint source parses");
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BaseMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid.len(), 1);
+    assert_location_start(
+        &valid[0],
+        &source_uri,
+        position_of(source, "BaseMember: Integer", 0),
+    );
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn generic_kind_constraints_accept_only_matching_specializations() {
+    let source = r#"unit GenericKindConstraints;
+interface
+type
+  TClassBox<T: class> = class
+    Value: T;
+  end;
+  TRecordBox<T: record> = class
+    Value: T;
+  end;
+  TInterfaceBox<T: interface> = class
+    Value: T;
+  end;
+  TClass = class
+    ClassMember: Integer;
+  end;
+  TRecord = record
+    RecordMember: Integer;
+  end;
+  TInterface = interface
+    procedure InterfaceMethod;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  ValidClass: TClassBox<TClass>;
+  InvalidClass: TClassBox<TRecord>;
+  ValidRecord: TRecordBox<TRecord>;
+  InvalidRecord: TRecordBox<TClass>;
+  ValidInterface: TInterfaceBox<TInterface>;
+  InvalidInterface: TInterfaceBox<TClass>;
+begin
+  ValidClass.Value.ClassMember;
+  InvalidClass.Value.RecordMember;
+  ValidRecord.Value.RecordMember;
+  InvalidRecord.Value.ClassMember;
+  ValidInterface.Value.InterfaceMethod;
+  InvalidInterface.Value.ClassMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericKindConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic kind constraint source parses");
+
+    let valid_class = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "ClassMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid_class.len(), 1);
+    assert_location_start(
+        &valid_class[0],
+        &source_uri,
+        position_of(source, "ClassMember: Integer", 0),
+    );
+
+    let invalid_class = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "RecordMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid_class.is_empty());
+
+    let valid_record = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "RecordMember",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid_record.len(), 1);
+    assert_location_start(
+        &valid_record[0],
+        &source_uri,
+        position_of(source, "RecordMember: Integer", 0),
+    );
+
+    let invalid_record = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "ClassMember",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid_record.is_empty());
+
+    let valid_interface = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "InterfaceMethod",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid_interface.len(), 1);
+    assert_location_start(
+        &valid_interface[0],
+        &source_uri,
+        position_of(source, "InterfaceMethod", 0),
+    );
+
+    let invalid_interface = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "ClassMember",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid_interface.is_empty());
+}
+
+#[test]
+fn generic_constructor_constraints_require_a_proven_constructor() {
+    let source = r#"unit GenericConstructorConstraints;
+interface
+type
+  TBox<T: constructor> = class
+    Value: T;
+  end;
+  TConstructible = class
+    constructor Create;
+    Member: Integer;
+  end;
+  TUnconstructible = class
+    OtherMember: Integer;
+  end;
+procedure Caller;
+implementation
+constructor TConstructible.Create;
+begin
+end;
+procedure Caller;
+var
+  Valid: TBox<TConstructible>;
+  Invalid: TBox<TUnconstructible>;
+begin
+  Valid.Value.Member;
+  Invalid.Value.OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericConstructorConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic constructor constraint source parses");
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid.len(), 1);
+    assert_location_start(
+        &valid[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn generic_primitive_results_feed_overload_selection() {
+    let source = r#"unit GenericPrimitiveOverload;
+interface
+function Identity<T>(Value: T): T;
+procedure Consume(Value: Integer); overload;
+procedure Consume(Value: String); overload;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+begin
+  Consume(Identity(1));
+end;
+end.
+"#;
+    let source_uri = uri("GenericPrimitiveOverload");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic primitive overload source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Consume",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Consume(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn generic_specialized_receivers_feed_completion_hover_and_type_definition() {
+    let source = r#"unit GenericAssistance;
+interface
+type
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.Value.Me;
+  Box.GetValue().Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic assistance source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Box.Value.Me", 0))
+        .expect("generic specialized completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Member", 1))
+        .expect("generic specialized hover");
+    assert!(hover_text(&hover).contains("Member: Integer"));
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Value", 4));
+    assert_exact_type_location(&type_definition, &source_uri, source, "TWidget", 0);
+}
+
+#[test]
 fn conditional_navigation_uses_only_a_provably_active_branch() {
     let source = r#"unit ConditionalNavigation;
 interface

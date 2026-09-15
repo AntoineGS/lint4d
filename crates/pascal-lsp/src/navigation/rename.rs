@@ -747,6 +747,19 @@ impl NavigationIndex {
         if binding.kind == SymbolKind::Unit {
             return Err("unit/module rename requires RenameFile support".to_string());
         }
+        if binding.members.iter().any(|member| {
+            self.documents
+                .get(&member.uri)
+                .and_then(|document| {
+                    document
+                        .symbols
+                        .iter()
+                        .find(|symbol| symbol_id(&member.uri, symbol) == *member)
+                })
+                .is_some_and(|symbol| symbol.generic_parameter.is_some())
+        }) {
+            return Err("generic parameter rename is not supported".to_string());
+        }
         if binding.kind == SymbolKind::Type && has_forward_class_pair(self, &binding) {
             return Err("forward class/completion type rename is not supported".to_string());
         }
@@ -1080,15 +1093,15 @@ impl NavigationIndex {
         };
         let receivers = self.resolve_receivers(occurrence_uri, document, offset, lhs);
         for receiver in receivers {
-            let super::Receiver::Type(type_uri, type_key, type_scope) = receiver else {
+            let super::Receiver::Type(instance) = receiver else {
                 continue;
             };
             let direct = self.direct_member_candidates(
-                &type_uri,
-                &type_key,
-                type_scope,
+                &instance.uri,
+                &instance.key,
+                instance.scope,
                 Some(&binding.old_key),
-                type_uri == *occurrence_uri,
+                instance.uri == *occurrence_uri,
             );
             if direct
                 .iter()

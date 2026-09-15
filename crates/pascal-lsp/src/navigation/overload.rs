@@ -1,8 +1,8 @@
 use super::{
     AncestryResolutionState, AncestryStatus, AssistanceBudget, BuiltinType, Candidate, Document,
-    IntegerKind, NavigationIndex, Origin, ParameterMode, Receiver, Region, ResolutionState,
-    RoutineParameter, Span, Symbol, SymbolKind, TypeKind, assistance, canonical_name,
-    check_navigation_cancel,
+    GenericSubstitution, IntegerKind, NavigationIndex, Origin, ParameterMode, Receiver, Region,
+    ResolutionState, ResolvedType, RoutineParameter, Span, Symbol, SymbolKind, TypeIdentity,
+    TypeInstance, TypeKind, TypeRef, assistance, canonical_name, check_navigation_cancel,
 };
 use lsp_types::Url;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -21,18 +21,8 @@ pub(super) struct OverloadKey {
 #[derive(Debug, Default)]
 pub(super) struct Selection {
     pub(super) selected_group: Option<OverloadKey>,
+    pub(super) generic_substitution: Option<GenericSubstitution>,
     pub(super) no_viable_group: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TypeIdentity {
-    Builtin(BuiltinType),
-    IntegerLiteral(i128),
-    Named {
-        uri: Url,
-        key: String,
-        kind: TypeKind,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -42,10 +32,11 @@ struct ArgumentInfo {
     nil_literal: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GroupScore {
     cost: u32,
     uncertain: bool,
+    substitution: GenericSubstitution,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +104,7 @@ pub(super) fn select(
     current_document: &Document,
     call: Node<'_>,
     candidates: &[Candidate],
+    receiver_substitution: &GenericSubstitution,
     state: &mut ResolutionState,
     depth: usize,
     cancel: &AtomicBool,
@@ -142,6 +134,7 @@ pub(super) fn select(
             current_uri,
             current_document,
             argument,
+            receiver_substitution,
             state,
             depth,
             cancel,
@@ -162,6 +155,10 @@ pub(super) fn select(
             &group.representative,
             symbol,
             &argument_info,
+            call,
+            current_uri,
+            current_document,
+            receiver_substitution,
             state,
             &mut ancestry,
             cancel,
@@ -181,8 +178,10 @@ pub(super) fn select(
         return Ok(Selection::default());
     }
     if possible.len() == 1 {
+        let (group, score) = possible.pop().expect("one possible overload");
         return Ok(Selection {
-            selected_group: Some(possible.pop().expect("one possible overload").0.key),
+            selected_group: Some(group.key),
+            generic_substitution: Some(score.substitution),
             no_viable_group: false,
         });
     }
@@ -195,7 +194,7 @@ pub(super) fn select(
     let mut best = possible
         .into_iter()
         .filter(|(_, score)| score.cost == best_cost);
-    let Some((group, _)) = best.next() else {
+    let Some((group, score)) = best.next() else {
         return Ok(Selection::default());
     };
     if best.next().is_some() {
@@ -203,6 +202,7 @@ pub(super) fn select(
     }
     Ok(Selection {
         selected_group: Some(group.key),
+        generic_substitution: Some(score.substitution),
         no_viable_group: false,
     })
 }
@@ -286,6 +286,10 @@ fn score_group(
     candidate: &Candidate,
     symbol: &Symbol,
     arguments: &[ArgumentInfo],
+    call: Node<'_>,
+    current_uri: &Url,
+    current_document: &Document,
+    receiver_substitution: &GenericSubstitution,
     state: &mut ResolutionState,
     ancestry: &mut AncestryResolutionState,
     cancel: &AtomicBool,
@@ -300,6 +304,23 @@ fn score_group(
         return Ok(None);
     }
 
+    let Some(substitution) = generic_substitution_for_group(
+        index,
+        candidate,
+        symbol,
+        call,
+        arguments,
+        current_uri,
+        current_document,
+        receiver_substitution,
+        state,
+        ancestry,
+        cancel,
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
     let mut cost: u32 = 0;
     let mut uncertain = false;
     for (argument, parameter) in arguments.iter().zip(parameters) {
@@ -309,7 +330,16 @@ fn score_group(
         {
             return Ok(None);
         }
-        let expected = parameter_type(index, candidate, symbol, parameter, state, cancel, budget)?;
+        let expected = parameter_type(
+            index,
+            candidate,
+            symbol,
+            parameter,
+            &substitution,
+            state,
+            cancel,
+            budget,
+        )?;
         if argument.nil_literal {
             match expected {
                 Some(TypeIdentity::Named {
@@ -343,7 +373,310 @@ fn score_group(
             }
         }
     }
-    Ok(Some(GroupScore { cost, uncertain }))
+    Ok(Some(GroupScore {
+        cost,
+        uncertain,
+        substitution,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generic_substitution_for_group(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    symbol: &Symbol,
+    call: Node<'_>,
+    arguments: &[ArgumentInfo],
+    current_uri: &Url,
+    current_document: &Document,
+    receiver_substitution: &GenericSubstitution,
+    state: &mut ResolutionState,
+    ancestry: &mut AncestryResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<GenericSubstitution>, String> {
+    if symbol.generic_parameters.is_empty() {
+        return Ok(Some(receiver_substitution.clone()));
+    }
+
+    let mut substitution = receiver_substitution.clone();
+    if let Some(explicit_arguments) = generic_call_arguments(call) {
+        if explicit_arguments.len() != symbol.generic_parameters.len() {
+            return Ok(None);
+        }
+        for (parameter, argument) in symbol.generic_parameters.iter().zip(explicit_arguments) {
+            let Some(type_ref) = super::type_ref_from_node(argument, &current_document.source)
+            else {
+                return Ok(None);
+            };
+            let receivers = index.type_receivers_for_type_ref_with_budget(
+                current_uri,
+                current_document,
+                type_ref.span.start,
+                &type_ref,
+                argument,
+                None,
+                &substitution,
+                state,
+                cancel,
+                budget,
+            )?;
+            let Some(resolved) = super::resolved_type_from_receivers(receivers) else {
+                return Ok(None);
+            };
+            substitution.insert(&parameter.name, resolved);
+        }
+    } else {
+        let generic_names = symbol
+            .generic_parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<HashSet<_>>();
+        for (argument, parameter) in arguments.iter().zip(&symbol.routine_parameters) {
+            let (Some(actual), Some(type_ref)) = (&argument.ty, parameter.type_ref.as_ref()) else {
+                continue;
+            };
+            if !infer_generic_type_ref(index, type_ref, actual, &generic_names, &mut substitution) {
+                return Ok(None);
+            }
+        }
+    }
+
+    if !generic_constraints_satisfied(
+        index,
+        candidate,
+        symbol,
+        &substitution,
+        state,
+        ancestry,
+        cancel,
+        budget,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(substitution))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn generic_constraints_satisfied(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    symbol: &Symbol,
+    substitution: &GenericSubstitution,
+    state: &mut ResolutionState,
+    ancestry: &mut AncestryResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(false);
+    };
+    for parameter in &symbol.generic_parameters {
+        let Some(constraint) = parameter.constraint.as_ref() else {
+            continue;
+        };
+        let Some(actual) = substitution
+            .get(&parameter.name)
+            .and_then(super::type_identity_from_resolved_type)
+        else {
+            return Ok(false);
+        };
+        if constraint.path.len() == 1 {
+            match canonical_name(&constraint.path[0]).as_str() {
+                "class" => {
+                    if !matches!(
+                        actual,
+                        TypeIdentity::Named {
+                            kind: TypeKind::Class,
+                            ..
+                        }
+                    ) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                "interface" => {
+                    if !matches!(
+                        actual,
+                        TypeIdentity::Named {
+                            kind: TypeKind::Interface,
+                            ..
+                        }
+                    ) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                "record" => {
+                    if !matches!(
+                        actual,
+                        TypeIdentity::Named {
+                            kind: TypeKind::Record,
+                            ..
+                        }
+                    ) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                "constructor" => {
+                    if !has_proven_constructor(index, &actual) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+            document.tree.root_node(),
+            constraint.span.start,
+            cancel,
+            budget,
+            "generic constraint",
+        )?
+        else {
+            return Ok(false);
+        };
+        let receivers = index.type_receivers_for_type_ref_with_budget(
+            &candidate.uri,
+            document,
+            constraint.span.start,
+            constraint,
+            lookup_identifier,
+            Some(symbol.scope),
+            substitution,
+            state,
+            cancel,
+            budget,
+        )?;
+        let Some(expected) = receiver_type(index, receivers)? else {
+            return Ok(false);
+        };
+        if !matches!(
+            conversion(index, &actual, &expected, ancestry, cancel, budget)?,
+            Conversion::Cost(_)
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn has_proven_constructor(index: &NavigationIndex, identity: &TypeIdentity) -> bool {
+    let TypeIdentity::Named { uri, key, .. } = identity else {
+        return false;
+    };
+    let Some(document) = index.documents.get(uri) else {
+        return false;
+    };
+    let Some(indices) = document.member_symbol_indices_by_owner.get(key) else {
+        return false;
+    };
+    indices.iter().any(|index| {
+        document.symbols.get(*index).is_some_and(|symbol| {
+            symbol.kind == SymbolKind::Routine
+                && symbol.routine_kind == super::RoutineKind::Constructor
+                && symbol
+                    .routine_parameters
+                    .iter()
+                    .all(|parameter| parameter.has_default)
+        })
+    })
+}
+
+fn generic_call_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let entity = call.child_by_field_name("entity")?;
+    if entity.kind() != "exprTpl" {
+        return None;
+    }
+    let arguments = entity.child_by_field_name("args")?;
+    if matches!(arguments.kind(), "genericArgs" | "typerefArgs" | "exprArgs") {
+        Some(
+            (0..arguments.named_child_count())
+                .filter_map(|index| arguments.named_child(index))
+                .collect(),
+        )
+    } else {
+        Some(vec![arguments])
+    }
+}
+
+fn infer_generic_type_ref(
+    index: &NavigationIndex,
+    type_ref: &TypeRef,
+    actual: &TypeIdentity,
+    generic_names: &HashSet<&str>,
+    substitution: &mut GenericSubstitution,
+) -> bool {
+    if type_ref.path.len() == 1 && type_ref.args.is_empty() {
+        let name = type_ref.path[0].as_str();
+        if !generic_names.contains(name) {
+            return true;
+        }
+        let Some(resolved) = resolved_type_from_identity(index, actual) else {
+            return false;
+        };
+        if let Some(existing) = substitution.get(name) {
+            existing == &resolved
+        } else {
+            substitution.insert(name, resolved);
+            true
+        }
+    } else if !type_ref.args.is_empty() {
+        let TypeIdentity::Named { args, .. } = actual else {
+            return true;
+        };
+        type_ref.args.len() == args.len()
+            && type_ref.args.iter().zip(args).all(|(expected, actual)| {
+                infer_generic_type_ref(index, expected, actual, generic_names, substitution)
+            })
+    } else {
+        true
+    }
+}
+
+fn resolved_type_from_identity(
+    index: &NavigationIndex,
+    identity: &TypeIdentity,
+) -> Option<ResolvedType> {
+    match identity {
+        TypeIdentity::Builtin(builtin) => Some(ResolvedType::Builtin(*builtin)),
+        TypeIdentity::IntegerLiteral(value) => Some(ResolvedType::IntegerLiteral(*value)),
+        TypeIdentity::Named {
+            uri,
+            key,
+            kind,
+            args,
+        } => {
+            let document = index.documents.get(uri)?;
+            let indices = document.type_symbol_indices.get(key)?;
+            if indices.len() != 1 {
+                return None;
+            }
+            let symbol = document.symbols.get(*indices.first()?)?;
+            if symbol.kind != SymbolKind::Type || symbol.generic_parameters.len() != args.len() {
+                return None;
+            }
+            let parameter_names = symbol
+                .generic_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect::<Vec<_>>();
+            let mut substitution = GenericSubstitution::empty();
+            for (name, argument) in parameter_names.iter().zip(args) {
+                substitution.insert(name, resolved_type_from_identity(index, argument)?);
+            }
+            Some(ResolvedType::Named(TypeInstance {
+                uri: uri.clone(),
+                key: key.clone(),
+                kind: *kind,
+                scope: symbol.scope,
+                parameter_names,
+                substitution,
+            }))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -352,13 +685,14 @@ fn parameter_type(
     candidate: &Candidate,
     symbol: &Symbol,
     parameter: &RoutineParameter,
+    receiver_substitution: &GenericSubstitution,
     state: &mut ResolutionState,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<TypeIdentity>, String> {
-    let Some(type_name) = parameter.type_name.as_deref() else {
+    if parameter.type_ref.is_none() && parameter.type_name.is_none() {
         return Ok(None);
-    };
+    }
     let Some(document) = index.documents.get(&candidate.uri) else {
         return Ok(None);
     };
@@ -373,19 +707,39 @@ fn parameter_type(
         "overload selection",
     )?
     else {
-        return Ok(builtin_type(type_name).map(TypeIdentity::Builtin));
+        return Ok(parameter
+            .type_ref
+            .as_ref()
+            .map(TypeRef::display)
+            .or_else(|| parameter.type_name.clone())
+            .and_then(|name| builtin_type(&name).map(TypeIdentity::Builtin)));
     };
-    let receivers = index.type_receivers_for_path_with_budget_at_scope(
-        &candidate.uri,
-        document,
-        offset,
-        type_name,
-        lookup_identifier,
-        Some(symbol.scope),
-        state,
-        cancel,
-        budget,
-    )?;
+    let receivers = if let Some(type_ref) = parameter.type_ref.as_ref() {
+        index.type_receivers_for_type_ref_with_budget(
+            &candidate.uri,
+            document,
+            type_ref.span.start,
+            type_ref,
+            lookup_identifier,
+            Some(symbol.scope),
+            receiver_substitution,
+            state,
+            cancel,
+            budget,
+        )?
+    } else {
+        index.type_receivers_for_path_with_budget_at_scope(
+            &candidate.uri,
+            document,
+            offset,
+            parameter.type_name.as_deref().unwrap_or_default(),
+            lookup_identifier,
+            Some(symbol.scope),
+            state,
+            cancel,
+            budget,
+        )?
+    };
     receiver_type(index, receivers)
 }
 
@@ -395,6 +749,7 @@ fn infer_argument(
     current_uri: &Url,
     current_document: &Document,
     node: Node<'_>,
+    receiver_substitution: &GenericSubstitution,
     state: &mut ResolutionState,
     depth: usize,
     cancel: &AtomicBool,
@@ -534,7 +889,15 @@ fn infer_argument(
             symbol.kind,
             SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::Field | SymbolKind::Property
         ) {
-            match symbol_type(index, &candidate, symbol, state, cancel, budget)? {
+            match symbol_type(
+                index,
+                &candidate,
+                symbol,
+                receiver_substitution,
+                state,
+                cancel,
+                budget,
+            )? {
                 Some(identity) => {
                     identities.insert(identity);
                 }
@@ -725,13 +1088,14 @@ fn symbol_type(
     index: &NavigationIndex,
     candidate: &Candidate,
     symbol: &Symbol,
+    receiver_substitution: &GenericSubstitution,
     state: &mut ResolutionState,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<TypeIdentity>, String> {
-    let Some(type_name) = symbol.type_name.as_deref() else {
+    if symbol.type_ref.is_none() && symbol.type_name.is_none() {
         return Ok(None);
-    };
+    }
     let Some(document) = index.documents.get(&candidate.uri) else {
         return Ok(None);
     };
@@ -743,15 +1107,20 @@ fn symbol_type(
         "overload selection",
     )?
     else {
-        return Ok(builtin_type(type_name).map(TypeIdentity::Builtin));
+        return Ok(symbol
+            .type_ref
+            .as_ref()
+            .map(TypeRef::display)
+            .or_else(|| symbol.type_name.clone())
+            .and_then(|name| builtin_type(&name).map(TypeIdentity::Builtin)));
     };
-    let receivers = index.type_receivers_for_path_with_budget_at_scope(
+    let receivers = index.type_receivers_for_symbol_type_with_budget(
         &candidate.uri,
         document,
-        symbol.span.start,
-        type_name,
+        symbol,
         lookup_identifier,
         Some(symbol.scope),
+        receiver_substitution,
         state,
         cancel,
         budget,
@@ -767,11 +1136,22 @@ fn receiver_type(
     for receiver in receivers {
         let identity = match receiver {
             Receiver::Builtin(builtin) => TypeIdentity::Builtin(builtin),
-            Receiver::Type(uri, key, _) => {
-                let Some(kind) = index.type_kind(&uri, &key) else {
+            Receiver::IntegerLiteral(value) => TypeIdentity::IntegerLiteral(value),
+            Receiver::Type(instance) => {
+                let Some(kind) = index.type_kind(&instance.uri, &instance.key) else {
                     return Ok(None);
                 };
-                TypeIdentity::Named { uri, key, kind }
+                TypeIdentity::Named {
+                    uri: instance.uri,
+                    key: instance.key,
+                    kind,
+                    args: instance
+                        .parameter_names
+                        .iter()
+                        .filter_map(|name| instance.substitution.get(name))
+                        .filter_map(super::type_identity_from_resolved_type)
+                        .collect(),
+                }
             }
             Receiver::Unit(_) => return Ok(None),
         };
@@ -895,6 +1275,7 @@ fn conversion(
                 uri: expected_uri,
                 key: expected_key,
                 kind: _,
+                ..
             },
         ) if actual_uri == expected_uri && actual_key == expected_key => Ok(Conversion::Cost(0)),
         (
@@ -902,11 +1283,13 @@ fn conversion(
                 uri: actual_uri,
                 key: actual_key,
                 kind: actual_kind,
+                ..
             },
             TypeIdentity::Named {
                 uri: expected_uri,
                 key: expected_key,
                 kind: expected_kind,
+                ..
             },
         ) => match upcast_distance(
             index,
@@ -932,6 +1315,11 @@ fn conversion(
         }
         (TypeIdentity::Builtin(_), TypeIdentity::Named { .. })
         | (TypeIdentity::Named { .. }, TypeIdentity::Builtin(_)) => Ok(Conversion::Incompatible),
+        (TypeIdentity::IntegerLiteral(actual), TypeIdentity::IntegerLiteral(expected))
+            if actual == expected =>
+        {
+            Ok(Conversion::Cost(0))
+        }
         (TypeIdentity::IntegerLiteral(_), TypeIdentity::IntegerLiteral(_)) => {
             Ok(Conversion::Unknown)
         }

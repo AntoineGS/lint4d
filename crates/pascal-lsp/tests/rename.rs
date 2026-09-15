@@ -2542,3 +2542,33 @@ fn mixed_boolean_and_comparison_precedence_keeps_the_active_include_audited() {
         "Pascal's lower-precedence comparison must leave the ELSE include active"
     );
 }
+
+#[test]
+fn generic_type_parameter_rename_fails_closed_until_instantiations_are_modeled() {
+    let source = r#"unit GenericRename;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+  end;
+var
+  Box: TBox<TWidget>;
+implementation
+procedure Run;
+begin
+  Box.Value := TWidget.Create;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "GenericRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, Position::new(3, 7), "TOther")
+            .is_err(),
+        "generic parameter rename must remain conservative"
+    );
+}

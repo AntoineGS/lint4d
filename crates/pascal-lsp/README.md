@@ -546,6 +546,13 @@ Implemented and covered by tests:
 - Unknown receivers do not trigger an unrelated workspace-wide name search.
 - Document/workspace symbols, semantic references, and document-local highlights
   use the standard LSP requests and preserve UTF-16 source ranges.
+- Generic type and routine substitution/inference covers explicit and inferred
+  calls, nested and inherited specializations, constructor results, consistent
+  multi-parameter inference, cross-unit type identity, and method/formal
+  shadowing. Unsupported or unproven constraints fail closed.
+- Specialized generic results feed source-based navigation, completion, hover,
+  signature help, type definitions, and overload selection, including primitive
+  literal substitutions.
 - Bounded, conservative conditional analysis recognizes `IFDEF`, `IFNDEF`,
   `IF`, `IFOPT`, `ELSEIF`/`ELIF`, `ELSE`, `ENDIF`, local `DEFINE`/`UNDEF`, and
   `DEFINED(...)`. Known-inactive source is omitted from the index; unknown
@@ -554,8 +561,7 @@ Implemented and covered by tests:
 
 Not implemented or incomplete:
 
-- Inherited-member lookup, `with` resolution, helpers, generic inference,
-  function-result expression typing, and argument-based overload selection.
+- `with` resolution and helpers.
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
 - Full compiler-equivalent conditional evaluation and include-file expansion.
@@ -564,10 +570,10 @@ Not implemented or incomplete:
   content can therefore produce no navigation result or block rename.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
-- Compiler-equivalent overload selection, generic inference, auto-imports,
-  snippets, and anonymous callable inference are not implemented. Completion
-  and signature help remain conservative when imports, conditionals, receivers,
-  or parser state are unknown.
+- Compiler-equivalent overload selection, auto-imports, snippets, and anonymous
+  callable inference are not implemented. Completion and signature help remain
+  conservative when imports, conditionals, receivers, or parser state are
+  unknown.
 - Semantic tokens and a general Delphi type checker are not implemented.
 
 Unsupported expressions can return no location. Results should be evaluated

@@ -382,6 +382,7 @@ impl NavigationIndex {
             document,
             call,
             &candidates,
+            &super::GenericSubstitution::empty(),
             &mut overload_state,
             0,
             cancel,
@@ -603,13 +604,13 @@ impl NavigationIndex {
                             cancel,
                         )?;
                     }
-                    super::Receiver::Type(type_uri, type_key, type_scope) => {
+                    super::Receiver::Type(instance) => {
                         let (ancestry_known, has_ambiguous_names) = self
                             .add_member_completion_candidates(
                                 &mut accumulator,
-                                &type_uri,
-                                &type_key,
-                                type_scope,
+                                &instance.uri,
+                                &instance.key,
+                                instance.scope,
                                 current_uri,
                                 &mut private_spans,
                                 0,
@@ -619,7 +620,7 @@ impl NavigationIndex {
                             accumulator.is_incomplete = true;
                         }
                     }
-                    super::Receiver::Builtin(_) => {}
+                    super::Receiver::Builtin(_) | super::Receiver::IntegerLiteral(_) => {}
                 }
                 if accumulator.exhausted {
                     break;
@@ -1256,6 +1257,73 @@ impl NavigationIndex {
                     let Some(declaration_document) = self.documents.get(&reference.uri) else {
                         continue;
                     };
+                    if let Some(dot) = super::member_expression_at(identifier)
+                        .filter(|dot| super::is_right_hand_member(*dot, identifier))
+                    {
+                        if let Some(lhs) = dot.child_by_field_name("lhs") {
+                            let receivers = self.resolve_receivers_with_state_and_budget(
+                                uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
+                            )?;
+                            let receiver_is_known = !receivers.is_empty();
+                            for receiver in receivers {
+                                let super::Receiver::Type(instance) = receiver else {
+                                    continue;
+                                };
+                                let owner_key =
+                                    symbol.owner_type.as_deref().unwrap_or(&instance.key);
+                                let Some(member_substitution) = self
+                                    .member_owner_substitution_with_budget(
+                                        &instance.uri,
+                                        &instance.key,
+                                        &instance.substitution,
+                                        &reference.uri,
+                                        owner_key,
+                                        &mut state,
+                                        cancel,
+                                        budget,
+                                    )?
+                                else {
+                                    continue;
+                                };
+                                let Some(lookup_identifier) = identifier_at_with_budget(
+                                    declaration_document.tree.root_node(),
+                                    symbol.span.start,
+                                    cancel,
+                                    budget,
+                                    "type definition",
+                                )?
+                                else {
+                                    continue;
+                                };
+                                let specialized = self.type_receivers_for_symbol_type_with_budget(
+                                    &reference.uri,
+                                    declaration_document,
+                                    symbol,
+                                    lookup_identifier,
+                                    None,
+                                    &member_substitution,
+                                    &mut state,
+                                    cancel,
+                                    budget,
+                                )?;
+                                for specialized in specialized {
+                                    let super::Receiver::Type(instance) = specialized else {
+                                        continue;
+                                    };
+                                    targets.extend(self.type_candidates_in_unit_with_budget(
+                                        &instance.uri,
+                                        &instance.key,
+                                        instance.uri == *uri,
+                                        cancel,
+                                        budget,
+                                    )?);
+                                }
+                            }
+                            if receiver_is_known {
+                                continue;
+                            }
+                        }
+                    }
                     let Some(type_name) = named_type_path_for_symbol(declaration_document, symbol)
                     else {
                         continue;
@@ -1305,15 +1373,14 @@ impl NavigationIndex {
                                 )?;
                                 let mut constructed_targets = Vec::new();
                                 for receiver in receivers {
-                                    let super::Receiver::Type(type_uri, type_key, _) = receiver
-                                    else {
+                                    let super::Receiver::Type(instance) = receiver else {
                                         continue;
                                     };
                                     constructed_targets.extend(
                                         self.type_candidates_in_unit_with_budget(
-                                            &type_uri,
-                                            &type_key,
-                                            type_uri == *uri,
+                                            &instance.uri,
+                                            &instance.key,
+                                            instance.uri == *uri,
                                             cancel,
                                             budget,
                                         )?,
@@ -2992,8 +3059,12 @@ mod tests {
             scope: 0,
             owner_type: None,
             owner_type_name: None,
+            generic_parameters: Vec::new(),
+            generic_parameter: None,
             type_name: None,
+            type_ref: None,
             result_type_name: None,
+            result_type_ref: None,
             result_type_span: None,
             region: Region::Interface,
             origin: Origin::Declaration,

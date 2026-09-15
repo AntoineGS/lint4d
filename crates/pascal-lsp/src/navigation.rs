@@ -361,6 +361,7 @@ impl NavigationIndex {
                 document,
                 call,
                 &references,
+                &GenericSubstitution::empty(),
                 &mut state,
                 0,
                 &cancel,
@@ -871,18 +872,18 @@ impl NavigationIndex {
                         &unit_uri, &key, cancel, budget,
                     )?);
                 }
-                Receiver::Type(type_uri, type_key, type_scope) => {
+                Receiver::Type(instance) => {
                     references.extend(self.member_references_for_type_with_budget(
-                        &type_uri,
-                        &type_key,
-                        type_scope,
+                        &instance.uri,
+                        &instance.key,
+                        instance.scope,
                         &key,
-                        type_uri == *current_uri,
+                        instance.uri == *current_uri,
                         cancel,
                         budget,
                     )?)
                 }
-                Receiver::Builtin(_) => {}
+                Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {}
             }
         }
         Ok(references)
@@ -926,11 +927,13 @@ impl NavigationIndex {
         )
         .into_iter()
         .flat_map(|receiver| match receiver {
-            Receiver::Type(type_uri, type_key, _) => {
-                self.type_candidates_in_unit(&type_uri, &type_key, type_uri == *current_uri)
-            }
+            Receiver::Type(instance) => self.type_candidates_in_unit(
+                &instance.uri,
+                &instance.key,
+                instance.uri == *current_uri,
+            ),
             Receiver::Unit(_) => Vec::new(),
-            Receiver::Builtin(_) => Vec::new(),
+            Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Vec::new(),
         })
         .collect()
     }
@@ -1015,11 +1018,11 @@ impl NavigationIndex {
         let mut result = Vec::new();
         for receiver in receivers {
             budget.require_work(1, cancel)?;
-            if let Receiver::Type(type_uri, type_key, _) = receiver {
+            if let Receiver::Type(instance) = receiver {
                 result.extend(self.type_candidates_in_unit_with_budget(
-                    &type_uri,
-                    &type_key,
-                    type_uri == *current_uri,
+                    &instance.uri,
+                    &instance.key,
+                    instance.uri == *current_uri,
                     cancel,
                     budget,
                 )?);
@@ -1373,17 +1376,17 @@ impl NavigationIndex {
                             })
                         }),
                 ),
-                Receiver::Type(type_uri, type_key, type_scope) => {
+                Receiver::Type(instance) => {
                     let members = self.member_references_for_type(
-                        &type_uri,
-                        &type_key,
-                        type_scope,
+                        &instance.uri,
+                        &instance.key,
+                        instance.scope,
                         &key,
-                        type_uri == *current_uri,
+                        instance.uri == *current_uri,
                     );
                     references.extend(members)
                 }
-                Receiver::Builtin(_) => {}
+                Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {}
             }
         }
         references
@@ -1462,6 +1465,23 @@ impl NavigationIndex {
                 cancel,
                 budget,
             ),
+            "exprTpl" | "typerefTpl" => {
+                let Some(type_ref) = type_ref_from_node(node, &current_document.source) else {
+                    return Ok(Vec::new());
+                };
+                self.type_receivers_for_type_ref_with_budget(
+                    current_uri,
+                    current_document,
+                    type_ref.span.start,
+                    &type_ref,
+                    lookup_identifier,
+                    None,
+                    &GenericSubstitution::empty(),
+                    state,
+                    cancel,
+                    budget,
+                )
+            }
             "exprBinary" | "exprAs" => {
                 let Some(operator) = node.child_by_field_name("operator") else {
                     return Ok(Vec::new());
@@ -1544,20 +1564,21 @@ impl NavigationIndex {
                                 budget,
                             )?)
                         }
-                        Receiver::Type(type_uri, type_key, type_scope) => {
+                        Receiver::Type(instance) => {
                             result.extend(self.member_type_receivers_with_budget(
-                                &type_uri,
-                                &type_key,
+                                &instance.uri,
+                                &instance.key,
                                 &rhs_name,
-                                type_uri == *current_uri,
-                                type_scope,
+                                instance.uri == *current_uri,
+                                instance.scope,
+                                &instance.substitution,
                                 lookup_identifier,
                                 state,
                                 cancel,
                                 budget,
                             )?)
                         }
-                        Receiver::Builtin(_) => {}
+                        Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {}
                     }
                 }
                 Ok(result)
@@ -1617,6 +1638,23 @@ impl NavigationIndex {
         let Some(entity) = call.child_by_field_name("entity") else {
             return Ok(Vec::new());
         };
+        let owner_substitution = callable_owner_node(entity)
+            .map(|lhs| {
+                self.resolve_receivers_with_state_and_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    lhs,
+                    lhs,
+                    state,
+                    cancel,
+                    budget,
+                    depth.saturating_add(1),
+                )
+            })
+            .transpose()?
+            .and_then(substitution_from_receivers)
+            .unwrap_or_else(GenericSubstitution::empty);
         let callable_identifier = callable_lookup_identifier(entity);
         let candidates = self.resolve_candidates_at_with_state_and_budget(
             current_uri,
@@ -1659,14 +1697,7 @@ impl NavigationIndex {
             }
             return Ok(type_candidates
                 .into_iter()
-                .filter_map(|candidate| {
-                    let symbol = self.symbol(&candidate)?;
-                    Some(Receiver::Type(
-                        candidate.uri,
-                        symbol.key.clone(),
-                        symbol.scope,
-                    ))
-                })
+                .filter_map(|candidate| self.type_receiver_for_candidate(&candidate))
                 .collect());
         }
         if routine_candidates.is_empty() {
@@ -1679,6 +1710,7 @@ impl NavigationIndex {
             current_document,
             call,
             &routine_candidates,
+            &owner_substitution,
             state,
             depth,
             cancel,
@@ -1688,6 +1720,9 @@ impl NavigationIndex {
             state.mark_receiver_uncertain();
             return Ok(Vec::new());
         };
+        let result_substitution = selection
+            .generic_substitution
+            .unwrap_or_else(|| owner_substitution.clone());
         let routine_candidates = routine_candidates
             .into_iter()
             .filter(|candidate| overload::candidate_in_group(self, candidate, &selected_group))
@@ -1740,6 +1775,7 @@ impl NavigationIndex {
             &result_uri,
             result_document,
             &annotation,
+            &result_substitution,
             state,
             cancel,
             budget,
@@ -1792,18 +1828,18 @@ impl NavigationIndex {
                 receivers = receivers
                     .into_iter()
                     .map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key, type_scope) => self
-                            .member_type_receivers_with_budget(
-                                &type_uri,
-                                &type_key,
-                                member_name,
-                                type_uri == *current_uri,
-                                type_scope,
-                                lookup_identifier,
-                                state,
-                                cancel,
-                                budget,
-                            ),
+                        Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                            &instance.uri,
+                            &instance.key,
+                            member_name,
+                            instance.uri == *current_uri,
+                            instance.scope,
+                            &instance.substitution,
+                            lookup_identifier,
+                            state,
+                            cancel,
+                            budget,
+                        ),
                         Receiver::Unit(unit_uri) => self.type_receivers_in_unit_with_budget(
                             &unit_uri,
                             member_name,
@@ -1811,7 +1847,7 @@ impl NavigationIndex {
                             cancel,
                             budget,
                         ),
-                        Receiver::Builtin(_) => Ok(Vec::new()),
+                        Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Ok(Vec::new()),
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
@@ -1859,20 +1895,20 @@ impl NavigationIndex {
                 receivers = receivers
                     .into_iter()
                     .map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key, type_scope) => self
-                            .member_type_receivers_with_budget(
-                                &type_uri,
-                                &type_key,
-                                member_name,
-                                type_uri == *current_uri,
-                                type_scope,
-                                lookup_identifier,
-                                state,
-                                cancel,
-                                budget,
-                            ),
+                        Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                            &instance.uri,
+                            &instance.key,
+                            member_name,
+                            instance.uri == *current_uri,
+                            instance.scope,
+                            &instance.substitution,
+                            lookup_identifier,
+                            state,
+                            cancel,
+                            budget,
+                        ),
                         Receiver::Unit(_) => Ok(Vec::new()),
-                        Receiver::Builtin(_) => Ok(Vec::new()),
+                        Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Ok(Vec::new()),
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
@@ -1897,18 +1933,18 @@ impl NavigationIndex {
             receivers = receivers
                 .into_iter()
                 .map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key, type_scope) => self
-                        .member_type_receivers_with_budget(
-                            &type_uri,
-                            &type_key,
-                            member_name,
-                            type_uri == *current_uri,
-                            type_scope,
-                            lookup_identifier,
-                            state,
-                            cancel,
-                            budget,
-                        ),
+                    Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                        &instance.uri,
+                        &instance.key,
+                        member_name,
+                        instance.uri == *current_uri,
+                        instance.scope,
+                        &instance.substitution,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                    ),
                     Receiver::Unit(unit_uri) => self.type_receivers_in_unit_with_budget(
                         &unit_uri,
                         member_name,
@@ -1916,7 +1952,7 @@ impl NavigationIndex {
                         cancel,
                         budget,
                     ),
-                    Receiver::Builtin(_) => Ok(Vec::new()),
+                    Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Ok(Vec::new()),
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
@@ -1942,7 +1978,16 @@ impl NavigationIndex {
             let scope = self.budgeted_scope_at(current_document, offset, cancel, budget)?;
             return Ok(current_document
                 .owner_type_at_identifier(lookup_identifier, scope)
-                .map(|owner_type| vec![Receiver::Type(current_uri.clone(), owner_type, ROOT_SCOPE)])
+                .map(|owner_type| {
+                    vec![Receiver::Type(TypeInstance {
+                        uri: current_uri.clone(),
+                        key: owner_type,
+                        kind: TypeKind::Other,
+                        scope: ROOT_SCOPE,
+                        parameter_names: Vec::new(),
+                        substitution: GenericSubstitution::empty(),
+                    })]
+                })
                 .unwrap_or_default());
         }
         if name.eq_ignore_ascii_case("Result") {
@@ -1953,6 +1998,7 @@ impl NavigationIndex {
                     current_uri,
                     current_document,
                     &annotation,
+                    &GenericSubstitution::empty(),
                     state,
                     cancel,
                     budget,
@@ -1983,27 +2029,22 @@ impl NavigationIndex {
                 };
                 match symbol.kind {
                     SymbolKind::Type => {
-                        result.push(Receiver::Type(
-                            reference.uri.clone(),
-                            symbol.key.clone(),
-                            symbol.scope,
-                        ));
+                        if let Some(receiver) = self.type_receiver_for_candidate(&reference) {
+                            result.push(receiver);
+                        }
                     }
                     SymbolKind::Variable
                     | SymbolKind::Parameter
                     | SymbolKind::Field
                     | SymbolKind::Property => {
-                        if let Some(type_name) = &symbol.type_name {
-                            let Some(declaration_document) = self.documents.get(&reference.uri)
-                            else {
-                                continue;
-                            };
-                            result.extend(self.type_receivers_for_path_with_budget(
+                        if let Some(declaration_document) = self.documents.get(&reference.uri) {
+                            result.extend(self.type_receivers_for_symbol_type_with_budget(
                                 &reference.uri,
                                 declaration_document,
-                                symbol.span.start,
-                                type_name,
+                                symbol,
                                 lookup_identifier,
+                                None,
+                                &GenericSubstitution::empty(),
                                 state,
                                 cancel,
                                 budget,
@@ -2032,6 +2073,7 @@ impl NavigationIndex {
         current_uri: &Url,
         current_document: &Document,
         annotation: &ResultTypeAnnotation,
+        substitution: &GenericSubstitution,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
@@ -2048,38 +2090,14 @@ impl NavigationIndex {
                 .map(|builtin| vec![Receiver::Builtin(builtin)])
                 .unwrap_or_default());
         };
-        self.type_receivers_for_path_with_budget_at_scope(
+        self.type_receivers_for_type_ref_with_budget(
             current_uri,
             current_document,
-            annotation.offset,
-            &annotation.name,
+            annotation.type_ref.span.start,
+            &annotation.type_ref,
             lookup_identifier,
             Some(annotation.scope),
-            state,
-            cancel,
-            budget,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn type_receivers_for_path_with_budget(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        path: &str,
-        lookup_identifier: Node<'_>,
-        state: &mut ResolutionState,
-        cancel: &AtomicBool,
-        budget: &mut AssistanceBudget,
-    ) -> Result<Vec<Receiver>, String> {
-        self.type_receivers_for_path_with_budget_at_scope(
-            current_uri,
-            current_document,
-            offset,
-            path,
-            lookup_identifier,
-            None,
+            substitution,
             state,
             cancel,
             budget,
@@ -2127,6 +2145,346 @@ impl NavigationIndex {
             }
         }
         Ok(receivers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_receivers_for_type_ref_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        type_ref: &TypeRef,
+        lookup_identifier: Node<'_>,
+        scope_override: Option<usize>,
+        substitution: &GenericSubstitution,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        self.type_receivers_for_type_ref_with_budget_at_depth(
+            current_uri,
+            current_document,
+            offset,
+            type_ref,
+            lookup_identifier,
+            scope_override,
+            substitution,
+            state,
+            cancel,
+            budget,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_receivers_for_type_ref_with_budget_at_depth(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        type_ref: &TypeRef,
+        lookup_identifier: Node<'_>,
+        scope_override: Option<usize>,
+        substitution: &GenericSubstitution,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        depth: usize,
+    ) -> Result<Vec<Receiver>, String> {
+        if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            return Ok(Vec::new());
+        }
+        budget.require_work(
+            type_ref.path.len().saturating_add(type_ref.args.len()),
+            cancel,
+        )?;
+        budget.require_bytes(type_ref.display().len(), cancel)?;
+        if type_ref.path.len() == 1 {
+            if let Some(resolved) = substitution.get(&type_ref.path[0]) {
+                return Ok(resolved.clone().into_receiver().into_iter().collect());
+            }
+        }
+        let bases = self.type_receivers_for_parts_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            &type_ref.path,
+            lookup_identifier,
+            scope_override,
+            state,
+            cancel,
+            budget,
+        )?;
+        let mut result = Vec::new();
+        for base in bases {
+            let Receiver::Type(mut instance) = base else {
+                if type_ref.args.is_empty() {
+                    result.push(base);
+                }
+                continue;
+            };
+            if instance.parameter_names.is_empty() {
+                if !type_ref.args.is_empty() {
+                    continue;
+                }
+                result.push(Receiver::Type(instance));
+                continue;
+            }
+            if type_ref.args.len() != instance.parameter_names.len() {
+                continue;
+            }
+            let mut actuals = Vec::with_capacity(type_ref.args.len());
+            let mut valid = true;
+            for argument in &type_ref.args {
+                let receivers = self.type_receivers_for_type_ref_with_budget_at_depth(
+                    current_uri,
+                    current_document,
+                    argument.span.start,
+                    argument,
+                    lookup_identifier,
+                    scope_override,
+                    substitution,
+                    state,
+                    cancel,
+                    budget,
+                    depth.saturating_add(1),
+                )?;
+                let Some(resolved) = resolved_type_from_receivers(receivers) else {
+                    valid = false;
+                    break;
+                };
+                actuals.push(resolved);
+            }
+            if !valid {
+                continue;
+            }
+            for (name, actual) in instance.parameter_names.iter().zip(actuals) {
+                instance.substitution.insert(name, actual);
+            }
+            if !self
+                .generic_type_constraints_satisfied_with_budget(&instance, state, cancel, budget)?
+            {
+                continue;
+            }
+            result.push(Receiver::Type(instance));
+        }
+        if result.is_empty() && type_ref.args.is_empty() {
+            if let Some(builtin) = overload::builtin_type(&type_ref.display()) {
+                result.push(Receiver::Builtin(builtin));
+            }
+        }
+        Ok(result)
+    }
+
+    fn generic_type_constraints_satisfied_with_budget(
+        &self,
+        instance: &TypeInstance,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let Some(candidate) = self.type_symbol_candidate(instance) else {
+            return Ok(false);
+        };
+        let Some(symbol) = self.symbol(&candidate) else {
+            return Ok(false);
+        };
+        if symbol.generic_parameters.is_empty() {
+            return Ok(true);
+        }
+        let mut ancestry = AncestryResolutionState::new();
+        overload::generic_constraints_satisfied(
+            self,
+            &candidate,
+            symbol,
+            &instance.substitution,
+            state,
+            &mut ancestry,
+            cancel,
+            budget,
+        )
+    }
+
+    fn generic_type_constraints_satisfied(
+        &self,
+        instance: &TypeInstance,
+        state: &mut ResolutionState,
+    ) -> bool {
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            MAX_NAVIGATION_OVERLOAD_WORK,
+            MAX_NAVIGATION_OVERLOAD_BYTES,
+            "generic type constraint",
+        );
+        self.generic_type_constraints_satisfied_with_budget(instance, state, &cancel, &mut budget)
+            .unwrap_or(false)
+    }
+
+    fn type_symbol_candidate(&self, instance: &TypeInstance) -> Option<Candidate> {
+        let document = self.documents.get(&instance.uri)?;
+        let indices = document.type_symbol_indices.get(&instance.key)?;
+        if indices.len() != 1 {
+            return None;
+        }
+        Some(Candidate {
+            uri: instance.uri.clone(),
+            index: *indices.first()?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_receivers_for_type_ref(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        type_ref: &TypeRef,
+        scope_override: Option<usize>,
+        substitution: &GenericSubstitution,
+        state: &mut ResolutionState,
+    ) -> Vec<Receiver> {
+        if type_ref.path.len() == 1 {
+            if let Some(resolved) = substitution.get(&type_ref.path[0]) {
+                return resolved.clone().into_receiver().into_iter().collect();
+            }
+        }
+        let bases = self.type_receivers_for_parts(
+            current_uri,
+            current_document,
+            offset,
+            &type_ref.path,
+            scope_override,
+            state,
+        );
+        let mut result = Vec::new();
+        for base in bases {
+            let Receiver::Type(mut instance) = base else {
+                if type_ref.args.is_empty() {
+                    result.push(base);
+                }
+                continue;
+            };
+            if instance.parameter_names.is_empty() {
+                if type_ref.args.is_empty() {
+                    result.push(Receiver::Type(instance));
+                }
+                continue;
+            }
+            if type_ref.args.len() != instance.parameter_names.len() {
+                continue;
+            }
+            let mut actuals = Vec::with_capacity(type_ref.args.len());
+            let mut valid = true;
+            for argument in &type_ref.args {
+                let receivers = self.type_receivers_for_type_ref(
+                    current_uri,
+                    current_document,
+                    argument.span.start,
+                    argument,
+                    scope_override,
+                    substitution,
+                    state,
+                );
+                let Some(resolved) = resolved_type_from_receivers(receivers) else {
+                    valid = false;
+                    break;
+                };
+                actuals.push(resolved);
+            }
+            if !valid {
+                continue;
+            }
+            for (name, actual) in instance.parameter_names.iter().zip(actuals) {
+                instance.substitution.insert(name, actual);
+            }
+            if !self.generic_type_constraints_satisfied(&instance, state) {
+                continue;
+            }
+            result.push(Receiver::Type(instance));
+        }
+        if result.is_empty() && type_ref.args.is_empty() {
+            if let Some(builtin) = overload::builtin_type(&type_ref.display()) {
+                result.push(Receiver::Builtin(builtin));
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_receivers_for_symbol_type_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        symbol: &Symbol,
+        lookup_identifier: Node<'_>,
+        scope_override: Option<usize>,
+        substitution: &GenericSubstitution,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        if let Some(type_ref) = symbol.type_ref.as_ref() {
+            return self.type_receivers_for_type_ref_with_budget(
+                current_uri,
+                current_document,
+                type_ref.span.start,
+                type_ref,
+                lookup_identifier,
+                scope_override,
+                substitution,
+                state,
+                cancel,
+                budget,
+            );
+        }
+        let Some(type_name) = symbol.type_name.as_deref() else {
+            return Ok(Vec::new());
+        };
+        self.type_receivers_for_path_with_budget_at_scope(
+            current_uri,
+            current_document,
+            symbol.span.start,
+            type_name,
+            lookup_identifier,
+            scope_override,
+            state,
+            cancel,
+            budget,
+        )
+    }
+
+    fn type_receivers_for_symbol_type(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        symbol: &Symbol,
+        scope_override: Option<usize>,
+        substitution: &GenericSubstitution,
+        state: &mut ResolutionState,
+    ) -> Vec<Receiver> {
+        if let Some(type_ref) = symbol.type_ref.as_ref() {
+            return self.type_receivers_for_type_ref(
+                current_uri,
+                current_document,
+                type_ref.span.start,
+                type_ref,
+                scope_override,
+                substitution,
+                state,
+            );
+        }
+        let Some(type_name) = symbol.type_name.as_deref() else {
+            return Vec::new();
+        };
+        self.type_receivers_for_path_at_scope(
+            current_uri,
+            current_document,
+            symbol.span.start,
+            type_name,
+            scope_override,
+            state,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2182,11 +2540,9 @@ impl NavigationIndex {
                     continue;
                 };
                 if symbol.kind == SymbolKind::Type {
-                    result.push(Receiver::Type(
-                        candidate.uri,
-                        symbol.key.clone(),
-                        symbol.scope,
-                    ));
+                    if let Some(receiver) = self.type_receiver_for_candidate(&candidate) {
+                        result.push(receiver);
+                    }
                 }
             }
             return Ok(result);
@@ -2230,31 +2586,30 @@ impl NavigationIndex {
                 if symbol.kind != SymbolKind::Type {
                     return Ok(Vec::new());
                 }
-                receivers.push(Receiver::Type(
-                    candidate.uri,
-                    symbol.key.clone(),
-                    symbol.scope,
-                ));
+                let Some(receiver) = self.type_receiver_for_candidate(&candidate) else {
+                    return Ok(Vec::new());
+                };
+                receivers.push(receiver);
             }
             for member_name in &parts[1..] {
                 budget.require_work(1, cancel)?;
                 receivers = receivers
                     .into_iter()
                     .map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key, type_scope) => self
-                            .member_type_receivers_with_budget(
-                                &type_uri,
-                                &type_key,
-                                member_name,
-                                type_uri == *current_uri,
-                                type_scope,
-                                lookup_identifier,
-                                state,
-                                cancel,
-                                budget,
-                            ),
+                        Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                            &instance.uri,
+                            &instance.key,
+                            member_name,
+                            instance.uri == *current_uri,
+                            instance.scope,
+                            &instance.substitution,
+                            lookup_identifier,
+                            state,
+                            cancel,
+                            budget,
+                        ),
                         Receiver::Unit(_) => Ok(Vec::new()),
-                        Receiver::Builtin(_) => Ok(Vec::new()),
+                        Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Ok(Vec::new()),
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
@@ -2294,20 +2649,20 @@ impl NavigationIndex {
             receivers = receivers
                 .into_iter()
                 .map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key, type_scope) => self
-                        .member_type_receivers_with_budget(
-                            &type_uri,
-                            &type_key,
-                            member_name,
-                            type_uri == *current_uri,
-                            type_scope,
-                            lookup_identifier,
-                            state,
-                            cancel,
-                            budget,
-                        ),
+                    Receiver::Type(instance) => self.member_type_receivers_with_budget(
+                        &instance.uri,
+                        &instance.key,
+                        member_name,
+                        instance.uri == *current_uri,
+                        instance.scope,
+                        &instance.substitution,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                    ),
                     Receiver::Unit(_) => Ok(Vec::new()),
-                    Receiver::Builtin(_) => Ok(Vec::new()),
+                    Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Ok(Vec::new()),
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
@@ -2341,14 +2696,12 @@ impl NavigationIndex {
         let mut result = Vec::new();
         for candidate in candidates {
             budget.require_work(1, cancel)?;
-            let Some(symbol) = self.symbol(&candidate) else {
+            let Some(_symbol) = self.symbol(&candidate) else {
                 continue;
             };
-            result.push(Receiver::Type(
-                candidate.uri,
-                symbol.key.clone(),
-                symbol.scope,
-            ));
+            if let Some(receiver) = self.type_receiver_for_candidate(&candidate) {
+                result.push(receiver);
+            }
         }
         Ok(result)
     }
@@ -2375,6 +2728,200 @@ impl NavigationIndex {
         Ok(document.scope_chain(offset))
     }
 
+    fn member_owner_substitution(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        substitution: &GenericSubstitution,
+        owner_uri: &Url,
+        owner_key: &str,
+        state: &mut ResolutionState,
+    ) -> Option<GenericSubstitution> {
+        let mut active = HashSet::new();
+        self.member_owner_substitution_inner(
+            type_uri,
+            type_key,
+            substitution,
+            owner_uri,
+            owner_key,
+            state,
+            &mut active,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_owner_substitution_inner(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        substitution: &GenericSubstitution,
+        owner_uri: &Url,
+        owner_key: &str,
+        state: &mut ResolutionState,
+        active: &mut HashSet<(Url, String)>,
+    ) -> Option<GenericSubstitution> {
+        if type_uri == owner_uri && type_key == owner_key {
+            return Some(substitution.clone());
+        }
+        if !active.insert((type_uri.clone(), type_key.to_owned())) {
+            return None;
+        }
+        let result = (|| {
+            let document = self.documents.get(type_uri)?;
+            let entries = document.type_ancestry.get(type_key)?;
+            if entries.len() != 1 {
+                return None;
+            }
+            let entry = &entries[0];
+            for parent in entry.parents.iter().filter(|parent| {
+                matches!(
+                    (entry.kind, parent.relation),
+                    (TypeKind::Class, ParentRelation::Superclass)
+                        | (TypeKind::Interface, ParentRelation::InterfaceParent)
+                )
+            }) {
+                let type_ref = parent.type_ref.as_ref()?;
+                let receivers = self.type_receivers_for_type_ref(
+                    type_uri,
+                    document,
+                    type_ref.span.start,
+                    type_ref,
+                    None,
+                    substitution,
+                    state,
+                );
+                let parent_instance = unique_type_instance(receivers)?;
+                if let Some(result) = self.member_owner_substitution_inner(
+                    &parent_instance.uri,
+                    &parent_instance.key,
+                    &parent_instance.substitution,
+                    owner_uri,
+                    owner_key,
+                    state,
+                    active,
+                ) {
+                    return Some(result);
+                }
+            }
+            None
+        })();
+        active.remove(&(type_uri.clone(), type_key.to_owned()));
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_owner_substitution_with_budget(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        substitution: &GenericSubstitution,
+        owner_uri: &Url,
+        owner_key: &str,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<GenericSubstitution>, String> {
+        let mut active = HashSet::new();
+        self.member_owner_substitution_with_budget_inner(
+            type_uri,
+            type_key,
+            substitution,
+            owner_uri,
+            owner_key,
+            state,
+            &mut active,
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_owner_substitution_with_budget_inner(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        substitution: &GenericSubstitution,
+        owner_uri: &Url,
+        owner_key: &str,
+        state: &mut ResolutionState,
+        active: &mut HashSet<(Url, String)>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<GenericSubstitution>, String> {
+        if type_uri == owner_uri && type_key == owner_key {
+            return Ok(Some(substitution.clone()));
+        }
+        if !active.insert((type_uri.clone(), type_key.to_owned())) {
+            return Ok(None);
+        }
+        let result = (|| {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(document) = self.documents.get(type_uri) else {
+                return Ok(None);
+            };
+            let Some(entries) = document.type_ancestry.get(type_key) else {
+                return Ok(None);
+            };
+            if entries.len() != 1 {
+                return Ok(None);
+            }
+            let entry = &entries[0];
+            for parent in entry.parents.iter().filter(|parent| {
+                matches!(
+                    (entry.kind, parent.relation),
+                    (TypeKind::Class, ParentRelation::Superclass)
+                        | (TypeKind::Interface, ParentRelation::InterfaceParent)
+                )
+            }) {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                let Some(type_ref) = parent.type_ref.as_ref() else {
+                    return Ok(None);
+                };
+                let lookup_identifier = assistance::identifier_at_with_budget(
+                    document.tree.root_node(),
+                    type_ref.span.start,
+                    cancel,
+                    budget,
+                    "generic parent substitution",
+                )?
+                .unwrap_or_else(|| document.tree.root_node());
+                let receivers = self.type_receivers_for_type_ref_with_budget(
+                    type_uri,
+                    document,
+                    type_ref.span.start,
+                    type_ref,
+                    lookup_identifier,
+                    None,
+                    substitution,
+                    state,
+                    cancel,
+                    budget,
+                )?;
+                let Some(parent_instance) = unique_type_instance(receivers) else {
+                    return Ok(None);
+                };
+                if let Some(result) = self.member_owner_substitution_with_budget_inner(
+                    &parent_instance.uri,
+                    &parent_instance.key,
+                    &parent_instance.substitution,
+                    owner_uri,
+                    owner_key,
+                    state,
+                    active,
+                    cancel,
+                    budget,
+                )? {
+                    return Ok(Some(result));
+                }
+            }
+            Ok(None)
+        })();
+        active.remove(&(type_uri.clone(), type_key.to_owned()));
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn member_type_receivers_with_budget(
         &self,
@@ -2383,6 +2930,7 @@ impl NavigationIndex {
         name: &str,
         allow_implementation: bool,
         type_scope: usize,
+        substitution: &GenericSubstitution,
         lookup_identifier: Node<'_>,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
@@ -2394,6 +2942,7 @@ impl NavigationIndex {
             type_key.to_owned(),
             member_key.clone(),
             type_scope,
+            substitution.clone(),
         );
         if !state.active_members.insert(resolution_key.clone()) {
             return Ok(Vec::new());
@@ -2439,26 +2988,41 @@ impl NavigationIndex {
             if symbol.kind == SymbolKind::Routine && symbol.routine_kind == RoutineKind::Constructor
             {
                 if constructor_is_unique {
-                    result.push(Receiver::Type(
-                        type_uri.clone(),
-                        type_key.to_owned(),
-                        type_scope,
-                    ));
+                    result.push(Receiver::Type(TypeInstance {
+                        uri: type_uri.clone(),
+                        key: type_key.to_owned(),
+                        kind: TypeKind::Other,
+                        scope: type_scope,
+                        parameter_names: Vec::new(),
+                        substitution: substitution.clone(),
+                    }));
                 }
                 continue;
             }
-            let Some(type_name) = symbol.type_name.as_deref() else {
+            let owner_key = symbol.owner_type.as_deref().unwrap_or(type_key);
+            let Some(member_substitution) = self.member_owner_substitution_with_budget(
+                type_uri,
+                type_key,
+                substitution,
+                &candidate.uri,
+                owner_key,
+                state,
+                cancel,
+                budget,
+            )?
+            else {
                 continue;
             };
             let Some(document) = self.documents.get(&candidate.uri) else {
                 continue;
             };
-            result.extend(self.type_receivers_for_path_with_budget(
+            result.extend(self.type_receivers_for_symbol_type_with_budget(
                 &candidate.uri,
                 document,
-                symbol.span.start,
-                type_name,
+                symbol,
                 lookup_identifier,
+                None,
+                &member_substitution,
                 state,
                 cancel,
                 budget,
@@ -2494,24 +3058,6 @@ impl NavigationIndex {
             0,
         )
         .unwrap_or_default()
-    }
-
-    fn type_receivers_for_path(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        path: &str,
-        state: &mut ResolutionState,
-    ) -> Vec<Receiver> {
-        self.type_receivers_for_path_at_scope(
-            current_uri,
-            current_document,
-            offset,
-            path,
-            None,
-            state,
-        )
     }
 
     fn type_receivers_for_path_at_scope(
@@ -2586,12 +3132,7 @@ impl NavigationIndex {
             }
             return candidates
                 .into_iter()
-                .filter_map(|candidate| {
-                    let symbol = self.symbol(&candidate)?;
-                    (symbol.kind == SymbolKind::Type).then(|| {
-                        Receiver::Type(candidate.uri.clone(), symbol.key.clone(), symbol.scope)
-                    })
-                })
+                .filter_map(|candidate| self.type_receiver_for_candidate(&candidate))
                 .collect();
         }
 
@@ -2625,30 +3166,23 @@ impl NavigationIndex {
             }
             let mut receivers = root_candidates
                 .into_iter()
-                .filter_map(|candidate| {
-                    let symbol = self.symbol(&candidate)?;
-                    Some(Receiver::Type(
-                        candidate.uri,
-                        symbol.key.clone(),
-                        symbol.scope,
-                    ))
-                })
+                .filter_map(|candidate| self.type_receiver_for_candidate(&candidate))
                 .collect::<Vec<_>>();
             for member_name in &parts[1..] {
                 receivers = receivers
                     .into_iter()
                     .flat_map(|receiver| match receiver {
-                        Receiver::Type(type_uri, type_key, type_scope) => self
-                            .member_type_receivers(
-                                &type_uri,
-                                &type_key,
-                                member_name,
-                                type_uri == *current_uri,
-                                type_scope,
-                                state,
-                            ),
+                        Receiver::Type(instance) => self.member_type_receivers(
+                            &instance.uri,
+                            &instance.key,
+                            member_name,
+                            instance.uri == *current_uri,
+                            instance.scope,
+                            &instance.substitution,
+                            state,
+                        ),
                         Receiver::Unit(_) => Vec::new(),
-                        Receiver::Builtin(_) => Vec::new(),
+                        Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Vec::new(),
                     })
                     .collect();
             }
@@ -2676,16 +3210,17 @@ impl NavigationIndex {
             receivers = receivers
                 .into_iter()
                 .flat_map(|receiver| match receiver {
-                    Receiver::Type(type_uri, type_key, type_scope) => self.member_type_receivers(
-                        &type_uri,
-                        &type_key,
+                    Receiver::Type(instance) => self.member_type_receivers(
+                        &instance.uri,
+                        &instance.key,
                         member_name,
-                        type_uri == *current_uri,
-                        type_scope,
+                        instance.uri == *current_uri,
+                        instance.scope,
+                        &instance.substitution,
                         state,
                     ),
                     Receiver::Unit(_) => Vec::new(),
-                    Receiver::Builtin(_) => Vec::new(),
+                    Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => Vec::new(),
                 })
                 .collect();
         }
@@ -2849,15 +3384,14 @@ impl NavigationIndex {
         }
         candidates
             .into_iter()
-            .filter_map(|candidate| {
-                let symbol = self.symbol(&candidate)?;
-                Some(Receiver::Type(
-                    candidate.uri,
-                    symbol.key.clone(),
-                    symbol.scope,
-                ))
-            })
+            .filter_map(|candidate| self.type_receiver_for_candidate(&candidate))
             .collect()
+    }
+
+    fn type_receiver_for_candidate(&self, candidate: &Candidate) -> Option<Receiver> {
+        let symbol = self.symbol(candidate)?;
+        (symbol.kind == SymbolKind::Type && symbol.generic_parameter.is_none())
+            .then(|| Receiver::Type(type_instance_from_symbol(candidate, symbol)))
     }
 
     fn type_candidates_in_unit(
@@ -2930,6 +3464,7 @@ impl NavigationIndex {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn member_type_receivers(
         &self,
         type_uri: &Url,
@@ -2937,6 +3472,7 @@ impl NavigationIndex {
         name: &str,
         allow_implementation: bool,
         type_scope: usize,
+        substitution: &GenericSubstitution,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
         let member_key = canonical_name(name);
@@ -2945,6 +3481,7 @@ impl NavigationIndex {
             type_key.to_owned(),
             member_key.clone(),
             type_scope,
+            substitution.clone(),
         );
         if !state.active_members.insert(resolution_key.clone()) {
             return Vec::new();
@@ -2987,25 +3524,37 @@ impl NavigationIndex {
             if symbol.kind == SymbolKind::Routine && symbol.routine_kind == RoutineKind::Constructor
             {
                 if constructor_is_unique {
-                    result.push(Receiver::Type(
-                        type_uri.clone(),
-                        type_key.to_owned(),
-                        type_scope,
-                    ));
+                    result.push(Receiver::Type(TypeInstance {
+                        uri: type_uri.clone(),
+                        key: type_key.to_owned(),
+                        kind: TypeKind::Other,
+                        scope: type_scope,
+                        parameter_names: Vec::new(),
+                        substitution: substitution.clone(),
+                    }));
                 }
                 continue;
             }
-            let Some(type_name) = symbol.type_name.as_deref() else {
+            let owner_key = symbol.owner_type.as_deref().unwrap_or(type_key);
+            let Some(member_substitution) = self.member_owner_substitution(
+                type_uri,
+                type_key,
+                substitution,
+                &candidate.uri,
+                owner_key,
+                state,
+            ) else {
                 continue;
             };
             let Some(document) = self.documents.get(&candidate.uri) else {
                 continue;
             };
-            result.extend(self.type_receivers_for_path(
+            result.extend(self.type_receivers_for_symbol_type(
                 &candidate.uri,
                 document,
-                symbol.span.start,
-                type_name,
+                symbol,
+                None,
+                &member_substitution,
                 state,
             ));
         }
@@ -4128,7 +4677,7 @@ enum SymbolKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum TypeKind {
+pub(super) enum TypeKind {
     Class,
     Record,
     Interface,
@@ -4138,6 +4687,93 @@ enum TypeKind {
     String,
     File,
     Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum TypeIdentity {
+    Builtin(BuiltinType),
+    IntegerLiteral(i128),
+    Named {
+        uri: Url,
+        key: String,
+        kind: TypeKind,
+        args: Vec<TypeIdentity>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TypeRef {
+    path: Vec<String>,
+    args: Vec<TypeRef>,
+    span: Span,
+}
+
+impl TypeRef {
+    fn display(&self) -> String {
+        let path = self.path.join(".");
+        if self.args.is_empty() {
+            return path;
+        }
+        format!(
+            "{path}<{}>",
+            self.args
+                .iter()
+                .map(TypeRef::display)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GenericParameter {
+    name: String,
+    span: Span,
+    constraint: Option<TypeRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GenericSubstitution(BTreeMap<String, ResolvedType>);
+
+impl GenericSubstitution {
+    fn empty() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    fn get(&self, name: &str) -> Option<&ResolvedType> {
+        self.0.get(&canonical_name(name))
+    }
+
+    fn insert(&mut self, name: &str, value: ResolvedType) {
+        self.0.insert(canonical_name(name), value);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TypeInstance {
+    uri: Url,
+    key: String,
+    kind: TypeKind,
+    scope: usize,
+    parameter_names: Vec<String>,
+    substitution: GenericSubstitution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ResolvedType {
+    Builtin(BuiltinType),
+    IntegerLiteral(i128),
+    Named(TypeInstance),
+}
+
+impl ResolvedType {
+    fn into_receiver(self) -> Option<Receiver> {
+        Some(match self {
+            Self::Builtin(builtin) => Receiver::Builtin(builtin),
+            Self::IntegerLiteral(value) => Receiver::IntegerLiteral(value),
+            Self::Named(instance) => Receiver::Type(instance),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4282,8 +4918,12 @@ struct Symbol {
     scope: usize,
     owner_type: Option<String>,
     owner_type_name: Option<String>,
+    generic_parameters: Vec<GenericParameter>,
+    generic_parameter: Option<String>,
     type_name: Option<String>,
+    type_ref: Option<TypeRef>,
     result_type_name: Option<String>,
+    result_type_ref: Option<TypeRef>,
     result_type_span: Option<Span>,
     region: Region,
     origin: Origin,
@@ -4304,6 +4944,7 @@ struct RoutineParameter {
     span: Span,
     type_span: Option<Span>,
     type_name: Option<String>,
+    type_ref: Option<TypeRef>,
     mode: ParameterMode,
     has_default: bool,
 }
@@ -4329,6 +4970,7 @@ enum ParameterMode {
 #[derive(Debug, Clone)]
 struct ResultTypeAnnotation {
     name: String,
+    type_ref: TypeRef,
     offset: usize,
     scope: usize,
 }
@@ -4339,6 +4981,15 @@ impl Symbol {
             .as_ref()
             .map(|name| ResultTypeAnnotation {
                 name: name.clone(),
+                type_ref: self.result_type_ref.clone().unwrap_or_else(|| TypeRef {
+                    path: name
+                        .split('.')
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                    args: Vec::new(),
+                    span: self.result_type_span.unwrap_or(self.span),
+                }),
                 offset: self
                     .result_type_span
                     .map_or(self.span.start, |span| span.start),
@@ -4356,6 +5007,7 @@ struct Candidate {
 #[derive(Debug, Clone)]
 struct ParentType {
     path: Vec<String>,
+    type_ref: Option<TypeRef>,
     relation: ParentRelation,
 }
 
@@ -4449,13 +5101,103 @@ impl AncestryResolutionState {
 
 enum Receiver {
     Unit(Url),
-    Type(Url, String, usize),
+    Type(TypeInstance),
     Builtin(BuiltinType),
+    IntegerLiteral(i128),
+}
+
+fn type_instance_from_symbol(candidate: &Candidate, symbol: &Symbol) -> TypeInstance {
+    TypeInstance {
+        uri: candidate.uri.clone(),
+        key: symbol.key.clone(),
+        kind: symbol.type_kind,
+        scope: symbol.scope,
+        parameter_names: symbol
+            .generic_parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect(),
+        substitution: GenericSubstitution::empty(),
+    }
+}
+
+fn type_identity_from_resolved_type(resolved: &ResolvedType) -> Option<TypeIdentity> {
+    match resolved {
+        ResolvedType::Builtin(builtin) => Some(TypeIdentity::Builtin(*builtin)),
+        ResolvedType::IntegerLiteral(value) => Some(TypeIdentity::IntegerLiteral(*value)),
+        ResolvedType::Named(instance) => Some(TypeIdentity::Named {
+            uri: instance.uri.clone(),
+            key: instance.key.clone(),
+            kind: instance.kind,
+            args: instance
+                .parameter_names
+                .iter()
+                .map(|name| instance.substitution.get(name))
+                .map(|value| value.and_then(type_identity_from_resolved_type))
+                .collect::<Option<Vec<_>>>()?,
+        }),
+    }
+}
+
+fn resolved_type_from_receivers(receivers: Vec<Receiver>) -> Option<ResolvedType> {
+    let mut result = None;
+    for receiver in receivers {
+        let resolved = match receiver {
+            Receiver::Builtin(builtin) => ResolvedType::Builtin(builtin),
+            Receiver::IntegerLiteral(value) => ResolvedType::IntegerLiteral(value),
+            Receiver::Type(instance) => {
+                let resolved = ResolvedType::Named(instance);
+                type_identity_from_resolved_type(&resolved)?;
+                resolved
+            }
+            Receiver::Unit(_) => return None,
+        };
+        if result.as_ref().is_some_and(|current| current != &resolved) {
+            return None;
+        }
+        result = Some(resolved);
+    }
+    result
+}
+
+fn substitution_from_receivers(receivers: Vec<Receiver>) -> Option<GenericSubstitution> {
+    let mut result = None;
+    for receiver in receivers {
+        let Receiver::Type(instance) = receiver else {
+            return None;
+        };
+        if result
+            .as_ref()
+            .is_some_and(|current: &GenericSubstitution| current != &instance.substitution)
+        {
+            return None;
+        }
+        result = Some(instance.substitution);
+    }
+    result
+}
+
+fn unique_type_instance(receivers: Vec<Receiver>) -> Option<TypeInstance> {
+    let mut result = None;
+    for receiver in receivers {
+        let Receiver::Type(instance) = receiver else {
+            return None;
+        };
+        if result
+            .as_ref()
+            .is_some_and(|current: &TypeInstance| current != &instance)
+        {
+            return None;
+        }
+        result = Some(instance);
+    }
+    result
 }
 
 const MAX_RECEIVER_WORK: usize = 256;
 const MAX_TYPE_RESOLUTION_WORK: usize = 256;
 const MAX_RECEIVER_RECURSION_DEPTH: usize = 64;
+const MAX_TYPE_REF_RECURSION_DEPTH: usize = 64;
 const MAX_ANCESTRY_WORK: usize = 256;
 const MAX_NAVIGATION_OVERLOAD_WORK: usize = 100_000;
 const MAX_NAVIGATION_OVERLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -4463,7 +5205,7 @@ const MAX_NAVIGATION_OVERLOAD_BYTES: usize = 8 * 1024 * 1024;
 struct ResolutionState {
     receiver_work: usize,
     type_work: usize,
-    active_members: HashSet<(Url, String, String, usize)>,
+    active_members: HashSet<(Url, String, String, usize, GenericSubstitution)>,
     receiver_uncertain: bool,
 }
 
@@ -4664,8 +5406,12 @@ impl Document {
                 scope: ROOT_SCOPE,
                 owner_type: None,
                 owner_type_name: None,
+                generic_parameters: Vec::new(),
+                generic_parameter: None,
                 type_name: None,
+                type_ref: None,
                 result_type_name: None,
+                result_type_ref: None,
                 result_type_span: None,
                 region: Region::Other,
                 origin: Origin::Declaration,
@@ -5246,7 +5992,11 @@ fn pair_abbreviated_definitions(
             symbols[declaration_index].routine_directives;
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
+        symbols[definition_index].result_type_ref =
+            symbols[declaration_index].result_type_ref.clone();
         symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
+        symbols[definition_index].generic_parameters =
+            symbols[declaration_index].generic_parameters.clone();
         let declaration_node = declaration_nodes_by_key
             .get(&routine_key)
             .and_then(|nodes| nodes.first().copied());
@@ -5290,7 +6040,11 @@ fn pair_abbreviated_definitions(
         };
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
+        symbols[definition_index].result_type_ref =
+            symbols[declaration_index].result_type_ref.clone();
         symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
+        symbols[definition_index].generic_parameters =
+            symbols[declaration_index].generic_parameters.clone();
         symbols[definition_index].routine_directives =
             symbols[declaration_index].routine_directives;
     }
@@ -5312,6 +6066,9 @@ fn inject_abbreviated_parameters(
         let type_name = node
             .child_by_field_name("type")
             .and_then(|type_node| simple_type_path(type_node, source));
+        let type_ref = node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_ref_from_node(type_node, source));
         for identifier in field_identifier_nodes(node, "name") {
             let name = node_text(identifier, source);
             if name.is_empty() {
@@ -5331,8 +6088,12 @@ fn inject_abbreviated_parameters(
                 scope: body_scope,
                 owner_type: None,
                 owner_type_name: None,
+                generic_parameters: Vec::new(),
+                generic_parameter: None,
                 type_name: type_name.clone(),
+                type_ref: type_ref.clone(),
                 result_type_name: None,
+                result_type_ref: None,
                 result_type_span: None,
                 region: Region::Implementation,
                 origin: Origin::Declaration,
@@ -5372,6 +6133,10 @@ fn add_definition_symbol(
     let scope = scopes[own_scope].parent.unwrap_or(ROOT_SCOPE);
     let signature = routine_signature(header, source);
     let result_type = routine_result_type(header, source);
+    let result_type_ref = header
+        .child_by_field_name("type")
+        .and_then(|type_node| type_ref_from_node(type_node, source));
+    let generic_parameters = generic_parameters_for_node(header, source);
     let routine_parameters = direct_routine_parameters(header, source);
     symbols.push(Symbol {
         span,
@@ -5387,8 +6152,12 @@ fn add_definition_symbol(
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
+        generic_parameters,
+        generic_parameter: None,
         type_name: None,
+        type_ref: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
+        result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
         region: region_for_node(node),
         origin: Origin::Definition,
@@ -5426,6 +6195,10 @@ fn add_routine_symbol(
     let scope = scope_for_declaration(node, scope_by_span);
     let signature = routine_signature(node, source);
     let result_type = routine_result_type(node, source);
+    let result_type_ref = node
+        .child_by_field_name("type")
+        .and_then(|type_node| type_ref_from_node(type_node, source));
+    let generic_parameters = generic_parameters_for_node(node, source);
     let routine_parameters = direct_routine_parameters(node, source);
     symbols.push(Symbol {
         span,
@@ -5441,8 +6214,12 @@ fn add_routine_symbol(
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
+        generic_parameters,
+        generic_parameter: None,
         type_name: None,
+        type_ref: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
+        result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
         region: region_for_node(node),
         origin: Origin::Declaration,
@@ -5494,7 +6271,23 @@ fn add_named_symbol(
     } else {
         None
     };
-    let identifiers = field_identifier_nodes(node, "name");
+    let generic_parameters = if kind == SymbolKind::Type {
+        generic_parameters_for_node(node, source)
+    } else {
+        Vec::new()
+    };
+    let type_ref = node
+        .child_by_field_name("type")
+        .and_then(|type_node| type_ref_from_node(type_node, source));
+    let identifiers = if kind == SymbolKind::Type {
+        declaration_name_identifiers(node)
+    } else {
+        field_identifier_nodes(node, "name")
+    };
+    let declared_type_key = (kind == SymbolKind::Type)
+        .then(|| identifiers.last())
+        .flatten()
+        .map(|identifier| canonical_name(&node_text(*identifier, source)));
     for identifier in identifiers {
         let name = node_text(identifier, source);
         if name.is_empty() {
@@ -5514,8 +6307,12 @@ fn add_named_symbol(
             scope,
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),
+            generic_parameters: generic_parameters.clone(),
+            generic_parameter: None,
             type_name: type_name.clone(),
+            type_ref: type_ref.clone(),
             result_type_name: None,
+            result_type_ref: None,
             result_type_span: None,
             region: region_for_node(node),
             origin: Origin::Declaration,
@@ -5530,6 +6327,45 @@ fn add_named_symbol(
             unresolved_abbreviated: false,
             accessor: accessor.clone(),
         });
+    }
+
+    if kind == SymbolKind::Type {
+        for parameter in generic_parameters {
+            symbols.push(Symbol {
+                span: parameter.span,
+                declaration_span: parameter.span,
+                selection_span: parameter.span,
+                name: parameter.name.clone(),
+                key: parameter.name.clone(),
+                kind: SymbolKind::Type,
+                type_kind: TypeKind::Other,
+                routine_kind: RoutineKind::Procedure,
+                routine_directives: RoutineDirectives::default(),
+                parameter_mode: None,
+                scope,
+                owner_type: declared_type_key.clone(),
+                owner_type_name: declared_type_key.clone(),
+                generic_parameters: Vec::new(),
+                generic_parameter: Some(parameter.name),
+                type_name: parameter.constraint.as_ref().map(TypeRef::display),
+                type_ref: parameter.constraint,
+                result_type_name: None,
+                result_type_ref: None,
+                result_type_span: None,
+                region: region_for_node(node),
+                origin: Origin::Declaration,
+                local_only: false,
+                routine_key: None,
+                routine_signature: None,
+                routine_header_span: None,
+                routine_parameter_spans: Vec::new(),
+                routine_parameters: Vec::new(),
+                type_excerpt_end: None,
+                body_scope: None,
+                unresolved_abbreviated: false,
+                accessor: None,
+            });
+        }
     }
 }
 
@@ -5609,7 +6445,7 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
         if enclosing_type(declaration, source).is_some() {
             continue;
         }
-        let Some(name) = field_identifier_nodes(declaration, "name").last().copied() else {
+        let Some(name) = declaration_name_identifiers(declaration).last().copied() else {
             continue;
         };
         let type_kind = type_kind_for_declaration(declaration);
@@ -5666,15 +6502,16 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
                 if !parent_spans.insert(span) {
                     continue;
                 }
-                let path = simple_type_path(parent, source)
-                    .map(|path| {
-                        path.split('.')
-                            .filter(|part| !part.is_empty())
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    })
+                let type_ref = type_ref_from_node(parent, source);
+                let path = type_ref
+                    .as_ref()
+                    .map(|type_ref| type_ref.path.clone())
                     .unwrap_or_default();
-                parents.push(ParentType { path, relation });
+                parents.push(ParentType {
+                    path,
+                    type_ref,
+                    relation,
+                });
             }
         }
 
@@ -5748,7 +6585,7 @@ fn routine_result_type(node: Node<'_>, source: &str) -> Option<(String, Span)> {
 }
 
 fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<String>)> {
-    let identifiers = field_identifier_nodes(node, "name");
+    let identifiers = declaration_name_identifiers(node);
     let last = identifiers.last().copied()?;
     let name = node_text(last, source);
     let owner_type = if identifiers.len() > 1 {
@@ -5762,7 +6599,7 @@ fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<St
 }
 
 fn routine_owner_name(node: Node<'_>, source: &str) -> Option<String> {
-    let identifiers = field_identifier_nodes(node, "name");
+    let identifiers = declaration_name_identifiers(node);
     if identifiers.len() > 1 {
         return identifiers
             .get(identifiers.len().saturating_sub(2))
@@ -5813,6 +6650,7 @@ fn direct_routine_parameters(node: Node<'_>, source: &str) -> Vec<RoutineParamet
             let type_node = group.child_by_field_name("type");
             let type_span = type_node.map(Span::from_node);
             let type_name = type_node.and_then(|node| simple_type_path(node, source));
+            let type_ref = type_node.and_then(|node| type_ref_from_node(node, source));
             let mode = parameter_mode(group);
             let has_default = group.child_by_field_name("defaultValue").is_some();
             field_identifier_nodes(group, "name")
@@ -5821,6 +6659,7 @@ fn direct_routine_parameters(node: Node<'_>, source: &str) -> Vec<RoutineParamet
                     span: Span::from_node(identifier),
                     type_span,
                     type_name: type_name.clone(),
+                    type_ref: type_ref.clone(),
                     mode,
                     has_default,
                 })
@@ -5867,7 +6706,7 @@ fn enclosing_type(node: Node<'_>, source: &str) -> Option<String> {
                 continue;
             };
             if Span::from_node(type_node).contains(node_span) {
-                let identifiers = field_identifier_nodes(parent, "name");
+                let identifiers = declaration_name_identifiers(parent);
                 return identifiers
                     .last()
                     .map(|identifier| canonical_name(&node_text(*identifier, source)));
@@ -5887,7 +6726,7 @@ fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
                 .child_by_field_name("type")
                 .is_some_and(|type_node| Span::from_node(type_node).contains(node_span))
         {
-            return field_identifier_nodes(parent, "name")
+            return declaration_name_identifiers(parent)
                 .last()
                 .map(|identifier| node_text(*identifier, source));
         }
@@ -5897,15 +6736,170 @@ fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn simple_type_path(node: Node<'_>, source: &str) -> Option<String> {
+    type_ref_from_node(node, source).map(|type_ref| type_ref.display())
+}
+
+fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
+    type_ref_from_node_at_depth(node, source, 0)
+}
+
+fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Option<TypeRef> {
+    if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
+        return None;
+    }
     let mut type_node = node;
     while matches!(type_node.kind(), "type" | "typeref") {
         type_node = first_named_child(type_node)?;
     }
-    if type_node.kind() == "declString" {
-        return Some("string".to_owned());
+    match type_node.kind() {
+        "identifier" => Some(TypeRef {
+            path: vec![canonical_name(&node_text(type_node, source))],
+            args: Vec::new(),
+            span: Span::from_node(node),
+        }),
+        "typerefDot" => {
+            let lhs = type_node.child_by_field_name("lhs")?;
+            let rhs = type_node.child_by_field_name("rhs")?;
+            let next_depth = depth.saturating_add(1);
+            let mut left = type_ref_from_node_at_depth(lhs, source, next_depth)?;
+            let right = type_ref_from_node_at_depth(rhs, source, next_depth)?;
+            if !right.args.is_empty() {
+                left.args = right.args;
+            }
+            left.path.extend(right.path);
+            left.span = Span::from_node(node);
+            Some(left)
+        }
+        "typerefTpl" | "exprTpl" => {
+            let entity = type_node.child_by_field_name("entity")?;
+            let next_depth = depth.saturating_add(1);
+            let mut result = type_ref_from_node_at_depth(entity, source, next_depth)?;
+            let args_node = type_node.child_by_field_name("args")?;
+            let args = if matches!(args_node.kind(), "genericArgs" | "typerefArgs" | "exprArgs") {
+                (0..args_node.named_child_count())
+                    .filter_map(|index| args_node.named_child(index))
+                    .filter_map(|arg| type_ref_from_node_at_depth(arg, source, next_depth))
+                    .collect::<Vec<_>>()
+            } else {
+                type_ref_from_node_at_depth(args_node, source, next_depth)
+                    .into_iter()
+                    .collect()
+            };
+            if args.is_empty() {
+                return None;
+            }
+            result.args = args;
+            result.span = Span::from_node(node);
+            Some(result)
+        }
+        "declString" => Some(TypeRef {
+            path: vec!["string".to_owned()],
+            args: Vec::new(),
+            span: Span::from_node(node),
+        }),
+        _ => None,
     }
-    let parts = qualified_name_parts(&type_node, source)?;
-    (!parts.is_empty()).then(|| canonical_path(&parts))
+}
+
+fn declaration_name_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
+    let Some(name) = node.child_by_field_name("name") else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    collect_name_identifiers(name, &mut result);
+    result
+}
+
+fn collect_name_identifiers<'a>(node: Node<'a>, result: &mut Vec<Node<'a>>) {
+    match node.kind() {
+        "identifier" => result.push(node),
+        "genericTpl" => {
+            if let Some(entity) = node.child_by_field_name("entity") {
+                collect_name_identifiers(entity, result);
+            }
+        }
+        "genericDot" => {
+            if let Some(lhs) = node.child_by_field_name("lhs") {
+                collect_name_identifiers(lhs, result);
+            }
+            if let Some(rhs) = node.child_by_field_name("rhs") {
+                collect_name_identifiers(rhs, result);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn generic_template_for_name(node: Node<'_>) -> Option<Node<'_>> {
+    let name = node.child_by_field_name("name")?;
+    generic_template_in_name(name)
+}
+
+fn generic_template_in_name(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "genericTpl" => Some(node),
+        "genericDot" => node
+            .child_by_field_name("rhs")
+            .and_then(generic_template_in_name),
+        _ => None,
+    }
+}
+
+fn generic_parameters_for_node(node: Node<'_>, source: &str) -> Vec<GenericParameter> {
+    let Some(template) = generic_template_for_name(node) else {
+        return Vec::new();
+    };
+    let Some(arguments) = template.child_by_field_name("args") else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for index in 0..arguments.named_child_count() {
+        let Some(argument) = arguments.named_child(index) else {
+            continue;
+        };
+        if argument.kind() != "genericArgs" && argument.kind() != "genericArg" {
+            continue;
+        }
+        let groups = if argument.kind() == "genericArgs" {
+            (0..argument.named_child_count())
+                .filter_map(|child_index| argument.named_child(child_index))
+                .collect::<Vec<_>>()
+        } else {
+            vec![argument]
+        };
+        for group in groups {
+            if group.kind() != "genericArg" {
+                continue;
+            }
+            let constraint = generic_constraint_type_node(group)
+                .and_then(|type_node| type_ref_from_node(type_node, source));
+            for identifier in field_identifier_nodes(group, "name") {
+                result.push(GenericParameter {
+                    name: canonical_name(&node_text(identifier, source)),
+                    span: Span::from_node(identifier),
+                    constraint: constraint.clone(),
+                });
+            }
+        }
+    }
+    result
+}
+
+fn generic_constraint_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(type_node) = node
+        .child_by_field_name("type")
+        .filter(|type_node| type_node.kind() != ":")
+    {
+        return Some(type_node);
+    }
+    (0..node.named_child_count())
+        .filter_map(|index| node.named_child(index))
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "typeref" | "typerefDot" | "typerefTpl" | "typerefPtr" | "ppFragmentExpr"
+            )
+        })
 }
 
 fn build_scopes(
@@ -6161,7 +7155,26 @@ fn callable_lookup_identifier(node: Node<'_>) -> Node<'_> {
                 };
                 current = rhs;
             }
+            "exprTpl" => {
+                let Some(entity) = current.child_by_field_name("entity") else {
+                    return node;
+                };
+                current = entity;
+            }
             _ => return node,
+        }
+    }
+}
+
+fn callable_owner_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "exprTpl" => current = current.child_by_field_name("entity")?,
+            "exprDot" | "genericDot" | "typerefDot" => {
+                return current.child_by_field_name("lhs");
+            }
+            _ => return None,
         }
     }
 }

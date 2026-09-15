@@ -1257,6 +1257,9 @@ impl NavigationIndex {
         document: &Document,
         identifier: Node<'_>,
     ) -> Option<Vec<Candidate>> {
+        if is_identifier_in_qualified_path(identifier, &document.source) {
+            return None;
+        }
         let span = Span::from_node(identifier);
         let key = canonical_name(&node_text(identifier, &document.source));
         let routine_keys = document
@@ -1580,7 +1583,7 @@ impl NavigationIndex {
                 let Some(type_ref) = type_ref_from_node(node, &current_document.source) else {
                     return Ok(Vec::new());
                 };
-                self.type_receivers_for_type_ref_with_budget(
+                let receivers = self.type_receivers_for_type_ref_with_budget(
                     current_uri,
                     current_document,
                     type_ref.span.start,
@@ -1591,7 +1594,8 @@ impl NavigationIndex {
                     state,
                     cancel,
                     budget,
-                )
+                )?;
+                Ok(receivers)
             }
             "exprBinary" | "exprAs" => {
                 let Some(operator) = node.child_by_field_name("operator") else {
@@ -1876,7 +1880,7 @@ impl NavigationIndex {
             let Some(lhs) = entity.child_by_field_name("lhs") else {
                 return Ok(Vec::new());
             };
-            return self.resolve_receivers_with_state_and_budget(
+            let receivers = self.resolve_receivers_with_state_and_budget(
                 current_uri,
                 current_document,
                 offset,
@@ -1886,7 +1890,8 @@ impl NavigationIndex {
                 cancel,
                 budget,
                 depth.saturating_add(1),
-            );
+            )?;
+            return Ok(receivers);
         };
         let Some(result_document) = self.documents.get(&result_uri) else {
             return Ok(Vec::new());
@@ -7031,9 +7036,13 @@ fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Op
                     .filter_map(|arg| type_ref_from_node_at_depth(arg, source, next_depth))
                     .collect::<Vec<_>>()
             } else {
-                type_ref_from_node_at_depth(args_node, source, next_depth)
-                    .into_iter()
-                    .collect()
+                (0..type_node.named_child_count())
+                    .filter_map(|index| type_node.named_child(index))
+                    .filter(|argument| argument.start_byte() >= args_node.start_byte())
+                    .filter_map(|argument| {
+                        type_ref_from_node_at_depth(argument, source, next_depth)
+                    })
+                    .collect::<Vec<_>>()
             };
             if args.is_empty() {
                 return None;
@@ -7124,7 +7133,14 @@ fn generic_parameters_for_node(node: Node<'_>, source: &str) -> Vec<GenericParam
             let constraint_node = generic_constraint_type_node(group);
             let constraint =
                 constraint_node.and_then(|type_node| type_ref_from_node(type_node, source));
-            let constraint_unsupported = constraint_node.is_some() && constraint.is_none();
+            let has_constraint_syntax = source
+                .get(group.start_byte()..group.end_byte())
+                .is_some_and(|text| text.contains(':'));
+            let constraint_unsupported = has_constraint_syntax
+                && constraint_node.is_none_or(|type_node| {
+                    constraint.is_none()
+                        || generic_constraint_has_trailing_tokens(group, type_node, source)
+                });
             for identifier in field_identifier_nodes(group, "name") {
                 result.push(GenericParameter {
                     name: canonical_name(&node_text(identifier, source)),
@@ -7136,6 +7152,16 @@ fn generic_parameters_for_node(node: Node<'_>, source: &str) -> Vec<GenericParam
         }
     }
     result
+}
+
+fn generic_constraint_has_trailing_tokens(
+    group: Node<'_>,
+    constraint: Node<'_>,
+    source: &str,
+) -> bool {
+    source
+        .get(constraint.end_byte()..group.end_byte())
+        .is_some_and(|trailing| trailing.contains(','))
 }
 
 fn generic_constraint_type_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -7395,6 +7421,23 @@ fn qualified_name_parts(node: &Node<'_>, source: &str) -> Option<Vec<String>> {
         }
     }
     Some(parts)
+}
+
+fn is_identifier_in_qualified_path(identifier: Node<'_>, source: &str) -> bool {
+    let span = Span::from_node(identifier);
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
+            && Span::from_node(node).contains(span)
+            && qualified_name_parts(&node, source).is_some()
+        {
+            return node
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| Span::from_node(rhs).contains(span));
+        }
+        current = node.parent();
+    }
+    false
 }
 
 fn callable_lookup_identifier(node: Node<'_>) -> Node<'_> {

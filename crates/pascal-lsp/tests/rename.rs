@@ -2617,3 +2617,45 @@ end.
         ],
     );
 }
+
+#[test]
+fn class_field_rename_keeps_qualified_type_and_routine_formals_disjoint() {
+    let source = r#"unit QualifiedFieldRename;
+interface
+type
+  T = class
+    GlobalMember: Integer;
+  end;
+  Holder = class
+    T: Integer;
+  end;
+procedure Run<T>(Obj: Holder);
+implementation
+procedure Run<T>(Obj: Holder);
+var
+  Qualified: QualifiedFieldRename.T;
+begin
+  Qualified.GlobalMember;
+  Obj.T := 1;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "QualifiedFieldRename", source);
+    let target = range_in(source, "T: Integer", "T", 0);
+
+    let edits = index
+        .rename_edits(&source_uri, target.start, "FieldValue")
+        .expect("qualified class field rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (source_uri.clone(), target, "FieldValue".to_owned()),
+            (
+                source_uri,
+                range_in(source, "Obj.T", "T", 0),
+                "FieldValue".to_owned(),
+            ),
+        ],
+    );
+}

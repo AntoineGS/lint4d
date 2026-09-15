@@ -1,7 +1,7 @@
 use super::{
-    AssistanceBudget, Candidate, Document, NavigationIndex, Origin, ROOT_SCOPE, Region,
-    RoutineKind, Span, Symbol, SymbolKind, canonical_name, location_for_span, node_text,
-    symbol_visible_in_region,
+    AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, Origin,
+    ROOT_SCOPE, Region, RoutineKind, Span, Symbol, SymbolKind, canonical_name, location_for_span,
+    node_text, symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
@@ -148,6 +148,12 @@ pub(crate) struct DeclarationDisplay {
     pub(crate) excerpt: String,
     pub(crate) source_uri: Url,
     pub(crate) source_start: usize,
+}
+
+struct SpecializedRoutineSignature {
+    label: String,
+    label_start: usize,
+    parameter_spans: Vec<Span>,
 }
 
 impl NavigationIndex {
@@ -401,7 +407,7 @@ impl NavigationIndex {
                 | super::Receiver::IntegerLiteral(_) => None,
             })
             .collect::<Vec<_>>();
-        let selected_group = super::overload::select(
+        let selection = super::overload::select(
             self,
             uri,
             document,
@@ -413,8 +419,8 @@ impl NavigationIndex {
             0,
             cancel,
             &mut budget,
-        )?
-        .selected_group;
+        )?;
+        let selected_group = selection.selected_group;
         let mut selected = BTreeMap::<(String, String), Candidate>::new();
         for candidate in candidates {
             check_cancel(cancel)?;
@@ -461,18 +467,33 @@ impl NavigationIndex {
             let Some(document) = self.documents.get(&candidate.uri) else {
                 continue;
             };
-            let Some((label, label_start)) =
-                routine_signature_label(document, symbol, cancel, &mut budget)?
-            else {
+            let candidate_substitution = self.routine_owner_substitution_with_budget(
+                &candidate,
+                &GenericSubstitution::empty(),
+                &owner_instances,
+                &mut overload_state,
+                cancel,
+                &mut budget,
+            )?;
+            let signature = specialized_routine_signature_label(
+                self,
+                document,
+                symbol,
+                candidate_substitution.as_ref(),
+                cancel,
+                &mut budget,
+            )?;
+            let Some(signature) = signature else {
                 continue;
             };
-            if symbol.routine_parameter_spans.len() > MAX_SIGNATURE_PARAMETERS {
+            if signature.parameter_spans.len() > MAX_SIGNATURE_PARAMETERS {
                 return Err(format!(
                     "signature help exceeds the {MAX_SIGNATURE_PARAMETERS}-parameter limit"
                 ));
             }
-            let parameter_count = symbol.routine_parameter_spans.len();
-            let signature_bytes = label
+            let parameter_count = signature.parameter_spans.len();
+            let signature_bytes = signature
+                .label
                 .len()
                 .saturating_add(parameter_count.saturating_mul(std::mem::size_of::<u32>() * 2));
             response_bytes = response_bytes.saturating_add(signature_bytes);
@@ -482,10 +503,10 @@ impl NavigationIndex {
                 ));
             }
             budget.require_bytes(signature_bytes, cancel)?;
-            let Some(parameters) = parameter_information_with_budget(
-                symbol,
-                &label,
-                label_start,
+            let Some(parameters) = parameter_information_for_spans_with_budget(
+                &signature.parameter_spans,
+                &signature.label,
+                signature.label_start,
                 cancel,
                 &mut budget,
             )?
@@ -501,7 +522,7 @@ impl NavigationIndex {
             signatures.push((
                 super::overload::key_for_candidate(self, &candidate),
                 SignatureInformation {
-                    label,
+                    label: signature.label,
                     documentation: None,
                     parameters: Some(parameters),
                     active_parameter: None,
@@ -994,7 +1015,7 @@ impl NavigationIndex {
             let Some(symbol) = self.symbol(&candidate) else {
                 continue;
             };
-            if symbol.local_only {
+            if symbol.local_only || symbol.generic_parameter.is_some() {
                 continue;
             }
             if symbol.kind == SymbolKind::Routine
@@ -1389,6 +1410,87 @@ impl NavigationIndex {
                     let Some(declaration_document) = self.documents.get(&reference.uri) else {
                         continue;
                     };
+                    if !is_constructor {
+                        if let Some(dot) = super::member_expression_at(identifier)
+                            .filter(|dot| super::is_right_hand_member(*dot, identifier))
+                        {
+                            if let Some(lhs) = dot.child_by_field_name("lhs") {
+                                let receivers = self.resolve_receivers_with_state_and_budget(
+                                    uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
+                                )?;
+                                let mut specialized_targets = Vec::new();
+                                let mut receiver_is_known = false;
+                                for receiver in receivers {
+                                    let super::Receiver::Type(instance) = receiver else {
+                                        continue;
+                                    };
+                                    receiver_is_known = true;
+                                    let owner_key =
+                                        symbol.owner_type.as_deref().unwrap_or(&instance.key);
+                                    let Some(member_substitution) = self
+                                        .member_owner_substitution_with_budget(
+                                            &instance.uri,
+                                            &instance.key,
+                                            &instance.substitution,
+                                            &reference.uri,
+                                            owner_key,
+                                            &mut state,
+                                            cancel,
+                                            budget,
+                                        )?
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(annotation) = symbol.result_type_annotation() else {
+                                        continue;
+                                    };
+                                    let Some(lookup_identifier) = identifier_at_with_budget(
+                                        declaration_document.tree.root_node(),
+                                        annotation.offset,
+                                        cancel,
+                                        budget,
+                                        "type definition",
+                                    )?
+                                    else {
+                                        continue;
+                                    };
+                                    let result_receivers = self
+                                        .type_receivers_for_type_ref_with_budget(
+                                            &reference.uri,
+                                            declaration_document,
+                                            annotation.offset,
+                                            &annotation.type_ref,
+                                            lookup_identifier,
+                                            Some(annotation.scope),
+                                            &member_substitution,
+                                            &mut state,
+                                            cancel,
+                                            budget,
+                                        )?;
+                                    for result_receiver in result_receivers {
+                                        let super::Receiver::Type(result_instance) =
+                                            result_receiver
+                                        else {
+                                            continue;
+                                        };
+                                        specialized_targets.extend(
+                                            self.type_candidates_in_unit_with_budget(
+                                                &result_instance.uri,
+                                                &result_instance.key,
+                                                result_instance.uri == *uri,
+                                                cancel,
+                                                budget,
+                                            )?,
+                                        );
+                                    }
+                                }
+                                if receiver_is_known {
+                                    targets.extend(specialized_targets);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     if is_constructor {
                         if let Some(dot) = super::member_expression_at(identifier)
                             .filter(|dot| super::is_right_hand_member(*dot, identifier))
@@ -1638,13 +1740,74 @@ impl NavigationIndex {
             ));
         }
 
+        let mut resolution_state = super::ResolutionState::new();
+        let owner_instances = if let Some(dot) = super::member_expression_at(identifier)
+            .filter(|dot| super::is_right_hand_member(*dot, identifier))
+        {
+            match dot.child_by_field_name("lhs") {
+                Some(lhs) => {
+                    let receivers = self.resolve_receivers_with_state_and_budget(
+                        uri,
+                        document,
+                        offset,
+                        lhs,
+                        lhs,
+                        &mut resolution_state,
+                        cancel,
+                        &mut budget,
+                        0,
+                    )?;
+                    if resolution_state.receiver_resolution_uncertain() {
+                        Vec::new()
+                    } else {
+                        receivers
+                            .into_iter()
+                            .filter_map(|receiver| match receiver {
+                                super::Receiver::Type(instance) => Some(instance),
+                                super::Receiver::Unit(_)
+                                | super::Receiver::Builtin(_)
+                                | super::Receiver::IntegerLiteral(_) => None,
+                            })
+                            .collect()
+                    }
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         let selected = self.select_display_candidates(candidates);
         let mut displays = Vec::with_capacity(selected.len());
         let mut seen = HashSet::new();
         for candidate in selected {
             check_cancel(cancel)?;
             budget.require_work(1, cancel)?;
-            let Some(display) = self.declaration_display(&candidate, cancel, &mut budget)? else {
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            let substitution = if matches!(
+                symbol.kind,
+                SymbolKind::Routine
+                    | SymbolKind::Variable
+                    | SymbolKind::Parameter
+                    | SymbolKind::Field
+                    | SymbolKind::Property
+            ) {
+                self.routine_owner_substitution_with_budget(
+                    &candidate,
+                    &GenericSubstitution::empty(),
+                    &owner_instances,
+                    &mut resolution_state,
+                    cancel,
+                    &mut budget,
+                )?
+            } else {
+                None
+            };
+            let Some(display) =
+                self.declaration_display(&candidate, substitution.as_ref(), cancel, &mut budget)?
+            else {
                 continue;
             };
             let key = (
@@ -1721,6 +1884,7 @@ impl NavigationIndex {
     fn declaration_display(
         &self,
         candidate: &Candidate,
+        substitution: Option<&GenericSubstitution>,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Option<DeclarationDisplay>, String> {
@@ -1730,7 +1894,9 @@ impl NavigationIndex {
         let Some(symbol) = document.symbols.get(candidate.index) else {
             return Ok(None);
         };
-        let Some(excerpt) = declaration_excerpt(document, symbol, cancel, budget)? else {
+        let Some(excerpt) =
+            declaration_excerpt(self, document, symbol, substitution, cancel, budget)?
+        else {
             return Ok(None);
         };
         let unit_name = display_unit_name(document);
@@ -2450,6 +2616,248 @@ fn routine_signature_label(
     Ok(Some((label.to_owned(), label_start)))
 }
 
+fn specialized_routine_signature_label(
+    index: &NavigationIndex,
+    document: &Document,
+    symbol: &Symbol,
+    substitution: Option<&GenericSubstitution>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<SpecializedRoutineSignature>, String> {
+    let Some((label, label_start)) = routine_signature_label(document, symbol, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    let parameter_spans = symbol.routine_parameter_spans.clone();
+    let Some(substitution) = substitution else {
+        return Ok(Some(SpecializedRoutineSignature {
+            label,
+            label_start,
+            parameter_spans,
+        }));
+    };
+
+    let mut replacements = Vec::new();
+    for parameter in &symbol.routine_parameters {
+        let Some(span) = parameter.type_span else {
+            continue;
+        };
+        let Some(text) = specialized_type_text(
+            index,
+            symbol,
+            parameter.type_ref.as_ref(),
+            substitution,
+            cancel,
+            budget,
+        )?
+        else {
+            continue;
+        };
+        replacements.push(LabelReplacement { span, text });
+    }
+    if let (Some(span), Some(type_ref)) = (symbol.result_type_span, symbol.result_type_ref.as_ref())
+    {
+        if let Some(text) =
+            specialized_type_text(index, symbol, Some(type_ref), substitution, cancel, budget)?
+        {
+            replacements.push(LabelReplacement { span, text });
+        }
+    }
+
+    let label_end = label_start.saturating_add(label.len());
+    replacements.retain(|replacement| {
+        replacement.span.start >= label_start && replacement.span.end <= label_end
+    });
+    replacements.sort_by_key(|replacement| (replacement.span.start, replacement.span.end));
+    replacements.dedup_by(|left, right| left.span == right.span);
+    if replacements.is_empty() {
+        return Ok(Some(SpecializedRoutineSignature {
+            label,
+            label_start,
+            parameter_spans,
+        }));
+    }
+
+    let mut specialized = String::with_capacity(label.len());
+    let mut cursor = 0usize;
+    for replacement in &replacements {
+        let start = replacement.span.start.saturating_sub(label_start);
+        let end = replacement.span.end.saturating_sub(label_start);
+        if start < cursor || end > label.len() {
+            return Ok(Some(SpecializedRoutineSignature {
+                label,
+                label_start,
+                parameter_spans,
+            }));
+        }
+        let Some(prefix) = label.get(cursor..start) else {
+            return Ok(Some(SpecializedRoutineSignature {
+                label,
+                label_start,
+                parameter_spans,
+            }));
+        };
+        specialized.push_str(prefix);
+        specialized.push_str(&replacement.text);
+        cursor = end;
+    }
+    let Some(suffix) = label.get(cursor..) else {
+        return Ok(Some(SpecializedRoutineSignature {
+            label,
+            label_start,
+            parameter_spans,
+        }));
+    };
+    specialized.push_str(suffix);
+    budget.require_bytes(specialized.len(), cancel)?;
+
+    let parameter_spans = parameter_spans
+        .into_iter()
+        .map(|span| adjusted_span(span, &replacements))
+        .collect::<Option<Vec<_>>>();
+    let Some(parameter_spans) = parameter_spans else {
+        return Ok(Some(SpecializedRoutineSignature {
+            label,
+            label_start,
+            parameter_spans: symbol.routine_parameter_spans.clone(),
+        }));
+    };
+    Ok(Some(SpecializedRoutineSignature {
+        label: specialized,
+        label_start,
+        parameter_spans,
+    }))
+}
+
+struct LabelReplacement {
+    span: Span,
+    text: String,
+}
+
+fn specialized_type_text(
+    index: &NavigationIndex,
+    symbol: &Symbol,
+    type_ref: Option<&super::TypeRef>,
+    substitution: &GenericSubstitution,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    let Some(type_ref) = type_ref else {
+        return Ok(None);
+    };
+    if type_ref.path.len() != 1 || !type_ref.args.is_empty() {
+        return Ok(None);
+    }
+    if symbol
+        .generic_parameters
+        .iter()
+        .any(|parameter| parameter.name == type_ref.path[0])
+    {
+        return Ok(None);
+    }
+    let Some(resolved) = substitution.get(&type_ref.path[0]) else {
+        return Ok(None);
+    };
+    resolved_type_text(index, resolved, cancel, budget, 0)
+}
+
+fn resolved_type_text(
+    index: &NavigationIndex,
+    resolved: &super::ResolvedType,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    depth: usize,
+) -> Result<Option<String>, String> {
+    if depth >= super::MAX_TYPE_REF_RECURSION_DEPTH {
+        return Ok(None);
+    }
+    budget.require_work(1, cancel)?;
+    let text = match resolved {
+        super::ResolvedType::Builtin(builtin) => builtin_type_text(*builtin).to_owned(),
+        super::ResolvedType::IntegerLiteral(value) => value.to_string(),
+        super::ResolvedType::Named(instance) => {
+            let Some(candidate) = index.type_symbol_candidate(instance) else {
+                return Ok(None);
+            };
+            let Some(symbol) = index.symbol(&candidate) else {
+                return Ok(None);
+            };
+            let mut text = symbol.name.clone();
+            if !instance.parameter_names.is_empty() {
+                let mut arguments = Vec::with_capacity(instance.parameter_names.len());
+                for name in &instance.parameter_names {
+                    let Some(argument) = instance.substitution.get(name) else {
+                        return Ok(None);
+                    };
+                    let Some(argument) = resolved_type_text(
+                        index,
+                        argument,
+                        cancel,
+                        budget,
+                        depth.saturating_add(1),
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    arguments.push(argument);
+                }
+                text.push('<');
+                text.push_str(&arguments.join(","));
+                text.push('>');
+            }
+            text
+        }
+    };
+    budget.require_bytes(text.len(), cancel)?;
+    Ok(Some(text))
+}
+
+fn builtin_type_text(builtin: super::BuiltinType) -> &'static str {
+    match builtin {
+        super::BuiltinType::Integer(kind) => match kind {
+            super::IntegerKind::Literal | super::IntegerKind::Integer => "Integer",
+            super::IntegerKind::ShortInt => "ShortInt",
+            super::IntegerKind::SmallInt => "SmallInt",
+            super::IntegerKind::Byte => "Byte",
+            super::IntegerKind::Word => "Word",
+            super::IntegerKind::Cardinal => "Cardinal",
+            super::IntegerKind::LongWord => "LongWord",
+            super::IntegerKind::Int64 => "Int64",
+            super::IntegerKind::UInt64 => "UInt64",
+            super::IntegerKind::NativeInt => "NativeInt",
+            super::IntegerKind::NativeUInt => "NativeUInt",
+        },
+        super::BuiltinType::Real => "Real",
+        super::BuiltinType::String => "string",
+        super::BuiltinType::Character => "Char",
+        super::BuiltinType::Boolean => "Boolean",
+    }
+}
+
+fn adjusted_span(span: Span, replacements: &[LabelReplacement]) -> Option<Span> {
+    Some(Span {
+        start: adjusted_offset(span.start, replacements)?,
+        end: adjusted_offset(span.end, replacements)?,
+    })
+}
+
+fn adjusted_offset(offset: usize, replacements: &[LabelReplacement]) -> Option<usize> {
+    let mut result = offset;
+    for replacement in replacements {
+        if replacement.span.end > offset {
+            break;
+        }
+        let old_len = replacement.span.end.checked_sub(replacement.span.start)?;
+        if replacement.text.len() >= old_len {
+            result = result.checked_add(replacement.text.len() - old_len)?;
+        } else {
+            result = result.checked_sub(old_len - replacement.text.len())?;
+        }
+    }
+    Some(result)
+}
+
+#[cfg(test)]
 fn parameter_information_with_budget(
     symbol: &Symbol,
     label: &str,
@@ -2457,7 +2865,23 @@ fn parameter_information_with_budget(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<Vec<ParameterInformation>>, String> {
-    let parameter_count = symbol.routine_parameter_spans.len();
+    parameter_information_for_spans_with_budget(
+        &symbol.routine_parameter_spans,
+        label,
+        label_start,
+        cancel,
+        budget,
+    )
+}
+
+fn parameter_information_for_spans_with_budget(
+    parameter_spans: &[Span],
+    label: &str,
+    label_start: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Vec<ParameterInformation>>, String> {
+    let parameter_count = parameter_spans.len();
     budget.require_work(parameter_count, cancel)?;
     budget.require_bytes(
         label
@@ -2470,7 +2894,7 @@ fn parameter_information_with_budget(
     record_assistance_helper_entry(&PARAMETER_INFORMATION_HELPER_ENTRIES);
 
     let mut ranges = Vec::with_capacity(parameter_count);
-    for span in &symbol.routine_parameter_spans {
+    for span in parameter_spans {
         check_cancel(cancel)?;
         let Some(start) = span.start.checked_sub(label_start) else {
             return Ok(None);
@@ -2770,8 +3194,10 @@ fn ignored_offset_with_budget(
 }
 
 fn declaration_excerpt(
+    index: &NavigationIndex,
     document: &Document,
     symbol: &Symbol,
+    substitution: Option<&GenericSubstitution>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<String>, String> {
@@ -2780,14 +3206,54 @@ fn declaration_excerpt(
         budget.require_bytes(excerpt.len(), cancel)?;
         return Ok(Some(excerpt));
     }
-    let Some(raw) = (match symbol.kind {
-        SymbolKind::Routine => routine_excerpt(document, symbol, cancel, budget),
-        SymbolKind::Type => type_excerpt(document, symbol),
-        _ => source_excerpt(document, symbol.declaration_span),
-    }) else {
+    let raw = match symbol.kind {
+        SymbolKind::Routine => {
+            if let Some(substitution) = substitution {
+                specialized_routine_signature_label(
+                    index,
+                    document,
+                    symbol,
+                    Some(substitution),
+                    cancel,
+                    budget,
+                )?
+                .map(|signature| signature.label)
+            } else {
+                routine_excerpt(document, symbol, cancel, budget).map(str::to_owned)
+            }
+        }
+        SymbolKind::Type => type_excerpt(document, symbol).map(str::to_owned),
+        _ => {
+            let Some(raw) = source_excerpt(document, symbol.declaration_span) else {
+                return Ok(None);
+            };
+            let raw = raw.to_owned();
+            if let Some(substitution) = substitution.filter(|_| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Variable
+                        | SymbolKind::Parameter
+                        | SymbolKind::Field
+                        | SymbolKind::Property
+                )
+            }) {
+                Some(specialized_typed_declaration_label(
+                    index,
+                    symbol,
+                    raw,
+                    substitution,
+                    cancel,
+                    budget,
+                )?)
+            } else {
+                Some(raw)
+            }
+        }
+    };
+    let Some(raw) = raw else {
         return Ok(None);
     };
-    let Some(excerpt) = bounded_source(raw) else {
+    let Some(excerpt) = bounded_source(&raw) else {
         return Ok(None);
     };
     budget.require_bytes(excerpt.len(), cancel)?;
@@ -2798,6 +3264,53 @@ fn declaration_excerpt(
     } else {
         Ok(Some(excerpt))
     }
+}
+
+fn specialized_typed_declaration_label(
+    index: &NavigationIndex,
+    symbol: &Symbol,
+    raw: String,
+    substitution: &GenericSubstitution,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<String, String> {
+    let Some(type_ref) = symbol.type_ref.as_ref() else {
+        return Ok(raw);
+    };
+    let Some(text) =
+        specialized_type_text(index, symbol, Some(type_ref), substitution, cancel, budget)?
+    else {
+        return Ok(raw);
+    };
+
+    let label = raw.trim();
+    let label_start = symbol
+        .declaration_span
+        .start
+        .saturating_add(raw.len().saturating_sub(raw.trim_start().len()));
+    let label_end = label_start.saturating_add(label.len());
+    if type_ref.span.start < label_start || type_ref.span.end > label_end {
+        return Ok(raw);
+    }
+    let start = type_ref.span.start.saturating_sub(label_start);
+    let end = type_ref.span.end.saturating_sub(label_start);
+    let Some(prefix) = label.get(..start) else {
+        return Ok(raw);
+    };
+    let Some(suffix) = label.get(end..) else {
+        return Ok(raw);
+    };
+    let mut specialized = String::with_capacity(
+        prefix
+            .len()
+            .saturating_add(text.len())
+            .saturating_add(suffix.len()),
+    );
+    specialized.push_str(prefix);
+    specialized.push_str(&text);
+    specialized.push_str(suffix);
+    budget.require_bytes(specialized.len(), cancel)?;
+    Ok(specialized)
 }
 
 fn routine_excerpt<'a>(

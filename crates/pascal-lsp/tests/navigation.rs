@@ -7704,6 +7704,537 @@ end.
 }
 
 #[test]
+fn generic_formal_lookup_does_not_capture_qualified_types_or_members() {
+    let source = r#"unit QualifiedRename;
+interface
+type
+  T = class
+    GlobalMember: Integer;
+  end;
+  Holder = class
+    T: Integer;
+  end;
+procedure Run<T>(Obj: Holder);
+implementation
+procedure Run<T>(Obj: Holder);
+var
+  Qualified: QualifiedRename.T;
+begin
+  Qualified.GlobalMember;
+  Obj.T := 1;
+end;
+end.
+"#;
+    let source_uri = uri("QualifiedRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("qualified generic formal source parses");
+
+    let qualified_type = index.navigate(
+        &source_uri,
+        final_qualified_type_position(source, "QualifiedRename.T"),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_type.len(), 1);
+    assert_location_start(
+        &qualified_type[0],
+        &source_uri,
+        position_of(source, "T = class", 0),
+    );
+
+    let member = index.navigate(
+        &source_uri,
+        final_qualified_type_position(source, "Obj.T"),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(
+        &member[0],
+        &source_uri,
+        position_of(source, "T: Integer", 0),
+    );
+}
+
+#[test]
+fn inferred_and_explicit_generic_actuals_keep_the_caller_type_scope() {
+    let source = r#"unit GenericInferenceScope;
+interface
+type
+  T = class
+    LocalMember: Integer;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    function Pick<U>(Value: U): U;
+  end;
+implementation
+function TBox<T>.Pick<U>(Value: U): U;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  B: TBox<TWidget>;
+  Obj: T;
+begin
+  B.Pick(Obj).LocalMember;
+  B.Pick(Obj).WidgetMember;
+  B.Pick<T>(Obj).LocalMember;
+  B.Pick<T>(Obj).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInferenceScope");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inference scope source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "LocalMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1);
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "LocalMember: Integer", 0),
+        );
+    }
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "generic occurrence {occurrence} used Widget"
+        );
+    }
+}
+
+#[test]
+fn inherited_constructors_satisfy_constructor_constraints_without_fallback() {
+    let source = r#"unit InheritedConstructorConstraint;
+interface
+type
+  TBase = class
+    constructor Create;
+  end;
+  TChild = class(TBase)
+  end;
+  TGood = class
+    GoodMember: Integer;
+  end;
+  TBad = class
+    BadMember: Integer;
+  end;
+function Choose<T: constructor>(Value: T): TGood; overload;
+function Choose(Value: TBase): TBad; overload;
+implementation
+constructor TBase.Create;
+begin
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Choose(Obj).GoodMember;
+  Choose(Obj).BadMember;
+end;
+end.
+"#;
+    let source_uri = uri("InheritedConstructorConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited constructor constraint source parses");
+
+    let good = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "GoodMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&good, &source_uri, source, "GoodMember", 0);
+
+    let bad = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BadMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(bad.is_empty());
+}
+
+#[test]
+fn generic_ancestry_preserves_instantiated_parent_arguments() {
+    let source = r#"unit GenericInstantiatedAncestry;
+interface
+type
+  TBox<T> = class
+  end;
+  TChild<T> = class(TBox<T>)
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Good(Value: TBox<TWidget>): TWidget;
+function Bad(Value: TBox<TOther>): TOther;
+implementation
+procedure Caller;
+var
+  Child: TChild<TWidget>;
+begin
+  Good(Child).WidgetMember;
+  Bad(Child).OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInstantiatedAncestry");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("instantiated ancestry source parses");
+
+    let good = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&good, &source_uri, source, "WidgetMember", 0);
+
+    let bad = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(bad.is_empty());
+}
+
+#[test]
+fn recovered_generic_constraint_declarations_are_unsupported() {
+    let source = r#"unit RecoveredGenericConstraint;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+function Bad<U: class, record>(Value: U): U;
+implementation
+function Bad<U: class, record>(Value: U): U;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  Bad<TWidget, TWidget>(Obj).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("RecoveredGenericConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("recovered generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn generic_type_expression_arguments_preserve_all_parameters() {
+    let source = r#"unit GenericTypeExpressionArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T; U> = class
+    Value: U;
+  end;
+  TPair<T; U> = class
+    Second: U;
+  end;
+implementation
+procedure Caller;
+begin
+  TBox<TWidget, TOther>.Value.WidgetMember;
+  TPair<TWidget, TOther>.Second.OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericTypeExpressionArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic type expression source parses");
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&valid, &source_uri, source, "OtherMember", 0);
+}
+
+#[test]
+fn generic_call_arguments_ignore_comments_but_preserve_arity() {
+    let source = r#"unit GenericCommentArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  Identity<TWidget { brace note }>(Obj).WidgetMember;
+  Identity<TWidget (* star note *)>(Obj).WidgetMember;
+  Identity<TWidget, TOther { invalid extra actual }>(Obj).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericCommentArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic comment argument source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "WidgetMember", 0);
+    }
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn type_definition_resolves_a_specialized_generic_routine_result() {
+    let source = r#"unit GenericRoutineTypeDefinition;
+interface
+type
+  TBox<T> = class
+    function GetValue: T;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.GetValue().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericRoutineTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic routine type definition source parses");
+
+    let type_definition = index.type_definitions(
+        &source_uri,
+        final_qualified_type_position(source, "Box.GetValue"),
+    );
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &source_uri,
+        position_of(source, "TWidget = class", 0),
+    );
+}
+
+#[test]
+fn generic_member_completion_excludes_formal_declarations() {
+    let source = r#"unit GenericMemberCompletion;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.
+end;
+end.
+"#;
+    let source_uri = uri("GenericMemberCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic member completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Box.", 0))
+        .expect("generic member completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Value"]
+    );
+}
+
+#[test]
+fn specialized_generic_assistance_renders_bound_routine_labels() {
+    let source = r#"unit GenericAssistanceLabels;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  T = class
+  end;
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+    procedure Put(Value: T);
+  end;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Obj: TWidget;
+begin
+  Box.GetValue().WidgetMember;
+  Box.Value.WidgetMember;
+  Box.Put(Obj);
+end;
+end.
+"#;
+    let source_uri = uri("GenericAssistanceLabels");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic assistance labels source parses");
+
+    let mut value_position = position_of(source, "Box.Value.WidgetMember", 0);
+    value_position.character += "Box.".encode_utf16().count() as u32;
+    let value_hover = index
+        .hover(&source_uri, value_position)
+        .expect("specialized generic field hover");
+    assert!(hover_text(&value_hover).contains("Value: TWidget;"));
+    assert!(!hover_text(&value_hover).contains("Value: T;"));
+
+    let get_value_position = final_qualified_type_position(source, "Box.GetValue");
+    let hover = index
+        .hover(&source_uri, get_value_position)
+        .expect("specialized generic routine hover");
+    assert!(hover_text(&hover).contains("function GetValue: TWidget;"));
+    assert!(!hover_text(&hover).contains("function GetValue: T;"));
+    assert_eq!(
+        hover.range,
+        Some(Range::new(
+            get_value_position,
+            Position::new(
+                get_value_position.line,
+                get_value_position.character + "GetValue".encode_utf16().count() as u32,
+            ),
+        ))
+    );
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "Box.Put(", 0))
+        .expect("specialized generic routine signature help")
+        .expect("specialized generic routine signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].label,
+        "procedure Put(Value: TWidget);"
+    );
+}
+
+#[test]
 fn conditional_navigation_uses_only_a_provably_active_branch() {
     let source = r#"unit ConditionalNavigation;
 interface

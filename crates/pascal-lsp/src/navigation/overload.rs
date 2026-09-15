@@ -142,7 +142,6 @@ pub(super) fn select(
             current_uri,
             current_document,
             argument,
-            receiver_substitution,
             state,
             depth,
             cancel,
@@ -375,7 +374,7 @@ fn score_group(
                         return Ok(None);
                     }
                 } else {
-                    match conversion(index, actual, &expected, ancestry, cancel, budget)? {
+                    match conversion(index, actual, &expected, state, ancestry, cancel, budget)? {
                         Conversion::Cost(value) => cost = cost.saturating_add(value),
                         Conversion::Unknown => uncertain = true,
                         Conversion::Incompatible => return Ok(None),
@@ -571,8 +570,18 @@ pub(super) fn generic_constraints_satisfied(
                     continue;
                 }
                 "constructor" => {
-                    if !has_proven_constructor(index, &actual) {
-                        return Ok(ConstraintOutcome::Contradictory);
+                    match has_proven_constructor(
+                        index,
+                        &actual,
+                        actual_uri_is_current(&actual, &candidate.uri),
+                        cancel,
+                        budget,
+                    )? {
+                        ConstraintOutcome::Proven => {}
+                        ConstraintOutcome::Unknown => unknown = true,
+                        ConstraintOutcome::Contradictory => {
+                            return Ok(ConstraintOutcome::Contradictory);
+                        }
                     }
                     continue;
                 }
@@ -606,7 +615,7 @@ pub(super) fn generic_constraints_satisfied(
             unknown = true;
             continue;
         };
-        match conversion(index, &actual, &expected, ancestry, cancel, budget)? {
+        match conversion(index, &actual, &expected, state, ancestry, cancel, budget)? {
             Conversion::Cost(_) => {}
             Conversion::Unknown => unknown = true,
             Conversion::Incompatible => return Ok(ConstraintOutcome::Contradictory),
@@ -619,18 +628,54 @@ pub(super) fn generic_constraints_satisfied(
     })
 }
 
-fn has_proven_constructor(index: &NavigationIndex, identity: &TypeIdentity) -> bool {
+fn actual_uri_is_current(identity: &TypeIdentity, current_uri: &Url) -> bool {
+    matches!(identity, TypeIdentity::Named { uri, .. } if uri == current_uri)
+}
+
+fn has_proven_constructor(
+    index: &NavigationIndex,
+    identity: &TypeIdentity,
+    allow_implementation: bool,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ConstraintOutcome, String> {
     let TypeIdentity::Named { uri, key, .. } = identity else {
-        return false;
+        return Ok(ConstraintOutcome::Contradictory);
     };
     let Some(document) = index.documents.get(uri) else {
-        return false;
+        return Ok(ConstraintOutcome::Unknown);
     };
-    let Some(indices) = document.member_symbol_indices_by_owner.get(key) else {
-        return false;
+    let Some(type_indices) = document.type_symbol_indices.get(key) else {
+        return Ok(ConstraintOutcome::Unknown);
     };
-    indices.iter().any(|index| {
-        document.symbols.get(*index).is_some_and(|symbol| {
+    if type_indices.len() != 1 {
+        return Ok(ConstraintOutcome::Unknown);
+    }
+    let Some(type_symbol) = document
+        .symbols
+        .get(*type_indices.first().expect("non-empty type indices"))
+    else {
+        return Ok(ConstraintOutcome::Unknown);
+    };
+    if type_symbol.kind != SymbolKind::Type {
+        return Ok(ConstraintOutcome::Unknown);
+    }
+    let mut ancestry = AncestryResolutionState::new();
+    let lookup = index.member_candidates_for_type_with_state_and_budget(
+        uri,
+        key,
+        type_symbol.scope,
+        None,
+        allow_implementation,
+        &mut ancestry,
+        cancel,
+        budget,
+    )?;
+    if !lookup.ancestry_known || !lookup.ambiguous_names.is_empty() {
+        return Ok(ConstraintOutcome::Unknown);
+    }
+    let has_constructor = lookup.candidates.iter().any(|candidate| {
+        index.symbol(candidate).is_some_and(|symbol| {
             symbol.kind == SymbolKind::Routine
                 && symbol.routine_kind == super::RoutineKind::Constructor
                 && symbol
@@ -638,6 +683,11 @@ fn has_proven_constructor(index: &NavigationIndex, identity: &TypeIdentity) -> b
                     .iter()
                     .all(|parameter| parameter.has_default)
         })
+    });
+    Ok(if has_constructor {
+        ConstraintOutcome::Proven
+    } else {
+        ConstraintOutcome::Contradictory
     })
 }
 
@@ -659,6 +709,7 @@ fn generic_call_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {
                 .filter_map(|index| entity.named_child(index))
                 .filter(|argument| {
                     argument.start_byte() >= arguments.start_byte()
+                        && !argument.is_extra()
                         && !matches!(argument.kind(), "kLt" | "kGt")
                 })
                 .collect(),
@@ -813,7 +864,6 @@ fn infer_argument(
     current_uri: &Url,
     current_document: &Document,
     node: Node<'_>,
-    receiver_substitution: &GenericSubstitution,
     state: &mut ResolutionState,
     depth: usize,
     cancel: &AtomicBool,
@@ -957,7 +1007,7 @@ fn infer_argument(
                 index,
                 &candidate,
                 symbol,
-                receiver_substitution,
+                &GenericSubstitution::empty(),
                 state,
                 cancel,
                 budget,
@@ -1292,6 +1342,7 @@ fn conversion(
     index: &NavigationIndex,
     actual: &TypeIdentity,
     expected: &TypeIdentity,
+    state: &mut ResolutionState,
     ancestry: &mut AncestryResolutionState,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
@@ -1339,22 +1390,25 @@ fn conversion(
                 uri: actual_uri,
                 key: actual_key,
                 kind: actual_kind,
-                ..
+                args: actual_args,
             },
             TypeIdentity::Named {
                 uri: expected_uri,
                 key: expected_key,
                 kind: expected_kind,
-                ..
+                args: expected_args,
             },
         ) => match upcast_distance(
             index,
             actual_uri,
             actual_key,
             *actual_kind,
+            actual_args,
             expected_uri,
             expected_key,
             *expected_kind,
+            expected_args,
+            state,
             ancestry,
             cancel,
             budget,
@@ -1400,9 +1454,12 @@ fn upcast_distance(
     actual_uri: &Url,
     actual_key: &str,
     actual_kind: TypeKind,
+    actual_args: &[TypeIdentity],
     expected_uri: &Url,
     expected_key: &str,
     expected_kind: TypeKind,
+    expected_args: &[TypeIdentity],
+    state: &mut ResolutionState,
     ancestry: &mut AncestryResolutionState,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
@@ -1417,26 +1474,74 @@ fn upcast_distance(
         return Ok(Upcast::No);
     }
 
-    let target = (expected_uri.clone(), expected_key.to_owned());
-    let mut queue = VecDeque::from([(actual_uri.clone(), actual_key.to_owned(), 0u32)]);
+    let actual = TypeIdentity::Named {
+        uri: actual_uri.clone(),
+        key: actual_key.to_owned(),
+        kind: actual_kind,
+        args: actual_args.to_vec(),
+    };
+    let mut queue = VecDeque::from([(actual, 0u32)]);
     let mut visited = HashSet::new();
-    while let Some((uri, key, distance)) = queue.pop_front() {
+    while let Some((current, distance)) = queue.pop_front() {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if !visited.insert((uri.clone(), key.clone())) {
+        let TypeIdentity::Named { uri, key, args, .. } = &current else {
+            return Ok(Upcast::Unknown);
+        };
+        if !visited.insert(current.clone()) {
             continue;
         }
+        if uri == expected_uri && key == expected_key {
+            return Ok(if args == expected_args {
+                Upcast::Distance(distance)
+            } else {
+                Upcast::No
+            });
+        }
         let ancestry_result =
-            index.resolve_type_ancestry_with_budget(&uri, &key, ancestry, cancel, budget)?;
+            index.resolve_type_ancestry_with_budget(uri, key, ancestry, cancel, budget)?;
         if ancestry_result.status == AncestryStatus::Unknown {
             return Ok(Upcast::Unknown);
         }
-        for (parent_uri, parent_key) in ancestry_result.parents {
+        let Some(document) = index.documents.get(uri) else {
+            return Ok(Upcast::Unknown);
+        };
+        let Some(entries) = document.type_ancestry.get(key) else {
+            return Ok(Upcast::Unknown);
+        };
+        let Some(entry) = entries.first().filter(|_| entries.len() == 1) else {
+            return Ok(Upcast::Unknown);
+        };
+        let Some(ResolvedType::Named(instance)) = resolved_type_from_identity(index, &current)
+        else {
+            return Ok(Upcast::Unknown);
+        };
+        for parent in entry.parents.iter().filter(|parent| {
+            matches!(
+                (entry.kind, parent.relation),
+                (TypeKind::Class, super::ParentRelation::Superclass)
+                    | (TypeKind::Interface, super::ParentRelation::InterfaceParent)
+            )
+        }) {
+            let Some(type_ref) = parent.type_ref.as_ref() else {
+                return Ok(Upcast::Unknown);
+            };
+            let receivers = index.type_receivers_for_type_ref(
+                uri,
+                document,
+                type_ref.span.start,
+                type_ref,
+                None,
+                &instance.substitution,
+                state,
+            );
+            let Some(parent) = super::resolved_type_from_receivers(receivers)
+                .and_then(|resolved| super::type_identity_from_resolved_type(&resolved))
+            else {
+                return Ok(Upcast::Unknown);
+            };
             let next_distance = distance.saturating_add(1);
-            if (parent_uri.clone(), parent_key.clone()) == target {
-                return Ok(Upcast::Distance(next_distance));
-            }
-            queue.push_back((parent_uri, parent_key, next_distance));
+            queue.push_back((parent, next_distance));
         }
     }
     Ok(Upcast::No)

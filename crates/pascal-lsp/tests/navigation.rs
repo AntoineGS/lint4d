@@ -12278,6 +12278,7 @@ type
 implementation
 procedure TChild.Run;
 begin
+  Value;
   Val
 end;
 end.
@@ -12292,12 +12293,25 @@ end.
         .update(consumer_uri.clone(), consumer.to_owned())
         .expect("completion access consumer parses");
 
+    let value_position = position_of(consumer, "Value;", 0);
+    assert!(
+        index
+            .navigate(&consumer_uri, value_position, NavigationTarget::Declaration,)
+            .is_empty(),
+        "inaccessible member leaked through navigation"
+    );
+    assert!(
+        index.hover(&consumer_uri, value_position).is_none(),
+        "inaccessible member leaked through hover"
+    );
+
     let completion = index
-        .completion(&consumer_uri, position_after(consumer, "Val", 1))
+        .completion(&consumer_uri, position_after(consumer, "Val", 2))
         .expect("completion with inaccessible member collision");
-    assert_eq!(completion.items.len(), 1);
-    assert_eq!(completion.items[0].label, "Value");
-    assert_eq!(completion.items[0].kind, Some(CompletionItemKind::CONSTANT));
+    assert!(
+        completion.items.is_empty(),
+        "inaccessible member leaked through completion: {completion:?}"
+    );
 }
 
 #[test]
@@ -12431,6 +12445,159 @@ end.
         completion.items.is_empty(),
         "inaccessible unqualified receiver leaked nested members: {completion:?}"
     );
+}
+
+#[test]
+fn inaccessible_unqualified_receiver_does_not_fall_back_to_imported_unit() {
+    let provider = r#"unit ReceiverUnitProvider;
+interface
+type
+  TBase = class
+  private
+    Value: Integer;
+    Hidden: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit ReceiverUnitConsumer;
+interface
+uses ReceiverUnitProvider, Hidden;
+const
+  Value = 1;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Value;
+  Hidden.Exposed := 1;
+end;
+end.
+"#;
+    let hidden = r#"unit Hidden;
+interface
+var
+  Exposed: Integer;
+implementation
+end.
+"#;
+    let provider_uri = uri("ReceiverUnitProvider");
+    let consumer_uri = uri("ReceiverUnitConsumer");
+    let hidden_uri = uri("Hidden");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("receiver unit provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("receiver unit consumer parses");
+    index
+        .update(hidden_uri, hidden.to_owned())
+        .expect("hidden unit parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Hidden.Exposed", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "inaccessible receiver fell back to an unrelated unit"
+    );
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Exposed", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "unit member navigation survived an inaccessible receiver"
+    );
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Hidden.Exp", 0))
+        .expect("receiver unit completion");
+    assert!(
+        completion.items.is_empty(),
+        "inaccessible receiver fell back to an unrelated unit in completion: {completion:?}"
+    );
+}
+
+#[test]
+fn free_procedure_rejects_restricted_members_but_selects_public_overload() {
+    for visibility in ["private", "strict private", "strict protected", "protected"] {
+        let provider = format!(
+            r#"unit FreeProcedureAccessProvider;
+interface
+type
+  TBase = class
+  {visibility}
+    procedure Pick(X: Integer); overload;
+  public
+    procedure Pick(X: string); overload;
+  end;
+end.
+"#
+        );
+        let consumer = r#"unit FreeProcedureAccessConsumer;
+interface
+uses FreeProcedureAccessProvider;
+implementation
+procedure Run;
+var
+  Obj: TBase;
+  S: string;
+begin
+  Obj.Pick(S);
+end;
+end.
+"#;
+        let provider_uri = uri("FreeProcedureAccessProvider");
+        let consumer_uri = uri("FreeProcedureAccessConsumer");
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.clone())
+            .expect("free procedure provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("free procedure consumer parses");
+
+        let navigation = index.navigate(
+            &consumer_uri,
+            position_of(consumer, "Pick(S)", 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            navigation.len(),
+            1,
+            "free procedure restricted visibility blocked public overload: {visibility}"
+        );
+        assert_location_start(
+            &navigation[0],
+            &provider_uri,
+            position_of(&provider, "Pick(X: string)", 0),
+        );
+
+        let signature = index
+            .signature_help(&consumer_uri, position_after(consumer, "Obj.Pick(S", 0))
+            .expect("free procedure signature help");
+        let signature = signature
+            .as_ref()
+            .expect("public overload signature is available");
+        assert_eq!(
+            signature.signatures.len(),
+            1,
+            "restricted overload leaked into free procedure signature help: {visibility}"
+        );
+        assert!(
+            signature.signatures[0].label.contains("string"),
+            "public string overload was not selected: {signature:?}"
+        );
+    }
 }
 
 #[test]

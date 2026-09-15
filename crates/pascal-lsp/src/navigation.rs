@@ -323,7 +323,7 @@ impl NavigationIndex {
                     AccessDecision::Visible
                 }
                 Some(_) => AccessDecision::Inaccessible,
-                None => AccessDecision::Unknown,
+                None => AccessDecision::Inaccessible,
             },
             Visibility::StrictProtected | Visibility::Protected => self.descendant_access_decision(
                 current_uri,
@@ -372,7 +372,7 @@ impl NavigationIndex {
                     Ok(AccessDecision::Visible)
                 }
                 Some(_) => Ok(AccessDecision::Inaccessible),
-                None => Ok(AccessDecision::Unknown),
+                None => Ok(AccessDecision::Inaccessible),
             },
             Visibility::StrictProtected | Visibility::Protected => self
                 .descendant_access_decision_with_budget(
@@ -398,7 +398,7 @@ impl NavigationIndex {
         state: &mut ResolutionState,
     ) -> AccessDecision {
         let Some(current_owner) = current_document.owner_type_at(offset) else {
-            return AccessDecision::Unknown;
+            return AccessDecision::Inaccessible;
         };
         let current_substitution = self
             .owner_type_substitution(current_uri, &current_owner)
@@ -495,7 +495,7 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<AccessDecision, String> {
         let Some(current_owner) = current_document.owner_type_at(offset) else {
-            return Ok(AccessDecision::Unknown);
+            return Ok(AccessDecision::Inaccessible);
         };
         let current_substitution = self
             .owner_type_substitution_with_budget(current_uri, &current_owner, cancel, budget)?
@@ -2473,6 +2473,7 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        let had_bound_reference = !references.is_empty();
         let references = self.filter_accessible_candidates_with_state_and_budget(
             current_uri,
             current_document,
@@ -2482,6 +2483,9 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        if had_bound_reference && references.is_empty() {
+            return Ok(Vec::new());
+        }
         if !references.is_empty() {
             if references
                 .iter()

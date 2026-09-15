@@ -3014,3 +3014,48 @@ end.
         ],
     );
 }
+
+#[test]
+fn rename_rejects_inaccessible_receiver_unit_fallback() {
+    let provider = r#"unit RenameReceiverUnitProvider;
+interface
+type
+  TBase = class
+  private
+    Hidden: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit RenameReceiverUnitConsumer;
+interface
+uses RenameReceiverUnitProvider, Hidden;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Hidden.Exposed := 1;
+end;
+end.
+"#;
+    let hidden = r#"unit Hidden;
+interface
+var
+  Exposed: Integer;
+implementation
+end.
+"#;
+    let hidden_uri = uri("Hidden");
+    let mut index = NavigationIndex::new();
+    update(&mut index, "RenameReceiverUnitProvider", provider);
+    update(&mut index, "RenameReceiverUnitConsumer", consumer);
+    update(&mut index, "Hidden", hidden);
+
+    let result = index.rename_edits(&hidden_uri, position_of(hidden, "Exposed", 0), "Changed");
+    assert!(
+        result.is_err(),
+        "rename accepted an inaccessible receiver's unit fallback: {result:?}"
+    );
+}

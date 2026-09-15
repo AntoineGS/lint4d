@@ -1,7 +1,7 @@
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, Origin,
     ROOT_SCOPE, Region, RoutineKind, Span, Symbol, SymbolKind, canonical_name, location_for_span,
-    node_text, symbol_visible_in_region,
+    node_text, symbol_is_available_at, symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
@@ -52,6 +52,7 @@ struct CompletionAccumulator<'a> {
     prefix: String,
     completion_is_declaration: bool,
     candidates: HashMap<String, (Candidate, usize)>,
+    inaccessible: HashMap<String, usize>,
     uncertain: HashMap<String, usize>,
     scanned: usize,
     exhausted: bool,
@@ -83,6 +84,7 @@ impl<'a> CompletionAccumulator<'a> {
             prefix: canonical_name(prefix),
             completion_is_declaration,
             candidates: HashMap::new(),
+            inaccessible: HashMap::new(),
             uncertain: HashMap::new(),
             scanned: 0,
             exhausted: false,
@@ -108,6 +110,12 @@ impl<'a> CompletionAccumulator<'a> {
     }
 
     fn insert(&mut self, candidate: Candidate, symbol: &Symbol, precedence: usize) {
+        if let Some(inaccessible_precedence) = self.inaccessible.get(&symbol.key).copied() {
+            if inaccessible_precedence < precedence {
+                return;
+            }
+            self.inaccessible.remove(&symbol.key);
+        }
         if let Some(uncertain_precedence) = self.uncertain.get(&symbol.key).copied() {
             if uncertain_precedence <= precedence {
                 return;
@@ -122,6 +130,27 @@ impl<'a> CompletionAccumulator<'a> {
             self.candidates
                 .insert(symbol.key.clone(), (candidate, precedence));
         }
+    }
+
+    fn mark_inaccessible(&mut self, key: &str, precedence: usize) {
+        if self
+            .candidates
+            .get(key)
+            .is_some_and(|(_, current_precedence)| *current_precedence <= precedence)
+            || self
+                .uncertain
+                .get(key)
+                .is_some_and(|current_precedence| *current_precedence <= precedence)
+        {
+            return;
+        }
+        self.candidates.remove(key);
+        self.inaccessible
+            .entry(key.to_owned())
+            .and_modify(|current_precedence| {
+                *current_precedence = (*current_precedence).min(precedence);
+            })
+            .or_insert(precedence);
     }
 
     fn mark_uncertain(&mut self, key: &str, precedence: usize) {
@@ -1118,6 +1147,14 @@ impl NavigationIndex {
             && symbol.span.start > offset
         {
             super::AccessDecision::Visible
+        } else if !symbol_is_available_at(
+            current_document,
+            symbol,
+            &candidate.uri,
+            current_uri,
+            offset,
+        ) {
+            return Ok(());
         } else {
             let mut access_state = super::ResolutionState::new();
             self.candidate_access_decision_with_budget(
@@ -1137,7 +1174,10 @@ impl NavigationIndex {
                 accumulator.is_incomplete = true;
                 return Ok(());
             }
-            super::AccessDecision::Inaccessible => return Ok(()),
+            super::AccessDecision::Inaccessible => {
+                accumulator.mark_inaccessible(&symbol.key, precedence);
+                return Ok(());
+            }
         }
         accumulator.insert(candidate, symbol, precedence);
         Ok(())

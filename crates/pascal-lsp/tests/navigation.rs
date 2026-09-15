@@ -7475,6 +7475,235 @@ end.
 }
 
 #[test]
+fn generic_actuals_use_call_site_scope_and_preserve_multi_argument_arity() {
+    let source = r#"unit GenericActualScope;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  T = class
+    LocalMember: Integer;
+  end;
+  TBox<T> = class
+    function Pick<U>: U;
+  end;
+function GlobalPick<A, B>: B;
+implementation
+function TBox<T>.Pick<U>: U;
+begin
+end;
+function GlobalPick<A, B>: B;
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  GlobalPick<TWidget, T>().LocalMember;
+  GlobalPick<TWidget, T>().WidgetMember;
+  Box.Pick<T>().LocalMember;
+  Box.Pick<T>().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericActualScope");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic actual scope source parses");
+
+    for (member, occurrence) in [("LocalMember", 1), ("LocalMember", 2)] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            member,
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "{member} occurrence {occurrence}");
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "LocalMember: Integer", 0),
+        );
+    }
+
+    for (member, occurrence) in [("WidgetMember", 1), ("WidgetMember", 2)] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            member,
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "{member} occurrence {occurrence} must not use the owner or declaration scope"
+        );
+    }
+}
+
+#[test]
+fn inherited_generic_routine_results_keep_the_declared_parent_arguments() {
+    let source = r#"unit GenericInheritedRoutineArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+  end;
+  TChild<T> = class(TBox<TWidget>)
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+end;
+procedure Caller;
+var
+  Child: TChild<TOther>;
+begin
+  Child.GetValue().WidgetMember;
+  Child.GetValue().OtherMember;
+  Child.Value.WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInheritedRoutineArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited generic routine argument source parses");
+
+    for (member, occurrence) in [("WidgetMember", 1), ("WidgetMember", 2)] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            member,
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "{member} occurrence {occurrence}");
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "WidgetMember: Integer", 0),
+        );
+    }
+
+    let other_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(other_locations.is_empty());
+}
+
+#[test]
+fn unknown_generic_constraint_prevents_selecting_a_proven_overload() {
+    let source = r#"unit UnknownGenericConstraintOverload;
+interface
+type
+  IFoo = interface
+    procedure Foo;
+  end;
+  TBase = class
+  end;
+  TChild = class(TBase, IFoo)
+    procedure Foo;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Choose<T: IFoo>(Value: T): TOther; overload;
+function Choose(Value: TBase): TWidget; overload;
+implementation
+procedure TChild.Foo;
+begin
+end;
+procedure Caller;
+var
+  Child: TChild;
+begin
+  Choose(Child).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownGenericConstraintOverload");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        locations.is_empty(),
+        "an unknown generic constraint must not select the proven fallback overload"
+    );
+}
+
+#[test]
+fn contradictory_generic_constraints_fail_closed() {
+    let source = r#"unit ContradictoryGenericConstraint;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+function Bad<T: class, record>(Value: T): T;
+implementation
+function Bad<T: class, record>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Bad(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("ContradictoryGenericConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("contradictory constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
 fn conditional_navigation_uses_only_a_provably_active_branch() {
     let source = r#"unit ConditionalNavigation;
 interface

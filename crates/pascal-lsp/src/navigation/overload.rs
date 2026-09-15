@@ -47,6 +47,13 @@ enum Conversion {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConstraintOutcome {
+    Proven,
+    Unknown,
+    Contradictory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Upcast {
     Distance(u32),
     No,
@@ -307,7 +314,7 @@ fn score_group(
         return Ok(None);
     }
 
-    let Some(substitution) = generic_substitution_for_group(
+    let Some((substitution, generic_uncertain)) = generic_substitution_for_group(
         index,
         candidate,
         symbol,
@@ -326,7 +333,7 @@ fn score_group(
         return Ok(None);
     };
     let mut cost: u32 = 0;
-    let mut uncertain = false;
+    let mut uncertain = generic_uncertain;
     for (argument, parameter) in arguments.iter().zip(parameters) {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -399,7 +406,7 @@ fn generic_substitution_for_group(
     ancestry: &mut AncestryResolutionState,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<Option<GenericSubstitution>, String> {
+) -> Result<Option<(GenericSubstitution, bool)>, String> {
     let Some(owner_substitution) = index.routine_owner_substitution_with_budget(
         candidate,
         receiver_substitution,
@@ -412,7 +419,7 @@ fn generic_substitution_for_group(
         return Ok(None);
     };
     if symbol.generic_parameters.is_empty() {
-        return Ok(Some(owner_substitution));
+        return Ok(Some((owner_substitution, false)));
     }
 
     let mut substitution = owner_substitution;
@@ -432,6 +439,11 @@ fn generic_substitution_for_group(
             else {
                 return Ok(None);
             };
+            // Explicit actual type arguments belong to the lexical call
+            // site.  The receiver's owner substitution is only for the
+            // selected routine's declaration/result types; applying it here
+            // makes a method call such as `Box.Pick<T>()` resolve `T` as the
+            // owner's parameter instead of the caller's declaration.
             let receivers = index.type_receivers_for_type_ref_with_budget(
                 current_uri,
                 current_document,
@@ -439,7 +451,7 @@ fn generic_substitution_for_group(
                 &type_ref,
                 argument,
                 None,
-                &substitution,
+                &GenericSubstitution::empty(),
                 state,
                 cancel,
                 budget,
@@ -473,7 +485,7 @@ fn generic_substitution_for_group(
         return Ok(None);
     }
 
-    if !generic_constraints_satisfied(
+    let constraint_outcome = generic_constraints_satisfied(
         index,
         candidate,
         symbol,
@@ -482,10 +494,12 @@ fn generic_substitution_for_group(
         ancestry,
         cancel,
         budget,
-    )? {
-        return Ok(None);
+    )?;
+    match constraint_outcome {
+        ConstraintOutcome::Contradictory => Ok(None),
+        ConstraintOutcome::Proven => Ok(Some((substitution, false))),
+        ConstraintOutcome::Unknown => Ok(Some((substitution, true))),
     }
-    Ok(Some(substitution))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -498,13 +512,15 @@ pub(super) fn generic_constraints_satisfied(
     ancestry: &mut AncestryResolutionState,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<bool, String> {
+) -> Result<ConstraintOutcome, String> {
     let Some(document) = index.documents.get(&candidate.uri) else {
-        return Ok(false);
+        return Ok(ConstraintOutcome::Contradictory);
     };
+    let mut unknown = false;
     for parameter in &symbol.generic_parameters {
         if parameter.constraint_unsupported {
-            return Ok(false);
+            unknown = true;
+            continue;
         }
         let Some(constraint) = parameter.constraint.as_ref() else {
             continue;
@@ -513,7 +529,8 @@ pub(super) fn generic_constraints_satisfied(
             .get(&parameter.name)
             .and_then(super::type_identity_from_resolved_type)
         else {
-            return Ok(false);
+            unknown = true;
+            continue;
         };
         if constraint.path.len() == 1 {
             match canonical_name(&constraint.path[0]).as_str() {
@@ -525,7 +542,7 @@ pub(super) fn generic_constraints_satisfied(
                             ..
                         }
                     ) {
-                        return Ok(false);
+                        return Ok(ConstraintOutcome::Contradictory);
                     }
                     continue;
                 }
@@ -537,7 +554,7 @@ pub(super) fn generic_constraints_satisfied(
                             ..
                         }
                     ) {
-                        return Ok(false);
+                        return Ok(ConstraintOutcome::Contradictory);
                     }
                     continue;
                 }
@@ -549,13 +566,13 @@ pub(super) fn generic_constraints_satisfied(
                             ..
                         }
                     ) {
-                        return Ok(false);
+                        return Ok(ConstraintOutcome::Contradictory);
                     }
                     continue;
                 }
                 "constructor" => {
                     if !has_proven_constructor(index, &actual) {
-                        return Ok(false);
+                        return Ok(ConstraintOutcome::Contradictory);
                     }
                     continue;
                 }
@@ -570,7 +587,8 @@ pub(super) fn generic_constraints_satisfied(
             "generic constraint",
         )?
         else {
-            return Ok(false);
+            unknown = true;
+            continue;
         };
         let receivers = index.type_receivers_for_type_ref_with_budget(
             &candidate.uri,
@@ -585,16 +603,20 @@ pub(super) fn generic_constraints_satisfied(
             budget,
         )?;
         let Some(expected) = receiver_type(index, receivers)? else {
-            return Ok(false);
+            unknown = true;
+            continue;
         };
-        if !matches!(
-            conversion(index, &actual, &expected, ancestry, cancel, budget)?,
-            Conversion::Cost(_)
-        ) {
-            return Ok(false);
+        match conversion(index, &actual, &expected, ancestry, cancel, budget)? {
+            Conversion::Cost(_) => {}
+            Conversion::Unknown => unknown = true,
+            Conversion::Incompatible => return Ok(ConstraintOutcome::Contradictory),
         }
     }
-    Ok(true)
+    Ok(if unknown {
+        ConstraintOutcome::Unknown
+    } else {
+        ConstraintOutcome::Proven
+    })
 }
 
 fn has_proven_constructor(index: &NavigationIndex, identity: &TypeIdentity) -> bool {

@@ -2572,3 +2572,48 @@ end.
         "generic parameter rename must remain conservative"
     );
 }
+
+#[test]
+fn global_type_rename_excludes_routine_generic_formals() {
+    let source = r#"unit GenericFormalShadow;
+interface
+type
+  T = class
+    LocalMember: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Run;
+var
+  Obj: T;
+begin
+  Identity(Obj).LocalMember;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "GenericFormalShadow", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "T = class", 0), "TRenamed")
+        .expect("global type rename must remain resolvable");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "T = class", "T", 0),
+                "TRenamed".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "Obj: T", "T", 0),
+                "TRenamed".to_owned(),
+            ),
+        ],
+    );
+}

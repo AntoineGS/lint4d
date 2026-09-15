@@ -17184,3 +17184,47 @@ fn rename_cancellation_during_final_content_hash_returns_request_canceled() {
     assert_eq!(error.message, "request cancelled");
     server.shutdown();
 }
+
+#[test]
+fn recursive_generic_constraint_completion_fails_closed_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("RecursiveGenericConstraint.pas");
+    let source = "unit RecursiveGenericConstraint;\ninterface\ntype\n  TWrap<T> = class\n    Value: T;\n  end;\n  TNode<T: TNode<TWrap<T>>> = class\n    Value: T;\n  end;\n  TImpl = class(TNode<TImpl>)\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: TNode<TImpl>;\nbegin\n  Box.Value.Member;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let completion_id = RequestId::from("recursive-generic-constraint-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Box.Value.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "recursive generic completion failed: {completion:?}"
+    );
+    let result = completion
+        .result
+        .expect("recursive generic completion result");
+    assert!(result["items"].is_array());
+    assert_eq!(result["isIncomplete"], true);
+
+    let responsive_id = RequestId::from("recursive-generic-constraint-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after recursive generic completion: {responsive:?}"
+    );
+    server.shutdown();
+}

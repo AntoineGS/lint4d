@@ -431,6 +431,8 @@ impl NavigationIndex {
             self.unit_references(document, &unit_name)
         } else if let Some(direct) = self.direct_symbol_references(uri, identifier) {
             direct
+        } else if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+            generic
         } else if let Some((path, cursor_index)) =
             qualified_type_path_at(identifier, &document.source)
         {
@@ -482,6 +484,10 @@ impl NavigationIndex {
             self.direct_symbol_references_with_budget(uri, identifier, cancel, budget)?
         {
             Ok(direct)
+        } else if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+            budget.require_work(generic.len(), cancel)?;
+            budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
+            Ok(generic)
         } else if let Some((path, cursor_index)) =
             qualified_type_path_at_with_budget(identifier, &document.source, cancel, budget)?
         {
@@ -649,6 +655,11 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
+        if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+            budget.require_work(generic.len(), cancel)?;
+            budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
+            return Ok(generic);
+        }
         let scope = document.scope_at(offset);
         self.unqualified_references_with_budget_at_scope(
             uri, document, offset, name, identifier, scope, cancel, budget,
@@ -669,6 +680,17 @@ impl NavigationIndex {
     ) -> Result<Vec<Candidate>, String> {
         budget.require_bytes(name.len(), cancel)?;
         let key = canonical_name(name);
+        if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+            budget.require_work(generic.len(), cancel)?;
+            budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
+            return Ok(generic
+                .into_iter()
+                .filter(|candidate| {
+                    self.symbol(candidate)
+                        .is_some_and(|symbol| symbol.key == key)
+                })
+                .collect());
+        }
         budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
         let owner_type = document.owner_type_at_identifier(identifier, scope);
 
@@ -696,6 +718,7 @@ impl NavigationIndex {
                 if scope_id != ROOT_SCOPE
                     && !symbol.local_only
                     && symbol.owner_type.is_none()
+                    && symbol.generic_parameter.is_none()
                     && symbol.kind != SymbolKind::Unit
                     && !symbol.unresolved_abbreviated
                 {
@@ -747,6 +770,7 @@ impl NavigationIndex {
             };
             if !symbol.local_only
                 && symbol.owner_type.is_none()
+                && symbol.generic_parameter.is_none()
                 && symbol.kind != SymbolKind::Unit
                 && !symbol.unresolved_abbreviated
                 && symbol_visible_in_region(symbol, region)
@@ -842,6 +866,7 @@ impl NavigationIndex {
                 continue;
             };
             if symbol.owner_type.is_none()
+                && symbol.generic_parameter.is_none()
                 && symbol.kind != SymbolKind::Unit
                 && !symbol.local_only
                 && (symbol.region == Region::Interface
@@ -1226,6 +1251,51 @@ impl NavigationIndex {
         Ok(urls.clone())
     }
 
+    fn generic_parameter_references(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+    ) -> Option<Vec<Candidate>> {
+        let span = Span::from_node(identifier);
+        let key = canonical_name(&node_text(identifier, &document.source));
+        let routine_keys = document
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind == SymbolKind::Routine
+                    && !symbol.generic_parameters.is_empty()
+                    && symbol.declaration_span.contains(span)
+                    && symbol
+                        .generic_parameters
+                        .iter()
+                        .any(|parameter| parameter.name == key)
+            })
+            .filter_map(|symbol| symbol.routine_key.as_ref())
+            .collect::<HashSet<_>>();
+        if routine_keys.is_empty() {
+            return None;
+        }
+        let candidates = document
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| {
+                symbol.kind == SymbolKind::Type
+                    && symbol.generic_parameter.as_deref() == Some(key.as_str())
+                    && symbol
+                        .routine_key
+                        .as_ref()
+                        .is_some_and(|routine_key| routine_keys.contains(routine_key))
+            })
+            .map(|(index, _)| Candidate {
+                uri: uri.clone(),
+                index,
+            })
+            .collect::<Vec<_>>();
+        (!candidates.is_empty()).then_some(candidates)
+    }
+
     fn unqualified_references(
         &self,
         uri: &Url,
@@ -1236,6 +1306,9 @@ impl NavigationIndex {
         let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
             return Vec::new();
         };
+        if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+            return generic;
+        }
         self.unqualified_references_at_scope(
             uri,
             document,
@@ -1256,6 +1329,15 @@ impl NavigationIndex {
         scope: usize,
     ) -> Vec<Candidate> {
         let key = canonical_name(name);
+        if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+            return generic
+                .into_iter()
+                .filter(|candidate| {
+                    self.symbol(candidate)
+                        .is_some_and(|symbol| symbol.key == key)
+                })
+                .collect();
+        }
 
         // Search lexical scopes from the innermost outward. A local symbol
         // shadows both the unit's declarations and imported declarations.
@@ -1271,6 +1353,7 @@ impl NavigationIndex {
                         scope_id != ROOT_SCOPE
                             && !symbol.local_only
                             && symbol.owner_type.is_none()
+                            && symbol.generic_parameter.is_none()
                             && symbol.kind != SymbolKind::Unit
                             && !symbol.unresolved_abbreviated
                     })
@@ -1306,6 +1389,7 @@ impl NavigationIndex {
                 document.symbols.get(*index).is_some_and(|symbol| {
                     !symbol.local_only
                         && symbol.owner_type.is_none()
+                        && symbol.generic_parameter.is_none()
                         && symbol.kind != SymbolKind::Unit
                         && !symbol.unresolved_abbreviated
                         && symbol_visible_in_region(symbol, region)
@@ -2329,11 +2413,14 @@ impl NavigationIndex {
         if symbol.generic_parameters.is_empty() {
             return Ok(true);
         }
-        let resolution_key = (
-            instance.uri.clone(),
-            instance.key.clone(),
-            instance.substitution.clone(),
-        );
+        // A constraint can expand its own parameter into a larger generic
+        // argument on every recursive pass (for example
+        // `TNode<T: TNode<TWrap<T>>>`).  Including the substitution in the
+        // active key therefore makes every pass look new and lets the call
+        // stack grow until the process overflows.  Re-entering the same
+        // source generic declaration while proving one specialization is
+        // already enough to classify the relationship as unknown.
+        let resolution_key = (instance.uri.clone(), instance.key.clone());
         if !state
             .active_generic_constraints
             .insert(resolution_key.clone())
@@ -2353,7 +2440,14 @@ impl NavigationIndex {
             budget,
         );
         state.active_generic_constraints.remove(&resolution_key);
-        result
+        match result? {
+            overload::ConstraintOutcome::Proven => Ok(true),
+            overload::ConstraintOutcome::Unknown => {
+                state.mark_receiver_uncertain();
+                Ok(false)
+            }
+            overload::ConstraintOutcome::Contradictory => Ok(false),
+        }
     }
 
     fn generic_type_constraints_satisfied(
@@ -5305,7 +5399,7 @@ struct ResolutionState {
     receiver_work: usize,
     type_work: usize,
     active_members: HashSet<(Url, String, String, usize, GenericSubstitution)>,
-    active_generic_constraints: HashSet<(Url, String, GenericSubstitution)>,
+    active_generic_constraints: HashSet<(Url, String)>,
     receiver_uncertain: bool,
 }
 
@@ -5539,6 +5633,7 @@ impl Document {
             .filter(|symbol| {
                 symbol.kind == SymbolKind::Type
                     && symbol.owner_type.is_none()
+                    && symbol.generic_parameter.is_none()
                     && symbol.type_kind == TypeKind::Class
             })
             .map(|symbol| symbol.key.clone())
@@ -5549,6 +5644,7 @@ impl Document {
             .filter(|(index, symbol)| {
                 symbol.kind == SymbolKind::Type
                     && symbol.owner_type.is_none()
+                    && symbol.generic_parameter.is_none()
                     && symbol.type_kind != TypeKind::Class
                     && !conditional_unknown_symbols[*index]
             })
@@ -5573,6 +5669,7 @@ impl Document {
                 if symbol.owner_type.is_some()
                     || symbol.kind == SymbolKind::Unit
                     || symbol.local_only
+                    || symbol.generic_parameter.is_some()
                 {
                     return false;
                 }
@@ -5633,6 +5730,7 @@ impl Document {
             if symbol.kind == SymbolKind::Type
                 && symbol.scope == ROOT_SCOPE
                 && symbol.owner_type.is_none()
+                && symbol.generic_parameter.is_none()
             {
                 type_symbol_indices
                     .entry(symbol.key.clone())
@@ -6239,6 +6337,7 @@ fn add_definition_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let generic_parameters = generic_parameters_for_node(header, source);
     let routine_parameters = direct_routine_parameters(header, source);
+    let routine_key = routine_key_with_owner(owner_type.as_deref(), &name, &signature, scope);
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -6253,7 +6352,7 @@ fn add_definition_symbol(
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
-        generic_parameters,
+        generic_parameters: generic_parameters.clone(),
         generic_parameter: None,
         type_name: None,
         type_ref: None,
@@ -6263,12 +6362,7 @@ fn add_definition_symbol(
         region: region_for_node(node),
         origin: Origin::Definition,
         local_only: false,
-        routine_key: Some(routine_key_with_owner(
-            owner_type.as_deref(),
-            &name,
-            &signature,
-            scope,
-        )),
+        routine_key: Some(routine_key.clone()),
         routine_signature: Some(signature),
         routine_header_span: Some(Span::from_node(header)),
         routine_parameter_spans: routine_parameters
@@ -6281,6 +6375,13 @@ fn add_definition_symbol(
         unresolved_abbreviated: false,
         accessor: None,
     });
+    push_routine_generic_parameter_symbols(
+        symbols,
+        &generic_parameters,
+        &routine_key,
+        scope,
+        region_for_node(node),
+    );
 }
 
 fn add_routine_symbol(
@@ -6301,6 +6402,7 @@ fn add_routine_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let generic_parameters = generic_parameters_for_node(node, source);
     let routine_parameters = direct_routine_parameters(node, source);
+    let routine_key = routine_key_with_owner(owner_type.as_deref(), &name, &signature, scope);
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -6315,7 +6417,7 @@ fn add_routine_symbol(
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
-        generic_parameters,
+        generic_parameters: generic_parameters.clone(),
         generic_parameter: None,
         type_name: None,
         type_ref: None,
@@ -6325,12 +6427,7 @@ fn add_routine_symbol(
         region: region_for_node(node),
         origin: Origin::Declaration,
         local_only: false,
-        routine_key: Some(routine_key_with_owner(
-            owner_type.as_deref(),
-            &name,
-            &signature,
-            scope,
-        )),
+        routine_key: Some(routine_key.clone()),
         routine_signature: Some(signature),
         routine_header_span: Some(Span::from_node(node)),
         routine_parameter_spans: routine_parameters
@@ -6343,6 +6440,58 @@ fn add_routine_symbol(
         unresolved_abbreviated: false,
         accessor: None,
     });
+    push_routine_generic_parameter_symbols(
+        symbols,
+        &generic_parameters,
+        &routine_key,
+        scope,
+        region_for_node(node),
+    );
+}
+
+fn push_routine_generic_parameter_symbols(
+    symbols: &mut Vec<Symbol>,
+    parameters: &[GenericParameter],
+    routine_key: &str,
+    scope: usize,
+    region: Region,
+) {
+    for parameter in parameters {
+        symbols.push(Symbol {
+            span: parameter.span,
+            declaration_span: parameter.span,
+            selection_span: parameter.span,
+            name: parameter.name.clone(),
+            key: parameter.name.clone(),
+            kind: SymbolKind::Type,
+            type_kind: TypeKind::Other,
+            routine_kind: RoutineKind::Procedure,
+            routine_directives: RoutineDirectives::default(),
+            parameter_mode: None,
+            scope,
+            owner_type: None,
+            owner_type_name: None,
+            generic_parameters: Vec::new(),
+            generic_parameter: Some(parameter.name.clone()),
+            type_name: parameter.constraint.as_ref().map(TypeRef::display),
+            type_ref: parameter.constraint.clone(),
+            result_type_name: None,
+            result_type_ref: None,
+            result_type_span: None,
+            region,
+            origin: Origin::Declaration,
+            local_only: false,
+            routine_key: Some(routine_key.to_owned()),
+            routine_signature: None,
+            routine_header_span: None,
+            routine_parameter_spans: Vec::new(),
+            routine_parameters: Vec::new(),
+            type_excerpt_end: None,
+            body_scope: None,
+            unresolved_abbreviated: false,
+            accessor: None,
+        });
+    }
 }
 
 fn add_named_symbol(

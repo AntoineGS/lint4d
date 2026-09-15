@@ -26,7 +26,7 @@ use lsp_types::{
 use pascal_core::decode_bytes;
 use pascal_core::delphi_overrides::EffectiveOverrides;
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -37,8 +37,6 @@ use walkdir::WalkDir;
 
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, Sender};
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 
 pub(crate) const CANCELLATION_MESSAGE: &str = "request cancelled";
 const MAX_SNAPSHOT_DEPENDENCY_FILES: usize = 512;
@@ -206,32 +204,30 @@ fn context_incomplete_for_mode(mode: SnapshotMode, context: &ProjectContext) -> 
 type SnapshotPriorityBarrier = (Url, Sender<()>, Receiver<()>);
 
 #[cfg(test)]
-static SNAPSHOT_PRIORITY_BARRIER: OnceLock<Mutex<Option<SnapshotPriorityBarrier>>> =
-    OnceLock::new();
+thread_local! {
+    static SNAPSHOT_PRIORITY_BARRIER: RefCell<Option<SnapshotPriorityBarrier>> =
+        const { RefCell::new(None) };
+}
 
 #[cfg(test)]
 fn install_snapshot_priority_barrier(priority_uri: Url, ready: Sender<()>, release: Receiver<()>) {
     SNAPSHOT_PRIORITY_BARRIER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("snapshot barrier lock")
-        .replace((priority_uri, ready, release));
+        .with(|barrier| barrier.borrow_mut().replace((priority_uri, ready, release)));
 }
 
 #[cfg(test)]
 fn wait_at_snapshot_priority_barrier(priority: &[Url]) {
-    let mut barrier = SNAPSHOT_PRIORITY_BARRIER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("snapshot barrier lock");
     let Some(priority_uri) = priority.first() else {
         return;
     };
-    if barrier
-        .as_ref()
-        .is_some_and(|(expected, _, _)| expected == priority_uri)
-    {
-        let (_, ready, release) = barrier.take().expect("snapshot barrier is present");
+    let barrier = SNAPSHOT_PRIORITY_BARRIER.with(|barrier| {
+        let mut barrier = barrier.borrow_mut();
+        barrier
+            .as_ref()
+            .is_some_and(|(expected, _, _)| expected == priority_uri)
+            .then(|| barrier.take().expect("snapshot barrier is present"))
+    });
+    if let Some((_, ready, release)) = barrier {
         ready.send(()).expect("snapshot barrier ready receiver");
         release.recv().expect("snapshot barrier release sender");
     }

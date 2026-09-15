@@ -840,6 +840,32 @@ end;
 end.
 "#;
 
+const PER_NAME_AMBIGUOUS_INHERITANCE: &str = r#"unit PerNameAmbiguousInheritance;
+interface
+type
+  IA = interface
+    procedure Shared;
+    procedure Unique;
+  end;
+  IB = interface
+    procedure Shared;
+  end;
+  IMid = interface(IA, IB)
+  end;
+  IChild = interface(IMid)
+    procedure Shared;
+  end;
+implementation
+procedure Caller;
+var
+  C: IChild;
+begin
+  C.Unique;
+  C.Shared;
+end;
+end.
+"#;
+
 const ASSISTANCE_PROVIDER: &str = r#"unit AssistanceProvider;
 interface
 type
@@ -1927,7 +1953,7 @@ end.
             .map(|item| &item.label)
             .collect::<Vec<_>>()
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -1981,7 +2007,7 @@ end.
             .map(|item| &item.label)
             .collect::<Vec<_>>()
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -2024,7 +2050,7 @@ end.
             .collect::<Vec<_>>(),
         ["LocalName"]
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -2066,7 +2092,7 @@ end.
             .collect::<Vec<_>>(),
         ["Member"]
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -2097,7 +2123,7 @@ fn completion_rejects_unknown_inheritance_context_after_the_context_budget() {
             .map(|item| &item.label)
             .collect::<Vec<_>>()
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -2128,7 +2154,7 @@ end.
         completion.items.is_empty(),
         "unexpected completion: {completion:?}"
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 
     assert!(
         index
@@ -2918,6 +2944,62 @@ fn class_lookup_excludes_implemented_interface_members() {
         "implemented interface contract completion leaked: {:?}",
         completion.items
     );
+}
+
+#[test]
+fn completion_keeps_proven_members_when_an_inherited_name_is_ambiguous() {
+    let source_uri = uri("PerNameAmbiguousInheritance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(
+            source_uri.clone(),
+            PER_NAME_AMBIGUOUS_INHERITANCE.to_owned(),
+        )
+        .expect("per-name ambiguous inheritance source parses");
+
+    let unique = index.navigate(
+        &source_uri,
+        position_of(PER_NAME_AMBIGUOUS_INHERITANCE, "Unique", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(unique.len(), 1);
+    assert_location_start(
+        &unique[0],
+        &source_uri,
+        position_of(PER_NAME_AMBIGUOUS_INHERITANCE, "Unique", 0),
+    );
+
+    let unique_completion = index
+        .completion(
+            &source_uri,
+            position_after(PER_NAME_AMBIGUOUS_INHERITANCE, "C.Unique", 0),
+        )
+        .expect("unambiguous inherited completion");
+    assert_eq!(
+        unique_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Unique"]
+    );
+    assert!(!unique_completion.is_incomplete);
+
+    let shared_completion = index
+        .completion(
+            &source_uri,
+            position_after(PER_NAME_AMBIGUOUS_INHERITANCE, "C.Shared", 0),
+        )
+        .expect("direct shadowing completion");
+    assert_eq!(
+        shared_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Shared"]
+    );
+    assert!(!shared_completion.is_incomplete);
 }
 
 #[test]

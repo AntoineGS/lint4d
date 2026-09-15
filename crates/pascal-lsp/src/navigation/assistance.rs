@@ -535,16 +535,17 @@ impl NavigationIndex {
                         )?;
                     }
                     super::Receiver::Type(type_uri, type_key) => {
-                        let ancestry_known = self.add_member_completion_candidates(
-                            &mut accumulator,
-                            &type_uri,
-                            &type_key,
-                            current_uri,
-                            &mut private_spans,
-                            0,
-                            cancel,
-                        )?;
-                        if !ancestry_known {
+                        let (ancestry_known, has_ambiguous_names) = self
+                            .add_member_completion_candidates(
+                                &mut accumulator,
+                                &type_uri,
+                                &type_key,
+                                current_uri,
+                                &mut private_spans,
+                                0,
+                                cancel,
+                            )?;
+                        if !ancestry_known || has_ambiguous_names {
                             accumulator.is_incomplete = true;
                         }
                     }
@@ -578,17 +579,21 @@ impl NavigationIndex {
 
             if !accumulator.exhausted {
                 if let Some(owner_type) = current_document.owner_type_at(offset) {
-                    let ancestry_known = self.add_member_completion_candidates(
-                        &mut accumulator,
-                        current_uri,
-                        &owner_type,
-                        current_uri,
-                        &mut private_spans,
-                        precedence,
-                        cancel,
-                    )?;
-                    if !ancestry_known && unqualified {
-                        suppress_unqualified_globals = true;
+                    let (ancestry_known, has_ambiguous_names) = self
+                        .add_member_completion_candidates(
+                            &mut accumulator,
+                            current_uri,
+                            &owner_type,
+                            current_uri,
+                            &mut private_spans,
+                            precedence,
+                            cancel,
+                        )?;
+                    if !ancestry_known || has_ambiguous_names {
+                        accumulator.is_incomplete = true;
+                        if unqualified {
+                            suppress_unqualified_globals = true;
+                        }
                     }
                     precedence += 1;
                 }
@@ -869,7 +874,7 @@ impl NavigationIndex {
         private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
         cancel: &AtomicBool,
-    ) -> Result<bool, String> {
+    ) -> Result<(bool, bool), String> {
         let lookup = self.member_candidates_for_completion_with_budget(
             type_uri,
             type_key,
@@ -877,6 +882,7 @@ impl NavigationIndex {
             cancel,
             accumulator.budget,
         )?;
+        let status = (lookup.ancestry_known, !lookup.ambiguous_names.is_empty());
         let mut routine_keys = HashSet::new();
         for candidate in lookup.candidates {
             check_cancel(cancel)?;
@@ -916,7 +922,7 @@ impl NavigationIndex {
                 cancel,
             )?;
         }
-        Ok(lookup.ancestry_known)
+        Ok(status)
     }
 
     #[allow(clippy::too_many_arguments)]

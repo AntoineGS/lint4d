@@ -1567,6 +1567,51 @@ fn completion_request_returns_semantic_items_and_plain_text_edits() {
 }
 
 #[test]
+fn completion_request_marks_unqualified_unknown_ancestry_incomplete() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("UnknownUnqualifiedProtocol.pas");
+    let source = "unit UnknownUnqualifiedProtocol;\ninterface\ntype\n  TChild = class(TMissing)\n    procedure Run;\n  end;\nimplementation\nprocedure TChild.Run;\nbegin\n  Unknown;\n  Self.Unknown;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let unqualified_id = RequestId::from("unknown-unqualified-completion".to_string());
+    server.send_request(
+        unqualified_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Unknown", 0),
+        }),
+    );
+    let unqualified = server
+        .response(&unqualified_id)
+        .result
+        .expect("unqualified completion result");
+    assert_eq!(unqualified["items"], json!([]));
+    assert_eq!(unqualified["isIncomplete"], true);
+
+    let qualified_id = RequestId::from("unknown-qualified-completion".to_string());
+    server.send_request(
+        qualified_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Self.Unknown", 0),
+        }),
+    );
+    let qualified = server
+        .response(&qualified_id)
+        .result
+        .expect("qualified completion result");
+    assert_eq!(qualified["items"], json!([]));
+    assert_eq!(qualified["isIncomplete"], true);
+
+    server.shutdown();
+}
+
+#[test]
 fn completion_request_rejects_an_unresolved_import_without_partial_items() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("UnresolvedCompletion.pas");

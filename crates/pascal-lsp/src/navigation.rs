@@ -2642,7 +2642,7 @@ impl NavigationIndex {
                 if ancestry.status != AncestryStatus::Complete {
                     MemberLookup::unknown(direct)
                 } else {
-                    let mut parent_candidates = Vec::with_capacity(ancestry.parents.len());
+                    let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
                     let mut ancestry_known = true;
                     for (parent_uri, parent_key) in ancestry.parents {
                         let lookup = self.member_candidates_for_type_with_state(
@@ -2656,10 +2656,10 @@ impl NavigationIndex {
                             ancestry_known = false;
                             break;
                         }
-                        parent_candidates.push(lookup.candidates);
+                        parent_lookups.push(lookup);
                     }
                     if ancestry_known {
-                        self.merge_member_candidates(direct, parent_candidates, member_key)
+                        self.merge_member_candidates(direct, parent_lookups, member_key)
                     } else {
                         MemberLookup::unknown(direct)
                     }
@@ -2727,7 +2727,7 @@ impl NavigationIndex {
                 return Ok(MemberLookup::unknown(direct));
             }
 
-            let mut parent_candidates = Vec::with_capacity(ancestry.parents.len());
+            let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
             let mut ancestry_known = true;
             for (parent_uri, parent_key) in ancestry.parents {
                 let lookup = self.member_candidates_for_type_with_state_and_budget(
@@ -2743,10 +2743,10 @@ impl NavigationIndex {
                     ancestry_known = false;
                     break;
                 }
-                parent_candidates.push(lookup.candidates);
+                parent_lookups.push(lookup);
             }
             Ok(if ancestry_known {
-                self.merge_member_candidates(direct, parent_candidates, member_key)
+                self.merge_member_candidates(direct, parent_lookups, member_key)
             } else {
                 MemberLookup::unknown(direct)
             })
@@ -3287,13 +3287,13 @@ impl NavigationIndex {
     fn merge_member_candidates(
         &self,
         direct: Vec<Candidate>,
-        parent_candidates: Vec<Vec<Candidate>>,
+        parent_lookups: Vec<MemberLookup>,
         member_key: Option<&str>,
     ) -> MemberLookup {
         if member_key.is_some() {
             let mut selected: Option<Vec<Candidate>> = None;
-            for candidates in parent_candidates {
-                let candidates = dedup_candidates(candidates);
+            for lookup in parent_lookups {
+                let candidates = dedup_candidates(lookup.candidates);
                 if candidates.is_empty() {
                     continue;
                 }
@@ -3318,12 +3318,18 @@ impl NavigationIndex {
             .collect();
         let mut key_order = Vec::new();
         let mut seen_keys = HashSet::new();
-        let mut ambiguous_member = false;
-        let branch_maps: Vec<HashMap<String, Vec<Candidate>>> = parent_candidates
+        let mut ambiguous_names = parent_lookups
+            .iter()
+            .flat_map(|lookup| lookup.ambiguous_names.iter().cloned())
+            .collect::<HashSet<_>>();
+        for key in &direct_keys {
+            ambiguous_names.remove(key);
+        }
+        let branch_maps: Vec<HashMap<String, Vec<Candidate>>> = parent_lookups
             .into_iter()
-            .map(|candidates| {
+            .map(|lookup| {
                 let mut by_key = HashMap::new();
-                for candidate in dedup_candidates(candidates) {
+                for candidate in dedup_candidates(lookup.candidates) {
                     let Some(symbol) = self.symbol(&candidate) else {
                         continue;
                     };
@@ -3355,21 +3361,22 @@ impl NavigationIndex {
                     .is_some_and(|current| !candidate_sets_equal(current, candidates))
                 {
                     ambiguous = true;
-                    ambiguous_member = true;
                     break;
                 }
                 selected = Some(candidates.clone());
             }
-            if !ambiguous {
+            if ambiguous {
+                ambiguous_names.insert(key);
+            } else if !ambiguous_names.contains(&key) {
                 if let Some(selected) = selected {
                     result.extend(selected);
                 }
             }
         }
-        if ambiguous_member {
-            MemberLookup::unknown(result)
-        } else {
+        if ambiguous_names.is_empty() {
             MemberLookup::known(result)
+        } else {
+            MemberLookup::ambiguous(result, ambiguous_names)
         }
     }
 
@@ -3791,6 +3798,7 @@ struct TypeAncestryResolution {
 struct MemberLookup {
     candidates: Vec<Candidate>,
     ancestry_known: bool,
+    ambiguous_names: HashSet<String>,
 }
 
 impl MemberLookup {
@@ -3798,6 +3806,7 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: true,
+            ambiguous_names: HashSet::new(),
         }
     }
 
@@ -3805,6 +3814,15 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: false,
+            ambiguous_names: HashSet::new(),
+        }
+    }
+
+    fn ambiguous(candidates: Vec<Candidate>, ambiguous_names: HashSet<String>) -> Self {
+        Self {
+            candidates,
+            ancestry_known: true,
+            ambiguous_names,
         }
     }
 }

@@ -1840,6 +1840,107 @@ end.
 }
 
 #[test]
+fn completion_bare_dot_allows_a_bounded_whitespace_gap_after_an_expression() {
+    let marked = r#"unit BareExpressionWhitespace;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().   |;
+end;
+end.
+"#;
+    let cursor_offset = marked.find('|').expect("whitespace cursor");
+    let source = marked.replacen('|', "", 1);
+    let source_uri = uri("BareExpressionWhitespace");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("whitespace expression source parses");
+
+    let completion = index
+        .completion(
+            &source_uri,
+            text::offset_to_position(&source, cursor_offset).expect("whitespace position"),
+        )
+        .expect("whitespace expression completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+}
+
+#[test]
+fn completion_bare_dot_rejects_an_unbounded_whitespace_gap_after_an_expression() {
+    let gap = " ".repeat(257);
+    let source = format!(
+        "unit BareExpressionWhitespaceBound;\ninterface\ntype\n  TObj = class\n    Member: Integer;\n  end;\nfunction MakeValue: TObj;\nimplementation\nfunction MakeValue: TObj;\nbegin\n  Result := TObj.Create;\nend;\nprocedure Caller;\nbegin\n  MakeValue().{gap};\nend;\nend.\n"
+    );
+    let source_uri = uri("BareExpressionWhitespaceBound");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("bounded whitespace source parses");
+    let cursor_offset = source
+        .find(&format!("MakeValue().{gap}"))
+        .map(|start| start + "MakeValue().".len() + gap.len())
+        .expect("bounded whitespace cursor");
+
+    let completion = index
+        .completion(
+            &source_uri,
+            text::offset_to_position(&source, cursor_offset).expect("bounded whitespace position"),
+        )
+        .expect("bounded whitespace completion");
+    assert!(completion.items.is_empty());
+}
+
+#[test]
+fn completion_bare_dot_with_a_malformed_expression_receiver_fails_closed() {
+    let source = r#"unit BareMalformedExpression;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue(.   ;
+end;
+end.
+"#;
+    let source_uri = uri("BareMalformedExpression");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("malformed expression source parses with recovery");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "MakeValue(.   ", 0))
+        .expect("malformed expression completion");
+    assert!(completion.items.is_empty());
+}
+
+#[test]
 fn completion_bare_dot_resolves_a_source_typed_function_call_receiver() {
     let marked = r#"unit SourceTypedExpressionReceiver;
 interface
@@ -1968,6 +2069,53 @@ end.
 }
 
 #[test]
+fn inherited_constructor_type_definition_uses_the_constructed_type() {
+    let source = r#"unit InheritedConstructorTypeDefinition;
+interface
+type
+  TBase = class
+    constructor Create;
+  end;
+  TChild = class(TBase)
+  end;
+implementation
+constructor TBase.Create;
+begin
+end;
+procedure Caller;
+begin
+  TChild.Create;
+end;
+end.
+"#;
+    let source_uri = uri("InheritedConstructorTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited constructor source parses");
+
+    let definition = index.navigate(
+        &source_uri,
+        position_of(source, "Create", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(definition.len(), 1);
+    assert_location_start(
+        &definition[0],
+        &source_uri,
+        position_of(source, "Create", 0),
+    );
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Create", 2));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &source_uri,
+        position_of(source, "TChild", 0),
+    );
+}
+
+#[test]
 fn navigation_resolves_nested_function_result_member_chains() {
     let source = r#"unit NestedFunctionResultChain;
 interface
@@ -2003,6 +2151,34 @@ end.
     );
     assert_eq!(locations.len(), 1);
     assert_location_start(&locations[0], &source_uri, position_of(source, "Name", 0));
+}
+
+#[test]
+fn nested_constructor_call_receivers_stop_at_the_receiver_work_bound() {
+    let chain_length = 14;
+    let mut chain = String::from("  TObj");
+    for _ in 0..chain_length {
+        chain.push_str(".Create()");
+    }
+    chain.push_str(".Member;\n");
+    let source = format!(
+        "unit NestedConstructorReceiverBound;\ninterface\ntype\n  TObj = class\n    constructor Create;\n    Member: Integer;\n  end;\nimplementation\nconstructor TObj.Create;\nbegin\nend;\nprocedure Caller;\nbegin\n{chain}end;\nend.\n"
+    );
+    let source_uri = uri("NestedConstructorReceiverBound");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("nested constructor receiver source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(&source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        locations.is_empty(),
+        "nested constructor calls must fail closed at the receiver work bound"
+    );
 }
 
 #[test]
@@ -2055,6 +2231,71 @@ end.
         &locations[0],
         &provider_uri,
         position_of(provider, "ProviderMember", 0),
+    );
+}
+
+#[test]
+fn function_result_annotations_keep_the_interface_type_scope() {
+    let provider = r#"unit ResultAnnotationProvider;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit ResultAnnotationConsumer;
+interface
+uses ResultAnnotationProvider;
+function Make: TResult;
+implementation
+type
+  TResult = record
+    Name: string;
+  end;
+function Make: TResult;
+begin
+end;
+procedure Caller;
+begin
+  Make().Name;
+end;
+end.
+"#;
+    let provider_uri = uri("ResultAnnotationProvider");
+    let consumer_uri = uri("ResultAnnotationConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("annotation provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("annotation consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("ResultAnnotationProvider".to_owned(), provider_uri.clone())],
+    );
+
+    let member = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Name", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(&member[0], &provider_uri, position_of(provider, "Name", 0));
+
+    let hover = index
+        .hover(&consumer_uri, position_of(consumer, "Name", 1))
+        .expect("provider result member hover");
+    assert!(hover_text(&hover).contains("Name: Integer"));
+    assert!(!hover_text(&hover).contains("Name: string"));
+
+    let type_definition = index.type_definitions(&consumer_uri, position_of(consumer, "Make", 2));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &provider_uri,
+        position_of(provider, "TResult", 0),
     );
 }
 
@@ -2121,6 +2362,7 @@ end;
 procedure Caller;
 begin
   Make(1).Member;
+  Make('text').Member;
 end;
 end.
 "#;
@@ -2148,6 +2390,16 @@ end.
         completion.items.is_empty(),
         "ambiguous overloads must not expose receiver members"
     );
+    assert!(
+        completion.is_incomplete,
+        "ambiguous receiver resolution must be reported as uncertain"
+    );
+
+    let string_completion = index
+        .completion(&source_uri, position_after(source, "Make('text').Me", 0))
+        .expect("ambiguous string overload completion");
+    assert!(string_completion.items.is_empty());
+    assert!(string_completion.is_incomplete);
 }
 
 #[test]
@@ -2271,6 +2523,48 @@ end.
             .collect::<Vec<_>>(),
         ["Name"]
     );
+}
+
+#[test]
+fn casts_reject_variable_rhs_receivers() {
+    let source = r#"unit InvalidCastVariableReceiver;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    Member: Integer;
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  OtherObj: TOther;
+begin
+  (Obj as OtherObj).Member;
+end;
+end.
+"#;
+    let source_uri = uri("InvalidCastVariableReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("invalid cast source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 2),
+        NavigationTarget::Declaration,
+    );
+    assert!(navigation.is_empty());
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "(Obj as OtherObj).Me", 0),
+        )
+        .expect("invalid cast completion");
+    assert!(completion.items.is_empty());
 }
 
 #[test]

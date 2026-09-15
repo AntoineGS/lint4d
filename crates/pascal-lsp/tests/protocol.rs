@@ -2248,7 +2248,7 @@ fn type_definition_request_resolves_a_function_result_with_utf16_positions() {
     let provider = temp.path().join("ResultProvider.pas");
     let consumer = temp.path().join("ResultConsumer.pas");
     let provider_source = "unit ResultProvider;\ninterface\ntype\n  TResult = class\n    Member: Integer;\n  end;\nfunction MakeValue: TResult;\nimplementation\nfunction MakeValue: TResult;\nbegin\n  Result := TResult.Create;\nend;\nend.\n";
-    let consumer_source = "unit ResultConsumer;\ninterface\nuses ResultProvider;\nimplementation\nprocedure Run;\nbegin\n  {é} ResultProvider.MakeValue().Member := 1;\nend;\nend.\n";
+    let consumer_source = "unit ResultConsumer;\ninterface\nuses ResultProvider;\nimplementation\nprocedure Run;\nbegin\n  {😀} ResultProvider.MakeValue().Member := 1;\nend;\nend.\n";
     write_file(&provider, provider_source);
     write_file(&consumer, consumer_source);
 
@@ -2752,6 +2752,33 @@ fn references_include_unopened_consumers() {
     assert_eq!(locations[0]["uri"], uri(&consumer).to_string());
     assert_eq!(locations[1]["uri"], uri(&consumer).to_string());
     assert_eq!(locations[2]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn references_reject_a_variable_rhs_in_a_cast_receiver() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("InvalidCastReferences.pas");
+    let source = "unit InvalidCastReferences;\ninterface\ntype\n  TWidget = class\n    Member: Integer;\n  end;\n  TOther = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Caller;\nvar\n  Obj: TWidget;\n  OtherObj: TOther;\nbegin\n  (Obj as OtherObj).Member := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("invalid-cast-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "Member", 1),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "an unresolved cast receiver must not return references"
+    );
     server.shutdown();
 }
 

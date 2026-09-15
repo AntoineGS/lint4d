@@ -30,6 +30,7 @@ const MAX_SIGNATURE_NODES: usize = 100_000;
 const MAX_SIGNATURE_LABEL_BYTES: usize = 128 * 1024;
 const MAX_SIGNATURE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_SIGNATURE_PARAMETERS: usize = 4096;
+const MAX_TRAILING_MEMBER_DOT_GAP_BYTES: usize = 256;
 
 #[cfg(test)]
 static COMPLETION_SYMBOL_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -62,6 +63,12 @@ enum CompletionMember<'a> {
     Expression(Node<'a>),
     Bare { path: &'a str, end: usize },
     Unsupported,
+}
+
+enum TrailingMemberDot {
+    Absent,
+    Present(usize),
+    GapExceeded,
 }
 
 impl<'a> CompletionAccumulator<'a> {
@@ -484,25 +491,41 @@ impl NavigationIndex {
                 let Some(lhs) = dot.child_by_field_name("lhs") else {
                     return Ok((Vec::new(), false));
                 };
-                Some(self.resolve_receivers_with_budget(
+                let mut state = super::ResolutionState::new();
+                let receivers = self.resolve_receivers_with_state_and_budget(
                     current_uri,
                     current_document,
                     offset,
                     lhs,
                     lhs,
+                    &mut state,
                     cancel,
                     accumulator.budget,
-                )?)
+                    0,
+                )?;
+                if state.receiver_resolution_uncertain() {
+                    accumulator.is_incomplete = true;
+                }
+                Some(receivers)
             }
-            CompletionMember::Expression(receiver) => Some(self.resolve_receivers_with_budget(
-                current_uri,
-                current_document,
-                offset,
-                receiver,
-                receiver,
-                cancel,
-                accumulator.budget,
-            )?),
+            CompletionMember::Expression(receiver) => {
+                let mut state = super::ResolutionState::new();
+                let receivers = self.resolve_receivers_with_state_and_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    receiver,
+                    receiver,
+                    &mut state,
+                    cancel,
+                    accumulator.budget,
+                    0,
+                )?;
+                if state.receiver_resolution_uncertain() {
+                    accumulator.is_incomplete = true;
+                }
+                Some(receivers)
+            }
             CompletionMember::Bare { path, end } => {
                 let lookup_identifier = lookup_identifier.or(identifier_at_with_budget(
                     current_document.tree.root_node(),
@@ -511,7 +534,7 @@ impl NavigationIndex {
                     accumulator.budget,
                     "completion",
                 )?);
-                Some(self.resolve_completion_receivers(
+                let (receivers, uncertain) = self.resolve_completion_receivers(
                     current_uri,
                     current_document,
                     end.saturating_sub(1),
@@ -519,13 +542,17 @@ impl NavigationIndex {
                     lookup_identifier,
                     cancel,
                     accumulator.budget,
-                )?)
+                )?;
+                if uncertain {
+                    accumulator.is_incomplete = true;
+                }
+                Some(receivers)
             }
             CompletionMember::Unsupported => return Ok((Vec::new(), false)),
         };
         if let Some(receivers) = member_receivers {
             if receivers.is_empty() {
-                return Ok((Vec::new(), false));
+                return Ok((Vec::new(), accumulator.is_incomplete));
             }
             if receivers.len() > 1 {
                 accumulator.is_incomplete = true;
@@ -737,7 +764,7 @@ impl NavigationIndex {
         lookup_identifier: Option<Node<'_>>,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<Vec<super::Receiver>, String> {
+    ) -> Result<(Vec<super::Receiver>, bool), String> {
         budget.require_bytes(path.len(), cancel)?;
         let parts = path
             .split('.')
@@ -745,13 +772,13 @@ impl NavigationIndex {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         if parts.is_empty() || parts.len() > super::MAX_RECEIVER_WORK {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let Some(lookup_identifier) = lookup_identifier else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let mut state = super::ResolutionState::new();
-        if parts.len() == 1 {
+        let receivers = if parts.len() == 1 {
             self.resolve_identifier_receiver_with_budget(
                 current_uri,
                 current_document,
@@ -773,7 +800,8 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )
-        }
+        }?;
+        Ok((receivers, state.receiver_resolution_uncertain()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1173,7 +1201,8 @@ impl NavigationIndex {
                     )?);
                 }
                 SymbolKind::Routine => {
-                    let type_name = if symbol.routine_kind == RoutineKind::Constructor {
+                    let is_constructor = symbol.routine_kind == RoutineKind::Constructor;
+                    let type_name = if is_constructor {
                         symbol.owner_type_name.as_deref()
                     } else {
                         symbol.result_type_name.as_deref()
@@ -1184,9 +1213,46 @@ impl NavigationIndex {
                     let Some(declaration_document) = self.documents.get(&reference.uri) else {
                         continue;
                     };
+                    if is_constructor {
+                        if let Some(dot) = super::member_expression_at(identifier)
+                            .filter(|dot| super::is_right_hand_member(*dot, identifier))
+                        {
+                            if let Some(lhs) = dot.child_by_field_name("lhs") {
+                                let receivers = self.resolve_receivers_with_state_and_budget(
+                                    uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
+                                )?;
+                                let mut constructed_targets = Vec::new();
+                                for receiver in receivers {
+                                    let super::Receiver::Type(type_uri, type_key) = receiver else {
+                                        continue;
+                                    };
+                                    constructed_targets.extend(
+                                        self.type_candidates_in_unit_with_budget(
+                                            &type_uri,
+                                            &type_key,
+                                            type_uri == *uri,
+                                            cancel,
+                                            budget,
+                                        )?,
+                                    );
+                                }
+                                if !constructed_targets.is_empty() {
+                                    targets.extend(constructed_targets);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    let type_offset = if is_constructor {
+                        symbol.span.start
+                    } else {
+                        symbol
+                            .result_type_span
+                            .map_or(symbol.span.start, |span| span.start)
+                    };
                     let Some(lookup_identifier) = identifier_at_with_budget(
                         declaration_document.tree.root_node(),
-                        symbol.span.start,
+                        type_offset,
                         cancel,
                         budget,
                         "type definition",
@@ -1197,7 +1263,7 @@ impl NavigationIndex {
                     targets.extend(self.type_declaration_candidates_with_budget(
                         &reference.uri,
                         declaration_document,
-                        symbol.span.start,
+                        type_offset,
                         type_name,
                         lookup_identifier,
                         &mut state,
@@ -1612,9 +1678,12 @@ fn member_expression_for_completion<'a>(
     {
         return Ok(CompletionMember::Bare { path, end });
     }
-    if trailing_member_dot_with_budget(&document.source, offset, cancel, budget)?.is_none() {
-        return Ok(CompletionMember::Unqualified);
-    }
+    let dot_offset =
+        match trailing_member_dot_with_budget(&document.source, offset, cancel, budget)? {
+            TrailingMemberDot::Absent => return Ok(CompletionMember::Unqualified),
+            TrailingMemberDot::Present(dot_offset) => dot_offset,
+            TrailingMemberDot::GapExceeded => return Ok(CompletionMember::Unsupported),
+        };
 
     // The parser may omit the RHS identifier while the user is typing `Obj.`.
     // In that case locate an expression whose dot is immediately before the
@@ -1625,6 +1694,16 @@ fn member_expression_for_completion<'a>(
         check_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         let node = cursor.node();
+        if result.is_none()
+            && node.end_byte() == dot_offset
+            && node.start_byte() < node.end_byte()
+            && matches!(
+                node.kind(),
+                "identifier" | "exprCall" | "exprParens" | "exprAs" | "exprDot" | "genericDot"
+            )
+        {
+            result = Some(CompletionMember::Expression(node));
+        }
         if result.is_none() && matches!(node.kind(), "exprDot" | "genericDot") {
             if let Some(operator) = node.child_by_field_name("operator") {
                 if operator.end_byte() <= prefix_start {
@@ -1685,16 +1764,27 @@ fn trailing_member_dot_with_budget(
     offset: usize,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<Option<usize>, String> {
+) -> Result<TrailingMemberDot, String> {
     let mut cursor = offset.min(source.len());
+    let mut gap_bytes = 0usize;
     while cursor > 0 && source.as_bytes()[cursor - 1].is_ascii_whitespace() {
         budget.require_bytes(1, cancel)?;
+        gap_bytes = gap_bytes.saturating_add(1);
+        if gap_bytes > MAX_TRAILING_MEMBER_DOT_GAP_BYTES {
+            return Ok(TrailingMemberDot::GapExceeded);
+        }
         cursor -= 1;
     }
     if cursor > 0 {
         budget.require_bytes(1, cancel)?;
     }
-    Ok((cursor > 0 && source.as_bytes().get(cursor - 1) == Some(&b'.')).then_some(cursor - 1))
+    Ok(
+        if cursor > 0 && source.as_bytes().get(cursor - 1) == Some(&b'.') {
+            TrailingMemberDot::Present(cursor - 1)
+        } else {
+            TrailingMemberDot::Absent
+        },
+    )
 }
 
 fn bare_member_path_with_budget<'a>(
@@ -1703,7 +1793,9 @@ fn bare_member_path_with_budget<'a>(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<(&'a str, usize)>, String> {
-    let Some(dot) = trailing_member_dot_with_budget(source, offset, cancel, budget)? else {
+    let TrailingMemberDot::Present(dot) =
+        trailing_member_dot_with_budget(source, offset, cancel, budget)?
+    else {
         return Ok(None);
     };
     let mut start = dot;
@@ -2772,6 +2864,7 @@ mod tests {
             owner_type_name: None,
             type_name: None,
             result_type_name: None,
+            result_type_span: None,
             region: Region::Interface,
             origin: Origin::Declaration,
             local_only: false,

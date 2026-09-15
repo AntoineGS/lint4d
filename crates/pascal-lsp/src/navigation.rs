@@ -330,6 +330,18 @@ impl NavigationIndex {
         offset: usize,
         identifier: Node<'_>,
     ) -> Vec<Candidate> {
+        let mut state = ResolutionState::new();
+        self.resolve_candidates_at_with_state(uri, document, offset, identifier, &mut state)
+    }
+
+    fn resolve_candidates_at_with_state(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        state: &mut ResolutionState,
+    ) -> Vec<Candidate> {
         let name = node_text(identifier, &document.source);
         if let Some(unit_name) = use_name_at(identifier, &document.source) {
             self.unit_references(document, &unit_name)
@@ -341,7 +353,7 @@ impl NavigationIndex {
             self.type_reference_candidates(uri, document, offset, &path, cursor_index)
         } else if let Some(dot) = member_expression_at(identifier) {
             if is_right_hand_member(dot, identifier) {
-                self.member_references(uri, document, offset, dot, &name)
+                self.member_references_with_state(uri, document, offset, dot, &name, state)
             } else {
                 self.unqualified_references(uri, document, offset, &name)
             }
@@ -356,6 +368,23 @@ impl NavigationIndex {
         document: &Document,
         offset: usize,
         identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let mut state = ResolutionState::new();
+        self.resolve_candidates_at_with_state_and_budget(
+            uri, document, offset, identifier, &mut state, cancel, budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_candidates_at_with_state_and_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
@@ -383,8 +412,8 @@ impl NavigationIndex {
             )
         } else if let Some(dot) = member_expression_at(identifier) {
             if is_right_hand_member(dot, identifier) {
-                self.member_references_with_budget(
-                    uri, document, offset, dot, name, identifier, cancel, budget,
+                self.member_references_with_state_and_budget(
+                    uri, document, offset, dot, name, identifier, state, cancel, budget,
                 )
             } else {
                 self.unqualified_references_with_budget(
@@ -730,7 +759,7 @@ impl NavigationIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn member_references_with_budget(
+    fn member_references_with_state_and_budget(
         &self,
         current_uri: &Url,
         current_document: &Document,
@@ -738,6 +767,7 @@ impl NavigationIndex {
         dot: Node<'_>,
         member_name: &str,
         lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
@@ -746,14 +776,16 @@ impl NavigationIndex {
         };
         budget.require_bytes(member_name.len(), cancel)?;
         let key = canonical_name(member_name);
-        let receivers = self.resolve_receivers_with_budget(
+        let receivers = self.resolve_receivers_with_state_and_budget(
             current_uri,
             current_document,
             offset,
             lhs,
             lookup_identifier,
+            state,
             cancel,
             budget,
+            0,
         )?;
         let mut references = Vec::new();
         for receiver in receivers {
@@ -1199,12 +1231,34 @@ impl NavigationIndex {
         dot: Node<'_>,
         member_name: &str,
     ) -> Vec<Candidate> {
+        let mut state = ResolutionState::new();
+        self.member_references_with_state(
+            current_uri,
+            current_document,
+            offset,
+            dot,
+            member_name,
+            &mut state,
+        )
+    }
+
+    fn member_references_with_state(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        dot: Node<'_>,
+        member_name: &str,
+        state: &mut ResolutionState,
+    ) -> Vec<Candidate> {
         let Some(lhs) = dot.child_by_field_name("lhs") else {
             return Vec::new();
         };
         let key = canonical_name(member_name);
         let mut references = Vec::new();
-        for receiver in self.resolve_receivers(current_uri, current_document, offset, lhs) {
+        for receiver in
+            self.resolve_receivers_with_state(current_uri, current_document, offset, lhs, state)
+        {
             match receiver {
                 Receiver::Unit(unit_uri) => references.extend(
                     self.exported_references_for_document(&unit_uri)
@@ -1237,31 +1291,6 @@ impl NavigationIndex {
     ) -> Vec<Receiver> {
         let mut state = ResolutionState::new();
         self.resolve_receivers_with_state(current_uri, current_document, offset, node, &mut state)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_receivers_with_budget(
-        &self,
-        current_uri: &Url,
-        current_document: &Document,
-        offset: usize,
-        node: Node<'_>,
-        lookup_identifier: Node<'_>,
-        cancel: &AtomicBool,
-        budget: &mut AssistanceBudget,
-    ) -> Result<Vec<Receiver>, String> {
-        let mut state = ResolutionState::new();
-        self.resolve_receivers_with_state_and_budget(
-            current_uri,
-            current_document,
-            offset,
-            node,
-            lookup_identifier,
-            &mut state,
-            cancel,
-            budget,
-            0,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1332,16 +1361,14 @@ impl NavigationIndex {
                 {
                     node.child_by_field_name("rhs")
                         .map(|rhs| {
-                            self.resolve_receivers_with_state_and_budget(
+                            self.resolve_cast_receivers_with_state_and_budget(
                                 current_uri,
                                 current_document,
                                 offset,
                                 rhs,
-                                lookup_identifier,
                                 state,
                                 cancel,
                                 budget,
-                                depth.saturating_add(1),
                             )
                         })
                         .unwrap_or_else(|| Ok(Vec::new()))
@@ -1428,6 +1455,34 @@ impl NavigationIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn resolve_cast_receivers_with_state_and_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        type_node: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        let Some(parts) =
+            qualified_name_parts_with_budget(type_node, &current_document.source, cancel, budget)?
+        else {
+            return Ok(Vec::new());
+        };
+        self.type_receivers_for_parts_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            &parts,
+            type_node,
+            state,
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn resolve_call_receivers_with_budget(
         &self,
         current_uri: &Url,
@@ -1443,11 +1498,12 @@ impl NavigationIndex {
             return Ok(Vec::new());
         };
         let callable_identifier = callable_lookup_identifier(entity);
-        let candidates = self.resolve_candidates_at_with_budget(
+        let candidates = self.resolve_candidates_at_with_state_and_budget(
             current_uri,
             current_document,
             entity.start_byte(),
             callable_identifier,
+            state,
             cancel,
             budget,
         )?;
@@ -1477,6 +1533,7 @@ impl NavigationIndex {
 
         if !type_candidates.is_empty() {
             if !routine_candidates.is_empty() {
+                state.mark_receiver_uncertain();
                 return Ok(Vec::new());
             }
             return Ok(type_candidates
@@ -1502,6 +1559,7 @@ impl NavigationIndex {
             routine_groups.insert((candidate.uri.clone(), routine_key.clone()));
         }
         if routine_groups.len() != 1 {
+            state.mark_receiver_uncertain();
             return Ok(Vec::new());
         }
 
@@ -1519,11 +1577,14 @@ impl NavigationIndex {
                     .as_ref()
                     .is_some_and(|(_, _, current)| current != result_type_name)
                 {
+                    state.mark_receiver_uncertain();
                     return Ok(Vec::new());
                 }
                 result_type_source = Some((
                     candidate.uri.clone(),
-                    symbol.span.start,
+                    symbol
+                        .result_type_span
+                        .map_or(symbol.span.start, |span| span.start),
                     result_type_name.to_owned(),
                 ));
             }
@@ -2133,7 +2194,7 @@ impl NavigationIndex {
                 if node_text(operator, &current_document.source).eq_ignore_ascii_case("as") {
                     node.child_by_field_name("rhs")
                         .map(|rhs| {
-                            self.resolve_receivers_with_state(
+                            self.resolve_cast_receivers_with_state(
                                 current_uri,
                                 current_document,
                                 offset,
@@ -2200,6 +2261,20 @@ impl NavigationIndex {
         }
     }
 
+    fn resolve_cast_receivers_with_state(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        type_node: Node<'_>,
+        state: &mut ResolutionState,
+    ) -> Vec<Receiver> {
+        let Some(parts) = qualified_name_parts(&type_node, &current_document.source) else {
+            return Vec::new();
+        };
+        self.type_receivers_for_parts(current_uri, current_document, offset, &parts, state)
+    }
+
     fn resolve_call_receivers(
         &self,
         current_uri: &Url,
@@ -2212,11 +2287,12 @@ impl NavigationIndex {
             return Vec::new();
         };
         let callable_identifier = callable_lookup_identifier(entity);
-        let candidates = self.resolve_candidates_at(
+        let candidates = self.resolve_candidates_at_with_state(
             current_uri,
             current_document,
             entity.start_byte(),
             callable_identifier,
+            state,
         );
         if candidates
             .iter()
@@ -2286,7 +2362,9 @@ impl NavigationIndex {
                 }
                 result_type_source = Some((
                     candidate.uri.clone(),
-                    symbol.span.start,
+                    symbol
+                        .result_type_span
+                        .map_or(symbol.span.start, |span| span.start),
                     result_type_name.to_owned(),
                 ));
             }
@@ -4115,6 +4193,7 @@ struct Symbol {
     owner_type_name: Option<String>,
     type_name: Option<String>,
     result_type_name: Option<String>,
+    result_type_span: Option<Span>,
     region: Region,
     origin: Origin,
     local_only: bool,
@@ -4242,6 +4321,7 @@ struct ResolutionState {
     receiver_work: usize,
     type_work: usize,
     active_members: HashSet<(Url, String, String)>,
+    receiver_uncertain: bool,
 }
 
 impl ResolutionState {
@@ -4250,7 +4330,16 @@ impl ResolutionState {
             receiver_work: MAX_RECEIVER_WORK,
             type_work: MAX_TYPE_RESOLUTION_WORK,
             active_members: HashSet::new(),
+            receiver_uncertain: false,
         }
+    }
+
+    fn mark_receiver_uncertain(&mut self) {
+        self.receiver_uncertain = true;
+    }
+
+    fn receiver_resolution_uncertain(&self) -> bool {
+        self.receiver_uncertain
     }
 
     fn take_receiver_work(&mut self) -> bool {
@@ -4431,6 +4520,7 @@ impl Document {
                 owner_type_name: None,
                 type_name: None,
                 result_type_name: None,
+                result_type_span: None,
                 region: Region::Other,
                 origin: Origin::Declaration,
                 local_only: false,
@@ -4988,6 +5078,7 @@ fn pair_abbreviated_definitions(
         symbols[definition_index].routine_key = Some(routine_key.clone());
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
+        symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
         let declaration_node = declaration_nodes_by_key
             .get(&routine_key)
             .and_then(|nodes| nodes.first().copied());
@@ -4997,6 +5088,41 @@ fn pair_abbreviated_definitions(
         if let Some(declaration_node) = declaration_node {
             inject_abbreviated_parameters(declaration_node, body_scope, source, symbols);
         }
+    }
+
+    let mut declarations_by_routine_key: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, symbol) in symbols.iter().enumerate() {
+        if symbol.kind == SymbolKind::Routine && symbol.origin == Origin::Declaration {
+            if let Some(routine_key) = symbol.routine_key.as_ref() {
+                declarations_by_routine_key
+                    .entry(routine_key.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+    }
+    let definition_indices: Vec<usize> = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| {
+            (symbol.kind == SymbolKind::Routine && symbol.origin == Origin::Definition)
+                .then_some(index)
+        })
+        .collect();
+    for definition_index in definition_indices {
+        let Some(routine_key) = symbols[definition_index].routine_key.as_ref() else {
+            continue;
+        };
+        let Some(declarations) = declarations_by_routine_key.get(routine_key) else {
+            continue;
+        };
+        let Some(&declaration_index) = declarations.first().filter(|_| declarations.len() == 1)
+        else {
+            continue;
+        };
+        symbols[definition_index].result_type_name =
+            symbols[declaration_index].result_type_name.clone();
+        symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
     }
 }
 
@@ -5035,6 +5161,7 @@ fn inject_abbreviated_parameters(
                 owner_type_name: None,
                 type_name: type_name.clone(),
                 result_type_name: None,
+                result_type_span: None,
                 region: Region::Implementation,
                 origin: Origin::Declaration,
                 local_only: false,
@@ -5071,6 +5198,7 @@ fn add_definition_symbol(
         .unwrap_or(ROOT_SCOPE);
     let scope = scopes[own_scope].parent.unwrap_or(ROOT_SCOPE);
     let signature = routine_signature(header, source);
+    let result_type = routine_result_type(header, source);
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -5084,7 +5212,8 @@ fn add_definition_symbol(
         owner_type: owner_type.clone(),
         owner_type_name,
         type_name: None,
-        result_type_name: routine_result_type(header, source),
+        result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
+        result_type_span: result_type.map(|(_, span)| span),
         region: region_for_node(node),
         origin: Origin::Definition,
         local_only: false,
@@ -5116,6 +5245,7 @@ fn add_routine_symbol(
     let owner_type_name = routine_owner_name(node, source);
     let scope = scope_for_declaration(node, scope_by_span);
     let signature = routine_signature(node, source);
+    let result_type = routine_result_type(node, source);
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -5129,7 +5259,8 @@ fn add_routine_symbol(
         owner_type: owner_type.clone(),
         owner_type_name,
         type_name: None,
-        result_type_name: routine_result_type(node, source),
+        result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
+        result_type_span: result_type.map(|(_, span)| span),
         region: region_for_node(node),
         origin: Origin::Declaration,
         local_only: false,
@@ -5196,6 +5327,7 @@ fn add_named_symbol(
             owner_type_name: owner_type_name.clone(),
             type_name: type_name.clone(),
             result_type_name: None,
+            result_type_span: None,
             region: region_for_node(node),
             origin: Origin::Declaration,
             local_only,
@@ -5406,9 +5538,10 @@ fn routine_kind(node: Node<'_>) -> RoutineKind {
     RoutineKind::Procedure
 }
 
-fn routine_result_type(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("type")
-        .and_then(|type_node| simple_type_path(type_node, source))
+fn routine_result_type(node: Node<'_>, source: &str) -> Option<(String, Span)> {
+    node.child_by_field_name("type").and_then(|type_node| {
+        simple_type_path(type_node, source).map(|name| (name, Span::from_node(type_node)))
+    })
 }
 
 fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<String>)> {

@@ -1043,6 +1043,42 @@ end.
 }
 
 #[test]
+fn invalid_cast_variable_rhs_does_not_authorize_a_member_rename() {
+    let source = "unit InvalidCastVariableRename;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    Member: Integer;
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  OtherObj: TOther;
+begin
+  Obj.Member := 1;
+  (Obj as OtherObj).Member := 2;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "InvalidCastVariableRename", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Member", 1),
+                "RenamedMember"
+            )
+            .is_err(),
+        "an invalid cast receiver must not produce a partial member rename"
+    );
+}
+
+#[test]
 fn unrelated_class_homonyms_are_not_renamed() {
     let source = "unit ClassHomonyms;
 interface

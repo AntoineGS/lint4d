@@ -7,15 +7,16 @@
 //! cache or the filesystem.
 
 use super::{
-    ContextKey, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
+    ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
     WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_configuration_file,
-    is_pascal_path, package_paths_equal, path_stamp, path_stamp_result, path_starts_with_ci,
-    paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
+    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, path_starts_with_native,
+    paths_equal_ci, read_disk_source,
 };
 use crate::NavigationIndex;
 use crate::conditional::{self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind};
 use crate::project::{
-    ProjectCandidateMembership, ProjectContext, ProjectSelections, has_invalid_project_selection,
+    MetadataObservation, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
+    ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
 };
 use crate::text;
 use lsp_types::{
@@ -23,16 +24,21 @@ use lsp_types::{
     PrepareRenameResponse, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::decode_bytes;
+use pascal_core::delphi_overrides::EffectiveOverrides;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
+
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, Sender};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 pub(crate) const CANCELLATION_MESSAGE: &str = "request cancelled";
 const MAX_SNAPSHOT_DEPENDENCY_FILES: usize = 512;
@@ -88,6 +94,7 @@ pub(crate) struct OverlayInput {
 pub(crate) struct WorkspaceInput {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) options: WorkspaceOptions,
+    pub(crate) overrides: pascal_core::delphi_overrides::OverrideSession,
     pub(crate) project_selections: ProjectSelections,
     pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
@@ -108,6 +115,21 @@ pub(crate) struct SourceRecord {
     pub(crate) content_hash: Option<u64>,
     pub(crate) content_bytes: Option<Vec<u8>>,
     pub(crate) candidate_membership: Option<ProjectCandidateMembership>,
+    /// The requester-scoped authorization used to read this closed source.
+    /// Open overlays do not need these values because their payload is already
+    /// supplied by the client and revalidation compares the overlay text.
+    pub(crate) read_policy: Option<ReadPolicy>,
+    pub(crate) path_entry: Option<ProjectPathEntry>,
+    pub(crate) include_payload: bool,
+}
+
+impl SourceRecord {
+    fn payload_dependency(&self) -> Result<(&ReadPolicy, &ProjectPathEntry), String> {
+        match (self.read_policy.as_ref(), self.path_entry.as_ref()) {
+            (Some(read_policy), Some(path_entry)) => Ok((read_policy, path_entry)),
+            _ => Err("closed source has no requester-scoped read authorization".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,14 +194,201 @@ pub(crate) enum SnapshotMode {
     WorkspaceSymbols,
 }
 
+fn context_incomplete_for_mode(mode: SnapshotMode, context: &ProjectContext) -> bool {
+    match mode {
+        SnapshotMode::Workspace => !context.discovery_complete,
+        SnapshotMode::WorkspaceSymbols => context.override_error.is_some(),
+        SnapshotMode::Local | SnapshotMode::LocalWithImports | SnapshotMode::Assistance => false,
+    }
+}
+
+#[cfg(test)]
+type SnapshotPriorityBarrier = (Url, Sender<()>, Receiver<()>);
+
+#[cfg(test)]
+static SNAPSHOT_PRIORITY_BARRIER: OnceLock<Mutex<Option<SnapshotPriorityBarrier>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn install_snapshot_priority_barrier(priority_uri: Url, ready: Sender<()>, release: Receiver<()>) {
+    SNAPSHOT_PRIORITY_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("snapshot barrier lock")
+        .replace((priority_uri, ready, release));
+}
+
+#[cfg(test)]
+fn wait_at_snapshot_priority_barrier(priority: &[Url]) {
+    let mut barrier = SNAPSHOT_PRIORITY_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("snapshot barrier lock");
+    let Some(priority_uri) = priority.first() else {
+        return;
+    };
+    if barrier
+        .as_ref()
+        .is_some_and(|(expected, _, _)| expected == priority_uri)
+    {
+        let (_, ready, release) = barrier.take().expect("snapshot barrier is present");
+        ready.send(()).expect("snapshot barrier ready receiver");
+        release.recv().expect("snapshot barrier release sender");
+    }
+}
+
 #[derive(Debug, Default)]
 struct Enumeration {
-    paths: Vec<PathBuf>,
+    paths: Vec<EnumeratedSource>,
+    path_indices: HashMap<String, usize>,
+    contexts: HashMap<ContextKey, ContextState>,
+    #[cfg(test)]
+    path_lookups: usize,
     baseline: BaselineAccumulator,
     baseline_content_hashes: HashMap<String, u64>,
     baseline_contents: HashMap<String, Vec<u8>>,
     complete: bool,
     reason: Option<String>,
+    visited_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct EnumeratedSource {
+    path: PathBuf,
+    owner: Option<ContextKey>,
+}
+
+impl Enumeration {
+    fn add_path(&mut self, path: PathBuf, owner: Option<ContextKey>) {
+        let key = path_key(&path);
+        if let Some(index) = self.lookup_index(&key) {
+            let existing = &mut self.paths[index];
+            if let Some(owner) = owner {
+                if let Some(existing_owner) = &existing.owner {
+                    if existing_owner != &owner {
+                        self.complete = false;
+                        self.reason.get_or_insert_with(|| {
+                            format!(
+                                "source {path:?} was discovered under incompatible project contexts"
+                            )
+                        });
+                    }
+                } else {
+                    existing.owner = Some(owner);
+                }
+            }
+            return;
+        }
+        let index = self.paths.len();
+        self.path_indices.insert(key, index);
+        self.paths.push(EnumeratedSource { path, owner });
+    }
+
+    fn assign_owner(&mut self, path: &Path, owner: ContextKey) {
+        let key = path_key(path);
+        let Some(index) = self.lookup_index(&key) else {
+            return;
+        };
+        let existing = &mut self.paths[index];
+        if let Some(existing_owner) = &existing.owner {
+            if existing_owner != &owner {
+                self.complete = false;
+                self.reason.get_or_insert_with(|| {
+                    format!("source {path:?} was discovered under incompatible project contexts")
+                });
+            }
+        } else {
+            existing.owner = Some(owner);
+        }
+    }
+
+    fn retain_context(&mut self, key: ContextKey, state: ContextState) {
+        match self.contexts.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if !evaluated_contexts_equal(&entry.get().context, &state.context) {
+                    self.complete = false;
+                    self.reason.get_or_insert_with(|| {
+                        "project context changed while building the workspace snapshot".to_string()
+                    });
+                }
+            }
+        }
+    }
+
+    fn lookup_index(&mut self, key: &str) -> Option<usize> {
+        #[cfg(test)]
+        {
+            self.path_lookups = self.path_lookups.saturating_add(1);
+        }
+        self.path_indices.get(key).copied()
+    }
+
+    #[cfg(test)]
+    fn lookup_count(&self) -> usize {
+        self.path_lookups
+    }
+
+    fn sort_paths(&mut self, priority: &[Url]) {
+        self.paths.sort_by(|left, right| {
+            left.path
+                .to_string_lossy()
+                .cmp(&right.path.to_string_lossy())
+        });
+        let priority_paths = priority
+            .iter()
+            .filter_map(|uri| uri.to_file_path().ok().map(absolute_path))
+            .collect::<Vec<_>>();
+        self.paths.sort_by_key(|source| {
+            priority_paths
+                .iter()
+                .position(|priority| paths_equal_ci(priority, &source.path))
+                .unwrap_or(priority_paths.len())
+        });
+        self.path_indices.clear();
+        for (index, source) in self.paths.iter().enumerate() {
+            self.path_indices.insert(path_key(&source.path), index);
+        }
+    }
+}
+
+fn evaluated_contexts_equal(left: &ProjectContext, right: &ProjectContext) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    // These fields are observations accumulated while reading, not evaluated
+    // project state. They may legitimately grow as a snapshot discovers more
+    // metadata, while changed search paths/overrides must invalidate it.
+    left.metadata_files.clear();
+    left.metadata_observations.clear();
+    left.warnings.clear();
+    right.metadata_files.clear();
+    right.metadata_observations.clear();
+    right.warnings.clear();
+    normalize_standalone_legacy_roots(&mut left);
+    normalize_standalone_legacy_roots(&mut right);
+    left == right
+}
+
+fn normalize_standalone_legacy_roots(context: &mut ProjectContext) {
+    if context.project_file.is_some() {
+        return;
+    }
+    let legacy_roots = context
+        .search_path_entries
+        .iter()
+        .filter(|entry| matches!(entry.provenance, ProjectPathProvenance::LegacyNative))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    context
+        .search_path_entries
+        .retain(|entry| !matches!(entry.provenance, ProjectPathProvenance::LegacyNative));
+    context.search_paths.retain(|path| {
+        !legacy_roots
+            .iter()
+            .any(|legacy_root| paths_equal_ci(path, legacy_root))
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +396,9 @@ struct BaselinePath {
     path: PathBuf,
     stamp: Option<PathStamp>,
     candidate_membership: Option<ProjectCandidateMembership>,
+    read_policy: Option<ReadPolicy>,
+    path_entry: Option<ProjectPathEntry>,
+    include_payload: bool,
 }
 
 #[derive(Debug, Default)]
@@ -202,7 +414,7 @@ impl BaselineAccumulator {
         let key = path_key(&path);
         if let Some(index) = self.lookup_index(&key) {
             let existing = &mut self.paths[index];
-            if existing.stamp.is_none() {
+            if existing.stamp.is_none() && existing.read_policy.is_none() {
                 existing.stamp = stamp;
             }
             return;
@@ -213,6 +425,9 @@ impl BaselineAccumulator {
             path,
             stamp,
             candidate_membership: None,
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
         });
     }
 
@@ -234,7 +449,96 @@ impl BaselineAccumulator {
             path,
             stamp,
             candidate_membership: Some(membership),
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
         });
+    }
+
+    fn set_payload_dependency(
+        &mut self,
+        path: &Path,
+        read_policy: ReadPolicy,
+        path_entry: ProjectPathEntry,
+    ) {
+        let key = path_key(path);
+        let index = self.lookup_index(&key).unwrap_or_else(|| {
+            let index = self.paths.len();
+            self.indices.insert(key, index);
+            self.paths.push(BaselinePath {
+                path: path.to_path_buf(),
+                stamp: path_stamp(path),
+                candidate_membership: None,
+                read_policy: None,
+                path_entry: None,
+                include_payload: false,
+            });
+            index
+        });
+        if self.paths[index].read_policy.is_some() {
+            return;
+        }
+        self.paths[index].read_policy = Some(read_policy);
+        self.paths[index].path_entry = Some(path_entry);
+        self.paths[index].include_payload = false;
+    }
+
+    fn set_payload_observation(
+        &mut self,
+        path: &Path,
+        stamp: Option<PathStamp>,
+        read_policy: ReadPolicy,
+        path_entry: ProjectPathEntry,
+    ) {
+        let key = path_key(path);
+        let index = self.lookup_index(&key).unwrap_or_else(|| {
+            let index = self.paths.len();
+            self.indices.insert(key, index);
+            self.paths.push(BaselinePath {
+                path: path.to_path_buf(),
+                stamp: None,
+                candidate_membership: None,
+                read_policy: None,
+                path_entry: None,
+                include_payload: false,
+            });
+            index
+        });
+        if self.paths[index].read_policy.is_some() {
+            return;
+        }
+        self.paths[index].stamp = stamp;
+        self.paths[index].read_policy = Some(read_policy);
+        self.paths[index].path_entry = Some(path_entry);
+        self.paths[index].include_payload = false;
+    }
+
+    fn set_include_payload_dependency(
+        &mut self,
+        path: &Path,
+        read_policy: ReadPolicy,
+        path_entry: ProjectPathEntry,
+    ) {
+        let key = path_key(path);
+        let index = self.lookup_index(&key).unwrap_or_else(|| {
+            let index = self.paths.len();
+            self.indices.insert(key, index);
+            self.paths.push(BaselinePath {
+                path: path.to_path_buf(),
+                stamp: path_stamp(path),
+                candidate_membership: None,
+                read_policy: None,
+                path_entry: None,
+                include_payload: false,
+            });
+            index
+        });
+        if self.paths[index].read_policy.is_some() {
+            return;
+        }
+        self.paths[index].read_policy = Some(read_policy);
+        self.paths[index].path_entry = Some(path_entry);
+        self.paths[index].include_payload = true;
     }
 
     fn lookup_index(&mut self, key: &str) -> Option<usize> {
@@ -277,6 +581,7 @@ impl Workspace {
         WorkspaceInput {
             roots: self.roots.iter().map(|root| root.path.clone()).collect(),
             options: self.options.clone(),
+            overrides: self.overrides.clone(),
             project_selections: self.project_selections.clone(),
             document_owners: self.document_owners.clone(),
             overlays,
@@ -371,13 +676,27 @@ impl Workspace {
                     record.uri
                 ));
             }
-            let current =
-                read_disk_source(&path, self.options.limits.max_file_bytes).map_err(|error| {
-                    format!(
-                        "closed source changed while resolving {}: {error}",
-                        record.uri
-                    )
-                })?;
+            let (read_policy, path_entry) = record.payload_dependency().map_err(|error| {
+                format!(
+                    "closed source changed while resolving {}: {error}",
+                    record.uri
+                )
+            })?;
+            let allow_legacy_payload =
+                matches!(&path_entry.provenance, ProjectPathProvenance::LegacyNative);
+            let current = read_disk_source(
+                &path,
+                self.options.limits.max_file_bytes,
+                read_policy,
+                path_entry,
+                allow_legacy_payload,
+            )
+            .map_err(|error| {
+                format!(
+                    "closed source changed while resolving {}: {error}",
+                    record.uri
+                )
+            })?;
             if current.text != record.text
                 || record
                     .content_hash
@@ -431,13 +750,27 @@ pub(crate) fn revalidate_input(
             .to_file_path()
             .map(absolute_path)
             .map_err(|_| format!("not a file URI: {}", record.uri))?;
-        let current =
-            read_disk_source(&path, input.options.limits.max_file_bytes).map_err(|error| {
-                format!(
-                    "closed source changed while resolving {}: {error}",
-                    record.uri
-                )
-            })?;
+        let (read_policy, path_entry) = record.payload_dependency().map_err(|error| {
+            format!(
+                "closed source changed while resolving {}: {error}",
+                record.uri
+            )
+        })?;
+        let allow_legacy_payload =
+            matches!(&path_entry.provenance, ProjectPathProvenance::LegacyNative);
+        let current = read_disk_source(
+            &path,
+            input.options.limits.max_file_bytes,
+            read_policy,
+            path_entry,
+            allow_legacy_payload,
+        )
+        .map_err(|error| {
+            format!(
+                "closed source changed while resolving {}: {error}",
+                record.uri
+            )
+        })?;
         if disk_stamp(&path) != record.stamp
             || current.text != record.text
             || record
@@ -510,7 +843,7 @@ fn revalidate_path_record(
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     if let Some(expected) = &record.content_bytes {
-        let actual = match read_exact_file_bytes(path, cancel) {
+        let actual = match read_record_content_bytes(path, record, cancel) {
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
             Err(error) => {
                 return Err(format!(
@@ -527,7 +860,7 @@ fn revalidate_path_record(
             ));
         }
     } else if let Some(expected) = record.content_hash {
-        let actual = match file_content_hash(path, cancel) {
+        let actual = match read_record_content_hash(path, record, cancel) {
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
             Err(error) => {
                 return Err(format!(
@@ -550,56 +883,25 @@ fn revalidate_path_record(
     Ok(())
 }
 
-fn file_content_hash(path: &Path, cancel: &AtomicBool) -> Result<u64, String> {
+fn file_content_hash(
+    path: &Path,
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+    cancel: &AtomicBool,
+) -> Result<u64, String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+    let bytes = if matches!(&entry.provenance, ProjectPathProvenance::LegacyNative) {
+        read_policy.read_legacy_payload_bytes(entry, MAX_RENAME_SCAN_FILE_BYTES as u64)
+    } else {
+        read_policy.read_payload_bytes(entry, MAX_RENAME_SCAN_FILE_BYTES as u64)
     }
-    if metadata.len() > MAX_RENAME_SCAN_FILE_BYTES as u64 {
-        return Err(format!(
-            "{} exceeds the fixed content hash limit {MAX_RENAME_SCAN_FILE_BYTES}",
-            path.display()
-        ));
-    }
-    let mut file = open_revalidation_file(path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect opened {}: {error}", path.display()))?;
-    if !opened_metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut byte_count = 0usize;
-    loop {
-        if is_cancelled(cancel) {
-            return Err(CANCELLATION_MESSAGE.to_string());
-        }
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        byte_count = byte_count.saturating_add(read);
-        if byte_count > MAX_RENAME_SCAN_FILE_BYTES {
-            return Err(format!(
-                "{} exceeds the fixed content hash limit {MAX_RENAME_SCAN_FILE_BYTES}",
-                path.display()
-            ));
-        }
-        hasher.write(&buffer[..read]);
-    }
-    hasher.write_usize(byte_count);
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    Ok(hasher.finish())
+    Ok(super::content_hash_bytes(&bytes))
 }
 
 fn text_content_hash(source: &str) -> u64 {
@@ -615,57 +917,22 @@ struct ScannedSource {
     content_hash: u64,
 }
 
-fn read_scan_source(path: &Path, cancel: &AtomicBool) -> Result<ScannedSource, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+fn read_scan_source(
+    path: &Path,
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+    cancel: &AtomicBool,
+) -> Result<ScannedSource, String> {
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
     }
-    if metadata.len() > MAX_RENAME_SCAN_FILE_BYTES as u64 {
-        return Err(format!(
-            "{} exceeds the fixed rename scan file limit {MAX_RENAME_SCAN_FILE_BYTES}",
-            path.display()
-        ));
+    let bytes = if matches!(&entry.provenance, ProjectPathProvenance::LegacyNative) {
+        read_policy.read_legacy_payload_bytes(entry, MAX_RENAME_SCAN_FILE_BYTES as u64)
+    } else {
+        read_policy.read_payload_bytes(entry, MAX_RENAME_SCAN_FILE_BYTES as u64)
     }
-    let mut file = open_revalidation_file(path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect opened {}: {error}", path.display()))?;
-    if !opened_metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    if opened_metadata.len() > MAX_RENAME_SCAN_FILE_BYTES as u64 {
-        return Err(format!(
-            "{} exceeds the fixed rename scan file limit {MAX_RENAME_SCAN_FILE_BYTES}",
-            path.display()
-        ));
-    }
-    let mut bytes = Vec::new();
-    let mut content_hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut byte_count = 0usize;
-    loop {
-        if is_cancelled(cancel) {
-            return Err(CANCELLATION_MESSAGE.to_string());
-        }
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        byte_count = byte_count.saturating_add(read);
-        if byte_count > MAX_RENAME_SCAN_FILE_BYTES {
-            return Err(format!(
-                "{} exceeds the fixed rename scan file limit {MAX_RENAME_SCAN_FILE_BYTES}",
-                path.display()
-            ));
-        }
-        content_hasher.write(&buffer[..read]);
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    content_hasher.write_usize(byte_count);
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let byte_count = bytes.len();
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
@@ -675,10 +942,11 @@ fn read_scan_source(path: &Path, cancel: &AtomicBool) -> Result<ScannedSource, S
             path.display()
         ));
     }
+    let content_hash = super::content_hash_bytes(&bytes);
     Ok(ScannedSource {
         bytes: byte_count,
         data: bytes,
-        content_hash: content_hasher.finish(),
+        content_hash,
     })
 }
 
@@ -690,12 +958,16 @@ fn unsupported_source_encoding(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn path_record_at(
     path: PathBuf,
     stamp: Option<PathStamp>,
     content_hash: Option<u64>,
     content_bytes: Option<Vec<u8>>,
     candidate_membership: Option<ProjectCandidateMembership>,
+    read_policy: Option<ReadPolicy>,
+    path_entry: Option<ProjectPathEntry>,
+    include_payload: bool,
 ) -> Option<SourceRecord> {
     let uri = Url::from_file_path(&path).ok()?;
     Some(SourceRecord {
@@ -709,6 +981,9 @@ fn path_record_at(
         content_hash,
         content_bytes,
         candidate_membership,
+        read_policy,
+        path_entry,
+        include_payload,
     })
 }
 
@@ -746,22 +1021,87 @@ pub(crate) fn source_for_input_with_cancel(
                 content_hash: None,
                 content_bytes: None,
                 candidate_membership: None,
+                read_policy: None,
+                path_entry: None,
+                include_payload: false,
             },
         ));
     }
 
+    let fallback_cancel = AtomicBool::new(false);
+    let cancel_token = cancel.unwrap_or(&fallback_cancel);
+    let owner = owner_for_input(input, &uri, cancel_token)?;
+    source_for_input_with_owner(input, &uri, &owner, cancel)
+}
+
+pub(crate) fn source_for_input_with_owner(
+    input: &WorkspaceInput,
+    uri: &Url,
+    owner: &KnownDocumentOwner,
+    cancel: Option<&AtomicBool>,
+) -> Result<(String, SourceRecord), String> {
+    let uri = canonical_file_uri(uri);
+    if input.rejected_documents.contains(&uri) {
+        return Err(format!(
+            "document {uri} was rejected and cannot be used for analysis"
+        ));
+    }
+    if let Some(overlay) = input.overlays.get(&uri) {
+        return Ok((
+            overlay.text.clone(),
+            SourceRecord {
+                uri,
+                text: overlay.text.clone(),
+                version: Some(overlay.version),
+                stamp: None,
+                open: true,
+                path: None,
+                path_stamp: None,
+                content_hash: None,
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: None,
+                path_entry: None,
+                include_payload: false,
+            },
+        ));
+    }
     let path = uri
         .to_file_path()
         .map(absolute_path)
         .map_err(|_| format!("not a file URI: {uri}"))?;
-    let disk = read_disk_source_with_cancel(&path, input.options.limits.max_file_bytes, cancel)
-        .map_err(|error| {
-            if error == CANCELLATION_MESSAGE {
-                error
-            } else {
-                format!("could not read source {uri}: {error}")
-            }
-        })?;
+    if has_invalid_project_selection(&owner.state.context) {
+        return Err(format!(
+            "project selection is invalid; select a current project or Automatic for {uri}"
+        ));
+    }
+    if let Some(error) = owner.state.context.override_error.as_deref() {
+        return Err(format!(
+            "project override configuration is invalid; analysis is unavailable for {uri}: {error}"
+        ));
+    }
+    let legacy_route = owner.has_legacy_route(&path);
+    let entry = super::context_path_entry(&owner.state.context, &path)
+        .or_else(|| {
+            legacy_route.then_some(ProjectPathEntry {
+                path: path.clone(),
+                provenance: ProjectPathProvenance::LegacyNative,
+            })
+        })
+        .ok_or_else(|| format!("source is outside the effective project read roots: {uri}"))?;
+    let allow_legacy_payload = matches!(&entry.provenance, ProjectPathProvenance::LegacyNative);
+    let read_policy = owner.state.context.read_policy.clone();
+    let disk = read_disk_source(
+        &path,
+        input.options.limits.max_file_bytes,
+        &read_policy,
+        &entry,
+        allow_legacy_payload,
+    )
+    .map_err(|error| format!("could not read source {uri}: {error}"))?;
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
     let record = SourceRecord {
         uri: uri.clone(),
         text: disk.text.clone(),
@@ -773,12 +1113,27 @@ pub(crate) fn source_for_input_with_cancel(
         content_hash: Some(disk.content_hash),
         content_bytes: None,
         candidate_membership: None,
+        read_policy: Some(read_policy),
+        path_entry: Some(entry),
+        include_payload: false,
     };
     Ok((disk.text, record))
 }
 
+#[allow(dead_code)]
+pub(crate) fn source_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+) -> Result<(String, SourceRecord), String> {
+    source_for_input_with_cancel(input, uri, None)
+}
+
 pub(crate) fn input_source_is_editable(input: &WorkspaceInput, uri: &Url) -> bool {
-    let workspace = Workspace::new(input.roots.clone(), input.options.clone());
+    let workspace = Workspace::with_override_session(
+        input.roots.clone(),
+        input.options.clone(),
+        input.overrides.clone(),
+    );
     let Ok(path) = uri.to_file_path() else {
         return false;
     };
@@ -786,13 +1141,63 @@ pub(crate) fn input_source_is_editable(input: &WorkspaceInput, uri: &Url) -> boo
     workspace.accepts_path(&path) && is_editable_source_path(&workspace, &path)
 }
 
-pub(crate) fn input_source_is_readable(input: &WorkspaceInput, uri: &Url) -> bool {
-    let workspace = Workspace::new(input.roots.clone(), input.options.clone());
+pub(crate) fn owner_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<KnownDocumentOwner, String> {
+    let uri = canonical_file_uri(uri);
+    let owner_origin = input.document_owners.get(&uri).map(|owner| owner.origin);
+
+    let mut workspace = Workspace::with_override_session(
+        input.roots.clone(),
+        input.options.clone(),
+        input.overrides.clone(),
+    );
+    workspace.project_selections = input.project_selections.clone();
+    workspace.document_owners = input.document_owners.clone();
+    let key = workspace.context_for_uri_with_cancel(&uri, Some(cancel))?;
+    let state = workspace
+        .contexts
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| format!("project context was not retained for {uri}"))?;
+    Ok(KnownDocumentOwner {
+        key: key.clone(),
+        state,
+        origin: owner_origin.unwrap_or_else(|| workspace.owner_origin_for_context_key(&key)),
+        legacy_route: workspace.document_owners.get(&uri).and_then(|owner| {
+            (owner.key == key)
+                .then(|| owner.legacy_route.clone())
+                .flatten()
+        }),
+    })
+}
+
+pub(crate) fn input_source_is_readable_with_owner(
+    input: &WorkspaceInput,
+    uri: &Url,
+    owner: &KnownDocumentOwner,
+) -> bool {
+    let workspace = Workspace::with_override_session(
+        input.roots.clone(),
+        input.options.clone(),
+        input.overrides.clone(),
+    );
     let Ok(path) = uri.to_file_path() else {
         return false;
     };
     let path = absolute_path(path);
-    workspace.accepts_path(&path) && is_readable_source_path(&workspace, &path)
+    let legacy_route = owner.has_legacy_route(&path);
+    workspace.ensure_supported_project_context_with_legacy_route(
+        &path,
+        &owner.state.context,
+        Some(&owner.key),
+        legacy_route,
+    ) && (workspace.accepts_path(&path)
+        || owner.state.context.project_file.is_some()
+        || workspace.mapped_path_is_readable(&path, &owner.key)
+        || legacy_route)
 }
 
 #[derive(Debug)]
@@ -896,7 +1301,11 @@ pub(crate) fn project_context_and_metadata_for_input(
     uri: &Url,
     cancel: &AtomicBool,
 ) -> Result<(ProjectContext, Vec<SourceRecord>), String> {
-    let mut workspace = Workspace::new(input.roots.clone(), input.options.clone());
+    let mut workspace = Workspace::with_override_session(
+        input.roots.clone(),
+        input.options.clone(),
+        input.overrides.clone(),
+    );
     workspace.project_selections = input.project_selections.clone();
     workspace.document_owners = input.document_owners.clone();
     let context_key = workspace.context_for_uri_with_cancel(uri, Some(cancel))?;
@@ -907,6 +1316,14 @@ pub(crate) fn project_context_and_metadata_for_input(
         .ok_or_else(|| format!("project context was not retained for {uri}"))?;
     let records = consumed_context_records(&state, cancel)?;
     Ok((state.context, records))
+}
+
+pub(crate) fn project_context_and_metadata_for_owner(
+    owner: &KnownDocumentOwner,
+    cancel: &AtomicBool,
+) -> Result<(ProjectContext, Vec<SourceRecord>), String> {
+    let records = consumed_context_records(&owner.state, cancel)?;
+    Ok((owner.state.context.clone(), records))
 }
 
 fn consumed_context_records(
@@ -947,7 +1364,29 @@ fn consumed_context_records(
             })?;
         let content_hash = observed.map(|observation| observation.content_hash);
         let content_bytes = observed.and_then(|observation| observation.content_bytes.clone());
-        if let Some(record) = path_record_at(path, stamp, content_hash, content_bytes, None) {
+        let payload = state
+            .context
+            .metadata_observations
+            .iter()
+            .find(|observation| path_key(observation.path()) == path_key(&path));
+        let (read_policy, path_entry) = match payload {
+            Some(MetadataObservation::Payload {
+                read_policy,
+                path_entry,
+                ..
+            }) => (Some(read_policy.clone()), Some(path_entry.clone())),
+            Some(MetadataObservation::Stat { .. }) | None => (None, None),
+        };
+        if let Some(record) = path_record_at(
+            path,
+            stamp,
+            content_hash,
+            content_bytes,
+            None,
+            read_policy,
+            path_entry,
+            false,
+        ) {
             records.push(record);
         }
     }
@@ -973,9 +1412,16 @@ fn consumed_context_records(
             }
         };
         if seen.insert(path_key(directory)) {
-            if let Some(record) =
-                path_record_at(directory.clone(), None, None, None, Some(membership))
-            {
+            if let Some(record) = path_record_at(
+                directory.clone(),
+                None,
+                None,
+                None,
+                Some(membership),
+                None,
+                None,
+                false,
+            ) {
                 records.push(record);
             }
         }
@@ -1374,6 +1820,512 @@ pub(crate) fn is_cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
 }
 
+fn snapshot_context_for_uri(
+    loader: &mut Workspace,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<ContextKey, String> {
+    if let Some(owner) = loader.document_owners.get(uri).cloned()
+        && (loader.context_has_open_legacy_overlay(&owner.state)
+            || (!super::context_state_is_fresh_with_cancel(&owner.state, Some(cancel))?
+                && loader
+                    .context_state_is_fresh_with_open_documents(&owner.state, Some(cancel))?))
+    {
+        loader
+            .contexts
+            .insert(owner.key.clone(), owner.state.clone());
+        loader
+            .document_contexts
+            .insert(uri.clone(), owner.key.clone());
+    }
+    loader.context_for_uri_with_cancel(uri, Some(cancel))
+}
+
+fn snapshot_payload_dependency(
+    loader: &Workspace,
+    context_key: &ContextKey,
+    path: &Path,
+) -> Result<(ReadPolicy, ProjectPathEntry), String> {
+    let context = loader
+        .contexts
+        .get(context_key)
+        .map(|state| &state.context)
+        .ok_or_else(|| format!("project context was not retained for {path:?}"))?;
+    let uri = Url::from_file_path(path)
+        .map_err(|()| format!("could not create a file URI for {path:?}"))?;
+    let legacy_route = loader.legacy_route_is_current(&uri, path, context_key);
+    let entry = super::context_path_entry(context, path)
+        .or_else(|| {
+            legacy_route.then_some(ProjectPathEntry {
+                path: path.to_path_buf(),
+                provenance: ProjectPathProvenance::LegacyNative,
+            })
+        })
+        .ok_or_else(|| {
+            format!("source path is outside the effective project read roots: {path:?}")
+        })?;
+    if !loader.ensure_supported_project_context_with_legacy_route(
+        path,
+        context,
+        Some(context_key),
+        legacy_route,
+    ) {
+        return Err(format!(
+            "source path is outside the effective project read roots: {path:?}"
+        ));
+    }
+    Ok((context.read_policy.clone(), entry))
+}
+
+fn discover_enumerated_contexts(
+    loader: &mut Workspace,
+    input: &WorkspaceInput,
+    enumeration: &mut Enumeration,
+    priority_contexts: &HashMap<Url, ContextKey>,
+    project_contexts: &HashSet<ContextKey>,
+    cancel: &AtomicBool,
+) -> Result<HashSet<ContextKey>, String> {
+    let mut context_keys = priority_contexts.values().cloned().collect::<HashSet<_>>();
+    context_keys.extend(project_contexts.iter().cloned());
+    for context_key in context_keys.clone() {
+        if let Some(state) = loader.contexts.get(&context_key).cloned() {
+            enumeration.retain_context(context_key, state);
+        }
+    }
+    for index in 0..enumeration.paths.len() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let path = enumeration.paths[index].path.clone();
+        let owner = if let Some(owner) = enumeration.paths[index].owner.clone() {
+            if let Some(state) = loader.contexts.get(&owner).cloned() {
+                enumeration.retain_context(owner.clone(), state);
+            } else {
+                let state = input
+                    .document_owners
+                    .values()
+                    .find(|known| known.key == owner)
+                    .map(|known| known.state.clone())
+                    .ok_or_else(|| {
+                        format!("source {path:?} has an owner context that was not retained")
+                    });
+                let Ok(state) = state else {
+                    enumeration.complete = false;
+                    enumeration.reason.get_or_insert_with(|| {
+                        format!("source {path:?} has an owner context that was not retained")
+                    });
+                    continue;
+                };
+                loader.contexts.insert(owner.clone(), state.clone());
+                enumeration.retain_context(owner.clone(), state);
+            }
+            owner
+        } else {
+            let uri = Url::from_file_path(&path)
+                .map_err(|()| format!("could not create a file URI for {path:?}"))?;
+            let owner = snapshot_context_for_uri(loader, &uri, cancel)?;
+            let Some(state) = loader.contexts.get(&owner).cloned() else {
+                enumeration.complete = false;
+                enumeration.reason.get_or_insert_with(|| {
+                    format!("source {path:?} has an owner context that was not retained")
+                });
+                continue;
+            };
+            enumeration.retain_context(owner.clone(), state);
+            owner
+        };
+        enumeration.assign_owner(&path, owner.clone());
+        context_keys.insert(owner);
+    }
+    context_keys.extend(enumeration.contexts.keys().cloned());
+    Ok(context_keys)
+}
+
+fn discover_project_metadata_contexts(
+    loader: &mut Workspace,
+    enumeration: &mut Enumeration,
+    cancel: &AtomicBool,
+) -> Result<HashSet<ContextKey>, String> {
+    let mut descriptors = enumeration
+        .baseline
+        .paths
+        .iter()
+        .map(|baseline| baseline.path.clone())
+        .filter(|path| {
+            path.extension().is_some_and(|extension| {
+                matches!(
+                    extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                    "dproj" | "dpr" | "dpk"
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    descriptors.dedup_by(|left, right| path_key(left) == path_key(right));
+
+    let roots = loader.workspace_root_paths();
+    let mut options = loader.project_options();
+    let mut contexts = HashSet::new();
+    for descriptor in descriptors {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let uri = Url::from_file_path(&descriptor)
+            .map_err(|()| format!("could not create a file URI for {descriptor:?}"))?;
+        options.project_file = Some(descriptor.clone());
+        let (key, context) =
+            loader.readonly_context_for_uri(&uri, &descriptor, &roots, &options)?;
+        for warning in context.warnings.iter().cloned() {
+            loader.warn(warning);
+        }
+        loader.install_context(
+            key.clone(),
+            context,
+            Vec::new(),
+            HashMap::new(),
+            &descriptor,
+            Some(cancel),
+        )?;
+        let Some(state) = loader.contexts.get(&key).cloned() else {
+            return Err(format!(
+                "project context was not retained for {descriptor:?}"
+            ));
+        };
+        enumeration.retain_context(key.clone(), state);
+        contexts.insert(key);
+    }
+    Ok(contexts)
+}
+
+fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mapped_read_roots = context
+        .overrides
+        .read_roots()
+        .into_iter()
+        .map(|root| super::native_mapping_root(&root))
+        .collect::<Vec<_>>();
+    let mut add_root = |root: &Path| {
+        let root = absolute_path(root.to_path_buf());
+        if !roots
+            .iter()
+            .any(|existing: &PathBuf| path_key(existing) == path_key(&root))
+        {
+            roots.push(root);
+        }
+    };
+
+    let mut add_entry = |entry: &crate::project::ProjectPathEntry| match &entry.provenance {
+        ProjectPathProvenance::Mapped { root } => add_root(root),
+        ProjectPathProvenance::Configured => {
+            if let Some(root) = mapped_read_roots
+                .iter()
+                .filter(|root| path_starts_with_native(&entry.path, root))
+                .max_by_key(|root| root.components().count())
+            {
+                add_root(root);
+            }
+        }
+        ProjectPathProvenance::LegacyNative => {}
+    };
+    for entry in &context.search_path_entries {
+        add_entry(entry);
+    }
+    if let Some(entry) = &context.main_source_entry {
+        add_entry(entry);
+    }
+    for entries in context.explicit_unit_entries.values() {
+        for entry in entries {
+            add_entry(entry);
+        }
+    }
+
+    // Include paths intentionally retain their historical untagged API. Tie
+    // them back to an effective mapping by destination containment so an
+    // absolute mapped include can also contribute its consumer root.
+    for include_path in &context.include_paths {
+        for mapping in &context.overrides.path_mappings {
+            let root = super::native_mapping_root(&mapping.to);
+            if super::path_starts_with_native(include_path, &root) {
+                add_root(&root);
+            }
+        }
+    }
+    // Package resolution can make a mapped destination relevant even when the
+    // project has no unit-search, MainSource, reference, or include entry
+    // under that destination. Keep the package root scoped to contexts that
+    // actually request named packages; do not form a global mapping union.
+    if !context.packages.is_empty() {
+        for root in mapped_read_roots {
+            add_root(&root);
+        }
+    }
+    roots
+}
+
+fn enumerate_mapped_sources(
+    workspace: &Workspace,
+    context_states: &HashMap<ContextKey, ContextState>,
+    contexts: &HashSet<ContextKey>,
+    enumeration: &mut Enumeration,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut context_keys = contexts.iter().cloned().collect::<Vec<_>>();
+    context_keys.sort_by_key(|key| format!("{key:?}"));
+    let entry_limit = MAX_RENAME_TRAVERSAL_ENTRIES;
+    let mut stop = false;
+
+    for context_key in context_keys {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Some(context) = context_states
+            .get(&context_key)
+            .map(|state| state.context.clone())
+        else {
+            enumeration.complete = false;
+            enumeration.reason.get_or_insert_with(|| {
+                format!("mapped project context {context_key:?} was not retained")
+            });
+            continue;
+        };
+        let mapped_roots = mapped_source_roots(&context);
+        if !context.discovery_complete
+            && (!mapped_roots.is_empty() || context.override_error.is_some())
+        {
+            enumeration.complete = false;
+            enumeration.reason.get_or_insert_with(|| {
+                if mapped_roots.is_empty() {
+                    "project context is ambiguous or incomplete".to_string()
+                } else {
+                    "mapped source roots belong to an ambiguous or incomplete project context"
+                        .to_string()
+                }
+            });
+            continue;
+        }
+        for root in mapped_roots {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            let root = absolute_path(root);
+            add_baseline_path(&mut enumeration.baseline, root.clone());
+            let metadata = match fs::symlink_metadata(&root) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    enumeration.complete = false;
+                    enumeration.reason.get_or_insert_with(|| {
+                        format!(
+                            "mapped source root {} is unavailable: {error}",
+                            root.display()
+                        )
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    enumeration.complete = false;
+                    enumeration.reason.get_or_insert_with(|| {
+                        format!(
+                            "could not inspect mapped source root {}: {error}",
+                            root.display()
+                        )
+                    });
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                enumeration.complete = false;
+                enumeration.reason.get_or_insert_with(|| {
+                    format!(
+                        "mapped source root {} is not a regular directory",
+                        root.display()
+                    )
+                });
+                continue;
+            }
+
+            let walker = WalkDir::new(&root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| {
+                    entry.depth() == 0
+                        || !workspace.mapped_path_is_excluded(entry.path(), &root, &context_key)
+                });
+            for entry in walker {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                enumeration.visited_entries = enumeration.visited_entries.saturating_add(1);
+                if enumeration.visited_entries > entry_limit {
+                    enumeration.complete = false;
+                    enumeration.reason.get_or_insert_with(|| {
+                        format!("source traversal entry limit ({entry_limit}) reached")
+                    });
+                    stop = true;
+                    break;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        enumeration.complete = false;
+                        enumeration.reason.get_or_insert_with(|| {
+                            format!(
+                                "source traversal error under mapped root {}: {error}",
+                                root.display()
+                            )
+                        });
+                        continue;
+                    }
+                };
+                let path = absolute_path(entry.path().to_path_buf());
+                let file_type = entry.file_type();
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    add_baseline_path(&mut enumeration.baseline, path);
+                    continue;
+                }
+                if file_type.is_file()
+                    && is_pascal_path(&path)
+                    && workspace.mapped_path_is_readable_under_root(&path, &root, &context_key)
+                {
+                    add_baseline_path(&mut enumeration.baseline, path.clone());
+                    enumeration.add_path(path, Some(context_key.clone()));
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+        if stop {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn enumerate_external_overlays(
+    workspace: &mut Workspace,
+    input: &WorkspaceInput,
+    active_contexts: &HashSet<ContextKey>,
+    mode: SnapshotMode,
+    enumeration: &mut Enumeration,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    for (overlay_uri, overlay) in &input.overlays {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let uri = canonical_file_uri(overlay_uri);
+        if input.rejected_documents.contains(&uri) {
+            continue;
+        }
+        let Ok(path) = uri.to_file_path() else {
+            continue;
+        };
+        let path = absolute_path(path);
+        if !is_pascal_path(&path) || workspace.accepts_path(&path) {
+            continue;
+        }
+        let Some(owner) = input
+            .document_owners
+            .get(&uri)
+            .or_else(|| input.document_owners.get(overlay_uri))
+            .cloned()
+        else {
+            continue;
+        };
+        if !active_contexts
+            .iter()
+            .any(|active| overlay_contexts_match(active, &owner.key))
+        {
+            continue;
+        }
+        workspace
+            .contexts
+            .entry(owner.key.clone())
+            .or_insert_with(|| owner.state.clone());
+        let Some(state) = workspace.contexts.get(&owner.key) else {
+            continue;
+        };
+        if context_incomplete_for_mode(mode, &state.context) {
+            enumeration.complete = false;
+            enumeration.reason.get_or_insert_with(|| {
+                format!("project context is ambiguous or incomplete for {uri}")
+            });
+            continue;
+        }
+        if !workspace.ensure_supported_project_context(&path, &state.context, Some(&owner.key)) {
+            continue;
+        }
+        if overlay.text.len() > input.options.limits.max_file_bytes {
+            enumeration.complete = false;
+            enumeration.reason.get_or_insert_with(|| {
+                format!("open overlay {uri} exceeds the configured per-file limit")
+            });
+            continue;
+        }
+        add_baseline_path(&mut enumeration.baseline, path.clone());
+        enumeration.add_path(path, Some(owner.key));
+    }
+    Ok(())
+}
+
+fn overlay_contexts_match(active: &ContextKey, owner: &ContextKey) -> bool {
+    if active.project_file.is_some() && owner.project_file.is_some() {
+        let mut active = active.clone();
+        let mut owner = owner.clone();
+        // An external mapped overlay has no workspace-root membership, while
+        // its requesting source retains the workspace root. The project and
+        // effective override identity still has to match exactly.
+        active.workspace_root = None;
+        owner.workspace_root = None;
+        active == owner
+    } else {
+        active == owner
+    }
+}
+
+fn add_priority_sources(
+    workspace: &Workspace,
+    input: &WorkspaceInput,
+    priority: &[Url],
+    priority_contexts: &HashMap<Url, ContextKey>,
+    enumeration: &mut Enumeration,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    for uri in priority {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Ok(path) = uri.to_file_path() else {
+            continue;
+        };
+        let path = absolute_path(path);
+        let Some(context_key) = priority_contexts.get(uri) else {
+            continue;
+        };
+        let readable = workspace.contexts.get(context_key).is_some_and(|state| {
+            let legacy_route = workspace.legacy_route_is_current(uri, &path, context_key);
+            workspace.ensure_supported_project_context_with_legacy_route(
+                &path,
+                &state.context,
+                Some(context_key),
+                legacy_route,
+            )
+        });
+        if !readable || !is_pascal_path(&path) {
+            continue;
+        }
+        if path.is_file() || input.overlays.contains_key(uri) {
+            add_baseline_path(&mut enumeration.baseline, path.clone());
+            enumeration.add_path(path, Some(context_key.clone()));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_snapshot(
     input: &WorkspaceInput,
     priority: &[Url],
@@ -1401,7 +2353,11 @@ pub(crate) fn build_snapshot(
                     .saturating_mul(MAX_SNAPSHOT_DEPENDENCY_FILES),
             );
     }
-    let mut loader = Workspace::new(input.roots.clone(), loader_options);
+    let mut loader = Workspace::with_override_session(
+        input.roots.clone(),
+        loader_options,
+        input.overrides.clone(),
+    );
     loader.project_selections = input.project_selections.clone();
     loader.document_owners = input.document_owners.clone();
     for (uri, overlay) in &input.overlays {
@@ -1426,12 +2382,21 @@ pub(crate) fn build_snapshot(
     }
 
     let priority = priority.iter().map(canonical_file_uri).collect::<Vec<_>>();
+    let mut priority_contexts = HashMap::new();
+    for uri in &priority {
+        let context_key = snapshot_context_for_uri(&mut loader, uri, cancel)?;
+        priority_contexts.insert(uri.clone(), context_key);
+    }
+    #[cfg(test)]
+    wait_at_snapshot_priority_barrier(&priority);
     if !input.project_selections.is_empty() {
         for uri in &priority {
-            let context_key = loader.context_for_uri_with_cancel(uri, Some(cancel))?;
+            let context_key = priority_contexts
+                .get(uri)
+                .expect("priority context was captured");
             if loader
                 .contexts
-                .get(&context_key)
+                .get(context_key)
                 .is_some_and(|state| has_invalid_project_selection(&state.context))
             {
                 return Err(format!(
@@ -1445,10 +2410,12 @@ pub(crate) fn build_snapshot(
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            let context_key = loader.context_for_uri_with_cancel(uri, Some(cancel))?;
+            let context_key = priority_contexts
+                .get(uri)
+                .expect("priority context was captured");
             if !loader
                 .contexts
-                .get(&context_key)
+                .get(context_key)
                 .is_some_and(|state| state.context.discovery_complete)
             {
                 return Err(format!(
@@ -1457,8 +2424,64 @@ pub(crate) fn build_snapshot(
             }
         }
     }
-    let enumeration = enumerate_sources(&loader, input, &priority, mode, cancel)?;
-    let mut paths = enumeration.paths;
+    let mut enumeration = enumerate_sources(&loader, input, &priority, mode, cancel)?;
+    let project_contexts = if mode == SnapshotMode::WorkspaceSymbols {
+        discover_project_metadata_contexts(&mut loader, &mut enumeration, cancel)?
+    } else {
+        HashSet::new()
+    };
+    let enumerated_contexts =
+        if mode == SnapshotMode::Workspace || mode == SnapshotMode::WorkspaceSymbols {
+            discover_enumerated_contexts(
+                &mut loader,
+                input,
+                &mut enumeration,
+                &priority_contexts,
+                &project_contexts,
+                cancel,
+            )?
+        } else {
+            priority_contexts.values().cloned().collect()
+        };
+    for (context_key, state) in &enumeration.contexts {
+        loader
+            .contexts
+            .entry(context_key.clone())
+            .or_insert_with(|| state.clone());
+    }
+    if mode == SnapshotMode::Workspace || mode == SnapshotMode::WorkspaceSymbols {
+        let mapped_contexts = if mode == SnapshotMode::WorkspaceSymbols {
+            enumerated_contexts.clone()
+        } else {
+            priority_contexts.values().cloned().collect()
+        };
+        let context_states = enumeration.contexts.clone();
+        enumerate_mapped_sources(
+            &loader,
+            &context_states,
+            &mapped_contexts,
+            &mut enumeration,
+            cancel,
+        )?;
+        enumerate_external_overlays(
+            &mut loader,
+            input,
+            &mapped_contexts,
+            mode,
+            &mut enumeration,
+            cancel,
+        )?;
+    }
+    add_priority_sources(
+        &loader,
+        input,
+        &priority,
+        &priority_contexts,
+        &mut enumeration,
+        cancel,
+    )?;
+    enumeration.sort_paths(&priority);
+    let paths = enumeration.paths;
     let mut complete = enumeration.complete;
     let mut incomplete_reason = enumeration.reason;
     let mut baseline = enumeration.baseline;
@@ -1496,18 +2519,6 @@ pub(crate) fn build_snapshot(
             });
         }
     }
-    paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-    paths.sort_by_key(|path| {
-        priority
-            .iter()
-            .position(|uri| {
-                uri.to_file_path()
-                    .ok()
-                    .is_some_and(|priority_path| paths_equal_ci(&priority_path, path))
-            })
-            .unwrap_or(priority.len())
-    });
-
     let mut sources = HashMap::new();
     let mut records = HashMap::new();
     let mut readable = HashSet::new();
@@ -1537,7 +2548,10 @@ pub(crate) fn build_snapshot(
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        let context_key = loader.context_for_uri_with_cancel(uri, Some(cancel))?;
+        let context_key = priority_contexts
+            .get(uri)
+            .expect("priority context was captured")
+            .clone();
         capture_context_baseline(
             &loader,
             &context_key,
@@ -1559,10 +2573,12 @@ pub(crate) fn build_snapshot(
             });
         }
     }
-    for path in paths {
+    for enumerated in paths {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
+        let path = enumerated.path;
+        let enumerated_owner = enumerated.owner;
         let uri = match Url::from_file_path(&path) {
             Ok(uri) => uri,
             Err(()) => continue,
@@ -1575,6 +2591,23 @@ pub(crate) fn build_snapshot(
             continue;
         }
         let is_priority = priority.iter().any(|priority_uri| priority_uri == &uri);
+        let source_context_key = if let Some(context_key) = enumerated_owner.clone() {
+            context_key
+        } else if let Some(context_key) = priority_contexts.get(&uri) {
+            context_key.clone()
+        } else {
+            snapshot_context_for_uri(&mut loader, &uri, cancel)?
+        };
+        let (read_policy, path_entry) =
+            match snapshot_payload_dependency(&loader, &source_context_key, &path) {
+                Ok(dependency) => dependency,
+                Err(error) if is_priority => return Err(error),
+                Err(error) => {
+                    complete = false;
+                    incomplete_reason.get_or_insert(error);
+                    continue;
+                }
+            };
         let (source, record, source_bytes) = if let Some(seed) =
             priority_seed.as_ref().filter(|seed| seed.record.uri == uri)
         {
@@ -1599,11 +2632,14 @@ pub(crate) fn build_snapshot(
                     content_hash: None,
                     content_bytes: None,
                     candidate_membership: None,
+                    read_policy: Some(read_policy.clone()),
+                    path_entry: Some(path_entry.clone()),
+                    include_payload: false,
                 },
                 overlay.text.len(),
             )
         } else {
-            let scan = match read_scan_source(&path, cancel) {
+            let scan = match read_scan_source(&path, &read_policy, &path_entry, cancel) {
                 Ok(scan) => scan,
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                 Err(error) => {
@@ -1623,6 +2659,7 @@ pub(crate) fn build_snapshot(
             baseline_content_hashes
                 .entry(path_key(&path))
                 .or_insert(scan.content_hash);
+            baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
             if scanned_bytes > MAX_RENAME_SCANNED_BYTES {
                 complete = false;
                 incomplete_reason.get_or_insert_with(|| {
@@ -1655,10 +2692,16 @@ pub(crate) fn build_snapshot(
                     content_hash: Some(scan.content_hash),
                     content_bytes: None,
                     candidate_membership: None,
+                    read_policy: Some(read_policy.clone()),
+                    path_entry: Some(path_entry.clone()),
+                    include_payload: false,
                 },
                 scan.bytes,
             )
         };
+        if !record.open {
+            baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+        }
         if let Some(content_hash) = record.content_hash {
             baseline_content_hashes
                 .entry(path_key(&path))
@@ -1713,6 +2756,30 @@ pub(crate) fn build_snapshot(
                     continue;
                 }
 
+                if !contexts.contains_key(&uri) {
+                    let context_key = source_context_key.clone();
+                    capture_context_baseline(
+                        &loader,
+                        &context_key,
+                        &mut baseline,
+                        &mut baseline_content_hashes,
+                        &mut baseline_contents,
+                        mode == SnapshotMode::WorkspaceSymbols,
+                        cancel,
+                    )?;
+                    contexts.insert(uri.clone(), context_key.clone());
+                    if loader
+                        .contexts
+                        .get(&context_key)
+                        .is_some_and(|state| context_incomplete_for_mode(mode, &state.context))
+                    {
+                        complete = false;
+                        incomplete_reason.get_or_insert_with(|| {
+                            format!("project context is ambiguous or incomplete for {uri}")
+                        });
+                    }
+                }
+
                 let mut summary_record = record;
                 summary_record.text = summary.clone();
                 if summary_record.open {
@@ -1759,16 +2826,8 @@ pub(crate) fn build_snapshot(
             continue;
         }
 
-        if matches!(
-            mode,
-            SnapshotMode::Workspace
-                | SnapshotMode::WorkspaceSymbols
-                | SnapshotMode::LocalWithImports
-                | SnapshotMode::Assistance
-                | SnapshotMode::Local
-        ) && !contexts.contains_key(&uri)
-        {
-            let context_key = loader.context_for_uri_with_cancel(&uri, Some(cancel))?;
+        if !contexts.contains_key(&uri) {
+            let context_key = source_context_key.clone();
             capture_context_baseline(
                 &loader,
                 &context_key,
@@ -1779,11 +2838,10 @@ pub(crate) fn build_snapshot(
                 cancel,
             )?;
             contexts.insert(uri.clone(), context_key.clone());
-            if mode == SnapshotMode::Workspace
-                && !loader
-                    .contexts
-                    .get(&context_key)
-                    .is_some_and(|state| state.context.discovery_complete)
+            if loader
+                .contexts
+                .get(&context_key)
+                .is_some_and(|state| context_incomplete_for_mode(mode, &state.context))
             {
                 complete = false;
                 incomplete_reason.get_or_insert_with(|| {
@@ -1817,7 +2875,7 @@ pub(crate) fn build_snapshot(
             indexed_stamps.insert(uri.clone(), stamp);
         }
         sources.insert(uri.clone(), source);
-        if is_readable_source_path(&loader, &path) {
+        if is_readable_source_for_context(&loader, &path, contexts.get(&uri)) {
             readable.insert(uri.clone());
         }
         if is_editable_source_path(&loader, &path) {
@@ -1894,7 +2952,7 @@ pub(crate) fn build_snapshot(
             .to_file_path()
             .map(absolute_path)
             .map_err(|_| format!("loaded dependency is not a file URI: {uri}"))?;
-        let (source, record) = if let Some(overlay) = input.overlays.get(&uri) {
+        let (source, mut record) = if let Some(overlay) = input.overlays.get(&uri) {
             (
                 overlay.text.clone(),
                 SourceRecord {
@@ -1908,6 +2966,9 @@ pub(crate) fn build_snapshot(
                     content_hash: None,
                     content_bytes: None,
                     candidate_membership: None,
+                    read_policy: None,
+                    path_entry: None,
+                    include_payload: false,
                 },
             )
         } else {
@@ -1922,7 +2983,6 @@ pub(crate) fn build_snapshot(
                 .cloned()
                 .ok_or_else(|| format!("loaded dependency {path:?} lost its disk identity"))?;
             baseline.add_path(path.clone(), path_stamp(&path));
-            add_baseline_content_hash(&path, &mut baseline_content_hashes, cancel, true)?;
             (
                 source.clone(),
                 SourceRecord {
@@ -1936,13 +2996,34 @@ pub(crate) fn build_snapshot(
                     content_hash: None,
                     content_bytes: None,
                     candidate_membership: None,
+                    read_policy: None,
+                    path_entry: None,
+                    include_payload: false,
                 },
             )
         };
+        if !record.open {
+            let context_key = loader.document_contexts.get(&uri).ok_or_else(|| {
+                format!("loaded dependency {path:?} has no retained project context")
+            })?;
+            let (read_policy, path_entry) =
+                snapshot_payload_dependency(&loader, context_key, &path)?;
+            add_baseline_content_hash(
+                &path,
+                &mut baseline,
+                &mut baseline_content_hashes,
+                &read_policy,
+                &path_entry,
+                cancel,
+                true,
+            )?;
+            record.read_policy = Some(read_policy);
+            record.path_entry = Some(path_entry);
+        }
         if let Some(context_key) = loader.document_contexts.get(&uri).cloned() {
             contexts.insert(uri.clone(), context_key);
         }
-        if is_readable_source_path(&loader, &path) {
+        if is_readable_source_for_context(&loader, &path, loader.document_contexts.get(&uri)) {
             readable.insert(uri.clone());
         }
         if is_editable_source_path(&loader, &path) {
@@ -1981,6 +3062,13 @@ pub(crate) fn build_snapshot(
         }
     }
 
+    for (context_key, state) in std::mem::take(&mut enumeration.contexts) {
+        if let Some(live) = loader.contexts.get_mut(&context_key) {
+            live.merge_observations(&state);
+        } else {
+            loader.contexts.insert(context_key, state);
+        }
+    }
     for context_key in loader.contexts.keys().cloned().collect::<Vec<_>>() {
         capture_context_baseline(
             &loader,
@@ -2005,6 +3093,9 @@ pub(crate) fn build_snapshot(
                 content_hash,
                 baseline_contents.get(&path_key(&baseline.path)).cloned(),
                 baseline.candidate_membership,
+                baseline.read_policy,
+                baseline.path_entry,
+                baseline.include_payload,
             )
         })
         .collect::<Vec<_>>();
@@ -2055,8 +3146,6 @@ fn enumerate_sources(
         complete: true,
         ..Enumeration::default()
     };
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let mut path_keys = HashSet::new();
     if matches!(
         mode,
         SnapshotMode::Local | SnapshotMode::LocalWithImports | SnapshotMode::Assistance
@@ -2079,15 +3168,11 @@ fn enumerate_sources(
             }
             if path.is_file() || input.overlays.contains_key(uri) {
                 add_baseline_path(&mut result.baseline, path.clone());
-                if path_keys.insert(path_key(&path)) {
-                    paths.push(path);
-                }
+                result.add_path(path, None);
             }
         }
-        result.paths = paths;
         return Ok(result);
     }
-    let mut visited_entries = 0usize;
     let entry_limit = MAX_RENAME_TRAVERSAL_ENTRIES;
     let mut stop = false;
     for root in &workspace.roots {
@@ -2106,8 +3191,8 @@ fn enumerate_sources(
                 if is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
-                visited_entries = visited_entries.saturating_add(1);
-                if visited_entries > entry_limit {
+                result.visited_entries = result.visited_entries.saturating_add(1);
+                if result.visited_entries > entry_limit {
                     result.complete = false;
                     result.reason.get_or_insert_with(|| {
                         format!("source traversal entry limit ({entry_limit}) reached")
@@ -2143,32 +3228,12 @@ fn enumerate_sources(
                     && !is_configuration_file(&path)
                 {
                     add_baseline_path(&mut result.baseline, path.clone());
-                    if let Err(error) = add_baseline_content_hash(
-                        &path,
-                        &mut result.baseline_content_hashes,
-                        cancel,
-                        true,
-                    ) {
-                        if error == CANCELLATION_MESSAGE {
-                            return Err(error);
-                        }
-                        result.complete = false;
-                        result.reason.get_or_insert_with(|| {
-                            format!(
-                                "could not fingerprint project metadata {}: {error}",
-                                path.display()
-                            )
-                        });
-                    }
                 }
                 if !file_type.is_file() || !is_pascal_path(&path) || !root.accepts(&path) {
                     continue;
                 }
-                if !path_keys.insert(path_key(&path)) {
-                    continue;
-                }
                 add_baseline_path(&mut result.baseline, path.clone());
-                paths.push(path);
+                result.add_path(path, None);
             }
             if stop {
                 break;
@@ -2192,10 +3257,9 @@ fn enumerate_sources(
                 "rename source path is a symlink or escapes configured workspace roots: {uri}"
             ));
         }
-        if (path.is_file() || input.overlays.contains_key(uri)) && path_keys.insert(path_key(&path))
-        {
+        if path.is_file() || input.overlays.contains_key(uri) {
             add_baseline_path(&mut result.baseline, path.clone());
-            paths.push(path);
+            result.add_path(path, None);
         }
     }
     for (uri, overlay) in &input.overlays {
@@ -2209,34 +3273,20 @@ fn enumerate_sources(
                 result.reason.get_or_insert_with(|| {
                     format!("source path is a symlink or escapes configured workspace roots: {uri}")
                 });
-            } else if path_keys.insert(path_key(&path)) {
-                if overlay.text.len() <= input.options.limits.max_file_bytes {
-                    add_baseline_path(&mut result.baseline, path.clone());
-                    paths.push(path);
-                } else {
-                    result.complete = false;
-                    result.reason.get_or_insert_with(|| {
-                        format!("open overlay {uri} exceeds the configured per-file limit")
-                    });
-                }
+            } else if overlay.text.len() <= input.options.limits.max_file_bytes {
+                add_baseline_path(&mut result.baseline, path.clone());
+                result.add_path(path, None);
+            } else {
+                result.complete = false;
+                result.reason.get_or_insert_with(|| {
+                    format!("open overlay {uri} exceeds the configured per-file limit")
+                });
             }
         }
     }
 
-    paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-    paths.dedup_by(|left, right| path_key(left) == path_key(right));
-    let priority_paths: Vec<PathBuf> = priority
-        .iter()
-        .filter_map(|uri| uri.to_file_path().ok().map(absolute_path))
-        .collect();
-    paths.sort_by_key(|path| {
-        priority_paths
-            .iter()
-            .position(|priority| paths_equal_ci(priority, path))
-            .unwrap_or(priority_paths.len())
-    });
+    result.sort_paths(priority);
 
-    result.paths = paths;
     Ok(result)
 }
 
@@ -2264,7 +3314,10 @@ fn add_baseline_candidate_membership(
 
 fn add_baseline_content_hash(
     path: &Path,
+    baseline: &mut BaselineAccumulator,
     content_hashes: &mut HashMap<String, u64>,
+    read_policy: &ReadPolicy,
+    path_entry: &ProjectPathEntry,
     cancel: &AtomicBool,
     require_file: bool,
 ) -> Result<(), String> {
@@ -2273,6 +3326,7 @@ fn add_baseline_content_hash(
     }
     let key = path_key(path);
     if content_hashes.contains_key(&key) {
+        baseline.set_payload_dependency(path, read_policy.clone(), path_entry.clone());
         return Ok(());
     }
     let metadata = match fs::metadata(path) {
@@ -2296,67 +3350,28 @@ fn add_baseline_content_hash(
         }
         return Ok(());
     }
-    let content_hash = file_content_hash(path, cancel)?;
+    let content_hash = file_content_hash(path, read_policy, path_entry, cancel)?;
     content_hashes.insert(key, content_hash);
+    baseline.set_payload_dependency(path, read_policy.clone(), path_entry.clone());
     Ok(())
 }
 
-fn read_exact_file_bytes(path: &Path, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+fn read_exact_file_bytes(
+    path: &Path,
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    if metadata.len() > MAX_RENAME_CONFIG_BYTES as u64 {
-        return Err(format!(
-            "{} exceeds the configuration byte limit {MAX_RENAME_CONFIG_BYTES}",
-            path.display()
-        ));
-    }
-    let file = open_revalidation_file(path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect opened {}: {error}", path.display()))?;
-    if !opened_metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_RENAME_CONFIG_BYTES.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
+    let bytes = read_policy
+        .read_payload_bytes(entry, MAX_RENAME_CONFIG_BYTES as u64)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    if bytes.len() > MAX_RENAME_CONFIG_BYTES {
-        return Err(format!(
-            "{} exceeds the configuration byte limit {MAX_RENAME_CONFIG_BYTES}",
-            path.display()
-        ));
-    }
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     Ok(bytes)
-}
-
-#[cfg(target_os = "linux")]
-fn open_revalidation_file(path: &Path) -> io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Protect the metadata-then-open race: a regular configuration file can
-    // be replaced by a FIFO between the two operations. O_NONBLOCK makes that
-    // replacement fail or return WouldBlock instead of stalling analysis.
-    const O_NONBLOCK: i32 = 0o4000;
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NONBLOCK)
-        .open(path)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn open_revalidation_file(path: &Path) -> io::Result<fs::File> {
-    fs::File::open(path)
 }
 
 fn capture_context_baseline(
@@ -2387,37 +3402,55 @@ fn capture_context_baseline(
                 observe_directory_stamps,
             );
         }
-        for (path, stamp) in &state.watched_paths {
+        for observation in &state.project_read_observations {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            if is_configuration_file(path) {
-                // Configuration paths are watched for discovery, but naming
-                // requests add only the effective resolver read-set. Reading
-                // every watched sidecar here would make shadowed or unused
-                // configurations part of workspace snapshot completeness.
-                continue;
+            let path = &observation.path;
+            let stamp = Some(super::path_stamp_from_project_read(&observation.stamp));
+            add_baseline_path_with_stamp(baseline, path.clone(), stamp.clone());
+            baseline_content_hashes
+                .entry(path_key(path))
+                .or_insert(observation.content_hash);
+            if let Some(content_bytes) = &observation.content_bytes {
+                baseline_contents
+                    .entry(path_key(path))
+                    .or_insert_with(|| content_bytes.clone());
             }
-            let observed = state
-                .project_read_observations
-                .iter()
-                .find(|observation| package_paths_equal(&observation.path, path));
-            let observed_stamp = observed
-                .map(|observation| Some(super::path_stamp_from_project_read(&observation.stamp)))
-                .unwrap_or_else(|| stamp.clone());
-            add_baseline_path_with_stamp(baseline, path.clone(), observed_stamp.clone());
-            if observed_stamp.as_ref().is_some_and(|stamp| !stamp.is_dir) {
-                if let Some(observation) = observed {
+            if let Some(path_entry) = super::context_path_entry(&state.context, path) {
+                baseline.set_payload_observation(
+                    path,
+                    stamp,
+                    state.context.read_policy.clone(),
+                    path_entry,
+                );
+            }
+        }
+        for observation in &state.context.metadata_observations {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            let path = observation.path();
+            match observation {
+                crate::project::MetadataObservation::Stat { .. } => {
+                    add_baseline_path_with_stamp(baseline, path.to_path_buf(), path_stamp(path));
+                }
+                crate::project::MetadataObservation::Payload {
+                    read_policy,
+                    path_entry,
+                    stamp,
+                    content_hash,
+                    ..
+                } => {
+                    baseline.set_payload_observation(
+                        path,
+                        stamp.clone(),
+                        read_policy.clone(),
+                        path_entry.clone(),
+                    );
                     baseline_content_hashes
                         .entry(path_key(path))
-                        .or_insert(observation.content_hash);
-                    if let Some(content_bytes) = &observation.content_bytes {
-                        baseline_contents
-                            .entry(path_key(path))
-                            .or_insert_with(|| content_bytes.clone());
-                    }
-                } else {
-                    add_baseline_content_hash(path, baseline_content_hashes, cancel, true)?;
+                        .or_insert(*content_hash);
                 }
             }
         }
@@ -2458,6 +3491,9 @@ fn capture_consumed_configuration_baseline(
             baseline_contents
                 .entry(path_key(path))
                 .or_insert_with(|| content_bytes.clone());
+            if let Ok((read_policy, path_entry)) = record.payload_dependency() {
+                baseline.set_payload_dependency(path, read_policy.clone(), path_entry.clone());
+            }
         }
     }
     Ok(())
@@ -2502,10 +3538,37 @@ fn is_editable_source_path(workspace: &Workspace, path: &Path) -> bool {
         .roots
         .iter()
         .any(|root| path_starts_with_ci(path, &root.path) && root.accepts(path))
+        && is_safe_source_path(workspace, path)
 }
 
 fn is_readable_source_path(workspace: &Workspace, path: &Path) -> bool {
     workspace.accepts_path(path) && is_safe_source_path(workspace, path)
+}
+
+fn is_readable_source_for_context(
+    workspace: &Workspace,
+    path: &Path,
+    context_key: Option<&ContextKey>,
+) -> bool {
+    context_key
+        .and_then(|key| {
+            workspace
+                .contexts
+                .get(key)
+                .map(|state| (key, &state.context))
+        })
+        .is_some_and(|(key, context)| {
+            let legacy_route = Url::from_file_path(path)
+                .ok()
+                .is_some_and(|uri| workspace.legacy_route_is_current(&uri, path, key));
+            workspace.ensure_supported_project_context_with_legacy_route(
+                path,
+                context,
+                Some(key),
+                legacy_route,
+            )
+        })
+        || is_readable_source_path(workspace, path)
 }
 
 fn canonical_source_path(path: &Path) -> Option<PathBuf> {
@@ -2625,10 +3688,18 @@ struct IncludeAuditResult {
     incomplete_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum IncludeRoute {
+    Legacy,
+    Mapped { root: PathBuf },
+}
+
 #[derive(Debug)]
 struct IncludeLookup {
     observations: Vec<IncludeObservation>,
     selected: Option<PathBuf>,
+    selected_directory: Option<PathBuf>,
+    selected_route: IncludeRoute,
     error: Option<String>,
 }
 
@@ -2685,6 +3756,16 @@ struct IncludeAuditor<'a> {
     result: IncludeAuditResult,
 }
 
+struct IncludeInspection<'a> {
+    context_key: &'a ContextKey,
+    context: &'a ProjectContext,
+    owner_path: &'a Path,
+    selected_directory: Option<&'a Path>,
+    relative: bool,
+    route: IncludeRoute,
+    legacy_authorized: bool,
+}
+
 fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult, String> {
     let mut uris = auditor.sources.keys().cloned().collect::<Vec<_>>();
     uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -2701,7 +3782,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         };
         let defines = context
             .as_ref()
-            .map(|context| {
+            .map(|(_, context)| {
                 if !context.discovery_complete
                     && auditor
                         .allow_incomplete_context_for
@@ -2751,7 +3832,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
 
         let incomplete_context = context
             .as_ref()
-            .is_none_or(|context| !context.discovery_complete);
+            .is_none_or(|(_, context)| !context.discovery_complete);
         let allow_incomplete_context = auditor
             .allow_incomplete_context_for
             .iter()
@@ -2779,7 +3860,14 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                 auditor.stopped = true;
                 break;
             }
-            auditor.inspect_top_level(&uri, &directive, context.as_ref())?;
+            let Some((context_key, context)) = context.as_ref() else {
+                auditor.record_error(format!(
+                    "rename cannot prove completeness because include owner {uri} has no project context"
+                ));
+                auditor.stopped = true;
+                break;
+            };
+            auditor.inspect_top_level(&uri, &directive, context_key, context)?;
         }
     }
 
@@ -2787,7 +3875,10 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
 }
 
 impl IncludeAuditor<'_> {
-    fn context_for_source(&mut self, uri: &Url) -> Result<Option<ProjectContext>, String> {
+    fn context_for_source(
+        &mut self,
+        uri: &Url,
+    ) -> Result<Option<(ContextKey, ProjectContext)>, String> {
         let context_key = if let Some(context_key) = self.contexts.get(uri).cloned() {
             Some(context_key)
         } else if let Some(context_key) = self.loader.document_contexts.get(uri).cloned() {
@@ -2827,7 +3918,7 @@ impl IncludeAuditor<'_> {
                 format!("project context is ambiguous or incomplete for {uri}")
             });
         }
-        Ok(Some(context))
+        Ok(Some((context_key, context)))
     }
 
     fn take_directive_budget(&mut self) -> bool {
@@ -2842,7 +3933,8 @@ impl IncludeAuditor<'_> {
         &mut self,
         uri: &Url,
         directive: &Directive,
-        context: Option<&ProjectContext>,
+        context_key: &ContextKey,
+        context: &ProjectContext,
     ) -> Result<(), String> {
         let Some(owner_path) = uri.to_file_path().ok().map(absolute_path) else {
             self.record_error(format!(
@@ -2852,8 +3944,9 @@ impl IncludeAuditor<'_> {
             return Ok(());
         };
 
-        let directories = include_search_directories(&owner_path, context);
-        let lookup = resolve_include_path(directive, &directories);
+        let directories = include_search_directories(&owner_path, Some(context));
+        let lookup =
+            resolve_include_path_with_overrides(directive, &directories, &context.overrides);
         self.observe_lookup(&lookup);
         if let Some(error) = lookup.error {
             self.record_error(format!(
@@ -2870,7 +3963,25 @@ impl IncludeAuditor<'_> {
             return Ok(());
         };
 
-        let analysis = self.inspect_include_file(&path, context, 0)?;
+        let route = lookup.selected_route.clone();
+        let legacy_authorized = matches!(&route, IncludeRoute::Legacy)
+            && legacy_include_is_authorized(
+                self.loader,
+                context,
+                &owner_path,
+                lookup.selected_directory.as_deref(),
+                include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()),
+            );
+        let inspection = IncludeInspection {
+            context_key,
+            context,
+            owner_path: &owner_path,
+            selected_directory: lookup.selected_directory.as_deref(),
+            relative: include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()),
+            route,
+            legacy_authorized,
+        };
+        let analysis = self.inspect_include_file(&path, inspection, 0)?;
         if !analysis.safe || analysis.relevant {
             let reason = analysis
                 .reason
@@ -2881,11 +3992,15 @@ impl IncludeAuditor<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inspect_nested(
         &mut self,
         owner_path: &Path,
         directive: &Directive,
-        context: Option<&ProjectContext>,
+        context_key: &ContextKey,
+        context: &ProjectContext,
+        inherited_route: IncludeRoute,
+        legacy_authorized: bool,
         depth: usize,
     ) -> Result<IncludeAnalysis, String> {
         if depth >= MAX_RENAME_INCLUDE_DEPTH {
@@ -2897,8 +4012,9 @@ impl IncludeAuditor<'_> {
                 false,
             ));
         }
-        let directories = include_search_directories(owner_path, context);
-        let lookup = resolve_include_path(directive, &directories);
+        let directories = include_search_directories(owner_path, Some(context));
+        let lookup =
+            resolve_include_path_with_overrides(directive, &directories, &context.overrides);
         self.observe_lookup(&lookup);
         if let Some(error) = lookup.error {
             return Ok(IncludeAnalysis::unsafe_with_reason(
@@ -2912,13 +4028,34 @@ impl IncludeAuditor<'_> {
                 false,
             ));
         };
-        self.inspect_include_file(&path, context, depth + 1)
+        let route = match lookup.selected_route {
+            IncludeRoute::Mapped { root } => IncludeRoute::Mapped { root },
+            IncludeRoute::Legacy => inherited_route,
+        };
+        let legacy_authorized = matches!(&route, IncludeRoute::Legacy)
+            && inherited_legacy_authorization(
+                legacy_authorized,
+                owner_path,
+                directive,
+                lookup.selected_directory.as_deref(),
+                context,
+            );
+        let inspection = IncludeInspection {
+            context_key,
+            context,
+            owner_path,
+            selected_directory: lookup.selected_directory.as_deref(),
+            relative: include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()),
+            route,
+            legacy_authorized,
+        };
+        self.inspect_include_file(&path, inspection, depth + 1)
     }
 
     fn inspect_include_file(
         &mut self,
         path: &Path,
-        context: Option<&ProjectContext>,
+        inspection: IncludeInspection<'_>,
         depth: usize,
     ) -> Result<IncludeAnalysis, String> {
         if is_cancelled(self.cancel) {
@@ -2934,8 +4071,17 @@ impl IncludeAuditor<'_> {
                 false,
             ));
         }
-        let directories = include_search_directories(path, context);
-        let cache_key = include_cache_key(path, &directories);
+        let directories = include_search_directories(path, Some(inspection.context));
+        let cache_key = include_cache_key(
+            path,
+            &directories,
+            inspection.context_key,
+            inspection.owner_path,
+            inspection.selected_directory,
+            inspection.relative,
+            &inspection.route,
+            inspection.legacy_authorized,
+        );
         let active_key = canonical_include_key(path);
         if self.active.contains(&active_key) {
             return Ok(IncludeAnalysis::unsafe_with_reason(
@@ -2945,6 +4091,53 @@ impl IncludeAuditor<'_> {
         }
         if let Some(analysis) = self.cache.get(&cache_key) {
             return Ok(analysis.clone());
+        }
+        if !is_readable_include_for_context(
+            self.loader,
+            path,
+            inspection.context_key,
+            inspection.context,
+            &inspection.route,
+            inspection.legacy_authorized,
+        ) {
+            let analysis = IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} is outside the owning project's readable roots"),
+                false,
+            );
+            self.cache.insert(cache_key, analysis.clone());
+            return Ok(analysis);
+        }
+        let path_entry = match &inspection.route {
+            IncludeRoute::Mapped { root } => Some(ProjectPathEntry {
+                path: path.to_path_buf(),
+                provenance: ProjectPathProvenance::Mapped { root: root.clone() },
+            }),
+            IncludeRoute::Legacy => {
+                super::context_path_entry(inspection.context, path).or_else(|| {
+                    inspection.legacy_authorized.then(|| ProjectPathEntry {
+                        path: path.to_path_buf(),
+                        provenance: ProjectPathProvenance::LegacyNative,
+                    })
+                })
+            }
+        };
+        let Some(path_entry) = path_entry else {
+            let analysis = IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has no requester-scoped read authorization"),
+                false,
+            );
+            self.cache.insert(cache_key, analysis.clone());
+            return Ok(analysis);
+        };
+        if matches!(&inspection.route, IncludeRoute::Mapped { .. })
+            && !matches!(&path_entry.provenance, ProjectPathProvenance::Mapped { .. })
+        {
+            let analysis = IncludeAnalysis::unsafe_with_reason(
+                format!("mapped include {path:?} has no mapped provenance"),
+                false,
+            );
+            self.cache.insert(cache_key, analysis.clone());
+            return Ok(analysis);
         }
         if self.files_read >= MAX_RENAME_INCLUDE_FILES {
             self.stopped = true;
@@ -2971,12 +4164,24 @@ impl IncludeAuditor<'_> {
         }
 
         self.files_read += 1;
-        let include_source = match read_include(
-            path,
-            self.max_file_bytes,
-            Some(remaining_bytes),
-            Some(self.cancel),
-        ) {
+        let include_source = match if matches!(&inspection.route, IncludeRoute::Mapped { .. }) {
+            read_mapped_include(
+                &inspection.context.read_policy,
+                &path_entry,
+                self.max_file_bytes,
+                remaining_bytes,
+                self.cancel,
+            )
+        } else {
+            read_include(
+                path,
+                &inspection.context.read_policy,
+                &path_entry,
+                self.max_file_bytes,
+                Some(remaining_bytes),
+                Some(self.cancel),
+            )
+        } {
             Ok(source) => source,
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
             Err(error) => {
@@ -2995,6 +4200,11 @@ impl IncludeAuditor<'_> {
         self.baseline_content_hashes
             .entry(path_key(path))
             .or_insert(include_source.content_hash);
+        self.baseline.set_include_payload_dependency(
+            path,
+            inspection.context.read_policy.clone(),
+            path_entry,
+        );
 
         // The caller's project defines are not necessarily the state at this
         // include boundary: the owner may have DEFINE/UNDEF directives, and
@@ -3062,7 +4272,15 @@ impl IncludeAuditor<'_> {
                 if directive.kind != DirectiveKind::Include {
                     continue;
                 }
-                let child = self.inspect_nested(path, &directive, context, depth)?;
+                let child = self.inspect_nested(
+                    path,
+                    &directive,
+                    inspection.context_key,
+                    inspection.context,
+                    inspection.route.clone(),
+                    inspection.legacy_authorized,
+                    depth,
+                )?;
                 if !child.safe || child.relevant {
                     self.stopped = true;
                     nested = Some(IncludeAnalysis::unsafe_with_reason(
@@ -3218,14 +4436,158 @@ fn add_include_directory(directories: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn include_cache_key(path: &Path, directories: &[PathBuf]) -> String {
-    let mut key = path_key(path);
-    key.push('\0');
+#[allow(clippy::too_many_arguments)]
+fn include_cache_key(
+    path: &Path,
+    directories: &[PathBuf],
+    context_key: &ContextKey,
+    owner_path: &Path,
+    selected_directory: Option<&Path>,
+    relative: bool,
+    route: &IncludeRoute,
+    legacy_authorized: bool,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    path_key(path).hash(&mut hasher);
     for directory in directories {
-        key.push_str(&path_key(directory));
-        key.push('\0');
+        path_key(directory).hash(&mut hasher);
     }
-    key
+    context_key.hash(&mut hasher);
+    path_key(owner_path).hash(&mut hasher);
+    selected_directory.map(path_key).hash(&mut hasher);
+    relative.hash(&mut hasher);
+    route.hash(&mut hasher);
+    legacy_authorized.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn is_readable_include_for_context(
+    workspace: &Workspace,
+    path: &Path,
+    context_key: &ContextKey,
+    context: &ProjectContext,
+    route: &IncludeRoute,
+    legacy_authorized: bool,
+) -> bool {
+    let path = absolute_path(path.to_path_buf());
+    if let IncludeRoute::Mapped { root } = route {
+        return workspace.mapped_path_is_readable_under_root(&path, root, context_key);
+    }
+    let mapped_roots = context_key
+        .overrides
+        .read_roots()
+        .into_iter()
+        .map(|root| super::native_mapping_root(&root))
+        .collect::<Vec<_>>();
+    if mapped_roots
+        .iter()
+        .any(|root| path_starts_with_native(&path, root))
+    {
+        return workspace.mapped_path_is_readable(&path, context_key);
+    }
+
+    workspace.accepts_path(&path)
+        || context.search_path_entries.iter().any(|entry| {
+            if !path_starts_with_native(&path, &entry.path) {
+                return false;
+            }
+            match &entry.provenance {
+                ProjectPathProvenance::Mapped { root } => {
+                    workspace.mapped_path_is_readable_under_root(&path, root, context_key)
+                }
+                ProjectPathProvenance::Configured => false,
+                ProjectPathProvenance::LegacyNative => true,
+            }
+        })
+        || context.include_path_entries.iter().any(|entry| {
+            if !path_starts_with_native(&path, &entry.path) {
+                return false;
+            }
+            match &entry.provenance {
+                ProjectPathProvenance::Mapped { root } => {
+                    workspace.mapped_path_is_readable_under_root(&path, root, context_key)
+                }
+                ProjectPathProvenance::Configured => false,
+                ProjectPathProvenance::LegacyNative => true,
+            }
+        })
+        || legacy_authorized
+}
+
+fn legacy_include_is_authorized(
+    workspace: &Workspace,
+    context: &ProjectContext,
+    owner_path: &Path,
+    selected_directory: Option<&Path>,
+    relative: bool,
+) -> bool {
+    owner_has_legacy_or_workspace_authority(workspace, owner_path, context)
+        && (!relative
+            || selected_directory.is_some_and(|directory| {
+                owner_path
+                    .parent()
+                    .is_some_and(|parent| path_key(parent) == path_key(directory))
+                    || legacy_search_entry_selected(context, Some(directory))
+            }))
+}
+
+fn inherited_legacy_authorization(
+    inherited: bool,
+    owner_path: &Path,
+    directive: &Directive,
+    selected_directory: Option<&Path>,
+    context: &ProjectContext,
+) -> bool {
+    if !inherited {
+        return legacy_search_entry_selected(context, selected_directory);
+    }
+    if !include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()) {
+        return true;
+    }
+    selected_directory.is_some_and(|directory| {
+        owner_path
+            .parent()
+            .is_some_and(|parent| path_key(parent) == path_key(directory))
+            || legacy_search_entry_selected(context, Some(directory))
+    })
+}
+
+fn legacy_search_entry_selected(
+    context: &ProjectContext,
+    selected_directory: Option<&Path>,
+) -> bool {
+    selected_directory.is_some_and(|directory| {
+        context
+            .search_path_entries
+            .iter()
+            .chain(context.include_path_entries.iter())
+            .any(|entry| {
+                path_key(&entry.path) == path_key(directory)
+                    && matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+            })
+    })
+}
+
+fn owner_has_legacy_or_workspace_authority(
+    workspace: &Workspace,
+    owner_path: &Path,
+    context: &ProjectContext,
+) -> bool {
+    if workspace.accepts_path(owner_path) {
+        return true;
+    }
+    let is_legacy = |entry: &crate::project::ProjectPathEntry| {
+        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+            && path_starts_with_native(owner_path, &entry.path)
+    };
+    context.search_path_entries.iter().any(is_legacy)
+        || context.include_path_entries.iter().any(is_legacy)
+        || context.main_source_entry.as_ref().is_some_and(is_legacy)
+        || context
+            .explicit_unit_entries
+            .values()
+            .flatten()
+            .any(is_legacy)
 }
 
 fn canonical_include_key(path: &Path) -> String {
@@ -3234,24 +4596,51 @@ fn canonical_include_key(path: &Path) -> String {
         .unwrap_or_else(|_| path_key(path))
 }
 
+#[cfg(test)]
 fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> IncludeLookup {
+    resolve_include_path_with_overrides(directive, directories, &EffectiveOverrides::default())
+}
+
+fn resolve_include_path_with_overrides(
+    directive: &Directive,
+    directories: &[PathBuf],
+    overrides: &EffectiveOverrides,
+) -> IncludeLookup {
     let Some(raw) = include_name(directive) else {
         return IncludeLookup {
             observations: Vec::new(),
             selected: None,
+            selected_directory: None,
+            selected_route: IncludeRoute::Legacy,
             error: None,
         };
     };
 
     let mut observations = Vec::new();
     let mut selected = None;
+    let mut selected_directory = None;
+    let mut selected_route = IncludeRoute::Legacy;
     let mut error = None;
     for directory in directories {
         observations.push(IncludeObservation {
             path: directory.clone(),
             stamp: path_stamp(directory),
         });
-        let candidate = absolute_path(directory.join(&raw));
+        let (candidate, route) = match overrides.resolve_path(&raw, directory) {
+            Ok(resolved) => {
+                let route = resolved
+                    .mapping
+                    .as_ref()
+                    .map_or(IncludeRoute::Legacy, |mapping| IncludeRoute::Mapped {
+                        root: super::native_mapping_root(&mapping.to),
+                    });
+                (absolute_path(resolved.path), route)
+            }
+            Err(resolve_error) => {
+                error = Some(resolve_error);
+                break;
+            }
+        };
         if observations
             .iter()
             .any(|observation| path_key(&observation.path) == path_key(&candidate))
@@ -3267,6 +4656,8 @@ fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> Inclu
         match metadata {
             Ok(metadata) if metadata.is_file() => {
                 selected = Some(candidate);
+                selected_directory = Some(directory.clone());
+                selected_route = route;
                 break;
             }
             Ok(_) => {}
@@ -3286,6 +4677,8 @@ fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> Inclu
                     match actual_metadata {
                         Ok(metadata) if metadata.is_file() => {
                             selected = Some(actual);
+                            selected_directory = Some(directory.clone());
+                            selected_route = route;
                             break;
                         }
                         Ok(_) => {}
@@ -3306,6 +4699,8 @@ fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> Inclu
     IncludeLookup {
         observations,
         selected,
+        selected_directory,
+        selected_route,
         error,
     }
 }
@@ -3483,12 +4878,22 @@ struct IncludeSource {
 
 fn read_include(
     path: &Path,
+    read_policy: &ReadPolicy,
+    path_entry: &ProjectPathEntry,
     max_file_bytes: usize,
     max_total_bytes: Option<usize>,
     cancel: Option<&AtomicBool>,
 ) -> Result<IncludeSource, String> {
     if cancel.is_some_and(is_cancelled) {
         return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let legacy_payload = matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
+    if if legacy_payload {
+        !read_policy.allows_legacy_payload_entry(path_entry)
+    } else {
+        !read_policy.allows_entry(path_entry)
+    } {
+        return Err("payload path is not authorized".to_string());
     }
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file() {
@@ -3505,50 +4910,14 @@ fn read_include(
     if cancel.is_some_and(is_cancelled) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    let mut file = open_revalidation_file(path).map_err(|error| error.to_string())?;
-    let opened_metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !opened_metadata.is_file() {
-        return Err("path is not a regular file".to_string());
+    let limit = max_total_bytes.map_or(max_file_bytes, |total| max_file_bytes.min(total));
+    let bytes = if legacy_payload {
+        read_policy.read_legacy_payload_bytes(path_entry, limit as u64)
+    } else {
+        read_policy.read_payload_bytes(path_entry, limit as u64)
     }
-    if opened_metadata.len() > max_file_bytes as u64 {
-        return Err(format!(
-            "file exceeds the configured per-file limit {max_file_bytes}"
-        ));
-    }
-    if max_total_bytes.is_some_and(|limit| opened_metadata.len() > limit as u64) {
-        return Err(INCLUDE_BYTE_BUDGET_ERROR.to_string());
-    }
-    let mut bytes = Vec::with_capacity(metadata.len().min(max_file_bytes as u64) as usize);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut byte_count = 0usize;
-    loop {
-        if cancel.is_some_and(is_cancelled) {
-            return Err(CANCELLATION_MESSAGE.to_string());
-        }
-        let read_limit = max_total_bytes
-            .map(|limit| limit.saturating_sub(byte_count))
-            .unwrap_or(buffer.len())
-            .min(buffer.len());
-        if read_limit == 0 {
-            break;
-        }
-        let read = file
-            .read(&mut buffer[..read_limit])
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        byte_count = byte_count.saturating_add(read);
-        if byte_count > max_file_bytes {
-            return Err(format!(
-                "file exceeds the configured per-file limit {max_file_bytes}"
-            ));
-        }
-        hasher.write(&buffer[..read]);
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    hasher.write_usize(byte_count);
+    .map_err(|error| error.to_string())?;
+    let byte_count = bytes.len();
     if cancel.is_some_and(is_cancelled) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
@@ -3557,9 +4926,170 @@ fn read_include(
     }
     Ok(IncludeSource {
         text: decode_bytes(&bytes).into_owned(),
-        content_hash: hasher.finish(),
+        content_hash: super::content_hash_bytes(&bytes),
         bytes: byte_count,
     })
+}
+
+fn read_mapped_include(
+    read_policy: &ReadPolicy,
+    path_entry: &ProjectPathEntry,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    cancel: &AtomicBool,
+) -> Result<IncludeSource, String> {
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let limit = max_file_bytes.min(max_total_bytes);
+    let bytes = read_policy.read_payload_bytes(path_entry, limit as u64)?;
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    if let Some(encoding) = unsupported_source_encoding(&bytes) {
+        return Err(format!("unsupported {encoding} source encoding"));
+    }
+    Ok(IncludeSource {
+        text: decode_bytes(&bytes).into_owned(),
+        content_hash: super::content_hash_bytes(&bytes),
+        bytes: bytes.len(),
+    })
+}
+
+fn read_record_content_bytes(
+    path: &Path,
+    record: &SourceRecord,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    if record.include_payload {
+        return Err(
+            "include payload does not have a byte-for-byte revalidation record".to_string(),
+        );
+    }
+    let (read_policy, path_entry) = record.payload_dependency()?;
+    read_exact_file_bytes(path, read_policy, path_entry, cancel)
+}
+
+fn read_record_content_hash(
+    path: &Path,
+    record: &SourceRecord,
+    cancel: &AtomicBool,
+) -> Result<u64, String> {
+    if record.include_payload {
+        let (read_policy, path_entry) = record.payload_dependency()?;
+        let bytes = if matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative) {
+            read_policy.read_legacy_payload_bytes(path_entry, MAX_RENAME_SCAN_FILE_BYTES as u64)?
+        } else {
+            read_policy.read_payload_bytes(path_entry, MAX_RENAME_SCAN_FILE_BYTES as u64)?
+        };
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        return Ok(super::content_hash_bytes(&bytes));
+    }
+    let (read_policy, path_entry) = record.payload_dependency()?;
+    file_content_hash(path, read_policy, path_entry, cancel)
+}
+
+#[allow(dead_code)]
+fn directive_only_directives(source: &str, allow_includes: bool) -> Option<Vec<Directive>> {
+    let bytes = source.as_bytes();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index = source[index..]
+                .find('\n')
+                .map_or(bytes.len(), |offset| index + offset + 1);
+            continue;
+        }
+        if bytes[index] == b'{' {
+            if bytes.get(index + 1) == Some(&b'$') {
+                let end = source[index + 2..].find('}')?;
+                let body = source[index + 2..index + 2 + end].to_string();
+                entries.push(Directive {
+                    kind: directive_kind(&body),
+                    body,
+                    start: index,
+                    end: index + end + 3,
+                });
+                index += end + 3;
+            } else {
+                let end = source[index + 1..].find('}')?;
+                index += end + 2;
+            }
+            continue;
+        }
+        if bytes[index] == b'(' && bytes.get(index + 1) == Some(&b'*') {
+            if bytes.get(index + 2) == Some(&b'$') {
+                let end = source[index + 3..].find("*)")?;
+                let body = source[index + 3..index + 3 + end].to_string();
+                entries.push(Directive {
+                    kind: directive_kind(&body),
+                    body,
+                    start: index,
+                    end: index + end + 5,
+                });
+                index += end + 5;
+            } else {
+                let end = source[index + 2..].find("*)")?;
+                index += end + 4;
+            }
+            continue;
+        }
+        return None;
+    }
+
+    let mut conditional_frames = Vec::new();
+    for directive in &entries {
+        match directive.kind {
+            DirectiveKind::ConditionalStart => conditional_frames.push(false),
+            DirectiveKind::ConditionalMiddle => {
+                let seen_else = conditional_frames.last_mut()?;
+                if directive_keyword(&directive.body)
+                    .is_some_and(|keyword| keyword.eq_ignore_ascii_case("else"))
+                {
+                    if *seen_else {
+                        return None;
+                    }
+                    *seen_else = true;
+                } else if *seen_else {
+                    return None;
+                }
+            }
+            DirectiveKind::ConditionalEnd => {
+                conditional_frames.pop()?;
+            }
+            DirectiveKind::Include if allow_includes => {}
+            DirectiveKind::CompilerDefine | DirectiveKind::MethodInfo | DirectiveKind::Harmless => {
+            }
+            DirectiveKind::Include | DirectiveKind::Other => return None,
+        }
+    }
+    conditional_frames.is_empty().then_some(entries)
+}
+
+#[allow(dead_code)]
+fn conditional_regions(source: &str) -> Vec<(usize, usize)> {
+    let mut starts = Vec::new();
+    let mut regions = Vec::new();
+    for directive in directives(source) {
+        match directive.kind {
+            DirectiveKind::ConditionalStart => starts.push(directive.start),
+            DirectiveKind::ConditionalEnd => {
+                if let Some(start) = starts.pop() {
+                    regions.push((start, directive.end));
+                }
+            }
+            _ => {}
+        }
+    }
+    regions.extend(starts.into_iter().map(|start| (start, source.len())));
+    regions
 }
 
 pub(crate) fn identifier_at_position(source: &str, position: Position) -> Option<String> {
@@ -3761,16 +5291,23 @@ fn skip_string(bytes: &[u8], index: &mut usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::FileChange;
+    use super::super::MetadataObservation;
     use super::{
-        BaselineAccumulator, Directive, DirectiveKind, PathStamp, ProjectCandidateMembership,
-        SnapshotMode, Workspace, WorkspaceOptions, build_snapshot,
-        capture_consumed_configuration_baseline, contains_any_identifier, directive_kind,
-        file_content_hash, path_key, path_record_at, read_exact_file_bytes, read_include,
-        rename_from_input, resolve_include_path, revalidate_input, snapshot_records,
+        BaselineAccumulator, ContextKey, ContextState, Directive, DirectiveKind, Enumeration,
+        IncludeAuditResult, IncludeAuditor, IncludeInspection, IncludeRoute, PathStamp,
+        ProjectCandidateMembership, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
+        ReadPolicy, SnapshotMode, Workspace, WorkspaceOptions, build_snapshot,
+        capture_consumed_configuration_baseline, capture_context_baseline, contains_any_identifier,
+        directive_kind, enumerate_external_overlays, file_content_hash,
+        install_snapshot_priority_barrier, path_key, path_record_at, read_exact_file_bytes,
+        read_include, read_record_content_hash, rename_from_input, resolve_include_path,
+        resolve_include_path_with_overrides, revalidate_input, snapshot_records,
         test_cancel_in_include_analysis,
     };
     use lsp_types::{Position, Url};
-    use std::collections::HashMap;
+    use pascal_core::delphi_overrides::{EffectiveOverrides, OverrideSession, PathMapping};
+    use std::collections::{HashMap, HashSet};
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -3778,8 +5315,667 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::process::Command;
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::thread;
     #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
+
+    fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
+        Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn delphi_overrides_analysis_input_reuses_captured_layers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::with_override_session(
+            vec![root.path().to_path_buf()],
+            WorkspaceOptions::default(),
+            OverrideSession::new(None),
+        );
+        let input = workspace.analysis_input();
+        std::fs::write(
+            root.path().join(".delphi-tools.local.toml"),
+            "[properties]\nBDS = 'new-on-disk'\n",
+        )
+        .unwrap();
+        let rebuilt = Workspace::with_override_session(
+            input.roots.clone(),
+            input.options.clone(),
+            input.overrides.clone(),
+        );
+        assert!(
+            rebuilt
+                .overrides
+                .effective_for(Some(root.path()), None)
+                .unwrap()
+                .properties
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn enumeration_owner_indices_follow_path_sorting() {
+        let mut enumeration = Enumeration {
+            complete: true,
+            ..Enumeration::default()
+        };
+        let b_path = PathBuf::from("/snapshot/B.pas");
+        let a_path = PathBuf::from("/snapshot/A.pas");
+        enumeration.add_path(b_path.clone(), None);
+        enumeration.add_path(a_path.clone(), None);
+        enumeration.sort_paths(&[]);
+        let a_owner = ContextKey {
+            project_file: Some(PathBuf::from("/projects/A.dproj")),
+            workspace_root: None,
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let b_owner = ContextKey {
+            project_file: Some(PathBuf::from("/projects/B.dproj")),
+            ..a_owner.clone()
+        };
+        enumeration.assign_owner(&a_path, a_owner.clone());
+        enumeration.assign_owner(&b_path, b_owner.clone());
+
+        assert_eq!(enumeration.paths[0].path, a_path);
+        assert_eq!(enumeration.paths[0].owner, Some(a_owner));
+        assert_eq!(enumeration.paths[1].path, b_path);
+        assert_eq!(enumeration.paths[1].owner, Some(b_owner));
+    }
+
+    #[test]
+    fn enumeration_rejects_changed_contexts_with_the_same_key() {
+        let key = ContextKey {
+            project_file: Some(PathBuf::from("/workspace/App.dproj")),
+            workspace_root: Some(PathBuf::from("/workspace")),
+            project_scope: Some(PathBuf::from("/workspace")),
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let old = ContextState {
+            context: ProjectContext {
+                search_paths: vec![PathBuf::from("/sdk/old")],
+                ..ProjectContext::default()
+            },
+            ..ContextState::default()
+        };
+        let new = ContextState {
+            context: ProjectContext {
+                search_paths: vec![PathBuf::from("/sdk/new")],
+                ..ProjectContext::default()
+            },
+            ..ContextState::default()
+        };
+        let mut enumeration = Enumeration {
+            complete: true,
+            ..Enumeration::default()
+        };
+
+        enumeration.retain_context(key.clone(), old);
+        enumeration.retain_context(key, new);
+
+        assert!(!enumeration.complete);
+        assert!(
+            enumeration
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("changed"))
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_project_metadata_changed_between_priority_and_enumeration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let sdk_a = temp.path().join("sdk-a");
+        let sdk_b = temp.path().join("sdk-b");
+        let provider = root.join("Provider.pas");
+        let project = root.join("App.dproj");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&sdk_a).unwrap();
+        fs::create_dir_all(&sdk_b).unwrap();
+        fs::write(
+            &provider,
+            "unit Provider; interface const SharedValue = 1; implementation end.\n",
+        )
+        .unwrap();
+        fs::write(
+            sdk_a.join("Consumer.pas"),
+            "unit Consumer; interface uses Provider; implementation procedure Use; begin Log(SharedValue); end; end.\n",
+        )
+        .unwrap();
+        fs::write(
+            sdk_b.join("Consumer.pas"),
+            "unit Consumer; interface uses Provider; implementation procedure Use; begin Log(SharedValue); end; end.\n",
+        )
+        .unwrap();
+        let mapping = format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK_A'\nto = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK_B'\nto = '{}'\n",
+            sdk_a.display(),
+            sdk_b.display(),
+        );
+        fs::write(root.join(".delphi-tools.local.toml"), mapping).unwrap();
+        let old_project = "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK_A</DCC_UnitSearchPath></PropertyGroup></Project>";
+        let new_project = "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK_B</DCC_UnitSearchPath></PropertyGroup></Project>";
+        fs::write(&project, old_project).unwrap();
+
+        let workspace = Workspace::with_override_session(
+            vec![root.clone()],
+            WorkspaceOptions {
+                project_file: Some(project.clone()),
+                ..WorkspaceOptions::default()
+            },
+            OverrideSession::new(None),
+        );
+        let input = workspace.analysis_input();
+        let provider_uri = Url::from_file_path(&provider).unwrap();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        install_snapshot_priority_barrier(provider_uri.clone(), ready_sender, release_receiver);
+        let project_for_mutator = project.clone();
+        let mutator = thread::spawn(move || {
+            ready_receiver.recv().expect("priority context capture");
+            fs::write(project_for_mutator, new_project).expect("switch project search root");
+            release_sender.send(()).expect("release snapshot barrier");
+        });
+
+        let cancel = AtomicBool::new(false);
+        let snapshot = build_snapshot(
+            &input,
+            std::slice::from_ref(&provider_uri),
+            &["SharedValue".to_string()],
+            SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("snapshot construction should report incompleteness, not panic");
+        mutator.join().expect("metadata mutator must finish");
+
+        assert!(!snapshot.complete);
+        assert!(
+            snapshot
+                .incomplete_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("context changed"))
+        );
+    }
+
+    #[test]
+    fn context_payload_baseline_uses_the_original_observation_after_equal_metadata_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let metadata = root.join("App.dproj");
+        let original =
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>";
+        let replacement =
+            "<Project><PropertyGroup><MainSource>New.dpr</MainSource></PropertyGroup></Project>";
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&metadata, original).expect("metadata");
+        let original_metadata = fs::metadata(&metadata).expect("original metadata");
+        let original_stamp = super::super::path_stamp(&metadata);
+        let original_hash = super::super::content_hash_bytes(original.as_bytes());
+        let policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let entry = ProjectPathEntry {
+            path: metadata.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let later = MetadataObservation::Payload {
+            path: metadata.clone(),
+            read_policy: policy.clone(),
+            path_entry: entry.clone(),
+            stamp: None,
+            content_hash: super::super::content_hash_bytes(replacement.as_bytes()),
+        };
+        let key = ContextKey {
+            project_file: Some(metadata.clone()),
+            workspace_root: Some(root.clone()),
+            project_scope: Some(root.clone()),
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let mut workspace = workspace;
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context: ProjectContext {
+                    metadata_files: vec![metadata.clone()],
+                    metadata_observations: vec![
+                        MetadataObservation::Payload {
+                            path: metadata.clone(),
+                            read_policy: policy.clone(),
+                            path_entry: entry.clone(),
+                            stamp: original_stamp.clone(),
+                            content_hash: original_hash,
+                        },
+                        later,
+                    ],
+                    ..ProjectContext::default()
+                },
+                ..ContextState::default()
+            },
+        );
+
+        fs::write(&metadata, replacement).expect("replacement metadata");
+        File::options()
+            .write(true)
+            .open(&metadata)
+            .expect("metadata for timestamp restore")
+            .set_times(
+                FileTimes::new().set_modified(
+                    original_metadata
+                        .modified()
+                        .expect("original modification time"),
+                ),
+            )
+            .expect("restore metadata timestamp");
+
+        let mut baseline = BaselineAccumulator::default();
+        let mut hashes = HashMap::new();
+        let mut contents = HashMap::new();
+        capture_context_baseline(
+            &workspace,
+            &key,
+            &mut baseline,
+            &mut hashes,
+            &mut contents,
+            false,
+            &AtomicBool::new(false),
+        )
+        .expect("capture metadata baseline");
+
+        let baseline_path = baseline
+            .paths
+            .iter()
+            .find(|path| path.path == metadata)
+            .expect("metadata baseline path");
+        assert_eq!(baseline_path.stamp, original_stamp);
+        assert_eq!(
+            hashes.get(&super::path_key(&metadata)),
+            Some(&original_hash)
+        );
+    }
+
+    #[test]
+    fn worker_rejects_a_recursive_membership_change_with_equal_file_metadata() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let target = root.join("Child.pas");
+        let original_source = "unit Child;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+        let changed_source = original_source.replace("= 1", "= 2");
+        fs::write(&target, original_source).expect("recursive member");
+        fs::write(
+            root.join("A.dpr"),
+            "program A; uses Child in 'Child.pas'; begin end.\n",
+        )
+        .expect("owning main source");
+        fs::write(root.join("B.dpr"), "program B; begin end.\n").expect("competing main source");
+        fs::write(
+            root.join("A.dproj"),
+            "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .expect("owning project");
+        fs::write(
+            root.join("B.dproj"),
+            "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .expect("competing project");
+        let original_metadata = fs::metadata(&target).expect("target metadata");
+        let target_uri = Url::from_file_path(&target).expect("target URI");
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        install_snapshot_priority_barrier(target_uri.clone(), ready_sender, release_receiver);
+        let target_for_mutator = target.clone();
+        let mutator = thread::spawn(move || {
+            ready_receiver.recv().expect("priority context capture");
+            fs::write(&target_for_mutator, changed_source).expect("change recursive member");
+            File::options()
+                .write(true)
+                .open(&target_for_mutator)
+                .expect("target for timestamp restore")
+                .set_times(
+                    FileTimes::new().set_modified(
+                        original_metadata
+                            .modified()
+                            .expect("original modification time"),
+                    ),
+                )
+                .expect("restore target timestamp");
+            release_sender.send(()).expect("release snapshot barrier");
+        });
+
+        let mut workspace = workspace;
+        let result = workspace.rename_edits(&target_uri, Position::new(2, 6), "GOOD_CONST", false);
+        mutator.join().expect("recursive member mutator");
+
+        let error = result.expect_err(
+            "a recursive membership payload changed after context evaluation; the worker must reject the snapshot",
+        );
+        assert!(
+            error.contains("changed") || error.contains("metadata") || error.contains("stale"),
+            "unexpected recursive metadata revalidation error: {error}"
+        );
+    }
+
+    #[test]
+    fn worker_revalidates_exists_only_stat_metadata_without_opening_its_payload() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let private = root.join("vendor/private/settings.optset");
+        let target = root.join("Provider.pas");
+        let target_source =
+            "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+        fs::create_dir_all(private.parent().expect("private metadata parent"))
+            .expect("private metadata directory");
+        fs::write(&private, "<Project />").expect("Exists-only metadata");
+        fs::write(&target, target_source).expect("target source");
+        fs::write(root.join("App.dpr"), "program App; begin end.\n").expect("main source");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><PropertyGroup Condition=\"Exists('vendor/private/settings.optset')\"><DCC_Define>PRIVATE_SETTINGS</DCC_Define></PropertyGroup></Project>",
+        )
+        .expect("project descriptor");
+
+        let workspace = test_workspace(
+            vec![root.clone()],
+            WorkspaceOptions {
+                source_paths: vec!["vendor".to_string()],
+                exclude: vec!["vendor/private".to_string()],
+                ..WorkspaceOptions::default()
+            },
+        );
+        let input = workspace.analysis_input();
+        let target_uri = Url::from_file_path(&target).expect("target URI");
+        let cancel = AtomicBool::new(false);
+        let computed = rename_from_input(
+            input.clone(),
+            &target_uri,
+            Position::new(2, 6),
+            "GOOD_CONST",
+            false,
+            &cancel,
+        );
+        assert!(
+            computed.value.is_ok(),
+            "complete worker baseline: {:?}",
+            computed.value
+        );
+        assert!(
+            computed.records.iter().any(|record| {
+                record.path.as_deref() == Some(private.as_path())
+                    && record.candidate_membership.is_none()
+                    && record.content_hash.is_none()
+                    && record.read_policy.is_none()
+                    && record.path_entry.is_none()
+            }),
+            "Exists-only dependency must be retained as a stat-only record"
+        );
+
+        fs::remove_file(&private).expect("change Exists-only metadata state");
+        let error = revalidate_input(&workspace.analysis_input(), &computed.records, &cancel)
+            .expect_err("a changed Exists-only stat dependency must invalidate the snapshot");
+        assert!(
+            error.contains("changed") || error.contains("metadata"),
+            "unexpected stat-only revalidation error: {error}"
+        );
+    }
+
+    #[test]
+    fn workspace_queries_reject_an_incomplete_non_priority_consumer_context() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let provider_root = root.join("provider");
+        let consumer_root = root.join("consumer");
+        let provider = provider_root.join("Provider.pas");
+        let consumer = consumer_root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+        fs::create_dir_all(&provider_root).expect("provider directory");
+        fs::create_dir_all(&consumer_root).expect("consumer directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(
+            provider_root.join("Provider.dproj"),
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("provider project");
+        for project in ["A.dproj", "B.dproj"] {
+            fs::write(
+                consumer_root.join(project),
+                "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource></PropertyGroup></Project>",
+            )
+            .expect("ambiguous consumer project");
+        }
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let provider_owner = super::owner_for_input(&input, &provider_uri, &cancel)
+            .expect("priority provider context");
+        assert!(
+            provider_owner.state.context.discovery_complete,
+            "priority provider context must be complete"
+        );
+        let references = super::super::queries::references_from_input(
+            input.clone(),
+            &provider_uri,
+            Position::new(2, 6),
+            true,
+            &cancel,
+        );
+        assert!(
+            references.value.is_err(),
+            "references must fail rather than bind an ambiguous consumer: {references:?}"
+        );
+
+        let rename = rename_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            "RenamedValue",
+            false,
+            &cancel,
+        );
+        assert!(
+            rename.value.is_err(),
+            "rename must fail rather than edit through an ambiguous consumer: {rename:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_queries_reject_a_missing_optset_in_a_non_priority_consumer_context() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let provider_root = root.join("provider");
+        let consumer_root = root.join("consumer");
+        let provider = provider_root.join("Provider.pas");
+        let consumer = consumer_root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+        fs::create_dir_all(&provider_root).expect("provider directory");
+        fs::create_dir_all(&consumer_root).expect("consumer directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(
+            provider_root.join("Provider.dproj"),
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("provider project");
+        fs::write(
+            consumer_root.join("Consumer.dproj"),
+            "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../provider/Provider.pas\" /></ItemGroup><Import Project=\"missing.optset\" /></Project>",
+        )
+        .expect("consumer project");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let provider_owner = super::owner_for_input(&input, &provider_uri, &cancel)
+            .expect("priority provider context");
+        assert!(
+            provider_owner.state.context.discovery_complete,
+            "priority provider context must be complete"
+        );
+        let references = super::super::queries::references_from_input(
+            input.clone(),
+            &provider_uri,
+            Position::new(2, 6),
+            true,
+            &cancel,
+        );
+        assert!(
+            references.value.is_err(),
+            "references must fail rather than bind a missing-optset consumer: {references:?}"
+        );
+
+        let rename = rename_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            "RenamedValue",
+            false,
+            &cancel,
+        );
+        assert!(
+            rename.value.is_err(),
+            "rename must fail rather than edit through a missing-optset consumer: {rename:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_rejects_an_incomplete_external_overlay_context() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        let project = root.join("Provider.dproj");
+        let overlay_path = external.join("Consumer.pas");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::create_dir_all(&external).expect("external directory");
+
+        let key = ContextKey {
+            project_file: Some(project),
+            workspace_root: Some(root.clone()),
+            project_scope: Some(root.clone()),
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let state = ContextState {
+            context: ProjectContext {
+                discovery_complete: false,
+                search_paths: vec![external.clone()],
+                search_path_entries: vec![super::super::super::project::ProjectPathEntry {
+                    path: external,
+                    provenance: super::super::super::project::ProjectPathProvenance::LegacyNative,
+                }],
+                ..ProjectContext::default()
+            },
+            ..ContextState::default()
+        };
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        workspace.contexts.insert(key.clone(), state.clone());
+        let overlay_uri = Url::from_file_path(&overlay_path).expect("overlay URI");
+        let mut input = workspace.analysis_input();
+        input.overlays.insert(
+            overlay_uri.clone(),
+            super::OverlayInput {
+                text: "unit Consumer; interface end.".to_string(),
+                version: 1,
+            },
+        );
+        input.document_owners.insert(
+            overlay_uri,
+            super::super::KnownDocumentOwner {
+                key: key.clone(),
+                state,
+                origin: super::super::OwnerOrigin::Inherited,
+                legacy_route: None,
+            },
+        );
+        let mut enumeration = Enumeration {
+            complete: true,
+            ..Enumeration::default()
+        };
+
+        enumerate_external_overlays(
+            &mut workspace,
+            &input,
+            &HashSet::from([key]),
+            SnapshotMode::Workspace,
+            &mut enumeration,
+            &AtomicBool::new(false),
+        )
+        .expect("external overlay enumeration");
+
+        assert!(
+            !enumeration.complete,
+            "an incomplete external overlay context must block a workspace snapshot"
+        );
+    }
+
+    #[test]
+    fn enumeration_owner_assignment_uses_keyed_lookup_after_sort() {
+        const SOURCES: usize = 2_048;
+        let mut enumeration = Enumeration {
+            complete: true,
+            ..Enumeration::default()
+        };
+        let owner = ContextKey {
+            project_file: Some(PathBuf::from("/projects/Owner.dproj")),
+            workspace_root: None,
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        for index in (0..SOURCES).rev() {
+            enumeration.add_path(PathBuf::from(format!("/snapshot/{index:04}.pas")), None);
+        }
+        enumeration.sort_paths(&[]);
+        for index in 0..SOURCES {
+            enumeration.assign_owner(
+                &PathBuf::from(format!("/snapshot/{index:04}.pas")),
+                owner.clone(),
+            );
+        }
+
+        assert_eq!(enumeration.paths.len(), SOURCES);
+        assert!(
+            enumeration
+                .paths
+                .iter()
+                .all(|source| { source.owner.as_ref() == Some(&owner) })
+        );
+        assert!(
+            enumeration.lookup_count() <= SOURCES * 2,
+            "enumeration lookup work must remain linear"
+        );
+    }
 
     #[test]
     fn contains_any_identifier_uses_identifier_boundaries() {
@@ -3844,7 +6040,7 @@ mod tests {
         )
         .expect("source");
 
-        let workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let snapshot = build_snapshot(
@@ -3889,6 +6085,9 @@ mod tests {
             None,
             Some(observed_bytes.clone()),
             None,
+            None,
+            None,
+            false,
         )
         .expect("configuration record");
         let mut baseline = BaselineAccumulator::default();
@@ -3957,7 +6156,7 @@ mod tests {
 
         let mut options = WorkspaceOptions::default();
         options.limits.max_file_bytes = source.len() - 1;
-        let workspace = Workspace::new(vec![root], options);
+        let workspace = test_workspace(vec![root], options);
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let snapshot = build_snapshot(
@@ -3995,7 +6194,7 @@ mod tests {
         fs::create_dir_all(&root).expect("fixture directory");
         fs::write(&source_path, source).expect("source");
 
-        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let snapshot = build_snapshot(
@@ -4047,7 +6246,7 @@ mod tests {
         fs::create_dir_all(&root).expect("fixture directory");
         fs::write(&source_path, source).expect("source");
 
-        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let snapshot = build_snapshot(
@@ -4102,7 +6301,7 @@ mod tests {
         fs::write(&provider, provider_source).expect("provider source");
 
         let provider_uri = Url::from_file_path(&provider).expect("provider URI");
-        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let computed = rename_from_input(
@@ -4137,6 +6336,347 @@ mod tests {
     }
 
     #[test]
+    fn rename_revalidation_observes_package_metadata_discovered_during_binding() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let package_root = temp.path().join("packages");
+        let imported_metadata = package_root.join("metadata/Mappings.optset");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Main.pas");
+        let project = root.join("App.dproj");
+        let package_project = package_root.join("Package.dproj");
+        let package_source = package_root.join("PackageMain.dpk");
+        let provider_source =
+            "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Main;\ninterface\nuses Provider, PackagedUnit;\nimplementation\nprocedure Run;\nbegin\n  Log(BadConst);\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("project directory");
+        fs::create_dir_all(&package_root).expect("package directory");
+        fs::create_dir_all(imported_metadata.parent().expect("metadata parent"))
+            .expect("metadata directory");
+        fs::write(&provider, provider_source).expect("package unit");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
+        )
+        .expect("project");
+        fs::write(&package_source, "package PackageMain;\ncontains\nend.\n")
+            .expect("package source");
+        fs::write(
+            package_root.join("PackagedUnit.pas"),
+            "unit PackagedUnit;\ninterface\nimplementation\nend.\n",
+        )
+        .expect("package unit");
+        fs::write(
+            &package_project,
+             "<Project><PropertyGroup><MainSource>PackageMain.dpk</MainSource></PropertyGroup><Import Project=\"metadata/Mappings.optset\" /></Project>",
+        )
+        .expect("package project");
+        fs::write(
+            &imported_metadata,
+            format!(
+                "<Project><ItemGroup><DCCReference Include=\"{}\" /></ItemGroup></Project>",
+                package_root.join("PackagedUnit.pas").display()
+            ),
+        )
+        .expect("imported package metadata");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\Packages'\nto = '{}'\n",
+                package_root.display()
+            ),
+        )
+        .expect("mapping configuration");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = rename_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            "GoodConst",
+            false,
+            &cancel,
+        );
+        assert!(
+            computed.value.is_ok(),
+            "rename must compute: {:?}",
+            computed.value
+        );
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| record.path.as_deref() == Some(imported_metadata.as_path())),
+            "package metadata discovered during import binding must be retained in the read-set"
+        );
+        fs::write(
+            &imported_metadata,
+            "<Project><ItemGroup><DCCReference Include=\"missing.pas\" /></ItemGroup></Project>",
+        )
+        .expect("changed imported package metadata");
+        let error = revalidate_input(&workspace.analysis_input(), &computed.records, &cancel)
+            .expect_err("a package descriptor changed during binding must stale the rename");
+        assert!(
+            error.contains("changed") || error.contains("metadata"),
+            "unexpected package metadata revalidation error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_flight_references_reject_a_changed_mapped_overlay() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("project");
+        let sdk = temp.path().join("sdk");
+        let project = root.join("App.dproj");
+        let provider = root.join("Provider.pas");
+        let consumer = sdk.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(BadConst);\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("project directory");
+        fs::create_dir_all(&sdk).expect("mapped source directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("mapping configuration");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let mut workspace = test_workspace(
+            vec![root],
+            WorkspaceOptions {
+                project_file: Some(project),
+                ..WorkspaceOptions::default()
+            },
+        );
+        workspace
+            .open_document(consumer_uri.clone(), consumer_source.to_owned(), 1)
+            .expect("open mapped consumer overlay");
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = super::super::queries::references_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            false,
+            &cancel,
+        );
+        assert!(
+            computed.value.is_ok(),
+            "rename must compute: {:?}",
+            computed.value
+        );
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| record.uri == consumer_uri)
+        );
+
+        workspace
+            .change_document(
+                consumer_uri,
+                "unit Consumer;\ninterface\nuses Provider;\nimplementation\nend.\n".to_owned(),
+                2,
+            )
+            .expect("change mapped consumer overlay");
+        let error = workspace
+            .finish_computation(computed)
+            .expect_err("changed mapped overlay must stale the computed rename");
+        assert!(error.contains("stale") || error.contains("changed"));
+    }
+
+    #[test]
+    fn in_flight_edit_rejects_a_changed_native_source() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("project");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(BadConst);\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("project directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = rename_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            "GoodConst",
+            false,
+            &cancel,
+        );
+        assert!(
+            computed.value.is_ok(),
+            "rename must compute: {:?}",
+            computed.value
+        );
+        assert!(
+            computed.records.iter().any(|record| {
+                record.uri == Url::from_file_path(&consumer).expect("consumer URI")
+            })
+        );
+
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nend.\n",
+        )
+        .expect("changed native consumer");
+        let error = workspace
+            .finish_computation(computed)
+            .expect_err("changed native source must stale the computed rename");
+        assert!(error.contains("changed"));
+    }
+
+    #[test]
+    fn in_flight_edit_rejects_changed_project_metadata() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("project");
+        let project = root.join("App.dproj");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(BadConst);\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("project directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("project");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = rename_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            "GoodConst",
+            false,
+            &cancel,
+        );
+        assert!(
+            computed.value.is_ok(),
+            "rename must compute: {:?}",
+            computed.value
+        );
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| { record.path.as_deref() == Some(project.as_path()) })
+        );
+
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_Define>CHANGED</DCC_Define></PropertyGroup></Project>",
+        )
+        .expect("changed project metadata");
+        let error = workspace
+            .finish_computation(computed)
+            .expect_err("changed project metadata must stale the computed rename");
+        assert!(error.contains("changed") || error.contains("configuration"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_flight_edit_ignores_an_override_only_edit_with_captured_settings() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("project");
+        let sdk = temp.path().join("sdk");
+        let changed_sdk = temp.path().join("changed-sdk");
+        let project = root.join("App.dproj");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(BadConst);\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("project directory");
+        fs::create_dir_all(&sdk).expect("mapped source directory");
+        fs::create_dir_all(&changed_sdk).expect("replacement source directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project");
+        let overrides = root.join(".delphi-tools.local.toml");
+        fs::write(
+            &overrides,
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("mapping configuration");
+
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let mut workspace = test_workspace(
+            vec![root],
+            WorkspaceOptions {
+                project_file: Some(project),
+                ..WorkspaceOptions::default()
+            },
+        );
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = rename_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            "GoodConst",
+            false,
+            &cancel,
+        );
+        assert!(
+            computed.value.is_ok(),
+            "rename must compute: {:?}",
+            computed.value
+        );
+
+        fs::write(
+            &overrides,
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                changed_sdk.display()
+            ),
+        )
+        .expect("changed override configuration");
+        let overrides_uri = Url::from_file_path(&overrides).expect("override URI");
+        workspace.file_event(&overrides_uri, FileChange::Changed);
+        let result = workspace.finish_computation(computed);
+        assert!(
+            result.is_ok(),
+            "captured override-only edits must not stale the computed rename: {result:?}"
+        );
+    }
+
+    #[test]
     fn rename_revalidation_preserves_include_lookup_directory_stamps() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().join("fixture");
@@ -4155,7 +6695,7 @@ mod tests {
         .expect("project");
 
         let main_uri = Url::from_file_path(&main).expect("main URI");
-        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let computed = rename_from_input(
@@ -4199,7 +6739,7 @@ mod tests {
         fs::write(&main, source).expect("main source");
 
         let main_uri = Url::from_file_path(&main).expect("main URI");
-        let workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
         let input = workspace.analysis_input();
         let validation_input = input.clone();
         let cancel = AtomicBool::new(false);
@@ -4295,7 +6835,7 @@ mod tests {
         .expect("project");
 
         let main_uri = Url::from_file_path(&main).expect("main URI");
-        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let computed = rename_from_input(
@@ -4352,12 +6892,30 @@ mod tests {
         let target = std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_TARGET");
         if let Some(target) = target {
             let target = std::path::PathBuf::from(target);
+            let policy_root = target.parent().expect("FIFO target parent").to_path_buf();
+            let read_policy = ReadPolicy::new(
+                std::slice::from_ref(&policy_root),
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            );
+            let path_entry = ProjectPathEntry {
+                path: target.clone(),
+                provenance: ProjectPathProvenance::Configured,
+            };
             let cancel = AtomicBool::new(false);
             for _ in 0..100_000 {
-                let _ = read_exact_file_bytes(&target, &cancel);
-                let _ = file_content_hash(&target, &cancel);
-                let _ = super::read_scan_source(&target, &cancel);
-                let _ = read_include(&target, 16 * 1024 * 1024, None, None);
+                let _ = read_exact_file_bytes(&target, &read_policy, &path_entry, &cancel);
+                let _ = file_content_hash(&target, &read_policy, &path_entry, &cancel);
+                let _ = super::read_scan_source(&target, &read_policy, &path_entry, &cancel);
+                let _ = read_include(
+                    &target,
+                    &read_policy,
+                    &path_entry,
+                    16 * 1024 * 1024,
+                    None,
+                    None,
+                );
             }
             return;
         }
@@ -4372,7 +6930,6 @@ mod tests {
             .status()
             .expect("mkfifo command");
         assert!(status.success(), "mkfifo failed");
-
         let mut child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -4442,6 +6999,93 @@ mod tests {
     }
 
     #[test]
+    fn include_cache_does_not_share_authorized_and_unauthorized_routes() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("project");
+        let main = root.join("Main.pas");
+        let outside = temp.path().join("outside/Shared.inc");
+        fs::create_dir_all(&root).expect("project directory");
+        fs::create_dir_all(outside.parent().expect("include parent")).expect("include directory");
+        fs::write(&main, "unit Main; interface implementation end.\n").expect("main source");
+        fs::write(&outside, "{$DEFINE SAFE}\n").expect("include source");
+
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let context_key = workspace.context_for_uri(&main_uri).expect("main context");
+        let context = workspace
+            .contexts
+            .get(&context_key)
+            .expect("retained main context")
+            .context
+            .clone();
+        let sources = HashMap::new();
+        let mut contexts = HashMap::new();
+        let mut baseline = BaselineAccumulator::default();
+        let mut baseline_content_hashes = HashMap::new();
+        let mut baseline_contents = HashMap::new();
+        let candidate_names = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let mut auditor = IncludeAuditor {
+            sources: &sources,
+            loader: &mut workspace,
+            contexts: &mut contexts,
+            baseline: &mut baseline,
+            baseline_content_hashes: &mut baseline_content_hashes,
+            baseline_contents: &mut baseline_contents,
+            candidate_names: &candidate_names,
+            max_file_bytes: 1024,
+            observe_directory_stamps: false,
+            allow_incomplete_context_for: &[],
+            cancel: &cancel,
+            cache: HashMap::new(),
+            active: HashSet::new(),
+            files_read: 0,
+            bytes_read: 0,
+            directives_seen: 0,
+            stopped: false,
+            result: IncludeAuditResult::default(),
+            name_free_assistance: false,
+        };
+
+        let allowed = auditor
+            .inspect_include_file(
+                &outside,
+                IncludeInspection {
+                    context_key: &context_key,
+                    context: &context,
+                    owner_path: &main,
+                    selected_directory: Some(root.as_path()),
+                    relative: true,
+                    route: IncludeRoute::Legacy,
+                    legacy_authorized: true,
+                },
+                0,
+            )
+            .expect("authorized route");
+        assert!(allowed.safe, "the authorized route must be accepted");
+
+        let denied = auditor
+            .inspect_include_file(
+                &outside,
+                IncludeInspection {
+                    context_key: &context_key,
+                    context: &context,
+                    owner_path: &main,
+                    selected_directory: Some(root.as_path()),
+                    relative: true,
+                    route: IncludeRoute::Legacy,
+                    legacy_authorized: false,
+                },
+                0,
+            )
+            .expect("unauthorized route");
+        assert!(
+            !denied.safe,
+            "the unauthorized route must not reuse the allow result"
+        );
+    }
+
+    #[test]
     fn include_lookup_keeps_the_missing_precedence_observation() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let root = temp.path().join("root");
@@ -4487,6 +7131,45 @@ mod tests {
         let lookup = resolve_include_path(&directive, &[temp.path().to_path_buf()]);
 
         assert_eq!(lookup.selected.as_deref(), Some(include.as_path()));
+    }
+
+    #[test]
+    fn include_lookup_maps_absolute_windows_paths_with_nested_suffixes() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mapped_root = temp.path().join("sdk");
+        let include = mapped_root.join("Nested/Shared.inc");
+        fs::create_dir_all(include.parent().expect("nested include directory"))
+            .expect("nested include directory");
+        fs::write(&include, "{$DEFINE SAFE}\n").expect("mapped include");
+
+        let overrides = EffectiveOverrides {
+            path_mappings: vec![PathMapping {
+                from: "c:/sdk".to_string(),
+                to: mapped_root.clone(),
+                config_file: temp.path().join(".delphi-tools.local.toml"),
+            }],
+            ..EffectiveOverrides::default()
+        };
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: "I C:/SDK/Nested/Shared.inc".to_string(),
+            start: 0,
+            end: 0,
+        };
+        let lookup = resolve_include_path_with_overrides(
+            &directive,
+            &[temp.path().to_path_buf()],
+            &overrides,
+        );
+
+        assert_eq!(lookup.selected.as_deref(), Some(include.as_path()));
+        assert_eq!(
+            lookup.selected_route,
+            IncludeRoute::Mapped {
+                root: mapped_root.clone()
+            }
+        );
+        assert!(lookup.error.is_none());
     }
 
     #[cfg(not(windows))]
@@ -4535,8 +7218,47 @@ mod tests {
         let include = temp.path().join("Large.inc");
         fs::write(&include, "{$DEFINE SAFE}\n").expect("include");
 
-        let error = read_include(&include, 1024, Some(1), None)
+        let read_policy = ReadPolicy::new(
+            std::slice::from_ref(&temp.path().to_path_buf()),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let path_entry = ProjectPathEntry {
+            path: include.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let error = read_include(&include, &read_policy, &path_entry, 1024, Some(1), None)
             .expect_err("remaining include budget is too small");
         assert_eq!(error, super::INCLUDE_BYTE_BUDGET_ERROR);
+    }
+
+    #[test]
+    fn include_revalidation_requires_recorded_payload_authorization() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let include = temp.path().join("Shared.inc");
+        fs::write(&include, b"{$DEFINE SAFE}\n").expect("include");
+        let record = super::SourceRecord {
+            uri: Url::from_file_path(&include).expect("include URI"),
+            text: String::new(),
+            version: None,
+            stamp: None,
+            open: false,
+            path: Some(include.clone()),
+            path_stamp: None,
+            content_hash: Some(1),
+            content_bytes: None,
+            candidate_membership: None,
+            read_policy: None,
+            path_entry: None,
+            include_payload: true,
+        };
+
+        let error = read_record_content_hash(&include, &record, &AtomicBool::new(false))
+            .expect_err("unbound include records must not perform a bare revalidation read");
+        assert!(
+            error.contains("requester-scoped") || error.contains("authorization"),
+            "unexpected missing authorization error: {error}"
+        );
     }
 }

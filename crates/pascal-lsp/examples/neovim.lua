@@ -1,5 +1,8 @@
 -- Neovim 0.11+. Install pascal-lsp on PATH, or set PASCAL_LSP_BIN to its full path.
 -- Load this file from init.lua using dofile('/path/to/examples/neovim.lua').
+-- For tool-neutral Delphi path/property overrides, see ../README.md's
+-- "Delphi path overrides (LSP only)" section and configure delphi-tools files;
+-- do not add mapping fields to init_options.
 vim.filetype.add({ extension = { pas = 'pascal', dpr = 'pascal', dpk = 'pascal' } })
 local example_file = assert(debug.getinfo(1, 'S').source:match('^@(.+)$'))
 local pascal_project = dofile(vim.fn.fnamemodify(example_file, ':h') .. '/pascal_project.lua')

@@ -83,6 +83,9 @@ If several overloads/candidates remain, Neovim presents multiple locations
 rather than the server guessing based on argument types. Keep the cursor on the
 identifier, not on whitespace following it.
 
+Neovim 0.13-dev may show a quickfix list even for a singleton `gi` result; use
+`:cfirst` and choose the entry to navigate. Older clients may jump directly.
+
 For example, put the cursor on `MDIBDatabase` in `uses MDIBDatabase;` and press
 `gd` to open the unit. Put it on `TMDIBDatabase` in a type annotation, generic
 argument, or constructor receiver to jump to the class declaration. These use
@@ -142,34 +145,118 @@ project metadata context used for navigation. The server reads `.dproj`,
 `.dpr`/`.dpk`, imported `.optset` files, `DCC_UnitSearchPath`, `DCCReference`,
 `DCC_UsePackage`, `DCC_Namespace`, `DCC_UnitAlias`, and explicit unit paths in a
 project main source. It does not launch a compiler, read the Windows registry,
-automatically translate Windows paths, or resolve compiled-only DCUs. Only use
-library sources you are entitled to access.
+execute Delphi/MSBuild targets, or resolve compiled-only DCUs. Only use library
+sources you are entitled to access.
+
+### Delphi path overrides (LSP only)
+
+When a Delphi project records Windows installation paths but the corresponding
+source is installed locally on Linux, `pascal-lsp` can translate those paths
+only when you explicitly configure a mapping. In this release, **only the LSP
+consumes these files**. `lint4d` and `fmt4d` CLI project discovery do not read
+them; CLI integration is separate follow-up work.
+
+The layers below are merged in order. A missing file is an empty layer.
+
+| Layer | Location |
+| --- | --- |
+| User | `$XDG_CONFIG_HOME/delphi-tools/config.toml`, when `XDG_CONFIG_HOME` is nonempty and absolute |
+| User fallback | `$HOME/.config/delphi-tools/config.toml` otherwise, when `HOME` is nonempty and absolute |
+| Workspace | `<workspace-root>/.delphi-tools.local.toml` |
+| Project | `<project-directory>/.delphi-tools.local.toml` |
+
+Use this configuration as a starting point:
+
+```toml
+[properties]
+BDS = 'C:\Program Files\Embarcadero\RAD Studio\7.0'
+
+[[path_mappings]]
+from = 'C:\Program Files\Embarcadero\RAD Studio\7.0'
+to = '/opt/delphi/2010'
+
+[[path_mappings]]
+from = 'C:\Program Files\Embarcadero\RAD Studio\7.0\lib\Indy10'
+to = '/home/you/sources/indy10'
+```
+
+Properties and mapping prefixes are ASCII case-insensitive per key. A higher
+layer replaces the complete value for the same property or normalized Windows
+prefix; unrelated entries remain inherited. The resolver then chooses the
+longest matching Windows path prefix after that merge, at path-component
+boundaries, so the Indy mapping above wins for paths below `lib\Indy10`.
+There is no deletion/tombstone syntax: to change an inherited entry, override
+the same key or prefix in the higher layer.
+
+Configured property values are literal values used while evaluating project
+metadata; configured values containing `$(` are rejected rather than recursively
+expanded. Client `buildConfig` and `platform` take precedence over `[properties]`
+`Config` and `Platform`; those file properties in turn take precedence over
+project and option-set defaults. Values from either higher-precedence source are
+immutable evaluator inputs: project XML and imports cannot replace or taint
+them. The server evaluates supported `.optset` imports, but still ignores
+non-`.optset` imports and does not execute targets.
+Consequently, an ignored import such as
+`$(BDS)\Bin\CodeGear.Delphi.Targets` remains a warning/limitation rather than a
+way to discover a Delphi installation.
+
+Mappings apply at supported project-metadata filesystem-use boundaries; they do
+not translate arbitrary strings, unit names, source directives with new macro
+semantics, or URIs. Native absolute property values bypass Windows translation,
+but they do not grant broad filesystem access. Mapped destinations are
+context-scoped, read-only roots for the project that selected them, subject to
+the existing containment and symlink-safety checks. They are not workspace
+roots or implicit unit-search paths, and mappings do not grant edit
+authorization: existing writable-workspace authorization remains authoritative.
+An explicit formatting request for the current buffer is not newly forbidden by
+a mapping. Unmapped Windows paths on Linux remain unavailable and produce a
+diagnostic; use an explicit mapping or the existing native `sourcePaths` option.
+
+Each applicable file is captured on its first read for the LSP session: user and
+initial workspace layers are captured at startup, and a project layer when its
+candidate is first evaluated. Editing a captured override file has no effect
+until the LSP is restarted. This snapshot behavior is independent of the
+existing lint/formatter sidecar reload behavior.
+
+Malformed, unreadable, oversized, or invalid override files are errors for the
+scope that selects them, not a silent fallback. A bad user file affects all
+project-dependent contexts; a bad workspace file affects contexts using that
+longest-containing workspace; a bad project file affects projects in that
+directory. Other contexts can continue. The server reports provenance in its
+log and project-context warnings without dumping configured property values.
+
+These local machine paths commonly differ between developers. Add
+`.delphi-tools.local.toml` to your global Git ignore or the repository's local
+exclude settings if it should not be committed; the `.local` suffix alone does
+not make Git ignore it.
 
 When an imported unit is not found through explicit project mappings or the
 ordinary unit search paths, the server lazily checks only source packages named
 by the selected project's evaluated `DCC_UsePackage` property. It performs a
 bounded, deterministic filename-only catalogue lookup under configured workspace
-roots and `sourcePaths`. The catalogue matches only descriptor filename stems
-named by `DCC_UsePackage` (case-insensitively); it never opens unrelated package
-headers to infer names. The catalogue retains only matching paths plus bounded
-directory stamps, and it must complete within its fixed safety bound before a
-package can be treated as unique; an incomplete catalogue is reported rather
-than guessed. Only the selected package descriptor and its relevant `contains`
-or project-reference metadata are read after that lookup. A selected descriptor
-must still have valid package syntax, but its header name may use a legacy
-variant: the matching filename remains the package identity. A same-stem `.dpk`
-is authoritative over its `.dproj`; duplicate package descriptors are reported
-as ambiguous rather than guessed. Package `.dproj` imports, imported option-set
-files, and the package `MainSource` are tracked for cache freshness and
-invalidation. Legacy descriptor filename aliases are not inferred; add the
-library's source directory to `sourcePaths` when its units need direct lookup.
-Package sources must remain under those configured roots, and missing compiled-only
-packages are skipped with a warning only when they are relevant to a failed
-import. Package `requires` dependencies are not followed transitively. Reference
-or candidate safety limits also report an incomplete result instead of returning
-a partial unique match. This discovery is not compiler-install or Windows-
-registry auto-detection and does not add package exports to global unit search
-paths.
+roots, `sourcePaths`, and the requester project's mapped destinations. The
+catalogue matches only descriptor filename stems named by `DCC_UsePackage`
+(case-insensitively); it never opens unrelated package headers to infer names.
+The catalogue retains only matching paths plus bounded directory stamps, and it
+must complete within its fixed safety bound before a package can be treated as
+unique; an incomplete catalogue is reported rather than guessed. Only the
+selected package descriptor and its relevant `contains` or project-reference
+metadata are read after that lookup. Package evaluation inherits the requesting
+project's effective properties and mappings; it does not load a package-local
+override sidecar. A selected descriptor must still have valid package syntax,
+but its header name may use a legacy variant: the matching filename remains the
+package identity. A same-stem `.dpk` is authoritative over its `.dproj`;
+duplicate package descriptors are reported as ambiguous rather than guessed.
+Package `.dproj` imports, imported option-set files, and the package `MainSource`
+are tracked for cache freshness and invalidation. Legacy descriptor filename
+aliases are not inferred; add the library's source directory to `sourcePaths`
+when its units need direct lookup. Package sources must remain under those
+configured or requester-mapped roots, and missing compiled-only packages are
+skipped with a warning only when they are relevant to a failed import. Package
+`requires` dependencies are not followed transitively. Reference or candidate
+safety limits also report an incomplete result instead of returning a partial
+unique match. This discovery is not compiler-install or Windows-registry
+auto-detection and does not add package exports to global unit search paths.
 
 Without `projectFile`, discovery searches ancestor directories up to the
 workspace boundary for an unambiguous `.dproj`, falling back to a `.dpr` or

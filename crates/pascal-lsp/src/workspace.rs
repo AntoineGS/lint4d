@@ -3,27 +3,31 @@
 use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use crate::project::{
-    PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
-    ProjectDiscovery, ProjectOptions, ProjectReadObservation, ProjectReadStamp, ProjectSelections,
-    discover_with_selections, discover_with_selections_and_observations,
-    discover_with_selections_and_observations_with_cancel, has_invalid_project_selection,
+    MetadataObservation, PackageMetadata, ProjectCandidateMembership, ProjectCandidates,
+    ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
+    ProjectReadObservation, ProjectReadStamp, ProjectSelections, discover_with_selections,
+    discover_with_selections_and_observations_with_cancel_and_overrides,
+    discover_with_selections_and_observations_with_overrides, has_invalid_project_selection,
     project_candidate_membership, project_candidates, project_candidates_with_cancel,
-    read_package_metadata, runtime_project_selection, selected_project_is_current,
-    selected_project_is_current_with_cancel,
+    read_package_metadata_with_observations, runtime_project_selection,
+    selected_project_is_current, selected_project_is_current_with_cancel,
 };
 use crate::{NavigationIndex, NavigationTarget, text};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use lsp_types::{
     Diagnostic as LspDiagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range,
     TextEdit, Url,
+};
+use pascal_core::delphi_overrides::{
+    EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
 };
 use pascal_core::{FileInfo, Severity, decode_bytes, parser};
 use serde::Deserialize;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
+use std::fs;
 use std::hash::Hasher;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -259,11 +263,21 @@ struct CachedPackageMetadata {
     last_used: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackageMetadataKey {
+    descriptor: PathBuf,
+    overrides: EffectiveOverrides,
+    read_policy: crate::project::ReadPolicy,
+    config: Option<String>,
+    platform: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct PackageLookup {
     candidates: Vec<PathBuf>,
     metadata_paths: Vec<PathBuf>,
     observations: Vec<ProjectReadObservation>,
+    metadata_observations: Vec<MetadataObservation>,
     warnings: Vec<String>,
     complete: bool,
 }
@@ -277,6 +291,22 @@ struct ContextKey {
     selection_project: Option<PathBuf>,
     config: Option<String>,
     platform: Option<String>,
+    overrides: EffectiveOverrides,
+}
+
+/// A legacy sibling lookup is a per-document fact, not a directory grant.  A
+/// route remains usable only for the exact source that was loaded and the
+/// project context that established it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyRouteProof {
+    source: PathBuf,
+    context: ContextKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackageCatalogueKey {
+    context: ContextKey,
+    root: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -285,6 +315,41 @@ struct ContextState {
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
+}
+
+impl ContextState {
+    fn merge_observations(&mut self, retained: &Self) {
+        for (path, stamp) in &retained.watched_paths {
+            self.watched_paths
+                .entry(path.clone())
+                .or_insert_with(|| stamp.clone());
+        }
+        for (path, membership) in &retained.project_candidate_memberships {
+            self.project_candidate_memberships
+                .entry(path.clone())
+                .or_insert_with(|| membership.clone());
+        }
+        for path in &retained.context.metadata_files {
+            if !self
+                .context
+                .metadata_files
+                .iter()
+                .any(|existing| paths_equal_ci(existing, path))
+            {
+                self.context.metadata_files.push(path.clone());
+            }
+        }
+        for observation in &retained.context.metadata_observations {
+            if !self
+                .context
+                .metadata_observations
+                .iter()
+                .any(|existing| existing == observation)
+            {
+                self.context.metadata_observations.push(observation.clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +368,15 @@ pub(crate) struct KnownDocumentOwner {
     key: ContextKey,
     state: ContextState,
     origin: OwnerOrigin,
+    pub(crate) legacy_route: Option<LegacyRouteProof>,
+}
+
+impl KnownDocumentOwner {
+    pub(crate) fn has_legacy_route(&self, path: &Path) -> bool {
+        self.legacy_route.as_ref().is_some_and(|route| {
+            route.context == self.key && native_paths_equal(&route.source, path)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -322,9 +396,8 @@ impl ExcludeMatcher {
     }
 
     fn is_excluded(&self, path: &Path, source_root: &Path) -> bool {
-        if path
-            .strip_prefix(source_root)
-            .is_ok_and(|relative| relative.components().any(is_default_excluded_component))
+        if native_relative_path(path, source_root)
+            .is_some_and(|relative| relative.components().any(is_default_excluded_component))
         {
             return true;
         }
@@ -334,8 +407,8 @@ impl ExcludeMatcher {
         };
         [source_root, self.root.as_path(), self.config_root.as_path()]
             .into_iter()
-            .filter_map(|base| path.strip_prefix(base).ok())
-            .any(|relative| matches_exclude_patterns(patterns, relative))
+            .filter_map(|base| native_relative_path(path, base))
+            .any(|relative| matches_exclude_patterns(patterns, &relative))
     }
 }
 
@@ -367,7 +440,19 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<GlobSet> {
     let mut valid_pattern_count = 0;
     for pattern in patterns {
         let normalized = pattern.replace('\\', "/");
-        match Glob::new(&normalized) {
+        let glob = {
+            #[cfg(windows)]
+            {
+                globset::GlobBuilder::new(&normalized)
+                    .case_insensitive(true)
+                    .build()
+            }
+            #[cfg(not(windows))]
+            {
+                globset::Glob::new(&normalized)
+            }
+        };
+        match glob {
             Ok(glob) => {
                 builder.add(glob);
                 valid_pattern_count += 1;
@@ -456,9 +541,19 @@ impl WorkspaceRoot {
     }
 }
 
+fn production_override_session() -> (OverrideSession, Vec<String>) {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match user_config_path(xdg.as_deref(), home.as_deref()) {
+        Ok(path) => (OverrideSession::new(Some(path)), Vec::new()),
+        Err(error) => (OverrideSession::new(None), vec![error]),
+    }
+}
+
 #[derive(Default)]
 pub struct Workspace {
     options: WorkspaceOptions,
+    overrides: OverrideSession,
     roots: Vec<WorkspaceRoot>,
     index: NavigationIndex,
     open_documents: HashMap<Url, OpenDocument>,
@@ -484,9 +579,9 @@ pub struct Workspace {
     project_selections: ProjectSelections,
     directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
     filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
-    package_catalogues: HashMap<PathBuf, PackageCatalogue>,
+    package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
     package_catalogue_epoch: u64,
-    package_metadata_cache: HashMap<PathBuf, CachedPackageMetadata>,
+    package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
     warnings: Vec<String>,
     source_generation: u64,
     configuration_generation: u64,
@@ -494,15 +589,46 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Self {
+        let (overrides, warnings) = production_override_session();
+        let mut workspace = Self::with_override_session(roots, options, overrides);
+        for warning in warnings {
+            workspace.warn(warning);
+        }
+        workspace
+    }
+
+    /// Construct a workspace with an explicitly captured Delphi override
+    /// session. The supplied session is the only source of override
+    /// configuration for this workspace.
+    pub fn with_override_session(
+        roots: Vec<PathBuf>,
+        options: WorkspaceOptions,
+        overrides: OverrideSession,
+    ) -> Self {
         let roots = roots
             .into_iter()
             .map(|root| WorkspaceRoot::new(root, &options))
             .collect();
-        Self {
+        let mut workspace = Self {
             options,
+            overrides,
             roots,
             ..Self::default()
+        };
+        if let Err(error) = workspace.overrides.effective_for(None, None) {
+            workspace.warn(error);
         }
+        let initial_roots = workspace
+            .roots
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        for root in initial_roots {
+            if let Err(error) = workspace.overrides.capture_workspace(&root) {
+                workspace.warn(error);
+            }
+        }
+        workspace
     }
 
     /// Kept as a compatibility no-op for callers of the original workspace
@@ -571,14 +697,14 @@ impl Workspace {
         }
         for state in self.contexts.values() {
             for path in state.watched_paths.keys() {
-                if is_configuration_file(path) {
+                if is_live_configuration_file(path) {
                     add_configuration_watch_path(&mut paths, path.clone());
                 }
             }
         }
         for owner in self.document_owners.values() {
             for path in owner.state.watched_paths.keys() {
-                if is_configuration_file(path) {
+                if is_live_configuration_file(path) {
                     add_configuration_watch_path(&mut paths, path.clone());
                 }
             }
@@ -627,6 +753,12 @@ impl Workspace {
         if self.context_has_invalid_project_selection(&context_key) {
             self.warn(format!(
                 "project selection is invalid; navigation is unavailable for {uri}"
+            ));
+            return Vec::new();
+        }
+        if self.context_has_override_error(&context_key) {
+            self.warn(format!(
+                "project override configuration is invalid; navigation is unavailable for {uri}"
             ));
             return Vec::new();
         }
@@ -679,12 +811,25 @@ impl Workspace {
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
         if !self.open_documents.contains_key(&uri) {
-            // A disk dependency may have been indexed under another request's
-            // project context. Select the editor buffer's own context when it
-            // first becomes authoritative instead of inheriting that binding.
-            self.document_contexts.remove(&uri);
-            self.document_owners.remove(&uri);
-            self.owner_last_used.remove(&uri);
+            let preserve_mapped_owner =
+                uri.to_file_path()
+                    .ok()
+                    .map(absolute_path)
+                    .is_some_and(|path| {
+                        self.document_owners.get(&uri).is_some_and(|owner| {
+                            owner.origin == OwnerOrigin::Inherited
+                                && self.mapped_path_is_readable(&path, &owner.key)
+                        })
+                    });
+            if !preserve_mapped_owner {
+                // A legacy disk dependency may have been indexed under another
+                // request's project context. Select the editor buffer's own
+                // context when it first becomes authoritative instead of
+                // inheriting that binding.
+                self.document_contexts.remove(&uri);
+                self.document_owners.remove(&uri);
+                self.owner_last_used.remove(&uri);
+            }
         }
         let context_key = self.context_for_uri(&uri)?;
         if !self.ensure_supported_with_context(&uri, &context_key) {
@@ -924,9 +1069,14 @@ impl Workspace {
     }
 
     pub fn file_event(&mut self, uri: &Url, change: FileChange) {
-        self.bump_source_generation();
+        let override_changed = uri
+            .to_file_path()
+            .is_ok_and(|path| is_immutable_override_file(&path));
+        if !override_changed {
+            self.bump_source_generation();
+        }
         let configuration_changed = is_configuration_path(uri);
-        if configuration_changed {
+        if configuration_changed && !override_changed {
             self.bump_configuration_generation();
         }
         self.invalidate_metadata_for_uri(uri);
@@ -965,6 +1115,7 @@ impl Workspace {
     ) {
         self.bump_source_generation();
         self.bump_configuration_generation();
+        self.clear_legacy_route_proofs();
         for removed in removed {
             let removed = absolute_path(removed);
             self.roots
@@ -993,7 +1144,11 @@ impl Workspace {
         for added in added {
             let added = absolute_path(added);
             if !self.roots.iter().any(|root| root.path == added) {
-                self.roots.push(WorkspaceRoot::new(added, &self.options));
+                let root = WorkspaceRoot::new(added, &self.options);
+                if let Err(error) = self.overrides.capture_workspace(&root.path) {
+                    self.warn(error);
+                }
+                self.roots.push(root);
             }
         }
         self.contexts.clear();
@@ -1062,7 +1217,18 @@ impl Workspace {
                 "project selection is invalid; select a current project or Automatic for {uri}"
             ));
         }
-        if !self.ensure_supported_project_context(&path, &context) {
+        if let Some(error) = context.override_error.as_deref() {
+            return Err(format!(
+                "project override configuration is invalid for {uri}: {error}"
+            ));
+        }
+        let legacy_route = self.legacy_route_is_current(uri, &path, &context_key);
+        if !self.ensure_supported_project_context_with_legacy_route(
+            &path,
+            &context,
+            Some(&context_key),
+            legacy_route,
+        ) {
             return Err(format!(
                 "document is outside configured source paths: {uri}"
             ));
@@ -1076,7 +1242,27 @@ impl Workspace {
                 .clone()
                 .expect("accepted open documents retain their text")
         } else {
-            read_disk_source(&path, self.options.limits.max_file_bytes)?.text
+            let entry = context_path_entry(&context, &path)
+                .or_else(|| {
+                    legacy_route.then_some(ProjectPathEntry {
+                        path: path.clone(),
+                        provenance: ProjectPathProvenance::LegacyNative,
+                    })
+                })
+                .ok_or_else(|| format!("document is outside configured source paths: {uri}"))?;
+            let legacy_payload = matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                && (legacy_route
+                    || project_path_entry_for(&context, &path).is_some_and(|entry| {
+                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    }));
+            read_disk_source(
+                &path,
+                self.options.limits.max_file_bytes,
+                &context.read_policy,
+                &entry,
+                legacy_payload,
+            )?
+            .text
         };
         if source.len() > self.options.limits.max_file_bytes {
             return Err(self.file_too_large_message(uri, source.len()));
@@ -1269,6 +1455,43 @@ impl Workspace {
         pinned: &HashSet<Url>,
         cancel: Option<&AtomicBool>,
     ) -> Result<bool, String> {
+        self.load_source_with_legacy_sibling_with_cancel(
+            uri,
+            context_key,
+            pinned,
+            None,
+            false,
+            cancel,
+        )
+    }
+
+    #[allow(dead_code)]
+    fn load_source_with_legacy_sibling(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        legacy_sibling_directory: Option<&Path>,
+    ) -> Result<bool, String> {
+        self.load_source_with_legacy_sibling_with_cancel(
+            uri,
+            context_key,
+            pinned,
+            legacy_sibling_directory,
+            false,
+            None,
+        )
+    }
+
+    fn load_source_with_legacy_sibling_with_cancel(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        legacy_sibling_directory: Option<&Path>,
+        legacy_search_path_route: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
         check_workspace_cancel(cancel)?;
         let path = match uri.to_file_path() {
             Ok(path) => absolute_path(path),
@@ -1280,6 +1503,60 @@ impl Workspace {
         if !is_pascal_path(&path) {
             self.warn(format!(
                 "unsupported Pascal dependency path: {}",
+                path.display()
+            ));
+            return Ok(false);
+        }
+        let Some(context) = self
+            .contexts
+            .get(context_key)
+            .map(|state| state.context.clone())
+        else {
+            return Ok(false);
+        };
+        let legacy_sibling_authorized = legacy_sibling_directory.is_some_and(|directory| {
+            path.parent()
+                .is_some_and(|parent| native_paths_equal(parent, directory))
+        });
+        let legacy_route_authorized =
+            legacy_search_path_route || self.legacy_route_is_current(uri, &path, context_key);
+        let entry = match context_path_entry(&context, &path) {
+            Some(entry) => entry,
+            None if legacy_sibling_authorized || legacy_route_authorized => ProjectPathEntry {
+                path: path.clone(),
+                provenance: ProjectPathProvenance::LegacyNative,
+            },
+            None => {
+                self.warn(format!(
+                    "source path is outside the effective project read roots: {}",
+                    path.display()
+                ));
+                return Ok(false);
+            }
+        };
+        let entry_is_explicitly_restricted =
+            !matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                || project_path_entry_for(&context, &path).is_some();
+        let legacy_route_granted = (legacy_sibling_authorized || legacy_search_path_route)
+            && !entry_is_explicitly_restricted;
+        let explicit_legacy_entry = project_path_entry_for(&context, &path)
+            .is_some_and(|entry| matches!(entry.provenance, ProjectPathProvenance::LegacyNative));
+        let verified_legacy_payload =
+            matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                && (legacy_route_authorized || legacy_route_granted || explicit_legacy_entry);
+        let readable = if verified_legacy_payload {
+            context.read_policy.allows_legacy_route_entry(&entry)
+        } else {
+            self.ensure_supported_project_context_with_legacy_route(
+                &path,
+                &context,
+                Some(context_key),
+                legacy_route_authorized || legacy_route_granted || explicit_legacy_entry,
+            )
+        };
+        if !readable {
+            self.warn(format!(
+                "source path is outside the effective project read roots: {}",
                 path.display()
             ));
             return Ok(false);
@@ -1298,6 +1575,9 @@ impl Workspace {
                 check_workspace_cancel(cancel)?;
                 self.touch(uri);
                 self.set_document_context(uri, context_key)?;
+                if legacy_route_granted {
+                    self.remember_legacy_route(uri, context_key, &path);
+                }
                 return Ok(true);
             }
             return self.index_source_with_cancel(uri, source, None, context_key, pinned, cancel);
@@ -1317,17 +1597,22 @@ impl Workspace {
             self.set_document_context(uri, context_key)?;
             return Ok(true);
         }
-        let source =
-            match read_disk_source_with_cancel(&path, self.options.limits.max_file_bytes, cancel) {
-                Ok(source) => source,
-                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(error) => {
-                    self.warn(format!("skipping {}: {error}", path.display()));
-                    self.remove_indexed(uri);
-                    return Ok(false);
-                }
-            };
-        check_workspace_cancel(cancel)?;
+        let source = match read_disk_source_with_cancel(
+            &path,
+            self.options.limits.max_file_bytes,
+            &context.read_policy,
+            &entry,
+            verified_legacy_payload,
+            cancel,
+        ) {
+            Ok(source) => source,
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error) => {
+                self.warn(format!("skipping {}: {error}", path.display()));
+                self.remove_indexed(uri);
+                return Ok(false);
+            }
+        };
         let stamp = source.stamp;
         let indexed = self.index_source_with_cancel(
             uri,
@@ -1339,6 +1624,9 @@ impl Workspace {
         )?;
         if indexed {
             self.disk_stamps.insert(uri.clone(), stamp);
+            if legacy_route_granted {
+                self.remember_legacy_route(uri, context_key, &path);
+            }
         }
         Ok(indexed)
     }
@@ -1570,18 +1858,22 @@ impl Workspace {
             }
         }
         let discovered = match cancel {
-            Some(cancel) => discover_with_selections_and_observations_with_cancel(
+            Some(cancel) => discover_with_selections_and_observations_with_cancel_and_overrides(
                 &path,
                 &roots,
                 &project_options,
                 &self.project_selections,
+                &self.overrides,
+                &self.options.exclude,
                 cancel,
             ),
-            None => discover_with_selections_and_observations(
+            None => discover_with_selections_and_observations_with_overrides(
                 &path,
                 &roots,
                 &project_options,
                 &self.project_selections,
+                &self.overrides,
+                &self.options.exclude,
             ),
         };
         let discovery = match discovered {
@@ -1625,12 +1917,15 @@ impl Workspace {
         project_options: &ProjectOptions,
         cancel: Option<&AtomicBool>,
     ) -> Result<ContextKey, String> {
-        if context_state_is_fresh_with_cancel(&owner.state, cancel)? {
+        if self.context_state_is_fresh_with_open_documents(&owner.state, cancel)? {
             self.contexts.insert(owner.key.clone(), owner.state.clone());
             self.select_document_context(uri, &owner.key, owner.origin);
             return Ok(owner.key.clone());
         }
 
+        if let Some(current_owner) = self.document_owners.get_mut(uri) {
+            current_owner.legacy_route = None;
+        }
         let (key, discovery) =
             self.rediscover_known_owner(path, owner, roots, project_options, cancel)?;
         self.install_context(
@@ -1696,18 +1991,24 @@ impl Workspace {
             }
             options.project_file = Some(selected.to_path_buf());
             let context = match cancel {
-                Some(cancel) => discover_with_selections_and_observations_with_cancel(
+                Some(cancel) => {
+                    discover_with_selections_and_observations_with_cancel_and_overrides(
+                        path,
+                        roots,
+                        &options,
+                        &ProjectSelections::new(),
+                        &self.overrides,
+                        &self.options.exclude,
+                        cancel,
+                    )?
+                }
+                None => discover_with_selections_and_observations_with_overrides(
                     path,
                     roots,
                     &options,
                     &ProjectSelections::new(),
-                    cancel,
-                )?,
-                None => discover_with_selections_and_observations(
-                    path,
-                    roots,
-                    &options,
-                    &ProjectSelections::new(),
+                    &self.overrides,
+                    &self.options.exclude,
                 )?,
             };
             return Ok((
@@ -1719,18 +2020,24 @@ impl Workspace {
         if let Some(project_file) = &owner.key.project_file {
             options.project_file = Some(project_file.clone());
             let context = match cancel {
-                Some(cancel) => discover_with_selections_and_observations_with_cancel(
+                Some(cancel) => {
+                    discover_with_selections_and_observations_with_cancel_and_overrides(
+                        path,
+                        roots,
+                        &options,
+                        &ProjectSelections::new(),
+                        &self.overrides,
+                        &self.options.exclude,
+                        cancel,
+                    )?
+                }
+                None => discover_with_selections_and_observations_with_overrides(
                     path,
                     roots,
                     &options,
                     &ProjectSelections::new(),
-                    cancel,
-                )?,
-                None => discover_with_selections_and_observations(
-                    path,
-                    roots,
-                    &options,
-                    &ProjectSelections::new(),
+                    &self.overrides,
+                    &self.options.exclude,
                 )?,
             };
             return Ok((
@@ -1740,18 +2047,22 @@ impl Workspace {
         }
 
         let context = match cancel {
-            Some(cancel) => discover_with_selections_and_observations_with_cancel(
+            Some(cancel) => discover_with_selections_and_observations_with_cancel_and_overrides(
                 path,
                 roots,
                 &options,
                 &self.project_selections,
+                &self.overrides,
+                &self.options.exclude,
                 cancel,
             )?,
-            None => discover_with_selections_and_observations(
+            None => discover_with_selections_and_observations_with_overrides(
                 path,
                 roots,
                 &options,
                 &self.project_selections,
+                &self.overrides,
+                &self.options.exclude,
             )?,
         };
         Ok((
@@ -1785,7 +2096,7 @@ impl Workspace {
             if owner.origin != OwnerOrigin::Automatic
                 && self.known_owner_selection_is_current(path, owner)
             {
-                if context_state_is_fresh(&owner.state) {
+                if self.context_state_is_fresh_with_open_documents(&owner.state, None)? {
                     return Ok((owner.key.clone(), owner.state.context.clone()));
                 }
                 let discovery =
@@ -1793,8 +2104,14 @@ impl Workspace {
                 return Ok((discovery.0, discovery.1.context));
             }
         }
-        let context =
-            discover_with_selections(path, roots, project_options, &self.project_selections)?;
+        let context = discover_with_selections(
+            path,
+            roots,
+            project_options,
+            &self.project_selections,
+            &self.overrides,
+            &self.options.exclude,
+        )?;
         let key = self.context_key_for_path(path, Some(&context));
         Ok((key, context))
     }
@@ -1818,6 +2135,14 @@ impl Workspace {
         }
 
         let Some(scope) = owner.key.selection_scope.as_deref() else {
+            if let (Some(scope), Some(project_file)) = (
+                owner.key.project_scope.as_deref(),
+                owner.key.project_file.as_deref(),
+            ) {
+                if let Some(selected) = self.project_selections.get(scope) {
+                    return Ok(paths_equal_ci(selected, project_file));
+                }
+            }
             // A startup-project owner is retained until a runtime directory
             // selection becomes applicable to this document. Inherited owners
             // follow the same precedence: retain their project identity only
@@ -1861,7 +2186,16 @@ impl Workspace {
             cancel,
         )?
         else {
-            return Ok(true);
+            let Some(scope) = key.selection_scope.as_deref() else {
+                return Ok(true);
+            };
+            let Some(selected) = self.project_selections.get(scope) else {
+                return Ok(key.selection_project.is_none());
+            };
+            return Ok(key
+                .selection_project
+                .as_deref()
+                .is_some_and(|key_project| paths_equal_ci(key_project, selected)));
         };
         Ok(self.context_matches_selection(key, &scope, &selected))
     }
@@ -1896,6 +2230,12 @@ impl Workspace {
         }
     }
 
+    fn legacy_route_is_current(&self, uri: &Url, path: &Path, key: &ContextKey) -> bool {
+        self.document_owners
+            .get(uri)
+            .is_some_and(|owner| owner.key == *key && owner.has_legacy_route(path))
+    }
+
     fn remember_document_owner(&mut self, uri: &Url, key: &ContextKey) {
         let origin = self
             .document_owners
@@ -1921,6 +2261,12 @@ impl Workspace {
         let Some(state) = self.contexts.get(key).cloned() else {
             return;
         };
+        let legacy_route = self.document_owners.get(uri).and_then(|owner| {
+            (owner.key == *key)
+                .then(|| owner.legacy_route.clone())
+                .flatten()
+                .filter(|route| route.context == *key)
+        });
         self.use_clock = self.use_clock.saturating_add(1);
         self.owner_last_used.insert(uri.clone(), self.use_clock);
         self.document_owners.insert(
@@ -1929,9 +2275,28 @@ impl Workspace {
                 key: key.clone(),
                 state,
                 origin,
+                legacy_route,
             },
         );
         self.trim_document_owners();
+    }
+
+    fn remember_legacy_route(&mut self, uri: &Url, key: &ContextKey, path: &Path) {
+        let Some(owner) = self.document_owners.get_mut(uri) else {
+            return;
+        };
+        if owner.key == *key {
+            owner.legacy_route = Some(LegacyRouteProof {
+                source: absolute_path(path.to_path_buf()),
+                context: key.clone(),
+            });
+        }
+    }
+
+    fn clear_legacy_route_proofs(&mut self) {
+        for owner in self.document_owners.values_mut() {
+            owner.legacy_route = None;
+        }
     }
 
     fn refresh_known_owners_for_context(&mut self, key: &ContextKey) {
@@ -1971,6 +2336,9 @@ impl Workspace {
             selection_project: selection.map(|(_, project)| project),
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
+            overrides: context
+                .map(|context| context.overrides.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -2001,6 +2369,9 @@ impl Workspace {
             selection_project: selection.map(|(_, project)| project),
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
+            overrides: context
+                .map(|context| context.overrides.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -2237,7 +2608,44 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
     ) -> Result<bool, String> {
         self.contexts.get(key).map_or(Ok(false), |state| {
-            context_state_is_fresh_with_cancel(state, cancel)
+            self.context_state_is_fresh_with_open_documents(state, cancel)
+        })
+    }
+
+    fn context_state_is_fresh_with_open_documents(
+        &self,
+        state: &ContextState,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        let open_overlay_paths = self
+            .open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                let path = document
+                    .text
+                    .as_ref()
+                    .and_then(|_| uri.to_file_path().ok())
+                    .map(absolute_path)?;
+                (!path.exists()
+                    && context_path_entry(&state.context, &path).is_some_and(|entry| {
+                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    }))
+                .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &open_overlay_paths)
+    }
+
+    fn context_has_open_legacy_overlay(&self, state: &ContextState) -> bool {
+        self.open_documents.iter().any(|(uri, document)| {
+            document.text.is_some()
+                && uri.to_file_path().ok().is_some_and(|path| {
+                    let path = absolute_path(path);
+                    !path.exists()
+                        && context_path_entry(&state.context, &path).is_some_and(|entry| {
+                            matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                        })
+                })
         })
     }
 
@@ -2247,8 +2655,19 @@ impl Workspace {
             .is_some_and(|state| has_invalid_project_selection(&state.context))
     }
 
+    fn context_has_override_error(&self, key: &ContextKey) -> bool {
+        self.contexts
+            .get(key)
+            .is_some_and(|state| state.context.override_error.is_some())
+    }
+
     fn invalidate_context(&mut self, key: &ContextKey) {
         self.contexts.remove(key);
+        for owner in self.document_owners.values_mut() {
+            if owner.key == *key {
+                owner.legacy_route = None;
+            }
+        }
         let mut affected: HashSet<Url> = self
             .document_contexts
             .iter()
@@ -2314,31 +2733,114 @@ impl Workspace {
             return false;
         };
         let path = absolute_path(path);
-        self.contexts
-            .get(key)
-            .is_some_and(|state| self.ensure_supported_project_context(&path, &state.context))
+        self.contexts.get(key).is_some_and(|state| {
+            self.ensure_supported_project_context_with_legacy_route(
+                &path,
+                &state.context,
+                Some(key),
+                self.legacy_route_is_current(uri, &path, key),
+            )
+        })
     }
 
-    fn ensure_supported_project_context(&self, path: &Path, context: &ProjectContext) -> bool {
+    fn ensure_supported_project_context(
+        &self,
+        path: &Path,
+        context: &ProjectContext,
+        context_key: Option<&ContextKey>,
+    ) -> bool {
+        self.ensure_supported_project_context_with_legacy_route(path, context, context_key, false)
+    }
+
+    fn ensure_supported_project_context_with_legacy_route(
+        &self,
+        path: &Path,
+        context: &ProjectContext,
+        context_key: Option<&ContextKey>,
+        legacy_route: bool,
+    ) -> bool {
         if !is_pascal_path(path) {
             return false;
         }
-        if self.accepts_path(path) {
+        let Some(entry) = context_path_entry(context, path) else {
+            return legacy_route
+                && context
+                    .read_policy
+                    .allows_legacy_route_entry(&ProjectPathEntry::legacy(path.to_path_buf()));
+        };
+        let explicit_legacy = project_path_entry_for(context, path)
+            .is_some_and(|entry| matches!(entry.provenance, ProjectPathProvenance::LegacyNative));
+        if matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+            && (legacy_route || explicit_legacy)
+        {
+            return context.read_policy.allows_legacy_route_entry(&entry);
+        }
+        if !self.project_path_entry_is_readable(path, &entry, context) {
+            return false;
+        }
+        let under_workspace = self.roots.iter().any(|root| {
+            root.source_roots
+                .iter()
+                .any(|source_root| path_starts_with_native(path, source_root))
+        });
+        !under_workspace
+            || self.accepts_path(path)
+            || context_key.is_some_and(|key| {
+                matches!(entry.provenance, ProjectPathProvenance::Mapped { .. })
+                    && self.mapped_path_is_readable(path, key)
+            })
+    }
+
+    fn project_path_entry_is_readable(
+        &self,
+        path: &Path,
+        entry: &ProjectPathEntry,
+        context: &ProjectContext,
+    ) -> bool {
+        context.read_policy.allows_path(path, &entry.provenance)
+    }
+
+    fn mapped_path_is_readable(&self, path: &Path, context_key: &ContextKey) -> bool {
+        let path = absolute_path(path.to_path_buf());
+        context_key
+            .overrides
+            .read_roots()
+            .into_iter()
+            .map(|root| native_mapping_root(&root))
+            .any(|root| self.mapped_path_is_readable_under_root(&path, &root, context_key))
+    }
+
+    fn mapped_path_is_readable_under_root(
+        &self,
+        path: &Path,
+        root: &Path,
+        context_key: &ContextKey,
+    ) -> bool {
+        path_starts_with_native(path, root)
+            && !self.mapped_path_is_excluded(path, root, context_key)
+            && safe_path_under_root(path, root)
+    }
+
+    fn mapped_path_is_excluded(
+        &self,
+        path: &Path,
+        mapped_root: &Path,
+        context_key: &ContextKey,
+    ) -> bool {
+        if native_relative_path(path, mapped_root)
+            .is_some_and(|relative| relative.components().any(is_default_excluded_component))
+        {
             return true;
         }
-        context
-            .main_source
-            .as_ref()
-            .is_some_and(|main| paths_equal_ci(main, path))
-            || context
-                .explicit_units
-                .values()
-                .flatten()
-                .any(|candidate| paths_equal_ci(candidate, path))
-            || context
-                .search_paths
-                .iter()
-                .any(|root| path_starts_with_ci(path, root))
+        context_key
+            .workspace_root
+            .as_deref()
+            .and_then(|workspace_root| {
+                self.roots
+                    .iter()
+                    .find(|root| native_paths_equal(&root.path, workspace_root))
+            })
+            .is_some_and(|workspace_root| workspace_root.excludes.is_excluded(path, mapped_root))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2353,39 +2855,72 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
     ) -> Result<Option<Url>, String> {
         check_workspace_cancel(cancel)?;
-        let mut groups: Vec<Vec<PathBuf>> = Vec::new();
+        let mut groups: Vec<(Vec<PathBuf>, bool)> = Vec::new();
         if let Some(explicit) = context.explicit_units.get(lookup_name) {
-            groups.push(explicit.clone());
+            groups.push((explicit.clone(), false));
         }
 
-        let current_directory = current_uri
-            .to_file_path()
-            .ok()
-            .and_then(|path| absolute_path(path).parent().map(Path::to_path_buf));
+        let current_path = current_uri.to_file_path().ok().map(absolute_path);
+        let current_directory = current_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let legacy_current_source = current_path.as_deref().is_some_and(|path| {
+            context.main_source_entry.as_ref().is_some_and(|entry| {
+                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    && native_paths_equal(&entry.path, path)
+            }) || context
+                .explicit_unit_entries
+                .values()
+                .flatten()
+                .any(|entry| {
+                    matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                        && native_paths_equal(&entry.path, path)
+                })
+                || self.legacy_route_is_current(current_uri, path, context_key)
+        });
+        let legacy_sibling_directory = legacy_current_source
+            .then_some(current_directory.clone())
+            .flatten();
         if let Some(directory) = current_directory {
             check_workspace_cancel(cancel)?;
-            groups.extend(self.directory_unit_candidate_groups(
-                &directory,
-                lookup_name,
-                &context.unit_namespaces,
-                context_key,
-            ));
+            groups.extend(
+                self.directory_unit_candidate_groups(
+                    &directory,
+                    lookup_name,
+                    &context.unit_namespaces,
+                    context_key,
+                )
+                .into_iter()
+                .map(|paths| (paths, false)),
+            );
         }
         for directory in &context.search_paths {
             check_workspace_cancel(cancel)?;
-            groups.extend(self.directory_unit_candidate_groups(
-                directory,
-                lookup_name,
-                &context.unit_namespaces,
-                context_key,
-            ));
+            let legacy_search_path = context.search_path_entries.iter().any(|entry| {
+                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    && native_paths_equal(&entry.path, directory)
+            });
+            groups.extend(
+                self.directory_unit_candidate_groups(
+                    directory,
+                    lookup_name,
+                    &context.unit_namespaces,
+                    context_key,
+                )
+                .into_iter()
+                .map(|paths| (paths, legacy_search_path)),
+            );
         }
         if context.project_file.is_none() {
             check_workspace_cancel(cancel)?;
-            groups.push(self.filename_unit_candidates(lookup_name, context, context_key));
+            groups.push((
+                self.filename_unit_candidates(lookup_name, context, context_key),
+                false,
+            ));
         }
 
-        for candidates in groups {
+        for (candidates, legacy_search_path) in groups {
             check_workspace_cancel(cancel)?;
             let mut paths = candidates;
             let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
@@ -2406,7 +2941,19 @@ impl Workspace {
                 if candidate_uri == *current_uri {
                     continue;
                 }
-                if !self.load_source_with_cancel(&candidate_uri, context_key, pinned, cancel)? {
+                let legacy_search_path_route = legacy_search_path
+                    && context.search_path_entries.iter().any(|entry| {
+                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                            && path_starts_with_native(&path, &entry.path)
+                    });
+                if !self.load_source_with_legacy_sibling_with_cancel(
+                    &candidate_uri,
+                    context_key,
+                    pinned,
+                    legacy_sibling_directory.as_deref(),
+                    legacy_search_path_route,
+                    cancel,
+                )? {
                     continue;
                 }
                 let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
@@ -2435,9 +2982,15 @@ impl Workspace {
             }
         }
         check_workspace_cancel(cancel)?;
-        let package_lookup =
-            self.package_unit_candidates(requested_name, lookup_name, context, cancel)?;
+        let package_lookup = self.package_unit_candidates(
+            requested_name,
+            lookup_name,
+            context,
+            context_key,
+            cancel,
+        )?;
         self.retain_package_observations(context_key, package_lookup.observations.clone());
+        self.merge_metadata_observations(context_key, &package_lookup.metadata_observations);
         for path in &package_lookup.metadata_paths {
             self.watch_package_path(context_key, path);
         }
@@ -2536,6 +3089,7 @@ impl Workspace {
         requested_name: &str,
         lookup_name: &str,
         context: &ProjectContext,
+        context_key: &ContextKey,
         cancel: Option<&AtomicBool>,
     ) -> Result<PackageLookup, String> {
         check_workspace_cancel(cancel)?;
@@ -2557,8 +3111,13 @@ impl Workspace {
         let package_names = context.packages.to_vec();
         for package_name in &package_names {
             check_workspace_cancel(cancel)?;
-            let (descriptors, catalogue_complete) =
-                self.package_descriptors(&package_names, package_name, cancel)?;
+            let (descriptors, catalogue_complete) = self.package_descriptors(
+                &package_names,
+                package_name,
+                context,
+                context_key,
+                cancel,
+            )?;
             if !catalogue_complete {
                 lookup.complete = false;
                 lookup.warnings.push(format!(
@@ -2586,35 +3145,40 @@ impl Workspace {
             }
 
             let descriptor = &descriptors[0];
-            let (metadata, observations) = match self.cached_package_metadata(descriptor, cancel) {
-                Ok(metadata) => metadata,
-                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(error) => {
-                    lookup.warnings.push(format!(
-                        "source package {package_name} was skipped: {error}"
-                    ));
-                    continue;
-                }
-            };
+            let (metadata, observations) =
+                match self.cached_package_metadata(descriptor, context, cancel) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                    Err(error) => {
+                        lookup.warnings.push(format!(
+                            "source package {package_name} was skipped: {error}"
+                        ));
+                        continue;
+                    }
+                };
             merge_project_read_observations(&mut lookup.observations, observations);
             lookup.metadata_paths.push(descriptor.clone());
             lookup
                 .metadata_paths
                 .extend(metadata.metadata_files.iter().cloned());
+            lookup
+                .metadata_observations
+                .extend(metadata.metadata_observations.iter().cloned());
             let mut matched_mapping = false;
-            for (unit_name, paths) in &metadata.units {
+            for (unit_name, entries) in &metadata.unit_entries {
                 if !package_unit_name_matches(unit_name, requested_name, lookup_name, context) {
                     continue;
                 }
                 matched_mapping = true;
-                for path in paths {
-                    if !self.package_source_is_configured(path) {
+                for entry in entries {
+                    if !context.read_policy.allows_location(entry) {
                         lookup.warnings.push(format!(
                             "source package {package_name} maps {requested_name} outside configured workspace/source roots; skipped: {}",
-                            path.display()
+                            entry.path.display()
                         ));
                         continue;
                     }
+                    let path = &entry.path;
                     if !lookup
                         .metadata_paths
                         .iter()
@@ -2654,6 +3218,8 @@ impl Workspace {
         &mut self,
         requested_names: &[String],
         package_name: &str,
+        context: &ProjectContext,
+        context_key: &ContextKey,
         cancel: Option<&AtomicBool>,
     ) -> Result<(Vec<PathBuf>, bool), String> {
         check_workspace_cancel(cancel)?;
@@ -2662,13 +3228,14 @@ impl Workspace {
             .map(|name| name.to_ascii_lowercase())
             .collect();
         let key = package_name.to_ascii_lowercase();
-        let roots = self.package_catalogue_roots();
+        let roots = self.package_catalogue_roots(context, context_key);
 
         for root in &roots {
-            self.package_catalogue(root, &requested_names, cancel)?;
+            self.package_catalogue(context_key, root, &requested_names, cancel)?;
         }
         check_workspace_cancel(cancel)?;
-        let (mut descriptors, complete) = self.catalogued_package_descriptors(&roots, &key);
+        let (mut descriptors, complete) =
+            self.catalogued_package_descriptors(context_key, &roots, &key);
 
         descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
         descriptors.dedup_by(|left, right| package_paths_equal(left, right));
@@ -2677,6 +3244,7 @@ impl Workspace {
 
     fn catalogued_package_descriptors(
         &self,
+        context_key: &ContextKey,
         roots: &[PathBuf],
         package_name: &str,
     ) -> (Vec<PathBuf>, bool) {
@@ -2684,7 +3252,11 @@ impl Workspace {
         let mut complete = true;
         for root in roots {
             let root = absolute_path(root.clone());
-            let Some(catalogue) = self.package_catalogues.get(&root) else {
+            let key = PackageCatalogueKey {
+                context: context_key.clone(),
+                root,
+            };
+            let Some(catalogue) = self.package_catalogues.get(&key) else {
                 complete = false;
                 continue;
             };
@@ -2703,7 +3275,11 @@ impl Workspace {
         (descriptors, complete)
     }
 
-    fn package_catalogue_roots(&self) -> Vec<PathBuf> {
+    fn package_catalogue_roots(
+        &self,
+        context: &ProjectContext,
+        context_key: &ContextKey,
+    ) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         for workspace_root in &self.roots {
             for root in &workspace_root.source_roots {
@@ -2712,9 +3288,25 @@ impl Workspace {
                 }
             }
         }
+        for configured_root in context_key.overrides.read_roots() {
+            let configured_root = absolute_path(configured_root);
+            let root = native_mapping_root(&configured_root);
+            if fs::symlink_metadata(&root).is_err()
+                && !context_uses_mapped_root(context, &configured_root, &root)
+            {
+                continue;
+            }
+            if !roots
+                .iter()
+                .any(|existing| package_paths_equal(existing, &root))
+            {
+                roots.push(root);
+            }
+        }
         roots
     }
 
+    #[allow(dead_code)]
     fn package_source_is_configured(&self, path: &Path) -> bool {
         self.roots.iter().any(|workspace_root| {
             workspace_root
@@ -2727,11 +3319,19 @@ impl Workspace {
     fn cached_package_metadata(
         &mut self,
         path: &Path,
+        context: &ProjectContext,
         cancel: Option<&AtomicBool>,
     ) -> Result<(PackageMetadata, Vec<ProjectReadObservation>), String> {
         check_workspace_cancel(cancel)?;
+        let key = PackageMetadataKey {
+            descriptor: path.to_path_buf(),
+            overrides: context.overrides.clone(),
+            read_policy: context.read_policy.clone(),
+            config: context.config.clone(),
+            platform: context.platform.clone(),
+        };
         let stamp = path_stamp(path);
-        if let Some(cached) = self.package_metadata_cache.get(path) {
+        if let Some(cached) = self.package_metadata_cache.get(&key) {
             if cached
                 .metadata_stamps
                 .iter()
@@ -2740,7 +3340,7 @@ impl Workspace {
                 let result = cached.result.clone();
                 let observations = cached.observations.clone();
                 self.use_clock = self.use_clock.saturating_add(1);
-                if let Some(cached) = self.package_metadata_cache.get_mut(path) {
+                if let Some(cached) = self.package_metadata_cache.get_mut(&key) {
                     cached.last_used = self.use_clock;
                 }
                 check_workspace_cancel(cancel)?;
@@ -2749,7 +3349,7 @@ impl Workspace {
         }
         let previous_metadata_paths = self
             .package_metadata_cache
-            .get(path)
+            .get(&key)
             .map(|cached| {
                 cached
                     .metadata_stamps
@@ -2758,12 +3358,32 @@ impl Workspace {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![path.to_path_buf()]);
-        let read = read_package_metadata(path);
-        check_workspace_cancel(cancel)?;
-        let (result, observations) = match read {
+        let options = ProjectOptions {
+            build_config: key.config.clone(),
+            platform: key.platform.clone(),
+            ..ProjectOptions::default()
+        };
+        let entry = match context_path_entry(context, path) {
+            Some(entry) => entry,
+            None => {
+                return Err(format!(
+                    "package metadata {} is outside the effective project read roots",
+                    path.display()
+                ));
+            }
+        };
+        let package_read = read_package_metadata_with_observations(
+            path,
+            &options,
+            &key.overrides,
+            &key.read_policy,
+            &entry,
+        );
+        let (result, observations) = match package_read {
             Ok(read) => (Ok(read.metadata), read.observations),
             Err(error) => (Err(error), Vec::new()),
         };
+        check_workspace_cancel(cancel)?;
         let metadata_paths = result
             .as_ref()
             .map(|metadata| metadata.metadata_files.clone())
@@ -2786,7 +3406,7 @@ impl Workspace {
             .collect();
         self.use_clock = self.use_clock.saturating_add(1);
         self.package_metadata_cache.insert(
-            path.to_path_buf(),
+            key,
             CachedPackageMetadata {
                 metadata_stamps,
                 result: result.clone(),
@@ -2804,7 +3424,7 @@ impl Workspace {
                 .package_metadata_cache
                 .iter()
                 .min_by_key(|(_, metadata)| metadata.last_used)
-                .map(|(path, _)| path.clone())
+                .map(|(key, _)| key.clone())
             else {
                 break;
             };
@@ -2840,29 +3460,52 @@ impl Workspace {
         }
     }
 
+    fn merge_metadata_observations(
+        &mut self,
+        context_key: &ContextKey,
+        observations: &[MetadataObservation],
+    ) {
+        let Some(state) = self.contexts.get_mut(context_key) else {
+            return;
+        };
+        for observation in observations {
+            crate::project::add_metadata_observation(
+                &mut state.context.metadata_observations,
+                observation.clone(),
+            );
+        }
+    }
+
     fn package_catalogue(
         &mut self,
+        context_key: &ContextKey,
         root: &Path,
         requested_names: &HashSet<String>,
         cancel: Option<&AtomicBool>,
     ) -> Result<PackageCatalogue, String> {
         check_workspace_cancel(cancel)?;
         let root = absolute_path(root.to_path_buf());
+        let key = PackageCatalogueKey {
+            context: context_key.clone(),
+            root: root.clone(),
+        };
         let requested_names: HashSet<String> = requested_names
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
-        let fresh = self.package_catalogues.get(&root).is_some_and(|catalogue| {
-            (catalogue.validated_epoch == self.package_catalogue_epoch
-                || catalogue
-                    .directories
-                    .iter()
-                    .all(|(path, stamp)| path_stamp(path) == *stamp))
+        let fresh = self.package_catalogues.get(&key).is_some_and(|catalogue| {
+            catalogue.complete
+                && package_catalogue_directories_are_readable(&catalogue.directories)
+                && (catalogue.validated_epoch == self.package_catalogue_epoch
+                    || catalogue
+                        .directories
+                        .iter()
+                        .all(|(path, stamp)| path_stamp(path) == *stamp))
                 && requested_names.is_subset(&catalogue.requested_names)
         });
         if fresh {
             self.use_clock = self.use_clock.saturating_add(1);
-            if let Some(catalogue) = self.package_catalogues.get_mut(&root) {
+            if let Some(catalogue) = self.package_catalogues.get_mut(&key) {
                 catalogue.validated_epoch = self.package_catalogue_epoch;
                 catalogue.last_used = self.use_clock;
                 return Ok(catalogue.clone());
@@ -2870,10 +3513,10 @@ impl Workspace {
         }
 
         let mut scan_names = requested_names.clone();
-        if let Some(catalogue) = self.package_catalogues.get(&root) {
+        if let Some(catalogue) = self.package_catalogues.get(&key) {
             scan_names.extend(catalogue.requested_names.iter().cloned());
         }
-        let scan = self.scan_package_catalogue(&root, &scan_names, cancel)?;
+        let scan = self.scan_package_catalogue(context_key, &root, &scan_names, cancel)?;
 
         self.use_clock = self.use_clock.saturating_add(1);
         let catalogue = PackageCatalogue {
@@ -2884,13 +3527,14 @@ impl Workspace {
             validated_epoch: self.package_catalogue_epoch,
             last_used: self.use_clock,
         };
-        self.package_catalogues.insert(root, catalogue.clone());
+        self.package_catalogues.insert(key, catalogue.clone());
         self.trim_package_catalogues();
         Ok(catalogue)
     }
 
     fn scan_package_catalogue(
         &mut self,
+        context_key: &ContextKey,
         root: &Path,
         requested_names: &HashSet<String>,
         cancel: Option<&AtomicBool>,
@@ -2900,13 +3544,23 @@ impl Workspace {
         let excludes = self
             .roots
             .iter()
-            .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
-            .map(|workspace_root| workspace_root.excludes.clone());
+            .find(|workspace_root| {
+                context_key
+                    .workspace_root
+                    .as_deref()
+                    .is_some_and(|selected| native_paths_equal(selected, &workspace_root.path))
+            })
+            .map(|workspace_root| workspace_root.excludes.clone())
+            .unwrap_or_else(|| ExcludeMatcher::new(&root, &root, &[]));
         let mut scan = PackageCatalogueScan {
             complete: true,
             directories: vec![(root.clone(), path_stamp(&root))],
             ..PackageCatalogueScan::default()
         };
+        if fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            scan.complete = false;
+            return Ok(scan);
+        }
         let mut pending = VecDeque::from([root.clone()]);
         let mut visited = 1usize;
 
@@ -2947,9 +3601,7 @@ impl Workspace {
                     scan.complete = false;
                     continue;
                 };
-                let excluded = excludes
-                    .as_ref()
-                    .is_some_and(|matcher| matcher.is_excluded(&path, &root));
+                let excluded = excludes.is_excluded(&path, &root);
                 if file_type.is_dir() {
                     scan.directories.push((path.clone(), path_stamp(&path)));
                     if !file_type.is_symlink() && !excluded {
@@ -3022,7 +3674,7 @@ impl Workspace {
                 .package_catalogues
                 .iter()
                 .min_by_key(|(_, catalogue)| catalogue.last_used)
-                .map(|(path, _)| path.clone())
+                .map(|(key, _)| key.clone())
             else {
                 break;
             };
@@ -3298,12 +3950,15 @@ impl Workspace {
                 .cloned()
         });
         let effective_context_key = if let Some(owner) = &known_owner {
-            if context_state_is_fresh(&owner.state) {
+            if self.context_state_is_fresh_with_open_documents(&owner.state, None)? {
                 self.contexts
                     .entry(owner.key.clone())
                     .or_insert_with(|| owner.state.clone());
                 owner.key.clone()
             } else {
+                if let Some(current_owner) = self.document_owners.get_mut(uri) {
+                    current_owner.legacy_route = None;
+                }
                 let path = absolute_path(
                     uri.to_file_path()
                         .map_err(|_| format!("document context requires a file URI: {uri}"))?,
@@ -3702,10 +4357,6 @@ fn project_unit_stems(context: &ProjectContext, current_path: &Path) -> HashSet<
     stems
 }
 
-fn context_state_is_fresh(state: &ContextState) -> bool {
-    context_state_is_fresh_with_cancel(state, None).unwrap_or(false)
-}
-
 fn path_stamp_from_project_read(stamp: &ProjectReadStamp) -> PathStamp {
     PathStamp {
         bytes: stamp.bytes,
@@ -3760,8 +4411,21 @@ fn context_state_is_fresh_with_cancel(
     state: &ContextState,
     cancel: Option<&AtomicBool>,
 ) -> Result<bool, String> {
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[])
+}
+
+fn context_state_is_fresh_with_cancel_ignoring_paths(
+    state: &ContextState,
+    cancel: Option<&AtomicBool>,
+    ignored_paths: &[PathBuf],
+) -> Result<bool, String> {
     let watched_paths_are_fresh = state.watched_paths.iter().all(|(path, stamp)| {
-        if is_configuration_file(path) {
+        if ignored_paths
+            .iter()
+            .any(|ignored| package_paths_equal(ignored, path))
+        {
+            true
+        } else if is_configuration_file(path) {
             path_stamp_result(path)
                 .map(|actual| actual == *stamp)
                 .unwrap_or(false)
@@ -3892,18 +4556,46 @@ fn path_to_glob(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn read_disk_source(path: &Path, max_bytes: usize) -> Result<DiskSource, String> {
-    read_disk_source_with_cancel(path, max_bytes, None)
+fn read_disk_source(
+    path: &Path,
+    max_bytes: usize,
+    read_policy: &crate::project::ReadPolicy,
+    entry: &ProjectPathEntry,
+    allow_legacy_payload: bool,
+) -> Result<DiskSource, String> {
+    read_disk_source_with_cancel(
+        path,
+        max_bytes,
+        read_policy,
+        entry,
+        allow_legacy_payload,
+        None,
+    )
 }
 
 fn read_disk_source_with_cancel(
     path: &Path,
     max_bytes: usize,
+    read_policy: &crate::project::ReadPolicy,
+    entry: &ProjectPathEntry,
+    allow_legacy_payload: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<DiskSource, String> {
     check_workspace_cancel(cancel)?;
-    let metadata = fs::metadata(path)
+    let link_metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    let is_symlink = link_metadata.file_type().is_symlink();
+    if is_symlink && !allow_legacy_payload {
+        return Err(format!(
+            "{} is a symlink and not an authorized workspace source",
+            path.display()
+        ));
+    }
+    let metadata = if is_symlink {
+        fs::metadata(path).map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+    } else {
+        link_metadata
+    };
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
@@ -3915,26 +4607,12 @@ fn read_disk_source_with_cancel(
         ));
     }
 
-    let mut file =
-        File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        check_workspace_cancel(cancel)?;
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if bytes.len() > max_bytes {
-            return Err(format!(
-                "{} is larger than the configured per-file limit {max_bytes}",
-                path.display()
-            ));
-        }
+    let bytes = if allow_legacy_payload {
+        read_policy.read_legacy_payload_bytes(entry, max_bytes as u64)
+    } else {
+        read_policy.read_payload_bytes(entry, max_bytes as u64)
     }
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     check_workspace_cancel(cancel)?;
     let text = decode_bytes(&bytes).into_owned();
     if text.len() > max_bytes {
@@ -4056,6 +4734,84 @@ fn paths_equal_ci(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
+fn project_path_entry_for<'a>(
+    context: &'a ProjectContext,
+    path: &Path,
+) -> Option<&'a ProjectPathEntry> {
+    context
+        .main_source_entry
+        .as_ref()
+        .filter(|entry| native_paths_equal(&entry.path, path))
+        .or_else(|| {
+            context
+                .explicit_unit_entries
+                .values()
+                .flatten()
+                .find(|entry| native_paths_equal(&entry.path, path))
+        })
+}
+
+fn context_path_entry(context: &ProjectContext, path: &Path) -> Option<ProjectPathEntry> {
+    if let Some(entry) = project_path_entry_for(context, path) {
+        return Some(ProjectPathEntry {
+            path: path.to_path_buf(),
+            provenance: entry.provenance.clone(),
+        });
+    }
+    context
+        .search_path_entries
+        .iter()
+        .filter(|entry| path_starts_with_native(path, &entry.path))
+        .max_by_key(|entry| entry.path.components().count())
+        .map(|entry| ProjectPathEntry {
+            path: path.to_path_buf(),
+            provenance: entry.provenance.clone(),
+        })
+        .or_else(|| context.read_policy.entry_for_path(path))
+}
+
+fn native_mapping_root(root: &Path) -> PathBuf {
+    resolve_case_insensitive_path(root).unwrap_or_else(|| absolute_path(root.to_path_buf()))
+}
+
+fn context_uses_mapped_root(
+    context: &ProjectContext,
+    configured_root: &Path,
+    resolved_root: &Path,
+) -> bool {
+    context
+        .main_source_entry
+        .as_ref()
+        .into_iter()
+        .chain(context.search_path_entries.iter())
+        .chain(context.include_path_entries.iter())
+        .chain(context.explicit_unit_entries.values().flatten())
+        .any(|entry| match &entry.provenance {
+            ProjectPathProvenance::Mapped { root: mapped_root } => {
+                package_paths_equal(mapped_root, resolved_root)
+                    || paths_equal_ci(mapped_root, configured_root)
+            }
+            ProjectPathProvenance::Configured => {
+                path_starts_with_native(&entry.path, resolved_root)
+                    || path_starts_with_native(&entry.path, configured_root)
+                    || (!resolved_root.exists()
+                        && path_starts_with_ci(&entry.path, configured_root))
+            }
+            ProjectPathProvenance::LegacyNative => false,
+        })
+}
+
+fn package_catalogue_directories_are_readable(
+    directories: &[(PathBuf, Option<PathStamp>)],
+) -> bool {
+    directories.iter().all(|(path, stamp)| {
+        !stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.is_dir && !stamp.is_symlink)
+            || fs::read_dir(path).is_ok()
+    })
+}
+
 fn relative_path(base: &Path, path: &Path) -> Option<PathBuf> {
     let base_components = base.components().collect::<Vec<_>>();
     let path_components = path.components().collect::<Vec<_>>();
@@ -4115,6 +4871,94 @@ fn path_starts_with_ci(path: &Path, root: &Path) -> bool {
             })
 }
 
+fn path_starts_with_native(path: &Path, root: &Path) -> bool {
+    let path_components = path.components().collect::<Vec<_>>();
+    let root_components = root.components().collect::<Vec<_>>();
+    path_components.len() >= root_components.len()
+        && path_components
+            .iter()
+            .zip(root_components.iter())
+            .all(|(path, root)| native_components_equal(*path, *root))
+}
+
+fn native_relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
+    let path_components = path.components().collect::<Vec<_>>();
+    let root_components = root.components().collect::<Vec<_>>();
+    if path_components.len() < root_components.len()
+        || !path_components
+            .iter()
+            .zip(root_components.iter())
+            .all(|(path, root)| native_components_equal(*path, *root))
+    {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in path_components.into_iter().skip(root_components.len()) {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
+fn native_paths_equal(left: &Path, right: &Path) -> bool {
+    let left_components = left.components().collect::<Vec<_>>();
+    let right_components = right.components().collect::<Vec<_>>();
+    left_components.len() == right_components.len()
+        && left_components
+            .iter()
+            .zip(right_components.iter())
+            .all(|(left, right)| native_components_equal(*left, *right))
+}
+
+fn native_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left.as_os_str() == right.as_os_str()
+    }
+}
+
+fn safe_path_under_root(path: &Path, root: &Path) -> bool {
+    let Some(canonical_root) = fs::canonicalize(root).ok() else {
+        return false;
+    };
+    let Some(canonical_path) = canonical_source_path(path) else {
+        return false;
+    };
+    path_starts_with_native(&canonical_path, &canonical_root) && !has_symlink_component(path, root)
+}
+
+fn canonical_source_path(path: &Path) -> Option<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path).ok();
+    }
+    let parent = path.parent()?;
+    let canonical_parent = fs::canonicalize(parent).ok()?;
+    Some(canonical_parent.join(path.file_name()?))
+}
+
+fn has_symlink_component(path: &Path, root: &Path) -> bool {
+    if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return true;
+    }
+    let Some(relative) = native_relative_path(path, root) else {
+        return true;
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
 fn resolve_case_insensitive_path(path: &Path) -> Option<PathBuf> {
     let absolute = absolute_path(path.to_path_buf());
     let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
@@ -4134,6 +4978,13 @@ fn resolve_case_insensitive_path(path: &Path) -> Option<PathBuf> {
                     .then_some(entry.path())
             })
             .collect::<Vec<_>>();
+        if let Some(exact) = matches
+            .iter()
+            .find(|candidate| candidate.file_name().is_some_and(|name| name == component))
+        {
+            current = exact.clone();
+            continue;
+        }
         if matches.len() != 1 {
             return None;
         }
@@ -4216,26 +5067,35 @@ fn package_unit_name_matches(
 }
 
 fn is_default_excluded_component(component: Component<'_>) -> bool {
-    matches!(
-        component,
-        Component::Normal(name)
-            if matches!(
-                name.to_str(),
-                Some(
-                    ".git"
-                        | ".worktrees"
-                        | ".hg"
-                        | ".svn"
-                        | ".idea"
-                        | ".vscode"
-                        | "target"
-                        | "node_modules"
-                        | "dist"
-                        | "build"
-                        | "coverage"
-                )
-            )
-    )
+    let Component::Normal(name) = component else {
+        return false;
+    };
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    const DEFAULT_EXCLUDED_COMPONENTS: &[&str] = &[
+        ".git",
+        ".worktrees",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vscode",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "coverage",
+    ];
+    #[cfg(windows)]
+    {
+        DEFAULT_EXCLUDED_COMPONENTS
+            .iter()
+            .any(|excluded| name.eq_ignore_ascii_case(excluded))
+    }
+    #[cfg(not(windows))]
+    {
+        DEFAULT_EXCLUDED_COMPONENTS.contains(&name)
+    }
 }
 
 fn is_pascal_path(path: &Path) -> bool {
@@ -4257,7 +5117,7 @@ fn is_configuration_path(uri: &Url) -> bool {
     let Ok(path) = uri.to_file_path() else {
         return false;
     };
-    is_configuration_file(&path)
+    is_live_configuration_file(&path)
         || path.extension().is_some_and(|extension| {
             matches!(
                 extension.to_string_lossy().to_ascii_lowercase().as_str(),
@@ -4267,6 +5127,10 @@ fn is_configuration_path(uri: &Url) -> bool {
 }
 
 pub(crate) fn is_configuration_file(path: &Path) -> bool {
+    is_live_configuration_file(path) || is_immutable_override_file(path)
+}
+
+fn is_live_configuration_file(path: &Path) -> bool {
     path.file_name().is_some_and(|name| {
         CONFIGURATION_FILENAMES
             .iter()
@@ -4274,17 +5138,205 @@ pub(crate) fn is_configuration_file(path: &Path) -> bool {
     })
 }
 
+fn is_immutable_override_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case(LOCAL_CONFIG_NAME)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextState, DiagnosticLineIndex, ResourceLimits, Workspace, WorkspaceOptions,
-        context_state_is_fresh, normalize_line_endings, scan_external_units,
+        ContextState, DiagnosticLineIndex, FileChange, ResourceLimits, Workspace, WorkspaceOptions,
+        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
-    use crate::project::ProjectContext;
-    use lsp_types::Url;
+    use crate::NavigationTarget;
+    use crate::project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance};
+    use lsp_types::{Position, Url};
+    use pascal_core::delphi_overrides::{
+        EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
+    };
     use std::collections::HashSet;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
+
+    fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
+        Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn legacy_route_proof_requires_the_exact_source_and_owner_context() {
+        let source = PathBuf::from("/external/Helper.pas");
+        let key = super::ContextKey {
+            project_file: Some(PathBuf::from("/workspace/A.dproj")),
+            workspace_root: Some(PathBuf::from("/workspace")),
+            project_scope: Some(PathBuf::from("/workspace")),
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut owner = super::KnownDocumentOwner {
+            key: key.clone(),
+            state: ContextState::default(),
+            origin: super::OwnerOrigin::Inherited,
+            legacy_route: Some(super::LegacyRouteProof {
+                source: source.clone(),
+                context: key.clone(),
+            }),
+        };
+
+        assert!(owner.has_legacy_route(&source));
+        assert!(!owner.has_legacy_route(&PathBuf::from("/external/Other.pas")));
+
+        owner.key.project_file = Some(PathBuf::from("/workspace/B.dproj"));
+        assert!(!owner.has_legacy_route(&source));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_route_proof_uses_native_case_sensitive_source_comparison() {
+        let source = PathBuf::from("/external/Helper.pas");
+        let key = super::ContextKey {
+            project_file: Some(PathBuf::from("/workspace/App.dproj")),
+            workspace_root: Some(PathBuf::from("/workspace")),
+            project_scope: Some(PathBuf::from("/workspace")),
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let owner = super::KnownDocumentOwner {
+            key: key.clone(),
+            state: ContextState::default(),
+            origin: super::OwnerOrigin::Inherited,
+            legacy_route: Some(super::LegacyRouteProof {
+                source,
+                context: key,
+            }),
+        };
+
+        assert!(!owner.has_legacy_route(Path::new("/external/helper.pas")));
+    }
+
+    #[cfg(unix)]
+    fn mapped_package_fixture(temp_root: &Path, mapped_root: &Path) -> (Workspace, Url) {
+        let workspace_root = temp_root.join("workspace");
+        let main = workspace_root.join("Main.pas");
+        let package = workspace_root.join("packages/Shared.dpk");
+        let provider = workspace_root.join("packages/src/SharedUnit.pas");
+        fs::create_dir_all(provider.parent().expect("package source directory"))
+            .expect("package source directory");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
+        )
+        .expect("package provider");
+        fs::write(
+            &package,
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("package descriptor");
+        fs::write(
+            workspace_root.join("App.dproj"),
+            r#"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\MappedSdk</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>"#,
+        )
+        .expect("project descriptor");
+        fs::write(
+            workspace_root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\MappedSdk'\nto = '{}'\n",
+                mapped_root.display()
+            ),
+        )
+        .expect("override configuration");
+
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        (
+            test_workspace(vec![workspace_root], WorkspaceOptions::default()),
+            main_uri,
+        )
+    }
+
+    #[cfg(unix)]
+    fn configured_native_package_fixture(
+        temp_root: &Path,
+        configured_root: &Path,
+        mapped_root: &Path,
+    ) -> (Workspace, Url) {
+        let workspace_root = temp_root.join("workspace");
+        let main = workspace_root.join("Main.pas");
+        let package = workspace_root.join("packages/Shared.dpk");
+        let provider = workspace_root.join("packages/src/SharedUnit.pas");
+        fs::create_dir_all(provider.parent().expect("package source directory"))
+            .expect("package source directory");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
+        )
+        .expect("package provider");
+        fs::write(
+            &package,
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("package descriptor");
+        fs::write(
+            workspace_root.join("App.dproj"),
+            r#"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>$(SDK)</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>"#,
+        )
+        .expect("project descriptor");
+        fs::write(
+            workspace_root.join(".delphi-tools.local.toml"),
+            format!(
+                "[properties]\nSDK = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                configured_root.display(),
+                mapped_root.display()
+            ),
+        )
+        .expect("override configuration");
+
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        (
+            test_workspace(vec![workspace_root], WorkspaceOptions::default()),
+            main_uri,
+        )
+    }
+
+    #[cfg(unix)]
+    struct PermissionsRestore {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    #[cfg(unix)]
+    impl Drop for PermissionsRestore {
+        fn drop(&mut self) {
+            if let Ok(mut permissions) =
+                fs::metadata(&self.path).map(|metadata| metadata.permissions())
+            {
+                permissions.set_mode(self.mode);
+                let _ = fs::set_permissions(&self.path, permissions);
+            }
+        }
+    }
 
     #[test]
     fn diagnostic_line_index_reuses_utf16_prefixes_for_unicode_and_bare_cr() {
@@ -4316,10 +5368,226 @@ mod tests {
 
     #[test]
     fn formatting_edit_keeps_the_read_only_workspace_api() {
-        let workspace = super::Workspace::new(Vec::new(), Default::default());
+        let workspace = test_workspace(Vec::new(), Default::default());
         let uri = Url::parse("file:///tmp/Main.pas").expect("file URI");
 
         let _ = workspace.formatting_edit(&uri);
+    }
+
+    #[test]
+    fn immutable_overrides_are_not_live_configuration_watchers() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        fs::create_dir_all(&root).expect("workspace directory");
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
+
+        let paths = workspace.configuration_watch_paths();
+        assert!(paths.contains(&root.join(".lint4d.toml")));
+        assert!(paths.contains(&root.join(".fmt4d.toml")));
+        assert!(!paths.contains(&root.join(LOCAL_CONFIG_NAME)));
+
+        let override_uri = Url::from_file_path(root.join(LOCAL_CONFIG_NAME)).expect("override URI");
+        let source_generation = workspace.source_generation();
+        let configuration_generation = workspace.configuration_generation();
+        workspace.file_event(&override_uri, FileChange::Changed);
+        assert_eq!(workspace.source_generation(), source_generation);
+        assert_eq!(
+            workspace.configuration_generation(),
+            configuration_generation
+        );
+
+        let live_uri = Url::from_file_path(root.join(".lint4d.toml")).expect("lint URI");
+        workspace.file_event(&live_uri, FileChange::Changed);
+        assert_ne!(workspace.source_generation(), source_generation);
+        assert_ne!(
+            workspace.configuration_generation(),
+            configuration_generation
+        );
+    }
+
+    #[test]
+    fn malformed_user_override_is_retained_before_project_context_request() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let source = root.join("Main.pas");
+        let user_config = temp.path().join("user.toml");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
+        fs::write(&user_config, "[properties\ninvalid = 'user'\n").expect("user config");
+
+        let session = OverrideSession::new(Some(user_config.clone()));
+        let mut workspace =
+            Workspace::with_override_session(vec![root], Default::default(), session);
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains(&user_config.display().to_string())),
+            "user override error was not retained at construction: {:?}",
+            workspace.warnings()
+        );
+
+        let uri = Url::from_file_path(source).expect("source URI");
+        let context = workspace
+            .project_context(&uri)
+            .expect("malformed user override must remain inspectable in project context");
+        assert!(
+            context
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&user_config.display().to_string())),
+            "project context lost malformed user override provenance: {:?}",
+            context.warnings
+        );
+    }
+
+    #[test]
+    fn malformed_override_blocks_navigation_after_context_retention() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let consumer = root.join("Consumer.pas");
+        let provider = root.join("Provider.pas");
+        let user_config = temp.path().join("user.toml");
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n",
+        )
+        .expect("provider source");
+        fs::write(&user_config, "[properties\ninvalid = 'user'\n").expect("user config");
+
+        let session = OverrideSession::new(Some(user_config.clone()));
+        let mut workspace =
+            Workspace::with_override_session(vec![root], Default::default(), session);
+        let uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let locations = workspace.navigate(&uri, Position::new(7, 2), NavigationTarget::Definition);
+
+        assert!(
+            locations.is_empty(),
+            "navigation claimed a result with invalid override configuration: {locations:?}"
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains(&user_config.display().to_string())),
+            "navigation did not retain override provenance: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[test]
+    fn malformed_override_blocks_formatting_after_context_retention() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let source = root.join("Main.pas");
+        let user_config = temp.path().join("user.toml");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(
+            &source,
+            "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nLog(1);\nend;\nend.\n",
+        )
+        .expect("source");
+        fs::write(root.join(".fmt4d.toml"), "[format]\nindent_size = 2\n")
+            .expect("formatter configuration");
+        fs::write(&user_config, "[properties\ninvalid = 'user'\n").expect("user config");
+
+        let session = OverrideSession::new(Some(user_config.clone()));
+        let workspace = Workspace::with_override_session(vec![root], Default::default(), session);
+        let uri = Url::from_file_path(&source).expect("source URI");
+        let error = workspace
+            .formatting_edit(&uri)
+            .expect_err("formatting must fail closed for invalid override configuration");
+
+        assert!(
+            error.contains(&user_config.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn malformed_override_blocks_rename_after_context_retention() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let consumer = root.join("Consumer.pas");
+        let provider = root.join("Provider.pas");
+        let user_config = temp.path().join("user.toml");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nuses Provider;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n",
+        )
+        .expect("consumer source");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n",
+        )
+        .expect("provider source");
+        fs::write(&user_config, "[properties\ninvalid = 'user'\n").expect("user config");
+
+        let session = OverrideSession::new(Some(user_config.clone()));
+        let mut workspace =
+            Workspace::with_override_session(vec![root], Default::default(), session);
+        let uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let error = workspace
+            .rename_edits(&uri, Position::new(7, 2), "Renamed", false)
+            .expect_err("rename must fail closed for invalid override configuration");
+
+        assert!(
+            error.contains("project override configuration is invalid")
+                && error.contains(&user_config.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn workspace_folder_readdition_keeps_captured_override_settings() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let source = root.join("Main.pas");
+        let config = root.join(".delphi-tools.local.toml");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
+        fs::write(&config, "[properties]\nBDS = 'first'\n").expect("initial override");
+
+        let mut workspace = test_workspace(Vec::new(), Default::default());
+        workspace.update_workspace_folders([root.clone()], []);
+        let uri = Url::from_file_path(&source).expect("source URI");
+        let first_key = workspace
+            .context_for_uri(&uri)
+            .expect("initial project context");
+        let first = &workspace
+            .contexts
+            .get(&first_key)
+            .expect("initial context state")
+            .context;
+        assert!(
+            first
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains(&config.display().to_string())),
+            "initial override configuration failed: {:?}",
+            first.warnings
+        );
+
+        workspace.update_workspace_folders([], [root.clone()]);
+        fs::write(&config, "[properties]\nBDS = 'second'\n").expect("replacement override");
+        workspace.update_workspace_folders([root], []);
+
+        let second_key = workspace
+            .context_for_uri(&uri)
+            .expect("re-added project context");
+        let second = &workspace
+            .contexts
+            .get(&second_key)
+            .expect("re-added context state")
+            .context;
+        assert_eq!(
+            second.overrides.properties.get("bds").map(String::as_str),
+            Some("first")
+        );
     }
 
     #[test]
@@ -4332,7 +5600,7 @@ mod tests {
         );
 
         assert!(
-            !context_state_is_fresh(&state),
+            !context_state_is_fresh_with_cancel(&state, None).expect("freshness check"),
             "repeated candidate-enumeration errors must not prove freshness"
         );
     }
@@ -4383,7 +5651,7 @@ mod tests {
         fs::write(&source, "unit External; interface implementation end.\n")
             .expect("external source");
 
-        let mut workspace = Workspace::new(
+        let mut workspace = test_workspace(
             vec![root],
             WorkspaceOptions {
                 source_paths: vec![external.to_string_lossy().into_owned()],
@@ -4434,7 +5702,7 @@ mod tests {
         fs::create_dir_all(&source_dir).expect("source directory");
         fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
 
-        let mut workspace = Workspace::new(
+        let mut workspace = test_workspace(
             vec![root.clone()],
             WorkspaceOptions {
                 source_paths: vec![source_dir.to_string_lossy().into_owned()],
@@ -4591,7 +5859,7 @@ mod tests {
         fs::write(&upper, "upper\n").expect("upper metadata");
         fs::write(&lower, "lower\n").expect("lower metadata");
 
-        let mut workspace = super::Workspace::new(vec![root.clone()], Default::default());
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
         let key = super::ContextKey {
             project_file: None,
             workspace_root: Some(root),
@@ -4600,6 +5868,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            overrides: EffectiveOverrides::default(),
         };
         let context = ProjectContext {
             metadata_files: vec![upper.clone(), lower.clone()],
@@ -4623,5 +5892,949 @@ mod tests {
             .watched_paths;
         assert!(watched_paths.contains_key(&upper));
         assert!(watched_paths.contains_key(&lower));
+    }
+
+    #[test]
+    fn delphi_overrides_package_keys_include_effective_inputs() {
+        let base = super::PackageMetadataKey {
+            descriptor: std::path::PathBuf::from("/packages/Shared.dproj"),
+            overrides: EffectiveOverrides::default(),
+            read_policy: crate::project::ReadPolicy::default(),
+            config: Some("Debug".into()),
+            platform: Some("Win32".into()),
+        };
+        let mut other = base.clone();
+        other
+            .overrides
+            .properties
+            .insert("bds".into(), r"D:\SDK".into());
+        assert_ne!(base, other);
+        other = base.clone();
+        other.platform = Some("Win64".into());
+        assert_ne!(base, other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_package_catalogue_rejects_a_symlinked_destination_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join("sdk");
+        let mapped_root = temp.path().join("mapped-sdk");
+        fs::create_dir(&target).expect("target directory");
+        fs::write(target.join("Shared.dpk"), "package Shared; end.\n").expect("package descriptor");
+        symlink(&target, &mapped_root).expect("mapped symlink");
+
+        let mut workspace = test_workspace(Vec::new(), WorkspaceOptions::default());
+        let key = super::ContextKey {
+            project_file: None,
+            workspace_root: None,
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides {
+                path_mappings: vec![PathMapping {
+                    from: "c:/sdk".to_owned(),
+                    to: mapped_root.clone(),
+                    config_file: temp.path().join("overrides.toml"),
+                }],
+                ..EffectiveOverrides::default()
+            },
+        };
+        let requested_names = HashSet::from(["shared".to_owned()]);
+        let catalogue = workspace
+            .package_catalogue(&key, &mapped_root, &requested_names, None)
+            .expect("package catalogue");
+
+        assert!(!catalogue.complete, "symlinked roots must be incomplete");
+        assert!(
+            catalogue.entries.is_empty(),
+            "symlinked roots must not be scanned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relevant_missing_mapped_package_root_keeps_package_lookup_incomplete() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let workspace_root = temp.path().join("workspace");
+        let main = workspace_root.join("Main.pas");
+        let package = workspace_root.join("packages/Shared.dpk");
+        let provider = workspace_root.join("packages/src/SharedUnit.pas");
+        let missing_root = temp.path().join("missing-sdk");
+        fs::create_dir_all(provider.parent().expect("package source directory"))
+            .expect("package source directory");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
+        )
+        .expect("package provider");
+        fs::write(
+            &package,
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("package descriptor");
+        fs::write(
+            workspace_root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\MissingSdk</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>",
+        )
+        .expect("project descriptor");
+        fs::write(
+            workspace_root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\MissingSdk'\nto = '{}'\n",
+                missing_root.display()
+            ),
+        )
+        .expect("override configuration");
+
+        let mut workspace = test_workspace(vec![workspace_root], WorkspaceOptions::default());
+        let locations = workspace.navigate(
+            &Url::from_file_path(&main).expect("main URI"),
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert!(
+            locations.is_empty(),
+            "missing mapped package root must not permit a unique package result: {locations:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "missing mapped package root did not produce an actionable incomplete warning: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relevant_missing_configured_native_package_root_keeps_package_lookup_incomplete() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let missing_root = temp.path().join("missing-sdk");
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &missing_root, &missing_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert!(
+            locations.is_empty(),
+            "missing configured native package root must not permit a unique package result: {locations:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "missing configured native package root did not produce an actionable incomplete warning: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_readable_configured_native_package_root_preserves_a_unique_package_result() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let configured_root = temp.path().join("empty-sdk");
+        fs::create_dir(&configured_root).expect("empty configured native root");
+
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            locations[0].uri,
+            Url::from_file_path(temp.path().join("workspace/packages/src/SharedUnit.pas"))
+                .expect("provider URI")
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .all(|warning| !warning.contains("bounded source catalogue")),
+            "empty readable configured native root made the catalogue incomplete: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_configured_native_package_root_revalidates_after_create_delete_and_restore() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let configured_root = temp.path().join("restored-sdk");
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
+
+        let initially_missing = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(initially_missing.is_empty());
+
+        fs::create_dir(&configured_root).expect("create configured native root");
+        let created = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(created.len(), 1);
+
+        fs::remove_dir(&configured_root).expect("remove configured native root");
+        let deleted = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            deleted.is_empty(),
+            "deleted configured native root reused a stale complete catalogue: {deleted:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "deleted configured native root did not remain incomplete: {:?}",
+            workspace.warnings()
+        );
+
+        fs::create_dir(&configured_root).expect("restore configured native root");
+        let restored = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "restored empty configured native root should resolve only the unique workspace package: {restored:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_adjusted_configured_native_package_root_stays_incomplete_after_deletion() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let actual_root = temp.path().join("SDK");
+        let configured_root = temp.path().join("sdk");
+        fs::create_dir(&actual_root).expect("case-adjusted configured native root");
+
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
+        let initial = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            initial.len(),
+            1,
+            "case-adjusted readable root should preserve the unique package: {initial:?}"
+        );
+
+        fs::remove_dir(&actual_root).expect("delete case-adjusted configured native root");
+        let missing = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            missing.is_empty(),
+            "deleted case-adjusted root must not reveal a unique workspace package: {missing:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "deleted case-adjusted configured root did not remain incomplete: {:?}",
+            workspace.warnings()
+        );
+
+        fs::create_dir(&actual_root).expect("restore case-adjusted configured native root");
+        workspace.warnings.clear();
+        let restored = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "restored case-adjusted root should resolve the unique workspace package: {restored:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_prefix_similar_mapping_does_not_grant_a_configured_native_root() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mapped_root = temp.path().join("missing-sdk");
+        let configured_root = temp.path().join("missing-sdk-extra");
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &configured_root, &mapped_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert_eq!(
+            locations.len(),
+            1,
+            "prefix-similar unrelated mapping must not make the package catalogue incomplete: {locations:?}"
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .all(|warning| !warning.contains("bounded source catalogue")),
+            "unrelated missing mapping incorrectly granted the configured root: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_native_entries_use_component_containment_for_nested_files() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let configured_root = temp.path().join("missing-sdk");
+        let nested_file = configured_root.join("nested/Provider.pas");
+        let sibling = temp.path().join("missing-sdk-extra/Provider.pas");
+        let context = ProjectContext {
+            search_path_entries: vec![ProjectPathEntry {
+                path: nested_file,
+                provenance: ProjectPathProvenance::Configured,
+            }],
+            ..ProjectContext::default()
+        };
+
+        assert!(super::context_uses_mapped_root(
+            &context,
+            &configured_root,
+            &configured_root
+        ));
+        let unrelated = ProjectContext {
+            search_path_entries: vec![ProjectPathEntry {
+                path: sibling,
+                provenance: ProjectPathProvenance::Configured,
+            }],
+            ..ProjectContext::default()
+        };
+        assert!(!super::context_uses_mapped_root(
+            &unrelated,
+            &configured_root,
+            &configured_root
+        ));
+
+        let existing_root = temp.path().join("mapped-sdk");
+        let case_distinct_root = temp.path().join("MAPPED-SDK");
+        fs::create_dir(&existing_root).expect("existing mapped destination");
+        let case_distinct = ProjectContext {
+            search_path_entries: vec![ProjectPathEntry {
+                path: case_distinct_root.join("Provider.pas"),
+                provenance: ProjectPathProvenance::Configured,
+            }],
+            ..ProjectContext::default()
+        };
+        assert!(!super::context_uses_mapped_root(
+            &case_distinct,
+            &existing_root,
+            &existing_root
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_directory_and_inaccessible_mapped_package_roots_keep_lookup_incomplete() {
+        for kind in ["non-directory", "inaccessible"] {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let mapped_root = temp.path().join(kind);
+            let inaccessible = kind == "inaccessible";
+            if inaccessible {
+                fs::create_dir(&mapped_root).expect("inaccessible mapped root");
+                let original_mode = fs::metadata(&mapped_root)
+                    .expect("inaccessible mapped root metadata")
+                    .permissions()
+                    .mode();
+                let _restore = PermissionsRestore {
+                    path: mapped_root.clone(),
+                    mode: original_mode,
+                };
+                let mut permissions = fs::metadata(&mapped_root)
+                    .expect("inaccessible mapped root metadata")
+                    .permissions();
+                permissions.set_mode(0o0);
+                fs::set_permissions(&mapped_root, permissions)
+                    .expect("remove mapped root permissions");
+                if fs::read_dir(&mapped_root).is_ok() {
+                    eprintln!(
+                        "skipping inaccessible mapped-root case: runner can read mode-000 directory"
+                    );
+                    continue;
+                }
+                assert!(
+                    fs::read_dir(&mapped_root).is_err(),
+                    "permission-revocation fixture must fail read_dir before testing the case"
+                );
+
+                let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
+                let locations = workspace.navigate(
+                    &main_uri,
+                    Position::new(6, 2),
+                    NavigationTarget::Declaration,
+                );
+                let warnings = workspace.warnings().to_vec();
+
+                assert!(
+                    locations.is_empty(),
+                    "{kind} mapped package root must not permit a unique result: {locations:?}"
+                );
+                assert!(
+                    warnings.iter().any(|warning| {
+                        warning.contains("package shared")
+                            && warning.contains("bounded source catalogue")
+                            && warning.contains("incomplete")
+                    }),
+                    "{kind} mapped package root did not produce an actionable incomplete warning: {warnings:?}"
+                );
+            } else {
+                fs::write(&mapped_root, "not a directory").expect("non-directory mapped root");
+                let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
+                let locations = workspace.navigate(
+                    &main_uri,
+                    Position::new(6, 2),
+                    NavigationTarget::Declaration,
+                );
+                let warnings = workspace.warnings().to_vec();
+
+                assert!(
+                    locations.is_empty(),
+                    "{kind} mapped package root must not permit a unique result: {locations:?}"
+                );
+                assert!(
+                    warnings.iter().any(|warning| {
+                        warning.contains("package shared")
+                            && warning.contains("bounded source catalogue")
+                            && warning.contains("incomplete")
+                    }),
+                    "{kind} mapped package root did not produce an actionable incomplete warning: {warnings:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_readable_mapped_package_root_preserves_a_unique_package_result() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mapped_root = temp.path().join("empty-sdk");
+        fs::create_dir(&mapped_root).expect("empty mapped root");
+
+        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            locations[0].uri,
+            Url::from_file_path(temp.path().join("workspace/packages/src/SharedUnit.pas"))
+                .expect("provider URI")
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .all(|warning| !warning.contains("bounded source catalogue")),
+            "empty readable mapped root made the catalogue incomplete: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_adjusted_mapped_package_root_contributes_duplicate_descriptors() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let actual_root = temp.path().join("SDK");
+        fs::create_dir_all(actual_root.join("src")).expect("case-adjusted mapped root");
+        fs::write(
+            actual_root.join("Shared.dpk"),
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("duplicate package descriptor");
+        fs::write(
+            actual_root.join("src/SharedUnit.pas"),
+            "unit SharedUnit; interface implementation end.\n",
+        )
+        .expect("duplicate package source");
+
+        let configured_root = temp.path().join("sdk");
+        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &configured_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert!(
+            locations.is_empty(),
+            "case-adjusted duplicate descriptor must not produce a unique result: {locations:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("ambiguous package shared")
+                    && warning.contains(&actual_root.join("Shared.dpk").display().to_string())
+            }),
+            "case-adjusted duplicate descriptor did not produce an ambiguity warning: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_adjusted_mapped_package_root_stays_incomplete_after_deletion() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let actual_root = temp.path().join("SDK");
+        fs::create_dir_all(actual_root.join("src")).expect("case-adjusted mapped root");
+        fs::write(
+            actual_root.join("Shared.dpk"),
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("duplicate package descriptor");
+        fs::write(
+            actual_root.join("src/SharedUnit.pas"),
+            "unit SharedUnit; interface implementation end.\n",
+        )
+        .expect("duplicate package source");
+
+        let configured_root = temp.path().join("sdk");
+        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &configured_root);
+        let initial = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            initial.is_empty(),
+            "the existing case-adjusted duplicate must be ambiguous: {initial:?}"
+        );
+
+        fs::remove_dir_all(&actual_root).expect("delete case-adjusted mapped root");
+        let missing = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            missing.is_empty(),
+            "deleted case-adjusted root must not reveal a unique workspace package: {missing:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "deleted case-adjusted root did not remain incomplete: {:?}",
+            workspace.warnings()
+        );
+
+        fs::create_dir_all(actual_root.join("src")).expect("restore case-adjusted mapped root");
+        fs::write(
+            actual_root.join("Shared.dpk"),
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("restored duplicate package descriptor");
+        fs::write(
+            actual_root.join("src/SharedUnit.pas"),
+            "unit SharedUnit; interface implementation end.\n",
+        )
+        .expect("restored duplicate package source");
+        workspace.warnings.clear();
+        let restored = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            restored.is_empty(),
+            "restored case-adjusted root must participate in the duplicate: {restored:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("ambiguous package shared")
+                    && warning.contains(&actual_root.join("Shared.dpk").display().to_string())
+            }),
+            "restored case-adjusted root did not participate in ambiguity: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_package_navigation_rejects_a_symlinked_destination_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let target = temp.path().join("sdk-target");
+        let mapped_root = temp.path().join("mapped-sdk");
+        fs::create_dir(&target).expect("symlink target directory");
+        symlink(&target, &mapped_root).expect("mapped symlink");
+
+        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert!(
+            locations.is_empty(),
+            "symlinked mapped root must not permit a unique package result: {locations:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "symlinked mapped root did not produce an actionable incomplete warning: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_catalogue_revalidates_directory_permissions_on_revoke_and_restore() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mapped_root = temp.path().join("mapped-sdk");
+        fs::create_dir(&mapped_root).expect("mapped root");
+        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
+
+        let initial = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            initial.len(),
+            1,
+            "readable empty root should be cached complete"
+        );
+
+        let original_mode = fs::metadata(&mapped_root)
+            .expect("mapped root metadata")
+            .permissions()
+            .mode();
+        let _restore = PermissionsRestore {
+            path: mapped_root.clone(),
+            mode: original_mode,
+        };
+        let mut inaccessible = fs::metadata(&mapped_root)
+            .expect("mapped root metadata")
+            .permissions();
+        inaccessible.set_mode(0o0);
+        fs::set_permissions(&mapped_root, inaccessible).expect("revoke mapped root permissions");
+
+        if fs::read_dir(&mapped_root).is_ok() {
+            eprintln!(
+                "skipping permission-revocation assertion: runner can read mode-000 directory"
+            );
+            return;
+        }
+        assert!(
+            fs::read_dir(&mapped_root).is_err(),
+            "permission-revocation fixture must fail read_dir before testing the cache"
+        );
+
+        let revoked = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            revoked.is_empty(),
+            "revoked mapped root must not reuse a complete catalogue: {revoked:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "revoked mapped root did not produce an actionable incomplete warning: {:?}",
+            workspace.warnings()
+        );
+
+        let mut restored_permissions = fs::metadata(&mapped_root)
+            .expect("mapped root metadata after revoke")
+            .permissions();
+        restored_permissions.set_mode(original_mode);
+        fs::set_permissions(&mapped_root, restored_permissions)
+            .expect("restore mapped root permissions");
+        let restored = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "restored mapped root must rebuild a complete catalogue"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_mapped_package_root_cache_revalidates_on_create_delete_and_restore() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mapped_root = temp.path().join("restored-sdk");
+        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
+
+        let initially_missing = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(initially_missing.is_empty());
+
+        fs::create_dir(&mapped_root).expect("create mapped root");
+        let created = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(created.len(), 1);
+
+        fs::remove_dir(&mapped_root).expect("remove mapped root");
+        let deleted = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            deleted.is_empty(),
+            "deleted mapped root reused a stale complete catalogue: {deleted:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                warning.contains("package shared")
+                    && warning.contains("bounded source catalogue")
+                    && warning.contains("incomplete")
+            }),
+            "deleted mapped root did not remain incomplete: {:?}",
+            workspace.warnings()
+        );
+
+        fs::create_dir(&mapped_root).expect("restore mapped root");
+        let restored = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "restored empty mapped root should resolve only the unique workspace package: {restored:?}"
+        );
+    }
+
+    #[test]
+    fn mapped_package_catalogue_applies_default_exclusions() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mapped_root = temp.path().join("mapped-sdk");
+        let excluded = mapped_root.join(".git");
+        fs::create_dir_all(&excluded).expect("excluded directory");
+        fs::write(excluded.join("Shared.dpk"), "package Shared; end.\n")
+            .expect("excluded package descriptor");
+
+        let mut workspace = test_workspace(Vec::new(), WorkspaceOptions::default());
+        let key = super::ContextKey {
+            project_file: None,
+            workspace_root: None,
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides {
+                path_mappings: vec![PathMapping {
+                    from: "c:/sdk".to_owned(),
+                    to: mapped_root.clone(),
+                    config_file: temp.path().join("overrides.toml"),
+                }],
+                ..EffectiveOverrides::default()
+            },
+        };
+        let requested_names = HashSet::from(["shared".to_owned()]);
+        let catalogue = workspace
+            .package_catalogue(&key, &mapped_root, &requested_names, None)
+            .expect("package catalogue");
+
+        assert!(
+            !catalogue.entries.contains_key("shared"),
+            "default-excluded directories must not contribute package descriptors"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_read_authorization_is_context_scoped_and_component_safe() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mapped_a = temp.path().join("sdk-a");
+        let mapped_b = temp.path().join("sdk-b");
+        let sibling = temp.path().join("sdk-a-extra");
+        let outside = temp.path().join("outside");
+        let source_a = mapped_a.join("source/Provider.pas");
+        let source_b = mapped_b.join("source/Provider.pas");
+        let sibling_source = sibling.join("Provider.pas");
+        let outside_source = outside.join("Provider.pas");
+        fs::create_dir_all(source_a.parent().expect("source A directory"))
+            .expect("source A directory");
+        fs::create_dir_all(source_b.parent().expect("source B directory"))
+            .expect("source B directory");
+        fs::create_dir_all(&sibling).expect("sibling directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::write(&source_a, "unit Provider; end.\n").expect("source A");
+        fs::write(&source_b, "unit Provider; end.\n").expect("source B");
+        fs::write(&sibling_source, "unit Provider; end.\n").expect("sibling source");
+        fs::write(&outside_source, "unit Provider; end.\n").expect("outside source");
+        symlink(&outside, mapped_a.join("escape")).expect("source escape symlink");
+
+        let key_for = |mapped_root: PathBuf| super::ContextKey {
+            project_file: None,
+            workspace_root: None,
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides {
+                path_mappings: vec![PathMapping {
+                    from: "c:/sdk".to_owned(),
+                    to: mapped_root,
+                    config_file: temp.path().join("overrides.toml"),
+                }],
+                ..EffectiveOverrides::default()
+            },
+        };
+        let workspace = test_workspace(Vec::new(), WorkspaceOptions::default());
+        let key_a = key_for(mapped_a.clone());
+        let key_b = key_for(mapped_b);
+
+        assert!(workspace.mapped_path_is_readable(&source_a, &key_a));
+        assert!(workspace.mapped_path_is_readable(&source_b, &key_b));
+        assert!(
+            !workspace.mapped_path_is_readable(&source_b, &key_a),
+            "another project's mapping must not authorize this source"
+        );
+        assert!(
+            !workspace.mapped_path_is_readable(&sibling_source, &key_a),
+            "prefix-similar sibling roots must not be authorized"
+        );
+        assert!(
+            !workspace.mapped_path_is_readable(&mapped_a.join("escape/Provider.pas"), &key_a),
+            "symlink escapes must not be authorized"
+        );
+        assert!(
+            !workspace
+                .mapped_path_is_readable(&temp.path().join("SDK-A/source/Provider.pas"), &key_a),
+            "Linux containment must remain case-sensitive"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn mapped_root_resolution_prefers_exact_case_before_unique_fallback() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let lower = temp.path().join("sdk");
+        let upper = temp.path().join("SDK");
+        fs::create_dir(&lower).expect("lowercase directory");
+        fs::create_dir(&upper).expect("uppercase directory");
+
+        assert_eq!(super::resolve_case_insensitive_path(&lower), Some(lower));
+        assert_eq!(
+            super::resolve_case_insensitive_path(&temp.path().join("sDk")),
+            None,
+            "case-adjusted mapping roots must reject ambiguous fallback"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mapped_read_authorization_is_case_insensitive_and_excludes_case_variants_on_windows() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mapped_root = temp.path().join("sdk");
+        let source = mapped_root.join("Source/Provider.pas");
+        let case_variant = temp.path().join("SDK/source/provider.pas");
+        let excluded = temp.path().join("SDK/.GIT/Shared.dpk");
+        let custom_excluded = temp.path().join("SDK/CACHE/Shared.dpk");
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(source.parent().expect("source directory")).expect("source directory");
+        fs::create_dir_all(excluded.parent().expect("excluded directory"))
+            .expect("excluded directory");
+        fs::create_dir_all(custom_excluded.parent().expect("custom excluded directory"))
+            .expect("custom excluded directory");
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        fs::write(&source, "unit Provider; end.\n").expect("source");
+        fs::write(&excluded, "package Shared; end.\n").expect("excluded descriptor");
+        fs::write(&custom_excluded, "package Shared; end.\n").expect("custom excluded descriptor");
+
+        let key = super::ContextKey {
+            project_file: None,
+            workspace_root: Some(workspace_root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides {
+                path_mappings: vec![PathMapping {
+                    from: "c:/sdk".to_owned(),
+                    to: mapped_root,
+                    config_file: temp.path().join("overrides.toml"),
+                }],
+                ..EffectiveOverrides::default()
+            },
+        };
+        let workspace = test_workspace(
+            vec![workspace_root],
+            WorkspaceOptions {
+                exclude: vec!["cache".to_owned()],
+                ..WorkspaceOptions::default()
+            },
+        );
+
+        assert!(workspace.mapped_path_is_readable(&case_variant, &key));
+        assert!(!workspace.mapped_path_is_readable(&excluded, &key));
+        assert!(!workspace.mapped_path_is_readable(&custom_excluded, &key));
     }
 }

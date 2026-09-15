@@ -1,10 +1,15 @@
 use lsp_types::{CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range, Url};
+use pascal_core::delphi_overrides::OverrideSession;
 use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::process::Command;
+
+fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
+    Workspace::with_override_session(roots, options, OverrideSession::new(None))
+}
 
 fn uri(name: &str) -> Url {
     Url::parse(&format!("file:///workspace/{name}.pas")).expect("valid test URI")
@@ -4614,7 +4619,7 @@ fn project_navigation_does_not_probe_unrelated_explicit_references() {
     fs::write(root.join("App.dpr"), "program App; begin end.\n").expect("write main project");
 
     let main_uri = Url::from_file_path(&main).expect("main URI");
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     let locations = workspace.navigate(
         &main_uri,
         position_of(main_source, "ProviderRoutine", 0),
@@ -4647,7 +4652,7 @@ fn local_navigation_does_not_revalidate_unrelated_disk_cache() {
 
     let main_uri = Url::from_file_path(&main).expect("main URI");
     let unrelated_uri = Url::from_file_path(&unrelated).expect("unrelated URI");
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert_eq!(
         workspace
             .navigate(

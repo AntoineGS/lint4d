@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use lsp_server::{Message, Notification, Request, RequestId, Response};
 use lsp_types::{Position, Url};
 use pascal_core::FileInfo;
+use pascal_core::delphi_overrides::OverrideSession;
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationTarget, ProjectContext};
 use serde_json::{Value, json};
@@ -42,6 +43,9 @@ const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
 
 #[cfg(target_os = "linux")]
 const IN_OPEN: u32 = 0x0000_0020;
+
+#[cfg(target_os = "linux")]
+const IN_NONBLOCK: i32 = 0x800;
 
 #[cfg(target_os = "linux")]
 const AT_FDCWD: i32 = -100;
@@ -85,6 +89,43 @@ fn wait_for_close_events(fd: i32, expected: usize) {
 }
 
 #[cfg(target_os = "linux")]
+fn observed_open(path: &Path, operation: impl FnOnce()) -> bool {
+    let fd = unsafe { inotify_init1(IN_NONBLOCK) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let pathname = CString::new(path.to_string_lossy().as_bytes()).expect("valid path");
+    let watch = unsafe { inotify_add_watch(fd, pathname.as_ptr(), IN_OPEN) };
+    assert!(watch >= 0, "inotify_add_watch failed");
+    operation();
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut events = [0_u8; 4096];
+    match io::Read::read(&mut file, &mut events) {
+        Ok(bytes) => {
+            let mut offset = 0;
+            while offset + 16 <= bytes {
+                let mask = u32::from_ne_bytes(
+                    events[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("inotify mask bytes"),
+                );
+                let name_length = u32::from_ne_bytes(
+                    events[offset + 12..offset + 16]
+                        .try_into()
+                        .expect("inotify name length bytes"),
+                ) as usize;
+                offset = offset.saturating_add(16).saturating_add(name_length);
+                if mask & IN_OPEN != 0 {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("read inotify events: {error}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
     let pathname = CString::new(path.to_string_lossy().as_bytes()).expect("valid path");
     let times = [
@@ -103,18 +144,35 @@ fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
+    Workspace::with_override_session(roots, options, OverrideSession::new(None))
+}
+
 struct TestServer {
     child: Child,
     stdin: Option<ChildStdin>,
     messages: Receiver<io::Result<Option<Message>>>,
     pending: VecDeque<Message>,
+    _environment: Option<TempDir>,
 }
 
 impl TestServer {
     fn launch() -> Self {
+        Self::launch_with_environment(tempfile::tempdir().expect("isolated server environment"))
+    }
+
+    fn launch_with_environment(environment: TempDir) -> Self {
+        let mut server = Self::launch_with_environment_path(environment.path());
+        server._environment = Some(environment);
+        server
+    }
+
+    fn launch_with_environment_path(environment: &Path) -> Self {
         let executable = env!("CARGO_BIN_EXE_pascal-lsp");
         let mut child = Command::new(executable)
             .arg("--stdio")
+            .env("HOME", environment.join("home"))
+            .env("XDG_CONFIG_HOME", environment.join("config"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -144,6 +202,7 @@ impl TestServer {
             child,
             messages: receiver,
             pending: VecDeque::new(),
+            _environment: None,
         }
     }
 
@@ -242,6 +301,45 @@ impl TestServer {
 
     fn initialize(&mut self, root: &Path, initialization_options: Value) -> Value {
         self.initialize_with_watched_registration(root, initialization_options, false)
+    }
+
+    fn initialize_with_workspace_folders(
+        &mut self,
+        root: &Path,
+        folders: &[&Path],
+        initialization_options: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let workspace_folders = folders
+            .iter()
+            .map(|folder| {
+                json!({
+                    "uri": uri(folder),
+                    "name": folder.display().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let id = RequestId::from("initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "workspaceFolders": workspace_folders,
+                "initializationOptions": initialization_options,
+                "capabilities": {
+                    "workspace": {
+                        "workspaceFolders": true,
+                        "didChangeWatchedFiles": {"dynamicRegistration": false}
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
     }
 
     fn initialize_with_hierarchical_document_symbols(&mut self, root: &Path) -> Value {
@@ -857,6 +955,535 @@ fn standard_workspace() -> (TempDir, PathBuf, PathBuf, String, String) {
     write_file(&provider, &provider_source);
     write_file(&main, &main_source);
     (temp, main, provider, main_source, provider_source)
+}
+
+#[cfg(unix)]
+#[test]
+fn delphi_overrides_user_config_navigates_to_native_source() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let sdk = tempfile::tempdir().unwrap();
+    let main = root.path().join("Main.pas");
+    let provider = sdk.path().join("source/Provider.pas");
+    let source = "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(&provider, "unit Provider; interface implementation end.");
+    write_file(
+        &root.path().join("Main.dproj"),
+        r#"
+<Project><PropertyGroup><MainSource>Main.pas</MainSource>
+<DCC_UnitSearchPath>$(BDS)\source</DCC_UnitSearchPath>
+</PropertyGroup></Project>
+"#,
+    );
+    write_file(
+        &environment.path().join("config/delphi-tools/config.toml"),
+        &format!(
+            "[properties]\nBDS = 'C:\\SDK'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.path().display()
+        ),
+    );
+    let mut server = TestServer::launch_with_environment(environment);
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let id = RequestId::from("mapped-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 2, "character": 5}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let value = response.result.unwrap();
+    let locations: Vec<lsp_types::Location> = serde_json::from_value(value).unwrap();
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+    server.shutdown();
+    assert_eq!(fs::read_to_string(main).unwrap(), source);
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_mapped_dependency_did_open_retains_requesting_project_owner() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let sdk = tempfile::tempdir().unwrap();
+    let conflicting_sdk = tempfile::tempdir().unwrap();
+    let main = root.path().join("Main.pas");
+    let provider = sdk.path().join("Provider.pas");
+    let helper = sdk.path().join("Helpers/Helper.pas");
+    let source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nuses Helper;\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine;\nbegin\n  HelperRoutine;\nend;\nend.\n";
+    let helper_source = "unit Helper;\ninterface\nprocedure HelperRoutine;\nimplementation\nprocedure HelperRoutine; begin end;\nend.\n";
+    write_file(&main, source);
+    write_file(&provider, provider_source);
+    write_file(&helper, helper_source);
+    write_file(
+        &root.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK;C:\\SDK\\Helpers</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &sdk.path().join("Sdk.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK\\Wrong</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.path().join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.path().display()
+        ),
+    );
+    write_file(
+        &sdk.path().join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            conflicting_sdk.path().display()
+        ),
+    );
+
+    let mut server = TestServer::launch_with_environment(environment);
+    server.initialize(root.path(), Value::Null);
+    let definition_id = RequestId::from("automatic-mapped-provider".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, source, "ProviderRoutine", 0),
+    );
+    let definition = result_locations(server.response(&definition_id));
+    assert_eq!(definition.len(), 1);
+    assert_eq!(definition[0]["uri"], uri(&provider).to_string());
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+    let helper_id = RequestId::from("automatic-mapped-helper-after-open".to_string());
+    server.send_request(
+        helper_id.clone(),
+        "textDocument/definition",
+        navigation_params(&provider, provider_source, "HelperRoutine", 0),
+    );
+    let helper_locations = result_locations(server.response(&helper_id));
+    assert_eq!(helper_locations.len(), 1);
+    assert_eq!(helper_locations[0]["uri"], uri(&helper).to_string());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn delphi_overrides_workspace_and_project_precedence_survives_project_switching() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let workspace_sdk = tempfile::tempdir().unwrap();
+    let project_sdk_a = tempfile::tempdir().unwrap();
+    let project_sdk_b = tempfile::tempdir().unwrap();
+    let user_sdk = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    let app_main = app.join("Main.pas");
+    let workspace_main = root.path().join("WorkspaceMain.pas");
+    let workspace_provider = workspace_sdk.path().join("source/Provider.pas");
+    let project_provider_a = project_sdk_a.path().join("source/Provider.pas");
+    let project_provider_b = project_sdk_b.path().join("source/Provider.pas");
+    let user_provider = user_sdk.path().join("source/Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&app_main, main_source);
+    write_file(&workspace_main, main_source);
+    for provider in [
+        &workspace_provider,
+        &project_provider_a,
+        &project_provider_b,
+        &user_provider,
+    ] {
+        write_file(provider, provider_source);
+    }
+    write_file(
+        &root.path().join("Workspace.dproj"),
+        "<Project><PropertyGroup><MainSource>WorkspaceMain.pas</MainSource><DCC_UnitSearchPath>C:\\SDK\\source</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    for project in ["A", "B"] {
+        write_file(
+            &app.join(format!("{project}.dproj")),
+            &format!(
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK_{project}\\source</DCC_UnitSearchPath></PropertyGroup></Project>"
+            ),
+        );
+    }
+    write_file(
+        &environment.path().join("config/delphi-tools/config.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK_A'\nto = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK_B'\nto = '{}'\n",
+            user_sdk.path().display(),
+            user_sdk.path().display(),
+            workspace_sdk.path().display()
+        ),
+    );
+    write_file(
+        &root.path().join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK_A'\nto = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK_B'\nto = '{}'\n",
+            workspace_sdk.path().display(),
+            workspace_sdk.path().display(),
+            user_sdk.path().display()
+        ),
+    );
+    let mut lower_server = TestServer::launch_with_environment_path(environment.path());
+    lower_server.initialize(root.path(), Value::Null);
+
+    let lower_workspace_id = RequestId::from("lower-workspace-precedence".to_string());
+    lower_server.send_request(
+        lower_workspace_id.clone(),
+        "textDocument/definition",
+        navigation_params(&workspace_main, main_source, "Provider", 0),
+    );
+    let lower_workspace_locations = result_locations(lower_server.response(&lower_workspace_id));
+    assert_eq!(lower_workspace_locations.len(), 1);
+    assert_eq!(
+        lower_workspace_locations[0]["uri"],
+        uri(&workspace_provider).to_string()
+    );
+
+    let lower_select_a_id = RequestId::from("lower-select-project-a".to_string());
+    lower_server.send_request(
+        lower_select_a_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&app_main)},
+            "projectUri": uri(&app.join("A.dproj"))
+        }),
+    );
+    assert!(lower_server.response(&lower_select_a_id).error.is_none());
+    let lower_a_id = RequestId::from("lower-project-a-definition".to_string());
+    lower_server.send_request(
+        lower_a_id.clone(),
+        "textDocument/definition",
+        navigation_params(&app_main, main_source, "Provider", 0),
+    );
+    let lower_a_locations = result_locations(lower_server.response(&lower_a_id));
+    assert_eq!(lower_a_locations.len(), 1);
+    assert_eq!(
+        lower_a_locations[0]["uri"],
+        uri(&workspace_provider).to_string()
+    );
+
+    let lower_select_b_id = RequestId::from("lower-select-project-b".to_string());
+    lower_server.send_request(
+        lower_select_b_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&app_main)},
+            "projectUri": uri(&app.join("B.dproj"))
+        }),
+    );
+    assert!(lower_server.response(&lower_select_b_id).error.is_none());
+    let lower_b_id = RequestId::from("lower-project-b-definition".to_string());
+    lower_server.send_request(
+        lower_b_id.clone(),
+        "textDocument/definition",
+        navigation_params(&app_main, main_source, "Provider", 0),
+    );
+    let lower_b_locations = result_locations(lower_server.response(&lower_b_id));
+    assert_eq!(lower_b_locations.len(), 1);
+    assert_eq!(lower_b_locations[0]["uri"], uri(&user_provider).to_string());
+    lower_server.shutdown();
+
+    write_file(
+        &app.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK_A'\nto = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK_B'\nto = '{}'\n",
+            project_sdk_a.path().display(),
+            project_sdk_b.path().display()
+        ),
+    );
+
+    let mut server = TestServer::launch_with_environment_path(environment.path());
+    server.initialize(root.path(), Value::Null);
+
+    let workspace_id = RequestId::from("workspace-precedence".to_string());
+    server.send_request(
+        workspace_id.clone(),
+        "textDocument/definition",
+        navigation_params(&workspace_main, main_source, "Provider", 0),
+    );
+    let workspace_locations = result_locations(server.response(&workspace_id));
+    assert_eq!(workspace_locations.len(), 1);
+    assert_eq!(
+        workspace_locations[0]["uri"],
+        uri(&workspace_provider).to_string()
+    );
+
+    let select_a_id = RequestId::from("select-project-a".to_string());
+    server.send_request(
+        select_a_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&app_main)},
+            "projectUri": uri(&app.join("A.dproj"))
+        }),
+    );
+    let selected_a = server.response(&select_a_id);
+    assert!(selected_a.error.is_none(), "{selected_a:?}");
+    assert_eq!(
+        selected_a.result.unwrap()["selectedProjectUri"],
+        uri(&app.join("A.dproj")).to_string()
+    );
+
+    let project_a_id = RequestId::from("project-a-definition".to_string());
+    server.send_request(
+        project_a_id.clone(),
+        "textDocument/definition",
+        navigation_params(&app_main, main_source, "Provider", 0),
+    );
+    let project_a_locations = result_locations(server.response(&project_a_id));
+    assert_eq!(project_a_locations.len(), 1);
+    assert_eq!(
+        project_a_locations[0]["uri"],
+        uri(&project_provider_a).to_string()
+    );
+
+    let select_b_id = RequestId::from("select-project-b".to_string());
+    server.send_request(
+        select_b_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&app_main)},
+            "projectUri": uri(&app.join("B.dproj"))
+        }),
+    );
+    let selected_b = server.response(&select_b_id);
+    assert!(selected_b.error.is_none(), "{selected_b:?}");
+    assert_eq!(
+        selected_b.result.unwrap()["selectedProjectUri"],
+        uri(&app.join("B.dproj")).to_string()
+    );
+
+    let project_b_id = RequestId::from("project-b-definition".to_string());
+    server.send_request(
+        project_b_id.clone(),
+        "textDocument/definition",
+        navigation_params(&app_main, main_source, "Provider", 0),
+    );
+    let project_b_locations = result_locations(server.response(&project_b_id));
+    assert_eq!(project_b_locations.len(), 1);
+    assert_eq!(
+        project_b_locations[0]["uri"],
+        uri(&project_provider_b).to_string()
+    );
+
+    let select_a_again_id = RequestId::from("select-project-a-again".to_string());
+    server.send_request(
+        select_a_again_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&app_main)},
+            "projectUri": uri(&app.join("A.dproj"))
+        }),
+    );
+    let selected_a_again = server.response(&select_a_again_id);
+    assert!(selected_a_again.error.is_none(), "{selected_a_again:?}");
+
+    let project_a_again_id = RequestId::from("project-a-definition-again".to_string());
+    server.send_request(
+        project_a_again_id.clone(),
+        "textDocument/definition",
+        navigation_params(&app_main, main_source, "Provider", 0),
+    );
+    let project_a_again_locations = result_locations(server.response(&project_a_again_id));
+    assert_eq!(project_a_again_locations.len(), 1);
+    assert_eq!(
+        project_a_again_locations[0]["uri"],
+        uri(&project_provider_a).to_string()
+    );
+
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn delphi_overrides_restart_keeps_the_captured_mapping_until_server_exit() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let old_sdk = tempfile::tempdir().unwrap();
+    let new_sdk = tempfile::tempdir().unwrap();
+    let main = root.path().join("Main.pas");
+    let project = root.path().join("Main.dproj");
+    let old_provider = old_sdk.path().join("source/Provider.pas");
+    let old_consumer = old_sdk.path().join("source/Consumer.pas");
+    let new_provider = new_sdk.path().join("source/Provider.pas");
+    let new_consumer = new_sdk.path().join("source/Consumer.pas");
+    let config = environment.path().join("config/delphi-tools/config.toml");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>$(BDS)\\source</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    for (provider, consumer) in [
+        (&old_provider, &old_consumer),
+        (&new_provider, &new_consumer),
+    ] {
+        write_file(provider, provider_source);
+        write_file(consumer, consumer_source);
+    }
+
+    let mapping = |sdk: &Path| {
+        format!(
+            "[properties]\nBDS = 'C:\\SDK'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        )
+    };
+    write_file(&config, &mapping(old_sdk.path()));
+
+    {
+        let mut server = TestServer::launch_with_environment_path(environment.path());
+        server.initialize(root.path(), Value::Null);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&main),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": main_source
+                }
+            }),
+        );
+
+        let definition_id = RequestId::from("restart-old-definition".to_string());
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "Provider", 0),
+        );
+        let definition = result_locations(server.response(&definition_id));
+        assert_eq!(definition.len(), 1);
+        assert_eq!(definition[0]["uri"], uri(&old_provider).to_string());
+
+        let references_id = RequestId::from("restart-old-references".to_string());
+        server.send_request(
+            references_id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&old_provider)},
+                "position": position_of(provider_source, "SharedValue", 0),
+                "context": {"includeDeclaration": false}
+            }),
+        );
+        let references = result_locations(server.response(&references_id));
+        let reference_uris = references
+            .iter()
+            .filter_map(|location| location["uri"].as_str())
+            .collect::<HashSet<_>>();
+        let old_consumer_uri = uri(&old_consumer).to_string();
+        let new_consumer_uri = uri(&new_consumer).to_string();
+        assert!(reference_uris.contains(old_consumer_uri.as_str()));
+        assert!(!reference_uris.contains(new_consumer_uri.as_str()));
+
+        write_file(&config, &mapping(new_sdk.path()));
+
+        let definition_id = RequestId::from("restart-captured-definition".to_string());
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "Provider", 0),
+        );
+        let definition = result_locations(server.response(&definition_id));
+        assert_eq!(definition.len(), 1);
+        assert_eq!(definition[0]["uri"], uri(&old_provider).to_string());
+
+        let references_id = RequestId::from("restart-captured-references".to_string());
+        server.send_request(
+            references_id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&old_provider)},
+                "position": position_of(provider_source, "SharedValue", 0),
+                "context": {"includeDeclaration": false}
+            }),
+        );
+        let references = result_locations(server.response(&references_id));
+        let reference_uris = references
+            .iter()
+            .filter_map(|location| location["uri"].as_str())
+            .collect::<HashSet<_>>();
+        let old_consumer_uri = uri(&old_consumer).to_string();
+        let new_consumer_uri = uri(&new_consumer).to_string();
+        assert!(reference_uris.contains(old_consumer_uri.as_str()));
+        assert!(!reference_uris.contains(new_consumer_uri.as_str()));
+        server.shutdown();
+    }
+
+    {
+        let mut server = TestServer::launch_with_environment_path(environment.path());
+        server.initialize(root.path(), Value::Null);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&main),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": main_source
+                }
+            }),
+        );
+
+        let definition_id = RequestId::from("restart-new-definition".to_string());
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "Provider", 0),
+        );
+        let definition = result_locations(server.response(&definition_id));
+        assert_eq!(definition.len(), 1);
+        assert_eq!(definition[0]["uri"], uri(&new_provider).to_string());
+
+        let references_id = RequestId::from("restart-new-references".to_string());
+        server.send_request(
+            references_id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&new_provider)},
+                "position": position_of(provider_source, "SharedValue", 0),
+                "context": {"includeDeclaration": false}
+            }),
+        );
+        let references = result_locations(server.response(&references_id));
+        let reference_uris = references
+            .iter()
+            .filter_map(|location| location["uri"].as_str())
+            .collect::<HashSet<_>>();
+        let old_consumer_uri = uri(&old_consumer).to_string();
+        let new_consumer_uri = uri(&new_consumer).to_string();
+        assert!(reference_uris.contains(new_consumer_uri.as_str()));
+        assert!(!reference_uris.contains(old_consumer_uri.as_str()));
+        server.shutdown();
+    }
+
+    assert_eq!(fs::read_to_string(&main).unwrap(), main_source);
 }
 
 #[test]
@@ -2168,6 +2795,50 @@ fn local_references_do_not_skip_imports_when_a_same_source_shadow_is_present() {
 }
 
 #[test]
+fn references_preserve_nested_project_ownership_without_overrides() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let parent_main = root.join("Main.pas");
+    let nested_project = root.join("nested/Nested.dproj");
+    let consumer = root.join("nested/src/Consumer.pas");
+    let provider = root.join("nested/lib/Provider.pas");
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    write_file(
+        &parent_main,
+        "unit Main;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(&consumer, consumer_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &nested_project,
+        "<Project><PropertyGroup><MainSource>src/Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("nested-project-ownership".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&id));
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0]["uri"], uri(&consumer).to_string());
+    server.shutdown();
+}
+
+#[test]
 fn local_references_still_reject_an_unsafe_include_in_the_target_document() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("UnsafeLocalReferences.pas");
@@ -2492,6 +3163,2161 @@ fn nonlocal_references_remain_blocked_by_incomplete_project_context() {
         "unexpected nonlocal error: {error:?}"
     );
     assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn explicit_external_unit_keeps_legacy_sibling_lookup_without_configuration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let external_root = temp.path().join("external");
+    let main = project_root.join("Main.pas");
+    let project = project_root.join("App.dproj");
+    let external = external_root.join("External.pas");
+    let helper = external_root.join("Helper.pas");
+    let main_source = "unit Main;\ninterface\nuses External;\nimplementation\nprocedure Run;\nbegin\n  ExternalRoutine;\nend;\nend.\n";
+    let external_source = "unit External;\ninterface\nuses Helper;\nprocedure ExternalRoutine;\nimplementation\nprocedure ExternalRoutine;\nbegin\n  HelperRoutine;\nend;\nend.\n";
+    let helper_source = "unit Helper;\ninterface\nprocedure HelperRoutine;\nimplementation\nprocedure HelperRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&external, external_source);
+    write_file(&helper, helper_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../external/External.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let external_id = RequestId::from("explicit-external-unit".to_string());
+    server.send_request(
+        external_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ExternalRoutine", 0),
+    );
+    let external_locations = result_locations(server.response(&external_id));
+    assert_eq!(external_locations.len(), 1);
+    assert_eq!(external_locations[0]["uri"], uri(&external).to_string());
+
+    let helper_id = RequestId::from("explicit-external-sibling".to_string());
+    server.send_request(
+        helper_id.clone(),
+        "textDocument/definition",
+        navigation_params(&external, external_source, "HelperRoutine", 0),
+    );
+    let helper_locations = result_locations(server.response(&helper_id));
+    assert_eq!(helper_locations.len(), 1);
+    assert_eq!(helper_locations[0]["uri"], uri(&helper).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn legacy_sibling_route_survives_closed_assistance_and_disk_refresh() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let external_root = temp.path().join("external");
+    let main = project_root.join("Main.pas");
+    let project = project_root.join("App.dproj");
+    let external = external_root.join("External.pas");
+    let helper = external_root.join("Helper.pas");
+    let third = external_root.join("Third.pas");
+    let main_source = "unit Main;\ninterface\nuses External;\nimplementation\nprocedure Run;\nbegin\n  ExternalRoutine;\nend;\nend.\n";
+    let external_source = "unit External;\ninterface\nuses Helper;\nprocedure ExternalRoutine;\nimplementation\nprocedure ExternalRoutine;\nbegin\n  HelperRoutine;\nend;\nend.\n";
+    let helper_source = "unit Helper;\ninterface\nuses Third;\nprocedure HelperRoutine;\nimplementation\nprocedure HelperRoutine;\nbegin\n  ThirdRoutine;\nend;\nend.\n";
+    let third_source = "unit Third;\ninterface\nprocedure ThirdRoutine;\nimplementation\nprocedure ThirdRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&external, external_source);
+    write_file(&helper, helper_source);
+    write_file(&third, third_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../external/External.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+
+    let external_id = RequestId::from("legacy-route-external".to_string());
+    server.send_request(
+        external_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ExternalRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&external_id))[0]["uri"],
+        uri(&external).to_string()
+    );
+
+    let helper_id = RequestId::from("legacy-route-helper".to_string());
+    server.send_request(
+        helper_id.clone(),
+        "textDocument/definition",
+        navigation_params(&external, external_source, "HelperRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&helper_id))[0]["uri"],
+        uri(&helper).to_string()
+    );
+
+    let hover_id = RequestId::from("legacy-route-hover".to_string());
+    server.send_request(
+        hover_id.clone(),
+        "textDocument/hover",
+        navigation_params(&helper, helper_source, "ThirdRoutine", 0),
+    );
+    let hover = server.response(&hover_id);
+    assert!(
+        hover.error.is_none(),
+        "closed helper hover failed: {hover:?}"
+    );
+    assert!(
+        hover
+            .result
+            .as_ref()
+            .is_some_and(|result| !result.is_null()),
+        "closed helper hover lost its legacy route: {hover:?}"
+    );
+
+    let references_id = RequestId::from("legacy-route-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&helper)},
+            "position": position_of(helper_source, "ThirdRoutine", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = server.response(&references_id);
+    assert!(
+        references.error.is_none(),
+        "closed helper reference preflight failed: {references:?}"
+    );
+    assert!(
+        references
+            .result
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|locations| {
+                locations
+                    .iter()
+                    .any(|location| location["uri"] == uri(&helper).to_string())
+            }),
+        "closed helper references lost their legacy route: {references:?}"
+    );
+
+    fs::write(&helper, format!("{helper_source}\n")).expect("refresh helper source");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&helper), "type": 2}]}),
+    );
+
+    let refreshed_id = RequestId::from("legacy-route-refresh".to_string());
+    server.send_request(
+        refreshed_id.clone(),
+        "textDocument/definition",
+        navigation_params(&helper, &format!("{helper_source}\n"), "ThirdRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&refreshed_id))[0]["uri"],
+        uri(&third).to_string(),
+        "a refreshed closed helper must retain its verified legacy route"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn legacy_sibling_route_is_invalidated_when_owner_metadata_removes_the_reference() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let external_root = temp.path().join("external");
+    let main = project_root.join("Main.pas");
+    let project = project_root.join("App.dproj");
+    let external = external_root.join("External.pas");
+    let helper = external_root.join("Helper.pas");
+    let third = external_root.join("Third.pas");
+    let main_source = "unit Main;\ninterface\nuses External;\nimplementation\nprocedure Run;\nbegin\n  ExternalRoutine;\nend;\nend.\n";
+    let external_source = "unit External;\ninterface\nuses Helper;\nprocedure ExternalRoutine;\nimplementation\nprocedure ExternalRoutine;\nbegin\n  HelperRoutine;\nend;\nend.\n";
+    let helper_source = "unit Helper;\ninterface\nuses Third;\nprocedure HelperRoutine;\nimplementation\nprocedure HelperRoutine;\nbegin\n  ThirdRoutine;\nend;\nend.\n";
+    let third_source = "unit Third;\ninterface\nprocedure ThirdRoutine;\nimplementation\nprocedure ThirdRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&external, external_source);
+    write_file(&helper, helper_source);
+    write_file(&third, third_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../external/External.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let external_id = RequestId::from("metadata-route-external".to_string());
+    server.send_request(
+        external_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ExternalRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&external_id))[0]["uri"],
+        uri(&external).to_string()
+    );
+    let helper_id = RequestId::from("metadata-route-helper".to_string());
+    server.send_request(
+        helper_id.clone(),
+        "textDocument/definition",
+        navigation_params(&external, external_source, "HelperRoutine", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&helper_id))[0]["uri"],
+        uri(&helper).to_string()
+    );
+
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&project), "type": 2}]}),
+    );
+
+    let third_id = RequestId::from("metadata-route-third".to_string());
+    server.send_request(
+        third_id.clone(),
+        "textDocument/definition",
+        navigation_params(&helper, helper_source, "ThirdRoutine", 0),
+    );
+    let response = server.response(&third_id);
+    assert!(
+        response.error.is_none(),
+        "metadata refresh failed: {response:?}"
+    );
+    assert!(
+        result_locations(response).is_empty(),
+        "removing the explicit owner reference must invalidate the legacy route"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn legacy_explicit_dependency_overlay_survives_deleted_backing_file_until_close() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let workspace_root = temp.path().join("workspace");
+    let project_root = workspace_root.clone();
+    let main = project_root.join("Main.pas");
+    let project = workspace_root.join("App.dproj");
+    let competing_project = workspace_root.join("Other.dproj");
+    let provider = workspace_root.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Provider.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&workspace_root, Value::Null);
+    let initial_context_id = RequestId::from("overlay-initial-context".to_string());
+    server.send_request(
+        initial_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let initial_context = server.response(&initial_context_id);
+    assert!(
+        initial_context.error.is_none(),
+        "initial project context failed: {initial_context:?}"
+    );
+    assert_eq!(
+        initial_context.result.as_ref().unwrap()["selectionMode"],
+        "automatic"
+    );
+    assert_eq!(
+        initial_context.result.as_ref().unwrap()["selectedProjectUri"],
+        uri(&project).to_string()
+    );
+
+    let initial_id = RequestId::from("overlay-initial-definition".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "SharedRoutine", 0),
+    );
+    let initial = result_locations(server.response(&initial_id));
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0]["uri"], uri(&provider).to_string());
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    fs::remove_file(&provider).expect("delete provider backing file");
+
+    let definition_id = RequestId::from("overlay-after-delete-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "SharedRoutine", 0),
+    );
+    let definition = result_locations(server.response(&definition_id));
+    assert_eq!(definition.len(), 1);
+    assert_eq!(definition[0]["uri"], uri(&provider).to_string());
+
+    let hover_id = RequestId::from("overlay-after-delete-hover".to_string());
+    server.send_request(
+        hover_id.clone(),
+        "textDocument/hover",
+        navigation_params(&main, main_source, "SharedRoutine", 0),
+    );
+    let hover = server.response(&hover_id);
+    assert!(hover.error.is_none(), "overlay hover failed: {hover:?}");
+    assert!(
+        hover
+            .result
+            .as_ref()
+            .is_some_and(|result| !result.is_null()),
+        "overlay hover lost the imported provider: {hover:?}"
+    );
+
+    write_file(
+        &competing_project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    let competing_definition_id = RequestId::from("overlay-after-competing-project".to_string());
+    server.send_request(
+        competing_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "SharedRoutine", 0),
+    );
+    let competing_definition = server.response(&competing_definition_id);
+    assert!(
+        competing_definition.error.is_none(),
+        "navigation with the open overlay failed: {competing_definition:?}"
+    );
+
+    let competing_context_id = RequestId::from("overlay-competing-context".to_string());
+    server.send_request(
+        competing_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let competing_context = server.response(&competing_context_id);
+    assert!(
+        competing_context.error.is_none(),
+        "competing project context failed: {competing_context:?}"
+    );
+    let competing_context_result = competing_context.result.as_ref().unwrap();
+    assert_eq!(
+        competing_context_result["selectionMode"], "ambiguous",
+        "new competing project must not leave the old automatic selection cached: {competing_context_result}"
+    );
+    assert!(
+        competing_context_result["selectedProjectUri"].is_null(),
+        "ambiguous context must not retain App.dproj: {competing_context_result}"
+    );
+
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    let missing_id = RequestId::from("overlay-after-close-missing".to_string());
+    server.send_request(
+        missing_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "SharedRoutine", 0),
+    );
+    let missing = server.response(&missing_id);
+    assert!(
+        missing.error.is_none(),
+        "missing provider failed: {missing:?}"
+    );
+    assert_eq!(
+        missing.result,
+        Some(Value::Array(Vec::new())),
+        "closing the overlay must expose the missing backing file"
+    );
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_native_symlink_leaf_and_ancestor_are_followed() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let external_root = temp.path().join("external");
+    let ancestor_target = external_root.join("ancestor-target");
+    let ancestor_link = temp.path().join("ancestor-link");
+    let main = project_root.join("Main.pas");
+    let project = project_root.join("App.dproj");
+    let leaf = external_root.join("Leaf.pas");
+    let leaf_target = external_root.join("LeafTarget.pas");
+    let ancestor = ancestor_link.join("Ancestor.pas");
+    let ancestor_target_file = ancestor_target.join("Ancestor.pas");
+    let main_source = "unit Main;\ninterface\nuses Leaf, Ancestor;\nimplementation\nprocedure Run;\nbegin\n  LeafRoutine;\n  AncestorRoutine;\nend;\nend.\n";
+    let leaf_source = "unit Leaf;\ninterface\nprocedure LeafRoutine;\nimplementation\nprocedure LeafRoutine; begin end;\nend.\n";
+    let ancestor_source = "unit Ancestor;\ninterface\nprocedure AncestorRoutine;\nimplementation\nprocedure AncestorRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&leaf_target, leaf_source);
+    write_file(&ancestor_target_file, ancestor_source);
+    fs::create_dir_all(&ancestor_target).expect("ancestor target directory");
+    symlink(&leaf_target, &leaf).expect("leaf symlink");
+    symlink(&ancestor_target, &ancestor_link).expect("ancestor symlink");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../external/Leaf.pas\" /><DCCReference Include=\"../ancestor-link/Ancestor.pas\" /></ItemGroup></Project>",
+    );
+
+    let mut leaf_server = TestServer::launch();
+    leaf_server.initialize(&project_root, Value::Null);
+    let leaf_opened = observed_open(&leaf_target, || {
+        let id = RequestId::from("native-leaf-symlink".to_string());
+        leaf_server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "LeafRoutine", 0),
+        );
+        let response = leaf_server.response(&id);
+        let locations = result_locations(response);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(&leaf).to_string());
+    });
+    assert!(leaf_opened, "explicit native leaf symlink was not followed");
+    leaf_server.shutdown();
+
+    let mut ancestor_server = TestServer::launch();
+    ancestor_server.initialize(&project_root, Value::Null);
+    let ancestor_opened = observed_open(&ancestor_target_file, || {
+        let id = RequestId::from("native-ancestor-symlink".to_string());
+        ancestor_server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "AncestorRoutine", 0),
+        );
+        let response = ancestor_server.response(&id);
+        let locations = result_locations(response);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(&ancestor).to_string());
+    });
+    assert!(
+        ancestor_opened,
+        "explicit native ancestor symlink was not followed"
+    );
+    ancestor_server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+fn assert_late_legacy_symlink_dependency_is_not_editable(ancestor_symlink: bool) {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let outside_root = temp.path().join("outside");
+    let main = project_root.join("Main.pas");
+    let project = project_root.join("App.dproj");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  SharedValue;\nend;\nend.\n";
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    fs::create_dir_all(&project_root).expect("project directory");
+    let (provider_link, provider_target, reference) = if ancestor_symlink {
+        let target_directory = outside_root.join("sdk");
+        let link = project_root.join("sdk-link");
+        let target = target_directory.join("Provider.pas");
+        fs::create_dir_all(&target_directory).expect("provider target directory");
+        symlink(&target_directory, &link).expect("ancestor symlink");
+        (link.join("Provider.pas"), target, "sdk-link/Provider.pas")
+    } else {
+        let target = outside_root.join("Provider.pas");
+        let link = project_root.join("Provider.pas");
+        write_file(&target, provider_source);
+        symlink(&target, &link).expect("leaf symlink");
+        (link, target, "Provider.pas")
+    };
+    write_file(&main, main_source);
+    write_file(&provider_target, provider_source);
+    write_file(
+        &project,
+        &format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"{reference}\" /></ItemGroup></Project>"
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let definition_id = RequestId::from("symlink-late-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "SharedValue", 0),
+    );
+    let definition = result_locations(server.response(&definition_id));
+    assert_eq!(definition.len(), 1);
+    assert_eq!(definition[0]["uri"], uri(&provider_link).to_string());
+
+    let rename_id = RequestId::from("symlink-late-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0),
+            "newName": "RenamedValue"
+        }),
+    );
+    let rename = server.response(&rename_id);
+    let error = rename
+        .error
+        .expect("rename must reject edits through a native symlink");
+    assert!(
+        error.message.contains("outside configured workspace roots"),
+        "unexpected symlink editability error: {error:?}"
+    );
+    assert!(rename.result.is_none(), "symlink dependency received edits");
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_from_a_regular_importer_does_not_edit_a_late_leaf_symlink_dependency() {
+    assert_late_legacy_symlink_dependency_is_not_editable(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_from_a_regular_importer_does_not_edit_a_late_ancestor_symlink_dependency() {
+    assert_late_legacy_symlink_dependency_is_not_editable(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_search_path_ancestor_symlink_is_followed_for_navigation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk_target = temp.path().join("sdk");
+    let sdk_link = project_root.join("sdk-link");
+    let main = project_root.join("Main.pas");
+    let provider_target = sdk_target.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider_target, provider_source);
+    symlink(&sdk_target, &sdk_link).expect("legacy search path ancestor symlink");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>sdk-link</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let opened = observed_open(&provider_target, || {
+        let id = RequestId::from("legacy-search-symlink-definition".to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "ProviderRoutine", 0),
+        );
+        let locations = result_locations(server.response(&id));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            locations[0]["uri"],
+            uri(&sdk_link.join("Provider.pas")).to_string()
+        );
+    });
+    assert!(opened, "legacy search path symlink target was not opened");
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+fn assert_search_path_ancestor_symlink_is_not_opened(mapped: bool) {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk_target = temp.path().join("sdk");
+    let sdk_link = project_root.join("sdk-link");
+    let main = project_root.join("Main.pas");
+    let provider_target = sdk_target.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider_target, provider_source);
+    symlink(&sdk_target, &sdk_link).expect("configured search path ancestor symlink");
+    write_file(
+        &project_root.join("App.dproj"),
+        if mapped {
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK\\sdk-link</DCC_UnitSearchPath></PropertyGroup></Project>"
+        } else {
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>"
+        },
+    );
+    if mapped {
+        write_file(
+            &project_root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                project_root.display()
+            ),
+        );
+    } else {
+        write_file(
+            &project_root.join(".delphi-tools.local.toml"),
+            "[properties]\nDCC_UnitSearchPath = 'sdk-link'\n",
+        );
+    }
+
+    let opened = observed_open(&provider_target, || {
+        let mut server = TestServer::launch();
+        server.initialize(&project_root, Value::Null);
+        let id = RequestId::from("strict-search-symlink-definition".to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "ProviderRoutine", 0),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "strict symlink lookup failed: {response:?}"
+        );
+        assert_eq!(
+            response.result,
+            Some(Value::Array(Vec::new())),
+            "strict search path symlink target was opened"
+        );
+        server.shutdown();
+    });
+    assert!(!opened, "strict search path symlink target was opened");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mapped_search_path_ancestor_symlink_is_not_opened() {
+    assert_search_path_ancestor_symlink_is_not_opened(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn configured_search_path_ancestor_symlink_is_not_opened() {
+    assert_search_path_ancestor_symlink_is_not_opened(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn configured_native_symlink_reference_is_not_opened_through_legacy_sibling_lookup() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let outside = temp.path().join("outside");
+    let main = project_root.join("Main.pas");
+    let provider = project_root.join("Provider.pas");
+    let outside_provider = outside.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&outside_provider, provider_source);
+    symlink(&outside_provider, &provider).expect("configured provider symlink");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"$(ProviderPath)\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        "[properties]\nProviderPath = 'Provider.pas'\n",
+    );
+
+    let opened = observed_open(&outside_provider, || {
+        let mut server = TestServer::launch();
+        server.initialize(&project_root, Value::Null);
+        let id = RequestId::from("configured-symlink-safety".to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "SharedRoutine", 0),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "configured symlink lookup failed: {response:?}"
+        );
+        assert_eq!(
+            response.result,
+            Some(Value::Array(Vec::new())),
+            "configured symlink target was opened through the legacy sibling route"
+        );
+        server.shutdown();
+    });
+    assert!(!opened, "configured symlink target was opened");
+}
+
+#[test]
+fn references_preserve_colocated_project_ownership_without_overrides() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let parent_main = root.join("0Main.pas");
+    let consumer_a = root.join("A/src/Consumer.pas");
+    let provider_a = root.join("A/lib/Provider.pas");
+    let consumer_b = root.join("B/src/Consumer.pas");
+    let provider_b = root.join("B/lib/Provider.pas");
+    let consumer_a_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedA);\nend;\nend.\n";
+    let consumer_b_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedB);\nend;\nend.\n";
+    let provider_a_source = "unit Provider;\ninterface\nconst SharedA = 1;\nimplementation\nend.\n";
+    let provider_b_source = "unit Provider;\ninterface\nconst SharedB = 1;\nimplementation\nend.\n";
+    write_file(
+        &parent_main,
+        "unit Main;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(&consumer_a, consumer_a_source);
+    write_file(&provider_a, provider_a_source);
+    write_file(&consumer_b, consumer_b_source);
+    write_file(&provider_b, provider_b_source);
+    for (directory, main_source) in [("A", "src/Consumer.pas"), ("B", "src/Consumer.pas")] {
+        write_file(
+            &root.join(directory).join("App.dproj"),
+            &format!(
+                "<Project><PropertyGroup><MainSource>{main_source}</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>"
+            ),
+        );
+    }
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>0Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("colocated-project-ownership".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider_a)},
+            "position": position_of(provider_a_source, "SharedA", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&id));
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0]["uri"], uri(&consumer_a).to_string());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn references_include_an_unopened_consumer_from_a_mapped_root() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let main = project_root.join("Main.pas");
+    let provider = sdk.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let declaration_id = RequestId::from("mapped-provider-declaration".to_string());
+    server.send_request(
+        declaration_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "SharedValue", 0),
+    );
+    let declaration = result_locations(server.response(&declaration_id));
+    assert_eq!(declaration.len(), 1);
+    assert_eq!(declaration[0]["uri"], uri(&provider).to_string());
+
+    let references_id = RequestId::from("mapped-consumer-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&references_id));
+    let reference_uris = references
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect::<HashSet<_>>();
+    assert!(reference_uris.contains(uri(&main).as_str()));
+    assert!(reference_uris.contains(uri(&consumer).as_str()));
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn package_only_mapping_scans_external_consumers_and_rejects_partial_rename() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let main = project_root.join("Main.pas");
+    let provider = sdk.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let package = sdk.join("SDKPackage.dpk");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &package,
+        "package SDKPackage;\ncontains\n  Provider in 'Provider.pas';\nend.\n",
+    );
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>SDKPackage</DCC_UsePackage></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let definition_id = RequestId::from("package-only-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Provider", 0),
+    );
+    let definition = result_locations(server.response(&definition_id));
+    assert_eq!(definition.len(), 1);
+    assert_eq!(definition[0]["uri"], uri(&provider).to_string());
+
+    let references_id = RequestId::from("package-only-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&references_id));
+    let reference_uris = references
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect::<HashSet<_>>();
+    assert!(reference_uris.contains(uri(&main).as_str()));
+    assert!(reference_uris.contains(uri(&consumer).as_str()));
+
+    let rename_id = RequestId::from("package-only-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "newName": "RenamedValue"
+        }),
+    );
+    let response = server.response(&rename_id);
+    let error = response
+        .error
+        .expect("package-only external consumer must reject partial rename");
+    assert!(error.message.contains("outside configured workspace roots"));
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn references_include_a_configured_native_source_under_an_effective_mapping() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let consumer = sdk.join("Consumer.pas");
+    let provider = sdk.join("Provider.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>C:\\SDK\\Provider.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nDCC_UnitSearchPath = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display(),
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, json!({"projectFile": "App.dproj"}));
+    let id = RequestId::from("configured-native-mapped-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&id));
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0]["uri"], uri(&consumer).to_string());
+
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn references_scan_the_mapping_destination_for_configured_native_files_and_paths() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let subdir = sdk.join("subdir");
+    let main = sdk.join("Main.pas");
+    let provider = sdk.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &subdir.join("SubdirUnit.pas"),
+        "unit SubdirUnit;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>$(MainSource)</MainSource><DCC_UnitSearchPath>$(DCC_UnitSearchPath)</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"$(ProviderPath)\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nMainSource = '{}'\nDCC_UnitSearchPath = '{}'\nProviderPath = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            main.display(),
+            subdir.display(),
+            provider.display(),
+            sdk.display()
+        ),
+    );
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, json!({"projectFile": "App.dproj"}));
+    let id = RequestId::from("configured-native-destination-scan".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&id));
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0]["uri"], uri(&consumer).to_string());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn summary_only_mapped_consumers_retain_their_owner_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let provider = project_root.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let include = sdk.join("Safe.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\n{$I C:\\SDK\\Safe.inc}\nimplementation\nprocedure Consume;\nbegin\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&include, "{$DEFINE SAFE}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("summary-mapped-consumer".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "summary consumer failed: {response:?}"
+    );
+    assert!(response.result.unwrap().as_array().unwrap().is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn rename_allows_a_legacy_relative_include_outside_the_workspace() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let include = temp.path().join("shared/Safe.inc");
+    let source = "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I ../shared/Safe.inc}\nend.\n";
+    write_file(&main, source);
+    write_file(&include, "{$DEFINE SAFE}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("legacy-relative-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "legacy include rejected: {response:?}"
+    );
+    assert!(response.result.is_some());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_allows_nested_legacy_relative_includes_outside_the_workspace() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let shared = temp.path().join("shared");
+    let main = project_root.join("Main.pas");
+    let outer = shared.join("Outer.inc");
+    let inner = shared.join("Inner.inc");
+    let source = "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I ../shared/Outer.inc}\nend.\n";
+    write_file(&main, source);
+    write_file(&outer, "{$I Inner.inc}\n");
+    write_file(&inner, "{$DEFINE SAFE}\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("nested-legacy-relative-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "nested legacy include rejected: {response:?}"
+    );
+    assert!(response.result.is_some());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_allows_a_multihop_legacy_search_include_without_overrides() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let legacy = temp.path().join("legacy");
+    let shared = temp.path().join("shared");
+    let main = project_root.join("Main.pas");
+    let outer = project_root.join("Outer.inc");
+    let via_search = legacy.join("ViaSearch.inc");
+    let safe = shared.join("Safe.inc");
+    let source =
+        "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I Outer.inc}\nend.\n";
+    write_file(&main, source);
+    write_file(&outer, "{$I ViaSearch.inc}\n");
+    write_file(&via_search, "{$I ../shared/Safe.inc}\n");
+    write_file(&safe, "{$DEFINE SAFE}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>../legacy</DCC_IncludePath></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("multihop-legacy-search-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "multihop legacy search include rejected: {response:?}"
+    );
+    assert!(response.result.is_some());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_allows_a_top_level_legacy_search_include_without_overrides() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let legacy = temp.path().join("legacy");
+    let shared = temp.path().join("shared");
+    let main = project_root.join("Main.pas");
+    let via_search = legacy.join("ViaSearch.inc");
+    let safe = shared.join("Safe.inc");
+    let source =
+        "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I ViaSearch.inc}\nend.\n";
+    write_file(&main, source);
+    write_file(&via_search, "{$I ../shared/Safe.inc}\n");
+    write_file(&safe, "{$DEFINE SAFE}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>../legacy</DCC_IncludePath></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("top-level-legacy-search-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "top-level legacy search include rejected: {response:?}"
+    );
+    assert!(response.result.is_some());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_allows_a_literal_native_absolute_include_outside_the_workspace() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let shared = temp.path().join("shared");
+    let main = project_root.join("Main.pas");
+    let include = shared.join("Safe.inc");
+    let source = format!(
+        "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{{$I {}}}\nend.\n",
+        include.display()
+    );
+    write_file(&main, &source);
+    write_file(&include, "{$DEFINE SAFE}\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("literal-native-absolute-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "native absolute include rejected: {response:?}"
+    );
+    assert!(response.result.is_some());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_rejects_a_configured_include_path_outside_allowed_roots() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let external = temp.path().join("external");
+    let main = project_root.join("Main.pas");
+    let include = external.join("Safe.inc");
+    let source =
+        "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I Safe.inc}\nend.\n";
+    write_file(&main, source);
+    write_file(&include, "{$DEFINE SAFE}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!("[properties]\nDCC_IncludePath = '{}'\n", external.display()),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("configured-include-outside-roots".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("configured external include must be rejected");
+    assert!(
+        error
+            .message
+            .contains("outside the owning project's readable roots")
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_rejects_a_nested_include_selected_from_a_configured_path_after_a_legacy_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let configured_include_root = temp.path().join("configured-includes");
+    let main = project_root.join("Main.pas");
+    let outer = project_root.join("Outer.inc");
+    let safe = configured_include_root.join("Safe.inc");
+    let source =
+        "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I Outer.inc}\nend.\n";
+    write_file(&main, source);
+    write_file(&outer, "{$I Safe.inc}\n");
+    write_file(&safe, "{$DEFINE SAFE}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nDCC_IncludePath = '{}'\n",
+            configured_include_root.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("nested-configured-include".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("nested configured include must be rejected");
+    assert!(
+        error
+            .message
+            .contains("outside the owning project's readable roots")
+    );
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn references_use_a_mapped_overlay_after_its_disk_source_is_removed() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let provider = project_root.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let disk_consumer = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nend.\n";
+    let overlay_consumer = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, disk_consumer);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, json!({"projectFile": "App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&consumer),
+                "languageId": "pascal",
+                "version": 7,
+                "text": overlay_consumer
+            }
+        }),
+    );
+    fs::remove_file(&consumer).expect("remove disk source behind overlay");
+
+    let id = RequestId::from("mapped-overlay-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&id));
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0]["uri"], uri(&consumer).to_string());
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&consumer), "version": 8},
+            "contentChanges": [{"text": "unit Consumer;\ninterface\nuses Provider;\nimplementation\nend.\n"}]
+        }),
+    );
+    let changed_id = RequestId::from("mapped-overlay-references-after-change".to_string());
+    server.send_request(
+        changed_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    assert!(result_locations(server.response(&changed_id)).is_empty());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn references_keep_same_named_mapped_overlays_in_their_owner_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let workspace_root = temp.path().join("workspace");
+    let project_a = temp.path().join("project-a");
+    let project_b = temp.path().join("project-b");
+    let sdk_a = project_a.join("sdk");
+    let sdk_b = project_b.join("sdk");
+    let provider_a = sdk_a.join("Provider.pas");
+    let provider_b = sdk_b.join("Provider.pas");
+    let consumer_a = sdk_a.join("Consumer.pas");
+    let consumer_b = sdk_b.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let safe_consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let poisoned_consumer_source = "unit Consumer;\ninterface\nuses Provider;\n{$I Missing.inc}\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    fs::create_dir_all(&workspace_root).expect("workspace root");
+    for (project, sdk) in [(&project_a, &sdk_a), (&project_b, &sdk_b)] {
+        write_file(
+            &project.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>C:\\SDK\\Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+        );
+        write_file(
+            &project.join(".delphi-tools.local.toml"),
+            &format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        );
+    }
+    write_file(&provider_a, provider_source);
+    write_file(&provider_b, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&workspace_root, Value::Null);
+    for (consumer, source) in [
+        (&consumer_a, safe_consumer_source),
+        (&consumer_b, poisoned_consumer_source),
+    ] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(consumer),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source
+                }
+            }),
+        );
+    }
+
+    let owner_a_id = RequestId::from("owner-a-mapped-overlay".to_string());
+    server.send_request(
+        owner_a_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider_a)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let owner_a_references = result_locations(server.response(&owner_a_id));
+    assert_eq!(owner_a_references.len(), 1);
+    assert_eq!(owner_a_references[0]["uri"], uri(&consumer_a).to_string());
+
+    for (consumer, source) in [
+        (&consumer_a, poisoned_consumer_source),
+        (&consumer_b, safe_consumer_source),
+    ] {
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(consumer), "version": 2},
+                "contentChanges": [{"text": source}]
+            }),
+        );
+    }
+    let owner_b_id = RequestId::from("owner-b-mapped-overlay".to_string());
+    server.send_request(
+        owner_b_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider_b)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let owner_b_references = result_locations(server.response(&owner_b_id));
+    assert_eq!(owner_b_references.len(), 1);
+    assert_eq!(owner_b_references[0]["uri"], uri(&consumer_b).to_string());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn captured_override_edits_do_not_stale_mapped_reference_snapshots() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let changed_sdk = temp.path().join("changed-sdk");
+    let provider = project_root.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let request = |server: &mut TestServer, id: &str| {
+        let id = RequestId::from(id.to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&provider)},
+                "position": position_of(provider_source, "SharedValue", 0),
+                "context": {"includeDeclaration": false}
+            }),
+        );
+        result_locations(server.response(&id))
+    };
+
+    let first = request(&mut server, "captured-overrides-before-edit");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0]["uri"], uri(&consumer).to_string());
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nDCC_UnitSearchPath = '{}'\n",
+            changed_sdk.display()
+        ),
+    );
+
+    for id in [
+        "captured-overrides-after-edit",
+        "captured-overrides-after-edit-again",
+    ] {
+        let references = request(&mut server, id);
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0]["uri"], uri(&consumer).to_string());
+    }
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_rejects_edits_to_a_mapped_external_consumer() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let provider = project_root.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let provider_source = "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(BadConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let rename_id = RequestId::from("mapped-consumer-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&rename_id);
+    let error = response
+        .error
+        .expect("mapped external edit must be rejected");
+    assert!(error.message.contains("outside configured workspace roots"));
+    assert!(response.result.is_none());
+    assert_eq!(fs::read_to_string(&provider).unwrap(), provider_source);
+    assert_eq!(fs::read_to_string(&consumer).unwrap(), consumer_source);
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn references_reject_a_missing_nested_include_in_a_mapped_consumer() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let provider = project_root.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let outer_include = sdk.join("Nested/Outer.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\n{$I C:\\SDK\\Nested\\Outer.inc}\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&outer_include, "{$I C:\\SDK\\Nested\\Missing.inc}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let references_id = RequestId::from("mapped-missing-nested-include".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&references_id);
+    let error = response
+        .error
+        .expect("missing mapped nested include must reject references");
+    assert!(error.message.contains("workspace scan incomplete"));
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mapped_include_cannot_grant_legacy_authority_to_an_outside_nested_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let provider = project_root.join("Provider.pas");
+    let outer_include = sdk.join("Nested/Outer.inc");
+    let outside_include = temp.path().join("outside.inc");
+    let provider_source = "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\n{$I C:\\SDK\\Nested\\Outer.inc}\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&outer_include, "{$I ../../outside.inc}\n");
+    write_file(&outside_include, "{$DEFINE SAFE}\n");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let opened = observed_open(&outside_include, || {
+        let mut server = TestServer::launch();
+        server.initialize(&project_root, Value::Null);
+        let references_id = RequestId::from("mapped-nested-escape".to_string());
+        server.send_request(
+            references_id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&provider)},
+                "position": position_of(provider_source, "SharedValue", 0),
+                "context": {"includeDeclaration": false}
+            }),
+        );
+        let response = server.response(&references_id);
+        let error = response
+            .error
+            .expect("outside nested include must reject references");
+        assert!(
+            error
+                .message
+                .contains("outside the owning project's readable roots")
+        );
+        server.shutdown();
+    });
+
+    assert!(!opened, "mapped nested include escaped its authorized root");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_fingerprint_does_not_reclassify_a_denied_recursive_candidate() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let sdk = root.join("sdk");
+    let outside = root.join("outside");
+    let target = root.join("Shared.pas");
+    let denied = outside.join("Denied.pas");
+    let target_source = "unit Shared;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+
+    write_file(&target, target_source);
+    write_file(&denied, "unit Denied; interface implementation end.\n");
+    write_file(
+        &sdk.join("App.dpr"),
+        "program App; uses Denied in '../outside/Denied.pas'; begin end.\n",
+    );
+    write_file(&root.join("B.dpr"), "program B; begin end.\n");
+    write_file(
+        &root.join("A.dproj"),
+        "<Project><PropertyGroup><MainSource>C:\\SDK\\App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("B.dproj"),
+        "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let opened = observed_open(&denied, || {
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let result = workspace.rename_edits(
+            &uri(&target),
+            position_of(target_source, "BadConst", 0),
+            "GoodConst",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "an incomplete candidate context must not produce a rename"
+        );
+    });
+
+    assert!(
+        !opened,
+        "fingerprinting must not grant the final context's workspace root to a denied recursive candidate"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exists_only_excluded_metadata_is_never_fingerprinted() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let private = root.join("vendor/private/settings.optset");
+    let target = root.join("Provider.pas");
+    let target_source = "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
+
+    write_file(
+        &private,
+        "<Project><PropertyGroup><DCC_Define>NOPE</DCC_Define></PropertyGroup></Project>",
+    );
+    write_file(&target, target_source);
+    write_file(&root.join("App.dpr"), "program App; begin end.\n");
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><PropertyGroup Condition=\"Exists('vendor/private/settings.optset')\"><DCC_Define>PRIVATE_SETTINGS</DCC_Define></PropertyGroup></Project>",
+    );
+
+    let opened = observed_open(&private, || {
+        let mut workspace = test_workspace(
+            vec![root.clone()],
+            WorkspaceOptions {
+                source_paths: vec!["vendor".to_string()],
+                exclude: vec!["vendor/private".to_string()],
+                ..WorkspaceOptions::default()
+            },
+        );
+        let result = workspace.rename_edits(
+            &uri(&target),
+            position_of(target_source, "BadConst", 0),
+            "GoodConst",
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "a complete project request must succeed: {result:?}"
+        );
+    });
+
+    assert!(
+        !opened,
+        "Exists-only excluded metadata must remain stat-only"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn references_do_not_follow_mapped_symlink_escapes_or_sibling_prefixes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let sibling = temp.path().join("sdk-old");
+    let outside = temp.path().join("outside");
+    let provider = project_root.join("Provider.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&outside.join("Consumer.pas"), consumer_source);
+    write_file(&sibling.join("Consumer.pas"), consumer_source);
+    fs::create_dir_all(&sdk).expect("mapped SDK directory");
+    symlink(&outside, sdk.join("escape")).expect("mapped symlink escape");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let references_id = RequestId::from("mapped-containment".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&references_id);
+    assert!(
+        response.error.is_none(),
+        "unexpected response error: {response:?}"
+    );
+    assert!(
+        response
+            .result
+            .expect("reference result")
+            .as_array()
+            .expect("reference array")
+            .is_empty()
+    );
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_sibling_grant_cannot_bypass_mapped_explicit_symlink_safety() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let outside = temp.path().join("outside");
+    let main = project_root.join("Main.pas");
+    let mapped_provider = project_root.join("Provider.pas");
+    let outside_provider = outside.join("Provider.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&outside_provider, provider_source);
+    write_file(&main, main_source);
+    fs::create_dir_all(&project_root).expect("project directory");
+    symlink(&outside_provider, &mapped_provider).expect("mapped provider escape");
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"C:\\SDK\\Provider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            project_root.display()
+        ),
+    );
+
+    let opened = observed_open(&outside_provider, || {
+        let mut server = TestServer::launch();
+        server.initialize(&project_root, Value::Null);
+        let definition_id = RequestId::from("mapped-explicit-symlink-safety".to_string());
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": uri(&main)},
+                "position": position_of(main_source, "SharedValue", 0)
+            }),
+        );
+        let response = server.response(&definition_id);
+        assert!(
+            response.error.is_none(),
+            "mapped symlink lookup returned an unexpected error: {response:?}"
+        );
+        assert_eq!(
+            response.result,
+            Some(Value::Array(Vec::new())),
+            "mapped symlink target was indexed through the legacy sibling grant"
+        );
+        server.shutdown();
+    });
+
+    assert!(!opened, "mapped explicit symlink target was opened");
+}
+
+#[cfg(unix)]
+#[test]
+fn references_reject_exhausted_mapped_source_budgets() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let provider = project_root.join("Provider.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, json!({"maxFiles": 1}));
+    let references_id = RequestId::from("mapped-budget".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&references_id);
+    let error = response
+        .error
+        .expect("mapped source budget exhaustion must reject references");
+    assert!(error.message.contains("incomplete"));
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn references_do_not_use_a_mapping_from_an_unrelated_project_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let project_a = root.join("A");
+    let project_b = root.join("B");
+    let sdk = temp.path().join("sdk");
+    let provider = project_a.join("Provider.pas");
+    let main_a = project_a.join("Main.pas");
+    let consumer = sdk.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main_a, main_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &project_a.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_b.join("Main.pas"),
+        "unit Main; interface implementation end.\n",
+    );
+    write_file(
+        &project_b.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"..\\A\\Provider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &project_b.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let references_id = RequestId::from("unrelated-project-mapping".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = result_locations(server.response(&references_id));
+    assert!(!references.is_empty());
+    assert!(
+        references
+            .iter()
+            .all(|location| location["uri"] == uri(&main_a).to_string()),
+        "project B's mapping must not add its external consumer: {references:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_symbols_enumerate_mapped_sources_from_project_metadata() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let sdk = temp.path().join("sdk");
+    let mapped_source = sdk.join("Mapped.pas");
+    write_file(
+        &mapped_source,
+        "unit Mapped;\ninterface\nprocedure MappedThing;\nimplementation\nend.\n",
+    );
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>C:\\SDK\\Mapped.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let symbols_id = RequestId::from("mapped-workspace-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "workspace/symbol",
+        json!({"query": "MappedThing"}),
+    );
+    let response = server.response(&symbols_id);
+    assert!(
+        response.error.is_none(),
+        "mapped workspace symbols failed: {response:?}"
+    );
+    let result = response.result.expect("mapped workspace symbols result");
+    let symbols = result.as_array().expect("mapped workspace symbols array");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(
+        symbols[0]["location"]["uri"],
+        uri(&mapped_source).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn workspace_symbols_reject_incomplete_override_context_without_mapped_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path().join("project");
+    let source = project_root.join("Main.pas");
+    write_file(
+        &source,
+        "unit Main;\ninterface\nprocedure IncompleteThing;\nimplementation\nend.\n",
+    );
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        "[properties\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let id = RequestId::from("incomplete-workspace-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "IncompleteThing"}),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("workspace symbols must fail on malformed override configuration");
+    assert!(error.message.contains("incomplete"), "{error:?}");
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_symbols_retain_same_directory_mapped_project_contexts() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let sdk = temp.path().join("sdk");
+    let ordinary_main = root.join("AMain.pas");
+    let mapped_source = sdk.join("MappedOnly.pas");
+
+    write_file(
+        &ordinary_main,
+        "unit AMain;\ninterface\nprocedure OrdinaryThing;\nimplementation\nend.\n",
+    );
+    write_file(
+        &mapped_source,
+        "unit MappedOnly;\ninterface\nprocedure MappedOnlyThing;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("0B.dproj"),
+        "<Project><PropertyGroup><MainSource>AMain.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join("1A.dproj"),
+        "<Project><PropertyGroup><MainSource>AMain.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("same-directory-mapped-contexts".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "MappedOnlyThing"}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "mapped context was lost: {response:?}"
+    );
+    let symbols = response
+        .result
+        .expect("workspace symbols result")
+        .as_array()
+        .expect("workspace symbols array")
+        .clone();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(
+        symbols[0]["location"]["uri"],
+        uri(&mapped_source).to_string()
+    );
     server.shutdown();
 }
 
@@ -4073,6 +6899,307 @@ fn project_context_reports_candidates_and_accepts_selection() {
     assert_eq!(context["selectionMode"], "ambiguous");
     assert!(context["selectedProjectUri"].is_null());
     server.shutdown();
+}
+
+#[test]
+fn production_project_context_reports_configured_override_errors_as_warnings() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let source = root.join("Main.pas");
+    let user_config = environment.path().join("config/delphi-tools/config.toml");
+    write_file(&source, "unit Main; interface implementation end.\n");
+    write_file(&user_config, "[properties\ninvalid = 'user'\n");
+
+    let mut server = TestServer::launch_with_environment(environment);
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("production-override-warning".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    let response = server.response(&id);
+
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.unwrap();
+    let warnings = result["warnings"]
+        .as_array()
+        .expect("project context warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| { warning.contains(&user_config.display().to_string()) })),
+        "configured override provenance was not returned: {warnings:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn malformed_candidate_override_survives_incomplete_selection_and_blocks_navigation() {
+    for (case_name, root_override) in [
+        ("without-root-override", None),
+        (
+            "with-valid-root-override",
+            Some("[properties]\nRoot = 'valid'\n"),
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let app = root.join("app");
+        let main = app.join("Main.pas");
+        let provider = app.join("Provider.pas");
+        let malformed = app.join(".delphi-tools.local.toml");
+        let main_source = "unit Main;\ninterface\nuses Provider;\nprocedure Use;\nimplementation\nprocedure Use;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+        write_file(&main, main_source);
+        write_file(
+            &provider,
+            "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine;\nbegin\nend;\nend.\n",
+        );
+        for project_name in ["A", "B"] {
+            write_file(
+                &app.join(format!("{project_name}.dproj")),
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Provider.pas\" /></ItemGroup></Project>",
+            );
+        }
+        write_file(&malformed, "[properties\ninvalid = 'candidate'\n");
+        if let Some(root_override) = root_override {
+            write_file(&root.join(".delphi-tools.local.toml"), root_override);
+        }
+
+        let mut server = TestServer::launch();
+        server.initialize(root, Value::Null);
+
+        let context_id = RequestId::from(format!("{case_name}-context"));
+        server.send_request(
+            context_id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&main)}}),
+        );
+        let context_response = server.response(&context_id);
+        assert!(context_response.error.is_none(), "{context_response:?}");
+        let context = context_response.result.expect("project context result");
+        let warnings = context["warnings"]
+            .as_array()
+            .expect("project context warnings");
+        assert!(
+            warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains(&malformed.display().to_string()))),
+            "candidate override provenance was not returned for {case_name}: {warnings:?}"
+        );
+        assert_eq!(context["candidates"].as_array().unwrap().len(), 2);
+        assert!(context["selectedProjectUri"].is_null());
+
+        let navigation_id = RequestId::from(format!("{case_name}-navigation"));
+        server.send_request(
+            navigation_id.clone(),
+            "textDocument/declaration",
+            navigation_params(&main, main_source, "ProviderRoutine", 0),
+        );
+        assert!(
+            result_locations(server.response(&navigation_id)).is_empty(),
+            "navigation resolved through malformed candidate override for {case_name}"
+        );
+        server.shutdown();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_delphi_override_scopes_report_provenance_fail_closed_and_preserve_valid_scopes() {
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+
+    for scope in ["user", "workspace", "project"] {
+        let environment = tempfile::tempdir().expect("isolated server environment");
+        let root = tempfile::tempdir().expect("workspace root");
+        let bad = root.path().join("bad");
+        let good = root.path().join("good");
+        let bad_project_dir = if scope == "workspace" {
+            bad.join("project")
+        } else {
+            bad.clone()
+        };
+        let good_project_dir = if scope == "workspace" {
+            good.join("project")
+        } else {
+            good.clone()
+        };
+        let bad_sdk = tempfile::tempdir().expect("bad SDK");
+        let good_sdk = tempfile::tempdir().expect("good SDK");
+        let bad_main = bad_project_dir.join("Main.pas");
+        let good_main = good_project_dir.join("Main.pas");
+        let user_config = environment.path().join("config/delphi-tools/config.toml");
+        let root_override = root.path().join(".delphi-tools.local.toml");
+        let bad_override = bad.join(".delphi-tools.local.toml");
+        let good_override = good.join(".delphi-tools.local.toml");
+        let bad_provider = bad_sdk.path().join("source/Provider.pas");
+        let good_provider = good_sdk.path().join("source/Provider.pas");
+        let malformed = match scope {
+            "user" => user_config.clone(),
+            "workspace" | "project" => bad_override.clone(),
+            _ => unreachable!("known malformed override scope"),
+        };
+        let mapping = |prefix: &str, sdk: &Path| {
+            format!(
+                "[[path_mappings]]\nfrom = '{prefix}'\nto = '{}'\n",
+                sdk.display()
+            )
+        };
+
+        write_file(&bad_main, main_source);
+        write_file(&good_main, main_source);
+        write_file(&bad_provider, provider_source);
+        write_file(&good_provider, provider_source);
+        for (directory, provider) in [
+            (&bad_project_dir, &bad_provider),
+            (&good_project_dir, &good_provider),
+        ] {
+            write_file(
+                &directory.join("Main.dproj"),
+                &format!(
+                    "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK\\source</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"{}\" /></ItemGroup></Project>",
+                    provider.display()
+                ),
+            );
+        }
+        write_file(&user_config, &mapping("C:\\SDK", bad_sdk.path()));
+        match scope {
+            "user" => {
+                write_file(&bad_override, &mapping("C:\\SDK", bad_sdk.path()));
+            }
+            "workspace" => {
+                write_file(&bad_override, &mapping("C:\\SDK", bad_sdk.path()));
+                write_file(&good_override, &mapping("C:\\SDK", good_sdk.path()));
+            }
+            "project" => {
+                write_file(&root_override, &mapping("C:\\SDK", bad_sdk.path()));
+                write_file(&bad_override, &mapping("C:\\SDK", bad_sdk.path()));
+                write_file(&good_override, &mapping("C:\\SDK", good_sdk.path()));
+            }
+            _ => unreachable!("known valid override scope"),
+        }
+
+        {
+            let mut server = TestServer::launch_with_environment_path(environment.path());
+            if scope == "workspace" {
+                server.initialize_with_workspace_folders(
+                    root.path(),
+                    &[bad.as_path(), good.as_path()],
+                    Value::Null,
+                );
+            } else {
+                server.initialize(root.path(), Value::Null);
+            }
+            let control_id = RequestId::from(format!("{scope}-valid-control"));
+            server.send_request(
+                control_id.clone(),
+                "textDocument/definition",
+                navigation_params(&bad_main, main_source, "ProviderRoutine", 0),
+            );
+            let control_locations = result_locations(server.response(&control_id));
+            assert_eq!(
+                control_locations.len(),
+                1,
+                "valid {scope} control did not navigate"
+            );
+            assert_eq!(control_locations[0]["uri"], uri(&bad_provider).to_string());
+            server.shutdown();
+        }
+
+        write_file(&malformed, "[properties]\nBad-Key = 'invalid property'\n");
+
+        let mut server = TestServer::launch_with_environment_path(environment.path());
+        if scope == "workspace" {
+            server.initialize_with_workspace_folders(
+                root.path(),
+                &[bad.as_path(), good.as_path()],
+                Value::Null,
+            );
+        } else {
+            server.initialize(root.path(), Value::Null);
+        }
+
+        let bad_context_id = RequestId::from(format!("{scope}-malformed-context"));
+        server.send_request(
+            bad_context_id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&bad_main)}}),
+        );
+        let bad_context_response = server.response(&bad_context_id);
+        assert!(
+            bad_context_response.error.is_none(),
+            "{bad_context_response:?}"
+        );
+        let bad_context = bad_context_response.result.unwrap();
+        let warnings = bad_context["warnings"]
+            .as_array()
+            .expect("malformed project context warnings");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.as_str().is_some_and(|warning| {
+                    warning.contains(&malformed.display().to_string())
+                        && warning.contains("Bad-Key")
+                })
+            }),
+            "malformed {scope} provenance was not returned: {warnings:?}"
+        );
+
+        let bad_navigation_id = RequestId::from(format!("{scope}-malformed-navigation"));
+        server.send_request(
+            bad_navigation_id.clone(),
+            "textDocument/definition",
+            navigation_params(&bad_main, main_source, "ProviderRoutine", 0),
+        );
+        assert!(
+            result_locations(server.response(&bad_navigation_id)).is_empty(),
+            "navigation used malformed {scope} overrides"
+        );
+
+        if scope != "user" {
+            let good_context_id = RequestId::from(format!("{scope}-valid-context"));
+            server.send_request(
+                good_context_id.clone(),
+                "pascal/projectContext",
+                json!({"textDocument": {"uri": uri(&good_main)}}),
+            );
+            let good_context_response = server.response(&good_context_id);
+            assert!(
+                good_context_response.error.is_none(),
+                "{good_context_response:?}"
+            );
+            let good_context = good_context_response.result.unwrap();
+            let good_warnings = good_context["warnings"]
+                .as_array()
+                .expect("valid project context warnings");
+            assert!(
+                good_warnings.iter().all(|warning| {
+                    !warning
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(&malformed.display().to_string())
+                }),
+                "malformed {scope} warning leaked into unrelated valid scope: {good_warnings:?}"
+            );
+
+            let good_navigation_id = RequestId::from(format!("{scope}-valid-navigation"));
+            server.send_request(
+                good_navigation_id.clone(),
+                "textDocument/definition",
+                navigation_params(&good_main, main_source, "ProviderRoutine", 0),
+            );
+            let good_locations = result_locations(server.response(&good_navigation_id));
+            assert_eq!(
+                good_locations.len(),
+                1,
+                "valid {scope} scope did not navigate"
+            );
+            assert_eq!(good_locations[0]["uri"], uri(&good_provider).to_string());
+        }
+
+        server.shutdown();
+    }
 }
 
 #[test]
@@ -7990,6 +11117,515 @@ fn project_explicit_dpr_unit_paths_can_load_sources_outside_workspace_root() {
 }
 
 #[test]
+fn native_unit_search_path_preserves_legacy_external_discovery_without_overrides() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let external = temp.path().join("external/ExternalUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses ExternalUnit;\nimplementation\nprocedure Run;\nbegin\n  ExternalRoutine;\nend;\nend.\n";
+    let external_source = "unit ExternalUnit;\ninterface\nprocedure ExternalRoutine;\nimplementation\nprocedure ExternalRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&external, external_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        &format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>{}</DCC_UnitSearchPath></PropertyGroup></Project>",
+            external.parent().expect("external directory").display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&project_root, Value::Null);
+    let request_id = RequestId::from("external-search-path".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "ExternalRoutine", 0),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "unexpected protocol error: {response:?}"
+    );
+    let locations = result_locations(response);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&external).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn standalone_document_directory_remains_a_legacy_native_root_without_workspace() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let provider = temp.path().join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+
+    let mut workspace = test_workspace(Vec::new(), WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+}
+
+#[cfg(unix)]
+#[test]
+fn unrelated_overrides_do_not_revoke_a_literal_native_search_path() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let external = temp.path().join("external/ExternalUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses ExternalUnit;\nimplementation\nprocedure Run;\nbegin\n  ExternalRoutine;\nend;\nend.\n";
+    let external_source = "unit ExternalUnit;\ninterface\nprocedure ExternalRoutine;\nimplementation\nprocedure ExternalRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&external, external_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        &format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>{}</DCC_UnitSearchPath></PropertyGroup></Project>",
+            external.parent().expect("external directory").display()
+        ),
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nUnrelated = 'value'\n[[path_mappings]]\nfrom = 'C:\\UNRELATED'\nto = '{}'\n",
+            temp.path().join("unrelated-destination").display()
+        ),
+    );
+
+    let mut workspace = test_workspace(vec![project_root], WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ExternalRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&external));
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_property_search_paths_do_not_authorize_external_discovery() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let external = temp.path().join("external/ExternalUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses ExternalUnit;\nimplementation\nprocedure Run;\nbegin\n  ExternalRoutine;\nend;\nend.\n";
+    let external_source = "unit ExternalUnit;\ninterface\nprocedure ExternalRoutine;\nimplementation\nprocedure ExternalRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&external, external_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nDCC_UnitSearchPath = '{}'\n",
+            external.parent().expect("external directory").display()
+        ),
+    );
+
+    let mut workspace = test_workspace(vec![project_root], WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ExternalRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        locations.is_empty(),
+        "override-configured search paths must not authorize external discovery"
+    );
+    assert_eq!(
+        workspace.parsed_document_count(),
+        1,
+        "unauthorized configured sources must not be read or indexed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn case_adjusted_mapped_explicit_references_reject_symlink_and_excluded_sources() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let project = root.join("App.dproj");
+    let sdk = temp.path().join("SDK");
+    let mapped_sdk = temp.path().join("sdk");
+    let outside = temp.path().join("outside");
+    let main_source = "unit Main;\ninterface\nuses Provider, HiddenProvider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\n  HiddenRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    let hidden_source = "unit HiddenProvider;\ninterface\nprocedure HiddenRoutine;\nimplementation\nprocedure HiddenRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"C:\\SDK\\escape\\Provider.pas\" /><DCCReference Include=\"C:\\SDK\\.git\\HiddenProvider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(&outside.join("Provider.pas"), provider_source);
+    write_file(&sdk.join(".git/HiddenProvider.pas"), hidden_source);
+    symlink(&outside, sdk.join("escape")).expect("mapped escape symlink");
+    write_file(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            mapped_sdk.display()
+        ),
+    );
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let main_uri = uri(&main);
+    let provider_locations = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        provider_locations.is_empty(),
+        "symlinked mapped explicit references must be rejected"
+    );
+    assert_eq!(
+        workspace.parsed_document_count(),
+        1,
+        "rejected mapped sources must not be read or indexed"
+    );
+
+    let hidden_locations = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "HiddenRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        hidden_locations.is_empty(),
+        "excluded mapped explicit references must be rejected"
+    );
+    assert_eq!(
+        workspace.parsed_document_count(),
+        1,
+        "excluded mapped sources must not be read or indexed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn case_adjusted_mapped_main_source_is_not_authorized_through_membership() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let project = project_root.join("App.dproj");
+    let sdk = temp.path().join("SDK");
+    let mapped_sdk = temp.path().join("sdk");
+    let outside = temp.path().join("outside");
+    let main = sdk.join("escape/Main.pas");
+    let main_source =
+        "program App;\nprocedure MainRoutine;\nbegin\nend;\nbegin\n  MainRoutine;\nend.\n";
+
+    fs::create_dir_all(&sdk).expect("mapped SDK directory");
+    fs::create_dir_all(&outside).expect("outside directory");
+    write_file(&outside.join("Main.pas"), main_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>C:\\SDK\\escape\\Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            mapped_sdk.display()
+        ),
+    );
+    symlink(&outside, sdk.join("escape")).expect("mapped escape symlink");
+
+    let mut workspace = test_workspace(
+        vec![project_root],
+        WorkspaceOptions {
+            project_file: Some(project),
+            ..WorkspaceOptions::default()
+        },
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "MainRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert!(
+        locations.is_empty(),
+        "case-adjusted mapped MainSource must be rejected"
+    );
+    assert_eq!(
+        workspace.parsed_document_count(),
+        0,
+        "rejected mapped MainSource must not be read or indexed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_native_main_and_explicit_paths_use_the_effective_mapped_root() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let project = project_root.join("App.dproj");
+    let sdk = temp.path().join("sdk");
+    let main = sdk.join("Main.pas");
+    let provider = sdk.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>$(BDS)/Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"$(BDS)/Provider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nBDS = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display(),
+            sdk.display()
+        ),
+    );
+
+    let mut workspace = test_workspace(
+        vec![project_root],
+        WorkspaceOptions {
+            project_file: Some(project),
+            ..WorkspaceOptions::default()
+        },
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_bds_mapped_dpr_membership_resolves_a_filename_mismatch_without_dcc_reference() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let project = project_root.join("App.dproj");
+    let sdk = temp.path().join("sdk");
+    let main = sdk.join("Launcher.dpr");
+    let provider = sdk.join("ProviderSource.pas");
+    let main_source = "program Launcher;\nuses Provider in 'ProviderSource.pas';\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nbegin\n  Run;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>$(BDS)\\Launcher.dpr</MainSource><BDS>C:\\SDK</BDS></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nBDS = 'C:\\SDK'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    );
+
+    let mut workspace = test_workspace(
+        vec![project_root],
+        WorkspaceOptions {
+            project_file: Some(project),
+            ..WorkspaceOptions::default()
+        },
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_native_mapped_references_reject_symlink_and_excluded_paths() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let project = project_root.join("App.dproj");
+    let sdk = temp.path().join("sdk");
+    let outside = temp.path().join("outside");
+    let main_source = "unit Main;\ninterface\nuses Provider, HiddenProvider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\n  HiddenRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    let hidden_source = "unit HiddenProvider;\ninterface\nprocedure HiddenRoutine;\nimplementation\nprocedure HiddenRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"$(BDS)/escape/Provider.pas\" /><DCCReference Include=\"$(BDS)/.git/HiddenProvider.pas\" /></ItemGroup></Project>",
+    );
+    write_file(&outside.join("Provider.pas"), provider_source);
+    write_file(&sdk.join(".git/HiddenProvider.pas"), hidden_source);
+    symlink(&outside, sdk.join("escape")).expect("mapped escape symlink");
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nBDS = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display(),
+            sdk.display()
+        ),
+    );
+
+    let mut workspace = test_workspace(vec![project_root], WorkspaceOptions::default());
+    let main_uri = uri(&main);
+    let provider_locations = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        provider_locations.is_empty(),
+        "configured mapped symlink references must be rejected"
+    );
+    assert_eq!(workspace.parsed_document_count(), 1);
+
+    let hidden_locations = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "HiddenRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        hidden_locations.is_empty(),
+        "configured mapped excluded references must be rejected"
+    );
+    assert_eq!(workspace.parsed_document_count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn client_config_selection_keeps_native_search_path_legacy_without_override() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let external = temp.path().join("external/Debug");
+    let provider = external.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        &format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>{}/$(Config)</DCC_UnitSearchPath></PropertyGroup></Project>",
+            temp.path().join("external").display()
+        ),
+    );
+
+    let mut workspace = test_workspace(
+        vec![project_root],
+        WorkspaceOptions {
+            build_config: Some("Debug".to_owned()),
+            ..WorkspaceOptions::default()
+        },
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+}
+
+#[cfg(unix)]
+#[test]
+fn client_platform_selection_keeps_native_search_path_legacy_without_override() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let external = temp.path().join("external/Win32");
+    let provider = external.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project_root.join("App.dproj"),
+        &format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>{}/$(Platform)</DCC_UnitSearchPath></PropertyGroup></Project>",
+            temp.path().join("external").display()
+        ),
+    );
+
+    let mut workspace = test_workspace(
+        vec![project_root],
+        WorkspaceOptions {
+            platform: Some("Win32".to_owned()),
+            ..WorkspaceOptions::default()
+        },
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+}
+
+#[cfg(unix)]
+#[test]
+fn client_selection_replaces_configured_property_for_source_authorization() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let project_root = temp.path().join("project");
+    let main = project_root.join("Main.pas");
+    let external = temp.path().join("external/Debug");
+    let provider = external.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project_root.join(".delphi-tools.local.toml"),
+        "[properties]\nConfig = 'FileValue'\n",
+    );
+    write_file(
+        &project_root.join("App.dproj"),
+        &format!(
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>{}/$(Config)</DCC_UnitSearchPath></PropertyGroup></Project>",
+            temp.path().join("external").display()
+        ),
+    );
+
+    let mut workspace = test_workspace(
+        vec![project_root],
+        WorkspaceOptions {
+            build_config: Some("Debug".to_owned()),
+            ..WorkspaceOptions::default()
+        },
+    );
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
+}
+
+#[test]
 fn dynamic_watcher_registration_is_conditional_and_acknowledged() {
     let (_temp, main, _provider, _main_source, _provider_source) = standard_workspace();
     let root = main.parent().expect("workspace root");
@@ -9078,7 +12714,7 @@ fn project_package_contains_resolves_case_insensitive_types_without_parsing_unre
     );
 
     let main_uri = uri(&main);
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     let locations = workspace.navigate(
         &main_uri,
         position_of(main_source, "TMDIBDatabase", 0),
@@ -9117,7 +12753,7 @@ fn direct_source_paths_override_package_contains_mappings() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>OverridePackage</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let mut workspace = Workspace::new(
+    let mut workspace = test_workspace(
         vec![root.clone()],
         WorkspaceOptions {
             source_paths: vec!["direct".to_string()],
@@ -9147,15 +12783,17 @@ fn missing_compiled_only_package_is_reported_only_when_an_import_cannot_resolve(
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>MissingCompiledPackage</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let context = ProjectContext::discover(
+    let session = OverrideSession::new(None);
+    let context = ProjectContext::discover_with_overrides(
         &main,
         std::slice::from_ref(&root),
         &pascal_lsp::ProjectOptions::default(),
+        &session,
     )
     .expect("discover project context");
     assert!(context.warnings.is_empty());
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9195,7 +12833,7 @@ fn package_name_in_an_unrelated_dpk_is_not_used_without_an_exact_filename_match(
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>RequestedPackage</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9237,7 +12875,7 @@ fn package_contains_changes_are_seen_without_file_watcher_notifications() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9295,7 +12933,7 @@ fn package_dproj_import_metadata_changes_are_seen_with_and_without_file_events()
 
     let main_uri = uri(&main);
     let mappings_uri = uri(&mappings);
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     let first = workspace.navigate(
         &main_uri,
         position_of(main_source, "MappedRoutine", 0),
@@ -9328,6 +12966,151 @@ fn package_dproj_import_metadata_changes_are_seen_with_and_without_file_events()
     );
     assert_eq!(with_event.len(), 1);
     assert_eq!(with_event[0].uri, uri(&version_three));
+}
+
+#[cfg(unix)]
+#[test]
+fn package_metadata_inherits_requesting_project_overrides_without_package_local_leakage() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let package_dir = root.join("packages");
+    let sdk_a = temp.path().join("sdk-a");
+    let sdk_b = temp.path().join("sdk-b");
+    let sdk_wrong = temp.path().join("sdk-wrong");
+    let main_source = "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n";
+    let package_project = package_dir.join("Shared.dproj");
+    let package_metadata = "<Project><PropertyGroup><MainSource>SharedMain.dpk</MainSource></PropertyGroup><Import Project=\"C:\\SDK\\Package.optset\" /></Project>";
+    let provider_source = |name: &str| {
+        format!(
+            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n// {name}\n",
+            name = name
+        )
+    };
+
+    for (project_name, sdk, provider_name, config, platform, branch) in [
+        ("A", &sdk_a, "A", "Debug", "Win32", "debug"),
+        ("B", &sdk_b, "B", "Release", "Win64", "release"),
+    ] {
+        let main = root.join(project_name).join("Main.pas");
+        write_file(&main, main_source);
+        write_file(
+            &root.join(project_name).join("App.dproj"),
+            &format!(
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource><Config>{config}</Config><Platform>{platform}</Platform><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>"
+            ),
+        );
+        write_file(
+            &sdk.join(format!("source/{branch}/SharedUnit.pas")),
+            &provider_source(provider_name),
+        );
+        write_file(
+            &sdk.join("Package.optset"),
+            &format!(
+                "<Project><ItemGroup><DCCReference Include=\"C:\\SDK\\source\\{branch}\\SharedUnit.pas\" /></ItemGroup></Project>"
+            ),
+        );
+        write_file(
+            &root.join(project_name).join(".delphi-tools.local.toml"),
+            &format!(
+                "[properties]\nBDS = 'C:\\SDK'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        );
+    }
+    write_file(&package_project, package_metadata);
+    write_file(
+        &sdk_wrong.join("source/debug/SharedUnit.pas"),
+        &provider_source("wrong package-local mapping"),
+    );
+    write_file(
+        &package_dir.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nBDS = 'C:\\SDK'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk_wrong.display()
+        ),
+    );
+
+    let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+    for (sdk, expected, branch) in [
+        (&sdk_a, "A", "debug"),
+        (&sdk_b, "B", "release"),
+        (&sdk_a, "A", "debug"),
+    ] {
+        let main = root.join(expected).join("Main.pas");
+        let locations = workspace.navigate(
+            &uri(&main),
+            position_of(main_source, "SharedRoutine", 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            locations.len(),
+            1,
+            "package lookup {expected}/{branch} should resolve"
+        );
+        assert_eq!(
+            locations[0].uri,
+            uri(&sdk.join(format!("source/{branch}/SharedUnit.pas")))
+        );
+        assert!(
+            !locations[0]
+                .uri
+                .to_file_path()
+                .unwrap()
+                .starts_with(&sdk_wrong),
+            "package-local overrides must not affect the requesting project"
+        );
+    }
+
+    let project_override = root.join("A/.delphi-tools.local.toml");
+    write_file(&project_override, "[properties]\nBDS = 'C:\\SDK'\n");
+    let mut revoked_workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+    let removed_grant = revoked_workspace.navigate(
+        &uri(&root.join("A/Main.pas")),
+        position_of(main_source, "SharedRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        removed_grant.is_empty(),
+        "removing the requesting project's mapping must revoke native package reads: {removed_grant:?}"
+    );
+}
+
+#[test]
+fn unrelated_missing_mapping_does_not_block_workspace_package_lookup() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let package = root.join("packages/Shared.dpk");
+    let provider = root.join("packages/SharedUnit.pas");
+    let main_source = "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n";
+    let provider_source = "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &package,
+        "package Shared;\ncontains\n  SharedUnit in 'SharedUnit.pas';\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>",
+    );
+    write_file(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\MissingSdk'\nto = '{}'\n",
+            temp.path().join("missing-sdk").display()
+        ),
+    );
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &uri(&main),
+        position_of(main_source, "SharedRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri(&provider));
 }
 
 fn exercise_missing_package_import_lifecycle(with_file_events: bool, exists_guard: bool) {
@@ -9363,7 +13146,7 @@ fn exercise_missing_package_import_lifecycle(with_file_events: bool, exists_guar
 
     let main_uri = uri(&main);
     let mappings_uri = uri(&mappings);
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9465,7 +13248,7 @@ fn package_lookup_limit_does_not_return_a_partial_unique_match() {
         ),
     );
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9508,7 +13291,7 @@ fn package_unit_candidate_limit_does_not_return_a_partial_unique_match() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>RequestedPackage</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9542,7 +13325,7 @@ fn oversized_package_metadata_is_skipped_without_loading_package_units() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9584,7 +13367,7 @@ fn opening_a_project_does_not_parse_package_sources_until_navigation_needs_one()
     );
 
     let main_uri = uri(&main);
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert_eq!(workspace.parsed_document_count(), 0);
     workspace
         .open_document(main_uri, main_source.to_string(), 1)
@@ -9613,7 +13396,7 @@ fn dproj_without_a_package_main_source_is_not_a_package_by_filename_alone() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>Package</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         workspace
             .navigate(
@@ -9647,7 +13430,7 @@ fn package_dproj_references_are_used_when_a_same_stem_dpk_is_unavailable() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>ProviderPackage</DCC_UsePackage></PropertyGroup></Project>",
     );
 
-    let mut workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     let locations = workspace.navigate(
         &uri(&main),
         position_of(main_source, "ProviderRoutine", 0),
@@ -9711,7 +13494,7 @@ fn bounded_package_catalogue_finds_late_packages_and_rejects_late_duplicates() {
         "unit TargetUnit;\ninterface\nprocedure TargetRoutine;\nimplementation\nprocedure TargetRoutine; begin end;\nend.\n",
     );
 
-    let mut target_workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+    let mut target_workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
     let target_locations = target_workspace.navigate(
         &uri(&target_main),
         position_of(target_source, "TargetRoutine", 0),
@@ -9720,7 +13503,7 @@ fn bounded_package_catalogue_finds_late_packages_and_rejects_late_duplicates() {
     assert_eq!(target_locations.len(), 1);
     assert_eq!(target_locations[0].uri, uri(&target_provider));
 
-    let mut duplicate_workspace = Workspace::new(vec![root], WorkspaceOptions::default());
+    let mut duplicate_workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(
         duplicate_workspace
             .navigate(
@@ -11777,6 +15560,47 @@ fn rename_allows_harmless_compiler_directive_includes_and_unrelated_conditionals
     assert!(
         response.error.is_none(),
         "harmless directives must not blanket-reject rename: {response:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&response.result.expect("rename result")),
+        HashSet::from([uri(&main).to_string()])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rename_allows_harmless_mapped_include_under_an_overlapping_legacy_root() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let include = root.join("BuildDirectives.inc");
+    let source = "unit Main;\ninterface\n{$I 'C:\\SDK\\BuildDirectives.inc'}\nconst\n  badConst = 1;\n{$IFDEF FEATURE}\nconst\n  unrelatedValue = 2;\n{$ENDIF}\nimplementation\nend.\n";
+    write_file(&include, "{$DEFINE FEATURE}\n{$METHODINFO ON}\n");
+    write_file(&main, source);
+    write_file(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            root.display()
+        ),
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("mapped-harmless-directives-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "BAD_CONST"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "harmless mapped include must not be rejected by the overlapping legacy root: {response:?}"
     );
     assert_eq!(
         workspace_edit_uris(&response.result.expect("rename result")),

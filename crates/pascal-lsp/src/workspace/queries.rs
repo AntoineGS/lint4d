@@ -1,10 +1,13 @@
 use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
-    WorkspaceInput, build_snapshot, input_source_is_readable, is_cancelled,
-    project_context_and_metadata_for_input, query_binding_info_for_input,
+    WorkspaceInput, build_snapshot, input_source_is_readable_with_owner, is_cancelled,
+    owner_for_input, project_context_and_metadata_for_input,
+    project_context_and_metadata_for_owner, query_binding_info_for_input,
     reference_binding_info_for_input, snapshot_records, source_for_input_with_cancel,
+    source_for_input_with_owner,
 };
 use crate::NavigationIndex;
+use crate::project::has_invalid_project_selection;
 use lsp_types::{
     CompletionList, DocumentHighlight, DocumentSymbol, Hover, Location, MarkupKind, Position,
     SignatureHelp, SymbolInformation, Url,
@@ -24,7 +27,11 @@ pub(crate) fn hover_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    if !input_source_is_readable(&input, &uri) {
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
         return failed(
             source_generation,
             configuration_generation,
@@ -83,7 +90,11 @@ pub(crate) fn completion_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    if !input_source_is_readable(&input, &uri) {
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
         return failed(
             source_generation,
             configuration_generation,
@@ -128,7 +139,11 @@ pub(crate) fn signature_help_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    if !input_source_is_readable(&input, &uri) {
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
         return failed(
             source_generation,
             configuration_generation,
@@ -173,7 +188,11 @@ pub(crate) fn type_definitions_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    if !input_source_is_readable(&input, &uri) {
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
         return failed(
             source_generation,
             configuration_generation,
@@ -233,7 +252,29 @@ pub(crate) fn references_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    if !input_source_is_readable(&input, &uri) {
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if has_invalid_project_selection(&owner.state.context) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!(
+                "project selection is invalid; select a current project or Automatic for {uri}"
+            ),
+        );
+    }
+    if owner.state.context.override_error.is_some() {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!(
+                "project override configuration is invalid; navigation is unavailable for {uri}"
+            ),
+        );
+    }
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
         return failed(
             source_generation,
             configuration_generation,
@@ -293,7 +334,29 @@ pub(crate) fn highlights_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    if !input_source_is_readable(&input, &uri) {
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if has_invalid_project_selection(&owner.state.context) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!(
+                "project selection is invalid; select a current project or Automatic for {uri}"
+            ),
+        );
+    }
+    if owner.state.context.override_error.is_some() {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!(
+                "project override configuration is invalid; navigation is unavailable for {uri}"
+            ),
+        );
+    }
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
         return failed(
             source_generation,
             configuration_generation,
@@ -594,22 +657,25 @@ pub(crate) fn document_symbols_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    if !input_source_is_readable(&input, &uri) {
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
         return failed(
             source_generation,
             configuration_generation,
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let (source, record) = match source_for_input_with_cancel(&input, &uri, Some(cancel)) {
+    let (source, record) = match source_for_input_with_owner(&input, &uri, &owner, Some(cancel)) {
         Ok(result) => result,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    let (context, metadata_records) =
-        match project_context_and_metadata_for_input(&input, &uri, cancel) {
-            Ok(result) => result,
-            Err(error) => return failed(source_generation, configuration_generation, error),
-        };
+    let (context, metadata_records) = match project_context_and_metadata_for_owner(&owner, cancel) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -742,11 +808,16 @@ mod tests {
         hover_from_input, references_from_input, signature_help_from_input,
         type_definitions_from_input,
     };
+    use crate::project::{
+        MetadataObservation, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
+    };
     use crate::workspace::rename::{
-        Computed, WorkspaceInput, binding_info_for_input, revalidate_input,
+        CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input, owner_for_input,
+        project_context_and_metadata_for_input, revalidate_input,
     };
     use crate::workspace::{Workspace, WorkspaceOptions, content_hash_bytes};
     use lsp_types::{MarkupKind, Position, Url};
+    use pascal_core::delphi_overrides::{EffectiveOverrides, OverrideSession};
     use std::collections::HashSet;
     #[cfg(target_os = "linux")]
     use std::ffi::CString;
@@ -754,8 +825,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+
+    fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
+        Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
 
     struct ReferenceFixture {
         _temp: TempDir,
@@ -775,7 +850,7 @@ mod tests {
         fs::create_dir_all(&external).expect("external source directory");
         fs::write(&source, source_text).expect("external source");
 
-        let workspace = Workspace::new(
+        let workspace = test_workspace(
             vec![root.clone()],
             WorkspaceOptions {
                 source_paths: vec![external.to_string_lossy().into_owned()],
@@ -859,6 +934,197 @@ mod tests {
             .expect("unrelated external ancestor files must not stale references");
     }
 
+    #[test]
+    fn owner_preflight_honors_cancellation() {
+        let fixture = query_fixture();
+        let cancel = AtomicBool::new(true);
+        let error = owner_for_input(&fixture.input, &source_uri(&fixture.provider), &cancel)
+            .expect_err("owner discovery must stop when cancellation is already requested");
+        assert_eq!(error, CANCELLATION_MESSAGE);
+    }
+
+    #[test]
+    fn automatic_context_uses_captured_overrides_after_sidecar_edit() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("project");
+        let source = root.join("App.pas");
+        let project = root.join("App.dproj");
+        let overrides = root.join(".delphi-tools.local.toml");
+        fs::create_dir_all(&root).expect("project directory");
+        fs::write(&source, "unit App;\ninterface\nimplementation\nend.\n").expect("source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("project");
+        fs::write(&overrides, "[properties]\nDCC_Define = 'CAPTURED'\n")
+            .expect("captured override");
+
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        fs::write(&overrides, "[properties]\nDCC_Define = 'LIVE'\n").expect("edited override");
+
+        let cancel = AtomicBool::new(false);
+        let (context, _) =
+            project_context_and_metadata_for_input(&input, &source_uri(&source), &cancel)
+                .expect("automatic project discovery");
+        assert_eq!(context.project_file, Some(project));
+        assert_eq!(context.defines, vec!["CAPTURED"]);
+    }
+
+    #[test]
+    fn assistance_preflight_propagates_cancellation_during_owner_discovery() {
+        let fixture = query_fixture();
+        let cancel = AtomicBool::new(false);
+        let _guard = crate::project::test_cancel_project_scan_after_checks(0);
+
+        let computed = hover_from_input(
+            fixture.input,
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            MarkupKind::PlainText,
+            &cancel,
+        );
+
+        assert_eq!(computed.value, Err(CANCELLATION_MESSAGE.to_string()));
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn document_symbols_revalidate_an_external_legacy_optset_payload() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let project_root = temp.path().join("project");
+        let shared_root = temp.path().join("shared");
+        let source = project_root.join("App.pas");
+        let project = project_root.join("App.dproj");
+        let settings = shared_root.join("settings.optset");
+        fs::create_dir_all(&project_root).expect("project directory");
+        fs::create_dir_all(&shared_root).expect("shared directory");
+        fs::write(
+            &source,
+            "unit App;\ninterface\nconst StableValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.pas</MainSource></PropertyGroup><Import Project=\"../shared/settings.optset\" /></Project>",
+        )
+        .expect("project");
+        fs::write(
+            &settings,
+            "<Project><PropertyGroup><DCC_Define>EXTERNAL_SETTINGS</DCC_Define></PropertyGroup></Project>",
+        )
+        .expect("external option set");
+
+        let workspace = test_workspace(vec![project_root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed = document_symbols_from_input(input.clone(), &source_uri(&source), &cancel);
+        assert!(
+            computed.value.is_ok(),
+            "document symbols: {:?}",
+            computed.value
+        );
+        let record = computed
+            .records
+            .iter()
+            .find(|record| record.path.as_deref() == Some(settings.as_path()))
+            .expect("external option-set record");
+        assert!(
+            record.content_bytes.is_some(),
+            "payload bytes must be retained"
+        );
+        assert!(
+            record.read_policy.is_some(),
+            "payload authorization must be retained"
+        );
+        assert_eq!(
+            record.path_entry.as_ref().map(|entry| &entry.provenance),
+            Some(&ProjectPathProvenance::LegacyNative),
+        );
+
+        revalidate_input(&input, &computed.records, &cancel)
+            .expect("unchanged external option set must revalidate");
+        fs::write(
+            &settings,
+            "<Project><PropertyGroup><DCC_Define>CHANGED_SETTINGS</DCC_Define></PropertyGroup></Project>",
+        )
+        .expect("changed external option set");
+        revalidate_input(&input, &computed.records, &cancel)
+            .expect_err("changed external option set must stale document symbols");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn references_include_an_unopened_consumer_under_the_requesting_mapping() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("project");
+        let sdk = temp.path().join("sdk");
+        let main = root.join("Main.pas");
+        let provider = sdk.join("Provider.pas");
+        let consumer = sdk.join("Consumer.pas");
+        fs::create_dir_all(&root).expect("project directory");
+        fs::create_dir_all(&sdk).expect("SDK directory");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider source");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("consumer source");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project metadata");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("path mapping");
+
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let main_uri = source_uri(&main);
+        let provider_uri = source_uri(&provider);
+        let declaration = workspace.navigate(
+            &main_uri,
+            Position::new(6, 6),
+            crate::NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            declaration.first().map(|location| &location.uri),
+            Some(&provider_uri),
+            "the fixture must load the mapped provider before capturing its owner"
+        );
+
+        let input = workspace.analysis_input();
+        let computed = references_from_input(
+            input,
+            &provider_uri,
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let locations = computed.value.expect("mapped references should complete");
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.uri == source_uri(&consumer)),
+            "unopened mapped consumer was not included: {locations:?}"
+        );
+    }
+
     struct QueryFixture {
         _temp: TempDir,
         provider: PathBuf,
@@ -879,7 +1145,7 @@ mod tests {
         fs::write(&provider, &provider_source).expect("provider source");
         fs::write(&consumer, &consumer_source).expect("consumer source");
         let workspace =
-            Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
         QueryFixture {
             _temp: temp,
             provider,
@@ -1445,18 +1711,62 @@ mod tests {
         let lower_source = "package lowerpackage;\ncontains\nend.\n";
         fs::write(&upper, upper_source).expect("uppercase package descriptor");
         fs::write(&lower, lower_source).expect("lowercase package descriptor");
-        let upper_read = crate::project::read_package_metadata(&upper).expect("upper package read");
-        let lower_read = crate::project::read_package_metadata(&lower).expect("lower package read");
-        assert_eq!(upper_read.observations.len(), 1);
-        assert_eq!(lower_read.observations.len(), 1);
-        assert_eq!(upper_read.observations[0].path, upper);
-        assert_eq!(lower_read.observations[0].path, lower);
+        let roots = vec![temp.path().to_path_buf()];
+        let overrides = EffectiveOverrides::default();
+        let read_policy = ReadPolicy::new(&roots, &[], &[], &overrides);
+        let options = ProjectOptions::default();
+        let upper_entry = ProjectPathEntry {
+            path: upper.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        };
+        let lower_entry = ProjectPathEntry {
+            path: lower.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        };
+        let upper_read = crate::project::read_package_metadata(
+            &upper,
+            &options,
+            &overrides,
+            &read_policy,
+            &upper_entry,
+        )
+        .expect("upper package read");
+        let lower_read = crate::project::read_package_metadata(
+            &lower,
+            &options,
+            &overrides,
+            &read_policy,
+            &lower_entry,
+        )
+        .expect("lower package read");
+        let upper_observation = upper_read
+            .metadata_observations
+            .iter()
+            .find_map(|observation| match observation {
+                MetadataObservation::Payload {
+                    path, content_hash, ..
+                } if path == &upper => Some((path, *content_hash)),
+                _ => None,
+            })
+            .expect("upper payload observation");
+        let lower_observation = lower_read
+            .metadata_observations
+            .iter()
+            .find_map(|observation| match observation {
+                MetadataObservation::Payload {
+                    path, content_hash, ..
+                } if path == &lower => Some((path, *content_hash)),
+                _ => None,
+            })
+            .expect("lower payload observation");
+        assert_eq!(upper_observation.0, &upper);
+        assert_eq!(lower_observation.0, &lower);
         assert_eq!(
-            upper_read.observations[0].content_hash,
+            upper_observation.1,
             content_hash_bytes(upper_source.as_bytes())
         );
         assert_eq!(
-            lower_read.observations[0].content_hash,
+            lower_observation.1,
             content_hash_bytes(lower_source.as_bytes())
         );
     }

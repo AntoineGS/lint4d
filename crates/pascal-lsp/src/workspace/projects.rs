@@ -160,7 +160,14 @@ impl Workspace {
 
         // Discover before mutating the live workspace. A malformed or otherwise
         // unavailable candidate must not leave a half-installed override.
-        discover_with_selections(&path, &roots, &self.project_options(), &tentative)?;
+        discover_with_selections(
+            &path,
+            &roots,
+            &self.project_options(),
+            &tentative,
+            &self.overrides,
+            &self.options.exclude,
+        )?;
 
         self.project_selections = tentative;
         self.document_owners.remove(&uri);
@@ -245,6 +252,7 @@ impl Workspace {
         self.contexts.clear();
         self.document_contexts.clear();
         self.open_document_contexts.clear();
+        self.clear_legacy_route_proofs();
         self.directory_catalogues.clear();
         self.filename_catalogues.clear();
         self.package_catalogues.clear();

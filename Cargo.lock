@@ -853,6 +853,7 @@ dependencies = [
  "quick-xml",
  "serde",
  "tempfile",
+ "toml",
  "tree-sitter",
  "tree-sitter-language",
  "tree-sitter-pascal 0.11.0",

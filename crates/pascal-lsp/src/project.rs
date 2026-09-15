@@ -4,12 +4,18 @@
 //! the small amount of project metadata needed by navigation, preserves
 //! ambiguity, and reports anything it cannot safely interpret as a warning.
 
+use pascal_core::delphi_overrides::{
+    EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
+};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
+use std::io::{self, Read};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
@@ -57,6 +63,496 @@ pub(crate) struct ProjectCandidateMembership {
     pub(crate) readable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ProjectPathProvenance {
+    LegacyNative,
+    Configured,
+    Mapped { root: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProjectPathEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) provenance: ProjectPathProvenance,
+}
+
+#[derive(Debug, Clone)]
+struct ProvenanceRange {
+    range: Range<usize>,
+    provenance: ProjectPathProvenance,
+}
+
+impl ProjectPathEntry {
+    pub(crate) fn legacy(path: PathBuf) -> Self {
+        Self {
+            path,
+            provenance: ProjectPathProvenance::LegacyNative,
+        }
+    }
+
+    fn resolved(path: PathBuf, resolved: &ResolvedPath, configured: bool) -> Self {
+        let provenance = resolved.mapping.as_ref().map_or_else(
+            || {
+                if configured {
+                    ProjectPathProvenance::Configured
+                } else {
+                    ProjectPathProvenance::LegacyNative
+                }
+            },
+            |mapping| ProjectPathProvenance::Mapped {
+                root: resolved_mapping_root(mapping),
+            },
+        );
+        Self { path, provenance }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AuthorizedReadRoot {
+    path: PathBuf,
+    pattern_exclusion_bases: Vec<PathBuf>,
+}
+
+/// Immutable, requester-scoped authorization for project metadata and source
+/// payloads.  The policy deliberately keeps configured native roots separate
+/// from mapping provenance: a mapped entry may only use its selected mapping
+/// root, while a configured native entry may use one of the requester's
+/// workspace, source-path, or effective mapping destinations.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReadPolicy {
+    configured_roots: Vec<AuthorizedReadRoot>,
+    mapped_roots: Vec<AuthorizedReadRoot>,
+    exclusions: Vec<String>,
+    exclusion_bases: Vec<PathBuf>,
+    compiled_exclusions: Arc<Option<globset::GlobSet>>,
+}
+
+impl PartialEq for ReadPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.configured_roots == other.configured_roots
+            && self.mapped_roots == other.mapped_roots
+            && self.exclusions == other.exclusions
+            && self.exclusion_bases == other.exclusion_bases
+    }
+}
+
+impl Eq for ReadPolicy {}
+
+impl Hash for ReadPolicy {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.configured_roots.hash(state);
+        self.mapped_roots.hash(state);
+        self.exclusions.hash(state);
+        self.exclusion_bases.hash(state);
+    }
+}
+
+impl ReadPolicy {
+    pub(crate) fn new(
+        roots: &[PathBuf],
+        source_paths: &[String],
+        exclusions: &[String],
+        overrides: &EffectiveOverrides,
+    ) -> Self {
+        let mut configured_roots = Vec::new();
+        for root in roots {
+            let root = absolute_lexical(root).unwrap_or_else(|_| root.to_path_buf());
+            add_unique_path(&mut configured_roots, root.clone());
+            for source in source_paths {
+                let source = PathBuf::from(source);
+                let source = if source.is_absolute() {
+                    source
+                } else {
+                    root.join(source)
+                };
+                let source = absolute_lexical(&source).unwrap_or(source);
+                add_unique_path(&mut configured_roots, source);
+            }
+        }
+        for source in source_paths {
+            let source = PathBuf::from(source);
+            if source.is_absolute() {
+                let source = absolute_lexical(&source).unwrap_or(source);
+                add_unique_path(&mut configured_roots, source);
+            }
+        }
+
+        let mut mapped_roots = Vec::new();
+        for mapping in &overrides.path_mappings {
+            add_unique_path(&mut mapped_roots, resolved_mapping_root(mapping));
+        }
+
+        let mut exclusion_bases = configured_roots.clone();
+        exclusion_bases.extend(mapped_roots.iter().cloned());
+        let mut unique_exclusion_bases = Vec::new();
+        for base in exclusion_bases {
+            add_unique_path(&mut unique_exclusion_bases, base);
+        }
+        let configured_roots = configured_roots
+            .into_iter()
+            .map(|path| AuthorizedReadRoot {
+                path,
+                pattern_exclusion_bases: unique_exclusion_bases.clone(),
+            })
+            .collect();
+        let mapped_roots = mapped_roots
+            .into_iter()
+            .map(|path| AuthorizedReadRoot {
+                path,
+                pattern_exclusion_bases: unique_exclusion_bases.clone(),
+            })
+            .collect();
+
+        Self {
+            configured_roots,
+            mapped_roots,
+            exclusions: exclusions.to_vec(),
+            exclusion_bases: unique_exclusion_bases,
+            compiled_exclusions: Arc::new(compile_exclude_patterns(exclusions)),
+        }
+    }
+
+    pub(crate) fn allows_entry(&self, entry: &ProjectPathEntry) -> bool {
+        match &entry.provenance {
+            ProjectPathProvenance::LegacyNative => {
+                safe_regular_file(&entry.path) && !self.is_excluded(&entry.path)
+            }
+            ProjectPathProvenance::Configured => self
+                .configured_roots
+                .iter()
+                .chain(self.mapped_roots.iter())
+                .any(|root| {
+                    self.allows_regular_file_under_root(&entry.path, &root.path)
+                        && !self.is_excluded_for_root(&entry.path, root)
+                }),
+            ProjectPathProvenance::Mapped { root } => {
+                !self.is_excluded_for_mapped_root(&entry.path, root)
+                    && self.allows_regular_file_under_root(&entry.path, root)
+            }
+        }
+    }
+
+    pub(crate) fn allows_location(&self, entry: &ProjectPathEntry) -> bool {
+        match &entry.provenance {
+            ProjectPathProvenance::LegacyNative => {
+                path_has_no_symlink_component(&entry.path) && !self.is_excluded(&entry.path)
+            }
+            ProjectPathProvenance::Configured => self
+                .configured_roots
+                .iter()
+                .chain(self.mapped_roots.iter())
+                .any(|root| {
+                    self.allows_location_under_root(&entry.path, &root.path)
+                        && !self.is_excluded_for_root(&entry.path, root)
+                }),
+            ProjectPathProvenance::Mapped { root } => {
+                !self.is_excluded_for_mapped_root(&entry.path, root)
+                    && self.allows_location_under_root(&entry.path, root)
+            }
+        }
+    }
+
+    pub(crate) fn entry_for_path(&self, path: &Path) -> Option<ProjectPathEntry> {
+        self.mapped_roots
+            .iter()
+            .filter(|root| project_path_starts_with(path, &root.path))
+            .max_by_key(|root| root.path.components().count())
+            .map(|root| ProjectPathEntry {
+                path: path.to_path_buf(),
+                provenance: ProjectPathProvenance::Mapped {
+                    root: root.path.clone(),
+                },
+            })
+            .or_else(|| {
+                self.configured_roots
+                    .iter()
+                    .filter(|root| project_path_starts_with(path, &root.path))
+                    .max_by_key(|root| root.path.components().count())
+                    .map(|_| ProjectPathEntry {
+                        path: path.to_path_buf(),
+                        provenance: ProjectPathProvenance::Configured,
+                    })
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn allows_path(&self, path: &Path, provenance: &ProjectPathProvenance) -> bool {
+        self.allows_location(&ProjectPathEntry {
+            path: path.to_path_buf(),
+            provenance: provenance.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn identity(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn read_payload_with_observation(
+        &self,
+        entry: &ProjectPathEntry,
+        limit: u64,
+    ) -> Result<(String, MetadataObservation), String> {
+        let stamp = crate::workspace::path_stamp_result(&entry.path)
+            .ok()
+            .flatten();
+        let bytes = self.read_payload_bytes(entry, limit)?;
+        let content_hash = crate::workspace::content_hash_bytes(&bytes);
+        let observation = MetadataObservation::Payload {
+            path: entry.path.clone(),
+            read_policy: self.clone(),
+            path_entry: entry.clone(),
+            stamp,
+            content_hash,
+        };
+        let contents =
+            String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))?;
+        Ok((contents, observation))
+    }
+
+    pub(crate) fn read_payload_bytes(
+        &self,
+        entry: &ProjectPathEntry,
+        limit: u64,
+    ) -> Result<Vec<u8>, String> {
+        if !self.allows_entry(entry) {
+            return Err("payload path is not authorized".to_string());
+        }
+        self.read_payload_bytes_after_authorization(entry, limit, false)
+    }
+
+    pub(crate) fn allows_legacy_payload_entry(&self, entry: &ProjectPathEntry) -> bool {
+        self.allows_legacy_route_entry(entry)
+            && fs::metadata(&entry.path).is_ok_and(|metadata| metadata.is_file())
+    }
+
+    pub(crate) fn allows_legacy_route_entry(&self, entry: &ProjectPathEntry) -> bool {
+        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+            && !self.is_excluded(&entry.path)
+    }
+
+    pub(crate) fn read_legacy_payload_bytes(
+        &self,
+        entry: &ProjectPathEntry,
+        limit: u64,
+    ) -> Result<Vec<u8>, String> {
+        if !self.allows_legacy_payload_entry(entry) {
+            return Err("payload path is not authorized".to_string());
+        }
+        self.read_payload_bytes_after_authorization(entry, limit, true)
+    }
+
+    fn read_payload_bytes_after_authorization(
+        &self,
+        entry: &ProjectPathEntry,
+        limit: u64,
+        allow_legacy_symlink: bool,
+    ) -> Result<Vec<u8>, String> {
+        let metadata = fs::symlink_metadata(&entry.path)
+            .map_err(|error| format!("could not inspect file: {error}"))?;
+        if metadata.file_type().is_symlink() && !allow_legacy_symlink {
+            return Err("path is not a regular file".to_string());
+        }
+        if !metadata.file_type().is_symlink() && !metadata.is_file() {
+            return Err("path is not a regular file".to_string());
+        }
+        let file = open_payload_file(&entry.path)
+            .map_err(|error| format!("could not open file: {error}"))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|error| format!("could not stat opened file: {error}"))?;
+        if !opened_metadata.is_file() {
+            return Err("opened path is not a regular file".to_string());
+        }
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("could not read file: {error}"))?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("file exceeds the {limit} byte safety limit"));
+        }
+        Ok(bytes)
+    }
+
+    fn allows_regular_file_under_root(&self, path: &Path, root: &Path) -> bool {
+        self.allows_location_under_root(path, root) && safe_regular_file(path)
+    }
+
+    fn allows_location_under_root(&self, path: &Path, root: &Path) -> bool {
+        project_path_starts_with(path, root) && path_has_no_symlink_component(path)
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        self.is_excluded_under_bases(path, &self.exclusion_bases)
+    }
+
+    fn is_excluded_for_root(&self, path: &Path, root: &AuthorizedReadRoot) -> bool {
+        project_relative_path(path, &root.path)
+            .is_some_and(|relative| relative.components().any(is_default_excluded_component))
+            || self.matches_exclusion_patterns(path, &root.pattern_exclusion_bases)
+    }
+
+    fn is_excluded_for_mapped_root(&self, path: &Path, root: &Path) -> bool {
+        project_relative_path(path, root)
+            .is_some_and(|relative| relative.components().any(is_default_excluded_component))
+            || self.matches_exclusion_patterns(path, &self.exclusion_bases)
+    }
+
+    fn is_excluded_under_bases(&self, path: &Path, bases: &[PathBuf]) -> bool {
+        bases.iter().any(|base| {
+            let Some(relative) = project_relative_path(path, base) else {
+                return false;
+            };
+            if relative.components().any(is_default_excluded_component) {
+                return true;
+            }
+            self.matches_exclusion_patterns_for_relative(&relative)
+        })
+    }
+
+    fn matches_exclusion_patterns(&self, path: &Path, bases: &[PathBuf]) -> bool {
+        bases.iter().any(|base| {
+            project_relative_path(path, base)
+                .is_some_and(|relative| self.matches_exclusion_patterns_for_relative(&relative))
+        })
+    }
+
+    fn matches_exclusion_patterns_for_relative(&self, relative: &Path) -> bool {
+        let Some(patterns) = self.compiled_exclusions.as_ref() else {
+            return false;
+        };
+        let mut prefix = PathBuf::new();
+        relative.components().any(|component| {
+            prefix.push(component.as_os_str());
+            patterns.is_match(prefix.to_string_lossy().replace('\\', "/"))
+        })
+    }
+}
+
+/// A metadata path observed during evaluation.  Stat-only observations are
+/// retained for freshness and precedence, but never authorize a later
+/// payload read.  Payload observations carry the exact policy and path entry
+/// that authorized the original read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MetadataObservation {
+    Stat {
+        path: PathBuf,
+    },
+    Payload {
+        path: PathBuf,
+        read_policy: ReadPolicy,
+        path_entry: ProjectPathEntry,
+        stamp: Option<crate::workspace::PathStamp>,
+        content_hash: u64,
+    },
+}
+
+impl MetadataObservation {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Stat { path } | Self::Payload { path, .. } => path,
+        }
+    }
+}
+
+fn compile_exclude_patterns(patterns: &[String]) -> Option<globset::GlobSet> {
+    let mut builder = globset::GlobSetBuilder::new();
+    let mut valid_pattern_count = 0;
+    for pattern in patterns {
+        let normalized = pattern.replace('\\', "/");
+        let glob = {
+            #[cfg(windows)]
+            {
+                globset::GlobBuilder::new(&normalized)
+                    .case_insensitive(true)
+                    .build()
+            }
+            #[cfg(not(windows))]
+            {
+                globset::Glob::new(&normalized)
+            }
+        };
+        if let Ok(glob) = glob {
+            builder.add(glob);
+            valid_pattern_count += 1;
+        }
+    }
+    (valid_pattern_count > 0)
+        .then(|| builder.build().ok())
+        .flatten()
+}
+
+fn project_relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
+    let path_components = path.components().collect::<Vec<_>>();
+    let root_components = root.components().collect::<Vec<_>>();
+    if path_components.len() < root_components.len()
+        || !path_components
+            .iter()
+            .zip(root_components.iter())
+            .all(|(path, root)| project_components_equal(*path, *root))
+    {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for component in &path_components[root_components.len()..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
+fn is_default_excluded_component(component: Component<'_>) -> bool {
+    let Component::Normal(name) = component else {
+        return false;
+    };
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    const DEFAULT_EXCLUDED_COMPONENTS: &[&str] = &[
+        ".git",
+        ".worktrees",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vscode",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "coverage",
+    ];
+    #[cfg(windows)]
+    {
+        DEFAULT_EXCLUDED_COMPONENTS
+            .iter()
+            .any(|excluded| name.eq_ignore_ascii_case(excluded))
+    }
+    #[cfg(not(windows))]
+    {
+        DEFAULT_EXCLUDED_COMPONENTS.contains(&name)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_payload_file(path: &Path) -> io::Result<fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Linux's UAPI O_NONBLOCK prevents a replaced FIFO from blocking between
+    // the stat-only check and the actual open.
+    const O_NONBLOCK: i32 = 0o4000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_payload_file(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
 #[derive(Debug, Default)]
 struct ProjectDirectoryEntries {
     dproj: Vec<PathBuf>,
@@ -74,17 +570,31 @@ pub struct ProjectContext {
     pub main_source: Option<PathBuf>,
     /// Ordered project and client-provided unit search paths.
     pub search_paths: Vec<PathBuf>,
+    /// The same search paths tagged with their source provenance. This keeps
+    /// legacy native roots distinct from configured and mapped roots.
+    pub(crate) search_path_entries: Vec<ProjectPathEntry>,
+    /// MainSource and explicit references retain the provenance of the path
+    /// expression that produced them so membership cannot bypass mapped-root
+    /// safety checks.
+    pub(crate) main_source_entry: Option<ProjectPathEntry>,
+    pub(crate) explicit_unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
     /// Ordered project-relative include paths from DCC_IncludePath.
     ///
     /// Include paths are kept separate from unit search paths because include
     /// lookup must not make an arbitrary directory a Pascal unit candidate.
     pub include_paths: Vec<PathBuf>,
+    /// Include paths retain their source provenance for read authorization.
+    pub(crate) include_path_entries: Vec<ProjectPathEntry>,
     pub explicit_units: HashMap<String, Vec<PathBuf>>,
     pub unit_namespaces: Vec<String>,
     pub unit_aliases: HashMap<String, String>,
     pub defines: Vec<String>,
     pub config: Option<String>,
     pub platform: Option<String>,
+    /// The immutable Delphi override snapshot used to evaluate this context.
+    pub overrides: EffectiveOverrides,
+    /// The requester-scoped read policy used while evaluating this context.
+    pub(crate) read_policy: ReadPolicy,
     /// Ordered, case-insensitively unique package names from DCC_UsePackage.
     /// Package exports are resolved lazily and are not merged into the unit
     /// search paths or the project-wide unit index.
@@ -93,7 +603,11 @@ pub struct ProjectContext {
     /// candidate files used to build the context. Consumers can revalidate
     /// these paths without rediscovering or reparsing unrelated source files.
     pub metadata_files: Vec<PathBuf>,
+    /// The authorization provenance for each metadata observation. A path in
+    /// `metadata_files` without a payload observation is stat-only.
+    pub(crate) metadata_observations: Vec<MetadataObservation>,
     pub warnings: Vec<String>,
+    pub(crate) override_error: Option<String>,
 }
 
 /// One file observation captured at the read which supplied bytes to project
@@ -175,11 +689,14 @@ impl ProjectReadTracker {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PackageMetadata {
     pub units: HashMap<String, Vec<PathBuf>>,
+    pub unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
     pub warnings: Vec<String>,
     pub metadata_files: Vec<PathBuf>,
+    pub metadata_observations: Vec<MetadataObservation>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct PackageMetadataRead {
     pub(crate) metadata: PackageMetadata,
     pub(crate) observations: Vec<ProjectReadObservation>,
@@ -197,7 +714,39 @@ impl ProjectContext {
         workspace_roots: &[PathBuf],
         options: &ProjectOptions,
     ) -> Result<Self, String> {
-        discover_context(file, workspace_roots, options)
+        let (overrides, warnings) = production_override_session();
+        discover_context_with_selections(
+            file,
+            workspace_roots,
+            options,
+            &ProjectSelections::new(),
+            &overrides,
+            warnings,
+            &[],
+            None,
+        )
+        .map(|discovery| discovery.context)
+    }
+
+    /// Discover a project context using an explicitly captured override
+    /// session. Injected sessions never consult the process environment.
+    pub fn discover_with_overrides(
+        file: &Path,
+        workspace_roots: &[PathBuf],
+        options: &ProjectOptions,
+        overrides: &OverrideSession,
+    ) -> Result<Self, String> {
+        discover_context_with_selections(
+            file,
+            workspace_roots,
+            options,
+            &ProjectSelections::new(),
+            overrides,
+            Vec::new(),
+            &[],
+            None,
+        )
+        .map(|discovery| discovery.context)
     }
 }
 
@@ -208,6 +757,15 @@ pub fn discover(
     options: &ProjectOptions,
 ) -> Result<ProjectContext, String> {
     ProjectContext::discover(file, workspace_roots, options)
+}
+
+fn production_override_session() -> (OverrideSession, Vec<String>) {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match user_config_path(xdg.as_deref(), home.as_deref()) {
+        Ok(path) => (OverrideSession::new(Some(path)), Vec::new()),
+        Err(error) => (OverrideSession::new(None), vec![error]),
+    }
 }
 
 pub(crate) fn project_candidates(
@@ -236,20 +794,43 @@ pub(crate) fn discover_with_selections(
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
     selections: &ProjectSelections,
+    overrides: &OverrideSession,
+    exclusions: &[String],
 ) -> Result<ProjectContext, String> {
-    discover_with_selections_and_observations(file, workspace_roots, options, selections)
-        .map(|discovery| discovery.context)
+    discover_context_with_selections(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        overrides,
+        Vec::new(),
+        exclusions,
+        None,
+    )
+    .map(|discovery| discovery.context)
 }
 
+#[allow(dead_code)]
 pub(crate) fn discover_with_selections_and_observations(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
     selections: &ProjectSelections,
 ) -> Result<ProjectDiscovery, String> {
-    discover_context_with_selections(file, workspace_roots, options, selections, None)
+    let (overrides, warnings) = production_override_session();
+    discover_context_with_selections(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        &overrides,
+        warnings,
+        &[],
+        None,
+    )
 }
 
+#[allow(dead_code)]
 pub(crate) fn discover_with_selections_and_observations_with_cancel(
     file: &Path,
     workspace_roots: &[PathBuf],
@@ -257,35 +838,96 @@ pub(crate) fn discover_with_selections_and_observations_with_cancel(
     selections: &ProjectSelections,
     cancel: &AtomicBool,
 ) -> Result<ProjectDiscovery, String> {
-    discover_context_with_selections(file, workspace_roots, options, selections, Some(cancel))
+    let (overrides, warnings) = production_override_session();
+    discover_context_with_selections(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        &overrides,
+        warnings,
+        &[],
+        Some(cancel),
+    )
 }
 
+pub(crate) fn discover_with_selections_and_observations_with_overrides(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+    overrides: &OverrideSession,
+    exclusions: &[String],
+) -> Result<ProjectDiscovery, String> {
+    discover_context_with_selections(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        overrides,
+        Vec::new(),
+        exclusions,
+        None,
+    )
+}
+
+pub(crate) fn discover_with_selections_and_observations_with_cancel_and_overrides(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+    overrides: &OverrideSession,
+    exclusions: &[String],
+    cancel: &AtomicBool,
+) -> Result<ProjectDiscovery, String> {
+    discover_context_with_selections(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        overrides,
+        Vec::new(),
+        exclusions,
+        Some(cancel),
+    )
+}
+
+#[allow(dead_code)]
 fn discover_context(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
 ) -> Result<ProjectContext, String> {
+    let (overrides, warnings) = production_override_session();
     discover_context_with_selections(
         file,
         workspace_roots,
         options,
         &ProjectSelections::new(),
+        &overrides,
+        warnings,
+        &[],
         None,
     )
     .map(|discovery| discovery.context)
 }
 
+// Discovery orchestration keeps the immutable request inputs, observation
+// tracker, and cancellation token explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn discover_context_with_selections(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
     selections: &ProjectSelections,
+    overrides: &OverrideSession,
+    mut warnings: Vec<String>,
+    exclusions: &[String],
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectDiscovery, String> {
     check_project_scan_cancel(cancel)?;
     let mut read_tracker = ProjectReadTracker::default();
     let absolute_file = absolute_lexical(file)?;
-    let mut warnings = Vec::new();
     let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
     let relevant_root = relevant_workspace_root(&file_path, &roots);
@@ -304,16 +946,18 @@ fn discover_context_with_selections(
             Ok(candidates) => candidates,
             Err(error) => {
                 warnings.push(error);
-                return build_standalone_context(
+                let context = build_standalone_context_with_overrides(
                     &file_path,
                     &roots,
                     options,
                     warnings,
                     false,
                     Vec::new(),
-                    cancel,
-                )
-                .map(|context| read_tracker.into_discovery(context));
+                    Vec::new(),
+                    overrides,
+                    exclusions,
+                )?;
+                return Ok(read_tracker.into_discovery(context));
             }
         };
         runtime_project_selection(&file_path, &candidates, selections).map(|(scope, requested)| {
@@ -334,15 +978,24 @@ fn discover_context_with_selections(
                 requested.display(),
                 scope.display()
             ));
-            return build_standalone_context(
-                &file_path, &roots, options, warnings, false, candidates, cancel,
-            )
-            .map(|context| read_tracker.into_discovery(context));
+            let context = build_standalone_context_with_overrides(
+                &file_path,
+                &roots,
+                options,
+                warnings,
+                false,
+                candidates,
+                Vec::new(),
+                overrides,
+                exclusions,
+            )?;
+            return Ok(read_tracker.into_discovery(context));
         };
         ProjectSelection::Selected {
             path: project_file,
             explicit: true,
             metadata_files: candidates,
+            metadata_observations: Vec::new(),
         }
     } else if let Some(project_file) = &options.project_file {
         explicit_project_file(project_file, &roots, &file_path, &mut warnings)
@@ -352,9 +1005,11 @@ fn discover_context_with_selections(
             relevant_root.as_deref(),
             &roots,
             options,
+            overrides,
             &mut warnings,
             &mut read_tracker,
             cancel,
+            exclusions,
         )
     };
     check_project_scan_cancel(cancel)?;
@@ -364,37 +1019,87 @@ fn discover_context_with_selections(
             path: project_file,
             explicit,
             metadata_files,
-        } => build_project_context(
-            project_file,
-            &file_path,
-            &roots,
-            options,
-            warnings,
-            explicit,
+            metadata_observations,
+        } => {
+            let effective_overrides =
+                match effective_overrides_for_project(&project_file, &roots, overrides) {
+                    Ok(overrides) => overrides,
+                    Err(error) => {
+                        warnings.push(error.clone());
+                        let mut context = build_project_context(
+                            project_file,
+                            &file_path,
+                            &roots,
+                            options,
+                            EffectiveOverrides::default(),
+                            warnings,
+                            explicit,
+                            metadata_files,
+                            metadata_observations.clone(),
+                            exclusions,
+                            &mut read_tracker,
+                            cancel,
+                        )?;
+                        context.discovery_complete = false;
+                        context.override_error = Some(error);
+                        return Ok(read_tracker.into_discovery(context));
+                    }
+                };
+            let context = build_project_context(
+                project_file,
+                &file_path,
+                &roots,
+                options,
+                effective_overrides,
+                warnings,
+                explicit,
+                metadata_files,
+                metadata_observations,
+                exclusions,
+                &mut read_tracker,
+                cancel,
+            )?;
+            Ok(read_tracker.into_discovery(context))
+        }
+        ProjectSelection::Standalone {
             metadata_files,
-            &mut read_tracker,
-            cancel,
-        ),
-        ProjectSelection::Standalone { metadata_files } => build_standalone_context(
-            &file_path,
-            &roots,
-            options,
-            warnings,
-            true,
+            metadata_observations,
+        } => {
+            let context = build_standalone_context_with_overrides(
+                &file_path,
+                &roots,
+                options,
+                warnings,
+                true,
+                metadata_files,
+                metadata_observations,
+                overrides,
+                exclusions,
+            )?;
+            Ok(read_tracker.into_discovery(context))
+        }
+        ProjectSelection::Incomplete {
             metadata_files,
-            cancel,
-        ),
-        ProjectSelection::Incomplete { metadata_files } => build_standalone_context(
-            &file_path,
-            &roots,
-            options,
-            warnings,
-            false,
-            metadata_files,
-            cancel,
-        ),
+            metadata_observations,
+            override_error,
+        } => {
+            let mut context = build_standalone_context_with_overrides(
+                &file_path,
+                &roots,
+                options,
+                warnings,
+                false,
+                metadata_files,
+                metadata_observations,
+                overrides,
+                exclusions,
+            )?;
+            if override_error.is_some() {
+                context.override_error = override_error;
+            }
+            Ok(read_tracker.into_discovery(context))
+        }
     }
-    .map(|context| read_tracker.into_discovery(context))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,12 +1108,16 @@ enum ProjectSelection {
         path: PathBuf,
         explicit: bool,
         metadata_files: Vec<PathBuf>,
+        metadata_observations: Vec<MetadataObservation>,
     },
     Standalone {
         metadata_files: Vec<PathBuf>,
+        metadata_observations: Vec<MetadataObservation>,
     },
     Incomplete {
         metadata_files: Vec<PathBuf>,
+        metadata_observations: Vec<MetadataObservation>,
+        override_error: Option<String>,
     },
 }
 
@@ -786,6 +1495,8 @@ fn explicit_project_file(
         ));
         return ProjectSelection::Incomplete {
             metadata_files: Vec::new(),
+            metadata_observations: Vec::new(),
+            override_error: None,
         };
     }
     let requested = PathBuf::from(requested_text.replace('\\', "/"));
@@ -819,12 +1530,15 @@ fn explicit_project_file(
             ));
             ProjectSelection::Incomplete {
                 metadata_files: Vec::new(),
+                metadata_observations: Vec::new(),
+                override_error: None,
             }
         }
         1 => ProjectSelection::Selected {
             path: candidates.remove(0),
             explicit: true,
             metadata_files: Vec::new(),
+            metadata_observations: Vec::new(),
         },
         _ => {
             warnings.push(format!(
@@ -833,19 +1547,26 @@ fn explicit_project_file(
             ));
             ProjectSelection::Incomplete {
                 metadata_files: Vec::new(),
+                metadata_observations: Vec::new(),
+                override_error: None,
             }
         }
     }
 }
 
+// Automatic project selection threads the discovery policy and observation
+// state through candidate probing without hiding runtime inputs in globals.
+#[allow(clippy::too_many_arguments)]
 fn discover_project_file(
     file: &Path,
     workspace_root: Option<&Path>,
     roots: &[PathBuf],
     options: &ProjectOptions,
+    overrides: &OverrideSession,
     warnings: &mut Vec<String>,
     tracker: &mut ProjectReadTracker,
     cancel: Option<&AtomicBool>,
+    exclusions: &[String],
 ) -> ProjectSelection {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     let mut fallback_dpr = None;
@@ -856,6 +1577,8 @@ fn discover_project_file(
             warnings.push(error);
             return ProjectSelection::Incomplete {
                 metadata_files: Vec::new(),
+                metadata_observations: Vec::new(),
+                override_error: None,
             };
         }
         let entries = match project_directory_entries(&directory, cancel) {
@@ -864,6 +1587,8 @@ fn discover_project_file(
                 warnings.push(error);
                 return ProjectSelection::Incomplete {
                     metadata_files: Vec::new(),
+                    metadata_observations: Vec::new(),
+                    override_error: None,
                 };
             }
         };
@@ -878,9 +1603,11 @@ fn discover_project_file(
                 file,
                 roots,
                 options,
+                overrides,
                 warnings,
                 tracker,
                 cancel,
+                exclusions,
             );
         }
         if fallback_dpr.is_none() && ambiguous_fallback_dpr.is_none() && !dpr_or_dpk.is_empty() {
@@ -910,19 +1637,23 @@ fn discover_project_file(
             file,
             roots,
             options,
+            overrides,
             warnings,
             tracker,
             cancel,
+            exclusions,
         );
     }
     fallback_dpr.map_or(
         ProjectSelection::Standalone {
             metadata_files: Vec::new(),
+            metadata_observations: Vec::new(),
         },
         |path| ProjectSelection::Selected {
             path,
             explicit: false,
             metadata_files: Vec::new(),
+            metadata_observations: Vec::new(),
         },
     )
 }
@@ -933,6 +1664,8 @@ fn push_bounded_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+// Candidate probing keeps the filesystem inputs, evaluator options, and
+// immutable override session explicit at this boundary.
 #[allow(clippy::too_many_arguments)]
 fn choose_project_candidate(
     mut candidates: Vec<PathBuf>,
@@ -941,15 +1674,18 @@ fn choose_project_candidate(
     file: &Path,
     roots: &[PathBuf],
     options: &ProjectOptions,
+    overrides: &OverrideSession,
     warnings: &mut Vec<String>,
     tracker: &mut ProjectReadTracker,
     cancel: Option<&AtomicBool>,
+    exclusions: &[String],
 ) -> ProjectSelection {
     if candidates.len() == 1 {
         return ProjectSelection::Selected {
             path: candidates.pop().expect("one candidate"),
             explicit: false,
             metadata_files: Vec::new(),
+            metadata_observations: Vec::new(),
         };
     }
     candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
@@ -963,7 +1699,11 @@ fn choose_project_candidate(
             .into_iter()
             .take(MAX_OWNERSHIP_METADATA_FILES)
             .collect();
-        return ProjectSelection::Incomplete { metadata_files };
+        return ProjectSelection::Incomplete {
+            metadata_files,
+            metadata_observations: Vec::new(),
+            override_error: None,
+        };
     }
 
     // Ownership checks stay within the already discovered candidate
@@ -971,13 +1711,17 @@ fn choose_project_candidate(
     // project selection into a recursive workspace scan.
     let mut budget = OwnershipProbeBudget::default();
     let mut consulted_metadata = Vec::new();
+    let mut consulted_observations = Vec::new();
     let mut owned = Vec::new();
     let mut incomplete = false;
     let mut candidate_warnings = Vec::new();
+    let mut candidate_override_error = None;
     for candidate in &candidates {
         if check_project_scan_cancel(cancel).is_err() {
             return ProjectSelection::Incomplete {
                 metadata_files: consulted_metadata,
+                metadata_observations: consulted_observations,
+                override_error: None,
             };
         }
         let evaluation = inspect_project_candidate(
@@ -985,10 +1729,20 @@ fn choose_project_candidate(
             file,
             roots,
             options,
+            overrides,
+            exclusions,
             &mut budget,
             tracker,
             cancel,
         );
+        for observation in &evaluation.metadata_observations {
+            if consulted_observations.len() >= MAX_OWNERSHIP_METADATA_FILES {
+                budget.exhaust("automatic ownership metadata read-set");
+                incomplete = true;
+                break;
+            }
+            add_metadata_observation(&mut consulted_observations, observation.clone());
+        }
         if !budget.reserve_metadata_files(evaluation.metadata_files.len()) {
             incomplete = true;
         }
@@ -1007,6 +1761,9 @@ fn choose_project_candidate(
             consulted_metadata.push(metadata_file);
         }
         append_bounded_warnings(&mut candidate_warnings, evaluation.warnings, &mut budget);
+        if let Some(error) = evaluation.override_error {
+            candidate_override_error.get_or_insert(error);
+        }
         match evaluation.ownership {
             CandidateOwnership::Owned => owned.push(candidate.clone()),
             CandidateOwnership::NotOwned => {}
@@ -1022,6 +1779,7 @@ fn choose_project_candidate(
             path: owned.pop().expect("one owned candidate"),
             explicit: false,
             metadata_files: consulted_metadata,
+            metadata_observations: consulted_observations,
         };
     }
 
@@ -1043,6 +1801,8 @@ fn choose_project_candidate(
     }
     ProjectSelection::Incomplete {
         metadata_files: consulted_metadata,
+        metadata_observations: consulted_observations,
+        override_error: candidate_override_error,
     }
 }
 
@@ -1131,27 +1891,54 @@ enum CandidateOwnership {
 struct CandidateEvaluation {
     ownership: CandidateOwnership,
     metadata_files: Vec<PathBuf>,
+    metadata_observations: Vec<MetadataObservation>,
     warnings: Vec<String>,
+    override_error: Option<String>,
 }
 
+// Candidate inspection keeps project evaluation, bounded probing, observation
+// tracking, and cancellation explicit so each read remains attributable.
+#[allow(clippy::too_many_arguments)]
 fn inspect_project_candidate(
     project_file: &Path,
     file: &Path,
     roots: &[PathBuf],
     options: &ProjectOptions,
+    overrides: &OverrideSession,
+    exclusions: &[String],
     budget: &mut OwnershipProbeBudget,
     tracker: &mut ProjectReadTracker,
     cancel: Option<&AtomicBool>,
 ) -> CandidateEvaluation {
     let mut metadata_files = vec![project_file.to_path_buf()];
+    let mut metadata_observations = Vec::new();
+    let effective_overrides = match effective_overrides_for_project(project_file, roots, overrides)
+    {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            return CandidateEvaluation {
+                ownership: CandidateOwnership::Incomplete,
+                metadata_files,
+                metadata_observations,
+                warnings: vec![format!(
+                    "could not evaluate project candidate {}: {error}",
+                    project_file.display()
+                )],
+                override_error: Some(error),
+            };
+        }
+    };
     match build_project_context(
         project_file.to_path_buf(),
         file,
         roots,
         options,
+        effective_overrides,
         Vec::new(),
         false,
         Vec::new(),
+        Vec::new(),
+        exclusions,
         tracker,
         cancel,
     ) {
@@ -1159,23 +1946,23 @@ fn inspect_project_candidate(
             for metadata_file in &context.metadata_files {
                 add_unique_path(&mut metadata_files, metadata_file.clone());
             }
+            metadata_observations.extend(context.metadata_observations.iter().cloned());
             if !context.discovery_complete {
                 return CandidateEvaluation {
                     ownership: CandidateOwnership::Incomplete,
                     metadata_files,
+                    metadata_observations,
                     warnings: context.warnings,
+                    override_error: None,
                 };
             }
             let membership = inspect_source_membership(&context, budget, tracker, cancel);
             for metadata_file in &membership.metadata_files {
                 add_unique_path(&mut metadata_files, metadata_file.clone());
             }
-            let mut ownership_paths = membership.source_files;
-            if let Some(main_source) = &context.main_source {
-                ownership_paths.push(main_source.clone());
-            }
-            ownership_paths.extend(context.explicit_units.values().flatten().cloned());
-            let (owns_source, identity_unverified) = source_ownership(&ownership_paths, file);
+            metadata_observations.extend(membership.metadata_observations);
+            let (owns_source, identity_unverified) =
+                source_ownership(&membership.source_entries, file, &context.read_policy);
             let ownership = if budget.exhausted || !membership.complete || identity_unverified {
                 CandidateOwnership::Incomplete
             } else if owns_source {
@@ -1188,16 +1975,20 @@ fn inspect_project_candidate(
             CandidateEvaluation {
                 ownership,
                 metadata_files,
+                metadata_observations,
                 warnings,
+                override_error: None,
             }
         }
         Err(error) => CandidateEvaluation {
             ownership: CandidateOwnership::Incomplete,
             metadata_files,
+            metadata_observations,
             warnings: vec![format!(
                 "could not inspect project candidate {}: {error}",
                 project_file.display()
             )],
+            override_error: None,
         },
     }
 }
@@ -1205,8 +1996,9 @@ fn inspect_project_candidate(
 #[derive(Debug, Default)]
 struct SourceMembershipInspection {
     complete: bool,
-    source_files: Vec<PathBuf>,
+    source_entries: Vec<ProjectPathEntry>,
     metadata_files: Vec<PathBuf>,
+    metadata_observations: Vec<MetadataObservation>,
     warnings: Vec<String>,
 }
 
@@ -1216,32 +2008,52 @@ fn inspect_source_membership(
     tracker: &mut ProjectReadTracker,
     cancel: Option<&AtomicBool>,
 ) -> SourceMembershipInspection {
+    inspect_source_membership_impl(context, budget, Some(tracker), cancel, &mut |_| {})
+}
+
+#[cfg(test)]
+fn inspect_source_membership_with_hook(
+    context: &ProjectContext,
+    budget: &mut OwnershipProbeBudget,
+    before_read: &mut dyn FnMut(&Path),
+) -> SourceMembershipInspection {
+    inspect_source_membership_impl(context, budget, None, None, before_read)
+}
+
+fn inspect_source_membership_impl(
+    context: &ProjectContext,
+    budget: &mut OwnershipProbeBudget,
+    mut tracker: Option<&mut ProjectReadTracker>,
+    cancel: Option<&AtomicBool>,
+    before_read: &mut dyn FnMut(&Path),
+) -> SourceMembershipInspection {
     let mut inspection = SourceMembershipInspection {
         complete: true,
         ..SourceMembershipInspection::default()
     };
     let mut pending = Vec::new();
-    if let Some(main_source) = &context.main_source {
+    if let Some(main_source) = &context.main_source_entry {
         pending.push(main_source.clone());
     }
-    pending.extend(context.explicit_units.values().flatten().cloned());
+    pending.extend(context.explicit_unit_entries.values().flatten().cloned());
     let mut queued = HashSet::new();
     let mut cursor = 0;
 
-    while let Some(source_path) = pending.get(cursor).cloned() {
+    while let Some(source_entry) = pending.get(cursor).cloned() {
         if check_project_scan_cancel(cancel).is_err() {
             inspection.complete = false;
             inspection.warnings.push("request cancelled".to_string());
             break;
         }
         cursor += 1;
-        if !queued.insert(source_path.clone()) {
+        if !queued.insert((source_entry.path.clone(), source_entry.provenance.clone())) {
             continue;
         }
-        add_unique_path(&mut inspection.source_files, source_path.clone());
+        let source_path = &source_entry.path;
+        inspection.source_entries.push(source_entry.clone());
         add_unique_path(&mut inspection.metadata_files, source_path.clone());
 
-        let size = match fs::metadata(&source_path) {
+        let size = match fs::symlink_metadata(source_path) {
             Ok(metadata) => metadata.len(),
             Err(error) => {
                 inspection.complete = false;
@@ -1252,6 +2064,14 @@ fn inspect_source_membership(
                 continue;
             }
         };
+        if !context.read_policy.allows_entry(&source_entry) {
+            inspection.complete = false;
+            inspection.warnings.push(format!(
+                "ignored source membership file outside authorized read roots: {}",
+                source_path.display()
+            ));
+            continue;
+        }
         if size > MAX_MAIN_SOURCE_BYTES {
             inspection.complete = false;
             inspection.warnings.push(format!(
@@ -1261,7 +2081,12 @@ fn inspect_source_membership(
             ));
             continue;
         }
-        if !budget.reserve_source_file(size) {
+        // Reserve the attempt before opening the payload.  Include the
+        // reader's one-byte overflow probe in the reservation so a file that
+        // grows after this stat cannot consume bytes outside the aggregate
+        // ownership budget.  Keeping the reservation on read/decode errors
+        // charges failed attempts conservatively as well.
+        if !budget.reserve_source_file(size.saturating_add(1)) {
             inspection.complete = false;
             inspection.warnings.push(format!(
                 "automatic source membership probe limit reached at {}",
@@ -1269,9 +2094,12 @@ fn inspect_source_membership(
             ));
             break;
         }
-        let contents = match read_bounded_with_tracker(&source_path, MAX_MAIN_SOURCE_BYTES, tracker)
+        before_read(source_path);
+        let (contents, observation) = match context
+            .read_policy
+            .read_payload_with_observation(&source_entry, size)
         {
-            Ok(contents) => contents,
+            Ok(payload) => payload,
             Err(error) => {
                 inspection.complete = false;
                 inspection.warnings.push(format!(
@@ -1281,6 +2109,12 @@ fn inspect_source_membership(
                 continue;
             }
         };
+        add_metadata_observation(&mut inspection.metadata_observations, observation);
+        if let Some(tracker) = tracker.as_deref_mut() {
+            if let Ok(stamp) = project_read_stamp(source_path) {
+                tracker.record(source_path, stamp, contents.as_bytes());
+            }
+        }
         let parsed = parse_unit_membership(&contents);
         if !parsed.exhaustive {
             inspection.complete = false;
@@ -1308,30 +2142,37 @@ fn inspect_source_membership(
             if is_compiled_reference(&raw_path) {
                 continue;
             }
-            let Some(path) = resolve_project_path(
+            let Some(entry) = resolve_project_path_entry(
                 &raw_path,
                 base,
+                &context.overrides,
                 &mut inspection.warnings,
                 "ownership source membership",
                 true,
+                false,
             ) else {
                 inspection.complete = false;
                 continue;
             };
-            add_unique_path(&mut inspection.metadata_files, path.clone());
-            if !queued.contains(&path) {
-                pending.push(path);
+            let entry = inherit_path_provenance(entry, &source_entry.provenance);
+            add_unique_path(&mut inspection.metadata_files, entry.path.clone());
+            if !queued.contains(&(entry.path.clone(), entry.provenance.clone())) {
+                pending.push(entry);
             }
         }
     }
     inspection
 }
 
-fn source_ownership(paths: &[PathBuf], target: &Path) -> (bool, bool) {
+fn source_ownership(
+    entries: &[ProjectPathEntry],
+    target: &Path,
+    read_policy: &ReadPolicy,
+) -> (bool, bool) {
     if filesystem_identity_unverified(target)
-        || paths
-            .iter()
-            .any(|path| filesystem_identity_unverified(path))
+        || entries.iter().any(|entry| {
+            !read_policy.allows_entry(entry) || filesystem_identity_unverified(&entry.path)
+        })
     {
         return (false, true);
     }
@@ -1340,8 +2181,8 @@ fn source_ownership(paths: &[PathBuf], target: &Path) -> (bool, bool) {
     };
     let mut owns_source = false;
     let mut identity_unverified = false;
-    for path in paths {
-        let Some(identity) = fs::canonicalize(path).ok() else {
+    for entry in entries {
+        let Some(identity) = fs::canonicalize(&entry.path).ok() else {
             identity_unverified = true;
             continue;
         };
@@ -1410,6 +2251,70 @@ fn relevant_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         .cloned()
 }
 
+fn standalone_overrides(
+    file: &Path,
+    roots: &[PathBuf],
+    session: &OverrideSession,
+) -> Result<EffectiveOverrides, String> {
+    let workspace_root = relevant_override_workspace_root(file, roots);
+    session.effective_for(workspace_root.as_deref(), None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_standalone_context_with_overrides(
+    file: &Path,
+    roots: &[PathBuf],
+    options: &ProjectOptions,
+    mut warnings: Vec<String>,
+    mut discovery_complete: bool,
+    metadata_files: Vec<PathBuf>,
+    metadata_observations: Vec<MetadataObservation>,
+    session: &OverrideSession,
+    exclusions: &[String],
+) -> Result<ProjectContext, String> {
+    let (effective_overrides, override_error) = match standalone_overrides(file, roots, session) {
+        Ok(overrides) => (overrides, None),
+        Err(error) => {
+            warnings.push(error.clone());
+            discovery_complete = false;
+            (EffectiveOverrides::default(), Some(error))
+        }
+    };
+    let mut context = build_standalone_context(
+        file,
+        roots,
+        options,
+        effective_overrides,
+        warnings,
+        discovery_complete,
+        metadata_files,
+        metadata_observations,
+        exclusions,
+        None,
+    )?;
+    context.override_error = override_error;
+    Ok(context)
+}
+
+fn effective_overrides_for_project(
+    project_file: &Path,
+    roots: &[PathBuf],
+    session: &OverrideSession,
+) -> Result<EffectiveOverrides, String> {
+    let project_directory = project_file.parent();
+    let workspace_root =
+        project_directory.and_then(|directory| relevant_override_workspace_root(directory, roots));
+    session.effective_for(workspace_root.as_deref(), project_directory)
+}
+
+fn relevant_override_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    roots
+        .iter()
+        .filter(|root| file.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+}
+
 fn path_starts_with_ci(path: &Path, root: &Path) -> bool {
     let path_components: Vec<String> = path
         .components()
@@ -1467,15 +2372,20 @@ fn fallback_main_source(project_file: &Path, warnings: &mut Vec<String>) -> Opti
     }
 }
 
+// Context construction keeps the selected project, requesting file, roots,
+// evaluator options, and immutable effective settings explicit for callers.
 #[allow(clippy::too_many_arguments)]
 fn build_project_context(
     project_file: PathBuf,
     file: &Path,
     roots: &[PathBuf],
     options: &ProjectOptions,
+    overrides: EffectiveOverrides,
     warnings: Vec<String>,
     explicit: bool,
     consulted_metadata_files: Vec<PathBuf>,
+    consulted_metadata_observations: Vec<MetadataObservation>,
+    exclusions: &[String],
     tracker: &mut ProjectReadTracker,
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectContext, String> {
@@ -1483,24 +2393,36 @@ fn build_project_context(
     let project_dir = project_file
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let mut builder = ProjectBuilder::new(options, warnings, project_dir.clone());
+    let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
+    let mut builder = ProjectBuilder::new(
+        options,
+        &overrides,
+        warnings,
+        project_dir.clone(),
+        read_policy.clone(),
+    );
     let project_is_dproj = extension_is(&project_file, "dproj");
     if project_is_dproj {
         builder.process_root_dproj(&project_file, tracker)?;
         check_project_scan_cancel(cancel)?;
     }
 
-    let main_source = if project_is_dproj {
+    let main_source_entry = if project_is_dproj {
         let main_name = builder.property("mainsource");
         match main_name {
             Some(name) if !name.is_empty() && !name.contains(UNRESOLVED_MARKER) => {
-                resolve_project_path(
+                let configured = builder.property_is_configured("mainsource");
+                let provenance = builder.property_provenance("mainsource");
+                resolve_project_path_entry(
                     &name,
                     &project_dir,
+                    &builder.overrides,
                     &mut builder.warnings,
                     "main source",
                     true,
+                    configured,
                 )
+                .map(|entry| inherit_path_provenance(entry, &provenance))
             }
             Some(_) => {
                 builder.warnings.push(format!(
@@ -1509,11 +2431,13 @@ fn build_project_context(
                 ));
                 None
             }
-            None => fallback_main_source(&project_file, &mut builder.warnings),
+            None => fallback_main_source(&project_file, &mut builder.warnings)
+                .map(ProjectPathEntry::legacy),
         }
     } else {
-        Some(project_file.clone())
+        Some(ProjectPathEntry::legacy(project_file.clone()))
     };
+    let main_source = main_source_entry.as_ref().map(|entry| entry.path.clone());
     if project_is_dproj && main_source.is_none() {
         builder.warnings.push(format!(
             "project has no resolvable MainSource: {}",
@@ -1521,58 +2445,75 @@ fn build_project_context(
         ));
     }
 
-    let mut search_paths = Vec::new();
-    add_unique_path(&mut search_paths, project_dir.clone());
-    if let Some(search_path) = builder.property("dcc_unitsearchpath") {
-        for item in search_path.split(';') {
-            check_project_scan_cancel(cancel)?;
-            add_resolved_search_path(
-                item,
-                &project_dir,
-                &mut search_paths,
-                &mut builder.warnings,
-                "DCC_UnitSearchPath",
-            );
-        }
+    if let Some(main_source_entry) = &main_source_entry
+        && !builder.read_policy.allows_entry(main_source_entry)
+    {
+        builder.incomplete = true;
+        builder.warnings.push(format!(
+            "ignored main source outside authorized read roots: {}",
+            main_source_entry.path.display()
+        ));
     }
 
-    let mut include_paths = Vec::new();
-    if let Some(include_path) = builder.property("dcc_includepath") {
-        for item in include_path.split(';') {
-            check_project_scan_cancel(cancel)?;
-            add_resolved_search_path(
-                item,
-                &project_dir,
-                &mut include_paths,
-                &mut builder.warnings,
-                "DCC_IncludePath",
-            );
-        }
-    }
-
+    let mut search_path_entries = vec![ProjectPathEntry::legacy(project_dir.clone())];
     let option_base = relevant_workspace_root(file, roots)
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| project_dir.clone());
-    for item in &options.source_paths {
+    for (item, provenance) in builder.property_list_with_provenance("dcc_unitsearchpath") {
         check_project_scan_cancel(cancel)?;
-        add_resolved_search_path(
-            item,
-            &option_base,
-            &mut search_paths,
+        add_resolved_search_path_entry(
+            &item,
+            &project_dir,
+            &builder.overrides,
+            &mut search_path_entries,
             &mut builder.warnings,
-            "configured source path",
+            "DCC_UnitSearchPath",
+            provenance,
         );
     }
+    for item in &options.source_paths {
+        check_project_scan_cancel(cancel)?;
+        add_resolved_search_path_entry(
+            item,
+            &option_base,
+            &builder.overrides,
+            &mut search_path_entries,
+            &mut builder.warnings,
+            "configured source path",
+            ProjectPathProvenance::Configured,
+        );
+    }
+    let search_paths = paths_from_entries(&search_path_entries);
+
+    let mut include_path_entries = Vec::new();
+    for (item, provenance) in builder.property_list_with_provenance("dcc_includepath") {
+        check_project_scan_cancel(cancel)?;
+        add_resolved_search_path_entry(
+            &item,
+            &project_dir,
+            &builder.overrides,
+            &mut include_path_entries,
+            &mut builder.warnings,
+            "DCC_IncludePath",
+            provenance,
+        );
+    }
+    let include_paths = paths_from_entries(&include_path_entries);
 
     let mut explicit_units = HashMap::new();
-    if let Some(main_source) = &main_source {
-        check_project_scan_cancel(cancel)?;
-        add_explicit_units_from_source(
+    let mut explicit_unit_entries = HashMap::new();
+    if let Some(main_source) = &main_source_entry {
+        if let Some(observation) = add_explicit_units_from_source(
             main_source,
             &mut explicit_units,
+            &mut explicit_unit_entries,
             &mut builder.warnings,
+            &builder.overrides,
+            &builder.read_policy,
             tracker,
-        );
+        ) {
+            add_metadata_observation(&mut builder.metadata_observations, observation);
+        }
     }
     for reference in &builder.references {
         check_project_scan_cancel(cancel)?;
@@ -1583,9 +2524,14 @@ fn build_project_context(
             &reference.include,
             "",
             &builder.properties,
+            &builder.configured_ranges,
+            &builder.configured_properties,
+            &builder.property_provenance_ranges,
+            &builder.property_default_provenances,
             &builder.unknown_properties,
             &mut builder.warnings,
             &reference.source_file,
+            &reference.source_provenance,
         );
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
             continue;
@@ -1593,21 +2539,25 @@ fn build_project_context(
         if is_compiled_reference(&expanded.value) {
             continue;
         }
-        let Some(path) = resolve_project_path(
+        let Some(entry) = resolve_project_path_entry(
             &expanded.value,
             &builder.project_dir,
+            &builder.overrides,
             &mut builder.warnings,
             "DCCReference",
             true,
+            expanded.explicit_dependency,
         ) else {
             continue;
         };
-        let Some(stem) = path.file_stem() else {
+        let provenance = expanded_path_provenance(&expanded, &reference.source_provenance);
+        let entry = inherit_path_provenance(entry, &provenance);
+        let Some(stem) = entry.path.file_stem() else {
             continue;
         };
         let name = canonical_unit_name(&stem.to_string_lossy());
         if !name.is_empty() {
-            add_unit_candidate(&mut explicit_units, name, path);
+            add_unit_candidate_entry(&mut explicit_units, &mut explicit_unit_entries, name, entry);
         }
     }
 
@@ -1626,6 +2576,15 @@ fn build_project_context(
             metadata_files.push(metadata_file);
         }
     }
+    let metadata_observations = complete_metadata_observations(
+        &metadata_files,
+        builder
+            .metadata_observations
+            .clone()
+            .into_iter()
+            .chain(consulted_metadata_observations)
+            .collect(),
+    );
 
     Ok(ProjectContext {
         discovery_complete: !builder.incomplete
@@ -1633,38 +2592,54 @@ fn build_project_context(
         project_file: Some(project_file),
         main_source,
         search_paths,
+        search_path_entries,
+        main_source_entry,
+        explicit_unit_entries,
         include_paths,
+        include_path_entries,
         explicit_units,
         unit_namespaces: property_list(&builder, "dcc_namespace"),
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
         defines: property_list(&builder, "dcc_define"),
         config: selected_config(&builder, options),
         platform: selected_platform(&builder, options),
+        overrides,
+        read_policy,
         packages: package_list(&builder),
         metadata_files,
+        metadata_observations,
         warnings: builder.warnings,
+        override_error: None,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_standalone_context(
     file: &Path,
     roots: &[PathBuf],
     options: &ProjectOptions,
+    overrides: EffectiveOverrides,
     mut warnings: Vec<String>,
     discovery_complete: bool,
     metadata_files: Vec<PathBuf>,
+    metadata_observations: Vec<MetadataObservation>,
+    exclusions: &[String],
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectContext, String> {
     check_project_scan_cancel(cancel)?;
-    let mut search_paths = Vec::new();
+    let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
+    let mut search_path_entries = Vec::new();
     if let Some(parent) = file.parent() {
         if let Some(actual) = resolve_existing_path(parent, &mut warnings, "source directory") {
-            add_unique_path(&mut search_paths, actual);
+            add_unique_project_path_entry(
+                &mut search_path_entries,
+                ProjectPathEntry::legacy(actual),
+            );
         }
     }
     if let Some(root) = relevant_workspace_root(file, roots) {
         if root.is_dir() {
-            add_unique_path(&mut search_paths, root);
+            add_unique_project_path_entry(&mut search_path_entries, ProjectPathEntry::legacy(root));
         }
     }
     let option_base = relevant_workspace_root(file, roots)
@@ -1672,30 +2647,43 @@ fn build_standalone_context(
         .unwrap_or_default();
     for item in &options.source_paths {
         check_project_scan_cancel(cancel)?;
-        add_resolved_search_path(
+        add_resolved_search_path_entry(
             item,
             &option_base,
-            &mut search_paths,
+            &overrides,
+            &mut search_path_entries,
             &mut warnings,
             "configured source path",
+            ProjectPathProvenance::Configured,
         );
     }
+    let search_paths = paths_from_entries(&search_path_entries);
+    let metadata_observations =
+        complete_metadata_observations(&metadata_files, metadata_observations);
 
     Ok(ProjectContext {
         discovery_complete,
         project_file: None,
         main_source: None,
         search_paths,
+        search_path_entries,
+        main_source_entry: None,
+        explicit_unit_entries: HashMap::new(),
         include_paths: Vec::new(),
+        include_path_entries: Vec::new(),
         explicit_units: HashMap::new(),
         unit_namespaces: Vec::new(),
         unit_aliases: HashMap::new(),
         defines: Vec::new(),
-        config: options.build_config.clone(),
-        platform: options.platform.clone(),
+        config: selected_standalone_property(&overrides, options.build_config.as_ref(), "config"),
+        platform: selected_standalone_property(&overrides, options.platform.as_ref(), "platform"),
+        overrides,
+        read_policy,
         packages: Vec::new(),
         metadata_files,
+        metadata_observations,
         warnings,
+        override_error: None,
     })
 }
 
@@ -1732,6 +2720,23 @@ fn selected_config(builder: &ProjectBuilder, options: &ProjectOptions) -> Option
         .or_else(|| options.build_config.clone())
 }
 
+fn selected_standalone_property(
+    overrides: &EffectiveOverrides,
+    client_value: Option<&String>,
+    name: &str,
+) -> Option<String> {
+    client_value
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .or_else(|| {
+            overrides
+                .properties
+                .get(name)
+                .cloned()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
 fn selected_platform(builder: &ProjectBuilder, options: &ProjectOptions) -> Option<String> {
     builder
         .property("platform")
@@ -1753,6 +2758,80 @@ fn property_list(builder: &ProjectBuilder, name: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn full_range(value: &str) -> Vec<Range<usize>> {
+    (!value.is_empty())
+        .then_some(0..value.len())
+        .into_iter()
+        .collect()
+}
+
+fn trim_ranges(
+    ranges: &[Range<usize>],
+    trim_start: usize,
+    trimmed_len: usize,
+) -> Vec<Range<usize>> {
+    let trim_end = trim_start.saturating_add(trimmed_len);
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let start = range.start.max(trim_start).min(trim_end);
+            let end = range.end.max(trim_start).min(trim_end);
+            (start < end).then_some((start - trim_start)..(end - trim_start))
+        })
+        .collect()
+}
+
+fn trim_provenance_ranges(
+    ranges: &[ProvenanceRange],
+    trim_start: usize,
+    trimmed_len: usize,
+) -> Vec<ProvenanceRange> {
+    let trim_end = trim_start.saturating_add(trimmed_len);
+    ranges
+        .iter()
+        .map(|range| {
+            if range.range.start == range.range.end {
+                let position = range.range.start.max(trim_start).min(trim_end) - trim_start;
+                ProvenanceRange {
+                    range: position..position,
+                    provenance: range.provenance.clone(),
+                }
+            } else {
+                let start = range.range.start.max(trim_start).min(trim_end);
+                let end = range.range.end.max(trim_start).min(trim_end);
+                ProvenanceRange {
+                    range: (start - trim_start)..(end - trim_start),
+                    provenance: range.provenance.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn property_list_item(
+    value: &str,
+    start: usize,
+    end: usize,
+    provenance_ranges: &[ProvenanceRange],
+    default_provenance: &ProjectPathProvenance,
+) -> (String, ProjectPathProvenance) {
+    let item = &value[start..end];
+    let trimmed = item.trim();
+    let provenance = provenance_ranges
+        .iter()
+        .filter(|range| {
+            if range.range.start == range.range.end {
+                start <= range.range.start && range.range.start <= end
+            } else {
+                range.range.start < end && start < range.range.end
+            }
+        })
+        .fold(default_provenance.clone(), |current, range| {
+            combine_path_provenance(&current, &range.provenance)
+        });
+    (trimmed.to_string(), provenance)
 }
 
 fn package_list(builder: &ProjectBuilder) -> Vec<String> {
@@ -1794,46 +2873,83 @@ fn parse_aliases(value: Option<&str>) -> HashMap<String, String> {
     aliases
 }
 
-fn add_resolved_search_path(
+fn add_resolved_search_path_entry(
     raw: &str,
     base: &Path,
-    search_paths: &mut Vec<PathBuf>,
+    overrides: &EffectiveOverrides,
+    search_paths: &mut Vec<ProjectPathEntry>,
     warnings: &mut Vec<String>,
     kind: &str,
+    provenance: ProjectPathProvenance,
 ) {
+    if let Some(entry) =
+        resolved_search_path_entry(raw, base, overrides, warnings, kind, provenance)
+    {
+        add_unique_project_path_entry(search_paths, entry);
+    }
+}
+
+fn resolved_search_path_entry(
+    raw: &str,
+    base: &Path,
+    overrides: &EffectiveOverrides,
+    warnings: &mut Vec<String>,
+    kind: &str,
+    provenance: ProjectPathProvenance,
+) -> Option<ProjectPathEntry> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains(UNRESOLVED_MARKER) {
-        return;
+        return None;
     }
-    if is_windows_absolute_text(raw) {
-        warnings.push(format!(
-            "Windows path in {kind} is unavailable on Linux and was omitted: {raw}"
-        ));
-        return;
-    }
-    if let Some(path) = resolve_project_path(raw, base, warnings, kind, false) {
-        add_unique_path(search_paths, path);
-        return;
-    }
-    let normalized = raw.replace('\\', "/");
-    let raw_path = Path::new(&normalized);
-    let candidate = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
-    } else {
-        base.join(raw_path)
-    };
-    let candidate = lexical_normalize(&candidate);
-    warnings.push(format!(
-        "{kind} path does not exist yet; retaining it for lazy discovery: {}",
-        candidate.display()
-    ));
-    add_unique_path(search_paths, candidate);
+    let resolved = project_path_candidate(raw, base, overrides, warnings, kind)?;
+    let candidate = lexical_normalize(&resolved.path);
+    Some(
+        match resolve_existing_path_status_with_provenance(
+            &candidate, &resolved, raw, warnings, kind,
+        ) {
+            ExistingPathStatus::Found(path) => inherit_path_provenance(
+                ProjectPathEntry::resolved(
+                    path,
+                    &resolved,
+                    matches!(&provenance, ProjectPathProvenance::Configured),
+                ),
+                &provenance,
+            ),
+            ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => {
+                warnings.push(search_path_missing_warning(
+                    kind, raw, &candidate, &resolved,
+                ));
+                inherit_path_provenance(
+                    ProjectPathEntry::resolved(
+                        candidate,
+                        &resolved,
+                        matches!(&provenance, ProjectPathProvenance::Configured),
+                    ),
+                    &provenance,
+                )
+            }
+        },
+    )
 }
 
 fn add_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
+}
+
+fn add_unique_project_path_entry(entries: &mut Vec<ProjectPathEntry>, entry: ProjectPathEntry) {
+    if !entries.iter().any(|existing| existing == &entry) {
+        entries.push(entry);
+    }
+}
+
+fn paths_from_entries(entries: &[ProjectPathEntry]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        add_unique_path(&mut paths, entry.path.clone());
+    }
+    paths
 }
 
 fn add_metadata_file(
@@ -1857,6 +2973,44 @@ fn add_metadata_file(
     true
 }
 
+pub(crate) fn add_metadata_observation(
+    observations: &mut Vec<MetadataObservation>,
+    observation: MetadataObservation,
+) {
+    let Some(existing) = observations
+        .iter_mut()
+        .find(|existing| existing.path() == observation.path())
+    else {
+        observations.push(observation);
+        return;
+    };
+    if matches!(existing, MetadataObservation::Stat { .. })
+        && matches!(&observation, MetadataObservation::Payload { .. })
+    {
+        *existing = observation;
+    }
+}
+
+fn complete_metadata_observations(
+    paths: &[PathBuf],
+    observations: Vec<MetadataObservation>,
+) -> Vec<MetadataObservation> {
+    let mut merged = Vec::with_capacity(observations.len());
+    for observation in observations {
+        add_metadata_observation(&mut merged, observation);
+    }
+    let mut observations = merged;
+    for path in paths {
+        if !observations
+            .iter()
+            .any(|observation| observation.path() == path)
+        {
+            observations.push(MetadataObservation::Stat { path: path.clone() });
+        }
+    }
+    observations
+}
+
 fn paths_equal_ci(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
@@ -1869,37 +3023,107 @@ fn add_unit_candidate(units: &mut HashMap<String, Vec<PathBuf>>, name: String, p
     }
 }
 
-fn add_explicit_units_from_source(
-    source_path: &Path,
+fn add_unit_candidate_entry(
     units: &mut HashMap<String, Vec<PathBuf>>,
-    warnings: &mut Vec<String>,
-    tracker: &mut ProjectReadTracker,
+    entries: &mut HashMap<String, Vec<ProjectPathEntry>>,
+    name: String,
+    entry: ProjectPathEntry,
 ) {
-    let contents = match read_bounded_with_tracker(source_path, MAX_MAIN_SOURCE_BYTES, tracker) {
-        Ok(contents) => contents,
+    add_unit_candidate(units, name.clone(), entry.path.clone());
+    add_unique_project_path_entry(entries.entry(name).or_default(), entry);
+}
+
+fn add_explicit_units_from_source(
+    source_entry: &ProjectPathEntry,
+    units: &mut HashMap<String, Vec<PathBuf>>,
+    entries: &mut HashMap<String, Vec<ProjectPathEntry>>,
+    warnings: &mut Vec<String>,
+    overrides: &EffectiveOverrides,
+    read_policy: &ReadPolicy,
+    tracker: &mut ProjectReadTracker,
+) -> Option<MetadataObservation> {
+    let source_path = &source_entry.path;
+    if !read_policy.allows_entry(source_entry) {
+        warnings.push(format!(
+            "ignored main source outside authorized read roots: {}",
+            source_path.display()
+        ));
+        return None;
+    }
+    let (contents, observation) = match read_payload_with_tracker(
+        read_policy,
+        source_entry,
+        MAX_MAIN_SOURCE_BYTES,
+        tracker,
+    ) {
+        Ok(payload) => payload,
         Err(error) => {
             warnings.push(format!(
                 "could not read main source {} for explicit unit paths: {error}",
                 source_path.display()
             ));
-            return;
+            return None;
         }
     };
     let Some(base) = source_path.parent() else {
-        return;
+        return Some(observation);
     };
     for (unit_name, raw_path) in parse_explicit_unit_paths(&contents) {
-        let Some(path) = resolve_project_path(
+        let Some(entry) = resolve_project_path_entry(
             &raw_path,
             base,
+            overrides,
             warnings,
             "explicit DPR/DPK unit path",
             true,
+            false,
         ) else {
             continue;
         };
-        add_unit_candidate(units, canonical_unit_name(&unit_name), path);
+        let entry = inherit_path_provenance(entry, &source_entry.provenance);
+        add_unit_candidate_entry(units, entries, canonical_unit_name(&unit_name), entry);
     }
+    Some(observation)
+}
+
+fn inherit_path_provenance(
+    mut entry: ProjectPathEntry,
+    parent: &ProjectPathProvenance,
+) -> ProjectPathEntry {
+    if matches!(entry.provenance, ProjectPathProvenance::LegacyNative) {
+        entry.provenance = parent.clone();
+    }
+    entry
+}
+
+fn combine_path_provenance(
+    current: &ProjectPathProvenance,
+    next: &ProjectPathProvenance,
+) -> ProjectPathProvenance {
+    match (current, next) {
+        (ProjectPathProvenance::Mapped { root }, _) => {
+            ProjectPathProvenance::Mapped { root: root.clone() }
+        }
+        (_, ProjectPathProvenance::Mapped { root }) => {
+            ProjectPathProvenance::Mapped { root: root.clone() }
+        }
+        (ProjectPathProvenance::Configured, _) | (_, ProjectPathProvenance::Configured) => {
+            ProjectPathProvenance::Configured
+        }
+        _ => ProjectPathProvenance::LegacyNative,
+    }
+}
+
+fn expanded_path_provenance(
+    expanded: &ExpandedValue,
+    source_provenance: &ProjectPathProvenance,
+) -> ProjectPathProvenance {
+    expanded
+        .provenance_ranges
+        .iter()
+        .fold(source_provenance.clone(), |current, range| {
+            combine_path_provenance(&current, &range.provenance)
+        })
 }
 
 fn canonical_unit_name(name: &str) -> String {
@@ -1924,51 +3148,168 @@ fn canonical_package_name(name: &str) -> String {
     stem.trim().trim_matches('.').to_ascii_lowercase()
 }
 
-fn resolve_project_path(
+fn resolve_project_path_entry(
     raw: &str,
     base: &Path,
+    overrides: &EffectiveOverrides,
     warnings: &mut Vec<String>,
     kind: &str,
     warn_missing: bool,
-) -> Option<PathBuf> {
-    let candidate = project_path_candidate(raw, base, warnings, kind)?;
-    match resolve_existing_path_status(&candidate, warnings, kind) {
-        ExistingPathStatus::Found(path) => Some(path),
+    configured: bool,
+) -> Option<ProjectPathEntry> {
+    let resolved = project_path_candidate(raw, base, overrides, warnings, kind)?;
+    let candidate = lexical_normalize(&resolved.path);
+    match resolve_existing_path_status_with_provenance(&candidate, &resolved, raw, warnings, kind) {
+        ExistingPathStatus::Found(path) => {
+            Some(ProjectPathEntry::resolved(path, &resolved, configured))
+        }
         ExistingPathStatus::Missing if warn_missing => {
-            warnings.push(format!(
-                "{kind} path does not exist and was omitted: {}",
-                candidate.display()
-            ));
+            warnings.push(missing_path_warning(kind, raw, &candidate, &resolved));
             None
         }
         ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => None,
     }
 }
 
+fn safe_regular_file(path: &Path) -> bool {
+    if filesystem_identity_unverified(path) {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && !metadata.file_type().is_symlink()
+}
+
+fn path_has_no_symlink_component(path: &Path) -> bool {
+    path.ancestors().all(|ancestor| {
+        fs::symlink_metadata(ancestor).map_or(true, |metadata| !metadata.file_type().is_symlink())
+    })
+}
+
 fn project_path_candidate(
     raw: &str,
     base: &Path,
+    overrides: &EffectiveOverrides,
     warnings: &mut Vec<String>,
     kind: &str,
-) -> Option<PathBuf> {
+) -> Option<ResolvedPath> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains(UNRESOLVED_MARKER) {
         return None;
     }
-    if is_windows_absolute_text(raw) {
-        warnings.push(format!(
-            "Windows path in {kind} is unavailable on Linux and was omitted: {raw}"
-        ));
-        return None;
+    let normalized = normalize_delphi_separators(raw);
+    match overrides.resolve_path(&normalized, base) {
+        Ok(resolved) => Some(resolved),
+        Err(error) if error == format!("Windows path is unavailable on Linux: {normalized}") => {
+            warnings.push(format!(
+                "Windows path in {kind} is unavailable on Linux and was omitted: {raw}"
+            ));
+            None
+        }
+        Err(error) => {
+            let error = restore_original_path_in_error(&error, &normalized, raw);
+            let provenance = matching_path_mapping(raw, overrides)
+                .map(|mapping| mapping_provenance_suffix(raw, mapping))
+                .unwrap_or_default();
+            warnings.push(format!("{kind}: {error}{provenance}"));
+            None
+        }
     }
-    let normalized = raw.replace('\\', "/");
-    let path = Path::new(&normalized);
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    };
-    Some(lexical_normalize(&candidate))
+}
+
+fn normalize_delphi_separators(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn restore_original_path_in_error(error: &str, normalized: &str, raw: &str) -> String {
+    error
+        .strip_suffix(normalized)
+        .map_or_else(|| error.to_owned(), |prefix| format!("{prefix}{raw}"))
+}
+
+fn matching_path_mapping<'a>(
+    raw: &str,
+    overrides: &'a EffectiveOverrides,
+) -> Option<&'a PathMapping> {
+    let normalized = normalize_delphi_separators(raw).to_ascii_lowercase();
+    overrides
+        .path_mappings
+        .iter()
+        .filter(|mapping| {
+            normalized == mapping.from || normalized.starts_with(&format!("{}/", mapping.from))
+        })
+        .max_by_key(|mapping| mapping.from.len())
+}
+
+fn mapping_provenance_suffix(raw: &str, mapping: &PathMapping) -> String {
+    format!(
+        " (from {raw}; mapping {} -> {})",
+        mapping.config_file.display(),
+        mapping.to.display(),
+    )
+}
+
+fn missing_path_warning(
+    kind: &str,
+    raw: &str,
+    candidate: &Path,
+    resolved: &ResolvedPath,
+) -> String {
+    match resolved.mapping.as_ref() {
+        Some(mapping) => format!(
+            "{kind} path does not exist and was omitted: {} (from {raw}; mapping {} -> {})",
+            candidate.display(),
+            mapping.config_file.display(),
+            mapping.to.display(),
+        ),
+        None => format!(
+            "{kind} path does not exist and was omitted: {}",
+            candidate.display()
+        ),
+    }
+}
+
+fn search_path_missing_warning(
+    kind: &str,
+    raw: &str,
+    candidate: &Path,
+    resolved: &ResolvedPath,
+) -> String {
+    match resolved.mapping.as_ref() {
+        Some(mapping) => format!(
+            "{kind} path does not exist yet; retaining it for lazy discovery: {} (from {raw}; mapping {} -> {})",
+            candidate.display(),
+            mapping.config_file.display(),
+            mapping.to.display(),
+        ),
+        None => format!(
+            "{kind} path does not exist yet; retaining it for lazy discovery: {}",
+            candidate.display()
+        ),
+    }
+}
+
+fn resolve_existing_path_status_with_provenance(
+    path: &Path,
+    resolved: &ResolvedPath,
+    raw: &str,
+    warnings: &mut Vec<String>,
+    kind: &str,
+) -> ExistingPathStatus {
+    let warning_start = warnings.len();
+    let status = resolve_existing_path_status(path, warnings, kind);
+    if matches!(status, ExistingPathStatus::Unresolvable) {
+        if let Some(mapping) = resolved.mapping.as_ref() {
+            let provenance = mapping_provenance_suffix(raw, mapping);
+            for warning in warnings.iter_mut().skip(warning_start) {
+                if !warning.ends_with(&provenance) {
+                    warning.push_str(&provenance);
+                }
+            }
+        }
+    }
+    status
 }
 
 #[derive(Debug)]
@@ -2004,6 +3345,15 @@ fn lexical_normalize(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn resolved_mapping_root(mapping: &PathMapping) -> PathBuf {
+    let candidate = lexical_normalize(&mapping.to);
+    let mut warnings = Vec::new();
+    match resolve_existing_path_status(&candidate, &mut warnings, "mapped path root") {
+        ExistingPathStatus::Found(path) => path,
+        ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => candidate,
+    }
 }
 
 fn resolve_existing_path(path: &Path, warnings: &mut Vec<String>, kind: &str) -> Option<PathBuf> {
@@ -2096,11 +3446,13 @@ fn is_compiled_reference(raw: &str) -> bool {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct BoundedRead {
     stamp: ProjectReadStamp,
     bytes: Vec<u8>,
 }
 
+#[allow(dead_code)]
 fn read_bounded_with_tracker(
     path: &Path,
     limit: u64,
@@ -2113,6 +3465,7 @@ fn read_bounded_with_tracker(
     Ok(text)
 }
 
+#[allow(dead_code)]
 fn read_bounded_bytes(path: &Path, limit: u64) -> Result<BoundedRead, String> {
     let stamp = project_read_stamp(path)?;
     if stamp.bytes > limit {
@@ -2124,6 +3477,33 @@ fn read_bounded_bytes(path: &Path, limit: u64) -> Result<BoundedRead, String> {
     let bytes = fs::read(path).map_err(|error| format!("could not read file: {error}"))?;
     run_after_project_read(path);
     Ok(BoundedRead { stamp, bytes })
+}
+
+fn read_payload_with_tracker(
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+    limit: u64,
+    tracker: &mut ProjectReadTracker,
+) -> Result<(String, MetadataObservation), String> {
+    if !read_policy.allows_entry(entry) {
+        return Err("payload path is not authorized".to_string());
+    }
+    let stamp = project_read_stamp(&entry.path)?;
+    let bytes = read_policy.read_payload_bytes(entry, limit)?;
+    run_after_project_read(&entry.path);
+    tracker.record(&entry.path, stamp, &bytes);
+    let observation = MetadataObservation::Payload {
+        path: entry.path.clone(),
+        read_policy: read_policy.clone(),
+        path_entry: entry.clone(),
+        stamp: crate::workspace::path_stamp_result(&entry.path)
+            .ok()
+            .flatten(),
+        content_hash: project_content_hash(&bytes),
+    };
+    let contents =
+        String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))?;
+    Ok((contents, observation))
 }
 
 fn project_read_stamp(path: &Path) -> Result<ProjectReadStamp, String> {
@@ -2158,32 +3538,75 @@ fn is_pascal_source_path(path: &Path) -> bool {
     })
 }
 
-pub(crate) fn read_package_metadata(path: &Path) -> Result<PackageMetadataRead, String> {
+#[allow(dead_code)]
+pub(crate) fn read_package_metadata(
+    path: &Path,
+    options: &ProjectOptions,
+    overrides: &EffectiveOverrides,
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+) -> Result<PackageMetadata, String> {
+    read_package_metadata_with_observations(path, options, overrides, read_policy, entry)
+        .map(|read| read.metadata)
+}
+
+pub(crate) fn read_package_metadata_with_observations(
+    path: &Path,
+    options: &ProjectOptions,
+    overrides: &EffectiveOverrides,
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+) -> Result<PackageMetadataRead, String> {
+    if entry.path != path {
+        return Err(format!(
+            "package metadata entry does not match descriptor {}",
+            path.display()
+        ));
+    }
     let mut tracker = ProjectReadTracker::default();
-    let contents = read_bounded_with_tracker(path, MAX_PACKAGE_METADATA_BYTES, &mut tracker)
-        .map_err(|error| {
-            format!(
-                "could not read package metadata {}: {error}",
-                path.display()
-            )
-        })?;
-    let metadata = if extension_is(path, "dpk") {
-        parse_dpk_metadata(path, &contents)
+    let (contents, descriptor_observation) =
+        read_payload_with_tracker(read_policy, entry, MAX_PACKAGE_METADATA_BYTES, &mut tracker)
+            .map_err(|error| {
+                format!(
+                    "could not read package metadata {}: {error}",
+                    path.display()
+                )
+            })?;
+    let mut metadata = if extension_is(path, "dpk") {
+        parse_dpk_metadata(path, &contents, options, overrides, read_policy, entry)
     } else if extension_is(path, "dproj") {
-        parse_dproj_package_metadata(path, &contents, &mut tracker)
+        parse_dproj_package_metadata(
+            path,
+            &contents,
+            options,
+            overrides,
+            read_policy,
+            entry,
+            &mut tracker,
+        )
     } else {
         Err(format!(
             "unsupported package descriptor extension: {}",
             path.display()
         ))
     }?;
+    add_metadata_observation(&mut metadata.metadata_observations, descriptor_observation);
+    metadata.metadata_observations =
+        complete_metadata_observations(&metadata.metadata_files, metadata.metadata_observations);
     Ok(PackageMetadataRead {
         metadata,
         observations: tracker.observations,
     })
 }
 
-fn parse_dpk_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, String> {
+fn parse_dpk_metadata(
+    path: &Path,
+    contents: &str,
+    _options: &ProjectOptions,
+    overrides: &EffectiveOverrides,
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+) -> Result<PackageMetadata, String> {
     if declared_package_name(contents).is_none() {
         return Err(format!(
             "package descriptor {} has no package declaration",
@@ -2197,19 +3620,18 @@ fn parse_dpk_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, St
     metadata.metadata_files.push(path.to_path_buf());
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     for (unit_name, raw_path) in parse_explicit_unit_paths(contents) {
-        let Some(unit_path) = package_unit_path(
+        let Some(unit_entry) = package_unit_entry(
             &raw_path,
             base,
+            overrides,
             &mut metadata.warnings,
             "package contains path",
+            &entry.provenance,
+            read_policy,
         ) else {
             continue;
         };
-        add_unit_candidate(
-            &mut metadata.units,
-            canonical_unit_name(&unit_name),
-            unit_path,
-        );
+        add_package_unit_candidate(&mut metadata, canonical_unit_name(&unit_name), unit_entry);
     }
     Ok(metadata)
 }
@@ -2217,16 +3639,22 @@ fn parse_dpk_metadata(path: &Path, contents: &str) -> Result<PackageMetadata, St
 fn parse_dproj_package_metadata(
     path: &Path,
     contents: &str,
+    options: &ProjectOptions,
+    overrides: &EffectiveOverrides,
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
     tracker: &mut ProjectReadTracker,
 ) -> Result<PackageMetadata, String> {
     let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut builder = ProjectBuilder::new(
-        &ProjectOptions::default(),
+        options,
+        overrides,
         Vec::new(),
         project_dir.to_path_buf(),
+        read_policy.clone(),
     );
     let operations = parse_xml_operations(contents, path)?;
-    builder.process_operations(operations, path, tracker);
+    builder.process_operations(operations, path, tracker, &entry.provenance);
 
     let Some(main_source) = builder.property("mainsource") else {
         return Err(format!(
@@ -2248,15 +3676,21 @@ fn parse_dproj_package_metadata(
         metadata_files: vec![path.to_path_buf()],
         ..PackageMetadata::default()
     };
-    if let Some(main_source) = package_unit_path(
+    if let Some(main_source) = package_unit_entry(
         &main_source,
         project_dir,
+        overrides,
         &mut metadata.warnings,
         "package main source",
+        &entry.provenance,
+        read_policy,
     ) {
-        metadata.metadata_files.push(main_source);
+        metadata.metadata_files.push(main_source.path);
     }
     metadata.metadata_files.extend(builder.metadata_files);
+    metadata
+        .metadata_observations
+        .extend(builder.metadata_observations);
     for reference in builder.references {
         if is_compiled_reference(&reference.include) {
             continue;
@@ -2265,9 +3699,14 @@ fn parse_dproj_package_metadata(
             &reference.include,
             "",
             &builder.properties,
+            &builder.configured_ranges,
+            &builder.configured_properties,
+            &builder.property_provenance_ranges,
+            &builder.property_default_provenances,
             &builder.unknown_properties,
             &mut metadata.warnings,
             &reference.source_file,
+            &reference.source_provenance,
         );
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
             continue;
@@ -2275,51 +3714,72 @@ fn parse_dproj_package_metadata(
         if is_compiled_reference(&expanded.value) {
             continue;
         }
-        let Some(unit_path) = package_unit_path(
+        let provenance = expanded_path_provenance(&expanded, &reference.source_provenance);
+        let Some(unit_entry) = package_unit_entry(
             &expanded.value,
             project_dir,
+            overrides,
             &mut metadata.warnings,
             "package project reference",
+            &provenance,
+            read_policy,
         ) else {
             continue;
         };
-        let Some(stem) = unit_path.file_stem() else {
+        let Some(stem) = unit_entry.path.file_stem() else {
             continue;
         };
-        add_unit_candidate(
-            &mut metadata.units,
+        add_package_unit_candidate(
+            &mut metadata,
             canonical_unit_name(&stem.to_string_lossy()),
-            unit_path,
+            unit_entry,
         );
     }
     Ok(metadata)
 }
 
-fn package_unit_path(
+fn package_unit_entry(
     raw: &str,
     base: &Path,
+    overrides: &EffectiveOverrides,
     warnings: &mut Vec<String>,
     kind: &str,
-) -> Option<PathBuf> {
+    parent_provenance: &ProjectPathProvenance,
+    read_policy: &ReadPolicy,
+) -> Option<ProjectPathEntry> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains(UNRESOLVED_MARKER) {
         return None;
     }
-    if is_windows_absolute_text(raw) {
+    let resolved = project_path_candidate(raw, base, overrides, warnings, kind)?;
+    let candidate = lexical_normalize(&resolved.path);
+    let path = match resolve_existing_path_status_with_provenance(
+        &candidate, &resolved, raw, warnings, kind,
+    ) {
+        ExistingPathStatus::Found(path) => path,
+        ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => candidate,
+    };
+    let entry = inherit_path_provenance(
+        ProjectPathEntry::resolved(path, &resolved, false),
+        parent_provenance,
+    );
+    if !read_policy.allows_location(&entry) {
         warnings.push(format!(
-            "Windows path in {kind} is unavailable on Linux and was omitted: {raw}"
+            "ignored package path outside authorized read roots: {}",
+            entry.path.display()
         ));
         return None;
     }
-    let normalized = raw.replace('\\', "/");
-    let raw_path = Path::new(&normalized);
-    let candidate = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
-    } else {
-        base.join(raw_path)
-    };
-    let candidate = lexical_normalize(&candidate);
-    Some(resolve_existing_path(&candidate, warnings, kind).unwrap_or(candidate))
+    Some(entry)
+}
+
+fn add_package_unit_candidate(
+    metadata: &mut PackageMetadata,
+    name: String,
+    entry: ProjectPathEntry,
+) {
+    add_unit_candidate(&mut metadata.units, name.clone(), entry.path.clone());
+    add_unique_project_path_entry(metadata.unit_entries.entry(name).or_default(), entry);
 }
 
 fn declared_package_name(source: &str) -> Option<String> {
@@ -2338,6 +3798,12 @@ fn declared_package_name(source: &str) -> Option<String> {
 #[derive(Debug)]
 struct ProjectBuilder {
     properties: HashMap<String, String>,
+    configured_ranges: HashMap<String, Vec<Range<usize>>>,
+    property_provenance_ranges: HashMap<String, Vec<ProvenanceRange>>,
+    property_default_provenances: HashMap<String, ProjectPathProvenance>,
+    configured_properties: HashSet<String>,
+    global_properties: HashSet<String>,
+    overrides: EffectiveOverrides,
     unknown_properties: HashSet<String>,
     unknown_import_taint: bool,
     references: Vec<DccReference>,
@@ -2346,51 +3812,194 @@ struct ProjectBuilder {
     active_imports: HashSet<PathBuf>,
     import_count: usize,
     project_dir: PathBuf,
-    global_config: Option<String>,
-    global_platform: Option<String>,
     property_bytes: usize,
     metadata_files: Vec<PathBuf>,
+    metadata_observations: Vec<MetadataObservation>,
+    read_policy: ReadPolicy,
 }
 
 impl ProjectBuilder {
-    fn new(options: &ProjectOptions, warnings: Vec<String>, project_dir: PathBuf) -> Self {
-        let mut properties = HashMap::new();
-        let global_config = options
-            .build_config
-            .clone()
-            .filter(|value| !value.trim().is_empty());
-        let global_platform = options
-            .platform
-            .clone()
-            .filter(|value| !value.trim().is_empty());
-        properties.insert(
-            "config".to_string(),
-            global_config.clone().unwrap_or_default(),
-        );
-        properties.insert(
-            "platform".to_string(),
-            global_platform.clone().unwrap_or_default(),
-        );
+    fn new(
+        options: &ProjectOptions,
+        overrides: &EffectiveOverrides,
+        mut warnings: Vec<String>,
+        project_dir: PathBuf,
+        read_policy: ReadPolicy,
+    ) -> Self {
+        let mut properties: HashMap<String, String> =
+            overrides.properties.clone().into_iter().collect();
+        let mut configured_ranges = properties
+            .iter()
+            .map(|(name, value)| (name.clone(), full_range(value)))
+            .collect::<HashMap<_, _>>();
+        let mut configured_properties: HashSet<String> =
+            overrides.properties.keys().cloned().collect();
+        let mut client_properties = HashSet::new();
+        for (name, value) in [
+            ("config", options.build_config.as_ref()),
+            ("platform", options.platform.as_ref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                properties.insert(name.to_string(), value.clone());
+                // Client selections retain the legacy project-evaluation
+                // source policy even when they replace an override-file
+                // value; they still remain immutable global properties.
+                configured_properties.remove(name);
+                configured_ranges.remove(name);
+                client_properties.insert(name.to_string());
+            }
+        }
+        let global_properties: HashSet<String> = properties.keys().cloned().collect();
+        properties.entry("config".to_string()).or_default();
+        properties.entry("platform".to_string()).or_default();
+        let mut property_provenance_ranges = HashMap::new();
+        let mut property_default_provenances = HashMap::new();
+        for (name, value) in &properties {
+            let key = name.to_ascii_lowercase();
+            let provenance = if client_properties.contains(&key) {
+                ProjectPathProvenance::LegacyNative
+            } else if overrides.properties.contains_key(name) {
+                ProjectPathProvenance::Configured
+            } else {
+                ProjectPathProvenance::LegacyNative
+            };
+            property_default_provenances.insert(key.clone(), provenance.clone());
+            if !value.is_empty() {
+                property_provenance_ranges.insert(
+                    key,
+                    vec![ProvenanceRange {
+                        range: 0..value.len(),
+                        provenance,
+                    }],
+                );
+            }
+        }
         let property_bytes = properties.values().map(String::len).sum();
+        let mut incomplete = false;
+        if property_bytes > MAX_TOTAL_PROPERTY_BYTES {
+            let mut provenances = Vec::new();
+            for name in &global_properties {
+                let provenance = if client_properties.contains(name) {
+                    "client initialization options".to_string()
+                } else {
+                    overrides.property_origins.get(name).map_or_else(
+                        || "explicit override session".to_string(),
+                        |path| path.display().to_string(),
+                    )
+                };
+                if !provenances.iter().any(|existing| existing == &provenance) {
+                    provenances.push(provenance);
+                }
+            }
+            provenances.sort_unstable();
+            incomplete = true;
+            warnings.push(format!(
+                "configured Delphi override properties exceed the {MAX_TOTAL_PROPERTY_BYTES} byte evaluator budget (sources: {})",
+                provenances.join(", ")
+            ));
+        }
+        for (name, value) in &properties {
+            if value.len() <= MAX_EXPANDED_VALUE_BYTES {
+                continue;
+            }
+            incomplete = true;
+            let provenance = if client_properties.contains(name) {
+                "client initialization options".to_string()
+            } else {
+                overrides.property_origins.get(name).map_or_else(
+                    || "explicit override session".to_string(),
+                    |path| path.display().to_string(),
+                )
+            };
+            warnings.push(format!(
+                "configured Delphi property {name} from {provenance} exceeds the {MAX_EXPANDED_VALUE_BYTES} byte per-value evaluator budget"
+            ));
+        }
         Self {
             properties,
+            configured_ranges,
+            property_provenance_ranges,
+            property_default_provenances,
+            configured_properties,
+            global_properties,
+            overrides: overrides.clone(),
             unknown_properties: HashSet::new(),
             unknown_import_taint: false,
             references: Vec::new(),
             warnings,
-            incomplete: false,
+            incomplete,
             active_imports: HashSet::new(),
             import_count: 0,
             project_dir,
-            global_config,
-            global_platform,
             property_bytes,
             metadata_files: Vec::new(),
+            metadata_observations: Vec::new(),
+            read_policy,
         }
+    }
+
+    fn record_payload_observation(&mut self, observation: MetadataObservation) {
+        add_metadata_observation(&mut self.metadata_observations, observation);
     }
 
     fn property(&self, name: &str) -> Option<String> {
         self.properties.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    fn property_is_configured(&self, name: &str) -> bool {
+        self.configured_properties
+            .contains(&name.to_ascii_lowercase())
+    }
+
+    fn property_provenance(&self, name: &str) -> ProjectPathProvenance {
+        let key = name.to_ascii_lowercase();
+        self.property_provenance_ranges
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .fold(
+                self.property_default_provenances
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(ProjectPathProvenance::LegacyNative),
+                |current, range| combine_path_provenance(&current, &range.provenance),
+            )
+    }
+
+    fn property_list_with_provenance(&self, name: &str) -> Vec<(String, ProjectPathProvenance)> {
+        let Some(value) = self.property(name) else {
+            return Vec::new();
+        };
+        let provenance_ranges = self
+            .property_provenance_ranges
+            .get(&name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let default_provenance = self
+            .property_default_provenances
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or(ProjectPathProvenance::LegacyNative);
+        let mut result = Vec::new();
+        let mut start = 0;
+        for separator in value.match_indices(';').map(|(index, _)| index) {
+            result.push(property_list_item(
+                &value,
+                start,
+                separator,
+                provenance_ranges,
+                &default_provenance,
+            ));
+            start = separator + 1;
+        }
+        result.push(property_list_item(
+            &value,
+            start,
+            value.len(),
+            provenance_ranges,
+            &default_provenance,
+        ));
+        result
     }
 
     fn process_root_dproj(
@@ -2399,10 +4008,13 @@ impl ProjectBuilder {
         tracker: &mut ProjectReadTracker,
     ) -> Result<(), String> {
         self.metadata_files.push(path.to_path_buf());
-        let contents = read_bounded_with_tracker(path, MAX_PROJECT_BYTES, tracker)
-            .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
+        let entry = ProjectPathEntry::legacy(path.to_path_buf());
+        let (contents, observation) =
+            read_payload_with_tracker(&self.read_policy, &entry, MAX_PROJECT_BYTES, tracker)
+                .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
+        self.record_payload_observation(observation);
         let operations = parse_xml_operations(&contents, path)?;
-        self.process_operations(operations, path, tracker);
+        self.process_operations(operations, path, tracker, &entry.provenance);
         Ok(())
     }
 
@@ -2411,12 +4023,13 @@ impl ProjectBuilder {
         operations: Vec<XmlOperation>,
         source_file: &Path,
         tracker: &mut ProjectReadTracker,
+        source_provenance: &ProjectPathProvenance,
     ) {
         let base = source_file.parent().unwrap_or_else(|| Path::new("."));
         for operation in operations {
             match operation {
                 XmlOperation::PropertyGroup(group) => {
-                    self.process_property_group(group, source_file, base);
+                    self.process_property_group(group, source_file, base, source_provenance);
                 }
                 XmlOperation::DccReference(reference) => {
                     if is_compiled_reference(&reference.include) {
@@ -2440,20 +4053,27 @@ impl ProjectBuilder {
                             include: reference.include,
                             condition: None,
                             source_file: source_file.to_path_buf(),
+                            source_provenance: source_provenance.clone(),
                         }),
                         TruthValue::False => {}
                         TruthValue::Unknown => self.incomplete = true,
                     }
                 }
                 XmlOperation::Import(import) => {
-                    self.process_import(import, source_file, base, tracker)
+                    self.process_import(import, source_file, base, tracker, source_provenance);
                 }
                 XmlOperation::Unsupported(message) => self.warnings.push(message),
             }
         }
     }
 
-    fn process_property_group(&mut self, group: PropertyGroup, source_file: &Path, base: &Path) {
+    fn process_property_group(
+        &mut self,
+        group: PropertyGroup,
+        source_file: &Path,
+        base: &Path,
+        source_provenance: &ProjectPathProvenance,
+    ) {
         let group_result = condition_matches(
             group.condition.as_deref(),
             ConditionEnvironment {
@@ -2472,7 +4092,7 @@ impl ProjectBuilder {
             TruthValue::Unknown => {
                 self.incomplete = true;
                 for property in group.properties {
-                    self.mark_property_unknown(&property.name, source_file);
+                    self.mark_property_unknown(&property.name, source_file, source_provenance);
                 }
                 return;
             }
@@ -2495,14 +4115,14 @@ impl ProjectBuilder {
                 TruthValue::False => continue,
                 TruthValue::Unknown => {
                     self.incomplete = true;
-                    self.mark_property_unknown(&property.name, source_file);
+                    self.mark_property_unknown(&property.name, source_file, source_provenance);
                     continue;
                 }
                 TruthValue::True => {}
             }
-            if (property.name.eq_ignore_ascii_case("config") && self.global_config.is_some())
-                || (property.name.eq_ignore_ascii_case("platform")
-                    && self.global_platform.is_some())
+            if self
+                .global_properties
+                .contains(&property.name.to_ascii_lowercase())
             {
                 continue;
             }
@@ -2510,21 +4130,50 @@ impl ProjectBuilder {
                 &property.value,
                 &property.name,
                 &self.properties,
+                &self.configured_ranges,
+                &self.configured_properties,
+                &self.property_provenance_ranges,
+                &self.property_default_provenances,
                 &self.unknown_properties,
                 &mut self.warnings,
                 source_file,
+                source_provenance,
             );
+            let trimmed = value.value.trim();
+            let trim_start = value.value.len() - value.value.trim_start().len();
+            let configured_ranges =
+                trim_ranges(&value.configured_ranges, trim_start, trimmed.len());
+            let provenance_ranges =
+                trim_provenance_ranges(&value.provenance_ranges, trim_start, trimmed.len());
             self.set_property(
                 &property.name,
-                value.value.trim().to_string(),
+                trimmed.to_string(),
                 value.unknown,
+                configured_ranges,
+                value.explicit_dependency,
+                provenance_ranges,
+                source_provenance,
                 source_file,
             );
         }
     }
 
-    fn set_property(&mut self, name: &str, value: String, unknown: bool, source_file: &Path) {
+    #[allow(clippy::too_many_arguments)]
+    fn set_property(
+        &mut self,
+        name: &str,
+        value: String,
+        unknown: bool,
+        configured_ranges: Vec<Range<usize>>,
+        explicit_dependency: bool,
+        provenance_ranges: Vec<ProvenanceRange>,
+        source_provenance: &ProjectPathProvenance,
+        source_file: &Path,
+    ) {
         let key = name.to_ascii_lowercase();
+        if self.global_properties.contains(&key) {
+            return;
+        }
         let previous_bytes = self.properties.get(&key).map_or(0, String::len);
         let new_bytes = self
             .property_bytes
@@ -2544,6 +4193,25 @@ impl ProjectBuilder {
         } else {
             self.unknown_properties.remove(&key);
         }
+        if explicit_dependency {
+            self.configured_properties.insert(key.clone());
+        } else {
+            self.configured_properties.remove(&key);
+        }
+        if configured_ranges.is_empty() {
+            self.configured_ranges.remove(&key);
+        } else {
+            self.configured_ranges
+                .insert(key.clone(), configured_ranges);
+        }
+        if provenance_ranges.is_empty() {
+            self.property_provenance_ranges.remove(&key);
+        } else {
+            self.property_provenance_ranges
+                .insert(key.clone(), provenance_ranges);
+        }
+        self.property_default_provenances
+            .insert(key.clone(), source_provenance.clone());
         self.properties.insert(key, value);
     }
 
@@ -2551,6 +4219,9 @@ impl ProjectBuilder {
         self.unknown_import_taint = true;
         let keys: Vec<String> = self.properties.keys().cloned().collect();
         for key in keys {
+            if self.global_properties.contains(&key) {
+                continue;
+            }
             // MainSource identifies the project itself and is consumed after
             // the complete metadata stream has been evaluated. Keep an
             // already-established value available for that identity lookup,
@@ -2561,11 +4232,6 @@ impl ProjectBuilder {
                 self.unknown_properties.insert(key);
                 continue;
             }
-            if (key.eq_ignore_ascii_case("config") && self.global_config.is_some())
-                || (key.eq_ignore_ascii_case("platform") && self.global_platform.is_some())
-            {
-                continue;
-            }
             let previous_bytes = self.properties.get(&key).map_or(0, String::len);
             self.property_bytes = self
                 .property_bytes
@@ -2573,17 +4239,31 @@ impl ProjectBuilder {
                 .saturating_add(UNRESOLVED_MARKER.len_utf8());
             self.properties
                 .insert(key.clone(), UNRESOLVED_MARKER.to_string());
+            self.configured_ranges.remove(&key);
+            self.property_provenance_ranges.remove(&key);
             self.unknown_properties.insert(key);
         }
     }
 
-    fn mark_property_unknown(&mut self, name: &str, source_file: &Path) {
-        if (name.eq_ignore_ascii_case("config") && self.global_config.is_some())
-            || (name.eq_ignore_ascii_case("platform") && self.global_platform.is_some())
-        {
+    fn mark_property_unknown(
+        &mut self,
+        name: &str,
+        source_file: &Path,
+        source_provenance: &ProjectPathProvenance,
+    ) {
+        if self.global_properties.contains(&name.to_ascii_lowercase()) {
             return;
         }
-        self.set_property(name, UNRESOLVED_MARKER.to_string(), true, source_file);
+        self.set_property(
+            name,
+            UNRESOLVED_MARKER.to_string(),
+            true,
+            Vec::new(),
+            false,
+            Vec::new(),
+            source_provenance,
+            source_file,
+        );
         self.unknown_properties.insert(name.to_ascii_lowercase());
     }
 
@@ -2593,8 +4273,9 @@ impl ProjectBuilder {
         source_file: &Path,
         base: &Path,
         tracker: &mut ProjectReadTracker,
+        source_provenance: &ProjectPathProvenance,
     ) {
-        if !looks_like_optset(&import.project) {
+        if !import_may_be_optset(&import.project) {
             self.warnings.push(format!(
                 "ignored non-optset project import in {} (targets are not executed): {}",
                 source_file.display(),
@@ -2606,24 +4287,47 @@ impl ProjectBuilder {
             &import.project,
             "",
             &self.properties,
+            &self.configured_ranges,
+            &self.configured_properties,
+            &self.property_provenance_ranges,
+            &self.property_default_provenances,
             &self.unknown_properties,
             &mut self.warnings,
             source_file,
+            source_provenance,
         );
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
             self.incomplete = true;
             self.taint_unknown_import();
             return;
         }
-        let Some(candidate) =
-            project_path_candidate(&expanded.value, base, &mut self.warnings, "optset import")
-        else {
+        let Some(resolved) = project_path_candidate(
+            &expanded.value,
+            base,
+            &self.overrides,
+            &mut self.warnings,
+            "optset import",
+        ) else {
             self.incomplete = true;
             self.taint_unknown_import();
             return;
         };
-        let path_status =
-            resolve_existing_path_status(&candidate, &mut self.warnings, "optset import");
+        let candidate = lexical_normalize(&resolved.path);
+        if !extension_is(&candidate, "optset") {
+            self.warnings.push(format!(
+                "ignored non-optset project import in {} (targets are not executed): {}",
+                source_file.display(),
+                import.project
+            ));
+            return;
+        }
+        let path_status = resolve_existing_path_status_with_provenance(
+            &candidate,
+            &resolved,
+            &expanded.value,
+            &mut self.warnings,
+            "optset import",
+        );
         let path = match &path_status {
             ExistingPathStatus::Found(path) => path,
             ExistingPathStatus::Missing => &candidate,
@@ -2633,6 +4337,21 @@ impl ProjectBuilder {
                 return;
             }
         };
+        let entry = inherit_path_provenance(
+            ProjectPathEntry::resolved(path.clone(), &resolved, expanded.explicit_dependency),
+            &expanded_path_provenance(&expanded, source_provenance),
+        );
+        if matches!(path_status, ExistingPathStatus::Found(_))
+            && !self.read_policy.allows_entry(&entry)
+        {
+            self.incomplete = true;
+            self.taint_unknown_import();
+            self.warnings.push(format!(
+                "ignored optset import outside authorized read roots: {}",
+                path.display()
+            ));
+            return;
+        }
         if !add_metadata_file(
             &mut self.metadata_files,
             path.clone(),
@@ -2650,6 +4369,7 @@ impl ProjectBuilder {
                 properties: &self.properties,
                 unknown_properties: &self.unknown_properties,
                 unknown_import_taint: self.unknown_import_taint,
+                overrides: &self.overrides,
             },
             base,
             &mut self.metadata_files,
@@ -2677,9 +4397,11 @@ impl ProjectBuilder {
         let ExistingPathStatus::Found(path) = path_status else {
             self.incomplete = true;
             self.taint_unknown_import();
-            self.warnings.push(format!(
-                "optset import path does not exist and was omitted: {}",
-                path.display()
+            self.warnings.push(missing_path_warning(
+                "optset import",
+                &expanded.value,
+                &candidate,
+                &resolved,
             ));
             return;
         };
@@ -2689,10 +4411,16 @@ impl ProjectBuilder {
             return;
         }
         self.import_count += 1;
-        let result = read_bounded_with_tracker(&path, MAX_IMPORT_BYTES, tracker)
-            .and_then(|contents| parse_xml_operations(&contents, &path));
+        let result =
+            read_payload_with_tracker(&self.read_policy, &entry, MAX_IMPORT_BYTES, tracker)
+                .and_then(|(contents, observation)| {
+                    self.record_payload_observation(observation);
+                    parse_xml_operations(&contents, &path)
+                });
         match result {
-            Ok(operations) => self.process_operations(operations, &path, tracker),
+            Ok(operations) => {
+                self.process_operations(operations, &path, tracker, &entry.provenance)
+            }
             Err(error) => {
                 self.incomplete = true;
                 self.taint_unknown_import();
@@ -2711,6 +4439,7 @@ struct DccReference {
     include: String,
     condition: Option<String>,
     source_file: PathBuf,
+    source_provenance: ProjectPathProvenance,
 }
 
 #[derive(Debug)]
@@ -2746,6 +4475,24 @@ fn looks_like_optset(project: &str) -> bool {
         .rsplit('/')
         .next()
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".optset"))
+}
+
+fn import_may_be_optset(project: &str) -> bool {
+    let project = project.trim();
+    if looks_like_optset(project) {
+        return true;
+    }
+    let normalized = project.replace('\\', "/");
+    let Some(name) = normalized.rsplit('/').next() else {
+        return false;
+    };
+    if !name.contains("$(") {
+        return false;
+    }
+    match name.rfind(')') {
+        Some(end) => name[end + 1..].is_empty(),
+        None => true,
+    }
 }
 
 #[derive(Debug)]
@@ -2860,6 +4607,7 @@ fn parse_xml_operations(contents: &str, path: &Path) -> Result<Vec<XmlOperation>
                         include: attributes.get("include").cloned().unwrap_or_default(),
                         condition: effective_condition,
                         source_file: path.to_path_buf(),
+                        source_provenance: ProjectPathProvenance::LegacyNative,
                     }));
                     frames.push(XmlFrame {
                         kind: FrameKind::Other {
@@ -2950,6 +4698,7 @@ fn parse_xml_operations(contents: &str, path: &Path) -> Result<Vec<XmlOperation>
                         include: attributes.get("include").cloned().unwrap_or_default(),
                         condition: effective_condition,
                         source_file: path.to_path_buf(),
+                        source_provenance: ProjectPathProvenance::LegacyNative,
                     }));
                 } else if (name.eq_ignore_ascii_case("option")
                     || name.eq_ignore_ascii_case("property"))
@@ -3048,25 +4797,47 @@ fn xml_attributes(
 struct ExpandedValue {
     value: String,
     unknown: bool,
+    explicit_dependency: bool,
+    configured_ranges: Vec<Range<usize>>,
+    provenance_ranges: Vec<ProvenanceRange>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_value(
     value: &str,
     current_property: &str,
     properties: &HashMap<String, String>,
+    property_ranges: &HashMap<String, Vec<Range<usize>>>,
+    configured_properties: &HashSet<String>,
+    property_provenance_ranges: &HashMap<String, Vec<ProvenanceRange>>,
+    property_default_provenances: &HashMap<String, ProjectPathProvenance>,
     unknown_properties: &HashSet<String>,
     warnings: &mut Vec<String>,
     source_file: &Path,
+    source_provenance: &ProjectPathProvenance,
 ) -> ExpandedValue {
     let mut expanded = String::new();
     let mut unknown = false;
+    let mut explicit_dependency = false;
+    let mut configured_ranges = Vec::new();
+    let mut provenance_ranges = Vec::new();
     let mut cursor = 0;
     while let Some(relative_start) = value[cursor..].find("$(") {
         let start = cursor + relative_start;
-        if !append_expansion(&mut expanded, &value[cursor..start], warnings, source_file) {
+        if !append_expansion_with_provenance(
+            &mut expanded,
+            &value[cursor..start],
+            warnings,
+            source_file,
+            &mut provenance_ranges,
+            source_provenance,
+        ) {
             return ExpandedValue {
                 value: UNRESOLVED_MARKER.to_string(),
                 unknown: true,
+                explicit_dependency,
+                configured_ranges: Vec::new(),
+                provenance_ranges: Vec::new(),
             };
         }
         let Some(relative_end) = value[start + 2..].find(')') else {
@@ -3077,6 +4848,9 @@ fn expand_value(
             return ExpandedValue {
                 value: UNRESOLVED_MARKER.to_string(),
                 unknown: true,
+                explicit_dependency,
+                configured_ranges: Vec::new(),
+                provenance_ranges: Vec::new(),
             };
         };
         let end = start + 2 + relative_end;
@@ -3091,19 +4865,72 @@ fn expand_value(
                 .to_string_lossy()
                 .replace('\\', "/");
             let directory = format!("{}/", directory.trim_end_matches('/'));
-            if !append_expansion(&mut expanded, &directory, warnings, source_file) {
+            if !append_expansion_with_provenance(
+                &mut expanded,
+                &directory,
+                warnings,
+                source_file,
+                &mut provenance_ranges,
+                source_provenance,
+            ) {
                 return ExpandedValue {
                     value: UNRESOLVED_MARKER.to_string(),
                     unknown: true,
+                    explicit_dependency,
+                    configured_ranges: Vec::new(),
+                    provenance_ranges: Vec::new(),
                 };
             }
         } else if let Some(replacement) = properties.get(&key) {
+            let replacement_start = expanded.len();
             if !append_expansion(&mut expanded, replacement, warnings, source_file) {
                 return ExpandedValue {
                     value: UNRESOLVED_MARKER.to_string(),
                     unknown: true,
+                    explicit_dependency,
+                    configured_ranges: Vec::new(),
+                    provenance_ranges: Vec::new(),
                 };
             }
+            let replacement_end = expanded.len();
+            if let Some(ranges) = property_provenance_ranges.get(&key) {
+                for range in ranges {
+                    if range.range.start <= range.range.end && range.range.end <= replacement.len()
+                    {
+                        provenance_ranges.push(ProvenanceRange {
+                            range: (replacement_start + range.range.start)
+                                ..(replacement_start + range.range.end),
+                            provenance: range.provenance.clone(),
+                        });
+                    }
+                }
+            } else if replacement_start < replacement_end {
+                provenance_ranges.push(ProvenanceRange {
+                    range: replacement_start..replacement_end,
+                    provenance: property_default_provenances
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| source_provenance.clone()),
+                });
+            } else if let Some(provenance) = property_default_provenances.get(&key) {
+                provenance_ranges.push(ProvenanceRange {
+                    range: replacement_start..replacement_end,
+                    provenance: provenance.clone(),
+                });
+            }
+            if let Some(ranges) = property_ranges.get(&key) {
+                for range in ranges {
+                    if range.start < range.end && range.end <= replacement.len() {
+                        configured_ranges.push(
+                            (replacement_start + range.start)..(replacement_start + range.end),
+                        );
+                    }
+                }
+            }
+            explicit_dependency |= configured_properties.contains(&key)
+                || property_ranges
+                    .get(&key)
+                    .is_some_and(|ranges| !ranges.is_empty());
             unknown |= replacement.contains(UNRESOLVED_MARKER) || unknown_properties.contains(&key);
         } else if name.eq_ignore_ascii_case(current_property) {
             // Delphi project files commonly terminate list properties with
@@ -3124,20 +4951,36 @@ fn expand_value(
                 return ExpandedValue {
                     value: UNRESOLVED_MARKER.to_string(),
                     unknown: true,
+                    explicit_dependency,
+                    configured_ranges: Vec::new(),
+                    provenance_ranges: Vec::new(),
                 };
             }
         }
         cursor = end + 1;
     }
-    if !append_expansion(&mut expanded, &value[cursor..], warnings, source_file) {
+    if !append_expansion_with_provenance(
+        &mut expanded,
+        &value[cursor..],
+        warnings,
+        source_file,
+        &mut provenance_ranges,
+        source_provenance,
+    ) {
         return ExpandedValue {
             value: UNRESOLVED_MARKER.to_string(),
             unknown: true,
+            explicit_dependency,
+            configured_ranges: Vec::new(),
+            provenance_ranges: Vec::new(),
         };
     }
     ExpandedValue {
         value: expanded,
         unknown,
+        explicit_dependency,
+        configured_ranges,
+        provenance_ranges,
     }
 }
 
@@ -3163,6 +5006,27 @@ fn append_expansion(
     true
 }
 
+fn append_expansion_with_provenance(
+    target: &mut String,
+    addition: &str,
+    warnings: &mut Vec<String>,
+    source_file: &Path,
+    provenance_ranges: &mut Vec<ProvenanceRange>,
+    provenance: &ProjectPathProvenance,
+) -> bool {
+    let start = target.len();
+    if !append_expansion(target, addition, warnings, source_file) {
+        return false;
+    }
+    if start < target.len() {
+        provenance_ranges.push(ProvenanceRange {
+            range: start..target.len(),
+            provenance: provenance.clone(),
+        });
+    }
+    true
+}
+
 #[derive(Debug, Clone)]
 struct ConditionValue {
     value: String,
@@ -3173,6 +5037,7 @@ struct ConditionEnvironment<'a> {
     properties: &'a HashMap<String, String>,
     unknown_properties: &'a HashSet<String>,
     unknown_import_taint: bool,
+    overrides: &'a EffectiveOverrides,
 }
 
 fn expand_condition_value(
@@ -3295,6 +5160,7 @@ fn condition_matches(
         properties: environment.properties,
         unknown_properties: environment.unknown_properties,
         unknown_import_taint: environment.unknown_import_taint,
+        overrides: environment.overrides,
         base,
         metadata_files,
         warnings,
@@ -3464,6 +5330,7 @@ struct ConditionParser<'a> {
     properties: &'a HashMap<String, String>,
     unknown_properties: &'a HashSet<String>,
     unknown_import_taint: bool,
+    overrides: &'a EffectiveOverrides,
     base: &'a Path,
     metadata_files: &'a mut Vec<PathBuf>,
     warnings: &'a mut Vec<String>,
@@ -3517,16 +5384,23 @@ impl ConditionParser<'_> {
                 self.unknown_seen = true;
                 return Ok(TruthValue::Unknown);
             }
-            let Some(candidate) = project_path_candidate(
+            let Some(resolved) = project_path_candidate(
                 &argument.value,
                 self.base,
+                self.overrides,
                 self.warnings,
                 "Exists condition",
             ) else {
                 return Ok(TruthValue::False);
             };
-            let path_status =
-                resolve_existing_path_status(&candidate, self.warnings, "Exists condition");
+            let candidate = lexical_normalize(&resolved.path);
+            let path_status = resolve_existing_path_status_with_provenance(
+                &candidate,
+                &resolved,
+                &argument.value,
+                self.warnings,
+                "Exists condition",
+            );
             let path = match &path_status {
                 ExistingPathStatus::Found(path) => path,
                 ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => &candidate,
@@ -3849,11 +5723,21 @@ fn lex_pascal(source: &str) -> Vec<PascalToken> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_OWNERSHIP_CANDIDATES, MAX_PROJECT_DIRECTORY_ENTRIES, ProjectContext, ProjectReadStamp,
-        ProjectReadTracker, project_candidate_membership, test_cancel_project_scan_after_checks,
+        EffectiveOverrides, MAX_OWNERSHIP_CANDIDATES, MAX_OWNERSHIP_SOURCE_BYTES,
+        MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES, MetadataObservation,
+        ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectReadStamp,
+        ProjectReadTracker, ReadPolicy, project_candidate_membership, read_package_metadata,
+        test_cancel_project_scan_after_checks,
     };
+    use pascal_core::delphi_overrides::OverrideSession;
     use std::fs;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::path::Path;
     use std::sync::atomic::AtomicBool;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn candidate_membership_reports_directory_read_errors() {
@@ -3937,6 +5821,841 @@ mod tests {
         assert_eq!(
             discovery.observations[0].content_bytes,
             Some(b"first".to_vec())
+        );
+    }
+
+    #[test]
+    fn candidate_selection_retains_payload_observations_for_main_and_recursive_members() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("A.dpr");
+        let member = root.join("Child.pas");
+        fs::write(&main, "program A; uses Child in 'Child.pas'; begin end.\n")
+            .expect("main source");
+        fs::write(&member, "unit Child; interface implementation end.\n")
+            .expect("recursive member");
+        fs::write(root.join("B.dpr"), "program B; begin end.\n").expect("other main source");
+        fs::write(
+            root.join("A.dproj"),
+            "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .expect("owning project");
+        fs::write(
+            root.join("B.dproj"),
+            "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .expect("competing project");
+
+        let context =
+            ProjectContext::discover(&member, &[root.to_path_buf()], &ProjectOptions::default())
+                .expect("discover project context");
+
+        assert_eq!(context.project_file, Some(root.join("A.dproj")));
+        for path in [&main, &member] {
+            assert!(
+                context.metadata_observations.iter().any(|observation| {
+                    let MetadataObservation::Payload {
+                        path: observed,
+                        read_policy,
+                        path_entry,
+                        stamp,
+                        content_hash,
+                    } = observation
+                    else {
+                        return false;
+                    };
+                    observed == path
+                        && read_policy == &context.read_policy
+                        && path_entry.path == *path
+                        && stamp
+                            == &crate::workspace::path_stamp_result(path)
+                                .expect("payload path stamp")
+                        && *content_hash
+                            == crate::workspace::content_hash_bytes(
+                                &fs::read(path).expect("payload bytes"),
+                            )
+                }),
+                "evaluated payload {path:?} was downgraded to stat-only: {context:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_observation_keeps_the_first_payload_for_each_path() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let metadata = root.join("App.dproj");
+        fs::write(&metadata, "<Project />").expect("metadata");
+        let policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let entry = ProjectPathEntry {
+            path: metadata.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let first_stamp =
+            crate::workspace::path_stamp_result(&metadata).expect("first metadata stamp");
+        let first = MetadataObservation::Payload {
+            path: metadata.clone(),
+            read_policy: policy.clone(),
+            path_entry: entry.clone(),
+            stamp: first_stamp.clone(),
+            content_hash: 1,
+        };
+        let replacement = MetadataObservation::Payload {
+            path: metadata.clone(),
+            read_policy: policy.clone(),
+            path_entry: entry.clone(),
+            stamp: first_stamp.clone(),
+            content_hash: 2,
+        };
+        let mut observations = vec![MetadataObservation::Stat {
+            path: metadata.clone(),
+        }];
+        super::add_metadata_observation(&mut observations, first.clone());
+        super::add_metadata_observation(&mut observations, replacement);
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0], first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_metadata_rejects_a_symlinked_descriptor() {
+        let temp = tempfile::tempdir().expect("temporary package directory");
+        let outside = temp.path().join("outside.dpk");
+        let descriptor = temp.path().join("Package.dpk");
+        fs::write(&outside, "package Package; end.\n").expect("package descriptor");
+        symlink(&outside, &descriptor).expect("descriptor symlink");
+        let root = temp.path().to_path_buf();
+        let read_policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let entry = ProjectPathEntry {
+            path: descriptor.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+
+        let error = read_package_metadata(
+            &descriptor,
+            &ProjectOptions::default(),
+            &EffectiveOverrides::default(),
+            &read_policy,
+            &entry,
+        )
+        .expect_err("symlinked package descriptors must not be opened");
+        assert!(
+            error.contains("regular file")
+                || error.contains("symlink")
+                || error.contains("authorized"),
+            "unexpected package descriptor error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_mapped_optset_path_properties_retain_mapping_provenance() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let outside = root.join("outside");
+        let main = root.join("App.dpr");
+        fs::create_dir_all(&sdk).expect("mapped destination");
+        fs::create_dir_all(&outside).expect("relative path directory");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            sdk.join("settings.optset"),
+            "<Project><PropertyGroup><DCC_UnitSearchPath>outside</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("mapped optset");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project=\"C:\\\\SDK\\\\settings.optset\" /></Project>",
+        )
+        .expect("project descriptor");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("mapping configuration");
+
+        let context = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("discover project");
+        let entry = context
+            .search_path_entries
+            .iter()
+            .find(|entry| entry.path == outside)
+            .expect("imported optset search path");
+
+        assert_eq!(
+            entry.provenance,
+            ProjectPathProvenance::Mapped { root: sdk },
+            "path-list values from mapped optsets must not fall back to legacy provenance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_metadata_rejects_relative_units_outside_a_mapped_descriptor_root() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let outside = root.join("outside");
+        let descriptor = sdk.join("Package.dpk");
+        fs::create_dir_all(&sdk).expect("mapped package directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::write(
+            &descriptor,
+            "package Package; contains Provider in '../outside/Provider.pas'; end.",
+        )
+        .expect("package descriptor");
+        fs::write(
+            outside.join("Provider.pas"),
+            "unit Provider; interface implementation end.",
+        )
+        .expect("outside package unit");
+        let overrides = EffectiveOverrides {
+            path_mappings: vec![pascal_core::delphi_overrides::PathMapping {
+                from: "c:/sdk".to_string(),
+                to: sdk.clone(),
+                config_file: root.join(".delphi-tools.local.toml"),
+            }],
+            ..EffectiveOverrides::default()
+        };
+        let read_policy = ReadPolicy::new(&[root.to_path_buf()], &[], &[], &overrides);
+        let entry = ProjectPathEntry {
+            path: descriptor.clone(),
+            provenance: ProjectPathProvenance::Mapped { root: sdk },
+        };
+
+        let metadata = read_package_metadata(
+            &descriptor,
+            &ProjectOptions::default(),
+            &overrides,
+            &read_policy,
+            &entry,
+        )
+        .expect("read package metadata");
+
+        assert!(
+            !metadata
+                .units
+                .values()
+                .flatten()
+                .any(|path| path == &outside.join("Provider.pas")),
+            "package metadata exposed a unit outside its mapped descriptor root: {metadata:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_optset_property_origin_reaches_a_later_root_reference() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let outside = root.join("outside");
+        let main = root.join("App.dpr");
+        let provider = outside.join("Provider.pas");
+        fs::create_dir_all(&sdk).expect("mapped destination");
+        fs::create_dir_all(&outside).expect("reference directory");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(&provider, "unit Provider; interface implementation end.")
+            .expect("provider source");
+        fs::write(
+            sdk.join("settings.optset"),
+            "<Project><PropertyGroup><ProviderPath>outside/Provider.pas</ProviderPath></PropertyGroup></Project>",
+        )
+        .expect("mapped optset");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project=\"C:\\\\SDK\\\\settings.optset\" /><ItemGroup><DCCReference Include=\"$(ProviderPath)\" /></ItemGroup></Project>",
+        )
+        .expect("project descriptor");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("mapping configuration");
+
+        let context = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("discover project");
+        let entry = context
+            .explicit_unit_entries
+            .values()
+            .flatten()
+            .find(|entry| entry.path == provider)
+            .expect("expanded root reference");
+
+        assert_eq!(
+            entry.provenance,
+            ProjectPathProvenance::Mapped { root: sdk },
+            "mapped property expansion must not fall back to root legacy provenance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_configured_substitution_reaches_a_search_path_item() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let outside = root.join("outside");
+        let main = root.join("App.dpr");
+        fs::create_dir_all(&outside).expect("search path directory");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            "[properties]\nPrefix = ''\n",
+        )
+        .expect("override configuration");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>$(Prefix)outside</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project descriptor");
+
+        let context = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("discover project");
+        let entry = context
+            .search_path_entries
+            .iter()
+            .find(|entry| entry.path == outside)
+            .expect("configured search path");
+
+        assert_eq!(
+            entry.provenance,
+            ProjectPathProvenance::Configured,
+            "an empty configured substitution must retain configured provenance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trimmed_empty_configured_list_item_keeps_its_boundary_provenance() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let outside = root.join("outside/sdk");
+        let legacy = root.join("legacy");
+        let main = root.join("App.dpr");
+        fs::create_dir_all(&outside).expect("configured search path");
+        fs::create_dir_all(&legacy).expect("legacy search path");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            "[properties]\nPrefix = ''\n",
+        )
+        .expect("override configuration");
+        fs::write(
+            root.join("App.dproj"),
+            format!(
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>$(Prefix) {outside};legacy</DCC_UnitSearchPath></PropertyGroup></Project>",
+                outside = outside.display()
+            ),
+        )
+        .expect("project descriptor");
+
+        let context = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("discover project");
+        let configured = context
+            .search_path_entries
+            .iter()
+            .find(|entry| entry.path == outside)
+            .expect("configured item");
+        let legacy = context
+            .search_path_entries
+            .iter()
+            .find(|entry| entry.path == legacy)
+            .expect("legacy item");
+
+        assert_eq!(
+            configured.provenance,
+            ProjectPathProvenance::Configured,
+            "the configured empty substitution must survive item trimming"
+        );
+        assert_eq!(
+            legacy.provenance,
+            ProjectPathProvenance::LegacyNative,
+            "the unrelated legacy item must not inherit configured provenance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_empty_override_markers_keep_unit_and_include_paths_configured() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        let unit = outside.join("unit");
+        let include = outside.join("include");
+        let intermediate = outside.join("intermediate");
+        let boundary = outside.join("boundary");
+        let boundary_include = outside.join("boundary_include");
+        let legacy = root.join("legacy");
+        let main = root.join("App.dpr");
+
+        fs::create_dir_all(&root).expect("project directory");
+        for path in [
+            &unit,
+            &include,
+            &intermediate,
+            &boundary,
+            &boundary_include,
+            &legacy,
+        ] {
+            fs::create_dir_all(path).expect("path directory");
+            fs::write(path.join("Probe.pas"), b"payload").expect("path payload");
+        }
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            "[properties]\nEmpty = ''\n",
+        )
+        .expect("override configuration");
+        fs::write(
+            root.join("App.dproj"),
+            format!(
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Intermediate>{intermediate} $(Empty)</Intermediate><DCC_UnitSearchPath>{unit} $(Empty);{legacy};{boundary}$(Empty);$(Intermediate)</DCC_UnitSearchPath><DCC_IncludePath>{include} $(Empty);{legacy};{boundary_include}$(Empty)</DCC_IncludePath></PropertyGroup></Project>",
+                intermediate = intermediate.display(),
+                unit = unit.display(),
+                legacy = legacy.display(),
+                boundary = boundary.display(),
+                include = include.display(),
+                boundary_include = boundary_include.display(),
+            ),
+        )
+        .expect("project descriptor");
+
+        let context = ProjectContext::discover_with_overrides(
+            &main,
+            std::slice::from_ref(&root),
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("discover project");
+
+        let search_entry = |path: &Path| {
+            context
+                .search_path_entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("missing search path entry {path:?}"))
+        };
+        let include_entry = |path: &Path| {
+            context
+                .include_path_entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("missing include path entry {path:?}"))
+        };
+        let assert_external_is_configured_and_denied =
+            |entry: &ProjectPathEntry, path: &Path, label: &str| {
+                assert_eq!(
+                    entry.provenance,
+                    ProjectPathProvenance::Configured,
+                    "{label} lost configured provenance"
+                );
+                let payload = ProjectPathEntry {
+                    path: path.join("Probe.pas"),
+                    provenance: entry.provenance.clone(),
+                };
+                assert!(
+                    !context.read_policy.allows_entry(&payload),
+                    "{label} payload unexpectedly authorized"
+                );
+                assert!(
+                    context
+                        .read_policy
+                        .read_payload_bytes(&payload, 1024)
+                        .is_err(),
+                    "{label} payload was not denied before opening"
+                );
+            };
+
+        assert_external_is_configured_and_denied(search_entry(&unit), &unit, "inline unit path");
+        assert_external_is_configured_and_denied(
+            search_entry(&intermediate),
+            &intermediate,
+            "derived intermediate unit path",
+        );
+        assert_external_is_configured_and_denied(
+            search_entry(&boundary),
+            &boundary,
+            "no-space unit boundary path",
+        );
+        assert_external_is_configured_and_denied(
+            include_entry(&include),
+            &include,
+            "inline include path",
+        );
+        assert_external_is_configured_and_denied(
+            include_entry(&boundary_include),
+            &boundary_include,
+            "no-space include boundary path",
+        );
+
+        assert_eq!(
+            search_entry(&legacy).provenance,
+            ProjectPathProvenance::LegacyNative,
+            "literal legacy search path inherited configured provenance"
+        );
+        assert_eq!(
+            include_entry(&legacy).provenance,
+            ProjectPathProvenance::LegacyNative,
+            "literal legacy include path inherited configured provenance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_markers_stay_with_trimmed_search_and_include_items() {
+        for (case_name, prefix) in [("empty", ""), ("whitespace", " ")] {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let root = temp.path().join("project");
+            let outside = temp.path().join("outside");
+            let main = root.join("App.dpr");
+            fs::create_dir_all(&root).expect("project directory");
+            fs::create_dir_all(&outside).expect("outside directory");
+            let configured_names = ["first", "second", "trailing", "intermediate"];
+            let legacy_names = ["legacy", "legacy2", "legacy3", "legacy4", "legacy5"];
+            for name in configured_names.iter().chain(legacy_names.iter()) {
+                fs::create_dir_all(root.join(name)).expect("legacy directory");
+                fs::create_dir_all(outside.join(name)).expect("configured directory");
+                fs::write(root.join(name).join("Probe.pas"), b"probe").expect("legacy payload");
+                fs::write(outside.join(name).join("Probe.pas"), b"probe")
+                    .expect("configured payload");
+            }
+            fs::write(&main, "program App; begin end.").expect("main source");
+            fs::write(
+                root.join(".delphi-tools.local.toml"),
+                format!("[properties]\nPrefix = '{prefix}'\n"),
+            )
+            .expect("override configuration");
+            let search_paths = format!(
+                "$(Prefix) {outside}/first;{root}/legacy;{root}/legacy2;$(Prefix) {outside}/second;{root}/legacy3;{outside}/trailing$(Prefix);$(Intermediate) {outside}/intermediate;{root}/legacy4;{root}/legacy5",
+                outside = outside.display(),
+                root = root.display(),
+            );
+            let include_paths = search_paths.replace("first", "include_first");
+            fs::create_dir_all(outside.join("include_first")).expect("configured include");
+            fs::create_dir_all(root.join("include_first")).expect("legacy include");
+            fs::write(
+                root.join("App.dproj"),
+                format!(
+                    "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Intermediate>$(Prefix)</Intermediate><DCC_UnitSearchPath>{search_paths}</DCC_UnitSearchPath><DCC_IncludePath>{include_paths}</DCC_IncludePath></PropertyGroup></Project>"
+                ),
+            )
+            .expect("project descriptor");
+
+            let context = ProjectContext::discover_with_overrides(
+                &main,
+                std::slice::from_ref(&root),
+                &ProjectOptions::default(),
+                &OverrideSession::new(None),
+            )
+            .expect("discover project");
+
+            for name in configured_names {
+                let path = outside.join(name);
+                let search_entry = context
+                    .search_path_entries
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .unwrap_or_else(|| panic!("{case_name}: configured search path {path:?}"));
+                assert_eq!(
+                    search_entry.provenance,
+                    ProjectPathProvenance::Configured,
+                    "{case_name}: configured search marker was lost for {name}"
+                );
+                let search_payload = ProjectPathEntry {
+                    path: path.join("Probe.pas"),
+                    provenance: search_entry.provenance.clone(),
+                };
+                assert!(
+                    !context.read_policy.allows_entry(&search_payload),
+                    "{case_name}: configured outside search payload must remain unauthorized"
+                );
+                assert!(
+                    context
+                        .read_policy
+                        .read_payload_bytes(&search_payload, 1024)
+                        .is_err(),
+                    "{case_name}: configured outside search payload must be denied before opening"
+                );
+                let include_name = if name == "first" {
+                    "include_first"
+                } else {
+                    name
+                };
+                let include_path = outside.join(include_name);
+                let include_entry = context
+                    .include_path_entries
+                    .iter()
+                    .find(|entry| entry.path == include_path)
+                    .unwrap_or_else(|| {
+                        panic!("{case_name}: configured include path {include_path:?}")
+                    });
+                assert_eq!(
+                    include_entry.provenance,
+                    ProjectPathProvenance::Configured,
+                    "{case_name}: configured include marker was lost for {include_name}"
+                );
+                let include_payload = ProjectPathEntry {
+                    path: include_path.join("Probe.pas"),
+                    provenance: include_entry.provenance.clone(),
+                };
+                assert!(
+                    !context.read_policy.allows_entry(&include_payload),
+                    "{case_name}: configured outside include payload must remain unauthorized"
+                );
+                assert!(
+                    context
+                        .read_policy
+                        .read_payload_bytes(&include_payload, 1024)
+                        .is_err(),
+                    "{case_name}: configured outside include payload must be denied before opening"
+                );
+            }
+            for name in legacy_names {
+                let path = root.join(name);
+                let entry = context
+                    .search_path_entries
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .unwrap_or_else(|| panic!("{case_name}: legacy search path {path:?}"));
+                assert_eq!(
+                    entry.provenance,
+                    ProjectPathProvenance::LegacyNative,
+                    "{case_name}: configured marker leaked into legacy item {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_exclusions_are_not_weakened_by_overlapping_source_roots() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temp.path().join("ws");
+        let excluded = workspace.join("vendor/private/settings.optset");
+        fs::create_dir_all(excluded.parent().expect("excluded parent")).expect("directories");
+        fs::write(&excluded, b"settings").expect("excluded metadata");
+
+        let policy = ReadPolicy::new(
+            std::slice::from_ref(&workspace),
+            &["vendor".to_string()],
+            &["vendor/private".to_string()],
+            &EffectiveOverrides::default(),
+        );
+        let entry = ProjectPathEntry {
+            path: excluded,
+            provenance: ProjectPathProvenance::Configured,
+        };
+
+        assert!(
+            !policy.allows_entry(&entry),
+            "an overlapping source root must not bypass the workspace-relative exclusion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_probe_charges_bytes_read_after_a_stale_stat() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let target_index = 8;
+        let initial_size = (super::MAX_OWNERSHIP_SOURCE_BYTES / 9).saturating_sub(1) as usize;
+        let total_initial = initial_size * 9;
+        let growth = (super::MAX_OWNERSHIP_SOURCE_BYTES as usize - total_initial) + 1;
+        let mut paths = Vec::new();
+
+        for index in 0..9 {
+            let path = root.join(format!("Unit{index}.pas"));
+            let next = if index < target_index {
+                format!("contains U{} in 'Unit{}.pas';", index + 1, index + 1)
+            } else {
+                String::new()
+            };
+            let mut source =
+                format!("unit U{index}; interface {next} implementation end.\n").into_bytes();
+            source.resize(initial_size, b' ');
+            fs::write(&path, source).expect("membership source");
+            paths.push(path);
+        }
+
+        let read_policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let context = ProjectContext {
+            main_source_entry: Some(ProjectPathEntry {
+                path: paths[0].clone(),
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            read_policy,
+            ..ProjectContext::default()
+        };
+        let mut budget = super::OwnershipProbeBudget::default();
+        let target = paths[target_index].clone();
+        let mut grew = false;
+        let inspection =
+            super::inspect_source_membership_with_hook(&context, &mut budget, &mut |path| {
+                if path == target && !grew {
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(path)
+                        .expect("target source");
+                    file.write_all(&vec![b'x'; growth])
+                        .expect("grow target source");
+                    grew = true;
+                }
+            });
+
+        assert!(grew, "the stale-stat growth hook must run");
+        assert!(
+            !inspection.complete,
+            "source membership must become incomplete when actual bytes exceed the aggregate budget"
+        );
+        assert!(
+            inspection.warnings.iter().any(|warning| {
+                warning.contains("probe limit reached") || warning.contains("exceeds")
+            }),
+            "expected bounded growth warning: {:?}",
+            inspection.warnings
+        );
+        assert!(
+            budget.source_bytes <= MAX_OWNERSHIP_SOURCE_BYTES,
+            "stale-stat growth must not make the aggregate byte reservation exceed its cap"
+        );
+        assert!(
+            budget.source_files <= MAX_OWNERSHIP_SOURCE_FILES,
+            "stale-stat growth must not make the aggregate file reservation exceed its cap"
+        );
+        assert!(
+            !inspection
+                .metadata_observations
+                .iter()
+                .any(|observation| observation.path() == target),
+            "a source that grew after its reservation must not be accepted as a payload"
+        );
+    }
+
+    #[test]
+    fn ownership_probe_caps_invalid_utf8_attempts_before_opening() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let main = root.join("Main.pas");
+        fs::write(&main, "unit Main; interface implementation end.\n").expect("main source");
+
+        let mut explicit_unit_entries = std::collections::HashMap::new();
+        for index in 0..(MAX_OWNERSHIP_SOURCE_FILES + 32) {
+            let path = root.join(format!("Invalid{index}.pas"));
+            fs::write(&path, [0xff]).expect("invalid UTF-8 source");
+            explicit_unit_entries.insert(
+                format!("Invalid{index}"),
+                vec![ProjectPathEntry {
+                    path,
+                    provenance: ProjectPathProvenance::Configured,
+                }],
+            );
+        }
+
+        let read_policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let context = ProjectContext {
+            main_source_entry: Some(ProjectPathEntry {
+                path: main,
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            explicit_unit_entries,
+            read_policy,
+            ..ProjectContext::default()
+        };
+        let mut budget = super::OwnershipProbeBudget::default();
+        let mut read_attempts = 0;
+        let inspection =
+            super::inspect_source_membership_with_hook(&context, &mut budget, &mut |_| {
+                read_attempts += 1
+            });
+
+        assert!(
+            !inspection.complete,
+            "invalid UTF-8 must make probing incomplete"
+        );
+        assert!(
+            budget.exhausted,
+            "failed payload reads must consume the ownership budget"
+        );
+        assert!(
+            read_attempts <= MAX_OWNERSHIP_SOURCE_FILES,
+            "invalid UTF-8 sources must be capped before payload opening"
+        );
+        assert!(
+            budget.source_files <= MAX_OWNERSHIP_SOURCE_FILES,
+            "failed payload reads must not exceed the file-attempt cap"
+        );
+        assert!(
+            budget.source_bytes <= MAX_OWNERSHIP_SOURCE_BYTES,
+            "failed payload reads must not exceed the byte cap"
+        );
+    }
+
+    #[test]
+    fn legacy_payload_entries_respect_configured_exclusions() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let path = root.join("private/Hidden.pas");
+        fs::create_dir_all(path.parent().expect("private directory")).expect("directories");
+        fs::write(&path, b"unit Hidden; interface implementation end.").expect("source");
+        let policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &["private".to_string()],
+            &EffectiveOverrides::default(),
+        );
+        let entry = ProjectPathEntry {
+            path,
+            provenance: ProjectPathProvenance::LegacyNative,
+        };
+
+        assert!(
+            !policy.allows_legacy_payload_entry(&entry),
+            "legacy payload compatibility must not bypass configured exclusions"
         );
     }
 }

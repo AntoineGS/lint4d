@@ -686,7 +686,11 @@ fn lint_configuration_for_input(
         .to_file_path()
         .map(absolute_path)
         .map_err(|_| format!("not a file URI: {uri}"))?;
-    let mut workspace = super::Workspace::new(input.roots.clone(), input.options.clone());
+    let mut workspace = super::Workspace::with_override_session(
+        input.roots.clone(),
+        input.options.clone(),
+        input.overrides.clone(),
+    );
     workspace.project_selections = input.project_selections.clone();
     workspace.document_owners = input.document_owners.clone();
     let context_key = workspace.context_for_uri(uri)?;
@@ -732,6 +736,9 @@ fn lint_configuration_for_input(
                 content_hash: None,
                 content_bytes: content_bytes.clone(),
                 candidate_membership: None,
+                read_policy: Some(context.read_policy.clone()),
+                path_entry: super::context_path_entry(&context, path),
+                include_payload: false,
             })
         })
         .collect();
@@ -1019,14 +1026,20 @@ mod tests {
         resolve_from_input, set_after_lint_configuration_hook,
     };
     use crate::workspace::Workspace;
+    use crate::workspace::WorkspaceOptions;
     use crate::workspace::rename::revalidate_input;
     use lsp_types::CodeActionOrCommand;
     use lsp_types::Url;
+    use pascal_core::delphi_overrides::OverrideSession;
     use serde_json::json;
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::sync::atomic::AtomicBool;
+
+    fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
+        Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
 
     #[test]
     fn local_code_actions_ignore_unused_shadowed_and_formatter_configurations() {
@@ -1054,7 +1067,7 @@ mod tests {
             .expect("unused formatter configuration");
 
         let uri = Url::from_file_path(&source_path).expect("source URI");
-        let input = Workspace::new(vec![root.clone()], Default::default()).analysis_input();
+        let input = test_workspace(vec![root.clone()], Default::default()).analysis_input();
         let start = lsp_types::Position::new(5, 2);
         let end = lsp_types::Position::new(5, 13);
         let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
@@ -1155,7 +1168,7 @@ mod tests {
             .expect("unused formatter configuration");
 
         let uri = Url::from_file_path(&source_path).expect("source URI");
-        let input = Workspace::new(vec![root], Default::default()).analysis_input();
+        let input = test_workspace(vec![root], Default::default()).analysis_input();
         let range = lsp_types::Range::new(
             lsp_types::Position::new(3, 2),
             lsp_types::Position::new(3, 10),
@@ -1250,7 +1263,7 @@ mod tests {
         .expect("configuration");
 
         let uri = Url::from_file_path(&source_path).expect("source URI");
-        let workspace = Workspace::new(vec![root], Default::default());
+        let workspace = test_workspace(vec![root], Default::default());
         let input = workspace.analysis_input();
         let validation_input = input.clone();
         let original_bytes = fs::read(&config_path).expect("original configuration bytes");
@@ -1344,7 +1357,7 @@ mod tests {
         fs::write(&source_path, source).expect("source");
 
         let uri = Url::from_file_path(&source_path).expect("source URI");
-        let workspace = Workspace::new(vec![root], Default::default());
+        let workspace = test_workspace(vec![root], Default::default());
         let input = workspace.analysis_input();
         let config_for_hook = config_path.clone();
         set_after_lint_configuration_hook(move || {
@@ -1391,7 +1404,7 @@ mod tests {
         .expect("source");
 
         let uri = Url::from_file_path(&source_path).expect("source URI");
-        let workspace = Workspace::new(vec![root], Default::default());
+        let workspace = test_workspace(vec![root], Default::default());
         let input = workspace.analysis_input();
         let config_for_hook = config_path.clone();
         set_after_lint_configuration_hook(move || {

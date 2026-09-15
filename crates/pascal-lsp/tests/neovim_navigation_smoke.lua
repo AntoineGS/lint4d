@@ -5,17 +5,64 @@ local function run()
   local root = assert(vim.env.PASCAL_LSP_SMOKE_ROOT)
   vim.cmd.edit(vim.fn.fnameescape(root .. '/Main.pas'))
   local main = vim.api.nvim_get_current_buf()
+  local provider_path = root .. '/Provider.pas'
   assert(vim.wait(5000, function()
     return #vim.lsp.get_clients({ bufnr = main, name = 'pascal_lsp' }) == 1
   end), 'LSP did not attach using the shipped example')
   local client = vim.lsp.get_clients({ bufnr = main, name = 'pascal_lsp' })[1]
   assert(client.offset_encoding == 'utf-16', 'wrong position encoding')
 
+  local function at_provider_location(expected_line)
+    return vim.api.nvim_buf_get_name(0) == provider_path
+      and vim.api.nvim_win_get_cursor(0)[1] == expected_line
+  end
+
+  local function quickfix_item_path(item)
+    if item.filename and item.filename ~= '' then
+      return item.filename
+    end
+    if item.bufnr and item.bufnr > 0 and vim.api.nvim_buf_is_valid(item.bufnr) then
+      return vim.api.nvim_buf_get_name(item.bufnr)
+    end
+    return nil
+  end
+
+  local function has_current_implementation_result(quickfix, expected_line)
+    local context = quickfix.context
+    if type(context) == 'table'
+      and context.method
+      and context.method ~= 'textDocument/implementation'
+    then
+      return false
+    end
+    local items = quickfix.items or {}
+    return #items == 1
+      and quickfix_item_path(items[1]) == provider_path
+      and items[1].lnum == expected_line
+  end
+
   local function keys(mapping, expected_line)
+    local implementation_quickfix = mapping == 'gi'
+    if implementation_quickfix then
+      -- Neovim 0.13 lists implementations instead of jumping to a single one.
+      -- Clear the previous gd/gD result so a stale quickfix entry cannot satisfy
+      -- this smoke before the actual gi response arrives.
+      vim.fn.setqflist({}, 'r')
+    end
     vim.api.nvim_feedkeys(mapping, 'xt', false)
+    local selected_implementation = false
     assert(vim.wait(5000, function()
-      return vim.api.nvim_buf_get_name(0) == root .. '/Provider.pas'
-        and vim.api.nvim_win_get_cursor(0)[1] == expected_line
+      if at_provider_location(expected_line) then
+        return true
+      end
+      if implementation_quickfix and not selected_implementation then
+        local quickfix = vim.fn.getqflist({ items = 1, context = 1 })
+        if has_current_implementation_result(quickfix, expected_line) then
+          vim.cmd('cfirst')
+          selected_implementation = true
+        end
+      end
+      return at_provider_location(expected_line)
     end), mapping .. ' did not navigate to Provider.pas:' .. expected_line)
   end
 

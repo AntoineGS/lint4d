@@ -1880,10 +1880,18 @@ mod tests {
     use crate::workspace::Workspace;
     use lsp_server::{Connection, Message, RequestId, Response};
     use lsp_types::{MarkupKind, Position, PrepareRenameResponse, Range, Url};
+    use pascal_core::delphi_overrides::OverrideSession;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
+
+    fn test_workspace(
+        roots: Vec<PathBuf>,
+        options: crate::workspace::WorkspaceOptions,
+    ) -> Workspace {
+        Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
 
     fn symbol_client_features() -> ClientFeatures {
         ClientFeatures {
@@ -2212,7 +2220,7 @@ mod tests {
     fn watcher_allowance_reaches_eligible_paths_after_degraded_candidates() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().join("workspace");
-        let mut workspace = Workspace::new(vec![root.clone()], Default::default());
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
         let source = "unit Main; interface implementation end.\n";
 
         for index in 0..=MAX_CONFIGURATION_WATCH_PATHS {
@@ -2281,7 +2289,7 @@ mod tests {
         let project_a_uri = Url::from_file_path(&project_a).expect("project A URI");
         let project_b_uri = Url::from_file_path(&project_b).expect("project B URI");
         let (server, client) = Connection::memory();
-        let mut workspace = Workspace::new(vec![root], Default::default());
+        let mut workspace = test_workspace(vec![root], Default::default());
         workspace
             .select_project(&main_uri, Some(&project_a_uri))
             .expect("select project A");
@@ -2368,7 +2376,7 @@ mod tests {
         fs::write(&main, original).expect("source");
 
         let main_uri = Url::from_file_path(&main).expect("source URI");
-        let mut workspace = Workspace::new(vec![root], Default::default());
+        let mut workspace = test_workspace(vec![root], Default::default());
         workspace
             .open_document(main_uri.clone(), original.to_string(), 1)
             .expect("open overlay");
@@ -2710,7 +2718,7 @@ mod tests {
         let main_uri = Url::from_file_path(&main).expect("source URI");
         let project_a_uri = Url::from_file_path(&project_a).expect("project A URI");
         let project_b_uri = Url::from_file_path(&project_b).expect("project B URI");
-        let mut workspace = Workspace::new(vec![root], Default::default());
+        let mut workspace = test_workspace(vec![root], Default::default());
         workspace
             .select_project(&main_uri, Some(&project_a_uri))
             .expect("select project A");
@@ -2799,7 +2807,7 @@ mod tests {
 
         let provider_uri = Url::from_file_path(&provider).expect("provider URI");
         let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
-        let mut workspace = Workspace::new(vec![root], Default::default());
+        let mut workspace = test_workspace(vec![root], Default::default());
         workspace
             .open_document(consumer_uri.clone(), consumer_source.to_string(), 1)
             .expect("open consumer overlay");
@@ -2880,7 +2888,7 @@ mod tests {
         fs::write(&main, original).expect("source");
 
         let main_uri = Url::from_file_path(&main).expect("source URI");
-        let mut workspace = Workspace::new(vec![root], Default::default());
+        let mut workspace = test_workspace(vec![root], Default::default());
         workspace
             .open_document(main_uri.clone(), original.to_string(), 1)
             .expect("open overlay");
@@ -2966,7 +2974,7 @@ mod tests {
         let main_uri = Url::from_file_path(&main).expect("source URI");
         let project_a_uri = Url::from_file_path(&project_a).expect("project A URI");
         let project_b_uri = Url::from_file_path(&project_b).expect("project B URI");
-        let mut workspace = Workspace::new(vec![root], Default::default());
+        let mut workspace = test_workspace(vec![root], Default::default());
         workspace
             .select_project(&main_uri, Some(&project_a_uri))
             .expect("select project A");
@@ -3078,7 +3086,7 @@ mod tests {
         fs::write(&provider, source).expect("provider source");
 
         let provider_uri = Url::from_file_path(&provider).expect("provider URI");
-        let workspace = Workspace::new(vec![root], Default::default());
+        let workspace = test_workspace(vec![root], Default::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let computed = crate::workspace::queries::references_from_input(
@@ -3126,7 +3134,7 @@ mod tests {
     #[test]
     fn delivery_rejects_a_stale_workspace_symbol_result() {
         let (server, client) = Connection::memory();
-        let workspace = Workspace::new(Vec::new(), Default::default());
+        let workspace = test_workspace(Vec::new(), Default::default());
         let id = RequestId::from("stale-workspace-symbols".to_string());
         deliver_analysis_result(
             &server,

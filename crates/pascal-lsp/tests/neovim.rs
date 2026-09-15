@@ -4,10 +4,30 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
+
+fn configure_neovim_environment(command: &mut Command, environment: &TempDir) {
+    for (name, directory) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CACHE_HOME", "cache"),
+    ] {
+        command.env(name, environment.path().join(directory));
+    }
+}
+
+fn neovim_is_available() -> bool {
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    configure_neovim_environment(&mut command, &environment);
+    command.arg("--version").output().is_ok()
+}
 
 #[test]
 fn neovim_example_navigates_and_applies_workspace_edits_without_saving() {
-    if Command::new("nvim").arg("--version").output().is_err() {
+    if !neovim_is_available() {
         eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
@@ -27,12 +47,16 @@ fn neovim_example_navigates_and_applies_workspace_edits_without_saving() {
     )
     .unwrap();
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut child = Command::new("nvim")
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    command
         .args(["--headless", "-u", "NONE", "-l"])
         .arg(manifest.join("tests/neovim_smoke.lua"))
         .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
         .env("PASCAL_LSP_SMOKE_ROOT", directory.path())
-        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"))
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"));
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -65,7 +89,7 @@ fn neovim_example_navigates_and_applies_workspace_edits_without_saving() {
 
 #[test]
 fn neovim_example_navigates_and_tracks_unsaved_documents() {
-    if Command::new("nvim").arg("--version").output().is_err() {
+    if !neovim_is_available() {
         eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
@@ -85,12 +109,16 @@ fn neovim_example_navigates_and_tracks_unsaved_documents() {
     )
     .unwrap();
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut child = Command::new("nvim")
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    command
         .args(["--headless", "-u", "NONE", "-l"])
         .arg(manifest.join("tests/neovim_navigation_smoke.lua"))
         .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
         .env("PASCAL_LSP_SMOKE_ROOT", directory.path())
-        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"))
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"));
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -123,7 +151,7 @@ fn neovim_example_navigates_and_tracks_unsaved_documents() {
 
 #[test]
 fn neovim_project_selection() {
-    if Command::new("nvim").arg("--version").output().is_err() {
+    if !neovim_is_available() {
         eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
@@ -174,12 +202,16 @@ fn neovim_project_selection() {
     }
 
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut child = Command::new("nvim")
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    command
         .args(["--headless", "-u", "NONE", "-l"])
         .arg(manifest.join("tests/neovim_project_smoke.lua"))
         .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
         .env("PASCAL_LSP_SMOKE_ROOT", root)
-        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"))
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"));
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -211,8 +243,96 @@ fn neovim_project_selection() {
 }
 
 #[test]
+fn neovim_delphi_overrides_navigate_to_native_source() {
+    if !neovim_is_available() {
+        eprintln!("Neovim integration skipped: nvim is not installed");
+        return;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("pascal lsp neovim delphi overrides ")
+        .tempdir()
+        .unwrap();
+    let root = directory.path().join("project");
+    let sdk = directory.path().join("sdk");
+    let provider = sdk.join("source/Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join(".lint4d.toml"), "").unwrap();
+    fs::write(root.join("Main.pas"), main_source).unwrap();
+    fs::write(
+        root.join("Main.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>$(BDS)\\source</DCC_UnitSearchPath></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::create_dir_all(provider.parent().unwrap()).unwrap();
+    fs::write(&provider, provider_source).unwrap();
+    let main_bytes = fs::read(root.join("Main.pas")).unwrap();
+    let provider_bytes = fs::read(&provider).unwrap();
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let user_config = environment.path().join("config/delphi-tools/config.toml");
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(
+        &user_config,
+        format!(
+            "[properties]\nBDS = 'C:\\SDK'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+            sdk.display()
+        ),
+    )
+    .unwrap();
+
+    let mut command = Command::new("nvim");
+    command
+        .args(["--headless", "-u", "NONE", "-l"])
+        .arg(manifest.join("tests/neovim_overrides_smoke.lua"))
+        .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
+        .env("PASCAL_LSP_SMOKE_ROOT", &root)
+        .env("PASCAL_LSP_EXPECTED_PROVIDER", &provider)
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"));
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "Neovim Delphi override smoke timed out: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "Neovim Delphi override smoke failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("NEOVIM_DELPHI_OVERRIDES_OK"),
+        "Neovim override smoke did not print its marker:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(root.join("Main.pas")).unwrap(), main_bytes);
+    assert_eq!(fs::read(&provider).unwrap(), provider_bytes);
+}
+
+#[test]
 fn neovim_watches_repository_parent_configuration_fallback() {
-    if Command::new("nvim").arg("--version").output().is_err() {
+    if !neovim_is_available() {
         eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
@@ -231,11 +351,15 @@ fn neovim_watches_repository_parent_configuration_fallback() {
     .unwrap();
 
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut child = Command::new("nvim")
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    command
         .args(["--headless", "-u", "NONE", "-l"])
         .arg(manifest.join("tests/neovim_watch_smoke.lua"))
         .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
-        .env("PASCAL_LSP_SMOKE_ROOT", &repository)
+        .env("PASCAL_LSP_SMOKE_ROOT", &repository);
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -268,7 +392,7 @@ fn neovim_watches_repository_parent_configuration_fallback() {
 
 #[test]
 fn neovim_standard_symbol_reference_and_highlight_queries() {
-    if Command::new("nvim").arg("--version").output().is_err() {
+    if !neovim_is_available() {
         eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
@@ -283,12 +407,16 @@ fn neovim_standard_symbol_reference_and_highlight_queries() {
     fs::write(directory.path().join("Consumer.pas"), consumer_source).unwrap();
 
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut child = Command::new("nvim")
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    command
         .args(["--headless", "-u", "NONE", "-l"])
         .arg(manifest.join("tests/neovim_queries_smoke.lua"))
         .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
         .env("PASCAL_LSP_SMOKE_ROOT", directory.path())
-        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"))
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"));
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

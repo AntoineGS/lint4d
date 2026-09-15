@@ -1,4 +1,5 @@
 pub mod config_discovery;
+pub mod delphi_overrides;
 pub mod directive_fragment_rewrite;
 pub mod directives;
 pub mod discovery;

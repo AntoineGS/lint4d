@@ -7041,13 +7041,20 @@ fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Op
             let args = if matches!(args_node.kind(), "genericArgs" | "typerefArgs" | "exprArgs") {
                 (0..args_node.named_child_count())
                     .filter_map(|index| args_node.named_child(index))
+                    .filter(|argument| {
+                        !argument.is_extra()
+                            && !matches!(argument.kind(), "comment" | "kLt" | "kGt")
+                    })
                     .map(|arg| type_ref_from_node_at_depth(arg, source, next_depth))
                     .collect::<Option<Vec<_>>>()?
             } else {
                 (0..type_node.named_child_count())
                     .filter_map(|index| type_node.named_child(index))
                     .filter(|argument| argument.start_byte() >= args_node.start_byte())
-                    .filter(|argument| !matches!(argument.kind(), "kLt" | "kGt"))
+                    .filter(|argument| {
+                        !argument.is_extra()
+                            && !matches!(argument.kind(), "comment" | "kLt" | "kGt")
+                    })
                     .map(|argument| type_ref_from_node_at_depth(argument, source, next_depth))
                     .collect::<Option<Vec<_>>>()?
             };

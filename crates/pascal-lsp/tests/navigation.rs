@@ -7030,6 +7030,61 @@ end.
         signature.signatures[0].label,
         "function Shadow<T>(Value: TOther): TOther;"
     );
+
+    for needle in ["B.Shadow<TOther>(", "B.Shadow<TOther>(Other"] {
+        let signature = index
+            .signature_help(&source_uri, position_after(source, needle, 0))
+            .expect("explicit generic method signature help")
+            .expect("explicit generic method signature");
+        assert_eq!(signature.signatures.len(), 1);
+        assert_eq!(signature.active_signature, Some(0));
+        assert_eq!(signature.active_parameter, Some(0));
+        assert_eq!(
+            signature.signatures[0].label,
+            "function Shadow<T>(Value: TOther): TOther;"
+        );
+    }
+}
+
+#[test]
+fn generic_method_type_definitions_require_a_selected_method_substitution() {
+    let source = r#"unit GenericMethodUnknownTypeDefinition;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    function Shadow<T>(Value: T): T;
+  end;
+implementation
+function TBox<T>.Shadow<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.Shadow();
+  Box.Shadow(UnknownValue);
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodUnknownTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown generic method source parses");
+
+    for occurrence in [2, 3] {
+        let type_definition =
+            index.type_definitions(&source_uri, position_of(source, "Shadow", occurrence));
+        assert!(
+            type_definition.is_empty(),
+            "unselected generic method occurrence {occurrence} must not use the owner substitution"
+        );
+    }
 }
 
 #[test]
@@ -8224,6 +8279,76 @@ end.
         NavigationTarget::Declaration,
     );
     assert_exact_type_location(&valid, &source_uri, source, "OtherMember", 0);
+}
+
+#[test]
+fn generic_type_arguments_ignore_comments_but_reject_unsupported_actuals() {
+    let source = r#"unit GenericCommentedTypeArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function Create: TBox<T>;
+  end;
+  TPair<T; U> = class
+    Value: U;
+  end;
+implementation
+function TBox<T>.Create: TBox<T>;
+begin
+end;
+procedure Caller;
+begin
+  TBox<TWidget {brace note}>.Create().Value.WidgetMember;
+  TBox<TWidget (*paren-star note*)>.Create().Value.WidgetMember;
+  TPair<TWidget {first actual note}, TOther (*second actual note*)>.Value.OtherMember;
+  TBox<TWidget, ^TOther>.Create().Value.WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericCommentedTypeArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("commented generic type argument source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "WidgetMember", 0);
+    }
+
+    let pair = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&pair, &source_uri, source, "OtherMember", 0);
+
+    let unsupported = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(unsupported.is_empty());
 }
 
 #[test]

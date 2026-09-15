@@ -1141,7 +1141,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
-        let lookup_identifier = callable_lookup_identifier(entity);
+        let lookup_identifier = super::callable_lookup_identifier(entity);
         let mut candidates = self.resolve_candidates_at_with_state_and_budget(
             current_uri,
             document,
@@ -1498,6 +1498,10 @@ impl NavigationIndex {
                                     else {
                                         continue;
                                     };
+                                    let mut member_substitution = member_substitution;
+                                    for parameter in &symbol.generic_parameters {
+                                        member_substitution.remove(&parameter.name);
+                                    }
                                     let result_substitution = call_selection
                                         .as_ref()
                                         .and_then(|(group, substitution)| {
@@ -2009,22 +2013,6 @@ impl NavigationIndex {
             source_uri: candidate.uri.clone(),
             source_start: symbol.declaration_span.start,
         }))
-    }
-}
-
-fn callable_lookup_identifier(entity: Node<'_>) -> Node<'_> {
-    let mut current = entity;
-    loop {
-        match current.kind() {
-            "identifier" => return current,
-            "exprDot" | "genericDot" | "typerefDot" => {
-                let Some(rhs) = current.child_by_field_name("rhs") else {
-                    return entity;
-                };
-                current = rhs;
-            }
-            _ => return entity,
-        }
     }
 }
 

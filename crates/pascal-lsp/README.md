@@ -84,9 +84,26 @@ another Pascal language server to the same buffer while evaluating this slice.
 Navigation, formatting, and open-buffer diagnostics run as cancellable,
 snapshot-based background work. The server limits analysis to two concurrent
 jobs, so the stdio loop remains responsive while a source or dependency graph
-is being read. Diagnostics stay debounced and coalesced per document; if both
-worker slots are occupied, the diagnostic request is retried rather than
-spawning an unbounded worker.
+is being read. Up to 32 analysis jobs wait in a bounded FIFO-within-priority
+queue; one slot is reserved for diagnostics. Completion, hover, signature,
+navigation, type-definition, and other interactive requests are preferred over
+bulk symbols, references, rename, and formatting, but at most three
+interactive jobs are dispatched before a waiting diagnostic or bulk job. A
+diagnostic burst is limited to two jobs when bulk work is also waiting, so
+neither lower-priority class can starve. Queue overflow returns an explicit
+`RequestFailed` response (`-32803`) with `analysis queue is full; retry the
+request`; the server does not capture source snapshots until a job is
+dispatched.
+
+Diagnostics stay debounced and coalesced per document; if both worker slots are
+occupied, the diagnostic request is retried rather than spawning an unbounded
+worker. Identical observational requests share a computation only when their
+method, document, position, options, and captured version/generations match.
+Queued observations invalidated by a newer document version receive one
+`RequestCanceled` response (`-32800`) and are replaced by the latest request;
+distinct-position references and edits are never silently merged. Explicit
+cancellation removes queued work immediately, and shutdown drains queued
+client requests with cancellation responses before stopping workers.
 
 Results are checked against the captured source/configuration generations and
 filesystem/configuration read set; diagnostics also verify the open-document

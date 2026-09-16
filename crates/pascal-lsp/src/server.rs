@@ -23,7 +23,7 @@ use lsp_types::{
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 #[cfg(feature = "test-support")]
 use std::io::Write;
@@ -39,10 +39,169 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_ANALYSIS_JOBS: usize = 2;
+/// Maximum number of accepted analysis requests waiting for a worker.
+///
+/// Queued requests retain only their parsed request parameters, never a
+/// `WorkspaceInput`. This keeps source snapshot memory bounded by the number
+/// of running workers rather than by the queue length.
+const MAX_ANALYSIS_QUEUE: usize = 32;
+// Keep one queue slot available for diagnostics while client work is busy.
+const MAX_CLIENT_ANALYSIS_QUEUE: usize = MAX_ANALYSIS_QUEUE.saturating_sub(1);
+const MAX_INTERACTIVE_BURST: usize = 3;
+const MAX_DIAGNOSTIC_BURST: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
-const ANALYSIS_BUSY_MESSAGE: &str = "analysis server is busy; retry the request";
+const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
+const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalysisPriority {
+    Interactive,
+    Diagnostics,
+    Bulk,
+}
+
+impl AnalysisPriority {
+    fn for_request(request: &AnalysisRequest) -> Self {
+        match request {
+            AnalysisRequest::Hover { .. }
+            | AnalysisRequest::Completion { .. }
+            | AnalysisRequest::SignatureHelp { .. }
+            | AnalysisRequest::Navigation { .. }
+            | AnalysisRequest::TypeDefinitions { .. }
+            | AnalysisRequest::Prepare { .. }
+            | AnalysisRequest::CodeActions(_)
+            | AnalysisRequest::Resolve(_)
+            | AnalysisRequest::DocumentHighlights { .. } => Self::Interactive,
+            AnalysisRequest::Diagnostics { .. } => Self::Diagnostics,
+            AnalysisRequest::Formatting { .. }
+            | AnalysisRequest::DocumentSymbols { .. }
+            | AnalysisRequest::WorkspaceSymbols { .. }
+            | AnalysisRequest::References { .. }
+            | AnalysisRequest::Rename { .. } => Self::Bulk,
+        }
+    }
+}
+
+/// A small weighted priority queue used by the analysis dispatcher.
+///
+/// Each priority is FIFO. Interactive requests are preferred, but after a
+/// bounded burst one diagnostic or bulk request is selected. Diagnostics also
+/// yield to bulk work after a short bounded burst when both lower-priority
+/// classes are continuously populated. This gives every non-empty class a
+/// finite service bound without making normal interactive requests wait behind
+/// a bulk scan.
+struct PriorityQueue<T> {
+    interactive: VecDeque<T>,
+    diagnostics: VecDeque<T>,
+    bulk: VecDeque<T>,
+    interactive_burst: usize,
+    diagnostic_burst: usize,
+}
+
+impl<T> PriorityQueue<T> {
+    fn new() -> Self {
+        Self {
+            interactive: VecDeque::new(),
+            diagnostics: VecDeque::new(),
+            bulk: VecDeque::new(),
+            interactive_burst: 0,
+            diagnostic_burst: 0,
+        }
+    }
+
+    fn push(&mut self, priority: AnalysisPriority, item: T) {
+        match priority {
+            AnalysisPriority::Interactive => self.interactive.push_back(item),
+            AnalysisPriority::Diagnostics => self.diagnostics.push_back(item),
+            AnalysisPriority::Bulk => self.bulk.push_back(item),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.interactive
+            .len()
+            .saturating_add(self.diagnostics.len())
+            .saturating_add(self.bulk.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.interactive.is_empty() && self.diagnostics.is_empty() && self.bulk.is_empty()
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        let lower_pending = !self.diagnostics.is_empty() || !self.bulk.is_empty();
+        let priority = if !self.interactive.is_empty()
+            && (!lower_pending || self.interactive_burst < MAX_INTERACTIVE_BURST)
+        {
+            AnalysisPriority::Interactive
+        } else if !self.diagnostics.is_empty()
+            && (self.bulk.is_empty() || self.diagnostic_burst < MAX_DIAGNOSTIC_BURST)
+        {
+            AnalysisPriority::Diagnostics
+        } else if !self.bulk.is_empty() {
+            AnalysisPriority::Bulk
+        } else {
+            AnalysisPriority::Interactive
+        };
+
+        let item = match priority {
+            AnalysisPriority::Interactive => self.interactive.pop_front(),
+            AnalysisPriority::Diagnostics => self.diagnostics.pop_front(),
+            AnalysisPriority::Bulk => self.bulk.pop_front(),
+        };
+        if item.is_some() {
+            match priority {
+                AnalysisPriority::Interactive => {
+                    if lower_pending {
+                        self.interactive_burst = self.interactive_burst.saturating_add(1);
+                    } else {
+                        self.interactive_burst = 0;
+                    }
+                }
+                AnalysisPriority::Diagnostics => {
+                    self.interactive_burst = 0;
+                    if !self.bulk.is_empty() {
+                        self.diagnostic_burst = self.diagnostic_burst.saturating_add(1);
+                    } else {
+                        self.diagnostic_burst = 0;
+                    }
+                }
+                AnalysisPriority::Bulk => {
+                    self.interactive_burst = 0;
+                    self.diagnostic_burst = 0;
+                }
+            }
+        }
+        item
+    }
+
+    fn remove_first(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<T> {
+        for queue in [&mut self.interactive, &mut self.diagnostics, &mut self.bulk] {
+            let Some(index) = queue.iter().position(&mut predicate) else {
+                continue;
+            };
+            return queue.remove(index);
+        }
+        None
+    }
+
+    fn find_mut(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<&mut T> {
+        for queue in [&mut self.interactive, &mut self.diagnostics, &mut self.bulk] {
+            if let Some(item) = queue.iter_mut().find(|item| predicate(&**item)) {
+                return Some(item);
+            }
+        }
+        None
+    }
+}
+
+impl<T> Default for PriorityQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy)]
 enum TestBarrier {
@@ -57,6 +216,7 @@ pub struct TestBarrierConfig {
     navigation: Option<TestBarrierPaths>,
     formatting: Option<TestBarrierPaths>,
     diagnostics: Option<TestBarrierPaths>,
+    dispatch: Option<PathBuf>,
 }
 
 #[cfg(feature = "test-support")]
@@ -78,6 +238,33 @@ impl TestBarrierConfig {
             formatting: formatting.map(|(entered, release)| TestBarrierPaths { entered, release }),
             diagnostics: diagnostics
                 .map(|(entered, release)| TestBarrierPaths { entered, release }),
+            dispatch: None,
+        }
+    }
+
+    pub fn with_dispatch(mut self, path: Option<PathBuf>) -> Self {
+        self.dispatch = path;
+        self
+    }
+
+    fn record_dispatch(&self, priority: AnalysisPriority) {
+        let Some(path) = self.dispatch.as_ref() else {
+            return;
+        };
+        let marker = match priority {
+            AnalysisPriority::Interactive => b'I',
+            AnalysisPriority::Diagnostics => b'D',
+            AnalysisPriority::Bulk => b'B',
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            let _ = file.write_all(&[marker]);
         }
     }
 
@@ -88,6 +275,11 @@ impl TestBarrierConfig {
             TestBarrier::Diagnostics => self.diagnostics.as_ref(),
         }
     }
+}
+
+#[cfg(not(feature = "test-support"))]
+impl TestBarrierConfig {
+    fn record_dispatch(&self, _priority: AnalysisPriority) {}
 }
 
 #[cfg(not(feature = "test-support"))]
@@ -182,6 +374,7 @@ struct SelectProjectRequestParams {
     project_uri: Value,
 }
 
+#[derive(Debug)]
 enum AnalysisRequest {
     Hover {
         uri: Url,
@@ -240,6 +433,7 @@ enum AnalysisRequest {
     },
 }
 
+#[derive(Clone)]
 enum AnalysisResultValue {
     Hover(Result<Option<lsp_types::Hover>, String>),
     Completion(Result<lsp_types::CompletionList, String>),
@@ -262,11 +456,13 @@ enum AnalysisResultValue {
     DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
 }
 
+#[derive(Clone)]
 struct NavigationAnalysis {
     value: Result<Vec<lsp_types::Location>, String>,
     state: Option<NavigationState>,
 }
 
+#[derive(Clone)]
 struct DiagnosticsAnalysis {
     uri: Url,
     version: Option<i32>,
@@ -294,8 +490,214 @@ impl DiagnosticNotificationEffect {
     }
 }
 
-struct AnalysisResult {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AnalysisJobId {
+    Client(RequestId),
+    Diagnostic(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NavigationObservationTarget {
+    Declaration,
+    Definition,
+    Implementation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ObservationMethod {
+    Hover { markdown: bool },
+    Completion,
+    SignatureHelp,
+    Navigation(NavigationObservationTarget),
+    TypeDefinitions,
+    Prepare,
+    DocumentSymbols { hierarchical: bool },
+    WorkspaceSymbols,
+    References { include_declaration: bool },
+    DocumentHighlights,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ObservationPosition {
+    line: u32,
+    character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObservationKey {
+    method: ObservationMethod,
+    uri: Option<Url>,
+    position: Option<ObservationPosition>,
+    query: Option<String>,
+    version: Option<i32>,
+    source_generation: u64,
+    configuration_generation: u64,
+}
+
+impl ObservationKey {
+    fn for_request(request: &AnalysisRequest, workspace: &Workspace) -> Option<Self> {
+        let (method, uri, position, query) = match request {
+            AnalysisRequest::Hover {
+                uri,
+                position,
+                format,
+            } => (
+                ObservationMethod::Hover {
+                    markdown: matches!(format, MarkupKind::Markdown),
+                },
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::Completion { uri, position } => (
+                ObservationMethod::Completion,
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::SignatureHelp { uri, position } => (
+                ObservationMethod::SignatureHelp,
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::Navigation {
+                uri,
+                position,
+                target,
+            } => (
+                ObservationMethod::Navigation(match target {
+                    NavigationTarget::Declaration => NavigationObservationTarget::Declaration,
+                    NavigationTarget::Definition => NavigationObservationTarget::Definition,
+                    NavigationTarget::Implementation => NavigationObservationTarget::Implementation,
+                }),
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::TypeDefinitions { uri, position } => (
+                ObservationMethod::TypeDefinitions,
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::Prepare { uri, position } => (
+                ObservationMethod::Prepare,
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::DocumentSymbols { uri, hierarchical } => (
+                ObservationMethod::DocumentSymbols {
+                    hierarchical: *hierarchical,
+                },
+                Some(uri.clone()),
+                None,
+                None,
+            ),
+            AnalysisRequest::WorkspaceSymbols { query } => (
+                ObservationMethod::WorkspaceSymbols,
+                None,
+                None,
+                Some(query.clone()),
+            ),
+            AnalysisRequest::References {
+                uri,
+                position,
+                include_declaration,
+            } => (
+                ObservationMethod::References {
+                    include_declaration: *include_declaration,
+                },
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::DocumentHighlights { uri, position } => (
+                ObservationMethod::DocumentHighlights,
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+            ),
+            AnalysisRequest::Formatting { .. }
+            | AnalysisRequest::Diagnostics { .. }
+            | AnalysisRequest::Rename { .. }
+            | AnalysisRequest::CodeActions(_)
+            | AnalysisRequest::Resolve(_) => return None,
+        };
+        let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
+        Some(Self {
+            method,
+            uri,
+            position,
+            query,
+            version,
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+        })
+    }
+
+    fn same_query(&self, other: &Self) -> bool {
+        self.method == other.method
+            && self.uri == other.uri
+            && self.position == other.position
+            && self.query == other.query
+    }
+
+    fn is_superseded_by(&self, newer: &Self) -> bool {
+        self.same_query(newer)
+            && matches!((self.version, newer.version), (Some(old), Some(new)) if new > old)
+    }
+}
+
+#[derive(Debug)]
+struct QueuedClientAnalysis {
     id: RequestId,
+    request: AnalysisRequest,
+    features: ClientFeatures,
+    client_ids: Vec<RequestId>,
+    key: Option<ObservationKey>,
+}
+
+#[derive(Debug)]
+struct QueuedDiagnostic {
+    id: u64,
+    uri: Url,
+}
+
+#[derive(Debug)]
+enum QueuedAnalysis {
+    Client(QueuedClientAnalysis),
+    Diagnostic(QueuedDiagnostic),
+}
+
+#[derive(Clone)]
+struct AnalysisResult {
+    id: AnalysisJobId,
     source_generation: u64,
     configuration_generation: u64,
     records: Vec<SourceRecord>,
@@ -305,11 +707,19 @@ struct AnalysisResult {
 struct PendingAnalysis {
     cancellation: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    client_ids: Vec<RequestId>,
+    key: Option<ObservationKey>,
 }
 
 struct PendingDiagnostic {
     uri: Url,
     analysis: PendingAnalysis,
+}
+
+struct DispatchFailure {
+    client_ids: Vec<RequestId>,
+    diagnostic: Option<QueuedDiagnostic>,
+    message: String,
 }
 
 struct FileWatcherRegistration {
@@ -412,9 +822,14 @@ struct AnalysisJobs {
     sender: Sender<AnalysisResult>,
     receiver: Receiver<AnalysisResult>,
     pending: std::collections::HashMap<RequestId, PendingAnalysis>,
-    diagnostics: HashMap<RequestId, PendingDiagnostic>,
+    diagnostics: HashMap<u64, PendingDiagnostic>,
+    queue: PriorityQueue<QueuedAnalysis>,
+    request_to_job: HashMap<RequestId, RequestId>,
+    observation_jobs: HashMap<ObservationKey, RequestId>,
+    diagnostic_jobs: HashMap<Url, u64>,
     test_barriers: TestBarrierConfig,
     next_internal_id: u64,
+    shutting_down: bool,
 }
 
 impl AnalysisJobs {
@@ -430,21 +845,23 @@ impl AnalysisJobs {
             receiver,
             pending: std::collections::HashMap::new(),
             diagnostics: HashMap::new(),
+            queue: PriorityQueue::new(),
+            request_to_job: HashMap::new(),
+            observation_jobs: HashMap::new(),
+            diagnostic_jobs: HashMap::new(),
             test_barriers,
             next_internal_id: 0,
+            shutting_down: false,
         }
     }
 
-    fn start(
-        &mut self,
-        id: RequestId,
+    fn spawn(
+        &self,
+        id: AnalysisJobId,
         request: AnalysisRequest,
         workspace: &Workspace,
         features: ClientFeatures,
-    ) -> Result<(), String> {
-        if self.pending.len().saturating_add(self.diagnostics.len()) >= MAX_ANALYSIS_JOBS {
-            return Err(ANALYSIS_BUSY_MESSAGE.to_string());
-        }
+    ) -> Result<PendingAnalysis, String> {
         let input = workspace.analysis_input();
         let source_generation = input.source_generation;
         let configuration_generation = input.configuration_generation;
@@ -518,10 +935,6 @@ impl AnalysisJobs {
             AnalysisRequest::DocumentHighlights { .. } => AnalysisResultValue::DocumentHighlights(
                 Err("analysis worker failed without changing workspace state".to_string()),
             ),
-        };
-        let diagnostic_uri = match &request {
-            AnalysisRequest::Diagnostics { uri } => Some(uri.clone()),
-            _ => None,
         };
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
@@ -875,45 +1288,272 @@ impl AnalysisJobs {
                 let _ = sender.send(result);
             })
             .map_err(|error| format!("could not start analysis worker: {error}"))?;
-        let analysis = PendingAnalysis {
+        Ok(PendingAnalysis {
             cancellation,
             handle,
+            client_ids: Vec::new(),
+            key: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn start(
+        &mut self,
+        id: RequestId,
+        request: AnalysisRequest,
+        workspace: &Workspace,
+        features: ClientFeatures,
+    ) -> Result<(), String> {
+        self.enqueue_client(id, request, workspace, features, None)
+    }
+
+    fn start_diagnostics(&mut self, uri: Url, _workspace: &Workspace) -> Result<(), String> {
+        if self.shutting_down || self.diagnostic_jobs.contains_key(&uri) {
+            return Ok(());
+        }
+        if self.queue.len() >= MAX_ANALYSIS_QUEUE {
+            return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
+        }
+        let id = self.next_internal_id;
+        self.next_internal_id = self.next_internal_id.wrapping_add(1);
+        self.diagnostic_jobs.insert(uri.clone(), id);
+        self.queue.push(
+            AnalysisPriority::Diagnostics,
+            QueuedAnalysis::Diagnostic(QueuedDiagnostic { id, uri }),
+        );
+        Ok(())
+    }
+
+    fn enqueue_client(
+        &mut self,
+        id: RequestId,
+        request: AnalysisRequest,
+        workspace: &Workspace,
+        features: ClientFeatures,
+        connection: Option<&Connection>,
+    ) -> Result<(), String> {
+        if self.shutting_down {
+            return Err("analysis server is shutting down".to_string());
+        }
+
+        let key = ObservationKey::for_request(&request, workspace);
+        if let Some(key) = key.as_ref() {
+            let superseded = self
+                .observation_jobs
+                .iter()
+                .filter(|(existing, _)| existing.is_superseded_by(key))
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>();
+            for primary_id in superseded {
+                self.supersede_client(&primary_id, connection)?;
+            }
+
+            if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
+                if self.attach_client(&primary_id, id.clone()) {
+                    self.request_to_job.insert(id, primary_id);
+                    return Ok(());
+                }
+                self.observation_jobs.remove(key);
+            }
+        }
+
+        if self.queue.len() >= MAX_CLIENT_ANALYSIS_QUEUE {
+            return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
+        }
+
+        let primary_id = id.clone();
+        self.request_to_job.insert(id, primary_id.clone());
+        if let Some(key) = key.clone() {
+            self.observation_jobs.insert(key, primary_id.clone());
+        }
+        self.queue.push(
+            AnalysisPriority::for_request(&request),
+            QueuedAnalysis::Client(QueuedClientAnalysis {
+                id: primary_id.clone(),
+                request,
+                features,
+                client_ids: vec![primary_id],
+                key,
+            }),
+        );
+        let failures = self.pump(workspace);
+        self.handle_dispatch_failures(failures, connection)
+    }
+
+    fn attach_client(&mut self, primary_id: &RequestId, id: RequestId) -> bool {
+        if let Some(job) = self.pending.get_mut(primary_id) {
+            if !job.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+                job.client_ids.push(id);
+                return true;
+            }
+        }
+        if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
+            |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
+        ) {
+            job.client_ids.push(id);
+            return true;
+        }
+        false
+    }
+
+    fn remove_client_mapping(&mut self, id: &RequestId, primary_id: &RequestId) {
+        if self
+            .request_to_job
+            .get(id)
+            .is_some_and(|job_id| job_id == primary_id)
+        {
+            self.request_to_job.remove(id);
+        }
+    }
+
+    fn remove_observation(&mut self, key: Option<&ObservationKey>, primary_id: &RequestId) {
+        if let Some(key) = key {
+            if self
+                .observation_jobs
+                .get(key)
+                .is_some_and(|job_id| job_id == primary_id)
+            {
+                self.observation_jobs.remove(key);
+            }
+        }
+    }
+
+    fn send_client_error(
+        connection: Option<&Connection>,
+        ids: impl IntoIterator<Item = RequestId>,
+        code: ErrorCode,
+        message: &str,
+    ) -> Result<(), String> {
+        let Some(connection) = connection else {
+            return Ok(());
         };
-        if let Some(uri) = diagnostic_uri {
-            self.diagnostics
-                .insert(id, PendingDiagnostic { uri, analysis });
-        } else {
-            self.pending.insert(id, analysis);
+        for id in ids {
+            send_error(connection, id, code, message)
+                .map_err(|error| format!("could not send analysis response: {error}"))?;
         }
         Ok(())
     }
 
-    fn start_diagnostics(&mut self, uri: Url, workspace: &Workspace) -> Result<(), String> {
-        let id = RequestId::from(format!("pascal-lsp-diagnostics-{}", self.next_internal_id));
-        self.next_internal_id = self.next_internal_id.wrapping_add(1);
-        let features = ClientFeatures {
-            action_resolve: false,
-            action_disabled: false,
-            document_changes: false,
-            hierarchical_document_symbols: false,
-            hover_markdown: false,
+    fn supersede_client(
+        &mut self,
+        primary_id: &RequestId,
+        connection: Option<&Connection>,
+    ) -> Result<(), String> {
+        if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
+            |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
+        ) {
+            self.remove_observation(job.key.as_ref(), primary_id);
+            for id in &job.client_ids {
+                self.remove_client_mapping(id, primary_id);
+            }
+            return Self::send_client_error(
+                connection,
+                job.client_ids,
+                ErrorCode::RequestCanceled,
+                ANALYSIS_SUPERSEDED_MESSAGE,
+            );
+        }
+
+        let Some(job) = self.pending.get_mut(primary_id) else {
+            return Ok(());
         };
-        self.start(
-            id,
-            AnalysisRequest::Diagnostics { uri },
-            workspace,
-            features,
+        job.cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let key = job.key.clone();
+        let client_ids = std::mem::take(&mut job.client_ids);
+        self.remove_observation(key.as_ref(), primary_id);
+        for id in &client_ids {
+            self.remove_client_mapping(id, primary_id);
+        }
+        Self::send_client_error(
+            connection,
+            client_ids,
+            ErrorCode::RequestCanceled,
+            ANALYSIS_SUPERSEDED_MESSAGE,
         )
     }
 
-    fn cancel(&self, id: &RequestId) {
-        if let Some(job) = self.pending.get(id) {
-            job.cancellation
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+    fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<(), String> {
+        let Some(primary_id) = self.request_to_job.get(id).cloned() else {
+            return Ok(());
+        };
+
+        let mut queued_empty = false;
+        let mut found_queued = false;
+        if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
+            |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
+        ) {
+            if let Some(position) = job.client_ids.iter().position(|client_id| client_id == id) {
+                job.client_ids.remove(position);
+                queued_empty = job.client_ids.is_empty();
+                found_queued = true;
+            }
         }
+        if found_queued {
+            self.remove_client_mapping(id, &primary_id);
+            Self::send_client_error(
+                Some(connection),
+                [id.clone()],
+                ErrorCode::RequestCanceled,
+                rename::CANCELLATION_MESSAGE,
+            )?;
+            if queued_empty {
+                if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
+                    |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
+                ) {
+                    self.remove_observation(job.key.as_ref(), &primary_id);
+                }
+            }
+            return Ok(());
+        }
+
+        let mut found_running = false;
+        let mut cancel_worker = false;
+        let mut key = None;
+        if let Some(job) = self.pending.get_mut(&primary_id) {
+            if let Some(position) = job.client_ids.iter().position(|client_id| client_id == id) {
+                job.client_ids.remove(position);
+                cancel_worker = job.client_ids.is_empty();
+                key = job.key.clone();
+                found_running = true;
+                if cancel_worker {
+                    job.cancellation
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        if found_running {
+            self.remove_client_mapping(id, &primary_id);
+            if cancel_worker {
+                self.remove_observation(key.as_ref(), &primary_id);
+            }
+            Self::send_client_error(
+                Some(connection),
+                [id.clone()],
+                ErrorCode::RequestCanceled,
+                rename::CANCELLATION_MESSAGE,
+            )?;
+        } else {
+            self.request_to_job.remove(id);
+        }
+        Ok(())
     }
 
-    fn cancel_diagnostics_for(&self, uris: &[Url]) {
+    fn cancel_diagnostics_for(&mut self, uris: &[Url]) {
+        loop {
+            let Some(QueuedAnalysis::Diagnostic(job)) = self.queue.remove_first(|queued| {
+                matches!(queued, QueuedAnalysis::Diagnostic(job) if uris.contains(&job.uri))
+            }) else {
+                break;
+            };
+            if self
+                .diagnostic_jobs
+                .get(&job.uri)
+                .is_some_and(|id| *id == job.id)
+            {
+                self.diagnostic_jobs.remove(&job.uri);
+            }
+        }
         for diagnostic in self.diagnostics.values() {
             if uris.contains(&diagnostic.uri) {
                 diagnostic
@@ -924,11 +1564,111 @@ impl AnalysisJobs {
         }
     }
 
-    fn refresh_diagnostics(&self, workspace: &mut Workspace, uris: &[Url]) {
+    fn refresh_diagnostics(&mut self, workspace: &mut Workspace, uris: &[Url]) {
         self.cancel_diagnostics_for(uris);
         for uri in uris {
             workspace.reschedule_diagnostics(uri.clone());
         }
+    }
+
+    fn pump(&mut self, workspace: &Workspace) -> Vec<DispatchFailure> {
+        if self.shutting_down {
+            return Vec::new();
+        }
+        let mut failures = Vec::new();
+        while self.pending.len().saturating_add(self.diagnostics.len()) < MAX_ANALYSIS_JOBS {
+            let Some(queued) = self.queue.pop() else {
+                break;
+            };
+            match queued {
+                QueuedAnalysis::Client(job) => {
+                    let primary_id = job.id.clone();
+                    self.test_barriers
+                        .record_dispatch(AnalysisPriority::for_request(&job.request));
+                    match self.spawn(
+                        AnalysisJobId::Client(primary_id.clone()),
+                        job.request,
+                        workspace,
+                        job.features,
+                    ) {
+                        Ok(mut analysis) => {
+                            analysis.client_ids = job.client_ids;
+                            analysis.key = job.key;
+                            self.pending.insert(primary_id, analysis);
+                        }
+                        Err(message) => {
+                            self.remove_observation(job.key.as_ref(), &primary_id);
+                            for id in &job.client_ids {
+                                self.remove_client_mapping(id, &primary_id);
+                            }
+                            failures.push(DispatchFailure {
+                                client_ids: job.client_ids,
+                                diagnostic: None,
+                                message,
+                            });
+                        }
+                    }
+                }
+                QueuedAnalysis::Diagnostic(job) => {
+                    let id = job.id;
+                    let uri = job.uri.clone();
+                    self.test_barriers
+                        .record_dispatch(AnalysisPriority::Diagnostics);
+                    match self.spawn(
+                        AnalysisJobId::Diagnostic(id),
+                        AnalysisRequest::Diagnostics { uri: uri.clone() },
+                        workspace,
+                        diagnostic_features(),
+                    ) {
+                        Ok(analysis) => {
+                            self.diagnostics
+                                .insert(id, PendingDiagnostic { uri, analysis });
+                        }
+                        Err(message) => {
+                            self.diagnostic_jobs.remove(&uri);
+                            failures.push(DispatchFailure {
+                                client_ids: Vec::new(),
+                                diagnostic: Some(QueuedDiagnostic { id, uri }),
+                                message,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        failures
+    }
+
+    fn handle_dispatch_failures(
+        &mut self,
+        failures: Vec<DispatchFailure>,
+        connection: Option<&Connection>,
+    ) -> Result<(), String> {
+        let mut first_error = None;
+        for failure in failures {
+            if let Some(diagnostic) = failure.diagnostic {
+                if !self.shutting_down && self.queue.len() < MAX_ANALYSIS_QUEUE {
+                    self.diagnostic_jobs
+                        .insert(diagnostic.uri.clone(), diagnostic.id);
+                    self.queue.push(
+                        AnalysisPriority::Diagnostics,
+                        QueuedAnalysis::Diagnostic(diagnostic),
+                    );
+                }
+            }
+            if let Some(connection) = connection {
+                for id in failure.client_ids {
+                    if let Err(error) =
+                        send_error(connection, id, ErrorCode::RequestFailed, &failure.message)
+                    {
+                        first_error.get_or_insert_with(|| error.to_string());
+                    }
+                }
+            } else if first_error.is_none() && !failure.client_ids.is_empty() {
+                first_error = Some(failure.message);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn poll(
@@ -937,45 +1677,106 @@ impl AnalysisJobs {
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Ok(result) = self.receiver.try_recv() {
-            let diagnostic = matches!(&result.value, AnalysisResultValue::Diagnostics(_));
-            let job = if diagnostic {
-                self.diagnostics
-                    .remove(&result.id)
-                    .map(|diagnostic| diagnostic.analysis)
-            } else {
-                self.pending.remove(&result.id)
-            };
-            let Some(job) = job else {
-                continue;
-            };
-            let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
-            let _ = job.handle.join();
-            if cancelled {
-                match result.value {
-                    AnalysisResultValue::Diagnostics(diagnostics) => {
-                        workspace.reschedule_diagnostics(diagnostics.uri);
+            match result.id.clone() {
+                AnalysisJobId::Diagnostic(id) => {
+                    let Some(job) = self.diagnostics.remove(&id) else {
+                        continue;
+                    };
+                    if self
+                        .diagnostic_jobs
+                        .get(&job.uri)
+                        .is_some_and(|job_id| *job_id == id)
+                    {
+                        self.diagnostic_jobs.remove(&job.uri);
                     }
-                    _ => {
-                        send_error(
-                            connection,
-                            result.id,
-                            ErrorCode::RequestCanceled,
-                            rename::CANCELLATION_MESSAGE,
-                        )?;
+                    let cancelled = job
+                        .analysis
+                        .cancellation
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let _ = job.analysis.handle.join();
+                    if cancelled {
+                        workspace.reschedule_diagnostics(job.uri);
+                    } else {
+                        deliver_analysis_result(connection, workspace, result)?;
                     }
                 }
-                continue;
+                AnalysisJobId::Client(primary_id) => {
+                    let Some(job) = self.pending.remove(&primary_id) else {
+                        continue;
+                    };
+                    let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
+                    let client_ids = job.client_ids;
+                    let key = job.key;
+                    let _ = job.handle.join();
+                    self.remove_observation(key.as_ref(), &primary_id);
+                    for id in &client_ids {
+                        self.remove_client_mapping(id, &primary_id);
+                    }
+                    if cancelled {
+                        Self::send_client_error(
+                            Some(connection),
+                            client_ids,
+                            ErrorCode::RequestCanceled,
+                            rename::CANCELLATION_MESSAGE,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                    } else if !client_ids.is_empty() {
+                        let mut client_result = result;
+                        client_result.id = AnalysisJobId::Client(
+                            client_ids.first().cloned().expect("non-empty client IDs"),
+                        );
+                        deliver_analysis_result(connection, workspace, client_result.clone())?;
+                        for id in client_ids.into_iter().skip(1) {
+                            let mut fanout = client_result.clone();
+                            fanout.id = AnalysisJobId::Client(id);
+                            deliver_analysis_result(connection, workspace, fanout)?;
+                        }
+                    }
+                }
             }
-            deliver_analysis_result(connection, workspace, result)?;
         }
+        let failures = self.pump(workspace);
+        self.handle_dispatch_failures(failures, Some(connection))
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
         Ok(())
     }
 
     fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.diagnostics.is_empty()
+        self.pending.is_empty() && self.diagnostics.is_empty() && self.queue.is_empty()
     }
 
     fn shutdown(&mut self) {
+        let _ = self.shutdown_inner(None);
+    }
+
+    fn shutdown_with_connection(
+        &mut self,
+        connection: &Connection,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.shutdown_inner(Some(connection))
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })
+    }
+
+    fn shutdown_inner(&mut self, connection: Option<&Connection>) -> Result<(), String> {
+        if self.shutting_down {
+            return Ok(());
+        }
+        self.shutting_down = true;
+        let mut queued = std::mem::take(&mut self.queue);
+        while let Some(job) = queued.pop() {
+            if let QueuedAnalysis::Client(job) = job {
+                Self::send_client_error(
+                    connection,
+                    job.client_ids.clone(),
+                    ErrorCode::RequestCanceled,
+                    rename::CANCELLATION_MESSAGE,
+                )?;
+            }
+        }
+        self.observation_jobs.clear();
+        self.diagnostic_jobs.clear();
+        self.request_to_job.clear();
+
         let mut pending = std::mem::take(&mut self.pending)
             .into_values()
             .collect::<Vec<_>>();
@@ -987,6 +1788,12 @@ impl AnalysisJobs {
         for job in &pending {
             job.cancellation
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            Self::send_client_error(
+                connection,
+                job.client_ids.clone(),
+                ErrorCode::RequestCanceled,
+                rename::CANCELLATION_MESSAGE,
+            )?;
         }
 
         let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
@@ -1010,6 +1817,17 @@ impl AnalysisJobs {
             pending = remaining;
             thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
+        Ok(())
+    }
+}
+
+fn diagnostic_features() -> ClientFeatures {
+    ClientFeatures {
+        action_resolve: false,
+        action_disabled: false,
+        document_changes: false,
+        hierarchical_document_symbols: false,
+        hover_markdown: false,
     }
 }
 
@@ -1018,6 +1836,10 @@ fn deliver_analysis_result(
     workspace: &mut Workspace,
     result: AnalysisResult,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let client_id = match &result.id {
+        AnalysisJobId::Client(id) => Some(id.clone()),
+        AnalysisJobId::Diagnostic(_) => None,
+    };
     if result.source_generation != workspace.source_generation()
         || result.configuration_generation != workspace.configuration_generation()
     {
@@ -1027,7 +1849,9 @@ fn deliver_analysis_result(
         }
         return send_error(
             connection,
-            result.id,
+            client_id
+                .clone()
+                .expect("non-diagnostic stale analysis result"),
             ErrorCode::RequestFailed,
             "analysis result became stale; retry the request",
         );
@@ -1048,30 +1872,54 @@ fn deliver_analysis_result(
     }
     match result.value {
         AnalysisResultValue::Hover(value) => match value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::Completion(value) => match value {
-            Ok(value) => send_ok(connection, result.id, CompletionResponse::List(value)),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(
+                connection,
+                client_id.clone().expect("client result"),
+                CompletionResponse::List(value),
+            ),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::SignatureHelp(value) => match value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::Navigation(navigation) => match navigation.value {
-            Ok(value) => send_ok(connection, result.id, GotoDefinitionResponse::Array(value)),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(
+                connection,
+                client_id.clone().expect("client result"),
+                GotoDefinitionResponse::Array(value),
+            ),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::Formatting(value) => match value {
-            Ok(Some(edit)) => send_ok(connection, result.id, vec![edit]),
-            Ok(None) => send_ok(connection, result.id, Vec::<lsp_types::TextEdit>::new()),
+            Ok(Some(edit)) => send_ok(
+                connection,
+                client_id.clone().expect("client result"),
+                vec![edit],
+            ),
+            Ok(None) => send_ok(
+                connection,
+                client_id.clone().expect("client result"),
+                Vec::<lsp_types::TextEdit>::new(),
+            ),
             Err(error) if error == rename::CANCELLATION_MESSAGE => {
-                send_analysis_error(connection, result.id, error)
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
             Err(error) => send_error(
                 connection,
-                result.id,
+                client_id.clone().expect("client result"),
                 ErrorCode::RequestFailed,
                 format!("formatting failed: {error}"),
             ),
@@ -1093,49 +1941,73 @@ fn deliver_analysis_result(
             ),
         },
         AnalysisResultValue::TypeDefinitions(value) => match value {
-            Ok(value) => send_ok(connection, result.id, GotoDefinitionResponse::Array(value)),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(
+                connection,
+                client_id.clone().expect("client result"),
+                GotoDefinitionResponse::Array(value),
+            ),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::Prepare(value) => match value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::Rename(value) => match *value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::CodeActions(value) => match value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::Resolve(value) => match *value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::DocumentSymbols {
             uri,
             hierarchical,
             value,
         } => match value {
-            Ok(value) if hierarchical => send_ok(connection, result.id, value),
+            Ok(value) if hierarchical => {
+                send_ok(connection, client_id.clone().expect("client result"), value)
+            }
             Ok(value) => send_ok(
                 connection,
-                result.id,
+                client_id.clone().expect("client result"),
                 NavigationIndex::flatten_document_symbols(&uri, value),
             ),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::WorkspaceSymbols(value) => match value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::References(value) => match value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::DocumentHighlights(value) => match value {
-            Ok(value) => send_ok(connection, result.id, value),
-            Err(error) => send_analysis_error(connection, result.id, error),
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
     }
 }
@@ -1499,7 +2371,7 @@ fn event_loop(
 
         match message {
             Message::Request(request) if request.method == "shutdown" => {
-                jobs.shutdown();
+                jobs.shutdown_with_connection(connection)?;
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
             }
@@ -1539,7 +2411,8 @@ fn event_loop(
                             .cloned()
                             .unwrap_or(Value::Null),
                     ) {
-                        jobs.cancel(&id);
+                        jobs.cancel(connection, &id)
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
                     continue;
                 }
@@ -1596,7 +2469,9 @@ fn start_analysis(
     request: AnalysisRequest,
     features: ClientFeatures,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if let Err(error) = jobs.start(id.clone(), request, workspace, features) {
+    if let Err(error) =
+        jobs.enqueue_client(id.clone(), request, workspace, features, Some(connection))
+    {
         send_error(connection, id, ErrorCode::RequestFailed, error)?;
     }
     Ok(())
@@ -2105,7 +2980,7 @@ fn publish_due_diagnostics(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     for (uri, version) in workspace.take_due_diagnostic_requests() {
         if let Err(error) = jobs.start_diagnostics(uri.clone(), workspace) {
-            if error == ANALYSIS_BUSY_MESSAGE {
+            if error == ANALYSIS_QUEUE_FULL_MESSAGE {
                 workspace.retry_diagnostics(uri);
             } else {
                 send_diagnostics(
@@ -2415,10 +3290,11 @@ fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalysisJobs, AnalysisRequest, AnalysisResult, AnalysisResultValue, BoundedReader,
-        ClientFeatures, FileWatcherRegistration, MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES,
-        MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, deliver_analysis_result,
-        invalidate_analysis_result,
+        ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisJobId, AnalysisJobs,
+        AnalysisPriority, AnalysisRequest, AnalysisResult, AnalysisResultValue, BoundedReader,
+        ClientFeatures, FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CONFIGURATION_WATCH_PATHS,
+        MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, PriorityQueue,
+        deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
     use crossbeam_channel::RecvTimeoutError;
@@ -2457,12 +3333,15 @@ mod tests {
             pending.handle.join().is_ok(),
             "analysis worker must exit cleanly"
         );
-        assert_eq!(&result.id, id);
+        assert_eq!(result.id, AnalysisJobId::Client(id.clone()));
         result
     }
 
     fn deliver_successfully(workspace: &mut Workspace, result: AnalysisResult) {
-        let id = result.id.clone();
+        let id = match result.id.clone() {
+            AnalysisJobId::Client(id) => id,
+            AnalysisJobId::Diagnostic(_) => panic!("expected a client analysis result"),
+        };
         let (server, client) = Connection::memory();
         deliver_analysis_result(&server, workspace, result).expect("deliver control result");
         let Message::Response(response) = client.receiver.recv().expect("control response") else {
@@ -2638,7 +3517,10 @@ mod tests {
     }
 
     fn assert_stale_delivery(workspace: &mut Workspace, result: AnalysisResult) {
-        let id = result.id.clone();
+        let id = match result.id.clone() {
+            AnalysisJobId::Client(id) => id,
+            AnalysisJobId::Diagnostic(_) => panic!("expected a client analysis result"),
+        };
         let (server, client) = Connection::memory();
         deliver_analysis_result(&server, workspace, result).expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
@@ -2686,6 +3568,51 @@ mod tests {
         assert!(
             !result.records.is_empty(),
             "the computed type-definition result must carry its source read set"
+        );
+    }
+
+    #[test]
+    fn priority_queue_is_fifo_within_priority_and_bounds_interactive_bursts() {
+        let mut queue = PriorityQueue::new();
+        queue.push(AnalysisPriority::Bulk, "bulk-1");
+        queue.push(AnalysisPriority::Interactive, "interactive-1");
+        queue.push(AnalysisPriority::Interactive, "interactive-2");
+        queue.push(AnalysisPriority::Interactive, "interactive-3");
+        queue.push(AnalysisPriority::Interactive, "interactive-4");
+        queue.push(AnalysisPriority::Diagnostics, "diagnostic-1");
+        queue.push(AnalysisPriority::Bulk, "bulk-2");
+
+        let order = (0..7)
+            .map(|_| queue.pop().expect("queued item"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                "interactive-1",
+                "interactive-2",
+                "interactive-3",
+                "diagnostic-1",
+                "interactive-4",
+                "bulk-1",
+                "bulk-2",
+            ]
+        );
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_empty());
+        let mut removable = PriorityQueue::new();
+        removable.push(AnalysisPriority::Bulk, "removed");
+        assert_eq!(
+            removable.remove_first(|item| *item == "removed"),
+            Some("removed")
+        );
+        assert_eq!(MAX_ANALYSIS_QUEUE, 32);
+        assert_eq!(
+            ANALYSIS_QUEUE_FULL_MESSAGE,
+            "analysis queue is full; retry the request"
+        );
+        assert_eq!(
+            ANALYSIS_SUPERSEDED_MESSAGE,
+            "request superseded by a newer document version"
         );
     }
 
@@ -2847,7 +3774,7 @@ mod tests {
             &server,
             &mut workspace,
             AnalysisResult {
-                id: control_id.clone(),
+                id: AnalysisJobId::Client(control_id.clone()),
                 source_generation,
                 configuration_generation,
                 records: Vec::new(),
@@ -2893,7 +3820,7 @@ mod tests {
             &server,
             &mut workspace,
             AnalysisResult {
-                id: id.clone(),
+                id: AnalysisJobId::Client(id.clone()),
                 source_generation: stale_source_generation,
                 configuration_generation: stale_configuration_generation,
                 records: Vec::new(),
@@ -3657,7 +4584,7 @@ mod tests {
 
         let id = RequestId::from("candidate-membership-cancel".to_string());
         let mut result = AnalysisResult {
-            id: id.clone(),
+            id: AnalysisJobId::Client(id.clone()),
             source_generation: computed.source_generation,
             configuration_generation: computed.configuration_generation,
             records: computed.records,
@@ -3691,7 +4618,7 @@ mod tests {
             &server,
             &mut workspace,
             AnalysisResult {
-                id: id.clone(),
+                id: AnalysisJobId::Client(id.clone()),
                 source_generation: source_generation.wrapping_add(1),
                 configuration_generation,
                 records: Vec::new(),
@@ -3717,6 +4644,8 @@ mod tests {
             PendingAnalysis {
                 cancellation: Arc::clone(&cancellation),
                 handle,
+                client_ids: Vec::new(),
+                key: None,
             },
         );
 
@@ -3739,7 +4668,7 @@ mod tests {
         let id = RequestId::from("orphaned-analysis-result".to_string());
         jobs.sender
             .send(AnalysisResult {
-                id,
+                id: AnalysisJobId::Client(id),
                 source_generation: workspace.source_generation(),
                 configuration_generation: workspace.configuration_generation(),
                 records: Vec::new(),

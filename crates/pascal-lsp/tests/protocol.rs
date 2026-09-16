@@ -164,6 +164,11 @@ struct TestBarrier {
     release: PathBuf,
 }
 
+#[cfg(feature = "test-support")]
+struct TestDispatchLog {
+    path: PathBuf,
+}
+
 impl TestServer {
     fn launch() -> Self {
         Self::launch_with_environment(tempfile::tempdir().expect("isolated server environment"))
@@ -182,6 +187,89 @@ impl TestServer {
     #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_NAVIGATION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_navigation_barrier_and_dispatch_log(
+        environment: TempDir,
+    ) -> (Self, TestBarrier, TestDispatchLog) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        let dispatch_directory = environment.path().join("analysis-dispatch");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        fs::create_dir_all(&dispatch_directory).expect("dispatch directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let dispatch = TestDispatchLog {
+            path: dispatch_directory.join("entries"),
+        };
+        let navigation_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let dispatch_value = dispatch.path.display().to_string();
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                (
+                    "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                    navigation_value.as_str(),
+                ),
+                ("PASCAL_LSP_TEST_DISPATCH_LOG", dispatch_value.as_str()),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, barrier, dispatch)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_navigation_and_diagnostics_barriers_and_dispatch_log(
+        environment: TempDir,
+    ) -> (Self, TestBarrier, TestBarrier, TestDispatchLog) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        let dispatch_directory = environment.path().join("analysis-dispatch");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        fs::create_dir_all(&dispatch_directory).expect("dispatch directory");
+        let navigation = TestBarrier {
+            entered: barrier_directory.join("navigation.entered"),
+            release: barrier_directory.join("navigation.release"),
+        };
+        let diagnostics = TestBarrier {
+            entered: barrier_directory.join("diagnostics.entered"),
+            release: barrier_directory.join("diagnostics.release"),
+        };
+        let dispatch = TestDispatchLog {
+            path: dispatch_directory.join("entries"),
+        };
+        let navigation_value = format!(
+            "{}|{}",
+            navigation.entered.display(),
+            navigation.release.display()
+        );
+        let diagnostics_value = format!(
+            "{}|{}",
+            diagnostics.entered.display(),
+            diagnostics.release.display()
+        );
+        let dispatch_value = dispatch.path.display().to_string();
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                (
+                    "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                    navigation_value.as_str(),
+                ),
+                (
+                    "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER",
+                    diagnostics_value.as_str(),
+                ),
+                ("PASCAL_LSP_TEST_DISPATCH_LOG", dispatch_value.as_str()),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, navigation, diagnostics, dispatch)
     }
 
     #[cfg(feature = "test-support")]
@@ -222,6 +310,17 @@ impl TestServer {
         variable: Option<&str>,
         value: Option<&str>,
     ) -> Self {
+        Self::launch_test_server_with_environment_path_and_variables(
+            environment,
+            variable.into_iter().zip(value),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_test_server_with_environment_path_and_variables<'a>(
+        environment: &Path,
+        variables: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
         let executable = env!("CARGO_BIN_EXE_pascal-lsp-test-server");
         let child = Command::new(executable)
             .arg("--stdio")
@@ -230,7 +329,7 @@ impl TestServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .envs(variable.into_iter().zip(value))
+            .envs(variables)
             .spawn()
             .expect("launch pascal-lsp test server");
         Self::from_child(child)
@@ -757,6 +856,22 @@ impl TestBarrier {
 
     fn release(&self) {
         fs::write(&self.release, b"release").expect("release analysis barrier");
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl TestDispatchLog {
+    fn wait_for_entries(&self, expected: usize) -> Vec<u8> {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(entries) = fs::read(&self.path) {
+                if entries.len() >= expected {
+                    return entries;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("expected {expected} analysis dispatches at the test log");
     }
 }
 
@@ -17833,7 +17948,7 @@ fn diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
 
 #[cfg(feature = "test-support")]
 #[test]
-fn full_analysis_queue_returns_busy_without_starting_an_extra_worker() {
+fn full_analysis_queue_returns_explicit_overflow_without_starting_an_extra_worker() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
     let provider = root.join("Provider.pas");
@@ -17848,34 +17963,589 @@ fn full_analysis_queue_returns_busy_without_starting_an_extra_worker() {
 
     let first_id = RequestId::from("full-queue-first".to_string());
     let second_id = RequestId::from("full-queue-second".to_string());
-    for id in [first_id.clone(), second_id.clone()] {
-        server.send_request(
-            id,
-            "textDocument/definition",
-            navigation_params(&main, main_source, "PublicRoutine", 0),
-        );
-    }
+    server.send_request(
+        first_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    server.send_request(
+        second_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
     barrier.wait_for_entries(2);
 
-    let busy_id = RequestId::from("full-queue-busy".to_string());
+    let queued_ids = (0..31)
+        .map(|index| RequestId::from(format!("full-queue-{index}")))
+        .collect::<Vec<_>>();
+    for (index, id) in queued_ids.iter().cloned().enumerate() {
+        server.send_request(
+            id,
+            "workspace/symbol",
+            json!({"query": format!("MissingSymbol{index}")}),
+        );
+    }
+    let overflow_id = RequestId::from("full-queue-overflow".to_string());
     server.send_request(
-        busy_id.clone(),
-        "textDocument/documentSymbol",
-        json!({"textDocument": {"uri": uri(&main)}}),
+        overflow_id.clone(),
+        "workspace/symbol",
+        json!({"query": "OverflowSymbol"}),
     );
-    let busy = server.response(&busy_id);
-    let error = busy
+    let overflow = server.response(&overflow_id);
+    let error = overflow
         .error
-        .expect("full queue must reject the third request");
+        .expect("full queue must reject the overflow request");
     assert_eq!(error.code, -32803);
-    assert_eq!(error.message, "analysis server is busy; retry the request");
+    assert_eq!(error.message, "analysis queue is full; retry the request");
 
     barrier.release();
     let first_locations = result_locations(server.response(&first_id));
     let second_locations = result_locations(server.response(&second_id));
     assert_eq!(first_locations.len(), 1);
     assert_eq!(second_locations.len(), 1);
+    for id in queued_ids {
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "queued request failed: {response:?}"
+        );
+    }
     server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn diagnostics_use_reserved_capacity_when_the_client_queue_is_full() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules]\nconstant-naming = \"warning\"\n[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let (mut server, navigation, diagnostics, dispatch) =
+        TestServer::launch_with_navigation_and_diagnostics_barriers_and_dispatch_log(environment);
+    server.initialize(&root, Value::Null);
+    for (id, occurrence) in [
+        ("diagnostic-capacity-blocker-first", 0),
+        ("diagnostic-capacity-blocker-second", 1),
+    ] {
+        server.send_request(
+            RequestId::from(id.to_string()),
+            "textDocument/definition",
+            navigation_params(&main, source, "Run", occurrence),
+        );
+    }
+    navigation.wait_for_entries(2);
+
+    let queued_ids = (0..31)
+        .map(|index| RequestId::from(format!("diagnostic-capacity-client-{index}")))
+        .collect::<Vec<_>>();
+    for (index, id) in queued_ids.iter().cloned().enumerate() {
+        server.send_request(
+            id,
+            "workspace/symbol",
+            json!({"query": format!("DiagnosticCapacitySymbol{index}")}),
+        );
+    }
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    thread::sleep(Duration::from_millis(350));
+
+    navigation.release();
+    let dispatches = dispatch.wait_for_entries(3);
+    assert_eq!(
+        &dispatches[..2],
+        b"II",
+        "the two blocking requests must dispatch first"
+    );
+    assert_eq!(
+        dispatches[2], b'D',
+        "diagnostics must occupy the reserved queue slot before client work"
+    );
+    diagnostics.wait_until_entered();
+    diagnostics.release();
+
+    let published = server
+        .diagnostic_with_timeout(&uri(&main), IO_TIMEOUT)
+        .expect("diagnostics must progress from reserved queue capacity");
+    assert_eq!(published["version"], 1);
+    assert!(
+        published["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming"),
+        "expected the configured naming diagnostic: {published}"
+    );
+    for id in queued_ids {
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "reserved-capacity client request failed: {response:?}"
+        );
+    }
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn bounded_analysis_queue_prioritizes_interactive_work_over_bulk_work() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier, dispatch) =
+        TestServer::launch_with_navigation_barrier_and_dispatch_log(environment);
+    server.initialize(&root, Value::Null);
+
+    let first_id = RequestId::from("priority-first".to_string());
+    let second_id = RequestId::from("priority-second".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    server.send_request(
+        second_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    barrier.wait_for_entries(2);
+
+    let bulk_id = RequestId::from("priority-bulk".to_string());
+    server.send_request(
+        bulk_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let interactive_id = RequestId::from("priority-interactive".to_string());
+    server.send_request(
+        interactive_id.clone(),
+        "textDocument/hover",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    assert!(
+        server
+            .response_with_timeout(&bulk_id, Duration::from_millis(100))
+            .is_none(),
+        "bulk work must remain queued while both workers are occupied"
+    );
+    assert!(
+        server
+            .response_with_timeout(&interactive_id, Duration::from_millis(100))
+            .is_none(),
+        "interactive work must remain queued while both workers are occupied"
+    );
+
+    barrier.release();
+    let dispatches = dispatch.wait_for_entries(4);
+    assert!(
+        dispatches.len() >= 4,
+        "all queued requests must be dispatched: {dispatches:?}"
+    );
+    assert_eq!(
+        &dispatches[..2],
+        b"II",
+        "the two blockers must dispatch first"
+    );
+    assert_eq!(dispatches[2], b'I', "interactive work must dispatch first");
+    assert_eq!(
+        dispatches[3], b'B',
+        "bulk work must dispatch after interactive work"
+    );
+    let bulk_response = server.response(&bulk_id);
+    let interactive_response = server.response(&interactive_id);
+    assert!(
+        bulk_response.error.is_none(),
+        "bulk response failed: {bulk_response:?}"
+    );
+    assert!(
+        interactive_response.error.is_none(),
+        "interactive response failed: {interactive_response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_a_queued_request_removes_it_without_starting_a_worker() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_request(
+        RequestId::from("queued-cancel-first".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    server.send_request(
+        RequestId::from("queued-cancel-second".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    barrier.wait_for_entries(2);
+
+    let queued_id = RequestId::from("queued-cancelled".to_string());
+    server.send_request(
+        queued_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert!(
+        server
+            .response_with_timeout(&queued_id, Duration::from_millis(100))
+            .is_none(),
+        "queued request must not respond before cancellation"
+    );
+    server.send_notification("$/cancelRequest", json!({"id": queued_id.clone()}));
+    let cancelled = server
+        .response_with_timeout(&queued_id, Duration::from_secs(1))
+        .expect("queued cancellation response");
+    assert_eq!(cancelled.error.expect("cancellation error").code, -32800);
+
+    barrier.release();
+    let _ = server.response(&RequestId::from("queued-cancel-first".to_string()));
+    let _ = server.response(&RequestId::from("queued-cancel-second".to_string()));
+    server.assert_no_response(&queued_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn identical_queued_observations_share_one_worker_but_distinct_positions_do_not() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut same_server, same_barrier) = TestServer::launch_with_navigation_barrier(environment);
+    same_server.initialize(&root, Value::Null);
+    same_server.send_request(
+        RequestId::from("coalesce-first".to_string()),
+        "textDocument/definition",
+        navigation_params(&provider, provider_source, "PublicRoutine", 0),
+    );
+    same_server.send_request(
+        RequestId::from("coalesce-second".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    same_barrier.wait_for_entries(2);
+    let first = RequestId::from("coalesced-query-first".to_string());
+    let second = RequestId::from("coalesced-query-second".to_string());
+    for id in [first.clone(), second.clone()] {
+        same_server.send_request(
+            id,
+            "textDocument/definition",
+            navigation_params(&main, main_source, "PublicRoutine", 0),
+        );
+    }
+    same_barrier.release();
+    same_barrier.wait_for_entries(3);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fs::read(&same_barrier.entered)
+            .expect("coalesced barrier entries")
+            .len(),
+        3,
+        "identical observations must share one dispatched worker"
+    );
+    let first_response = same_server.response(&first);
+    let second_response = same_server.response(&second);
+    assert!(
+        first_response.error.is_none(),
+        "first coalesced response failed"
+    );
+    assert!(
+        second_response.error.is_none(),
+        "second coalesced response failed"
+    );
+    same_server.assert_no_response(&first);
+    same_server.assert_no_response(&second);
+    same_server.shutdown();
+
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+    let (mut distinct_server, distinct_barrier) =
+        TestServer::launch_with_navigation_barrier(environment);
+    distinct_server.initialize(&root, Value::Null);
+    distinct_server.send_request(
+        RequestId::from("distinct-first".to_string()),
+        "textDocument/definition",
+        navigation_params(&provider, provider_source, "PublicRoutine", 0),
+    );
+    distinct_server.send_request(
+        RequestId::from("distinct-second".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Main", 0),
+    );
+    distinct_barrier.wait_for_entries(2);
+    let first = RequestId::from("distinct-position-first".to_string());
+    let second = RequestId::from("distinct-position-second".to_string());
+    distinct_server.send_request(
+        first.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    distinct_server.send_request(
+        second.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    distinct_barrier.release();
+    distinct_barrier.wait_for_entries(4);
+    assert!(
+        distinct_server.response(&first).error.is_none(),
+        "first distinct-position response failed"
+    );
+    assert!(
+        distinct_server.response(&second).error.is_none(),
+        "second distinct-position response failed"
+    );
+    distinct_server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_analysis_dispatches_against_the_latest_document_snapshot() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let first_source = "unit Main;\ninterface\nprocedure OldThing;\nimplementation\nend.\n";
+    let second_source = "unit Main;\ninterface\nprocedure NewThing;\nimplementation\nend.\n";
+    write_file(&main, first_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_source
+            }
+        }),
+    );
+    server.send_request(
+        RequestId::from("latest-snapshot-first".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, first_source, "OldThing", 0),
+    );
+    server.send_request(
+        RequestId::from("latest-snapshot-second".to_string()),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 0, "character": 0}
+        }),
+    );
+    barrier.wait_for_entries(2);
+
+    let symbols_id = RequestId::from("latest-snapshot-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+    assert!(
+        server
+            .response_with_timeout(&symbols_id, Duration::from_millis(100))
+            .is_none(),
+        "queued analysis must wait for a worker slot"
+    );
+
+    barrier.release();
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "latest snapshot request failed: {symbols:?}"
+    );
+    let symbols = symbols.result.expect("document symbols");
+    let symbols = symbols.as_array().expect("document symbol array");
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "NewThing"),
+        "queued analysis returned the obsolete source snapshot: {symbols:?}"
+    );
+    assert!(
+        symbols.iter().all(|symbol| symbol["name"] != "OldThing"),
+        "queued analysis retained an obsolete declaration: {symbols:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn newer_document_version_supersedes_a_queued_observation_once() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nprocedure ChangedRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nprocedure ChangedRoutine;\nbegin\nend;\nend.\n";
+    let first_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    let second_source = first_source.replace("PublicRoutine", "ChangedRoutine");
+    write_file(&provider, provider_source);
+    write_file(&main, first_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_source
+            }
+        }),
+    );
+    server.send_request(
+        RequestId::from("supersede-blocker-main".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, first_source, "Run", 0),
+    );
+    server.send_request(
+        RequestId::from("supersede-blocker-provider".to_string()),
+        "textDocument/definition",
+        navigation_params(&provider, provider_source, "PublicRoutine", 0),
+    );
+    barrier.wait_for_entries(2);
+
+    let old_id = RequestId::from("superseded-old".to_string());
+    server.send_request(
+        old_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, first_source, "PublicRoutine", 0),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+    let new_id = RequestId::from("superseded-new".to_string());
+    server.send_request(
+        new_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, &second_source, "ChangedRoutine", 0),
+    );
+
+    let old_response = server
+        .response_with_timeout(&old_id, Duration::from_secs(1))
+        .expect("superseded request response");
+    assert_eq!(old_response.error.expect("superseded error").code, -32800);
+    server.assert_no_response(&old_id);
+
+    barrier.release();
+    let new_response = server.response(&new_id);
+    assert!(
+        new_response.error.is_none(),
+        "new request failed: {new_response:?}"
+    );
+    assert_eq!(
+        result_locations(new_response).len(),
+        1,
+        "newer version must still be dispatched"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn shutdown_cancels_queued_requests_without_dispatching_them() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_request(
+        RequestId::from("shutdown-first".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    server.send_request(
+        RequestId::from("shutdown-second".to_string()),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    barrier.wait_for_entries(2);
+    let queued_id = RequestId::from("shutdown-queued".to_string());
+    server.send_request(
+        queued_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let shutdown_id = RequestId::from("shutdown-request".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+
+    let queued = server.response(&queued_id);
+    assert_eq!(
+        queued.error.expect("queued shutdown cancellation").code,
+        -32800
+    );
+    let shutdown = server.response(&shutdown_id);
+    assert!(shutdown.error.is_none(), "shutdown failed: {shutdown:?}");
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fs::read(&barrier.entered)
+            .expect("shutdown barrier entries")
+            .len(),
+        2,
+        "shutdown must not dispatch a queued request"
+    );
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server.child.wait().expect("wait for shutdown server");
+    assert!(status.success(), "server exited unsuccessfully: {status}");
 }
 
 #[cfg(feature = "test-support")]

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 const TEST_NAVIGATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_NAVIGATION_BARRIER";
 const TEST_FORMATTING_BARRIER_ENV: &str = "PASCAL_LSP_TEST_FORMATTING_BARRIER";
 const TEST_DIAGNOSTICS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER";
+const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
 
 fn barrier_from_environment(variable: &str) -> Result<Option<(PathBuf, PathBuf)>, String> {
     let Some(spec) = std::env::var_os(variable) else {
@@ -21,7 +22,8 @@ fn test_barrier_config() -> Result<TestBarrierConfig, String> {
         barrier_from_environment(TEST_NAVIGATION_BARRIER_ENV)?,
         barrier_from_environment(TEST_FORMATTING_BARRIER_ENV)?,
         barrier_from_environment(TEST_DIAGNOSTICS_BARRIER_ENV)?,
-    ))
+    )
+    .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from)))
 }
 
 fn main() {

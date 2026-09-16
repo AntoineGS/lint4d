@@ -495,7 +495,7 @@ support.
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial
 location list. Unsupported or ambiguous bindings are rejected rather than
-guessed; inherited and `with` lookup, unknown class ancestors, and unsupported
+guessed; inherited or `with`-dependent lookup, unknown class ancestors, and unsupported
 overload relationships can therefore make a reference request fail.
 
 ### Document highlights
@@ -538,6 +538,11 @@ Implemented and covered by tests:
 - Qualified unit/type names, namespaced units, straightforward declared-type
   member access, class/record helper members (including class-target ancestry),
   parent-helper members, and `Self` members.
+- Typed `with` scopes for class/record variables, `Self`, qualified fields,
+  factory and generic receiver expressions, nested and comma-separated
+  receivers, ordered shadowing, and single-statement or block body boundaries.
+  Receiver expressions are evaluated in their enclosing lexical scope; unknown
+  receiver, ancestry, helper, or conditional resolution fails closed.
 - Class and record helpers are selected using lexical visibility and ordered
   `uses` clauses. Helper members feed navigation, completion, hover, signature
   help, type definitions, and safe binding-based rename; unresolved or
@@ -566,7 +571,6 @@ Implemented and covered by tests:
 
 Not implemented or incomplete:
 
-- `with` resolution.
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
 - Full compiler-equivalent conditional evaluation and include-file expansion.
@@ -615,7 +619,7 @@ conditional expressions and relevant source-bearing includes remain unsupported;
 missing or unreadable includes cannot be treated as evidence that no reference
 exists. Source conditional compilation is projected for analysis rather than
 textually expanded. Unit/module renames (which require
-`RenameFile`), inherited/`with` lookup, overloaded/override relationships,
+`RenameFile`), inherited or `with`-dependent lookup, overloaded/override relationships,
 compiled-only consumers, and other unsupported bindings are also rejected by
 the shared planner. Name collisions and reference capture are rejected before
 any edit is returned. Unresolved imports can be irrelevant when all candidate
@@ -663,8 +667,9 @@ context or a call, 128 signatures, 64 KiB of signature-argument scanning, 256
 nested parentheses/indexers, 128 KiB per rendered signature label, 4,096 formal
 parameters, and 256 KiB of aggregate signature metadata. Completion reports
 item truncation as `isIncomplete` and fails closed when context traversal cannot
-finish; signature help fails closed when its bounded parser or output limit is
-exceeded.
+finish; typed `with` context traversal is capped at 64 nested contexts and also
+reports incomplete rather than guessing. Signature help fails closed when its
+bounded parser or output limit is exceeded.
 
 Linting and formatting reject syntax trees deeper than 256 levels to protect
 their recursive analysis pipelines. Navigation uses iterative tree walks. LSP

@@ -729,27 +729,40 @@ impl NavigationIndex {
                 }
             }
         } else {
-            let mut precedence = 0;
-            for scope in
-                self.scope_chain_with_budget(current_document, offset, cancel, accumulator.budget)?
-            {
-                if scope == super::ROOT_SCOPE {
-                    continue;
-                }
-                self.add_symbols_for_completion_scope(
-                    &mut accumulator,
-                    current_uri,
+            let (with_lookup_blocks, mut precedence) = self.add_with_completion_candidates(
+                &mut accumulator,
+                current_uri,
+                current_document,
+                offset,
+                &mut private_spans,
+                cancel,
+            )?;
+
+            if !with_lookup_blocks {
+                for scope in self.scope_chain_with_budget(
                     current_document,
-                    scope,
-                    precedence,
-                    &mut private_spans,
                     offset,
                     cancel,
-                )?;
-                if accumulator.exhausted {
-                    break;
+                    accumulator.budget,
+                )? {
+                    if scope == super::ROOT_SCOPE {
+                        continue;
+                    }
+                    self.add_symbols_for_completion_scope(
+                        &mut accumulator,
+                        current_uri,
+                        current_document,
+                        scope,
+                        precedence,
+                        &mut private_spans,
+                        offset,
+                        cancel,
+                    )?;
+                    if accumulator.exhausted {
+                        break;
+                    }
+                    precedence += 1;
                 }
-                precedence += 1;
             }
 
             if !accumulator.exhausted {
@@ -927,6 +940,83 @@ impl NavigationIndex {
                 .then_with(|| left.index.cmp(&right.index))
         });
         Ok((candidates, accumulator.is_incomplete))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_with_completion_candidates(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        private_spans: &mut HashMap<Url, HashSet<super::Span>>,
+        cancel: &AtomicBool,
+    ) -> Result<(bool, usize), String> {
+        let contexts = current_document.with_contexts_at(offset);
+        accumulator.budget.require_work(contexts.len(), cancel)?;
+        if contexts.is_empty() {
+            return Ok((false, 0));
+        }
+
+        let mut state = super::ResolutionState::new();
+        let mut precedence = 0;
+        for context in contexts {
+            let Some(receivers) = self.resolve_with_context_receivers_with_budget(
+                current_uri,
+                current_document,
+                context,
+                &mut state,
+                cancel,
+                accumulator.budget,
+            )?
+            else {
+                accumulator.is_incomplete = true;
+                return Ok((true, precedence));
+            };
+            if receivers.len() > 1 {
+                accumulator.is_incomplete = true;
+            }
+            let mut blocks_lower = receivers.len() > 1;
+            for receiver in receivers.into_iter().rev() {
+                check_cancel(cancel)?;
+                match receiver {
+                    super::Receiver::Type(instance) => {
+                        let (ancestry_known, has_ambiguous_names) = self
+                            .add_member_completion_candidates(
+                                accumulator,
+                                &instance.uri,
+                                &instance.key,
+                                instance.scope,
+                                &instance.substitution,
+                                instance.helper_owner.as_ref(),
+                                current_uri,
+                                private_spans,
+                                precedence,
+                                offset,
+                                cancel,
+                            )?;
+                        if !ancestry_known || has_ambiguous_names {
+                            accumulator.is_incomplete = true;
+                            blocks_lower = true;
+                        }
+                    }
+                    super::Receiver::Unit(_)
+                    | super::Receiver::Builtin(_)
+                    | super::Receiver::IntegerLiteral(_) => {}
+                }
+                precedence += 1;
+                if accumulator.exhausted {
+                    break;
+                }
+            }
+            if blocks_lower {
+                return Ok((true, precedence));
+            }
+            if accumulator.exhausted {
+                break;
+            }
+        }
+        Ok((false, precedence))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1766,23 +1856,25 @@ impl NavigationIndex {
         }
         if parts.len() == 1 {
             let references = if let Some(scope) = scope_override {
-                self.unqualified_references_with_budget_at_scope(
+                self.unqualified_references_with_budget_at_scope_and_state(
                     current_uri,
                     current_document,
                     offset,
                     &parts[0],
                     lookup_identifier,
                     scope,
+                    state,
                     cancel,
                     budget,
                 )?
             } else {
-                self.unqualified_references_with_budget(
+                self.unqualified_references_with_budget_and_state(
                     current_uri,
                     current_document,
                     offset,
                     &parts[0],
                     lookup_identifier,
+                    state,
                     cancel,
                     budget,
                 )?
@@ -3108,7 +3200,7 @@ fn unsupported_hover_context_with_budget(
     for ancestor in Ancestors::new(identifier) {
         check_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if matches!(ancestor.kind(), "ppDirective" | "with" | "inherited") {
+        if matches!(ancestor.kind(), "ppDirective" | "inherited") {
             return Ok(true);
         }
     }
@@ -3173,7 +3265,7 @@ fn unsupported_context_at(
     for ancestor in Ancestors::new(node) {
         check_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if matches!(ancestor.kind(), "ppDirective" | "with" | "inherited") {
+        if matches!(ancestor.kind(), "ppDirective" | "inherited") {
             return Ok(true);
         }
     }

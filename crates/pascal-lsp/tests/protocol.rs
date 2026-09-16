@@ -1744,6 +1744,85 @@ fn deeply_nested_generic_receiver_completion_stays_bounded_and_server_responsive
 }
 
 #[test]
+fn deeply_nested_with_completion_cancels_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepWithReceivers.pas");
+    let depth = 512;
+    let mut source = String::from(
+        "unit DeepWithReceivers;\ninterface\ntype\n  TObj = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Obj: TObj;\nbegin\n",
+    );
+    for _ in 0..depth {
+        source.push_str("  with Obj do begin\n");
+    }
+    let cursor_line = source[..source.len()]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32;
+    source.push_str("    \n");
+    for _ in 0..depth {
+        source.push_str("  end;\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let position = Position::new(cursor_line, 4);
+
+    let completion_id = RequestId::from("deep-with-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position,
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "deep with completion failed: {completion:?}"
+    );
+    assert_eq!(
+        completion.result.expect("deep with completion result")["isIncomplete"],
+        true
+    );
+
+    let cancelled_id = RequestId::from("deep-with-completion-cancelled".to_string());
+    server.send_request(
+        cancelled_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position,
+        }),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "deep-with-completion-cancelled"}),
+    );
+    let cancelled = server.response(&cancelled_id);
+    let error = cancelled
+        .error
+        .expect("cancelled deep with completion must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+
+    let responsive_id = RequestId::from("deep-with-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep with completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn cyclic_generic_member_types_fail_closed_and_keep_the_server_responsive() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("CyclicGeneric.pas");

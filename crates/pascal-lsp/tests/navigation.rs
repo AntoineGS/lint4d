@@ -5899,7 +5899,7 @@ end.
 }
 
 #[test]
-fn signature_help_rejects_lookup_inside_a_with_receiver_context() {
+fn signature_help_resolves_lookup_inside_a_with_receiver_context() {
     let source = r#"unit WithSignature;
 interface
 type
@@ -5929,17 +5929,22 @@ end.
         .update(source_uri.clone(), source.to_owned())
         .expect("with signature source parses");
 
-    assert!(
-        index
-            .signature_help(&source_uri, position_after(source, "    Run(", 0))
-            .expect("with signature projection")
-            .is_none(),
-        "with receiver lookup must fail closed"
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "    Run(", 0))
+        .expect("with signature projection")
+        .expect("with receiver lookup");
+    assert_eq!(
+        signature
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(Text: string);"]
     );
 }
 
 #[test]
-fn completion_rejects_blank_positions_inside_a_with_context() {
+fn completion_lists_members_at_a_blank_position_inside_a_with_context() {
     let marked = r#"unit WithCompletion;
 interface
 type
@@ -5973,8 +5978,686 @@ end.
     let completion = index
         .completion(&source_uri, position)
         .expect("blank with completion");
-    assert!(completion.items.is_empty());
+    assert!(
+        completion.items.iter().any(|item| item.label == "Field"),
+        "unexpected labels: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
     assert!(!completion.is_incomplete);
+}
+
+#[test]
+fn with_implicit_members_resolve_rightmost_then_earlier_receiver() {
+    let source = r#"unit TypedWithLookup;
+interface
+type
+  TLeft = record
+    LeftField: Integer;
+  end;
+  TRight = record
+    RightField: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  LeftValue: TLeft;
+  RightValue: TRight;
+begin
+  with LeftValue, RightValue do begin
+    RightField := LeftField;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithLookup");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("typed with source parses");
+
+    let right_field = index.navigate(
+        &source_uri,
+        position_of(source, "RightField", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(right_field.len(), 1);
+    assert_location_start(
+        &right_field[0],
+        &source_uri,
+        position_of(source, "RightField", 0),
+    );
+
+    let left_field = index.navigate(
+        &source_uri,
+        position_of(source, "LeftField", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(left_field.len(), 1);
+    assert_location_start(
+        &left_field[0],
+        &source_uri,
+        position_of(source, "LeftField", 0),
+    );
+}
+
+#[test]
+fn with_members_shadow_same_named_locals_only_inside_the_body() {
+    let source = r#"unit TypedWithShadowing;
+interface
+type
+  TBox = record
+    Value: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox;
+  Value: Integer;
+begin
+  with Box do begin
+    Value := 1;
+  end;
+  Value := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithShadowing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("shadowing with source parses");
+
+    let member = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(
+        &member[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let local = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local.len(), 1);
+    assert_location_start(
+        &local[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 1),
+    );
+}
+
+#[test]
+fn declarations_inside_with_bodies_are_not_implicit_members() {
+    let source = r#"unit TypedWithDeclaration;
+interface
+type
+  TBox = record
+    Value: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox;
+begin
+  with Box do begin
+    var Value: Integer;
+    Value := 1;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithDeclaration");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("declaration with source parses");
+
+    let declaration = index.navigate(
+        &source_uri,
+        position_after(source, "var ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(declaration.len(), 1);
+    assert_location_start(
+        &declaration[0],
+        &source_uri,
+        position_after(source, "var ", 0),
+    );
+}
+
+#[test]
+fn with_receiver_list_uses_earlier_receiver_for_later_receiver_expression() {
+    let source = r#"unit TypedWithReceiverList;
+interface
+type
+  TInner = record
+    Value: Integer;
+  end;
+  TOuter = record
+    Inner: TInner;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  OuterValue: TOuter;
+begin
+  with OuterValue, Inner do
+    Value := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithReceiverList");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("receiver-list with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+}
+
+#[test]
+fn with_factory_result_resolves_a_single_statement_member() {
+    let source = r#"unit TypedWithFactory;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeObj: TObj;
+implementation
+function MakeObj: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  with MakeObj() do
+    Member := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithFactory");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("factory with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Member :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn with_generic_receiver_preserves_specialized_nested_member_types() {
+    let source = r#"unit TypedWithGeneric;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  with Box do
+    Value.WidgetMember := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithGeneric");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic with source parses");
+
+    let box_locations = index.navigate(
+        &source_uri,
+        position_after(source, "with ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(box_locations.len(), 1);
+    assert_location_start(
+        &box_locations[0],
+        &source_uri,
+        position_of(source, "Box:", 0),
+    );
+
+    let value_locations = index.navigate(
+        &source_uri,
+        position_of(source, "Value.WidgetMember", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(value_locations.len(), 1);
+    assert_location_start(
+        &value_locations[0],
+        &source_uri,
+        position_of(source, "Value: T", 0),
+    );
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "WidgetMember :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "WidgetMember: Integer", 0),
+    );
+}
+
+#[test]
+fn deeply_nested_with_completion_stays_bounded_and_keeps_proven_members() {
+    let depth = 512;
+    let mut source = String::from(
+        "unit DeepTypedWith;\ninterface\ntype\n  TBox = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: TBox;\nbegin\n",
+    );
+    for _ in 0..depth {
+        source.push_str("  with Box do begin\n");
+    }
+    let cursor_offset = source.len() + 4;
+    source.push_str("    \n");
+    for _ in 0..depth {
+        source.push_str("  end;\n");
+    }
+    source.push_str("end;\nend.\n");
+
+    let source_uri = uri("DeepTypedWith");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("deep with source parses");
+    let position = text::offset_to_position(&source, cursor_offset).expect("deep with position");
+    let completion = index
+        .completion(&source_uri, position)
+        .expect("deep with completion remains responsive");
+    assert!(completion.is_incomplete);
+}
+
+#[test]
+fn with_receiver_activates_record_helpers_for_implicit_members() {
+    let source = r#"unit TypedWithHelper;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+procedure Caller;
+implementation
+procedure TPointHelper.Offset;
+begin
+end;
+procedure Caller;
+var
+  Point: TPoint;
+begin
+  with Point do
+    Offset;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithHelper");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Offset", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Offset", 0));
+}
+
+#[test]
+fn explicit_member_qualification_bypasses_an_implicit_with_receiver() {
+    let source = r#"unit TypedWithQualification;
+interface
+type
+  TObj = record
+    Field: Integer;
+  end;
+  TOther = record
+    Field: string;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Obj: TObj;
+  Other: TOther;
+begin
+  with Obj do
+    Other.Field := 'value';
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithQualification");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("qualified with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Field :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Field: string", 0),
+    );
+}
+
+#[test]
+fn explicit_qualification_prefers_a_local_root_over_a_same_named_with_member() {
+    let source = r#"unit TypedWithQualificationShadow;
+interface
+type
+  TOther = record
+    LocalField: string;
+  end;
+  TInner = record
+    WithField: Integer;
+  end;
+  TObj = record
+    Other: TInner;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Obj: TObj;
+  Other: TOther;
+begin
+  with Obj do
+    Other.LocalField := 'value';
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithQualificationShadow");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("qualified shadow source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "LocalField :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "LocalField: string", 0),
+    );
+}
+
+#[test]
+fn unknown_with_receiver_blocks_an_unrelated_global_fallback() {
+    let source = r#"unit TypedWithUnknown;
+interface
+const
+  GlobalValue = 1;
+procedure Caller;
+implementation
+procedure Caller;
+begin
+  with UnknownReceiver do
+    GlobalValue := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknown");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "GlobalValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        locations.is_empty(),
+        "unknown with receiver must not select the global declaration"
+    );
+}
+
+#[test]
+fn proven_inner_with_receiver_precedes_an_unknown_outer_context() {
+    let source = r#"unit TypedWithUnknownOuter;
+interface
+type
+  TInner = class
+    constructor Create;
+    InnerValue: Integer;
+  end;
+procedure Caller;
+implementation
+constructor TInner.Create;
+begin
+end;
+procedure Caller;
+begin
+  with UnknownOuter do
+    with TypedWithUnknownOuter.TInner.Create do
+      InnerValue := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownOuter");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown outer with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "InnerValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "InnerValue: Integer", 0),
+    );
+}
+
+#[test]
+fn nested_with_uses_inner_then_outer_and_does_not_leak_after_body() {
+    let source = r#"unit TypedWithNesting;
+interface
+type
+  TInner = record
+    InnerValue: Integer;
+  end;
+  TOuter = record
+    OuterValue: Integer;
+    Inner: TInner;
+  end;
+const
+  OuterValue = 0;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Outer: TOuter;
+begin
+  with Outer do begin
+    with Inner do begin
+      InnerValue := 1;
+      OuterValue := 2;
+    end;
+  end;
+  OuterValue := 3;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithNesting");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested with source parses");
+
+    let inner = index.navigate(
+        &source_uri,
+        position_of(source, "InnerValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(inner.len(), 1);
+    assert_location_start(
+        &inner[0],
+        &source_uri,
+        position_of(source, "InnerValue: Integer", 0),
+    );
+
+    let outer_inside = index.navigate(
+        &source_uri,
+        position_of(source, "OuterValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(outer_inside.len(), 1);
+    assert_location_start(
+        &outer_inside[0],
+        &source_uri,
+        position_of(source, "OuterValue: Integer", 0),
+    );
+
+    let outer_after = index.navigate(
+        &source_uri,
+        position_of(source, "OuterValue :=", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(outer_after.len(), 1);
+    assert_location_start(
+        &outer_after[0],
+        &source_uri,
+        position_of(source, "OuterValue = 0", 0),
+    );
+}
+
+#[test]
+fn with_binding_is_shared_by_hover_completion_signature_and_type_definition() {
+    let source = r#"unit TypedWithAssistance;
+interface
+type
+  TChild = record
+    ChildValue: Integer;
+  end;
+  TObj = record
+    Field: TChild;
+    procedure Run(Value: Integer);
+  end;
+procedure Caller;
+implementation
+procedure TObj.Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  Obj: TObj;
+begin
+  with Obj do begin
+    Field.ChildValue := 1;
+    Run(1);
+    Fi;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("with assistance source parses");
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Field", 1))
+        .expect("with member hover");
+    assert!(hover_text(&hover).contains("Field: TChild"));
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "  Fi", 0))
+        .expect("with member completion");
+    assert!(
+        completion.items.iter().any(|item| item.label == "Field"),
+        "unexpected labels: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "    Run(", 0))
+        .expect("with signature help")
+        .expect("with member signature");
+    assert_eq!(
+        signature
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(Value: Integer);"]
+    );
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Field", 1));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &source_uri,
+        position_of(source, "TChild", 0),
+    );
 }
 
 #[test]

@@ -734,10 +734,10 @@ impl NavigationIndex {
             if is_right_hand_member(dot, identifier) {
                 self.member_references_with_state(uri, document, offset, dot, &name, state)
             } else {
-                self.unqualified_references(uri, document, offset, &name)
+                self.unqualified_references_with_state(uri, document, offset, &name, state)
             }
         } else {
-            self.unqualified_references(uri, document, offset, &name)
+            self.unqualified_references_with_state(uri, document, offset, &name, state)
         };
         let candidates =
             self.filter_accessible_candidates_with_state(uri, document, offset, candidates, state);
@@ -807,13 +807,13 @@ impl NavigationIndex {
                     uri, document, offset, dot, name, identifier, state, depth, cancel, budget,
                 )
             } else {
-                self.unqualified_references_with_budget(
-                    uri, document, offset, name, identifier, cancel, budget,
+                self.unqualified_references_with_budget_and_state(
+                    uri, document, offset, name, identifier, state, cancel, budget,
                 )
             }
         } else {
-            self.unqualified_references_with_budget(
-                uri, document, offset, name, identifier, cancel, budget,
+            self.unqualified_references_with_budget_and_state(
+                uri, document, offset, name, identifier, state, cancel, budget,
             )
         }?;
         let candidates = self.filter_accessible_candidates_with_state_and_budget(
@@ -953,13 +953,14 @@ impl NavigationIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn unqualified_references_with_budget(
+    fn unqualified_references_with_budget_and_state(
         &self,
         uri: &Url,
         document: &Document,
         offset: usize,
         name: &str,
         identifier: Node<'_>,
+        state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
@@ -969,13 +970,34 @@ impl NavigationIndex {
             return Ok(generic);
         }
         let scope = document.scope_at(offset);
-        self.unqualified_references_with_budget_at_scope(
-            uri, document, offset, name, identifier, scope, cancel, budget,
+        self.unqualified_references_with_budget_at_scope_and_state(
+            uri, document, offset, name, identifier, scope, state, cancel, budget,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn unqualified_references_with_budget_at_scope(
+    fn unqualified_references_with_budget_and_state_without_with(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        name: &str,
+        identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let previous = state.suppress_with_lookup;
+        state.suppress_with_lookup = true;
+        let result = self.unqualified_references_with_budget_and_state(
+            uri, document, offset, name, identifier, state, cancel, budget,
+        );
+        state.suppress_with_lookup = previous;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unqualified_references_with_budget_at_scope_and_state(
         &self,
         uri: &Url,
         document: &Document,
@@ -983,6 +1005,7 @@ impl NavigationIndex {
         name: &str,
         identifier: Node<'_>,
         scope: usize,
+        state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
@@ -998,6 +1021,15 @@ impl NavigationIndex {
                         .is_some_and(|symbol| symbol.key == key)
                 })
                 .collect());
+        }
+        if !state.suppress_with_lookup {
+            match self.with_lookup_for_name_with_budget(
+                uri, document, offset, name, state, cancel, budget,
+            )? {
+                WithLookup::Found(candidates) => return Ok(candidates),
+                WithLookup::Unknown => return Ok(Vec::new()),
+                WithLookup::NotFound => {}
+            }
         }
         budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
         let owner_type = document.owner_type_at_identifier(identifier, scope);
@@ -1369,13 +1401,15 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
         budget.require_work(parts.len(), cancel)?;
+        let mut state = ResolutionState::new();
         if parts.len() == 1 {
-            let candidates = self.unqualified_references_with_budget(
+            let candidates = self.unqualified_references_with_budget_and_state(
                 current_uri,
                 current_document,
                 offset,
                 &parts[0],
                 lookup_identifier,
+                &mut state,
                 cancel,
                 budget,
             )?;
@@ -1393,7 +1427,6 @@ impl NavigationIndex {
                 })
                 .collect());
         }
-        let mut state = ResolutionState::new();
         if let Some((prefix_len, unit_uris)) = self.longest_visible_unit_prefix_with_budget(
             current_uri,
             current_document,
@@ -1665,6 +1698,407 @@ impl NavigationIndex {
         (!candidates.is_empty()).then_some(candidates)
     }
 
+    fn with_lookup_for_name(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        name: &str,
+        state: &mut ResolutionState,
+    ) -> WithLookup {
+        let key = canonical_name(name);
+
+        let overlay = state.with_receivers.clone();
+        if !overlay.is_empty() {
+            for receiver in overlay.iter().rev() {
+                match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
+                    WithLookup::NotFound => {}
+                    lookup => return lookup,
+                }
+            }
+        }
+
+        let contexts = document.with_contexts_at(offset);
+        if contexts.len() > MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            return WithLookup::Unknown;
+        }
+        for context in contexts {
+            let Some(receivers) =
+                self.resolve_with_context_receivers(uri, document, context, state)
+            else {
+                return WithLookup::Unknown;
+            };
+            for receiver in receivers.iter().rev() {
+                match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
+                    WithLookup::NotFound => {}
+                    lookup => return lookup,
+                }
+            }
+        }
+
+        WithLookup::NotFound
+    }
+
+    fn resolve_with_context_receivers(
+        &self,
+        uri: &Url,
+        document: &Document,
+        context: &WithContext,
+        state: &mut ResolutionState,
+    ) -> Option<Vec<Receiver>> {
+        let cache_key = (uri.clone(), context.body);
+        if let Some(cached) = state.with_context_resolutions.get(&cache_key) {
+            if let Some(receivers) = cached {
+                return Some(receivers.clone());
+            }
+            state.mark_receiver_uncertain();
+            return None;
+        }
+        if state.with_context_depth >= MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            state.with_context_resolutions.insert(cache_key, None);
+            return None;
+        }
+        state.with_context_depth += 1;
+        let mut receivers = Vec::new();
+        let mut result = Some(Vec::new());
+        for receiver_span in &context.receiver_spans {
+            let Some(node) = document
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(receiver_span.start, receiver_span.end)
+                .filter(|node| Span::from_node(*node) == *receiver_span)
+            else {
+                result = None;
+                break;
+            };
+            let previous = std::mem::replace(&mut state.with_receivers, receivers.clone());
+            let uncertain_before = state.receiver_resolution_uncertain();
+            let resolved =
+                self.resolve_receivers_with_state(uri, document, receiver_span.start, node, state);
+            state.with_receivers = previous;
+            if (!uncertain_before && state.receiver_resolution_uncertain()) || resolved.is_empty() {
+                state.mark_receiver_uncertain();
+                result = None;
+                break;
+            }
+            receivers.extend(resolved);
+        }
+        if result.is_some() {
+            result = Some(receivers);
+        }
+        state
+            .with_context_resolutions
+            .insert(cache_key, result.clone());
+        state.with_context_depth -= 1;
+        result
+    }
+
+    fn with_receiver_lookup(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        receiver: &Receiver,
+        key: &str,
+        state: &mut ResolutionState,
+    ) -> WithLookup {
+        let Receiver::Type(instance) = receiver else {
+            return WithLookup::NotFound;
+        };
+        let lookup = self.member_references_for_instance(
+            uri,
+            document,
+            offset,
+            instance,
+            key,
+            instance.uri == *uri,
+        );
+        if !lookup.ancestry_known
+            || lookup.ambiguous_names.contains(key)
+            || lookup
+                .candidates
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            state.mark_receiver_uncertain();
+            return WithLookup::Unknown;
+        }
+        if lookup.candidates.is_empty() {
+            WithLookup::NotFound
+        } else {
+            self.remember_with_member_substitutions(
+                uri,
+                offset,
+                instance,
+                &lookup.candidates,
+                state,
+            );
+            WithLookup::Found(lookup.candidates)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_lookup_for_name_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        name: &str,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<WithLookup, String> {
+        budget.require_bytes(name.len(), cancel)?;
+        let key = canonical_name(name);
+        let overlay = state.with_receivers.clone();
+        for receiver in overlay.iter().rev() {
+            match self.with_receiver_lookup_with_budget(
+                uri, document, offset, receiver, &key, state, cancel, budget,
+            )? {
+                WithLookup::NotFound => {}
+                lookup => return Ok(lookup),
+            }
+        }
+
+        let contexts = document.with_contexts_at(offset);
+        if contexts.len() > MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            return Ok(WithLookup::Unknown);
+        }
+        budget.require_work(contexts.len(), cancel)?;
+        for context in contexts {
+            let Some(receivers) = self.resolve_with_context_receivers_with_budget(
+                uri, document, context, state, cancel, budget,
+            )?
+            else {
+                return Ok(WithLookup::Unknown);
+            };
+            for receiver in receivers.iter().rev() {
+                match self.with_receiver_lookup_with_budget(
+                    uri, document, offset, receiver, &key, state, cancel, budget,
+                )? {
+                    WithLookup::NotFound => {}
+                    lookup => return Ok(lookup),
+                }
+            }
+        }
+
+        Ok(WithLookup::NotFound)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with_context_receivers_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        context: &WithContext,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Vec<Receiver>>, String> {
+        let cache_key = (uri.clone(), context.body);
+        if let Some(cached) = state.with_context_resolutions.get(&cache_key) {
+            if let Some(receivers) = cached {
+                return Ok(Some(receivers.clone()));
+            }
+            state.mark_receiver_uncertain();
+            return Ok(None);
+        }
+        if state.with_context_depth >= MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            state.with_context_resolutions.insert(cache_key, None);
+            return Ok(None);
+        }
+        state.with_context_depth += 1;
+        let result = (|| {
+            budget.require_work(context.receiver_spans.len(), cancel)?;
+            let mut receivers = Vec::new();
+            for receiver_span in &context.receiver_spans {
+                check_navigation_cancel(cancel)?;
+                let Some(node) = document
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(receiver_span.start, receiver_span.end)
+                    .filter(|node| Span::from_node(*node) == *receiver_span)
+                else {
+                    state.mark_receiver_uncertain();
+                    return Ok(None);
+                };
+                let previous = std::mem::replace(&mut state.with_receivers, receivers.clone());
+                let uncertain_before = state.receiver_resolution_uncertain();
+                let resolved = self.resolve_receivers_with_state_and_budget(
+                    uri,
+                    document,
+                    receiver_span.start,
+                    node,
+                    node,
+                    state,
+                    cancel,
+                    budget,
+                    0,
+                );
+                state.with_receivers = previous;
+                let resolved = resolved?;
+                if (!uncertain_before && state.receiver_resolution_uncertain())
+                    || resolved.is_empty()
+                {
+                    state.mark_receiver_uncertain();
+                    return Ok(None);
+                }
+                receivers.extend(resolved);
+            }
+            Ok(Some(receivers))
+        })();
+        if let Ok(resolved) = &result {
+            state
+                .with_context_resolutions
+                .insert(cache_key, resolved.clone());
+        }
+        state.with_context_depth -= 1;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_receiver_lookup_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        receiver: &Receiver,
+        key: &str,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<WithLookup, String> {
+        let Receiver::Type(instance) = receiver else {
+            return Ok(WithLookup::NotFound);
+        };
+        let lookup = self.member_references_for_instance_with_budget(
+            uri,
+            document,
+            offset,
+            instance,
+            key,
+            instance.uri == *uri,
+            cancel,
+            budget,
+        )?;
+        if !lookup.ancestry_known
+            || lookup.ambiguous_names.contains(key)
+            || lookup
+                .candidates
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            state.mark_receiver_uncertain();
+            return Ok(WithLookup::Unknown);
+        }
+        if lookup.candidates.is_empty() {
+            Ok(WithLookup::NotFound)
+        } else {
+            self.remember_with_member_substitutions_with_budget(
+                uri,
+                offset,
+                instance,
+                &lookup.candidates,
+                state,
+                cancel,
+                budget,
+            )?;
+            Ok(WithLookup::Found(lookup.candidates))
+        }
+    }
+
+    fn remember_with_member_substitutions(
+        &self,
+        current_uri: &Url,
+        offset: usize,
+        instance: &TypeInstance,
+        candidates: &[Candidate],
+        state: &mut ResolutionState,
+    ) {
+        for candidate in candidates {
+            let Some(symbol) = self.symbol(candidate) else {
+                continue;
+            };
+            let owner_key = symbol.owner_type.as_deref().unwrap_or(&instance.key);
+            let substitution = self
+                .member_owner_substitution(
+                    &instance.uri,
+                    &instance.key,
+                    &instance.substitution,
+                    &candidate.uri,
+                    owner_key,
+                    state,
+                )
+                .or_else(|| {
+                    self.candidate_is_helper_member(candidate)
+                        .then(|| instance.substitution.clone())
+                });
+            let Some(substitution) = substitution else {
+                state.mark_receiver_uncertain();
+                continue;
+            };
+            let substitutions = state
+                .with_member_substitutions
+                .entry((current_uri.clone(), offset, candidate.clone()))
+                .or_default();
+            if !substitutions.contains(&substitution) {
+                substitutions.push(substitution);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remember_with_member_substitutions_with_budget(
+        &self,
+        current_uri: &Url,
+        offset: usize,
+        instance: &TypeInstance,
+        candidates: &[Candidate],
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<(), String> {
+        budget.require_work(candidates.len(), cancel)?;
+        for candidate in candidates {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = self.symbol(candidate) else {
+                continue;
+            };
+            let owner_key = symbol.owner_type.as_deref().unwrap_or(&instance.key);
+            let substitution = self
+                .member_owner_substitution_with_budget(
+                    &instance.uri,
+                    &instance.key,
+                    &instance.substitution,
+                    &candidate.uri,
+                    owner_key,
+                    state,
+                    cancel,
+                    budget,
+                )?
+                .or_else(|| {
+                    self.candidate_is_helper_member(candidate)
+                        .then(|| instance.substitution.clone())
+                });
+            let Some(substitution) = substitution else {
+                state.mark_receiver_uncertain();
+                continue;
+            };
+            let substitutions = state
+                .with_member_substitutions
+                .entry((current_uri.clone(), offset, candidate.clone()))
+                .or_default();
+            if !substitutions.contains(&substitution) {
+                substitutions.push(substitution);
+            }
+        }
+        Ok(())
+    }
+
     fn unqualified_references(
         &self,
         uri: &Url,
@@ -1672,23 +2106,37 @@ impl NavigationIndex {
         offset: usize,
         name: &str,
     ) -> Vec<Candidate> {
+        let mut state = ResolutionState::new();
+        self.unqualified_references_with_state(uri, document, offset, name, &mut state)
+    }
+
+    fn unqualified_references_with_state(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        name: &str,
+        state: &mut ResolutionState,
+    ) -> Vec<Candidate> {
         let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
             return Vec::new();
         };
         if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
             return generic;
         }
-        self.unqualified_references_at_scope(
+        self.unqualified_references_at_scope_with_state(
             uri,
             document,
             offset,
             name,
             identifier,
             document.scope_at(offset),
+            state,
         )
     }
 
-    fn unqualified_references_at_scope(
+    #[allow(clippy::too_many_arguments)]
+    fn unqualified_references_at_scope_with_state(
         &self,
         uri: &Url,
         document: &Document,
@@ -1696,6 +2144,7 @@ impl NavigationIndex {
         name: &str,
         identifier: Node<'_>,
         scope: usize,
+        state: &mut ResolutionState,
     ) -> Vec<Candidate> {
         let key = canonical_name(name);
         if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
@@ -1706,6 +2155,12 @@ impl NavigationIndex {
                         .is_some_and(|symbol| symbol.key == key)
                 })
                 .collect();
+        }
+
+        match self.with_lookup_for_name(uri, document, offset, name, state) {
+            WithLookup::Found(candidates) => return candidates,
+            WithLookup::Unknown => return Vec::new(),
+            WithLookup::NotFound => {}
         }
 
         // Search lexical scopes from the innermost outward. A local symbol
@@ -1961,6 +2416,37 @@ impl NavigationIndex {
         match node.kind() {
             "identifier" => {
                 let name = node_text_with_budget(node, &current_document.source, cancel, budget)?;
+                let is_qualified_receiver = node.parent().is_some_and(|parent| {
+                    matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot")
+                        && parent
+                            .child_by_field_name("lhs")
+                            .is_some_and(|lhs| Span::from_node(lhs) == Span::from_node(node))
+                });
+                if is_qualified_receiver
+                    && !self
+                        .unqualified_references_with_budget_and_state_without_with(
+                            current_uri,
+                            current_document,
+                            offset,
+                            name,
+                            lookup_identifier,
+                            state,
+                            cancel,
+                            budget,
+                        )?
+                        .is_empty()
+                {
+                    return self.resolve_identifier_receiver_with_budget_without_with(
+                        current_uri,
+                        current_document,
+                        offset,
+                        name,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                    );
+                }
                 self.resolve_identifier_receiver_with_budget(
                     current_uri,
                     current_document,
@@ -2349,19 +2835,16 @@ impl NavigationIndex {
         let Some(first) = parts.first() else {
             return Ok(Vec::new());
         };
+        let unit_prefix = self.longest_visible_unit_prefix_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            parts,
+            cancel,
+            budget,
+        )?;
         let first_is_bound = !self
-            .unqualified_references_with_budget(
-                current_uri,
-                current_document,
-                offset,
-                first,
-                lookup_identifier,
-                cancel,
-                budget,
-            )?
-            .is_empty();
-        if first.eq_ignore_ascii_case("Self") || first_is_bound {
-            let mut receivers = self.resolve_identifier_receiver_with_budget(
+            .unqualified_references_with_budget_and_state_without_with(
                 current_uri,
                 current_document,
                 offset,
@@ -2370,7 +2853,32 @@ impl NavigationIndex {
                 state,
                 cancel,
                 budget,
-            )?;
+            )?
+            .is_empty();
+        if first.eq_ignore_ascii_case("Self") || first_is_bound {
+            let mut receivers = if first_is_bound {
+                self.resolve_identifier_receiver_with_budget_without_with(
+                    current_uri,
+                    current_document,
+                    offset,
+                    first,
+                    lookup_identifier,
+                    state,
+                    cancel,
+                    budget,
+                )?
+            } else {
+                self.resolve_identifier_receiver_with_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    first,
+                    lookup_identifier,
+                    state,
+                    cancel,
+                    budget,
+                )?
+            };
             for member_name in &parts[1..] {
                 budget.require_work(1, cancel)?;
                 receivers = receivers
@@ -2420,14 +2928,7 @@ impl NavigationIndex {
             return Ok(unit_uris.into_iter().map(Receiver::Unit).collect());
         }
 
-        if let Some((prefix_len, unit_uris)) = self.longest_visible_unit_prefix_with_budget(
-            current_uri,
-            current_document,
-            offset,
-            parts,
-            cancel,
-            budget,
-        )? {
+        if let Some((prefix_len, unit_uris)) = unit_prefix {
             let Some(type_name) = parts.get(prefix_len) else {
                 return Ok(Vec::new());
             };
@@ -2572,12 +3073,13 @@ impl NavigationIndex {
                 );
             }
         }
-        let references = self.unqualified_references_with_budget(
+        let references = self.unqualified_references_with_budget_and_state(
             current_uri,
             current_document,
             offset,
             name,
             lookup_identifier,
+            state,
             cancel,
             budget,
         )?;
@@ -2607,6 +3109,15 @@ impl NavigationIndex {
                 let Some(symbol) = self.symbol(&reference) else {
                     continue;
                 };
+                let substitutions = state
+                    .with_member_substitutions
+                    .get(&(current_uri.clone(), offset, reference.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| vec![GenericSubstitution::empty()]);
+                if substitutions.len() > 1 {
+                    state.mark_receiver_uncertain();
+                    return Ok(Vec::new());
+                }
                 match symbol.kind {
                     SymbolKind::Type => {
                         if let Some(receiver) = self.type_receiver_for_candidate(&reference) {
@@ -2618,13 +3129,16 @@ impl NavigationIndex {
                     | SymbolKind::Field
                     | SymbolKind::Property => {
                         if let Some(declaration_document) = self.documents.get(&reference.uri) {
+                            let substitution = substitutions
+                                .first()
+                                .expect("non-empty receiver substitution list");
                             result.extend(self.type_receivers_for_symbol_type_with_budget(
                                 &reference.uri,
                                 declaration_document,
                                 symbol,
                                 lookup_identifier,
                                 None,
-                                &GenericSubstitution::empty(),
+                                substitution,
                                 state,
                                 cancel,
                                 budget,
@@ -2645,6 +3159,34 @@ impl NavigationIndex {
             budget,
         )?;
         Ok(urls.into_iter().map(Receiver::Unit).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_identifier_receiver_with_budget_without_with(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        name: &str,
+        lookup_identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Receiver>, String> {
+        let previous = state.suppress_with_lookup;
+        state.suppress_with_lookup = true;
+        let result = self.resolve_identifier_receiver_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            name,
+            lookup_identifier,
+            state,
+            cancel,
+            budget,
+        );
+        state.suppress_with_lookup = previous;
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3110,23 +3652,25 @@ impl NavigationIndex {
         budget.require_work(parts.len(), cancel)?;
         if parts.len() == 1 {
             let candidates = if let Some(scope) = scope_override {
-                self.unqualified_references_with_budget_at_scope(
+                self.unqualified_references_with_budget_at_scope_and_state(
                     current_uri,
                     current_document,
                     offset,
                     &parts[0],
                     lookup_identifier,
                     scope,
+                    state,
                     cancel,
                     budget,
                 )?
             } else {
-                self.unqualified_references_with_budget(
+                self.unqualified_references_with_budget_and_state(
                     current_uri,
                     current_document,
                     offset,
                     &parts[0],
                     lookup_identifier,
+                    state,
                     cancel,
                     budget,
                 )?
@@ -3153,23 +3697,25 @@ impl NavigationIndex {
         }
 
         let root_candidates = if let Some(scope) = scope_override {
-            self.unqualified_references_with_budget_at_scope(
+            self.unqualified_references_with_budget_at_scope_and_state(
                 current_uri,
                 current_document,
                 offset,
                 &parts[0],
                 lookup_identifier,
                 scope,
+                state,
                 cancel,
                 budget,
             )?
         } else {
-            self.unqualified_references_with_budget(
+            self.unqualified_references_with_budget_and_state(
                 current_uri,
                 current_document,
                 offset,
                 &parts[0],
                 lookup_identifier,
+                state,
                 cancel,
                 budget,
             )?
@@ -3825,16 +4371,23 @@ impl NavigationIndex {
                 else {
                     return Vec::new();
                 };
-                self.unqualified_references_at_scope(
+                self.unqualified_references_at_scope_with_state(
                     current_uri,
                     current_document,
                     offset,
                     &parts[0],
                     identifier,
                     scope,
+                    state,
                 )
             } else {
-                self.unqualified_references(current_uri, current_document, offset, &parts[0])
+                self.unqualified_references_with_state(
+                    current_uri,
+                    current_document,
+                    offset,
+                    &parts[0],
+                    state,
+                )
             };
             if candidates
                 .iter()
@@ -3852,16 +4405,23 @@ impl NavigationIndex {
             let Some(identifier) = identifier_at(current_document.tree.root_node(), offset) else {
                 return Vec::new();
             };
-            self.unqualified_references_at_scope(
+            self.unqualified_references_at_scope_with_state(
                 current_uri,
                 current_document,
                 offset,
                 &parts[0],
                 identifier,
                 scope,
+                state,
             )
         } else {
-            self.unqualified_references(current_uri, current_document, offset, &parts[0])
+            self.unqualified_references_with_state(
+                current_uri,
+                current_document,
+                offset,
+                &parts[0],
+                state,
+            )
         };
         if !root_candidates.is_empty() {
             if root_candidates
@@ -6523,6 +7083,19 @@ struct Scope {
     owner_type: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct WithContext {
+    body: Span,
+    receiver_spans: Vec<Span>,
+}
+
+#[derive(Debug, Clone)]
+enum WithLookup {
+    NotFound,
+    Found(Vec<Candidate>),
+    Unknown,
+}
+
 #[derive(Debug)]
 pub(super) struct AssistanceBudget {
     remaining_work: usize,
@@ -6708,7 +7281,7 @@ impl Symbol {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Candidate {
     uri: Url,
     index: usize,
@@ -6869,6 +7442,7 @@ impl AncestryResolutionState {
     }
 }
 
+#[derive(Debug, Clone)]
 enum Receiver {
     Unit(Url),
     Type(TypeInstance),
@@ -6991,6 +7565,7 @@ fn unique_type_instance(receivers: Vec<Receiver>) -> Option<TypeInstance> {
 const MAX_RECEIVER_WORK: usize = 256;
 const MAX_TYPE_RESOLUTION_WORK: usize = 256;
 const MAX_RECEIVER_RECURSION_DEPTH: usize = 64;
+const MAX_WITH_CONTEXT_RECURSION_DEPTH: usize = 64;
 const MAX_TYPE_REF_RECURSION_DEPTH: usize = 64;
 const MAX_ANCESTRY_WORK: usize = 256;
 const MAX_NAVIGATION_OVERLOAD_WORK: usize = 100_000;
@@ -7002,6 +7577,11 @@ struct ResolutionState {
     active_members: HashSet<(Url, String, String, usize, GenericSubstitution)>,
     active_generic_constraints: HashSet<(Url, String)>,
     receiver_uncertain: bool,
+    with_receivers: Vec<Receiver>,
+    with_context_depth: usize,
+    with_context_resolutions: HashMap<(Url, Span), Option<Vec<Receiver>>>,
+    with_member_substitutions: HashMap<(Url, usize, Candidate), Vec<GenericSubstitution>>,
+    suppress_with_lookup: bool,
 }
 
 impl ResolutionState {
@@ -7012,6 +7592,11 @@ impl ResolutionState {
             active_members: HashSet::new(),
             active_generic_constraints: HashSet::new(),
             receiver_uncertain: false,
+            with_receivers: Vec::new(),
+            with_context_depth: 0,
+            with_context_resolutions: HashMap::new(),
+            with_member_substitutions: HashMap::new(),
+            suppress_with_lookup: false,
         }
     }
 
@@ -7055,6 +7640,7 @@ struct Document {
     import_bindings: Option<HashMap<String, Url>>,
     interface_routine_keys: HashSet<String>,
     scopes: Vec<Scope>,
+    with_contexts: Vec<WithContext>,
     cache_unsafe_scopes: HashSet<usize>,
     symbols: Vec<Symbol>,
     opaque_ranges: Vec<Span>,
@@ -7179,6 +7765,7 @@ impl Document {
 
         let definitions = collect_nodes_matching(root, "defProc");
         let (scopes, scope_by_span) = build_scopes(source.len(), root, &definitions, &source);
+        let with_contexts = collect_with_contexts(root);
         let cache_unsafe_scopes = cache_unsafe_scopes(root, &scope_by_span);
         let mut symbols = Vec::new();
 
@@ -7372,6 +7959,7 @@ impl Document {
             import_bindings: None,
             interface_routine_keys,
             scopes,
+            with_contexts,
             cache_unsafe_scopes,
             symbols,
             opaque_ranges,
@@ -7480,6 +8068,21 @@ impl Document {
             current = parent;
         }
         result
+    }
+
+    fn with_contexts_at(&self, offset: usize) -> Vec<&WithContext> {
+        let mut contexts = self
+            .with_contexts
+            .iter()
+            .filter(|context| context.body.contains_offset(offset))
+            .collect::<Vec<_>>();
+        contexts.sort_by_key(|context| {
+            (
+                context.body.end.saturating_sub(context.body.start),
+                context.body.start,
+            )
+        });
+        contexts
     }
 
     fn result_type_annotation_for_body_scope(&self, scope: usize) -> Option<ResultTypeAnnotation> {
@@ -9224,6 +9827,24 @@ fn build_scopes(
         open_scopes.push(scope);
     }
     (scopes, scope_by_span)
+}
+
+fn collect_with_contexts(root: Node<'_>) -> Vec<WithContext> {
+    collect_nodes_matching(root, "with")
+        .into_iter()
+        .filter_map(|node| {
+            let body = node.child_by_field_name("body")?;
+            let mut cursor = node.walk();
+            let receiver_spans = node
+                .children_by_field_name("entity", &mut cursor)
+                .map(Span::from_node)
+                .collect::<Vec<_>>();
+            (!receiver_spans.is_empty()).then_some(WithContext {
+                body: Span::from_node(body),
+                receiver_spans,
+            })
+        })
+        .collect()
 }
 
 fn cache_unsafe_scopes(root: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> HashSet<usize> {

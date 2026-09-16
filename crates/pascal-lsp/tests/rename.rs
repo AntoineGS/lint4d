@@ -2008,6 +2008,44 @@ end.
 }
 
 #[test]
+fn unrelated_local_rename_inside_with_body_remains_safe() {
+    let source = "unit WithSafeLocalRename;
+interface
+type
+  TBox = class
+    Value: Integer;
+  end;
+implementation
+procedure Run(Box: TBox);
+var
+  LocalValue: Integer;
+begin
+  with Box do
+    LocalValue := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithSafeLocalRename", source);
+    let declaration = range_in(source, "LocalValue: Integer", "LocalValue", 0);
+
+    let edits = index
+        .rename_edits(&source_uri, declaration.start, "RenamedLocal")
+        .expect("an unrelated local inside with can be renamed safely");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (source_uri.clone(), declaration, "RenamedLocal".to_owned()),
+            (
+                source_uri,
+                range_in(source, "LocalValue := 1", "LocalValue", 0),
+                "RenamedLocal".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
 fn inherited_member_reference_aborts_without_partial_edits() {
     let source = "unit InheritedRename;
 interface

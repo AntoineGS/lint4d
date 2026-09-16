@@ -42,12 +42,6 @@ const MAX_ANALYSIS_JOBS: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
-#[cfg(feature = "test-support")]
-const TEST_NAVIGATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_NAVIGATION_BARRIER";
-#[cfg(feature = "test-support")]
-const TEST_FORMATTING_BARRIER_ENV: &str = "PASCAL_LSP_TEST_FORMATTING_BARRIER";
-#[cfg(feature = "test-support")]
-const TEST_DIAGNOSTICS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER";
 const ANALYSIS_BUSY_MESSAGE: &str = "analysis server is busy; retry the request";
 
 #[derive(Clone, Copy)]
@@ -58,35 +52,84 @@ enum TestBarrier {
 }
 
 #[cfg(feature = "test-support")]
-fn wait_at_test_barrier(barrier: TestBarrier, cancel: &AtomicBool) -> Result<(), String> {
-    let variable = match barrier {
-        TestBarrier::Navigation => TEST_NAVIGATION_BARRIER_ENV,
-        TestBarrier::Formatting => TEST_FORMATTING_BARRIER_ENV,
-        TestBarrier::Diagnostics => TEST_DIAGNOSTICS_BARRIER_ENV,
-    };
-    let Some(spec) = std::env::var_os(variable) else {
+#[derive(Clone, Debug, Default)]
+pub struct TestBarrierConfig {
+    navigation: Option<TestBarrierPaths>,
+    formatting: Option<TestBarrierPaths>,
+    diagnostics: Option<TestBarrierPaths>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+struct TestBarrierPaths {
+    entered: PathBuf,
+    release: PathBuf,
+}
+
+#[cfg(feature = "test-support")]
+impl TestBarrierConfig {
+    pub fn new(
+        navigation: Option<(PathBuf, PathBuf)>,
+        formatting: Option<(PathBuf, PathBuf)>,
+        diagnostics: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        Self {
+            navigation: navigation.map(|(entered, release)| TestBarrierPaths { entered, release }),
+            formatting: formatting.map(|(entered, release)| TestBarrierPaths { entered, release }),
+            diagnostics: diagnostics
+                .map(|(entered, release)| TestBarrierPaths { entered, release }),
+        }
+    }
+
+    fn paths(&self, barrier: TestBarrier) -> Option<&TestBarrierPaths> {
+        match barrier {
+            TestBarrier::Navigation => self.navigation.as_ref(),
+            TestBarrier::Formatting => self.formatting.as_ref(),
+            TestBarrier::Diagnostics => self.diagnostics.as_ref(),
+        }
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+#[derive(Clone, Debug)]
+struct TestBarrierConfig;
+
+impl TestBarrierConfig {
+    fn disabled() -> Self {
+        #[cfg(feature = "test-support")]
+        {
+            Self::default()
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            Self
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn wait_at_test_barrier(
+    barrier: TestBarrier,
+    config: &TestBarrierConfig,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let Some(paths) = config.paths(barrier) else {
         return Ok(());
     };
-    let spec = spec.to_string_lossy();
-    let Some((entered, release)) = spec.split_once('|') else {
-        return Err(format!("{variable} must contain <entered>|<release>"));
-    };
-    let entered = PathBuf::from(entered);
-    let release = PathBuf::from(release);
     let mut marker = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(&entered)
-        .map_err(|error| format!("could not enter {variable}: {error}"))?;
+        .open(&paths.entered)
+        .map_err(|error| format!("could not enter test barrier: {error}"))?;
     marker
         .write_all(b"x")
-        .map_err(|error| format!("could not record entry into {variable}: {error}"))?;
+        .map_err(|error| format!("could not record test barrier entry: {error}"))?;
     drop(marker);
     loop {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(rename::CANCELLATION_MESSAGE.to_string());
         }
-        if release.exists() {
+        if paths.release.exists() {
             return Ok(());
         }
         thread::sleep(ANALYSIS_POLL_INTERVAL);
@@ -94,7 +137,11 @@ fn wait_at_test_barrier(barrier: TestBarrier, cancel: &AtomicBool) -> Result<(),
 }
 
 #[cfg(not(feature = "test-support"))]
-fn wait_at_test_barrier(_barrier: TestBarrier, _cancel: &AtomicBool) -> Result<(), String> {
+fn wait_at_test_barrier(
+    _barrier: TestBarrier,
+    _config: &TestBarrierConfig,
+    _cancel: &AtomicBool,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -366,17 +413,24 @@ struct AnalysisJobs {
     receiver: Receiver<AnalysisResult>,
     pending: std::collections::HashMap<RequestId, PendingAnalysis>,
     diagnostics: HashMap<RequestId, PendingDiagnostic>,
+    test_barriers: TestBarrierConfig,
     next_internal_id: u64,
 }
 
 impl AnalysisJobs {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_test_barriers(TestBarrierConfig::disabled())
+    }
+
+    fn with_test_barriers(test_barriers: TestBarrierConfig) -> Self {
         let (sender, receiver) = unbounded();
         Self {
             sender,
             receiver,
             pending: std::collections::HashMap::new(),
             diagnostics: HashMap::new(),
+            test_barriers,
             next_internal_id: 0,
         }
     }
@@ -396,6 +450,7 @@ impl AnalysisJobs {
         let configuration_generation = input.configuration_generation;
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
+        let test_barriers = self.test_barriers.clone();
         let sender = self.sender.clone();
         let worker_id = id.clone();
         let panic_id = id.clone();
@@ -529,9 +584,11 @@ impl AnalysisJobs {
                             position,
                             target,
                         } => {
-                            if let Err(error) =
-                                wait_at_test_barrier(TestBarrier::Navigation, &worker_cancellation)
-                            {
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Navigation,
+                                &test_barriers,
+                                &worker_cancellation,
+                            ) {
                                 AnalysisResult {
                                     id: worker_id.clone(),
                                     source_generation,
@@ -567,9 +624,11 @@ impl AnalysisJobs {
                             }
                         }
                         AnalysisRequest::Formatting { uri } => {
-                            if let Err(error) =
-                                wait_at_test_barrier(TestBarrier::Formatting, &worker_cancellation)
-                            {
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Formatting,
+                                &test_barriers,
+                                &worker_cancellation,
+                            ) {
                                 AnalysisResult {
                                     id: worker_id.clone(),
                                     source_generation,
@@ -594,9 +653,11 @@ impl AnalysisJobs {
                         }
                         AnalysisRequest::Diagnostics { uri } => {
                             let version = validation_input.document_versions.get(&uri).copied();
-                            if let Err(error) =
-                                wait_at_test_barrier(TestBarrier::Diagnostics, &worker_cancellation)
-                            {
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Diagnostics,
+                                &test_barriers,
+                                &worker_cancellation,
+                            ) {
                                 AnalysisResult {
                                     id: worker_id.clone(),
                                     source_generation,
@@ -1120,8 +1181,22 @@ fn send_analysis_error(
 
 /// Run one native LSP session over stdin/stdout.
 pub fn run_stdio() -> Result<bool, Box<dyn Error + Send + Sync>> {
+    run_stdio_with_config(TestBarrierConfig::disabled())
+}
+
+#[cfg(feature = "test-support")]
+/// Run one native LSP session with explicitly injected deterministic test barriers.
+pub fn run_stdio_with_test_barriers(
+    test_barriers: TestBarrierConfig,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    run_stdio_with_config(test_barriers)
+}
+
+fn run_stdio_with_config(
+    test_barriers: TestBarrierConfig,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let (connection, io_threads) = bounded_stdio();
-    let outcome = run_connection(&connection);
+    let outcome = run_connection(&connection, test_barriers);
     drop(connection);
     let success = outcome?;
     io_threads.join()?;
@@ -1324,7 +1399,10 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
     }
 }
 
-fn run_connection(connection: &Connection) -> Result<bool, Box<dyn Error + Send + Sync>> {
+fn run_connection(
+    connection: &Connection,
+    test_barriers: TestBarrierConfig,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let (initialize_id, initialize, options) = loop {
         let (initialize_id, initialize_value) = connection.initialize_start()?;
         let initialize: InitializeParams = match serde_json::from_value(initialize_value) {
@@ -1378,6 +1456,7 @@ fn run_connection(connection: &Connection) -> Result<bool, Box<dyn Error + Send 
         workspace_folders_supported,
         client_features,
         watcher_registration,
+        test_barriers,
     )
 }
 
@@ -1387,9 +1466,10 @@ fn event_loop(
     workspace_folders_supported: bool,
     client_features: ClientFeatures,
     mut watcher_registration: Option<FileWatcherRegistration>,
+    test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
-    let mut jobs = AnalysisJobs::new();
+    let mut jobs = AnalysisJobs::with_test_barriers(test_barriers);
     loop {
         if !shutdown_received {
             publish_due_diagnostics(connection, workspace, &mut jobs)?;

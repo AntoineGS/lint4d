@@ -13,7 +13,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+#[cfg(feature = "test-support")]
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -322,6 +324,7 @@ impl TestServer {
         }
     }
 
+    #[cfg(feature = "test-support")]
     fn response_with_timeout(
         &mut self,
         expected_id: &RequestId,
@@ -18211,7 +18214,7 @@ fn client_request_id_cannot_collide_with_internal_diagnostic_job() {
         formatting_entered.display(),
         formatting_release.display()
     );
-    let executable = env!("CARGO_BIN_EXE_pascal-lsp");
+    let executable = env!("CARGO_BIN_EXE_pascal-lsp-test-server");
     let child = Command::new(executable)
         .arg("--stdio")
         .env("HOME", environment.path().join("home"))
@@ -18270,9 +18273,9 @@ fn client_request_id_cannot_collide_with_internal_diagnostic_job() {
     server.assert_no_response(&colliding_id);
 }
 
-#[cfg(not(feature = "test-support"))]
+#[cfg(feature = "test-support")]
 #[test]
-fn production_binary_does_not_activate_test_barrier_from_environment() {
+fn production_binary_built_with_test_support_does_not_activate_test_barrier_from_environment() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
     let main = root.join("Main.pas");
@@ -18287,7 +18290,7 @@ fn production_binary_does_not_activate_test_barrier_from_environment() {
         Some(&value),
     );
     server.initialize(&root, Value::Null);
-    let request_id = RequestId::from("production-barrier-probe".to_string());
+    let request_id = RequestId::from("feature-enabled-production-barrier-probe".to_string());
     server.send_request(
         request_id.clone(),
         "textDocument/formatting",
@@ -18302,8 +18305,9 @@ fn production_binary_does_not_activate_test_barrier_from_environment() {
     assert!(response.error.is_none(), "formatting failed: {response:?}");
     assert!(
         !entered.exists(),
-        "production binary wrote a test barrier marker"
+        "production binary built with test-support wrote a test barrier marker"
     );
+    server.shutdown();
 }
 
 #[cfg(feature = "test-support")]

@@ -1,3 +1,32 @@
+local REQUEST_TIMEOUT = 10000
+local BUSY_ERROR_CODE = -32803
+local BUSY_RETRY_DELAY = 50
+local MAX_BUSY_RETRIES = REQUEST_TIMEOUT / BUSY_RETRY_DELAY
+
+local function wait_for_analysis_slot(client, uri, bufnr)
+  for _ = 1, MAX_BUSY_RETRIES do
+    local completed = false
+    local callback_error
+    local accepted = client:request('textDocument/documentSymbol', {
+      textDocument = { uri = uri },
+    }, function(err)
+      callback_error = err
+      completed = true
+    end, bufnr)
+    assert(accepted, 'analysis readiness request was not accepted')
+    assert(vim.wait(REQUEST_TIMEOUT, function()
+      return completed
+    end), 'analysis readiness request timed out')
+    if not callback_error then
+      return
+    end
+    assert(callback_error.code == BUSY_ERROR_CODE,
+      'analysis readiness request failed: ' .. vim.inspect(callback_error))
+    vim.wait(BUSY_RETRY_DELAY)
+  end
+  error('analysis remained busy for ' .. REQUEST_TIMEOUT .. 'ms')
+end
+
 local function run()
   vim.cmd('filetype on')
   vim.opt.hidden = true
@@ -16,6 +45,7 @@ local function run()
   local client = vim.lsp.get_clients({ bufnr = provider, name = 'pascal_lsp' })[1]
   assert(client.offset_encoding == 'utf-16', 'wrong position encoding')
   assert(vim.fn.bufnr(consumer_path) == -1, 'consumer must start unopened')
+  wait_for_analysis_slot(client, vim.uri_from_fname(provider_path), provider)
 
   local renamed_provider = {
     'unit Provider;', 'interface', 'const', '  renamedConst = 1;',
@@ -50,7 +80,7 @@ local function run()
   }
   vim.api.nvim_set_current_buf(provider)
   vim.api.nvim_win_set_cursor(0, { 4, 3 })
-  vim.wait(300)
+  wait_for_analysis_slot(client, vim.uri_from_fname(provider_path), provider)
   vim.lsp.buf.code_action({ apply = true, context = { only = { 'quickfix' } } })
   assert(vim.wait(5000, function()
     return vim.deep_equal(vim.api.nvim_buf_get_lines(provider, 0, -1, false), fixed_provider)

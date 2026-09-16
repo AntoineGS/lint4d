@@ -1270,7 +1270,7 @@ impl NavigationIndex {
     /// Return source-based hover information for the identifier at `position`.
     ///
     /// The direct index API uses Markdown because it has no client capability
-    /// negotiation context. Protocol workers call [`hover_with_cancel`] with
+    /// negotiation context. Protocol workers call `hover_with_cancel` with
     /// the negotiated format instead.
     pub fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
         let cancel = AtomicBool::new(false);
@@ -2727,6 +2727,7 @@ mod tests {
             type_name: None,
             region: Region::Interface,
             origin: Origin::Declaration,
+            is_static: false,
             local_only: false,
             routine_key: None,
             routine_signature: None,

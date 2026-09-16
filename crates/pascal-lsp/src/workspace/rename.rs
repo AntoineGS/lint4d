@@ -210,7 +210,11 @@ static SNAPSHOT_PRIORITY_BARRIER: OnceLock<Mutex<Option<SnapshotPriorityBarrier>
     OnceLock::new();
 
 #[cfg(test)]
-fn install_snapshot_priority_barrier(priority_uri: Url, ready: Sender<()>, release: Receiver<()>) {
+pub(crate) fn install_snapshot_priority_barrier(
+    priority_uri: Url,
+    ready: Sender<()>,
+    release: Receiver<()>,
+) {
     SNAPSHOT_PRIORITY_BARRIER
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -1825,18 +1829,18 @@ fn snapshot_context_for_uri(
     uri: &Url,
     cancel: &AtomicBool,
 ) -> Result<ContextKey, String> {
-    if let Some(owner) = loader.document_owners.get(uri).cloned()
-        && (loader.context_has_open_legacy_overlay(&owner.state)
+    if let Some(owner) = loader.document_owners.get(uri).cloned() {
+        if loader.context_has_open_legacy_overlay(&owner.state)
             || (!super::context_state_is_fresh_with_cancel(&owner.state, Some(cancel))?
-                && loader
-                    .context_state_is_fresh_with_open_documents(&owner.state, Some(cancel))?))
-    {
-        loader
-            .contexts
-            .insert(owner.key.clone(), owner.state.clone());
-        loader
-            .document_contexts
-            .insert(uri.clone(), owner.key.clone());
+                && loader.context_state_is_fresh_with_open_documents(&owner.state, Some(cancel))?)
+        {
+            loader
+                .contexts
+                .insert(owner.key.clone(), owner.state.clone());
+            loader
+                .document_contexts
+                .insert(uri.clone(), owner.key.clone());
+        }
     }
     loader.context_for_uri_with_cancel(uri, Some(cancel))
 }
@@ -4319,12 +4323,12 @@ impl IncludeAuditor<'_> {
     }
 
     fn record_error(&mut self, error: String) {
-        if self.result.errors.len() < MAX_RENAME_INCLUDE_ERRORS {
-            self.result.errors.push(error);
-        } else if self.result.errors.len() == MAX_RENAME_INCLUDE_ERRORS {
-            self.result.errors.push(format!(
+        match self.result.errors.len().cmp(&MAX_RENAME_INCLUDE_ERRORS) {
+            std::cmp::Ordering::Less => self.result.errors.push(error),
+            std::cmp::Ordering::Equal => self.result.errors.push(format!(
                 "rename cannot prove completeness because include error limit ({MAX_RENAME_INCLUDE_ERRORS}) was reached"
-            ));
+            )),
+            std::cmp::Ordering::Greater => {}
         }
     }
 }

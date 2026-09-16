@@ -13,6 +13,7 @@ use tree_sitter::{Node, Tree};
 
 mod assistance;
 mod rename;
+mod semantic_tokens;
 mod symbols;
 pub(crate) use rename::RenameBindingInfo;
 #[cfg(test)]
@@ -29,6 +30,14 @@ thread_local! {
     static TEST_MEMBER_INDEX_VECTOR_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
     static TEST_NODE_SIBLING_FRONTIER_ENTRIES: Cell<usize> = const { Cell::new(0) };
     static TEST_LEGACY_EXPORTED_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_SCOPE_SCAN_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_SCOPE_CHAIN_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_OWNER_FALLBACKS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_OWNER_HEADER_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_GENERIC_CONTEXT_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_SHADOW_CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -50,6 +59,38 @@ fn test_reset_materialization_counters() {
     TEST_LEGACY_EXPORTED_MATERIALIZATIONS.with(|value| value.set(0));
 }
 
+#[cfg(test)]
+pub(super) fn test_reset_semantic_token_work_counters() {
+    TEST_SEMANTIC_SCOPE_SCAN_VISITS.with(|value| value.set(0));
+    TEST_SEMANTIC_SCOPE_CHAIN_VISITS.with(|value| value.set(0));
+    TEST_SEMANTIC_OWNER_FALLBACKS.with(|value| value.set(0));
+    TEST_SEMANTIC_OWNER_HEADER_NODE_VISITS.with(|value| value.set(0));
+    TEST_SEMANTIC_GENERIC_CONTEXT_CHECKS.with(|value| value.set(0));
+    TEST_SEMANTIC_NODE_VISITS.with(|value| value.set(0));
+    TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS.with(|value| value.set(0));
+    TEST_SEMANTIC_SHADOW_CHECKS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn test_semantic_token_work_counters()
+-> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    (
+        TEST_SEMANTIC_SCOPE_SCAN_VISITS.with(Cell::get),
+        TEST_SEMANTIC_SCOPE_CHAIN_VISITS.with(Cell::get),
+        TEST_SEMANTIC_OWNER_FALLBACKS.with(Cell::get),
+        TEST_SEMANTIC_OWNER_HEADER_NODE_VISITS.with(Cell::get),
+        TEST_SEMANTIC_GENERIC_CONTEXT_CHECKS.with(Cell::get),
+        TEST_SEMANTIC_NODE_VISITS.with(Cell::get),
+        TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS.with(Cell::get),
+        TEST_SEMANTIC_SHADOW_CHECKS.with(Cell::get),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn test_record_semantic_node_visit() {
+    TEST_SEMANTIC_NODE_VISITS.with(|value| value.set(value.get().saturating_add(1)));
+}
+
 /// The navigation operation requested by an LSP client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NavigationTarget {
@@ -59,6 +100,14 @@ pub enum NavigationTarget {
     Definition,
     /// The implementation body, explicitly requested by the client.
     Implementation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticTokenResolutionMode {
+    /// Resolve identifiers against the complete workspace snapshot.
+    Full,
+    /// Emit only syntax-derived tokens when semantic bindings are uncertain.
+    LexicalOnly,
 }
 
 /// An in-memory, incrementally replaceable index of Pascal source documents.
@@ -103,6 +152,20 @@ impl NavigationIndex {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<lsp_types::DocumentSymbol>, String> {
         symbols::document_symbols_with_cancel(self, uri, cancel)
+    }
+
+    pub(crate) fn semantic_tokens_with_resolution_mode(
+        &self,
+        uri: &Url,
+        range: Option<&Range>,
+        cancel: &std::sync::atomic::AtomicBool,
+        mode: SemanticTokenResolutionMode,
+    ) -> Result<lsp_types::SemanticTokens, String> {
+        semantic_tokens::semantic_tokens_with_mode(self, uri, range, cancel, mode)
+    }
+
+    pub(crate) fn semantic_tokens_legend() -> lsp_types::SemanticTokensLegend {
+        semantic_tokens::legend()
     }
 
     /// Return fully-resolved declarations from the indexed documents whose
@@ -537,16 +600,12 @@ impl NavigationIndex {
     ) -> Result<Vec<Candidate>, String> {
         budget.require_bytes(name.len(), cancel)?;
         let key = canonical_name(name);
-        budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
-        let scope = document.scope_at(offset);
-        let owner_type = document.owner_type_at_identifier(identifier, scope);
+        let scope = self.budgeted_scope_at(document, offset, cancel, budget)?;
+        let owner_type =
+            document.owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?;
 
-        let scope_chain = document.scope_chain(offset);
-        budget.require_bytes(
-            key.len()
-                .saturating_mul(scope_chain.len().saturating_add(1)),
-            cancel,
-        )?;
+        let scope_chain = self.scope_chain_from_with_budget(document, scope, cancel, budget)?;
+        budget.require_bytes(key.len().saturating_mul(scope_chain.len()), cancel)?;
         for scope_id in scope_chain {
             let Some(indices) = document
                 .symbol_indices_by_scope_key
@@ -1790,8 +1849,13 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<usize, String> {
-        budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
-        Ok(document.scope_at(offset))
+        match document
+            .scope_intervals
+            .at_with_budget(offset, cancel, budget)?
+        {
+            Some(scope) => Ok(scope),
+            None => Ok(ROOT_SCOPE),
+        }
     }
 
     fn scope_chain_with_budget(
@@ -1801,8 +1865,27 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<usize>, String> {
-        budget.require_work(document.scopes.len().saturating_add(1), cancel)?;
-        Ok(document.scope_chain(offset))
+        let scope = self.budgeted_scope_at(document, offset, cancel, budget)?;
+        self.scope_chain_from_with_budget(document, scope, cancel, budget)
+    }
+
+    fn scope_chain_from_with_budget(
+        &self,
+        document: &Document,
+        mut current: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<usize>, String> {
+        let mut result = Vec::new();
+        loop {
+            budget.require_work(1, cancel)?;
+            result.push(current);
+            let Some(parent) = document.scopes[current].parent else {
+                break;
+            };
+            current = parent;
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2884,6 +2967,158 @@ struct Scope {
     owner_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BudgetedLookup<T> {
+    Value(T),
+    Exhausted,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexedInterval {
+    start: usize,
+    end: usize,
+    value: usize,
+}
+
+#[derive(Debug)]
+struct SourceIntervalIndex {
+    ranges: Vec<IndexedInterval>,
+    query_work: usize,
+}
+
+impl SourceIntervalIndex {
+    fn from_intervals<I>(intervals: I) -> Self
+    where
+        I: IntoIterator<Item = (Span, usize)>,
+    {
+        let intervals = intervals
+            .into_iter()
+            .filter_map(|(span, value)| {
+                (span.start < span.end).then_some(IndexedInterval {
+                    start: span.start,
+                    end: span.end,
+                    value,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut events = Vec::with_capacity(intervals.len().saturating_mul(2));
+        for (index, interval) in intervals.iter().enumerate() {
+            events.push((interval.start, 1_u8, std::cmp::Reverse(interval.end), index));
+            events.push((interval.end, 0_u8, std::cmp::Reverse(interval.start), index));
+        }
+        events.sort_unstable();
+
+        let mut ranges: Vec<IndexedInterval> = Vec::new();
+        let mut active: Vec<usize> = Vec::new();
+        let mut previous = 0;
+        let mut event_index = 0;
+        while event_index < events.len() {
+            let offset = events[event_index].0;
+            if previous < offset {
+                if let Some(&active_index) = active.last() {
+                    let value = intervals[active_index].value;
+                    match ranges.last_mut() {
+                        Some(last) if last.end == previous && last.value == value => {
+                            last.end = offset;
+                        }
+                        _ => {
+                            ranges.push(IndexedInterval {
+                                start: previous,
+                                end: offset,
+                                value,
+                            });
+                        }
+                    }
+                }
+            }
+
+            while event_index < events.len() && events[event_index].0 == offset {
+                let (_, kind, _, interval_index) = events[event_index];
+                if kind == 0 {
+                    if active.last().copied() == Some(interval_index) {
+                        active.pop();
+                    } else if let Some(position) =
+                        active.iter().position(|index| *index == interval_index)
+                    {
+                        active.remove(position);
+                    }
+                } else {
+                    active.push(interval_index);
+                }
+                event_index += 1;
+            }
+            previous = offset;
+        }
+
+        let query_work = binary_search_work(ranges.len());
+        Self { ranges, query_work }
+    }
+
+    fn at(&self, offset: usize) -> Option<usize> {
+        let mut low = 0;
+        let mut high = self.ranges.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            #[cfg(test)]
+            TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS.with(|comparisons| {
+                comparisons.set(comparisons.get().saturating_add(1));
+            });
+            if self.ranges[middle].start <= offset {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low.checked_sub(1)
+            .and_then(|index| (offset < self.ranges[index].end).then_some(self.ranges[index].value))
+    }
+
+    fn at_with_budget(
+        &self,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<usize>, String> {
+        budget.require_work(self.query_work, cancel)?;
+        Ok(self.at(offset))
+    }
+
+    fn at_with_budget_or_unknown(
+        &self,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<BudgetedLookup<Option<usize>>, String> {
+        if !budget.take_work(self.query_work, cancel)? {
+            return Ok(BudgetedLookup::Exhausted);
+        }
+        Ok(BudgetedLookup::Value(self.at(offset)))
+    }
+}
+
+fn binary_search_work(len: usize) -> usize {
+    let mut remaining = len;
+    let mut work = 0;
+    while remaining > 0 {
+        work += 1;
+        remaining /= 2;
+    }
+    work
+}
+
+#[derive(Debug)]
+pub(super) struct GenericParameterContext {
+    span: Span,
+    names: HashSet<String>,
+    parent: Option<usize>,
+}
+
+#[derive(Debug)]
+pub(super) struct OwnerTypeContext {
+    span: Span,
+    owner_type: String,
+}
+
 #[derive(Debug)]
 pub(super) struct AssistanceBudget {
     remaining_work: usize,
@@ -2987,6 +3222,7 @@ struct Symbol {
     type_name: Option<String>,
     region: Region,
     origin: Origin,
+    is_static: bool,
     local_only: bool,
     routine_key: Option<String>,
     routine_signature: Option<String>,
@@ -3060,7 +3296,10 @@ struct Document {
     import_bindings: Option<HashMap<String, Url>>,
     interface_routine_keys: HashSet<String>,
     scopes: Vec<Scope>,
+    scope_intervals: SourceIntervalIndex,
     cache_unsafe_scopes: HashSet<usize>,
+    owner_type_contexts: Vec<OwnerTypeContext>,
+    owner_type_intervals: SourceIntervalIndex,
     symbols: Vec<Symbol>,
     opaque_ranges: Vec<Span>,
     conditionals: ConditionalAnalysis,
@@ -3070,6 +3309,8 @@ struct Document {
     symbol_indices_by_scope_key: HashMap<(usize, String), Vec<usize>>,
     scope_symbol_indices: HashMap<usize, Vec<usize>>,
     member_symbol_indices: HashMap<(String, String), Vec<usize>>,
+    member_binding_keys_by_owner: HashMap<String, HashSet<String>>,
+    scope_binding_keys: Vec<HashSet<String>>,
     member_symbol_indices_by_owner: HashMap<String, Vec<usize>>,
     type_symbol_indices: HashMap<String, Vec<usize>>,
     direct_symbol_indices: HashMap<Span, Vec<usize>>,
@@ -3077,6 +3318,8 @@ struct Document {
     exported_symbol_indices: Vec<usize>,
     routine_declaration_spans: HashMap<String, Span>,
     interface_member_routine_keys: HashMap<String, HashSet<String>>,
+    generic_parameter_contexts: Vec<GenericParameterContext>,
+    generic_parameter_intervals: SourceIntervalIndex,
 }
 
 impl Document {
@@ -3097,6 +3340,20 @@ impl Document {
         let (tree, _diagnostics, patches) =
             parser::parse_file_with_patches(&info, conditionals.projected_source.as_bytes())?;
         let root = tree.root_node();
+        let generic_parameter_contexts = semantic_tokens::generic_parameter_contexts(root, &source);
+        let generic_parameter_intervals = SourceIntervalIndex::from_intervals(
+            generic_parameter_contexts
+                .iter()
+                .enumerate()
+                .map(|(index, context)| (context.span, index)),
+        );
+        let owner_type_contexts = semantic_tokens::owner_type_contexts(root, &source);
+        let owner_type_intervals = SourceIntervalIndex::from_intervals(
+            owner_type_contexts
+                .iter()
+                .enumerate()
+                .map(|(index, context)| (context.span, index)),
+        );
         let parser_recovery_spans = collect_parser_recovery_spans(root);
         let opaque_ranges = patches
             .into_iter()
@@ -3182,6 +3439,16 @@ impl Document {
 
         let definitions = collect_nodes_matching(root, "defProc");
         let (scopes, scope_by_span) = build_scopes(source.len(), &definitions, &source);
+        let scope_intervals =
+            SourceIntervalIndex::from_intervals(scopes.iter().enumerate().map(|(index, scope)| {
+                (
+                    Span {
+                        start: scope.start,
+                        end: scope.end,
+                    },
+                    index,
+                )
+            }));
         let cache_unsafe_scopes = cache_unsafe_scopes(root, &scope_by_span);
         let mut symbols = Vec::new();
 
@@ -3206,6 +3473,7 @@ impl Document {
                 type_name: None,
                 region: Region::Other,
                 origin: Origin::Declaration,
+                is_static: false,
                 local_only: false,
                 routine_key: None,
                 routine_signature: None,
@@ -3340,6 +3608,8 @@ impl Document {
                 }
             }
         }
+        let scope_binding_keys = build_scope_binding_keys(&scopes, &symbol_indices_by_scope_key);
+        let member_binding_keys_by_owner = build_member_binding_keys(&member_symbol_indices);
 
         Ok(Self {
             source,
@@ -3356,7 +3626,10 @@ impl Document {
             import_bindings: None,
             interface_routine_keys,
             scopes,
+            scope_intervals,
             cache_unsafe_scopes,
+            owner_type_contexts,
+            owner_type_intervals,
             symbols,
             opaque_ranges,
             conditionals,
@@ -3366,6 +3639,8 @@ impl Document {
             symbol_indices_by_scope_key,
             scope_symbol_indices,
             member_symbol_indices,
+            member_binding_keys_by_owner,
+            scope_binding_keys,
             member_symbol_indices_by_owner,
             type_symbol_indices,
             direct_symbol_indices,
@@ -3373,6 +3648,8 @@ impl Document {
             exported_symbol_indices,
             routine_declaration_spans,
             interface_member_routine_keys,
+            generic_parameter_contexts,
+            generic_parameter_intervals,
         })
     }
 
@@ -3428,18 +3705,7 @@ impl Document {
     }
 
     fn scope_at(&self, offset: usize) -> usize {
-        self.scopes
-            .iter()
-            .enumerate()
-            .filter(|(_, scope)| {
-                Span {
-                    start: scope.start,
-                    end: scope.end,
-                }
-                .contains_offset(offset)
-            })
-            .min_by_key(|(_, scope)| scope.end.saturating_sub(scope.start))
-            .map_or(ROOT_SCOPE, |(index, _)| index)
+        self.scope_intervals.at(offset).unwrap_or(ROOT_SCOPE)
     }
 
     fn scope_chain(&self, offset: usize) -> Vec<usize> {
@@ -3457,31 +3723,107 @@ impl Document {
 
     fn owner_type_at(&self, offset: usize) -> Option<String> {
         let scope = self.scope_at(offset);
-        if let Some(owner_type) = self.owner_type_for_scope(scope) {
-            return Some(owner_type);
-        }
-        #[cfg(test)]
-        OWNER_TYPE_ROOT_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
-        let identifier = identifier_at(self.tree.root_node(), offset)?;
-        enclosing_type(identifier, &self.source)
+        self.owner_type_for_scope(scope)
+            .or_else(|| self.owner_type_at_offset(offset))
     }
 
     fn owner_type_at_identifier(&self, identifier: Node<'_>, scope: usize) -> Option<String> {
         self.owner_type_for_scope(scope)
-            .or_else(|| enclosing_type(identifier, &self.source))
+            .or_else(|| self.owner_type_at_offset(identifier.start_byte()))
     }
 
-    fn owner_type_for_scope(&self, mut scope: usize) -> Option<String> {
-        loop {
-            if let Some(owner_type) = &self.scopes[scope].owner_type {
-                return Some(owner_type.clone());
-            }
-            let Some(parent) = self.scopes[scope].parent else {
-                break;
-            };
-            scope = parent;
+    fn owner_type_for_scope(&self, scope: usize) -> Option<String> {
+        self.scopes.get(scope)?.owner_type.clone()
+    }
+
+    fn owner_type_for_scope_ref(&self, scope: usize) -> Option<&str> {
+        self.scopes
+            .get(scope)
+            .and_then(|scope| scope.owner_type.as_deref())
+    }
+
+    fn owner_type_at_offset(&self, offset: usize) -> Option<String> {
+        let context = self.owner_type_intervals.at(offset)?;
+        self.owner_type_contexts
+            .get(context)
+            .map(|context| context.owner_type.clone())
+    }
+
+    fn scope_at_with_budget_or_unknown(
+        &self,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<BudgetedLookup<usize>, String> {
+        match self
+            .scope_intervals
+            .at_with_budget_or_unknown(offset, cancel, budget)?
+        {
+            BudgetedLookup::Value(Some(scope)) => Ok(BudgetedLookup::Value(scope)),
+            BudgetedLookup::Value(None) => Ok(BudgetedLookup::Value(ROOT_SCOPE)),
+            BudgetedLookup::Exhausted => Ok(BudgetedLookup::Exhausted),
         }
-        None
+    }
+
+    fn owner_type_at_identifier_with_budget(
+        &self,
+        identifier: Node<'_>,
+        scope: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<String>, String> {
+        if let Some(owner_type) = self.owner_type_for_scope_ref(scope) {
+            budget.require_bytes(owner_type.len(), cancel)?;
+            return Ok(Some(owner_type.to_owned()));
+        }
+        let Some(context_index) =
+            self.owner_type_intervals
+                .at_with_budget(identifier.start_byte(), cancel, budget)?
+        else {
+            return Ok(None);
+        };
+        let Some(owner_type) = self.owner_type_contexts.get(context_index) else {
+            return Ok(None);
+        };
+        budget.require_bytes(owner_type.owner_type.len(), cancel)?;
+        Ok(Some(owner_type.owner_type.clone()))
+    }
+
+    fn owner_type_at_identifier_with_budget_or_unknown(
+        &self,
+        identifier: Node<'_>,
+        scope: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<BudgetedLookup<Option<&str>>, String> {
+        if let Some(owner_type) = self.owner_type_for_scope_ref(scope) {
+            if !budget.take_bytes(owner_type.len(), cancel)? {
+                return Ok(BudgetedLookup::Exhausted);
+            }
+            return Ok(BudgetedLookup::Value(Some(owner_type)));
+        }
+        #[cfg(test)]
+        TEST_SEMANTIC_OWNER_FALLBACKS.with(|value| {
+            value.set(value.get().saturating_add(1));
+        });
+        let context = match self.owner_type_intervals.at_with_budget_or_unknown(
+            identifier.start_byte(),
+            cancel,
+            budget,
+        )? {
+            BudgetedLookup::Value(context) => context,
+            BudgetedLookup::Exhausted => return Ok(BudgetedLookup::Exhausted),
+        };
+        let Some(context) = context else {
+            return Ok(BudgetedLookup::Value(None));
+        };
+        let Some(owner_type) = self.owner_type_contexts.get(context) else {
+            return Ok(BudgetedLookup::Value(None));
+        };
+        if !budget.take_bytes(owner_type.owner_type.len(), cancel)? {
+            return Ok(BudgetedLookup::Exhausted);
+        }
+        Ok(BudgetedLookup::Value(Some(owner_type.owner_type.as_str())))
     }
 
     fn has_parser_recovery_near(&self, span: Span) -> bool {
@@ -3736,6 +4078,7 @@ fn inject_abbreviated_parameters(
                 type_name: type_name.clone(),
                 region: Region::Implementation,
                 origin: Origin::Declaration,
+                is_static: false,
                 local_only: false,
                 routine_key: None,
                 routine_signature: None,
@@ -3785,6 +4128,7 @@ fn add_definition_symbol(
         type_name: None,
         region: region_for_node(node),
         origin: Origin::Definition,
+        is_static: has_class_modifier(header),
         local_only: false,
         routine_key: Some(routine_key_with_owner(
             owner_type.as_deref(),
@@ -3829,6 +4173,7 @@ fn add_routine_symbol(
         type_name: None,
         region: region_for_node(node),
         origin: Origin::Declaration,
+        is_static: has_class_modifier(node),
         local_only: false,
         routine_key: Some(routine_key_with_owner(
             owner_type.as_deref(),
@@ -3863,6 +4208,7 @@ fn add_named_symbol(
     } else {
         TypeKind::Other
     };
+    let is_static = declaration_is_static(node);
     let type_excerpt_end = if kind == SymbolKind::Type {
         type_declaration_excerpt_end(node, type_kind)
     } else {
@@ -3894,6 +4240,7 @@ fn add_named_symbol(
             type_name: type_name.clone(),
             region: region_for_node(node),
             origin: Origin::Declaration,
+            is_static,
             local_only,
             routine_key: None,
             routine_signature: None,
@@ -3905,6 +4252,29 @@ fn add_named_symbol(
             accessor: accessor.clone(),
         });
     }
+}
+
+fn declaration_is_static(node: Node<'_>) -> bool {
+    match node.kind() {
+        "declProc" | "declProp" => has_class_modifier(node),
+        "declVar" => node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "declVars" && has_class_modifier(parent)),
+        "declConst" => node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "declConsts" && has_class_modifier(parent)),
+        _ => false,
+    }
+}
+
+fn has_class_modifier(node: Node<'_>) -> bool {
+    if matches!(node.kind(), "declVars" | "declConsts") {
+        return node.child(0).is_some_and(|child| child.kind() == "kClass");
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .take(4)
+        .any(|child| child.kind() == "kClass")
 }
 
 fn type_declaration_excerpt_end(node: Node<'_>, type_kind: TypeKind) -> Option<usize> {
@@ -4038,7 +4408,7 @@ fn routine_signature(node: Node<'_>, source: &str) -> String {
     types.join(",")
 }
 
-fn direct_routine_argument_groups<'a>(arguments: Node<'a>) -> Vec<Node<'a>> {
+fn direct_routine_argument_groups(arguments: Node<'_>) -> Vec<Node<'_>> {
     (0..arguments.named_child_count())
         .filter_map(|index| arguments.named_child(index))
         .filter(|child| child.kind() == "declArg")
@@ -4160,6 +4530,7 @@ fn build_scopes(
         }
         let parent = open_scopes.last().copied().unwrap_or(ROOT_SCOPE);
         let scope = scopes.len();
+        let owner_type = owner_type.or_else(|| scopes[parent].owner_type.clone());
         scopes.push(Scope {
             start: span.start,
             end: span.end,
@@ -4170,6 +4541,42 @@ fn build_scopes(
         open_scopes.push(scope);
     }
     (scopes, scope_by_span)
+}
+
+fn build_scope_binding_keys(
+    scopes: &[Scope],
+    symbol_indices_by_scope_key: &HashMap<(usize, String), Vec<usize>>,
+) -> Vec<HashSet<String>> {
+    let mut keys = vec![HashSet::new(); scopes.len()];
+    for ((scope, key), indices) in symbol_indices_by_scope_key {
+        if *scope != ROOT_SCOPE && !indices.is_empty() {
+            keys[*scope].insert(key.clone());
+        }
+    }
+    for scope in 1..scopes.len() {
+        let inherited = scopes[scope]
+            .parent
+            .and_then(|parent| keys.get(parent))
+            .cloned()
+            .unwrap_or_default();
+        keys[scope].extend(inherited);
+    }
+    keys
+}
+
+fn build_member_binding_keys(
+    member_symbol_indices: &HashMap<(String, String), Vec<usize>>,
+) -> HashMap<String, HashSet<String>> {
+    let mut keys_by_owner = HashMap::new();
+    for ((owner_type, key), indices) in member_symbol_indices {
+        if !indices.is_empty() {
+            keys_by_owner
+                .entry(owner_type.clone())
+                .or_insert_with(HashSet::new)
+                .insert(key.clone());
+        }
+    }
+    keys_by_owner
 }
 
 fn cache_unsafe_scopes(root: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> HashSet<usize> {
@@ -4320,9 +4727,13 @@ fn collect_parser_recovery_spans(root: Node<'_>) -> Vec<Span> {
     spans
 }
 
-fn identifier_nodes<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+fn identifier_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     let mut result = Vec::new();
     collect_nodes(node, &mut |child| {
+        #[cfg(test)]
+        TEST_SEMANTIC_OWNER_HEADER_NODE_VISITS.with(|value| {
+            value.set(value.get().saturating_add(1));
+        });
         if child.kind() == "identifier" {
             result.push(child);
         }
@@ -4339,7 +4750,7 @@ fn field_identifier_nodes<'a>(node: Node<'a>, field: &str) -> Vec<Node<'a>> {
     result
 }
 
-fn identifier_texts<'a>(node: Node<'a>, source: &str) -> Vec<String> {
+fn identifier_texts(node: Node<'_>, source: &str) -> Vec<String> {
     identifier_nodes(node)
         .into_iter()
         .map(|identifier| node_text(identifier, source))
@@ -4644,7 +5055,7 @@ fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
-fn identifier_at<'a>(root: Node<'a>, offset: usize) -> Option<Node<'a>> {
+fn identifier_at(root: Node<'_>, offset: usize) -> Option<Node<'_>> {
     if !Span::from_node(root).contains_offset(offset) {
         return None;
     }
@@ -4691,7 +5102,7 @@ fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn member_expression_at<'a>(identifier: Node<'a>) -> Option<Node<'a>> {
+fn member_expression_at(identifier: Node<'_>) -> Option<Node<'_>> {
     let mut current = identifier.parent();
     while let Some(node) = current {
         if node.kind() == "exprDot" {

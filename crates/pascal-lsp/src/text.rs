@@ -20,7 +20,7 @@ impl<'a> Line<'a> {
     }
 }
 
-fn lines<'a>(source: &'a str) -> Vec<Line<'a>> {
+fn lines(source: &str) -> Vec<Line<'_>> {
     let mut result = Vec::new();
     let mut start = 0;
     let bytes = source.as_bytes();
@@ -70,6 +70,17 @@ pub fn position_to_offset(source: &str, position: Position) -> Option<usize> {
     offset_for_utf16(line, character)
 }
 
+/// Convert a zero-based LSP range endpoint to a UTF-8 byte offset, clamping a
+/// character position past the end of an existing line to that line's end.
+/// Positions in the middle of a UTF-16 surrogate pair or in a missing line are
+/// still rejected.
+pub(crate) fn position_to_offset_clamped(source: &str, position: Position) -> Option<usize> {
+    let line_number = usize::try_from(position.line).ok()?;
+    let character = usize::try_from(position.character).ok()?;
+    let line = lines(source).get(line_number).copied()?;
+    offset_for_utf16_clamped(line, character)
+}
+
 fn offset_for_utf16(line: Line<'_>, character: usize) -> Option<usize> {
     if character > line.utf16_len() {
         return None;
@@ -90,6 +101,13 @@ fn offset_for_utf16(line: Line<'_>, character: usize) -> Option<usize> {
     }
 
     (units == character).then_some(line.end)
+}
+
+fn offset_for_utf16_clamped(line: Line<'_>, character: usize) -> Option<usize> {
+    if character > line.utf16_len() {
+        return Some(line.end);
+    }
+    offset_for_utf16(line, character)
 }
 
 fn utf16_before(source: &str, offset: usize) -> usize {
@@ -268,7 +286,9 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{POSITION_INDEX_BUILDS, PositionIndex, position_to_offset};
+    use super::{
+        POSITION_INDEX_BUILDS, PositionIndex, position_to_offset, position_to_offset_clamped,
+    };
     use lsp_types::Position;
     use std::sync::atomic::AtomicBool;
 
@@ -303,5 +323,27 @@ mod tests {
             Some(12)
         );
         assert_eq!(POSITION_INDEX_BUILDS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn clamped_range_endpoints_preserve_utf16_and_crlf_boundaries() {
+        let source = "😀abc\r\nxy\n";
+        assert_eq!(
+            position_to_offset_clamped(source, Position::new(0, 10)),
+            Some(7)
+        );
+        assert_eq!(
+            position_to_offset_clamped(source, Position::new(1, 10)),
+            Some(11)
+        );
+        assert_eq!(
+            position_to_offset_clamped(source, Position::new(0, 1)),
+            None,
+            "a surrogate-pair interior must remain invalid"
+        );
+        assert_eq!(
+            position_to_offset_clamped(source, Position::new(2, 10)),
+            Some(source.len())
+        );
     }
 }

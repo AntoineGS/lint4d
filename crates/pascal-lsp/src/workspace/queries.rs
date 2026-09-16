@@ -7,10 +7,11 @@ use super::rename::{
     source_for_input_with_owner,
 };
 use crate::NavigationIndex;
+use crate::navigation::SemanticTokenResolutionMode;
 use crate::project::has_invalid_project_selection;
 use lsp_types::{
     CompletionList, DocumentHighlight, DocumentSymbol, Hover, Location, MarkupKind, Position,
-    SignatureHelp, SymbolInformation, Url,
+    Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
 use std::sync::atomic::AtomicBool;
 
@@ -170,6 +171,61 @@ pub(crate) fn signature_help_from_input(
     let value = snapshot
         .index
         .signature_help_with_cancel(&uri, position, cancel);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    with_records(source_generation, configuration_generation, value, records)
+}
+
+pub(crate) fn semantic_tokens_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    range: Option<Range>,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<SemanticTokens> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("document is outside configured workspace roots or source paths: {uri}"),
+        );
+    }
+
+    let snapshot = match assistance_snapshot(&input, &uri, cancel) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let records = snapshot_records(&snapshot);
+    let resolution_mode = match ensure_semantic_tokens_ready(&snapshot, &uri) {
+        Ok(mode) => mode,
+        Err(error) => {
+            return with_records(
+                source_generation,
+                configuration_generation,
+                Err(error),
+                records,
+            );
+        }
+    };
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let value = snapshot.index.semantic_tokens_with_resolution_mode(
+        &uri,
+        range.as_ref(),
+        cancel,
+        resolution_mode,
+    );
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -646,6 +702,26 @@ fn ensure_assistance_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), S
     Ok(())
 }
 
+fn ensure_semantic_tokens_ready(
+    snapshot: &RenameSnapshot,
+    uri: &Url,
+) -> Result<SemanticTokenResolutionMode, String> {
+    if !snapshot.records.contains_key(uri) {
+        return Err(format!(
+            "semantic-token document was not retained in the local snapshot: {uri}"
+        ));
+    }
+    if !snapshot.readable.contains(uri) {
+        return Err(format!(
+            "semantic-token document is outside configured workspace roots: {uri}"
+        ));
+    }
+    if !snapshot.complete || !snapshot.include_errors.is_empty() {
+        return Ok(SemanticTokenResolutionMode::LexicalOnly);
+    }
+    Ok(SemanticTokenResolutionMode::Full)
+}
+
 pub(crate) fn document_symbols_from_input(
     input: WorkspaceInput,
     uri: &Url,
@@ -805,8 +881,8 @@ fn with_records<T>(
 mod tests {
     use super::{
         completion_from_input, document_symbols_from_input, highlights_from_input,
-        hover_from_input, references_from_input, signature_help_from_input,
-        type_definitions_from_input,
+        hover_from_input, references_from_input, semantic_tokens_from_input,
+        signature_help_from_input, type_definitions_from_input,
     };
     use crate::project::{
         MetadataObservation, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
@@ -2300,6 +2376,80 @@ mod tests {
             &cancel,
         );
         assert_eq!(computed.value, Err("request cancelled".to_string()));
+    }
+
+    #[test]
+    fn semantic_tokens_preserve_lexical_tokens_but_skip_resolution_when_an_import_is_missing() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("Main.pas");
+        let source = "unit Main;\ninterface\nuses MissingUnit;\nimplementation\nprocedure Run;\nvar\n  LocalValue: Integer;\nbegin\n  LocalValue := 1;\n  MissingRoutine;\nend;\nend.\n";
+        fs::write(&source_path, source).expect("source");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let cancel = AtomicBool::new(false);
+
+        let computed = semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &source_uri(&source_path),
+            None,
+            &cancel,
+        );
+
+        let tokens = computed
+            .value
+            .expect("missing imports must not fail lexical token generation");
+        assert!(
+            !tokens.data.iter().any(|token| token.token_type == 8),
+            "an incomplete import snapshot must not claim semantic variable bindings"
+        );
+        assert!(
+            tokens.data.iter().any(|token| token.token_type == 17),
+            "the lexical number token must be retained"
+        );
+        assert!(
+            !computed.records.is_empty(),
+            "the snapshot read set is required"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_skip_resolution_when_include_audit_is_uncertain() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let provider_path = root.join("Provider.pas");
+        let include_path = root.join("IncludeLocal.inc");
+        let source_path = root.join("Main.pas");
+        fs::write(
+            &provider_path,
+            "unit Provider;\ninterface\nconst Value = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider source");
+        fs::write(&include_path, "  Value: Integer;\n").expect("include source");
+        let source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar\n{$I IncludeLocal.inc}\nbegin\n  Value := 1;\nend;\nend.\n";
+        fs::write(&source_path, source).expect("main source");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let cancel = AtomicBool::new(false);
+
+        let computed = semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &source_uri(&source_path),
+            None,
+            &cancel,
+        );
+
+        let tokens = computed
+            .value
+            .expect("uncertain includes must not fail lexical token generation");
+        assert!(
+            !tokens.data.iter().any(|token| {
+                token.token_type == 8 && token.token_modifiers_bitset & (1 << 2) != 0
+            }),
+            "an include audit error must prevent readonly classification from a partial import"
+        );
+        assert!(
+            tokens.data.iter().any(|token| token.token_type == 17),
+            "lexical number tokens must survive an uncertain include audit"
+        );
     }
 
     #[test]

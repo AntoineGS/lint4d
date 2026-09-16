@@ -2,7 +2,7 @@
 
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
-use crate::workspace::rename::{self, SourceRecord};
+use crate::workspace::rename::{self, SourceRecord, WorkspaceInput};
 use crate::workspace::{
     FileChange, MAX_CONFIGURATION_WATCH_PATHS, Workspace, WorkspaceOptions, canonical_file_uri,
 };
@@ -121,6 +121,10 @@ enum AnalysisRequest {
         uri: Url,
         position: Position,
     },
+    SemanticTokens {
+        uri: Url,
+        range: Option<lsp_types::Range>,
+    },
 }
 
 enum AnalysisResultValue {
@@ -140,6 +144,7 @@ enum AnalysisResultValue {
     WorkspaceSymbols(Result<Vec<lsp_types::SymbolInformation>, String>),
     References(Result<Vec<lsp_types::Location>, String>),
     DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
+    SemanticTokens(Result<lsp_types::SemanticTokens, String>),
 }
 
 struct AnalysisResult {
@@ -278,9 +283,20 @@ impl AnalysisJobs {
             return Err("analysis server is busy; retry the request".to_string());
         }
         let input = workspace.analysis_input();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.start_immediately(id, request, input, features, cancellation)
+    }
+
+    fn start_immediately(
+        &mut self,
+        id: RequestId,
+        request: AnalysisRequest,
+        input: WorkspaceInput,
+        features: ClientFeatures,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<(), String> {
         let source_generation = input.source_generation;
         let configuration_generation = input.configuration_generation;
-        let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
         let sender = self.sender.clone();
         let worker_id = id.clone();
@@ -328,6 +344,9 @@ impl AnalysisJobs {
             AnalysisRequest::DocumentHighlights { .. } => AnalysisResultValue::DocumentHighlights(
                 Err("analysis worker failed without changing workspace state".to_string()),
             ),
+            AnalysisRequest::SemanticTokens { .. } => AnalysisResultValue::SemanticTokens(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
         };
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
@@ -541,6 +560,21 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::DocumentHighlights(computed.value),
                             }
                         }
+                        AnalysisRequest::SemanticTokens { uri, range } => {
+                            let computed = queries::semantic_tokens_from_input(
+                                input,
+                                &uri,
+                                range,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id.clone(),
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::SemanticTokens(computed.value),
+                            }
+                        }
                     }));
                 let mut result = result.unwrap_or_else(|_| AnalysisResult {
                     id: panic_id,
@@ -687,6 +721,10 @@ fn deliver_analysis_result(
             Ok(value) => send_ok(connection, result.id, value),
             Err(error) => send_analysis_error(connection, result.id, error),
         },
+        AnalysisResultValue::SemanticTokens(value) => match value {
+            Ok(value) => send_ok(connection, result.id, value),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
     }
 }
 
@@ -704,6 +742,7 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::WorkspaceSymbols(value) => *value = Err(error),
         AnalysisResultValue::References(value) => *value = Err(error),
         AnalysisResultValue::DocumentHighlights(value) => *value = Err(error),
+        AnalysisResultValue::SemanticTokens(value) => *value = Err(error),
     }
 }
 
@@ -1338,6 +1377,48 @@ fn handle_request(
                 client_features,
             )?;
         }
+        "textDocument/semanticTokens/full" => {
+            let id = request.id.clone();
+            let params: lsp_types::SemanticTokensParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::SemanticTokens {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    range: None,
+                },
+                client_features,
+            )?;
+        }
+        "textDocument/semanticTokens/range" => {
+            let id = request.id.clone();
+            let params: lsp_types::SemanticTokensRangeParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::SemanticTokens {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    range: Some(params.range),
+                },
+                client_features,
+            )?;
+        }
         "textDocument/prepareRename" => {
             let id = request.id.clone();
             let params: PositionRequestParams = match parse_params(&request) {
@@ -1764,6 +1845,11 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
         "workspaceSymbolProvider": true,
         "referencesProvider": true,
         "documentHighlightProvider": true,
+        "semanticTokensProvider": {
+            "legend": crate::NavigationIndex::semantic_tokens_legend(),
+            "range": true,
+            "full": true
+        },
         "documentFormattingProvider": true,
         "renameProvider": {"prepareProvider": true},
         "codeActionProvider": {
@@ -1878,6 +1964,7 @@ mod tests {
         MAX_WATCHER_REGISTRATION_RETRIES, deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
+    use crate::workspace::rename::install_snapshot_priority_barrier;
     use lsp_server::{Connection, Message, RequestId, Response};
     use lsp_types::{MarkupKind, Position, PrepareRenameResponse, Range, Url};
     use pascal_core::delphi_overrides::OverrideSession;
@@ -1885,6 +1972,9 @@ mod tests {
     use std::io::{Cursor, ErrorKind};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn test_workspace(
         roots: Vec<PathBuf>,
@@ -2009,6 +2099,25 @@ mod tests {
         assert!(
             !result.records.is_empty(),
             "the computed signature-help result must carry its source read set"
+        );
+    }
+
+    fn assert_semantic_tokens_were_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::SemanticTokens(Ok(tokens)) => {
+                assert!(
+                    !tokens.data.is_empty(),
+                    "the computed semantic-token result must not be empty"
+                );
+            }
+            AnalysisResultValue::SemanticTokens(Err(error)) => {
+                panic!("semantic-token worker failed before delivery: {error}");
+            }
+            _ => panic!("expected a semantic-token result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed semantic-token result must carry its source read set"
         );
     }
 
@@ -2363,6 +2472,120 @@ mod tests {
         };
         assert_eq!(response.id, id);
         assert_eq!(response.error.expect("stale result error").code, -32803);
+    }
+
+    #[test]
+    fn analysis_workers_reject_requests_beyond_the_worker_bound() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let first = root.join("First.pas");
+        let source = "unit First;\ninterface\nprocedure VisibleThing;\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&first, source).expect("first source");
+
+        let first_uri = Url::from_file_path(&first).expect("first URI");
+        let workspace = test_workspace(vec![root], Default::default());
+        let mut jobs = AnalysisJobs::new();
+
+        let (first_ready_sender, first_ready_receiver) = mpsc::channel();
+        let (first_release_sender, first_release_receiver) = mpsc::channel();
+        install_snapshot_priority_barrier(
+            first_uri.clone(),
+            first_ready_sender,
+            first_release_receiver,
+        );
+        jobs.start(
+            RequestId::from("busy-first".to_string()),
+            AnalysisRequest::SemanticTokens {
+                uri: first_uri.clone(),
+                range: None,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("first worker must start");
+        first_ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first worker must reach the snapshot barrier");
+
+        jobs.start(
+            RequestId::from("busy-second".to_string()),
+            AnalysisRequest::SemanticTokens {
+                uri: first_uri.clone(),
+                range: None,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("second worker must start");
+        assert_eq!(jobs.pending.len(), 2, "both workers must remain active");
+
+        let error = jobs
+            .start(
+                RequestId::from("busy-rejected".to_string()),
+                AnalysisRequest::SemanticTokens {
+                    uri: Url::from_file_path(&first).expect("first URI"),
+                    range: None,
+                },
+                &workspace,
+                symbol_client_features(),
+            )
+            .expect_err("requests beyond the active worker bound must be rejected");
+        assert_eq!(error, "analysis server is busy; retry the request");
+
+        let (server, client) = Connection::memory();
+        first_release_sender.send(()).expect("release first worker");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !jobs.is_empty() && Instant::now() < deadline {
+            jobs.poll(&server, &workspace)
+                .expect("poll analysis requests");
+            while let Ok(message) = client.receiver.try_recv() {
+                assert!(matches!(message, Message::Response(_)));
+            }
+            if !jobs.is_empty() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        assert!(jobs.is_empty(), "both admitted requests must be drained");
+    }
+
+    #[test]
+    fn semantic_token_worker_honors_cancellation_during_snapshot_construction() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Tokens.pas");
+        let source = "unit Tokens;\ninterface\nconst Value = 1;\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&source_path, source).expect("source");
+
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let workspace = test_workspace(vec![root], Default::default());
+        let mut jobs = AnalysisJobs::new();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        install_snapshot_priority_barrier(uri.clone(), ready_sender, release_receiver);
+        let id = RequestId::from("cancelled-semantic-tokens".to_string());
+        jobs.start(
+            id.clone(),
+            AnalysisRequest::SemanticTokens { uri, range: None },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("semantic token worker must start");
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("semantic token worker must reach the snapshot barrier");
+        jobs.cancel(&id);
+        release_sender.send(()).expect("release semantic worker");
+
+        let result = receive_analysis_result(&mut jobs, &id);
+        match result.value {
+            AnalysisResultValue::SemanticTokens(Err(error)) => {
+                assert_eq!(error, "request cancelled")
+            }
+            _ => panic!("expected cancellation from in-flight semantic token request"),
+        }
     }
 
     #[test]
@@ -2957,6 +3180,70 @@ mod tests {
     }
 
     #[test]
+    fn delivery_rejects_a_computed_semantic_token_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nconst Value = 1;\nimplementation\nprocedure Run;\nbegin\n  Log(Value);\nend;\nend.\n";
+        let changed = original.replace("Value", "ChangedValue");
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = test_workspace(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("semantic-token-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::SemanticTokens {
+                uri: main_uri.clone(),
+                range: None,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start semantic-token control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_semantic_tokens_were_computed(&control);
+        deliver_successfully(&workspace, control);
+
+        let stale_id = RequestId::from("semantic-token-overlay-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::SemanticTokens {
+                uri: main_uri.clone(),
+                range: None,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale semantic-token request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_semantic_tokens_were_computed(&stale);
+
+        workspace
+            .change_document(main_uri, changed, 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &workspace, stale)
+            .expect("deliver stale semantic-token result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed semantic-token overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
     fn delivery_rejects_computed_reference_and_highlight_results_after_a_project_switch() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().join("fixture");
@@ -3017,6 +3304,21 @@ mod tests {
         ));
         deliver_successfully(&workspace, highlight_control);
 
+        let semantic_control_id = RequestId::from("project-semantic-token-control".to_string());
+        jobs.start(
+            semantic_control_id.clone(),
+            AnalysisRequest::SemanticTokens {
+                uri: main_uri.clone(),
+                range: None,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start semantic-token control request");
+        let semantic_control = receive_analysis_result(&mut jobs, &semantic_control_id);
+        assert_semantic_tokens_were_computed(&semantic_control);
+        deliver_successfully(&workspace, semantic_control);
+
         let reference_id = RequestId::from("project-reference-stale".to_string());
         jobs.start(
             reference_id.clone(),
@@ -3039,7 +3341,7 @@ mod tests {
         jobs.start(
             highlight_id.clone(),
             AnalysisRequest::DocumentHighlights {
-                uri: main_uri,
+                uri: main_uri.clone(),
                 position: Position::new(2, 6),
             },
             &workspace,
@@ -3052,6 +3354,20 @@ mod tests {
             AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
         ));
 
+        let semantic_id = RequestId::from("project-semantic-token-stale".to_string());
+        jobs.start(
+            semantic_id.clone(),
+            AnalysisRequest::SemanticTokens {
+                uri: main_uri.clone(),
+                range: None,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start semantic-token request");
+        let semantic = receive_analysis_result(&mut jobs, &semantic_id);
+        assert_semantic_tokens_were_computed(&semantic);
+
         workspace
             .select_project(
                 &Url::from_file_path(&main).expect("source URI"),
@@ -3059,7 +3375,7 @@ mod tests {
             )
             .expect("switch to project B");
 
-        for result in [reference, highlight] {
+        for result in [reference, highlight, semantic] {
             let (server, client) = Connection::memory();
             deliver_analysis_result(&server, &workspace, result).expect("deliver stale result");
             let Message::Response(response) = client.receiver.recv().expect("stale response")

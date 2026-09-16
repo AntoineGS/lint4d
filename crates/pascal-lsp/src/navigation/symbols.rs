@@ -275,6 +275,7 @@ fn workspace_eligible(symbol: &Symbol) -> bool {
     }
 }
 
+#[allow(deprecated)]
 fn document_symbol(
     outline: &Outline,
     index: usize,
@@ -301,7 +302,6 @@ fn document_symbol(
         detail: None,
         kind: entry.kind,
         tags: None,
-        #[allow(deprecated)]
         deprecated: None,
         range: range_for_span(positions, &document.source, entry.declaration_span)?,
         selection_range: range_for_span(positions, &document.source, entry.selection_span)?,
@@ -320,6 +320,7 @@ fn workspace_container_name(unit_name: &str, symbol: &Symbol) -> Option<String> 
     }
 }
 
+#[allow(deprecated)]
 fn project_workspace_symbols<'a, I, F>(
     uri: &Url,
     unit_name: &str,
@@ -342,7 +343,6 @@ where
             name: symbol.name.clone(),
             kind: lsp_kind(symbol),
             tags: None,
-            #[allow(deprecated)]
             deprecated: None,
             location: Location {
                 uri: uri.clone(),

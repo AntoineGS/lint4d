@@ -1,24 +1,34 @@
 local REQUEST_TIMEOUT = 10000
+local BUSY_ERROR_CODE = -32803
+local BUSY_RETRY_DELAY = 50
+local MAX_BUSY_RETRIES = REQUEST_TIMEOUT / BUSY_RETRY_DELAY
 
 local function request(client, method, params, bufnr)
-	local completed = false
-	local callback_error
-	local result
-	local accepted = client:request(method, params, function(err, response)
-		callback_error = err
-		result = response
-		completed = true
-	end, bufnr)
-	assert(accepted, method .. " request was not accepted")
-	assert(
-		vim.wait(REQUEST_TIMEOUT, function()
-			return completed
-		end),
-		method .. " request timed out"
-	)
-	assert(not callback_error, method .. " callback error: " .. vim.inspect(callback_error))
-	assert(result ~= nil, method .. " returned no result")
-	return result
+	for _ = 1, MAX_BUSY_RETRIES do
+		local completed = false
+		local callback_error
+		local result
+		local accepted = client:request(method, params, function(err, response)
+			callback_error = err
+			result = response
+			completed = true
+		end, bufnr)
+		assert(accepted, method .. " request was not accepted")
+		assert(
+			vim.wait(REQUEST_TIMEOUT, function()
+				return completed
+			end),
+			method .. " request timed out"
+		)
+		if callback_error and callback_error.code == BUSY_ERROR_CODE then
+			vim.wait(BUSY_RETRY_DELAY)
+		else
+			assert(not callback_error, method .. " callback error: " .. vim.inspect(callback_error))
+			assert(result ~= nil, method .. " returned no result")
+			return result
+		end
+	end
+	error(method .. " remained busy for " .. REQUEST_TIMEOUT .. "ms")
 end
 
 local function assert_range(actual, start_line, start_character, end_line, end_character)

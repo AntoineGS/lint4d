@@ -1131,6 +1131,22 @@ impl Workspace {
         self.accept_open_document(uri, candidate, version, context_key)
     }
 
+    pub(crate) fn reject_malformed_change(
+        &mut self,
+        uri: &Url,
+        version: i32,
+        reason: String,
+    ) -> bool {
+        let Some(previous) = self.open_documents.get(uri) else {
+            return false;
+        };
+        if version <= previous.version {
+            return false;
+        }
+        self.reject_open_document(uri.clone(), version, reason);
+        true
+    }
+
     pub fn save_document(&mut self, uri: &Url, saved_text: Option<String>) -> Result<(), String> {
         if let Some(document) = self.open_documents.get(uri) {
             if let Some(reason) = &document.rejection {
@@ -6188,7 +6204,7 @@ mod tests {
             limits: ResourceLimits {
                 max_files: 10,
                 max_file_bytes: source.len() + 3,
-                max_total_bytes: source.len() + 3,
+                max_total_bytes: source.len() * 3,
             },
             ..WorkspaceOptions::default()
         };
@@ -6197,16 +6213,163 @@ mod tests {
         workspace
             .open_document(uri.clone(), source.to_owned(), 1)
             .expect("open document");
+        assert_eq!(overlay_text(&workspace, &uri).as_deref(), Some(source));
+        assert!(!workspace.analysis_input().rejected_documents.contains(&uri));
+
+        let insertion = "x".repeat(4);
+        let after_first = format!("{insertion}{source}");
         workspace
             .change_document_with_changes(
                 uri.clone(),
-                vec![text_change(source, 0, 0, &"x".repeat(4), Some(0))],
+                vec![
+                    text_change(source, 0, 0, &insertion, Some(0)),
+                    text_change(
+                        &after_first,
+                        0,
+                        insertion.len(),
+                        "",
+                        Some(insertion.encode_utf16().count() as u32),
+                    ),
+                ],
                 2,
             )
-            .expect("oversized notification is recorded as rejection");
+            .expect("oversized intermediate notification is recorded as rejection");
 
         assert!(workspace.analysis_input().rejected_documents.contains(&uri));
         assert!(!workspace.analysis_input().overlays.contains_key(&uri));
+
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: source.to_owned(),
+                }],
+                3,
+            )
+            .expect("full replacement resynchronizes after an oversized batch");
+        assert_eq!(overlay_text(&workspace, &uri).as_deref(), Some(source));
+        assert!(!workspace.analysis_input().rejected_documents.contains(&uri));
+    }
+
+    #[test]
+    fn total_overlay_budget_counts_other_open_documents() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let first_path = temp.path().join("First.pas");
+        let second_path = temp.path().join("Second.pas");
+        let first_uri = Url::from_file_path(&first_path).expect("first source URI");
+        let second_uri = Url::from_file_path(&second_path).expect("second source URI");
+        let first_source = "unit First; end.\n";
+        let second_source = "unit Second; end.\n";
+        fs::write(&first_path, first_source).expect("first source");
+        fs::write(&second_path, second_source).expect("second source");
+        let options = WorkspaceOptions {
+            limits: ResourceLimits {
+                max_files: 10,
+                max_file_bytes: 1024,
+                max_total_bytes: first_source.len() * 2 + second_source.len() * 2,
+            },
+            ..WorkspaceOptions::default()
+        };
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], options);
+        workspace
+            .open_document(first_uri.clone(), first_source.to_owned(), 1)
+            .expect("first document");
+        workspace
+            .open_document(second_uri.clone(), second_source.to_owned(), 1)
+            .expect("second document fits total budget");
+        assert_eq!(
+            overlay_text(&workspace, &first_uri).as_deref(),
+            Some(first_source)
+        );
+        assert_eq!(
+            overlay_text(&workspace, &second_uri).as_deref(),
+            Some(second_source)
+        );
+
+        workspace
+            .change_document_with_changes(
+                first_uri.clone(),
+                vec![text_change(
+                    first_source,
+                    first_source.len(),
+                    first_source.len(),
+                    "x",
+                    Some(0),
+                )],
+                2,
+            )
+            .expect("total-budget rejection is recorded");
+        assert!(
+            workspace
+                .analysis_input()
+                .rejected_documents
+                .contains(&first_uri)
+        );
+        assert!(!workspace.analysis_input().overlays.contains_key(&first_uri));
+        assert_eq!(
+            overlay_text(&workspace, &second_uri).as_deref(),
+            Some(second_source)
+        );
+
+        workspace
+            .change_document_with_changes(
+                first_uri.clone(),
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: first_source.to_owned(),
+                }],
+                3,
+            )
+            .expect("full replacement resynchronizes within the total budget");
+        assert_eq!(
+            overlay_text(&workspace, &first_uri).as_deref(),
+            Some(first_source)
+        );
+        assert_eq!(
+            overlay_text(&workspace, &second_uri).as_deref(),
+            Some(second_source)
+        );
+    }
+
+    #[test]
+    fn incremental_cross_line_crlf_edit_updates_the_overlay() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\r\ninterface\r\nconst OldName = 1;\r\nimplementation\r\nend.\r\n";
+        let start = source.find("interface").expect("interface");
+        let end = source.find("OldName").expect("OldName") + "OldName".len();
+        let replaced = &source[start..end];
+        let replacement = "interface\r\nconst NewName";
+        let updated = source.replacen("OldName", "NewName", 1);
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![text_change(
+                    source,
+                    start,
+                    end,
+                    replacement,
+                    Some(replaced.encode_utf16().count() as u32),
+                )],
+                2,
+            )
+            .expect("cross-line CRLF edit");
+
+        assert_eq!(
+            overlay_text(&workspace, &uri).as_deref(),
+            Some(updated.as_str())
+        );
     }
 
     #[test]

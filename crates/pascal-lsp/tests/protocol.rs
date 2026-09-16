@@ -1950,6 +1950,320 @@ fn incremental_did_change_updates_overlay_for_navigation() {
 }
 
 #[test]
+fn malformed_did_change_position_desynchronizes_until_full_resynchronization() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure OldRoutine;\nimplementation\nprocedure OldRoutine;\nprocedure Use;\nbegin\n  OldRoutine;\nend;\nend.\n";
+    let updated = source.replace("OldRoutine", "NewRoutine");
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": -1, "character": 0},
+                    "end": {"line": -1, "character": 0}
+                },
+                "text": "NewRoutine"
+            }]
+        }),
+    );
+
+    let first_start = position_of(source, "OldRoutine", 0);
+    let first_end = position_after(source, "OldRoutine", 0);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 3},
+            "contentChanges": [{
+                "range": {"start": first_start, "end": first_end},
+                "text": "NewRoutine"
+            }]
+        }),
+    );
+    let request_id = RequestId::from("malformed-position-ranged-change".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(
+            &source_path,
+            &source.replacen("OldRoutine", "NewRoutine", 1),
+            "NewRoutine",
+            0,
+        ),
+    );
+    assert!(
+        result_locations(server.response(&request_id)).is_empty(),
+        "a ranged change after malformed didChange must not use stale text"
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 4},
+            "contentChanges": [{"text": updated}]
+        }),
+    );
+    let request_id = RequestId::from("malformed-position-full-resync".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &updated, "NewRoutine", 2),
+    );
+    assert!(!result_locations(server.response(&request_id)).is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn malformed_did_change_range_length_desynchronizes_until_close_and_reopen() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure OldRoutine;\nimplementation\nprocedure OldRoutine;\nprocedure Use;\nbegin\n  OldRoutine;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let start = position_of(source, "OldRoutine", 0);
+    let end = position_after(source, "OldRoutine", 0);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{
+                "range": {"start": start, "end": end},
+                "rangeLength": "11",
+                "text": "NewRoutine"
+            }]
+        }),
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 3},
+            "contentChanges": [{
+                "range": {"start": start, "end": end},
+                "text": "NewRoutine"
+            }]
+        }),
+    );
+    let request_id = RequestId::from("malformed-range-length-ranged-change".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(
+            &source_path,
+            &source.replacen("OldRoutine", "NewRoutine", 1),
+            "NewRoutine",
+            0,
+        ),
+    );
+    assert!(
+        result_locations(server.response(&request_id)).is_empty(),
+        "a ranged change after malformed rangeLength must not use stale text"
+    );
+
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{
+                "range": {"start": start, "end": end},
+                "text": "NewRoutine"
+            }]
+        }),
+    );
+    let request_id = RequestId::from("malformed-range-length-close-reopen".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(
+            &source_path,
+            &source.replacen("OldRoutine", "NewRoutine", 1),
+            "NewRoutine",
+            0,
+        ),
+    );
+    assert_eq!(result_locations(server.response(&request_id)).len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn malformed_did_change_without_trusted_newer_open_attribution_does_not_desynchronize() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let unknown_path = temp.path().join("Unknown.pas");
+    let source = "unit Main;\ninterface\nprocedure OldRoutine;\nimplementation\nprocedure OldRoutine;\nprocedure Use;\nbegin\n  OldRoutine;\nend;\nend.\n";
+    let updated = source.replacen("OldRoutine", "NewRoutine", 1);
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    for params in [
+        json!({
+            "textDocument": {"uri": uri(&unknown_path), "version": 2},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": -1, "character": 0},
+                    "end": {"line": -1, "character": 0}
+                },
+                "text": "ignored"
+            }]
+        }),
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "contentChanges": [{
+                "range": {"start": {"line": -1, "character": 0}, "end": {"line": -1, "character": 0}},
+                "text": "ignored"
+            }]
+        }),
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 1},
+            "contentChanges": [{
+                "range": {"start": {"line": -1, "character": 0}, "end": {"line": -1, "character": 0}},
+                "text": "ignored"
+            }]
+        }),
+    ] {
+        server.send_notification("textDocument/didChange", params);
+    }
+
+    let start = position_of(source, "OldRoutine", 0);
+    let end = position_after(source, "OldRoutine", 0);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{
+                "range": {"start": start, "end": end},
+                "text": "NewRoutine"
+            }]
+        }),
+    );
+    let request_id = RequestId::from("untrusted-malformed-attribution".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &updated, "NewRoutine", 0),
+    );
+    assert_eq!(result_locations(server.response(&request_id)).len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn incremental_did_change_applies_a_cross_line_crlf_range() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let source = "unit Main;\r\ninterface\r\nprocedure OldRoutine;\r\nimplementation\r\nend.\r\n";
+    let start = position_of(source, "interface", 0);
+    let end = position_after(source, "OldRoutine", 0);
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{
+                "range": {"start": start, "end": end},
+                "text": "interface\r\nprocedure NewRoutine"
+            }]
+        }),
+    );
+
+    let id = RequestId::from("cross-line-crlf-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "cross-line CRLF symbols failed: {response:?}"
+    );
+    let result = response.result.expect("cross-line CRLF symbols result");
+    let symbols = result.as_array().expect("cross-line CRLF symbols array");
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "NewRoutine"),
+        "incremental CRLF edit was not applied: {symbols:?}"
+    );
+    assert!(
+        symbols.iter().all(|symbol| symbol["name"] != "OldRoutine"),
+        "stale CRLF symbol remained after incremental edit: {symbols:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&source_path).expect("source after edit"),
+        source
+    );
+    server.shutdown();
+}
+
+#[test]
 fn initialize_advertises_standard_completion_and_signature_help() {
     let (_temp, main, _provider, _main_source, _provider_source) = standard_workspace();
     let root = main.parent().expect("workspace root");

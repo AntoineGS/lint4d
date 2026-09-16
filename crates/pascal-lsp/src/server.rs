@@ -2921,7 +2921,24 @@ fn handle_notification(
             Ok(effect)
         }
         "textDocument/didChange" => {
-            let params: DidChangeTextDocumentParams = parse_notification(&notification)?;
+            let params: DidChangeTextDocumentParams = match parse_notification(&notification) {
+                Ok(params) => params,
+                Err(error) => {
+                    if let Some((uri, version)) = malformed_did_change_attribution(&notification) {
+                        if workspace.reject_malformed_change(
+                            &uri,
+                            version,
+                            format!("{error}; a full-document replacement is required"),
+                        ) {
+                            let mut effect = DiagnosticNotificationEffect::default();
+                            effect.cancel_uri(uri.clone());
+                            effect.refresh_uri(uri);
+                            return Ok(effect);
+                        }
+                    }
+                    return Err(error);
+                }
+            };
             let uri = params.text_document.uri.clone();
             workspace
                 .change_document_with_changes(
@@ -3170,6 +3187,13 @@ fn parse_params<T: DeserializeOwned>(request: &Request) -> Result<T, String> {
 fn parse_notification<T: DeserializeOwned>(notification: &Notification) -> Result<T, String> {
     serde_json::from_value(notification.params.clone())
         .map_err(|error| format!("invalid parameters for {}: {error}", notification.method))
+}
+
+fn malformed_did_change_attribution(notification: &Notification) -> Option<(Url, i32)> {
+    let text_document = notification.params.get("textDocument")?.as_object()?;
+    let uri = Url::parse(text_document.get("uri")?.as_str()?).ok()?;
+    let version = i32::try_from(text_document.get("version")?.as_i64()?).ok()?;
+    Some((uri, version))
 }
 
 fn send_ok<T: serde::Serialize>(

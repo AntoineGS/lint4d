@@ -1,4 +1,7 @@
-use lsp_types::{CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range, Url};
+use lsp_types::{
+    CompletionItemKind, CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range,
+    Url,
+};
 use pascal_core::delphi_overrides::OverrideSession;
 use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
@@ -67,15 +70,973 @@ fn assert_location_start(location: &Location, expected_uri: &Url, expected: Posi
     assert_eq!(location.range.start, expected);
 }
 
+#[test]
+fn class_helper_members_navigate_from_the_helped_class() {
+    let source = r#"unit ClassHelperNavigation;
+interface
+type
+  TWidget = class
+  end;
+  TWidgetHelper = class helper for TWidget
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TWidgetHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("ClassHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("class helper source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Touch", 2),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Touch", 0));
+}
+
+#[test]
+fn class_helper_inheritance_exposes_parent_helper_members() {
+    let source = r#"unit ClassHelperInheritance;
+interface
+type
+  TWidget = class
+  end;
+  TBaseWidgetHelper = class helper for TWidget
+    procedure Base;
+  end;
+  TDerivedWidgetHelper = class helper (TBaseWidgetHelper) for TWidget
+    procedure Derived;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBaseWidgetHelper.Base;
+begin
+end;
+
+procedure TDerivedWidgetHelper.Derived;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Base;
+  Widget.Derived;
+end;
+
+end.
+"#;
+    let source_uri = uri("ClassHelperInheritance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("class helper inheritance source parses");
+
+    let base = index.navigate(
+        &source_uri,
+        position_of(source, "Base;", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base.len(), 1);
+    assert_location_start(&base[0], &source_uri, position_of(source, "Base;", 0));
+
+    let derived = index.navigate(
+        &source_uri,
+        position_of(source, "Derived;", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(derived.len(), 1);
+    assert_location_start(&derived[0], &source_uri, position_of(source, "Derived;", 0));
+}
+
+#[test]
+fn record_helper_members_navigate_from_the_helped_record() {
+    let source = r#"unit RecordHelperNavigation;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TPointHelper.Offset;
+begin
+end;
+
+procedure Run;
+var
+  Point: TPoint;
+begin
+  Point.Offset;
+end;
+
+end.
+"#;
+    let source_uri = uri("RecordHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("record helper source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Offset", 2),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Offset", 0));
+}
+
+#[test]
+fn helper_self_uses_the_helped_type_and_helper_members() {
+    let source = r#"unit HelperSelfNavigation;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+
+implementation
+
+procedure TPointHelper.Offset;
+begin
+  Self.X := 1;
+  Self.Offset;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperSelfNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper self source parses");
+
+    let field = index.navigate(
+        &source_uri,
+        position_of(source, "X", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(field.len(), 1);
+    assert_location_start(&field[0], &source_uri, position_of(source, "X", 0));
+
+    let method = index.navigate(
+        &source_uri,
+        position_of(source, "Offset", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(method.len(), 1);
+    assert_location_start(&method[0], &source_uri, position_of(source, "Offset", 0));
+}
+
+#[test]
+fn helper_members_feed_completion_hover_and_signature_help() {
+    let source = r#"unit HelperAssistance;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset(Value: Integer);
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TPointHelper.Offset(Value: Integer);
+begin
+end;
+
+procedure Run;
+var
+  Point: TPoint;
+begin
+  Point.Offset(1);
+  Point.
+  Point.Offset(1);
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper assistance source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Point.", 1))
+        .expect("helper completion");
+    let labels = completion
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        labels.contains(&"Offset"),
+        "helper member missing: {labels:?}"
+    );
+
+    assert!(
+        index
+            .hover(&source_uri, position_of(source, "Offset", 2))
+            .is_some(),
+        "helper member hover should resolve"
+    );
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "Point.Offset(1", 0))
+        .expect("helper signature help")
+        .expect("helper method signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert!(signature.signatures[0].label.contains("Offset"));
+}
+
+#[test]
+fn helper_method_results_feed_nested_member_navigation() {
+    let source = r#"unit HelperResultNavigation;
+interface
+type
+  TChild = class
+    procedure Run;
+  end;
+  TWidget = class
+  end;
+  TWidgetHelper = class helper for TWidget
+    function Child: TChild;
+  end;
+
+implementation
+
+procedure TChild.Run;
+begin
+end;
+
+function TWidgetHelper.Child: TChild;
+begin
+end;
+
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Widget.Child().Run;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperResultNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper result source parses");
+
+    let child = index.navigate(
+        &source_uri,
+        position_of(source, "Child", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child.len(), 1);
+    assert_location_start(&child[0], &source_uri, position_of(source, "TChild", 0));
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Run", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Run", 0));
+
+    let child_type = index.type_definitions(&source_uri, position_of(source, "Child", 5));
+    assert_eq!(child_type.len(), 1);
+    assert_location_start(
+        &child_type[0],
+        &source_uri,
+        position_of(source, "TChild", 0),
+    );
+}
+
+#[test]
+fn specialized_generic_helper_targets_match_specialized_receivers() {
+    let source = r#"unit GenericHelperNavigation;
+interface
+type
+  TBox<T> = class
+  end;
+  TBoxHelper = class helper for TBox<Integer>
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBoxHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Box: TBox<Integer>;
+begin
+  Box.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("GenericHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic helper source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Touch", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Touch", 0));
+}
+
+#[test]
+fn generic_helpers_match_their_generic_target_specialization() {
+    let source = r#"unit GenericHelperNavigation;
+interface
+type
+  TBox<T> = class
+  end;
+  TBoxHelper<T> = class helper for TBox<T>
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBoxHelper<T>.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Box: TBox<Integer>;
+begin
+  Box.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("GenericHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic helper specialization source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Touch", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Touch", 0));
+}
+
+#[test]
+fn helper_members_shadow_helped_type_members_for_navigation() {
+    let source = r#"unit HelperMemberPrecedence;
+interface
+type
+  TWidget = class
+    Value: Integer;
+  end;
+  TWidgetHelper = class helper for TWidget
+    procedure Value;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TWidgetHelper.Value;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Value;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperMemberPrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper precedence source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Value;", 2),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Value;", 0));
+}
+
+#[test]
+fn imported_helpers_are_visible_independently_of_consumer_offsets() {
+    let target = r#"unit HelperVisibilityTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let helper = format!(
+        "unit LateHelper;\ninterface\nuses HelperVisibilityTarget;\n{}type\n  TWidgetHelper = class helper for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TWidgetHelper.Touch;\nbegin\nend;\nend.\n",
+        "\n".repeat(256)
+    );
+    let consumer = r#"unit HelperVisibilityConsumer;
+interface
+uses HelperVisibilityTarget, LateHelper;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+end.
+"#;
+
+    let target_uri = uri("HelperVisibilityTarget");
+    let helper_uri = uri("LateHelper");
+    let consumer_uri = uri("HelperVisibilityConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(target_uri, target.to_owned())
+        .expect("helper target parses");
+    index
+        .update(helper_uri.clone(), helper.clone())
+        .expect("late helper parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("helper consumer parses");
+
+    let locations = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Touch", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &helper_uri,
+        position_of(&helper, "Touch;", 0),
+    );
+}
+
+#[test]
+fn base_helpers_apply_to_descendants_but_specific_helpers_win() {
+    let source = r#"unit HelperTargetAncestry;
+interface
+type
+  TBase = class
+  end;
+  TChild = class(TBase)
+  end;
+  TOther = class(TBase)
+  end;
+  TBaseHelper = class helper for TBase
+    procedure BaseOnly;
+    procedure Shared;
+  end;
+  TChildHelper = class helper for TChild
+    procedure Shared;
+  end;
+
+implementation
+
+procedure TBaseHelper.BaseOnly;
+begin
+end;
+
+procedure TBaseHelper.Shared;
+begin
+end;
+
+procedure TChildHelper.Shared;
+begin
+end;
+
+procedure Run;
+var
+  Child: TChild;
+  Other: TOther;
+begin
+  Other.BaseOnly;
+  Child.BaseOnly;
+  Child.Shared;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperTargetAncestry");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper ancestry source parses");
+
+    let base_only = index.navigate(
+        &source_uri,
+        position_of(source, "BaseOnly", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_only.len(), 1);
+    assert_location_start(
+        &base_only[0],
+        &source_uri,
+        position_of(source, "BaseOnly", 0),
+    );
+
+    let shadowed_base_only = index.navigate(
+        &source_uri,
+        position_of(source, "BaseOnly", 3),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        shadowed_base_only.is_empty(),
+        "a more-specific helper must win instead of unioning helper members"
+    );
+
+    let shared = index.navigate(
+        &source_uri,
+        position_of(source, "Shared", 4),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shared.len(), 1);
+    assert_location_start(&shared[0], &source_uri, position_of(source, "Shared", 1));
+}
+
+#[test]
+fn helper_methods_resolve_implicit_target_members_without_breaking_local_shadowing() {
+    let source = r#"unit HelperImplicitMembers;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Update;
+    procedure Shadow;
+  end;
+
+implementation
+
+procedure TPointHelper.Update;
+begin
+  X := 1;
+  Self.X := 2;
+end;
+
+procedure TPointHelper.Shadow;
+var
+  X: Integer;
+begin
+  X := 3;
+  Self.X := 4;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperImplicitMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("implicit helper member source parses");
+
+    let implicit = index.navigate(
+        &source_uri,
+        position_of(source, "X := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(implicit.len(), 1);
+    assert_location_start(&implicit[0], &source_uri, position_of(source, "X:", 0));
+
+    let self_start = position_of(source, "Self.X", 0);
+    let self_member = index.navigate(
+        &source_uri,
+        Position::new(self_start.line, self_start.character + 5),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(self_member.len(), 1);
+    assert_location_start(&self_member[0], &source_uri, position_of(source, "X:", 0));
+
+    let local = index.navigate(
+        &source_uri,
+        position_of(source, "X := 3", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local.len(), 1);
+    assert_location_start(&local[0], &source_uri, position_of(source, "X: Integer", 1));
+}
+
+#[test]
+fn specialized_generic_helpers_are_available_in_completion() {
+    let source = r#"unit GenericHelperCompletion;
+interface
+type
+  TBox<T> = class
+  end;
+  TBoxHelper = class helper for TBox<Integer>
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBoxHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Box: TBox<Integer>;
+begin
+  Box.Touch;
+  Box.
+end;
+
+end.
+"#;
+    let source_uri = uri("GenericHelperCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic helper completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Box.", 1))
+        .expect("generic helper completion succeeds");
+    assert!(
+        completion.items.iter().any(|item| item.label == "Touch"),
+        "specialized helper member missing: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn imported_helpers_use_only_the_last_helper_in_uses_order() {
+    let provider = r#"unit HelperTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let first_helper = r#"unit FirstWidgetHelper;
+interface
+uses HelperTarget;
+type
+  TFirstWidgetHelper = class helper for TWidget
+    procedure Shared;
+    procedure FirstOnly;
+  end;
+implementation
+procedure TFirstWidgetHelper.Shared;
+begin
+end;
+procedure TFirstWidgetHelper.FirstOnly;
+begin
+end;
+end.
+"#;
+    let second_helper = r#"unit SecondWidgetHelper;
+interface
+uses HelperTarget;
+type
+  TSecondWidgetHelper = class helper for TWidget
+    procedure Shared;
+    procedure SecondOnly;
+  end;
+implementation
+procedure TSecondWidgetHelper.Shared;
+begin
+end;
+procedure TSecondWidgetHelper.SecondOnly;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit HelperConsumer;
+interface
+uses HelperTarget, FirstWidgetHelper, SecondWidgetHelper;
+procedure Run;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Shared;
+  Widget.FirstOnly;
+  Widget.SecondOnly;
+end;
+end.
+"#;
+    let reverse_consumer = r#"unit ReverseHelperConsumer;
+interface
+uses HelperTarget, SecondWidgetHelper, FirstWidgetHelper;
+procedure Run;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Shared;
+  Widget.FirstOnly;
+  Widget.SecondOnly;
+end;
+end.
+"#;
+
+    let provider_uri = uri("HelperTarget");
+    let first_uri = uri("FirstWidgetHelper");
+    let second_uri = uri("SecondWidgetHelper");
+    let consumer_uri = uri("HelperConsumer");
+    let reverse_uri = uri("ReverseHelperConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("helper target parses");
+    index
+        .update(first_uri.clone(), first_helper.to_owned())
+        .expect("first helper parses");
+    index
+        .update(second_uri.clone(), second_helper.to_owned())
+        .expect("second helper parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("helper consumer parses");
+    index
+        .update(reverse_uri.clone(), reverse_consumer.to_owned())
+        .expect("reverse helper consumer parses");
+
+    let shared = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Shared", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shared.len(), 1);
+    assert_location_start(
+        &shared[0],
+        &second_uri,
+        position_of(second_helper, "Shared", 0),
+    );
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "FirstOnly", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "an inactive helper must not leak its unique member"
+    );
+    let second_only = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "SecondOnly", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(second_only.len(), 1);
+    assert_location_start(
+        &second_only[0],
+        &second_uri,
+        position_of(second_helper, "SecondOnly", 0),
+    );
+
+    let reverse_shared = index.navigate(
+        &reverse_uri,
+        position_of(reverse_consumer, "Shared", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(reverse_shared.len(), 1);
+    assert_location_start(
+        &reverse_shared[0],
+        &first_uri,
+        position_of(first_helper, "Shared", 0),
+    );
+    assert!(
+        index
+            .navigate(
+                &reverse_uri,
+                position_of(reverse_consumer, "SecondOnly", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "reversing uses order must switch the active helper"
+    );
+}
+
+#[test]
+fn unknown_conditional_import_blocks_known_helper_selection() {
+    let target = r#"unit ConditionalHelperTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let known_helper = r#"unit KnownConditionalHelper;
+interface
+uses ConditionalHelperTarget;
+type
+  TKnownHelper = class helper for TWidget
+    procedure Touch;
+  end;
+implementation
+procedure TKnownHelper.Touch;
+begin
+end;
+end.
+"#;
+    let maybe_helper = r#"unit MaybeConditionalHelper;
+interface
+uses ConditionalHelperTarget;
+type
+  TMaybeHelper = class helper for TWidget
+    procedure Touch;
+  end;
+implementation
+procedure TMaybeHelper.Touch;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit ConditionalHelperConsumer;
+interface
+uses
+  ConditionalHelperTarget,
+  KnownConditionalHelper,
+  {$IF CompilerVersion >= 24}
+  MaybeConditionalHelper
+  {$ENDIF};
+implementation
+procedure Run;
+var
+  Widget: ConditionalHelperTarget.TWidget;
+begin
+  Widget.Touch;
+end;
+end.
+"#;
+
+    let target_uri = uri("ConditionalHelperTarget");
+    let known_uri = uri("KnownConditionalHelper");
+    let maybe_uri = uri("MaybeConditionalHelper");
+    let consumer_uri = uri("ConditionalHelperConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(target_uri, target.to_owned())
+        .expect("conditional helper target parses");
+    index
+        .update(known_uri, known_helper.to_owned())
+        .expect("known conditional helper parses");
+    index
+        .update(maybe_uri, maybe_helper.to_owned())
+        .expect("maybe conditional helper parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("conditional helper consumer parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Touch", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "a matching helper hidden behind an unknown conditional import must block a unique target"
+    );
+
+    let reverse_consumer = consumer.replace(
+        "ConditionalHelperTarget,\n  KnownConditionalHelper,\n  {$IF CompilerVersion >= 24}\n  MaybeConditionalHelper\n  {$ENDIF};",
+        "ConditionalHelperTarget,\n  {$IF CompilerVersion >= 24}\n  MaybeConditionalHelper\n  {$ENDIF},\n  KnownConditionalHelper;",
+    );
+    let reverse_uri = uri("ReverseConditionalHelperConsumer");
+    index
+        .update(reverse_uri.clone(), reverse_consumer.clone())
+        .expect("reverse conditional helper consumer parses");
+    let reverse_locations = index.navigate(
+        &reverse_uri,
+        position_of(&reverse_consumer, "Touch", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(reverse_locations.len(), 1);
+    assert_location_start(
+        &reverse_locations[0],
+        &uri("KnownConditionalHelper"),
+        position_of(known_helper, "Touch;", 0),
+    );
+}
+
 const PROVIDER: &str = r#"unit Provider;
 interface
 
 type
   TWidget = class
-  private
+  public
     FValue: Integer;
     procedure DoThing;
-  public
     property Value: Integer read FValue;
   end;
 
@@ -691,6 +1652,181 @@ end;
 end.
 "#;
 
+const INHERITED_CLASS_MEMBERS: &str = r#"unit InheritedClassMembers;
+interface
+type
+  TBase = class
+  private
+    BaseField: Integer;
+  public
+    procedure BaseMethod;
+  end;
+  TChild = class(TBase)
+    procedure ChildMethod;
+  end;
+implementation
+procedure TBase.BaseMethod;
+begin
+  BaseField := 1;
+end;
+procedure TChild.ChildMethod;
+begin
+  BaseField := 2;
+  BaseMethod;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.BaseField;
+  Obj.BaseMethod;
+end;
+end.
+"#;
+
+const INHERITED_PROVIDER: &str = r#"unit InheritedProvider;
+interface
+type
+  TBase = class
+  public
+    CrossField: Integer;
+    procedure CrossMethod;
+  end;
+implementation
+procedure TBase.CrossMethod;
+begin
+  CrossField := 1;
+end;
+end.
+"#;
+
+const INHERITED_CONSUMER: &str = r#"unit InheritedConsumer;
+interface
+uses InheritedProvider;
+type
+  TChild = class(InheritedProvider.TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  CrossField := 1;
+  CrossMethod;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.CrossField;
+  Obj.CrossMethod;
+end;
+end.
+"#;
+
+const INHERITED_INTERFACE_MEMBERS: &str = r#"unit InheritedInterfaceMembers;
+interface
+type
+  IBase = interface
+    procedure BaseMethod;
+  end;
+  IChild = interface(IBase)
+    procedure ChildMethod;
+  end;
+implementation
+procedure Caller;
+var
+  Obj: IChild;
+begin
+  Obj.BaseMethod;
+  Obj.ChildMethod;
+end;
+end.
+"#;
+
+const DECLARED_MEMBER_TYPE_PROVIDER: &str = r#"unit DeclaredMemberTypeProvider;
+interface
+type
+  TP = class
+    Shared: Integer;
+  end;
+  TBase = class
+    F: TP;
+  end;
+implementation
+end.
+"#;
+
+const DECLARED_MEMBER_TYPE_CONSUMER: &str = r#"unit DeclaredMemberTypeConsumer;
+interface
+uses DeclaredMemberTypeProvider;
+type
+  TP = class
+    Shared: string;
+  end;
+  TChild = class(DeclaredMemberTypeProvider.TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.F.Shared;
+end;
+end.
+"#;
+
+const CLASS_INTERFACE_PARENTS: &str = r#"unit ClassInterfaceParents;
+interface
+type
+  IFoo = interface
+    procedure ContractOnly;
+    procedure Shared;
+  end;
+  TBase = class
+    procedure Shared;
+  end;
+  TChild = class(TBase, IFoo)
+  end;
+implementation
+procedure TBase.Shared;
+begin
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.ContractOnly;
+  Obj.Shared;
+end;
+end.
+"#;
+
+const PER_NAME_AMBIGUOUS_INHERITANCE: &str = r#"unit PerNameAmbiguousInheritance;
+interface
+type
+  IA = interface
+    procedure Shared;
+    procedure Unique;
+  end;
+  IB = interface
+    procedure Shared;
+  end;
+  IMid = interface(IA, IB)
+  end;
+  IChild = interface(IMid)
+    procedure Shared;
+  end;
+implementation
+procedure Caller;
+var
+  C: IChild;
+begin
+  C.Unique;
+  C.Shared;
+end;
+end.
+"#;
+
 const ASSISTANCE_PROVIDER: &str = r#"unit AssistanceProvider;
 interface
 type
@@ -758,6 +1894,1631 @@ begin
 end;
 end.
 "#;
+
+#[test]
+fn overload_selection_drives_navigation_completion_and_signature_help() {
+    let source = r#"unit OverloadSelection;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: string;
+  end;
+function Select(Value: Integer): TIntResult; overload;
+function Select(Value: string): TStringResult; overload;
+implementation
+function Select(Value: Integer): TIntResult;
+begin
+  Result := TIntResult.Create;
+end;
+function Select(Value: string): TStringResult;
+begin
+  Result := TStringResult.Create;
+end;
+procedure Caller;
+begin
+  Select(1).IntMember;
+  Select('text' ).StringMember;
+end;
+end.
+"#;
+    let source_uri = uri("OverloadSelection");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("overload selection source parses");
+
+    let integer_call = position_of(source, "Select(1)", 0);
+    let integer_navigation =
+        index.navigate(&source_uri, integer_call, NavigationTarget::Declaration);
+    assert_eq!(integer_navigation.len(), 1);
+    assert_location_start(
+        &integer_navigation[0],
+        &source_uri,
+        position_of(source, "Select(Value: Integer)", 0),
+    );
+
+    let string_call = position_of(source, "Select('text' )", 0);
+    let string_navigation = index.navigate(&source_uri, string_call, NavigationTarget::Declaration);
+    assert_eq!(string_navigation.len(), 1);
+    assert_location_start(
+        &string_navigation[0],
+        &source_uri,
+        position_of(source, "Select(Value: string)", 0),
+    );
+
+    let integer_completion = index
+        .completion(&source_uri, position_after(source, "Select(1).IntM", 0))
+        .expect("integer result completion");
+    assert_eq!(
+        integer_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["IntMember"]
+    );
+
+    let string_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Select('text' ).StringM", 0),
+        )
+        .expect("string result completion");
+    assert_eq!(
+        string_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["StringMember"]
+    );
+
+    let integer_signature = index
+        .signature_help(&source_uri, position_after(source, "Select(1", 0))
+        .expect("integer signature help")
+        .expect("integer call signature");
+    assert_eq!(integer_signature.active_signature, Some(0));
+    assert_eq!(integer_signature.signatures.len(), 2);
+
+    let string_signature = index
+        .signature_help(&source_uri, position_after(source, "Select('text' ", 0))
+        .expect("string signature help")
+        .expect("string call signature");
+    assert_eq!(string_signature.active_signature, Some(1));
+    assert_eq!(string_signature.signatures.len(), 2);
+}
+
+#[test]
+fn nil_selects_reference_overloads_but_preserves_nil_ambiguity() {
+    let source = r#"unit NilOverloads;
+interface
+type
+  TClassArgument = class
+  end;
+  TOtherClassArgument = class
+  end;
+  TClassResult = class
+    ClassMember: Integer;
+  end;
+  TIntegerResult = class
+    IntegerMember: Integer;
+  end;
+  TOtherResult = class
+    OtherMember: Integer;
+  end;
+function Select(Value: TClassArgument): TClassResult; overload;
+function Select(Value: Integer): TIntegerResult; overload;
+function Ambiguous(Value: TClassArgument): TClassResult; overload;
+function Ambiguous(Value: TOtherClassArgument): TOtherResult; overload;
+implementation
+procedure Caller;
+begin
+  Select(nil).ClassMember;
+  Ambiguous(nil).ClassMember;
+end;
+end.
+"#;
+    let source_uri = uri("NilOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nil overload source parses");
+
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Select(nil)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(selected.len(), 1);
+    assert_location_start(
+        &selected[0],
+        &source_uri,
+        position_of(source, "Select(Value: TClassArgument)", 0),
+    );
+
+    let ambiguous = index.navigate(
+        &source_uri,
+        position_of(source, "Ambiguous(nil)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(ambiguous.len(), 2);
+}
+
+#[test]
+fn overload_selection_handles_typed_nested_calls_defaults_and_parameter_modes() {
+    let source = r#"unit TypedOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+  TVarResult = class
+    VarMember: Integer;
+  end;
+  TConstResult = class
+    ConstMember: Integer;
+  end;
+function Pick(Value: Integer; Extra: Integer = 0): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+function Wrap(Value: TIntResult): TVarResult; overload;
+function Wrap(Value: TStringResult): TConstResult; overload;
+function Mutate(var Value: Integer): TVarResult; overload;
+function Mutate(const Value: Integer): TConstResult; overload;
+function Store(out Value: Integer): TVarResult; overload;
+function Store(const Value: Integer): TConstResult; overload;
+implementation
+procedure Caller(Number: Integer; Text: string);
+var
+  Local: Integer;
+begin
+  Pick(Number).IntMember;
+  Pick(1, 2).IntMember;
+  Pick(Text).StringMember;
+  Wrap(Pick(Number)).VarMember;
+  Wrap(Pick(Text)).ConstMember;
+  Mutate(1).ConstMember;
+  Store(1).ConstMember;
+  Mutate(Local).VarMember;
+end;
+end.
+"#;
+    let source_uri = uri("TypedOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("typed overload source parses");
+
+    let number_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(Number)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(number_navigation.len(), 1);
+    assert_location_start(
+        &number_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer; Extra", 0),
+    );
+
+    let default_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1, 2)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(default_navigation.len(), 1);
+    assert_location_start(
+        &default_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer; Extra", 0),
+    );
+
+    let string_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(Text)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(string_navigation.len(), 1);
+    assert_location_start(
+        &string_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: string)", 0),
+    );
+
+    let nested_number_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Wrap(Pick(Number)).VarM", 0),
+        )
+        .expect("nested number overload completion");
+    assert_eq!(
+        nested_number_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["VarMember"]
+    );
+
+    let nested_string_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Wrap(Pick(Text)).ConstM", 0),
+        )
+        .expect("nested string overload completion");
+    assert_eq!(
+        nested_string_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ConstMember"]
+    );
+
+    let literal_var_completion = index
+        .completion(&source_uri, position_after(source, "Mutate(1).ConstM", 0))
+        .expect("var overload literal completion");
+    assert_eq!(
+        literal_var_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ConstMember"]
+    );
+
+    let literal_out_completion = index
+        .completion(&source_uri, position_after(source, "Store(1).ConstM", 0))
+        .expect("out overload literal completion");
+    assert_eq!(
+        literal_out_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ConstMember"]
+    );
+
+    let lvalue_completion = index
+        .completion(&source_uri, position_after(source, "Mutate(Local).VarM", 0))
+        .expect("var overload lvalue completion");
+    assert!(lvalue_completion.items.is_empty());
+    assert!(lvalue_completion.is_incomplete);
+}
+
+#[test]
+fn overload_selection_rejects_properties_and_const_arguments_for_var_and_out() {
+    let source = r#"unit NonAssignableOverloads;
+interface
+type
+  TVarResult = class
+    VarMember: Integer;
+  end;
+  TConstResult = class
+    ConstMember: Integer;
+  end;
+  TOutResult = class
+    OutMember: Integer;
+  end;
+  TWidget = class
+    FValue: Integer;
+    property P: Integer read FValue;
+  end;
+function Pick(var Value: Integer): TVarResult; overload;
+function Pick(const Value: Integer): TConstResult; overload;
+function Store(out Value: Integer): TOutResult; overload;
+function Store(const Value: Integer): TConstResult; overload;
+implementation
+procedure Caller(const C: Integer; Widget: TWidget);
+begin
+  Pick(C).ConstMember;
+  Pick(Widget.P).ConstMember;
+  Store(C).ConstMember;
+  Store(Widget.P).ConstMember;
+end;
+end.
+"#;
+    let source_uri = uri("NonAssignableOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("non-assignable overload source parses");
+
+    for (call, declaration) in [
+        ("Pick(C)", "Pick(const Value: Integer)"),
+        ("Pick(Widget.P)", "Pick(const Value: Integer)"),
+        ("Store(C)", "Store(const Value: Integer)"),
+        ("Store(Widget.P)", "Store(const Value: Integer)"),
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(navigation.len(), 1, "{call} must have one viable overload");
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, declaration, 0),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_requires_exact_types_for_var_and_out_parameters() {
+    let source = r#"unit ExactVarOutTypes;
+interface
+type
+  TGrand = class
+  end;
+  TBase = class(TGrand)
+  end;
+  TChild = class(TBase)
+  end;
+  TGrandResult = class
+    GrandMember: Integer;
+  end;
+  TBaseResult = class
+    BaseMember: Integer;
+  end;
+function Pick(var Value: TBase): TBaseResult; overload;
+function Pick(Value: TGrand): TGrandResult; overload;
+implementation
+procedure Caller(const C: TChild);
+begin
+  Pick(C).GrandMember;
+end;
+end.
+"#;
+    let source_uri = uri("ExactVarOutTypes");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("exact var/out source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(C)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: TGrand)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_resolves_builtins_after_lexical_and_unit_bindings() {
+    let arbitrary = r#"unit ArbitraryInteger;
+interface
+type
+  Integer = class
+  end;
+end.
+"#;
+    let source = r#"unit BuiltinShadowing;
+interface
+uses ArbitraryInteger;
+type
+  Integer = class
+  end;
+  TShadowResult = class
+    ShadowMember: Integer;
+  end;
+  TSystemResult = class
+    SystemMember: Integer;
+  end;
+  TUnitResult = class
+    UnitMember: Integer;
+  end;
+function Pick(Value: Integer): TShadowResult; overload;
+function Pick(Value: System.Integer): TSystemResult; overload;
+function UnitPick(Value: ArbitraryInteger.Integer): TUnitResult; overload;
+function UnitPick(Value: System.Integer): TSystemResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(1).SystemMember;
+  UnitPick(1).SystemMember;
+end;
+end.
+"#;
+    let arbitrary_uri = uri("ArbitraryInteger");
+    let source_uri = uri("BuiltinShadowing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(arbitrary_uri, arbitrary.to_owned())
+        .expect("arbitrary integer source parses");
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("builtin shadowing source parses");
+
+    for call in ["Pick(1)", "UnitPick(1)"] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(navigation.len(), 1, "{call} must select System.Integer");
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(
+                source,
+                if call == "Pick(1)" {
+                    "Pick(Value: System.Integer)"
+                } else {
+                    "UnitPick(Value: System.Integer)"
+                },
+                0,
+            ),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_parses_radix_literals_before_exponents() {
+    let source = r#"unit RadixOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TRealResult = class
+    RealMember: Integer;
+  end;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: Real): TRealResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick($FE).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("RadixOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("radix overload source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick($FE)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_distinguishes_string_fragments_from_characters() {
+    let source = r#"unit LiteralFragments;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+function Ord(Value: Char): Integer;
+implementation
+procedure Caller(CharValue: Char);
+begin
+  Pick('A'#66).StringMember;
+  Pick(#65#66).StringMember;
+  Pick(#65'B').StringMember;
+  Pick('A''B').StringMember;
+  Pick(#65).StringMember;
+  Pick(CharValue).StringMember;
+  Pick(Ord(CharValue)).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("LiteralFragments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("literal fragment source parses");
+
+    let string_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick('A'#66)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(string_navigation.len(), 1);
+    assert_location_start(
+        &string_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: string)", 0),
+    );
+
+    for call in [
+        "Pick(#65#66)",
+        "Pick(#65'B')",
+        "Pick('A''B')",
+        "Pick(#65)",
+        "Pick(CharValue)",
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(navigation.len(), 1, "{call} must use the string overload");
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, "Pick(Value: string)", 0),
+        );
+    }
+
+    let ordinal_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(Ord(CharValue))", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(ordinal_navigation.len(), 1);
+    assert_location_start(
+        &ordinal_navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_classifies_hex_codepoint_fragments_conservatively() {
+    let source = r#"unit HexCodepointFragments;
+interface
+type
+  TCharResult = class
+    CharMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+function Pick(Value: Char; Extra: Integer): TCharResult; overload;
+function Pick(Value: string; Extra: Integer): TStringResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(#65, 1).CharMember;
+  Pick(#$41, 1).CharMember;
+  Pick(#$41#66, 1).StringMember;
+  Pick(#$41'B', 1).StringMember;
+  Pick(#$41#$42, 1).StringMember;
+  Pick(#$GG, 1).StringMember;
+end;
+end.
+"#;
+    let source_uri = uri("HexCodepointFragments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("hex codepoint source parses");
+
+    for (call, declaration) in [
+        ("Pick(#65, 1)", "Pick(Value: Char; Extra: Integer)"),
+        ("Pick(#$41, 1)", "Pick(Value: Char; Extra: Integer)"),
+        ("Pick(#$41#66, 1)", "Pick(Value: string; Extra: Integer)"),
+        ("Pick(#$41'B', 1)", "Pick(Value: string; Extra: Integer)"),
+        ("Pick(#$41#$42, 1)", "Pick(Value: string; Extra: Integer)"),
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(navigation.len(), 1, "{call} must select one overload");
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, declaration, 0),
+        );
+    }
+
+    let hex_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Pick(#$41, 1).CharM", 0),
+        )
+        .expect("hex codepoint result completion");
+    assert_eq!(
+        hex_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["CharMember"]
+    );
+
+    let hex_signature_result = index
+        .signature_help(&source_uri, position_after(source, "Pick(#$41, 1", 0))
+        .expect("hex codepoint signature help");
+    let hex_signature = hex_signature_result.expect("hex codepoint call signature");
+    let char_signature = hex_signature.signatures.iter().position(|signature| {
+        signature
+            .label
+            .contains("Pick(Value: Char; Extra: Integer)")
+    });
+    assert!(char_signature.is_some());
+    assert_eq!(hex_signature.signatures.len(), 2);
+    assert_eq!(
+        hex_signature.active_signature,
+        char_signature.map(|index| index as u32)
+    );
+
+    let unsupported_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Pick(#$GG, 1).StringM", 0),
+        )
+        .expect("unsupported codepoint result completion");
+    assert!(unsupported_completion.items.is_empty());
+    assert!(unsupported_completion.is_incomplete);
+}
+
+#[test]
+fn overload_selection_keeps_integer_alias_parameters_unknown_for_literals() {
+    let source = r#"unit IntegerAliasOverloads;
+interface
+type
+  TNum = Integer;
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TDoubleResult = class
+    DoubleMember: Integer;
+  end;
+function Pick(Value: TNum): TIntResult; overload;
+function Pick(Value: Double): TDoubleResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(1).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("IntegerAliasOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("integer alias source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        navigation.len(),
+        2,
+        "an unsupported integer alias parameter must remain ambiguous for a literal"
+    );
+}
+
+#[test]
+fn overload_selection_treats_value_parameters_as_writable_var_arguments() {
+    let source = r#"unit WritableValueParameters;
+interface
+type
+  TVarResult = class
+    VarMember: Integer;
+  end;
+  TDoubleResult = class
+    DoubleMember: Integer;
+  end;
+function Pick(var Value: Integer): TVarResult; overload;
+function Pick(const Value: Double): TDoubleResult; overload;
+implementation
+procedure Run(C: Integer);
+begin
+  Pick(C).VarMember;
+end;
+end.
+"#;
+    let source_uri = uri("WritableValueParameters");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("writable value parameter source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(C)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(var Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_preserves_integer_width_and_literal_ranges() {
+    let source = r#"unit IntegerKinds;
+interface
+type
+  TByteResult = class
+    ByteMember: Integer;
+  end;
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TInt64Result = class
+    Int64Member: Integer;
+  end;
+  TLongResult = class
+    LongMember: Integer;
+  end;
+  TDoubleResult = class
+    DoubleMember: Integer;
+  end;
+function RangePick(Value: Byte): TByteResult; overload;
+function RangePick(Value: Integer): TIntResult; overload;
+function WidthPick(Value: Integer): TIntResult; overload;
+function WidthPick(Value: Int64): TInt64Result; overload;
+function AliasPick(Value: LongInt): TLongResult; overload;
+function AliasPick(Value: Double): TDoubleResult; overload;
+implementation
+procedure Caller(Number: Integer; Wide: Int64);
+begin
+  RangePick(1000).IntMember;
+  WidthPick(Number).IntMember;
+  WidthPick(Wide).Int64Member;
+  AliasPick(Number).LongMember;
+end;
+end.
+"#;
+    let source_uri = uri("IntegerKinds");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("integer kinds source parses");
+
+    for (call, declaration) in [
+        ("RangePick(1000)", "RangePick(Value: Integer)"),
+        ("WidthPick(Number)", "WidthPick(Value: Integer)"),
+        ("WidthPick(Wide)", "WidthPick(Value: Int64)"),
+        ("AliasPick(Number)", "AliasPick(Value: LongInt)"),
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            navigation.len(),
+            1,
+            "{call} must select one integer-kind overload"
+        );
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, declaration, 0),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_does_not_charge_omitted_defaults_as_conversion_cost() {
+    let source = r#"unit DefaultCosts;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TRealResult = class
+    RealMember: Integer;
+  end;
+function Pick(Value: Real): TRealResult; overload;
+function Pick(Value: Integer; Extra: Integer = 0): TIntResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(1).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("DefaultCosts");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("default cost source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer; Extra", 0),
+    );
+}
+
+#[test]
+fn overload_selection_extends_method_overloads_through_inheritance() {
+    let source = r#"unit ExtendedMethodOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TDoubleResult = class
+    DoubleMember: Integer;
+  end;
+  TBase = class
+    function Pick(Value: Integer): TIntResult; overload;
+  end;
+  TChild = class(TBase)
+    function Pick(Value: Double): TDoubleResult; overload;
+  end;
+implementation
+procedure Caller(Value: TChild);
+begin
+  Value.Pick(1).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("ExtendedMethodOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("extended method overload source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_respects_reintroduced_method_hiding() {
+    let source = r#"unit ReintroducedMethod;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TDoubleResult = class
+    DoubleMember: Integer;
+  end;
+  TBase = class
+    function Pick(Value: Integer): TIntResult;
+  end;
+  TChild = class(TBase)
+    function Pick(Value: Double): TDoubleResult; reintroduce;
+  end;
+implementation
+function TBase.Pick(Value: Integer): TIntResult;
+begin
+end;
+function TChild.Pick(Value: Double): TDoubleResult;
+begin
+end;
+procedure Caller(Value: TChild);
+begin
+  Value.Pick(1).DoubleMember;
+end;
+end.
+"#;
+    let source_uri = uri("ReintroducedMethod");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("reintroduced method source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Double)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_keeps_reintroduced_overloads_across_assistance() {
+    let provider = r#"unit ReintroducedOverloadProvider;
+interface
+type
+  TBaseResult = class
+    BaseMember: Integer;
+  end;
+  TChildResult = class
+    ChildMember: Integer;
+  end;
+  THiddenResult = class
+    HiddenMember: Integer;
+  end;
+  TBase = class
+    function Pick(Value: Integer): TBaseResult; overload;
+  end;
+  TChild = class(TBase)
+    function Pick(Value: Double): TChildResult; reintroduce; overload;
+  end;
+  THiddenChild = class(TBase)
+    function Pick(Value: Double): THiddenResult; reintroduce;
+  end;
+implementation
+function TBase.Pick(Value: Integer): TBaseResult;
+begin
+end;
+function TChild.Pick(Value: Double): TChildResult;
+begin
+end;
+function THiddenChild.Pick(Value: Double): THiddenResult;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit ReintroducedOverloadConsumer;
+interface
+uses ReintroducedOverloadProvider;
+procedure Caller(C: TChild; H: THiddenChild);
+implementation
+procedure Caller(C: TChild; H: THiddenChild);
+begin
+  C.Pick(1).BaseMember;
+  C.Pick(1.0).ChildMember;
+  H.Pick(1).HiddenMember;
+end;
+end.
+"#;
+    let provider_uri = uri("ReintroducedOverloadProvider");
+    let consumer_uri = uri("ReintroducedOverloadConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("reintroduced overload provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("reintroduced overload consumer parses");
+
+    let integer_navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(integer_navigation.len(), 1);
+    assert_location_start(
+        &integer_navigation[0],
+        &provider_uri,
+        position_of(provider, "Pick(Value: Integer)", 0),
+    );
+
+    let base_completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "C.Pick(1).BaseM", 0),
+        )
+        .expect("base inherited result completion");
+    assert_eq!(
+        base_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseMember"]
+    );
+
+    let child_completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "C.Pick(1.0).ChildM", 0),
+        )
+        .expect("child reintroduced result completion");
+    assert_eq!(
+        child_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ChildMember"]
+    );
+
+    let integer_signature = index
+        .signature_help(&consumer_uri, position_after(consumer, "C.Pick(1", 0))
+        .expect("inherited overload signature help")
+        .expect("inherited overload call signature");
+    let integer_signature_index = integer_signature
+        .signatures
+        .iter()
+        .position(|signature| signature.label.contains("Pick(Value: Integer)"));
+    let double_signature_index = integer_signature
+        .signatures
+        .iter()
+        .position(|signature| signature.label.contains("Pick(Value: Double)"));
+    assert!(integer_signature_index.is_some());
+    assert!(double_signature_index.is_some());
+    assert_eq!(integer_signature.signatures.len(), 2);
+    assert_eq!(
+        integer_signature.active_signature,
+        integer_signature_index.map(|index| index as u32)
+    );
+
+    let hidden_navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Pick(1)", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(hidden_navigation.len(), 1);
+    assert_location_start(
+        &hidden_navigation[0],
+        &provider_uri,
+        position_of(provider, "Pick(Value: Double)", 1),
+    );
+
+    let hidden_completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "H.Pick(1).HiddenM", 0),
+        )
+        .expect("reintroduced hidden result completion");
+    assert_eq!(
+        hidden_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["HiddenMember"]
+    );
+}
+
+#[test]
+fn overload_selection_collapses_proven_method_overrides() {
+    let source = r#"unit OverrideMethod;
+interface
+type
+  TResult = class
+    Member: Integer;
+  end;
+  TBase = class
+    function Pick(Value: Integer): TResult; virtual;
+  end;
+  TChild = class(TBase)
+    function Pick(Value: Integer): TResult; override;
+  end;
+implementation
+function TBase.Pick(Value: Integer): TResult;
+begin
+end;
+function TChild.Pick(Value: Integer): TResult;
+begin
+end;
+procedure Caller(Value: TChild);
+begin
+  Value.Pick(1).Member;
+end;
+end.
+"#;
+    let source_uri = uri("OverrideMethod");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("override method source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 1),
+    );
+}
+
+#[test]
+fn overload_selection_infers_primitive_nested_call_results() {
+    let source = r#"unit PrimitiveNestedResults;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+function GetInt: Integer;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+implementation
+function GetInt: Integer;
+begin
+  Result := 1;
+end;
+procedure Caller;
+begin
+  Pick(GetInt()).IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("PrimitiveNestedResults");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("primitive nested result source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Pick(GetInt())", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Pick(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn overload_selection_classifies_parenthesized_literal_types() {
+    let source = r#"unit ParenthesizedLiterals;
+interface
+type
+  TStringResult = class
+    StringMember: Integer;
+  end;
+  TBooleanResult = class
+    BooleanMember: Integer;
+  end;
+  TClassArgument = class
+  end;
+  TClassResult = class
+    ClassMember: Integer;
+  end;
+  TIntResult = class
+    IntMember: Integer;
+  end;
+function Pick(Value: string): TStringResult; overload;
+function Pick(Value: Boolean): TBooleanResult; overload;
+function Pick(Value: TClassArgument): TClassResult; overload;
+function Pick(Value: Integer): TIntResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(('text')).StringMember;
+  Pick((True)).BooleanMember;
+  Pick((nil)).ClassMember;
+end;
+end.
+"#;
+    let source_uri = uri("ParenthesizedLiterals");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("parenthesized literal source parses");
+
+    for (call, declaration) in [
+        ("Pick(('text'))", "Pick(Value: string)"),
+        ("Pick((True))", "Pick(Value: Boolean)"),
+        ("Pick((nil))", "Pick(Value: TClassArgument)"),
+    ] {
+        let navigation = index.navigate(
+            &source_uri,
+            position_of(source, call, 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            navigation.len(),
+            1,
+            "{call} must select one literal overload"
+        );
+        assert_location_start(
+            &navigation[0],
+            &source_uri,
+            position_of(source, declaration, 0),
+        );
+    }
+}
+
+#[test]
+fn overload_selection_preserves_cross_unit_type_identity() {
+    const FIRST: &str = r#"unit DistinctFirst;
+interface
+type
+  TValue = class
+  end;
+  TFirstResult = class
+    FirstMember: Integer;
+  end;
+function Choose(Value: TValue): TFirstResult; overload;
+implementation
+function Choose(Value: TValue): TFirstResult;
+begin
+end;
+end.
+"#;
+    const SECOND: &str = r#"unit DistinctSecond;
+interface
+type
+  TValue = class
+  end;
+  TSecondResult = class
+    SecondMember: Integer;
+  end;
+function Choose(Value: TValue): TSecondResult; overload;
+implementation
+function Choose(Value: TValue): TSecondResult;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit DistinctConsumer;
+interface
+uses DistinctFirst, DistinctSecond;
+implementation
+procedure Caller;
+var
+  Value: DistinctFirst.TValue;
+begin
+  Choose(Value).FirstMember;
+end;
+end.
+"#;
+    let first_uri = uri("DistinctFirst");
+    let second_uri = uri("DistinctSecond");
+    let consumer_uri = uri("DistinctConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(first_uri.clone(), FIRST.to_owned())
+        .expect("first distinct type source parses");
+    index
+        .update(second_uri, SECOND.to_owned())
+        .expect("second distinct type source parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("cross-unit overload source parses");
+
+    let navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Choose(Value)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &first_uri,
+        position_of(FIRST, "Choose(Value: TValue)", 0),
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "Choose(Value).FirstM", 0),
+        )
+        .expect("cross-unit overload completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["FirstMember"]
+    );
+}
+
+#[test]
+fn overload_selection_handles_inherited_methods_and_constructors() {
+    let source = r#"unit MethodOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TStringResult = class
+    StringMember: Integer;
+  end;
+  TBase = class
+    function Make(Value: Integer): TIntResult; overload;
+    function Make(Value: string): TStringResult; overload;
+  end;
+  TChild = class(TBase)
+    ChildMember: Integer;
+    constructor Create(Value: Integer); overload;
+    constructor Create(Value: string); overload;
+  end;
+implementation
+function TBase.Make(Value: Integer): TIntResult;
+begin
+end;
+function TBase.Make(Value: string): TStringResult;
+begin
+end;
+constructor TChild.Create(Value: Integer);
+begin
+end;
+constructor TChild.Create(Value: string);
+begin
+end;
+procedure Caller;
+var
+  Value: TChild;
+begin
+  Value.Make(1).IntMember;
+  Value.Make('text').StringMember;
+  TChild.Create(1).ChildMember;
+  TChild.Create('text').ChildMember;
+end;
+end.
+"#;
+    let source_uri = uri("MethodOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("method overload source parses");
+
+    let base_method = index.navigate(
+        &source_uri,
+        position_of(source, "Make(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_method.len(), 1);
+    assert_location_start(
+        &base_method[0],
+        &source_uri,
+        position_of(source, "Make(Value: Integer)", 0),
+    );
+
+    let child_method = index.navigate(
+        &source_uri,
+        position_of(source, "Make('text')", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child_method.len(), 1);
+    assert_location_start(
+        &child_method[0],
+        &source_uri,
+        position_of(source, "Make(Value: string)", 0),
+    );
+
+    let base_completion = index
+        .completion(&source_uri, position_after(source, "Value.Make(1).IntM", 0))
+        .expect("inherited method result completion");
+    assert_eq!(
+        base_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["IntMember"]
+    );
+
+    let child_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Value.Make('text').StringM", 0),
+        )
+        .expect("child method result completion");
+    assert_eq!(
+        child_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["StringMember"]
+    );
+
+    let integer_constructor = index.navigate(
+        &source_uri,
+        position_of(source, "Create(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(integer_constructor.len(), 1);
+    assert_location_start(
+        &integer_constructor[0],
+        &source_uri,
+        position_of(source, "Create(Value: Integer)", 0),
+    );
+
+    let string_constructor = index.navigate(
+        &source_uri,
+        position_of(source, "Create('text')", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(string_constructor.len(), 1);
+    assert_location_start(
+        &string_constructor[0],
+        &source_uri,
+        position_of(source, "Create(Value: string)", 0),
+    );
+
+    let constructor_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "TChild.Create(1).ChildM", 0),
+        )
+        .expect("constructor result completion");
+    assert_eq!(
+        constructor_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["ChildMember"]
+    );
+}
+
+#[test]
+fn overload_selection_keeps_equal_and_unknown_matches_ambiguous() {
+    let source = r#"unit AmbiguousOverloads;
+interface
+type
+  TIntResult = class
+    IntMember: Integer;
+  end;
+  TCardinalResult = class
+    CardinalMember: Integer;
+  end;
+  TRealResult = class
+    RealMember: Integer;
+  end;
+function Tie(Value: Integer): TIntResult; overload;
+function Tie(Value: Cardinal): TCardinalResult; overload;
+function Prefer(Value: Integer): TIntResult; overload;
+function Prefer(Value: Real): TRealResult; overload;
+function Solo(Value: Integer): TIntResult; overload;
+implementation
+procedure Caller;
+begin
+  Tie(1).IntMember;
+  Prefer(1).IntMember;
+  Prefer(UnknownValue).IntMember;
+  Solo(UnknownValue).IntMember;
+  Solo('text').IntMember;
+end;
+end.
+"#;
+    let source_uri = uri("AmbiguousOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ambiguous overload source parses");
+
+    let equal_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Tie(1)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(equal_navigation.len(), 2);
+
+    let widening_completion = index
+        .completion(&source_uri, position_after(source, "Prefer(1).IntM", 0))
+        .expect("widening overload completion");
+    assert_eq!(
+        widening_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["IntMember"]
+    );
+
+    let unknown_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Prefer(UnknownValue).IntM", 0),
+        )
+        .expect("unknown overload completion");
+    assert!(unknown_completion.items.is_empty());
+    assert!(unknown_completion.is_incomplete);
+
+    let single_unknown_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "Solo(UnknownValue).IntM", 0),
+        )
+        .expect("single unknown overload completion");
+    assert!(single_unknown_completion.items.is_empty());
+    assert!(single_unknown_completion.is_incomplete);
+
+    let incompatible_navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Solo('text')", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(incompatible_navigation.is_empty());
+
+    let unknown_signature = index
+        .signature_help(
+            &source_uri,
+            position_after(source, "Prefer(UnknownValue", 0),
+        )
+        .expect("unknown overload signature help")
+        .expect("unknown overload signatures");
+    assert_eq!(unknown_signature.signatures.len(), 2);
+    assert_eq!(unknown_signature.active_signature, None);
+}
+
+#[test]
+fn signature_help_keeps_overloads_for_an_incomplete_known_call() {
+    let source = r#"unit IncompleteOverloads;
+interface
+type
+  TIntResult = class
+  end;
+  TStringResult = class
+  end;
+function Pick(Value: Integer): TIntResult; overload;
+function Pick(Value: string): TStringResult; overload;
+implementation
+procedure Caller;
+begin
+  Pick(1
+end;
+end.
+"#;
+    let source_uri = uri("IncompleteOverloads");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("incomplete overload source parses");
+
+    let help = index
+        .signature_help(&source_uri, position_after(source, "Pick(1", 0))
+        .expect("incomplete overload signature help")
+        .expect("incomplete overload call");
+    assert_eq!(help.signatures.len(), 2);
+    assert_eq!(help.active_signature, Some(0));
+    assert_eq!(help.active_parameter, Some(0));
+}
+
+#[test]
+fn signature_help_rejects_an_oversized_overload_selection() {
+    let mut source = String::from("unit OverloadSelectionLimit;\ninterface\n");
+    for index in 0..129 {
+        writeln!(&mut source, "procedure Run(Value: T{index}); overload;")
+            .expect("write overload declaration");
+    }
+    source.push_str("implementation\nprocedure Caller;\nbegin\n  Run(UnknownValue);\nend;\nend.\n");
+    let source_uri = uri("OverloadSelectionLimit");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("overload selection limit source parses");
+
+    let error = index
+        .signature_help(&source_uri, position_after(&source, "  Run(", 0))
+        .expect_err("overload selection must be bounded");
+    assert!(
+        error.contains("overload selection exceeds the 128-group limit"),
+        "{error}"
+    );
+}
 
 #[test]
 fn completion_projection_is_scope_aware_and_uses_plain_identifier_edits() {
@@ -1018,6 +3779,180 @@ end.
     assert_eq!(
         known_header.signatures[0].parameters.as_ref().map(Vec::len),
         Some(1)
+    );
+}
+
+#[test]
+fn inline_variables_are_visible_only_inside_their_blocks() {
+    let source = r#"unit BlockInline;
+interface
+var
+  Value: Integer;
+  Inferred: Integer;
+implementation
+procedure Run;
+begin
+  Value := 1;
+  if True then
+  begin
+    var Value: Integer;
+    Value := 2;
+    if True then
+    begin
+      var Inferred := Value;
+      Inferred := 3;
+    end;
+  end;
+  Value := 4;
+  Inferred := 5;
+end;
+end.
+"#;
+    let source_uri = uri("BlockInline");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inline variable source parses");
+
+    let global_value = position_of(source, "Value: Integer", 0);
+    let local_value = position_of(source, "Value: Integer", 1);
+    let global_inferred = position_of(source, "Inferred: Integer", 0);
+    let nested_inferred = position_of(source, "Inferred := 3", 0);
+
+    let before_block = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(before_block.len(), 1);
+    assert_location_start(&before_block[0], &source_uri, global_value);
+
+    let inside_block = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 2", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(inside_block.len(), 1);
+    assert_location_start(&inside_block[0], &source_uri, local_value);
+
+    let nested_use = index.navigate(&source_uri, nested_inferred, NavigationTarget::Declaration);
+    assert_eq!(nested_use.len(), 1);
+    assert_location_start(
+        &nested_use[0],
+        &source_uri,
+        position_of(source, "Inferred :=", 0),
+    );
+
+    let after_block = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 4", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(after_block.len(), 1);
+    assert_location_start(&after_block[0], &source_uri, global_value);
+
+    let after_nested_block = index.navigate(
+        &source_uri,
+        position_of(source, "Inferred := 5", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(after_nested_block.len(), 1);
+    assert_location_start(&after_nested_block[0], &source_uri, global_inferred);
+}
+
+#[test]
+fn unknown_member_access_keeps_overload_and_result_resolution_uncertain() {
+    let provider = r#"unit UnknownOverloadProvider;
+interface
+type
+  TProtectedResult = class
+    ProtectedMember: Integer;
+  end;
+  TPublicResult = class
+    PublicMember: Integer;
+  end;
+  TBase = class
+  strict protected
+    function Pick(Value: Integer): TProtectedResult; overload;
+  public
+    function Pick(Value: Int64): TPublicResult; overload;
+  end;
+implementation
+function TBase.Pick(Value: Integer): TProtectedResult;
+begin
+  Result := TProtectedResult.Create;
+end;
+function TBase.Pick(Value: Int64): TPublicResult;
+begin
+  Result := TPublicResult.Create;
+end;
+end.
+"#;
+    let consumer = r#"unit UnknownOverloadConsumer;
+interface
+uses UnknownOverloadProvider;
+type
+  TChild = class(MissingBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+var
+  Obj: TBase;
+  N: Integer;
+begin
+  Obj.Pick(N);
+  Obj.Pick(N).PublicMember;
+end;
+end.
+"#;
+    let provider_uri = uri("UnknownOverloadProvider");
+    let consumer_uri = uri("UnknownOverloadConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("unknown overload provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("unknown overload consumer parses");
+
+    let navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Pick(N)", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        navigation.is_empty(),
+        "unknown access selected a public overload: {navigation:?}"
+    );
+
+    let signature = index
+        .signature_help(&consumer_uri, position_after(consumer, "Obj.Pick(N", 0))
+        .expect("unknown access signature help");
+    assert!(
+        signature.is_none(),
+        "unknown access produced a definite signature: {signature:?}"
+    );
+
+    let result_navigation = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "PublicMember", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        result_navigation.is_empty(),
+        "unknown access selected a public result: {result_navigation:?}"
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "Obj.Pick(N).Pub", 0),
+        )
+        .expect("unknown access result completion");
+    assert!(
+        completion.items.is_empty() && completion.is_incomplete,
+        "unknown access produced a definite result completion: {completion:?}"
     );
 }
 
@@ -1665,7 +4600,1306 @@ end.
 }
 
 #[test]
-fn signature_help_rejects_lookup_inside_a_with_receiver_context() {
+fn completion_bare_dot_allows_a_bounded_whitespace_gap_after_an_expression() {
+    let marked = r#"unit BareExpressionWhitespace;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().   |;
+end;
+end.
+"#;
+    let cursor_offset = marked.find('|').expect("whitespace cursor");
+    let source = marked.replacen('|', "", 1);
+    let source_uri = uri("BareExpressionWhitespace");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("whitespace expression source parses");
+
+    let completion = index
+        .completion(
+            &source_uri,
+            text::offset_to_position(&source, cursor_offset).expect("whitespace position"),
+        )
+        .expect("whitespace expression completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+}
+
+#[test]
+fn completion_bare_dot_rejects_an_unbounded_whitespace_gap_after_an_expression() {
+    let gap = " ".repeat(257);
+    let source = format!(
+        "unit BareExpressionWhitespaceBound;\ninterface\ntype\n  TObj = class\n    Member: Integer;\n  end;\nfunction MakeValue: TObj;\nimplementation\nfunction MakeValue: TObj;\nbegin\n  Result := TObj.Create;\nend;\nprocedure Caller;\nbegin\n  MakeValue().{gap};\nend;\nend.\n"
+    );
+    let source_uri = uri("BareExpressionWhitespaceBound");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("bounded whitespace source parses");
+    let cursor_offset = source
+        .find(&format!("MakeValue().{gap}"))
+        .map(|start| start + "MakeValue().".len() + gap.len())
+        .expect("bounded whitespace cursor");
+
+    let completion = index
+        .completion(
+            &source_uri,
+            text::offset_to_position(&source, cursor_offset).expect("bounded whitespace position"),
+        )
+        .expect("bounded whitespace completion");
+    assert!(completion.items.is_empty());
+}
+
+#[test]
+fn completion_bare_dot_with_a_malformed_expression_receiver_fails_closed() {
+    let source = r#"unit BareMalformedExpression;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue(.   ;
+end;
+end.
+"#;
+    let source_uri = uri("BareMalformedExpression");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("malformed expression source parses with recovery");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "MakeValue(.   ", 0))
+        .expect("malformed expression completion");
+    assert!(completion.items.is_empty());
+}
+
+#[test]
+fn completion_bare_dot_resolves_a_source_typed_function_call_receiver() {
+    let marked = r#"unit SourceTypedExpressionReceiver;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().|;
+end;
+end.
+"#;
+    let cursor_offset = marked.find('|').expect("function receiver cursor");
+    let source = marked.replacen('|', "", 1);
+    let source_uri = uri("SourceTypedExpressionReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source-typed expression receiver parses");
+
+    let completion = index
+        .completion(
+            &source_uri,
+            text::offset_to_position(&source, cursor_offset).expect("function receiver position"),
+        )
+        .expect("source-typed expression receiver completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+}
+
+#[test]
+fn unknown_conditional_helpers_do_not_yield_a_unique_member() {
+    let source = r#"unit UnknownConditionalHelper;
+interface
+type
+  TWidget = class
+  end;
+{$IF CompilerVersion >= 24}
+  TWidgetHelper = class helper for TWidget
+    procedure Touch;
+  end;
+{$ENDIF}
+
+procedure Run;
+
+implementation
+
+procedure TWidgetHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("UnknownConditionalHelper");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown conditional helper source parses");
+
+    assert!(
+        index
+            .navigate(
+                &source_uri,
+                position_of(source, "Touch", 2),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "an unknown conditional helper must not produce a unique member"
+    );
+}
+
+#[test]
+fn navigation_resolves_a_source_typed_function_call_receiver() {
+    let source = r#"unit SourceTypedNavigationReceiver;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Member;
+end;
+end.
+"#;
+    let source_uri = uri("SourceTypedNavigationReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source-typed navigation receiver parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Member", 0));
+}
+
+#[test]
+fn navigation_resolves_constructor_and_cast_expression_receivers() {
+    let source = r#"unit ConstructorAndCastReceivers;
+interface
+type
+  TWidget = class
+    constructor Create;
+    Member: Integer;
+  end;
+procedure Caller;
+implementation
+constructor TWidget.Create;
+begin
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  TWidget.Create.Member;
+  TWidget(Obj).Member;
+  (Obj as TWidget).Member;
+end;
+end.
+"#;
+    let source_uri = uri("ConstructorAndCastReceivers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("constructor and cast source parses");
+
+    for occurrence in 1..=3 {
+        let locations = index.navigate(
+            &source_uri,
+            position_of(source, "Member", occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "Member occurrence {occurrence}");
+        assert_location_start(&locations[0], &source_uri, position_of(source, "Member", 0));
+    }
+
+    let constructor_type = index.type_definitions(&source_uri, position_of(source, "Create", 2));
+    assert_eq!(constructor_type.len(), 1);
+    assert_location_start(
+        &constructor_type[0],
+        &source_uri,
+        position_of(source, "TWidget", 0),
+    );
+}
+
+#[test]
+fn inherited_constructor_type_definition_uses_the_constructed_type() {
+    let source = r#"unit InheritedConstructorTypeDefinition;
+interface
+type
+  TBase = class
+    constructor Create;
+  end;
+  TChild = class(TBase)
+  end;
+implementation
+constructor TBase.Create;
+begin
+end;
+procedure Caller;
+begin
+  TChild.Create;
+end;
+end.
+"#;
+    let source_uri = uri("InheritedConstructorTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited constructor source parses");
+
+    let definition = index.navigate(
+        &source_uri,
+        position_of(source, "Create", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(definition.len(), 1);
+    assert_location_start(
+        &definition[0],
+        &source_uri,
+        position_of(source, "Create", 0),
+    );
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Create", 2));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &source_uri,
+        position_of(source, "TChild", 0),
+    );
+}
+
+#[test]
+fn navigation_resolves_nested_function_result_member_chains() {
+    let source = r#"unit NestedFunctionResultChain;
+interface
+type
+  TLeaf = class
+    Name: Integer;
+  end;
+  TFactory = class
+    Child: TLeaf;
+  end;
+function Factory: TFactory;
+implementation
+function Factory: TFactory;
+begin
+  Result := TFactory.Create;
+end;
+procedure Caller;
+begin
+  Factory().Child.Name;
+end;
+end.
+"#;
+    let source_uri = uri("NestedFunctionResultChain");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested function result source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Name", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Name", 0));
+}
+
+#[test]
+fn nested_constructor_call_receivers_stop_at_the_receiver_work_bound() {
+    let chain_length = 14;
+    let mut chain = String::from("  TObj");
+    for _ in 0..chain_length {
+        chain.push_str(".Create()");
+    }
+    chain.push_str(".Member;\n");
+    let source = format!(
+        "unit NestedConstructorReceiverBound;\ninterface\ntype\n  TObj = class\n    constructor Create;\n    Member: Integer;\n  end;\nimplementation\nconstructor TObj.Create;\nbegin\nend;\nprocedure Caller;\nbegin\n{chain}end;\nend.\n"
+    );
+    let source_uri = uri("NestedConstructorReceiverBound");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("nested constructor receiver source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(&source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        locations.is_empty(),
+        "nested constructor calls must fail closed at the receiver work bound"
+    );
+}
+
+#[test]
+fn deep_constructor_receiver_completion_reports_receiver_uncertainty() {
+    let chain_length = 14;
+    let mut expression = String::from("TObj");
+    for _ in 0..chain_length {
+        expression.push_str(".Create()");
+    }
+    expression.push_str(".Me");
+    let source = format!(
+        "unit DeepConstructorCompletion;\ninterface\ntype\n  TObj = class\n    constructor Create;\n    Member: Integer;\n  end;\nimplementation\nconstructor TObj.Create;\nbegin\nend;\nprocedure Caller;\nbegin\n  {expression};\nend;\nend.\n"
+    );
+    let source_uri = uri("DeepConstructorCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("deep constructor completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(&source, &expression, 0))
+        .expect("deep constructor completion");
+    assert!(completion.items.is_empty());
+    assert!(
+        completion.is_incomplete,
+        "receiver work/depth exhaustion must remain incomplete"
+    );
+}
+
+#[test]
+fn function_result_types_keep_the_declaring_unit_context() {
+    let provider = r#"unit ResultProvider;
+interface
+type
+  TResult = class
+    ProviderMember: Integer;
+  end;
+function MakeResult: TResult;
+implementation
+function MakeResult: TResult;
+begin
+  Result := TResult.Create;
+end;
+end.
+"#;
+    let consumer = r#"unit ResultConsumer;
+interface
+uses ResultProvider;
+type
+  TResult = class
+    ConsumerMember: Integer;
+  end;
+implementation
+procedure Caller;
+begin
+  ResultProvider.MakeResult().ProviderMember;
+end;
+end.
+"#;
+    let provider_uri = uri("ResultProvider");
+    let consumer_uri = uri("ResultConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("result provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("result consumer parses");
+
+    let locations = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "ProviderMember", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &provider_uri,
+        position_of(provider, "ProviderMember", 0),
+    );
+}
+
+#[test]
+fn function_result_annotations_keep_the_interface_type_scope() {
+    let provider = r#"unit ResultAnnotationProvider;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit ResultAnnotationConsumer;
+interface
+uses ResultAnnotationProvider;
+function Make: TResult;
+implementation
+type
+  TResult = record
+    Name: string;
+  end;
+function Make: TResult;
+begin
+end;
+procedure Caller;
+begin
+  Make().Name;
+end;
+end.
+"#;
+    let provider_uri = uri("ResultAnnotationProvider");
+    let consumer_uri = uri("ResultAnnotationConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("annotation provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("annotation consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("ResultAnnotationProvider".to_owned(), provider_uri.clone())],
+    );
+
+    let member = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Name", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(&member[0], &provider_uri, position_of(provider, "Name", 0));
+
+    let hover = index
+        .hover(&consumer_uri, position_of(consumer, "Name", 1))
+        .expect("provider result member hover");
+    assert!(hover_text(&hover).contains("Name: Integer"));
+    assert!(!hover_text(&hover).contains("Name: string"));
+
+    let type_definition = index.type_definitions(&consumer_uri, position_of(consumer, "Make", 2));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &provider_uri,
+        position_of(provider, "TResult", 0),
+    );
+}
+
+#[test]
+fn implementation_only_function_result_excludes_its_own_body_type_scope() {
+    let provider = r#"unit TypeSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit ImplementationOnlyResult;
+interface
+uses TypeSource;
+implementation
+function Make: TResult;
+type
+  TResult = record
+    Name: string;
+  end;
+begin
+  Result.Name := '';
+end;
+procedure Caller;
+begin
+  Make().Name;
+end;
+end.
+"#;
+    let provider_uri = uri("TypeSource");
+    let consumer_uri = uri("ImplementationOnlyResult");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("type source parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("implementation-only result source parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("TypeSource".to_owned(), provider_uri.clone())],
+    );
+
+    let result_member_position = position_of(consumer, "Name", 1);
+    let result_member = index.navigate(
+        &consumer_uri,
+        result_member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(result_member.len(), 1);
+    assert_location_start(
+        &result_member[0],
+        &provider_uri,
+        position_of(provider, "Name", 0),
+    );
+
+    let result_hover = index
+        .hover(&consumer_uri, result_member_position)
+        .expect("provider Result member hover");
+    assert!(hover_text(&result_hover).contains("Name: Integer"));
+    assert!(!hover_text(&result_hover).contains("Name: string"));
+
+    let result_type_definition =
+        index.type_definitions(&consumer_uri, position_of(consumer, "Result", 3));
+    assert_eq!(result_type_definition.len(), 1);
+    assert_location_start(
+        &result_type_definition[0],
+        &provider_uri,
+        position_of(provider, "TResult", 0),
+    );
+
+    let member_position = position_of(consumer, "Name", 2);
+    let member = index.navigate(
+        &consumer_uri,
+        member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(&member[0], &provider_uri, position_of(provider, "Name", 0));
+
+    let hover = index
+        .hover(&consumer_uri, member_position)
+        .expect("provider result member hover");
+    assert!(hover_text(&hover).contains("Name: Integer"));
+    assert!(!hover_text(&hover).contains("Name: string"));
+
+    let type_definition = index.type_definitions(&consumer_uri, position_of(consumer, "Make", 1));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &provider_uri,
+        position_of(provider, "TResult", 0),
+    );
+}
+
+#[test]
+fn nested_function_result_excludes_its_own_body_but_keeps_outer_type_scope() {
+    let provider = r#"unit NestedTypeSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit NestedImplementationOnlyResult;
+interface
+uses NestedTypeSource;
+implementation
+procedure Outer;
+type
+  TResult = record
+    Name: string;
+  end;
+  function Make: TResult;
+  type
+    TResult = record
+      Name: Boolean;
+    end;
+  begin
+    Result.Name := False;
+  end;
+begin
+  Make().Name;
+end;
+end.
+"#;
+    let provider_uri = uri("NestedTypeSource");
+    let consumer_uri = uri("NestedImplementationOnlyResult");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("nested type source parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("nested implementation-only result source parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("NestedTypeSource".to_owned(), provider_uri.clone())],
+    );
+
+    let result_member_position = position_of(consumer, "Name", 2);
+    let result_member = index.navigate(
+        &consumer_uri,
+        result_member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(result_member.len(), 1);
+    assert_location_start(
+        &result_member[0],
+        &consumer_uri,
+        position_of(consumer, "Name", 0),
+    );
+
+    let result_hover = index
+        .hover(&consumer_uri, result_member_position)
+        .expect("outer Result member hover");
+    assert!(hover_text(&result_hover).contains("Name: string"));
+    assert!(!hover_text(&result_hover).contains("Name: Boolean"));
+    assert!(!hover_text(&result_hover).contains("Name: Integer"));
+
+    let result_type_definition =
+        index.type_definitions(&consumer_uri, position_of(consumer, "Result", 4));
+    assert_eq!(result_type_definition.len(), 1);
+    assert_location_start(
+        &result_type_definition[0],
+        &consumer_uri,
+        position_of(consumer, "TResult", 0),
+    );
+
+    let member_position = position_of(consumer, "Name", 3);
+    let member = index.navigate(
+        &consumer_uri,
+        member_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(&member[0], &consumer_uri, position_of(consumer, "Name", 0));
+
+    let hover = index
+        .hover(&consumer_uri, member_position)
+        .expect("outer result member hover");
+    assert!(hover_text(&hover).contains("Name: string"));
+    assert!(!hover_text(&hover).contains("Name: Boolean"));
+    assert!(!hover_text(&hover).contains("Name: Integer"));
+
+    let type_definition = index.type_definitions(&consumer_uri, position_of(consumer, "Make", 1));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &consumer_uri,
+        position_of(consumer, "TResult", 0),
+    );
+}
+
+#[test]
+fn type_definitions_distinguish_result_members_from_implicit_function_results() {
+    let source = r#"unit MemberTypeDefinition;
+interface
+type
+  TFieldType = class end;
+  TReturnType = class end;
+  TBox = record
+    Result: TFieldType;
+  end;
+function Make: TReturnType;
+implementation
+function Make: TReturnType;
+var
+  Box: TBox;
+begin
+  Box.Result := nil;
+  Result := nil;
+end;
+end.
+"#;
+    let source_uri = uri("ResultMemberTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("result member type-definition source parses");
+
+    let declaration =
+        index.type_definitions(&source_uri, position_of(source, "Result: TFieldType", 0));
+    assert_exact_type_location(&declaration, &source_uri, source, "TFieldType", 0);
+
+    let qualified_member = index.type_definitions(&source_uri, position_of(source, "Result", 1));
+    assert_exact_type_location(&qualified_member, &source_uri, source, "TFieldType", 0);
+
+    let implicit_result = index.type_definitions(&source_uri, position_of(source, "Result", 2));
+    assert_exact_type_location(&implicit_result, &source_uri, source, "TReturnType", 0);
+
+    let member_position = position_of(source, "Result", 1);
+    let definition = index.navigate(&source_uri, member_position, NavigationTarget::Declaration);
+    assert_eq!(definition.len(), 1);
+    assert_location_start(
+        &definition[0],
+        &source_uri,
+        position_of(source, "Result: TFieldType", 0),
+    );
+    let hover = index
+        .hover(&source_uri, member_position)
+        .expect("Result field hover");
+    assert!(hover_text(&hover).contains("Result: TFieldType"));
+}
+
+#[test]
+fn implicit_result_type_definitions_out_rank_class_and_unit_bindings() {
+    let source = r#"unit Precedence;
+interface
+type
+  TFieldType = class end;
+  TReturnType = class end;
+  TBox = class
+    Result: TFieldType;
+    function Make: TReturnType;
+  end;
+var
+  Result: TFieldType;
+implementation
+function TBox.Make: TReturnType;
+begin
+  Self.Result := nil;
+  Result := nil;
+end;
+function FreeMake: TReturnType;
+begin
+  Result := nil;
+end;
+function LocalMake: TReturnType;
+var
+  Result: TFieldType;
+begin
+  Result := nil;
+end;
+end.
+"#;
+    let source_uri = uri("ResultPrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("result precedence source parses");
+
+    let field_declaration =
+        index.type_definitions(&source_uri, position_of(source, "Result: TFieldType", 0));
+    assert_exact_type_location(&field_declaration, &source_uri, source, "TFieldType", 0);
+
+    let unit_declaration =
+        index.type_definitions(&source_uri, position_of(source, "Result: TFieldType", 1));
+    assert_exact_type_location(&unit_declaration, &source_uri, source, "TFieldType", 0);
+
+    let member = index.type_definitions(&source_uri, position_of(source, "Result", 2));
+    assert_exact_type_location(&member, &source_uri, source, "TFieldType", 0);
+
+    let method_result = index.type_definitions(&source_uri, position_of(source, "Result", 3));
+    assert_exact_type_location(&method_result, &source_uri, source, "TReturnType", 0);
+
+    let free_result = index.type_definitions(&source_uri, position_of(source, "Result", 4));
+    assert_exact_type_location(&free_result, &source_uri, source, "TReturnType", 0);
+
+    let local_result = index.type_definitions(&source_uri, position_of(source, "Result", 6));
+    assert_exact_type_location(&local_result, &source_uri, source, "TFieldType", 0);
+}
+
+#[test]
+fn implicit_result_type_definitions_out_rank_imported_bindings() {
+    let provider = r#"unit ImportedProvider;
+interface
+type
+  TImportedField = class end;
+var
+  Result: TImportedField;
+implementation
+end.
+"#;
+    let consumer = r#"unit ImportedConsumer;
+interface
+uses ImportedProvider;
+type
+  TReturnType = class end;
+function Make: TReturnType;
+implementation
+function Make: TReturnType;
+begin
+  Result := nil;
+end;
+end.
+"#;
+    let provider_uri = uri("ImportedProvider");
+    let consumer_uri = uri("ImportedConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("imported result provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("imported result consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("ImportedProvider".to_owned(), provider_uri.clone())],
+    );
+
+    let result_position = position_of(consumer, "Result", 0);
+    let definition = index.navigate(
+        &consumer_uri,
+        result_position,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(definition.len(), 1);
+    assert_location_start(
+        &definition[0],
+        &provider_uri,
+        position_of(provider, "Result: TImportedField", 0),
+    );
+
+    let result = index.type_definitions(&consumer_uri, result_position);
+    assert_exact_type_location(&result, &consumer_uri, consumer, "TReturnType", 0);
+}
+
+#[test]
+fn inherited_methods_preserve_their_result_type_context() {
+    let source = r#"unit InheritedResultContext;
+interface
+type
+  TResult = class
+    Member: Integer;
+  end;
+  TBase = class
+    function Build: TResult;
+  end;
+  TChild = class(TBase)
+  end;
+implementation
+function TBase.Build: TResult;
+begin
+  Result := TResult.Create;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Build().Member;
+end;
+end.
+"#;
+    let source_uri = uri("InheritedResultContext");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited result source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Member", 0));
+}
+
+#[test]
+fn known_argument_selects_an_overload_receiver() {
+    let source = r#"unit AmbiguousFunctionResult;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function Make(Value: Integer): TObj; overload;
+function Make(Value: string): TObj; overload;
+implementation
+function Make(Value: Integer): TObj;
+begin
+  Result := TObj.Create;
+end;
+function Make(Value: string): TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  Make(1).Member;
+  Make('text').Member;
+end;
+end.
+"#;
+    let source_uri = uri("AmbiguousFunctionResult");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ambiguous function result source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(navigation.len(), 1);
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "Member", 0),
+    );
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Make(1).Me", 0))
+        .expect("integer overload result completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+    assert!(!completion.is_incomplete);
+
+    let string_completion = index
+        .completion(&source_uri, position_after(source, "Make('text').Me", 0))
+        .expect("string overload result completion");
+    assert_eq!(
+        string_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+    assert!(!string_completion.is_incomplete);
+}
+
+#[test]
+fn type_definition_resolves_a_function_result_type() {
+    let source = r#"unit FunctionResultTypeDefinition;
+interface
+type
+  TObj = class
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Create;
+end;
+end.
+"#;
+    let source_uri = uri("FunctionResultTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("function result type definition source parses");
+
+    let locations = index.type_definitions(&source_uri, position_of(source, "MakeValue", 2));
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "TObj", 0));
+}
+
+#[test]
+fn completion_resolves_cast_and_nested_result_receivers() {
+    let source = r#"unit CompletionExpressionReceivers;
+interface
+type
+  TLeaf = class
+    Name: Integer;
+  end;
+  TFactory = class
+    Child: TLeaf;
+  end;
+  TWidget = class
+    Member: Integer;
+    constructor Create;
+  end;
+function Factory: TFactory;
+implementation
+function Factory: TFactory;
+begin
+  Result := TFactory.Create;
+end;
+constructor TWidget.Create;
+begin
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  TWidget.Create.Me;
+  TWidget(Obj).Me;
+  (Obj as TWidget).Me;
+  Factory().Child.Na;
+end;
+end.
+"#;
+    let source_uri = uri("CompletionExpressionReceivers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("completion expression receiver source parses");
+
+    let cast_completion = index
+        .completion(&source_uri, position_after(source, "TWidget(Obj).Me", 0))
+        .expect("cast completion");
+    assert_eq!(
+        cast_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let constructor_completion = index
+        .completion(&source_uri, position_after(source, "TWidget.Create.Me", 0))
+        .expect("constructor completion");
+    assert_eq!(
+        constructor_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let as_completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "(Obj as TWidget).Me", 0),
+        )
+        .expect("as completion");
+    assert_eq!(
+        as_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let chain_completion = index
+        .completion(&source_uri, position_after(source, "Factory().Child.Na", 0))
+        .expect("nested result completion");
+    assert_eq!(
+        chain_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Name"]
+    );
+}
+
+#[test]
+fn casts_reject_variable_rhs_receivers() {
+    let source = r#"unit InvalidCastVariableReceiver;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    Member: Integer;
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  OtherObj: TOther;
+begin
+  (Obj as OtherObj).Member;
+end;
+end.
+"#;
+    let source_uri = uri("InvalidCastVariableReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("invalid cast source parses");
+
+    let navigation = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 2),
+        NavigationTarget::Declaration,
+    );
+    assert!(navigation.is_empty());
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(source, "(Obj as OtherObj).Me", 0),
+        )
+        .expect("invalid cast completion");
+    assert!(completion.items.is_empty());
+}
+
+#[test]
+fn qualified_cast_type_root_respects_a_shadowing_local_value() {
+    let provider = r#"unit CastTypes;
+interface
+type
+  TResult = class
+    Member: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit QualifiedCastRootShadow;
+interface
+uses CastTypes;
+type
+  TWidget = class
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  CastTypes: Integer;
+begin
+  (Obj as CastTypes.TResult).Member;
+end;
+end.
+"#;
+    let provider_uri = uri("CastTypes");
+    let consumer_uri = uri("QualifiedCastRootShadow");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("cast type provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("qualified cast shadow source parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("CastTypes".to_owned(), provider_uri.clone())],
+    );
+
+    let member = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Member", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(member.is_empty(), "a value shadow must block the unit root");
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "(Obj as CastTypes.TResult).Me", 0),
+        )
+        .expect("qualified cast shadow completion");
+    assert!(completion.items.is_empty());
+}
+
+#[test]
+fn signature_help_resolves_a_function_result_method_receiver() {
+    let source = r#"unit SignatureFunctionResultReceiver;
+interface
+type
+  TObj = class
+    procedure Run(Value: Integer);
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure TObj.Run(Value: Integer);
+begin
+end;
+procedure Caller;
+begin
+  MakeValue().Run(1);
+end;
+end.
+"#;
+    let source_uri = uri("SignatureFunctionResultReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("signature function result source parses");
+
+    let result = index
+        .signature_help(&source_uri, position_after(source, "MakeValue().Run(1", 0))
+        .expect("function result signature projection");
+    let help = result.expect("function result method call must resolve");
+    assert_eq!(
+        help.signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(Value: Integer);"]
+    );
+}
+
+#[test]
+fn hover_resolves_a_function_result_member_receiver() {
+    let source = r#"unit HoverFunctionResultReceiver;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Member := 1;
+end;
+end.
+"#;
+    let source_uri = uri("HoverFunctionResultReceiver");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("hover function result source parses");
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Member", 1))
+        .expect("function result member hover");
+    assert!(hover_text(&hover).contains("Member: Integer"));
+}
+
+#[test]
+fn signature_help_resolves_lookup_inside_a_with_receiver_context() {
     let source = r#"unit WithSignature;
 interface
 type
@@ -1695,17 +5929,22 @@ end.
         .update(source_uri.clone(), source.to_owned())
         .expect("with signature source parses");
 
-    assert!(
-        index
-            .signature_help(&source_uri, position_after(source, "    Run(", 0))
-            .expect("with signature projection")
-            .is_none(),
-        "with receiver lookup must fail closed"
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "    Run(", 0))
+        .expect("with signature projection")
+        .expect("with receiver lookup");
+    assert_eq!(
+        signature
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(Text: string);"]
     );
 }
 
 #[test]
-fn completion_rejects_blank_positions_inside_a_with_context() {
+fn completion_lists_members_at_a_blank_position_inside_a_with_context() {
     let marked = r#"unit WithCompletion;
 interface
 type
@@ -1739,8 +5978,1545 @@ end.
     let completion = index
         .completion(&source_uri, position)
         .expect("blank with completion");
-    assert!(completion.items.is_empty());
+    assert!(
+        completion.items.iter().any(|item| item.label == "Field"),
+        "unexpected labels: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
     assert!(!completion.is_incomplete);
+}
+
+#[test]
+fn with_implicit_members_resolve_rightmost_then_earlier_receiver() {
+    let source = r#"unit TypedWithLookup;
+interface
+type
+  TLeft = record
+    LeftField: Integer;
+  end;
+  TRight = record
+    RightField: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  LeftValue: TLeft;
+  RightValue: TRight;
+begin
+  with LeftValue, RightValue do begin
+    RightField := LeftField;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithLookup");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("typed with source parses");
+
+    let right_field = index.navigate(
+        &source_uri,
+        position_of(source, "RightField", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(right_field.len(), 1);
+    assert_location_start(
+        &right_field[0],
+        &source_uri,
+        position_of(source, "RightField", 0),
+    );
+
+    let left_field = index.navigate(
+        &source_uri,
+        position_of(source, "LeftField", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(left_field.len(), 1);
+    assert_location_start(
+        &left_field[0],
+        &source_uri,
+        position_of(source, "LeftField", 0),
+    );
+}
+
+#[test]
+fn with_members_shadow_same_named_locals_only_inside_the_body() {
+    let source = r#"unit TypedWithShadowing;
+interface
+type
+  TBox = record
+    Value: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox;
+  Value: Integer;
+begin
+  with Box do begin
+    Value := 1;
+  end;
+  Value := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithShadowing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("shadowing with source parses");
+
+    let member = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(
+        &member[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let local = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local.len(), 1);
+    assert_location_start(
+        &local[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 1),
+    );
+}
+
+#[test]
+fn declarations_inside_with_bodies_are_not_implicit_members() {
+    let source = r#"unit TypedWithDeclaration;
+interface
+type
+  TBox = record
+    Value: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox;
+begin
+  with Box do begin
+    var Value: Integer;
+    Value := 1;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithDeclaration");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("declaration with source parses");
+
+    let declaration = index.navigate(
+        &source_uri,
+        position_after(source, "var ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(declaration.len(), 1);
+    assert_location_start(
+        &declaration[0],
+        &source_uri,
+        position_after(source, "var ", 0),
+    );
+}
+
+#[test]
+fn with_receiver_list_uses_earlier_receiver_for_later_receiver_expression() {
+    let source = r#"unit TypedWithReceiverList;
+interface
+type
+  TInner = record
+    Value: Integer;
+  end;
+  TOuter = record
+    Inner: TInner;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  OuterValue: TOuter;
+  Inner: TInner;
+begin
+  with OuterValue, Inner do
+    Value := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithReceiverList");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("receiver-list with source parses");
+
+    let receiver = index.navigate(
+        &source_uri,
+        position_of(source, "Inner do", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(receiver.len(), 1);
+    assert_location_start(
+        &receiver[0],
+        &source_uri,
+        position_of(source, "Inner: TInner", 0),
+    );
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+}
+
+#[test]
+fn with_factory_result_resolves_a_single_statement_member() {
+    let source = r#"unit TypedWithFactory;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeObj: TObj;
+implementation
+function MakeObj: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  with MakeObj() do
+    Member := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithFactory");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("factory with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Member :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn with_generic_receiver_preserves_specialized_nested_member_types() {
+    let source = r#"unit TypedWithGeneric;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  with Box do
+    Value.WidgetMember := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithGeneric");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic with source parses");
+
+    let box_locations = index.navigate(
+        &source_uri,
+        position_after(source, "with ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(box_locations.len(), 1);
+    assert_location_start(
+        &box_locations[0],
+        &source_uri,
+        position_of(source, "Box:", 0),
+    );
+
+    let value_locations = index.navigate(
+        &source_uri,
+        position_of(source, "Value.WidgetMember", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(value_locations.len(), 1);
+    assert_location_start(
+        &value_locations[0],
+        &source_uri,
+        position_of(source, "Value: T", 0),
+    );
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "WidgetMember :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "WidgetMember: Integer", 0),
+    );
+}
+
+#[test]
+fn deeply_nested_with_completion_stays_bounded_and_keeps_proven_members() {
+    let depth = 512;
+    let mut source = String::from(
+        "unit DeepTypedWith;\ninterface\ntype\n  TBox = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: TBox;\nbegin\n",
+    );
+    for _ in 0..depth {
+        source.push_str("  with Box do begin\n");
+    }
+    let cursor_offset = source.len() + 4;
+    source.push_str("    \n");
+    for _ in 0..depth {
+        source.push_str("  end;\n");
+    }
+    source.push_str("end;\nend.\n");
+
+    let source_uri = uri("DeepTypedWith");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.clone())
+        .expect("deep with source parses");
+    let position = text::offset_to_position(&source, cursor_offset).expect("deep with position");
+    let completion = index
+        .completion(&source_uri, position)
+        .expect("deep with completion remains responsive");
+    assert!(completion.is_incomplete);
+}
+
+#[test]
+fn with_receiver_activates_record_helpers_for_implicit_members() {
+    let source = r#"unit TypedWithHelper;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+procedure Caller;
+implementation
+procedure TPointHelper.Offset;
+begin
+end;
+procedure Caller;
+var
+  Point: TPoint;
+begin
+  with Point do
+    Offset;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithHelper");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Offset", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Offset", 0));
+}
+
+#[test]
+fn explicit_member_qualification_bypasses_an_implicit_with_receiver() {
+    let source = r#"unit TypedWithQualification;
+interface
+type
+  TObj = record
+    Field: Integer;
+  end;
+  TOther = record
+    Field: string;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Obj: TObj;
+  Other: TOther;
+begin
+  with Obj do
+    Other.Field := 'value';
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithQualification");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("qualified with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Field :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Field: string", 0),
+    );
+}
+
+#[test]
+fn dotted_with_root_remains_implicit_with_lookup() {
+    let source = r#"unit TypedWithDottedRoot;
+interface
+type
+  TLocal = record
+    Value: string;
+  end;
+  TInner = record
+    Value: Integer;
+  end;
+  TObj = record
+    Child: TInner;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Obj: TObj;
+  Child: TLocal;
+begin
+  with Obj do
+    Child.Value := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithDottedRoot");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("dotted with source parses");
+
+    let child = index.navigate(
+        &source_uri,
+        position_of(source, "Child.Value", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child.len(), 1);
+    assert_location_start(
+        &child[0],
+        &source_uri,
+        position_of(source, "Child: TInner", 0),
+    );
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+}
+
+#[test]
+fn unresolved_with_root_keeps_the_bound_member_and_fails_closed_after_type_failure() {
+    let source = r#"unit TypedWithUnknownRoot;
+interface
+type
+  TOuter = record
+    Child: TUnknown;
+  end;
+  TLocal = record
+    Value: string;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Obj: TOuter;
+  Child: TLocal;
+begin
+  with Obj do begin
+    Child.Value := 1;
+    Child.Va := 1;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownRoot");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown typed-with root source parses");
+
+    let child = index.navigate(
+        &source_uri,
+        position_of(source, "Child.Value", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child.len(), 1);
+    assert_location_start(
+        &child[0],
+        &source_uri,
+        position_of(source, "Child: TUnknown", 0),
+    );
+
+    let value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        value.is_empty(),
+        "an unresolved bound field must not fall back to the local Value: {value:?}"
+    );
+    assert!(
+        index
+            .hover(&source_uri, position_of(source, "Value :=", 0))
+            .is_none(),
+        "an unresolved bound field must not expose the local hover"
+    );
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Child.Va", 0))
+        .expect("unknown typed-with root completion");
+    assert!(
+        completion.items.iter().all(|item| item.label != "Value"),
+        "an unresolved bound field must not expose local completion: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(completion.is_incomplete);
+}
+
+#[test]
+fn unknown_with_receiver_blocks_an_unrelated_global_fallback() {
+    let source = r#"unit TypedWithUnknown;
+interface
+const
+  GlobalValue = 1;
+procedure Caller;
+implementation
+procedure Caller;
+begin
+  with UnknownReceiver do
+    GlobalValue := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknown");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "GlobalValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        locations.is_empty(),
+        "unknown with receiver must not select the global declaration"
+    );
+}
+
+#[test]
+fn unknown_with_receiver_blocks_an_unrelated_global_completion() {
+    let source = r#"unit TypedWithUnknownCompletion;
+interface
+const
+  GlobalValue = 1;
+procedure Caller;
+implementation
+procedure Caller;
+begin
+  with UnknownReceiver do
+    Glo := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Glo", 1))
+        .expect("unknown with completion");
+    assert!(
+        completion
+            .items
+            .iter()
+            .all(|item| item.label != "GlobalValue"),
+        "unknown with receiver leaked a global: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(completion.is_incomplete);
+}
+
+#[test]
+fn proven_inner_with_receiver_precedes_an_unknown_outer_context() {
+    let source = r#"unit TypedWithUnknownOuter;
+interface
+type
+  TInner = class
+    constructor Create;
+    InnerValue: Integer;
+  end;
+procedure Caller;
+implementation
+constructor TInner.Create;
+begin
+end;
+procedure Caller;
+begin
+  with UnknownOuter do
+    with TypedWithUnknownOuter.TInner.Create do
+      InnerValue := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownOuter");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown outer with source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "InnerValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "InnerValue: Integer", 0),
+    );
+}
+
+#[test]
+fn nested_with_uses_inner_then_outer_and_does_not_leak_after_body() {
+    let source = r#"unit TypedWithNesting;
+interface
+type
+  TInner = record
+    InnerValue: Integer;
+  end;
+  TOuter = record
+    OuterValue: Integer;
+    Inner: TInner;
+  end;
+const
+  OuterValue = 0;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Outer: TOuter;
+begin
+  with Outer do begin
+    with Inner do begin
+      InnerValue := 1;
+      OuterValue := 2;
+    end;
+  end;
+  OuterValue := 3;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithNesting");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested with source parses");
+
+    let inner = index.navigate(
+        &source_uri,
+        position_of(source, "InnerValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(inner.len(), 1);
+    assert_location_start(
+        &inner[0],
+        &source_uri,
+        position_of(source, "InnerValue: Integer", 0),
+    );
+
+    let outer_inside = index.navigate(
+        &source_uri,
+        position_of(source, "OuterValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(outer_inside.len(), 1);
+    assert_location_start(
+        &outer_inside[0],
+        &source_uri,
+        position_of(source, "OuterValue: Integer", 0),
+    );
+
+    let outer_after = index.navigate(
+        &source_uri,
+        position_of(source, "OuterValue :=", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(outer_after.len(), 1);
+    assert_location_start(
+        &outer_after[0],
+        &source_uri,
+        position_of(source, "OuterValue = 0", 0),
+    );
+}
+
+#[test]
+fn known_with_receivers_fall_back_to_a_local_for_an_unmatched_completion() {
+    let source = r#"unit TypedWithCompletionFallback;
+interface
+type
+  TLeft = record
+    LeftField: Integer;
+  end;
+  TRight = record
+    RightField: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  LeftValue: TLeft;
+  RightValue: TRight;
+  LocalValue: Integer;
+begin
+  with LeftValue, RightValue do
+    Loc := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithCompletionFallback");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("known completion fallback source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Loc", 1))
+        .expect("known with completion fallback");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["LocalValue"]
+    );
+    assert!(!completion.is_incomplete);
+}
+
+#[test]
+fn an_unknown_comma_receiver_does_not_hide_a_later_qualified_receiver() {
+    let source = r#"unit TypedWithUnknownReceiverList;
+interface
+type
+  TInner = class
+    constructor Create;
+    Value: Integer;
+  end;
+implementation
+constructor TInner.Create;
+begin
+end;
+procedure Caller;
+begin
+  with UnknownReceiver, TypedWithUnknownReceiverList.TInner.Create do
+    Value := 1;
+  with UnknownReceiver do
+    with TypedWithUnknownReceiverList.TInner.Create do
+      Value := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownReceiverList");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown receiver-list source parses");
+
+    let qualified_receiver = index.navigate(
+        &source_uri,
+        position_of(source, "TInner.Create", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_receiver.len(), 1);
+    assert_location_start(
+        &qualified_receiver[0],
+        &source_uri,
+        position_of(source, "TInner = class", 0),
+    );
+
+    let comma_value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(comma_value.len(), 1);
+    assert_location_start(
+        &comma_value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let nested_value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(nested_value.len(), 1);
+    assert_location_start(
+        &nested_value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+}
+
+#[test]
+fn unknown_middle_with_slots_preserve_overlay_barriers_for_comma_and_nested_forms() {
+    let source = r#"unit TypedWithUnknownMiddleOverlay;
+interface
+type
+  TInner = class
+    constructor Create;
+    Value: Integer;
+  end;
+  TOuter = record
+    Inner: TInner;
+  end;
+const
+  Value = 0;
+procedure CommaCaller;
+procedure NestedCaller;
+procedure QualifiedCaller;
+implementation
+constructor TInner.Create;
+begin
+end;
+procedure CommaCaller;
+var
+  Obj: TOuter;
+begin
+  with Obj, UnknownReceiver, Inner do begin
+    Value := 1;
+    Va := 1;
+  end;
+end;
+procedure NestedCaller;
+var
+  Obj: TOuter;
+begin
+  with Obj do
+    with UnknownReceiver do
+      with Inner do begin
+        Value := 2;
+        Va := 2;
+      end;
+end;
+procedure QualifiedCaller;
+var
+  Obj: TOuter;
+begin
+  with Obj, UnknownReceiver, TypedWithUnknownMiddleOverlay.TInner.Create do begin
+    Value := 3;
+    Va := 3;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownMiddleOverlay");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown middle with source parses");
+
+    for occurrence in 0..2 {
+        let receiver = index.navigate(
+            &source_uri,
+            position_of(source, "Inner do", occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            receiver.is_empty(),
+            "an unknown middle receiver must keep an unqualified later slot unresolved: {receiver:?}"
+        );
+        assert!(
+            index
+                .type_definitions(&source_uri, position_of(source, "Inner do", occurrence))
+                .is_empty(),
+            "an unknown middle receiver must not invent a type for the later slot"
+        );
+    }
+
+    for occurrence in 0..2 {
+        let completion_position = position_of(source, "Va :=", occurrence);
+        let completion_position = Position::new(
+            completion_position.line,
+            completion_position.character + "Va".encode_utf16().count() as u32,
+        );
+        let value = index.navigate(
+            &source_uri,
+            position_of(source, "Value :=", occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            value.is_empty(),
+            "an unknown middle receiver must block body fallback for comma/nested form: {value:?}"
+        );
+        assert!(
+            index
+                .hover(&source_uri, position_of(source, "Value :=", occurrence))
+                .is_none(),
+            "an unknown middle receiver must block body hover fallback"
+        );
+        let completion = index
+            .completion(&source_uri, completion_position)
+            .expect("unknown middle completion");
+        assert!(
+            completion.items.iter().all(|item| item.label != "Value"),
+            "an unknown middle receiver must block body completion fallback: {:?}",
+            completion
+                .items
+                .iter()
+                .map(|item| &item.label)
+                .collect::<Vec<_>>()
+        );
+        assert!(completion.is_incomplete);
+    }
+
+    let qualified_receiver = index.navigate(
+        &source_uri,
+        position_of(source, "TInner.Create do", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_receiver.len(), 1);
+    assert_location_start(
+        &qualified_receiver[0],
+        &source_uri,
+        position_of(source, "TInner = class", 0),
+    );
+    let qualified_type =
+        index.type_definitions(&source_uri, position_of(source, "TInner.Create do", 0));
+    assert_exact_type_location(&qualified_type, &source_uri, source, "TInner", 0);
+
+    let qualified_value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_value.len(), 1);
+    assert_location_start(
+        &qualified_value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+    let qualified_hover = index
+        .hover(&source_uri, position_of(source, "Value :=", 2))
+        .expect("independently qualified later receiver hover");
+    assert!(hover_text(&qualified_hover).contains("Value: Integer"));
+    let qualified_completion_position = position_of(source, "Va :=", 2);
+    let qualified_completion_position = Position::new(
+        qualified_completion_position.line,
+        qualified_completion_position.character + "Va".encode_utf16().count() as u32,
+    );
+    let qualified_completion = index
+        .completion(&source_uri, qualified_completion_position)
+        .expect("independently qualified later receiver completion");
+    assert!(
+        qualified_completion
+            .items
+            .iter()
+            .any(|item| item.label == "Value"),
+        "an independently qualified later receiver must retain its member: {:?}",
+        qualified_completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn nested_comma_receiver_prefix_precedes_outer_context_across_assistance_endpoints() {
+    let source = r#"unit TypedWithNestedCommaPrecedence;
+interface
+type
+  TFirst = class
+    Value: Integer;
+    FirstOnly: Integer;
+    procedure Run(A: Integer);
+  end;
+  TWrong = class
+    Value: string;
+    WrongOnly: string;
+    procedure Run(A: string);
+  end;
+  TLeft = class
+    Inner: TFirst;
+  end;
+  TOuter = class
+    Left: TLeft;
+    Inner: TWrong;
+  end;
+procedure Caller;
+implementation
+procedure TFirst.Run(A: Integer);
+begin
+end;
+procedure TWrong.Run(A: string);
+begin
+end;
+procedure Caller;
+var
+  OuterValue: TOuter;
+begin
+  with OuterValue do
+    with Left, Inner do begin
+      Value := 1;
+      Fir := 1;
+      Run(1);
+    end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithNestedCommaPrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested comma precedence source parses");
+
+    let receiver = index.navigate(
+        &source_uri,
+        position_of(source, "Inner do", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(receiver.len(), 1);
+    assert_location_start(
+        &receiver[0],
+        &source_uri,
+        position_of(source, "Inner: TFirst", 0),
+    );
+
+    let value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(value.len(), 1);
+    assert_location_start(
+        &value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Value :=", 0))
+        .expect("nested comma value hover");
+    assert!(hover_text(&hover).contains("Value: Integer"));
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Inner do", 0));
+    assert_exact_type_location(&type_definition, &source_uri, source, "TFirst", 0);
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "      Fir", 0))
+        .expect("nested comma member completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["FirstOnly"]
+    );
+    assert!(!completion.is_incomplete);
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "      Run(", 0))
+        .expect("nested comma signature help")
+        .expect("nested comma method signature");
+    assert_eq!(
+        signature
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(A: Integer);"]
+    );
+}
+
+#[test]
+fn nested_comma_receiver_rename_fails_closed_without_partial_edits() {
+    let source = r#"unit TypedWithNestedCommaRename;
+interface
+type
+  TFirst = class
+    Value: Integer;
+  end;
+  TLeft = class
+    Inner: TFirst;
+  end;
+  TOuter = class
+    Left: TLeft;
+    Inner: TFirst;
+  end;
+implementation
+procedure Caller;
+var
+  OuterValue: TOuter;
+begin
+  with OuterValue do
+    with Left, Inner do
+      Value := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithNestedCommaRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested comma rename source parses");
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Inner: TFirst", 0),
+                "RenamedInner",
+            )
+            .is_err(),
+        "a nested comma receiver rename must fail closed"
+    );
+}
+
+#[test]
+fn completion_keeps_known_receiver_prefix_slots_ordered_and_blocks_unknown_middle_slots() {
+    let source = r#"unit TypedWithOrderedReceiverCompletion;
+interface
+type
+  TTarget = record
+    Value: Integer;
+  end;
+  TLeft = record
+    A: Integer;
+  end;
+  TRight = record
+    B: Integer;
+  end;
+  TRightMember = record
+    B: Integer;
+    LocalReceiver: TTarget;
+  end;
+procedure KnownReceivers;
+procedure RightmostMember;
+procedure UnknownMiddle;
+implementation
+procedure KnownReceivers;
+var
+  L: TLeft;
+  R: TRight;
+  LocalReceiver: TTarget;
+begin
+  with L, R, LocalReceiver do begin
+    Value := 1;
+  end;
+end;
+procedure RightmostMember;
+var
+  L: TLeft;
+  R: TRightMember;
+  LocalReceiver: TTarget;
+begin
+  with L, R, LocalReceiver do begin
+    Value := 2;
+  end;
+end;
+procedure UnknownMiddle;
+var
+  L: TLeft;
+  LocalReceiver: TTarget;
+begin
+  with L, UnknownReceiver, LocalReceiver do begin
+    Value := 3;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithOrderedReceiverCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ordered receiver completion source parses");
+
+    let known_body = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(known_body.len(), 1);
+    assert_location_start(
+        &known_body[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let known_none = index
+        .completion(&source_uri, position_after(source, "with L, R, Loc", 0))
+        .expect("known receiver prefix completion");
+    let known_none_item = known_none
+        .items
+        .iter()
+        .find(|item| item.label == "LocalReceiver")
+        .expect("a known three-receiver prefix must retain the local candidate");
+    assert_eq!(known_none_item.kind, Some(CompletionItemKind::VARIABLE));
+    assert!(!known_none.is_incomplete);
+
+    let rightmost = index
+        .completion(&source_uri, position_after(source, "with L, R, Loc", 1))
+        .expect("rightmost receiver member completion");
+    let rightmost_item = rightmost
+        .items
+        .iter()
+        .find(|item| item.label == "LocalReceiver")
+        .expect("the rightmost prefix member must be offered");
+    assert_eq!(rightmost_item.kind, Some(CompletionItemKind::FIELD));
+    assert!(!rightmost.is_incomplete);
+
+    let unknown_middle = index
+        .completion(
+            &source_uri,
+            position_after(source, "with L, UnknownReceiver, Loc", 0),
+        )
+        .expect("unknown middle receiver completion");
+    assert!(
+        unknown_middle
+            .items
+            .iter()
+            .all(|item| item.label != "LocalReceiver"),
+        "an unknown middle receiver must block the local third receiver: {:?}",
+        unknown_middle
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(unknown_middle.is_incomplete);
+}
+
+#[test]
+fn completion_resolves_nested_comma_receiver_prefixes_and_unknown_barriers() {
+    let source = r#"unit TypedWithReceiverCompletion;
+interface
+type
+  TTarget = record
+    Value: Integer;
+  end;
+  TLeft = record
+    Inner: TTarget;
+  end;
+  TOuter = record
+    Left: TLeft;
+  end;
+const
+  LeftGlobal = 1;
+  InnerGlobal = 2;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  OuterValue: TOuter;
+begin
+  with OuterValue do
+    with Left, Inn do begin
+      Value := 1;
+    end;
+  with UnknownOuter do
+    with Left, Inn do begin
+      Value := 2;
+    end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithReceiverCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("receiver completion source parses");
+
+    let first_receiver = index
+        .completion(&source_uri, position_after(source, "with Left", 0))
+        .expect("first nested receiver completion");
+    assert!(
+        first_receiver.items.iter().any(|item| item.label == "Left"),
+        "the outer receiver must complete the first nested receiver: {:?}",
+        first_receiver
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(!first_receiver.is_incomplete);
+
+    let second_receiver = index
+        .completion(&source_uri, position_after(source, "with Left, Inn", 0))
+        .expect("second nested receiver completion");
+    assert!(
+        second_receiver
+            .items
+            .iter()
+            .any(|item| item.label == "Inner"),
+        "the earlier nested receiver must complete Outer.Left.Inner: {:?}",
+        second_receiver
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(!second_receiver.is_incomplete);
+
+    let unknown_first = index
+        .completion(&source_uri, position_after(source, "with Left", 1))
+        .expect("unknown outer first receiver completion");
+    assert!(
+        unknown_first
+            .items
+            .iter()
+            .all(|item| item.label != "Left" && item.label != "LeftGlobal"),
+        "an unknown outer receiver must block lower-priority first-receiver globals: {:?}",
+        unknown_first
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(unknown_first.is_incomplete);
+
+    let unknown_second = index
+        .completion(&source_uri, position_after(source, "with Left, Inn", 1))
+        .expect("unknown outer second receiver completion");
+    assert!(
+        unknown_second
+            .items
+            .iter()
+            .all(|item| item.label != "Inner" && item.label != "InnerGlobal"),
+        "an unknown outer receiver must block lower-priority second-receiver globals: {:?}",
+        unknown_second
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(unknown_second.is_incomplete);
+}
+
+#[test]
+fn with_generic_receiver_substitution_reaches_call_result_assistance() {
+    let source = r#"unit TypedWithGenericAssistance;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+    procedure Put(Item: T);
+  end;
+procedure Caller;
+implementation
+function TBox<T>.GetValue: T;
+begin
+  Result := Value;
+end;
+procedure TBox<T>.Put(Item: T);
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Widget: TWidget;
+begin
+  with Box do begin
+    Value.Member;
+    GetValue().Member;
+    Put(Widget);
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithGenericAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic with assistance source parses");
+
+    let value_type = index.type_definitions(&source_uri, position_of(source, "Value.Member", 0));
+    assert_exact_type_location(&value_type, &source_uri, source, "TWidget", 0);
+
+    let call_result_type = index.type_definitions(&source_uri, position_of(source, "GetValue", 2));
+    assert_exact_type_location(&call_result_type, &source_uri, source, "TWidget", 0);
+
+    let call_member = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(call_member.len(), 1);
+    assert_location_start(
+        &call_member[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "GetValue", 2))
+        .expect("generic with call-result hover");
+    assert!(hover_text(&hover).contains("function GetValue: TWidget;"));
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "Put(", 2))
+        .expect("generic with signature help")
+        .expect("generic with Put signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].label,
+        "procedure Put(Item: TWidget);"
+    );
+}
+
+#[test]
+fn with_binding_is_shared_by_hover_completion_signature_and_type_definition() {
+    let source = r#"unit TypedWithAssistance;
+interface
+type
+  TChild = record
+    ChildValue: Integer;
+  end;
+  TObj = record
+    Field: TChild;
+    procedure Run(Value: Integer);
+  end;
+procedure Caller;
+implementation
+procedure TObj.Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  Obj: TObj;
+begin
+  with Obj do begin
+    Field.ChildValue := 1;
+    Run(1);
+    Fi;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("with assistance source parses");
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Field", 1))
+        .expect("with member hover");
+    assert!(hover_text(&hover).contains("Field: TChild"));
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "  Fi", 0))
+        .expect("with member completion");
+    assert!(
+        completion.items.iter().any(|item| item.label == "Field"),
+        "unexpected labels: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "    Run(", 0))
+        .expect("with signature help")
+        .expect("with member signature");
+    assert_eq!(
+        signature
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(Value: Integer);"]
+    );
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Field", 1));
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &source_uri,
+        position_of(source, "TChild", 0),
+    );
 }
 
 #[test]
@@ -1778,7 +7554,7 @@ end.
             .map(|item| &item.label)
             .collect::<Vec<_>>()
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -1832,7 +7608,7 @@ end.
             .map(|item| &item.label)
             .collect::<Vec<_>>()
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -1875,7 +7651,7 @@ end.
             .collect::<Vec<_>>(),
         ["LocalName"]
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -1917,7 +7693,7 @@ end.
             .collect::<Vec<_>>(),
         ["Member"]
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -1948,7 +7724,7 @@ fn completion_rejects_unknown_inheritance_context_after_the_context_budget() {
             .map(|item| &item.label)
             .collect::<Vec<_>>()
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -1979,7 +7755,7 @@ end.
         completion.items.is_empty(),
         "unexpected completion: {completion:?}"
     );
-    assert!(!completion.is_incomplete);
+    assert!(completion.is_incomplete);
 
     assert!(
         index
@@ -2554,6 +8330,719 @@ fn method_declaration_definition_fields_properties_and_self_are_scope_aware() {
 }
 
 #[test]
+fn inherited_class_members_resolve_for_navigation_completion_and_hover() {
+    let source_uri = uri("InheritedClassMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), INHERITED_CLASS_MEMBERS.to_owned())
+        .expect("inherited class source parses");
+
+    let field = index.navigate(
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseField := 2", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(field.len(), 1);
+    assert_location_start(
+        &field[0],
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseField", 0),
+    );
+
+    let method = index.navigate(
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseMethod;\nend;", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(method.len(), 1);
+    assert_location_start(
+        &method[0],
+        &source_uri,
+        position_of(INHERITED_CLASS_MEMBERS, "BaseMethod", 0),
+    );
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(INHERITED_CLASS_MEMBERS, "Obj.Ba", 0),
+        )
+        .expect("inherited member completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseField", "BaseMethod"]
+    );
+
+    let hover = index
+        .hover(
+            &source_uri,
+            position_of(INHERITED_CLASS_MEMBERS, "BaseField := 2", 0),
+        )
+        .expect("inherited member hover");
+    assert!(hover_text(&hover).contains("BaseField: Integer"));
+}
+
+#[test]
+fn inherited_members_resolve_through_a_cross_unit_ancestor() {
+    let provider_uri = uri("InheritedProvider");
+    let consumer_uri = uri("InheritedConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), INHERITED_PROVIDER.to_owned())
+        .expect("inherited provider parses");
+    index
+        .update(consumer_uri.clone(), INHERITED_CONSUMER.to_owned())
+        .expect("inherited consumer parses");
+
+    let field = index.navigate(
+        &consumer_uri,
+        position_of(INHERITED_CONSUMER, "CrossField := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(field.len(), 1);
+    assert_location_start(
+        &field[0],
+        &provider_uri,
+        position_of(INHERITED_PROVIDER, "CrossField", 0),
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(INHERITED_CONSUMER, "Obj.Cross", 0),
+        )
+        .expect("cross-unit inherited completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["CrossField", "CrossMethod"]
+    );
+
+    let hover = index
+        .hover(
+            &consumer_uri,
+            position_of(INHERITED_CONSUMER, "CrossMethod;\nend;", 0),
+        )
+        .expect("cross-unit inherited hover");
+    assert!(hover_text(&hover).contains("procedure CrossMethod;"));
+}
+
+#[test]
+fn inherited_interface_members_resolve_from_a_derived_interface() {
+    let source_uri = uri("InheritedInterfaceMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), INHERITED_INTERFACE_MEMBERS.to_owned())
+        .expect("inherited interface source parses");
+
+    let base_method = index.navigate(
+        &source_uri,
+        position_of(INHERITED_INTERFACE_MEMBERS, "BaseMethod", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_method.len(), 1);
+    assert_location_start(
+        &base_method[0],
+        &source_uri,
+        position_of(INHERITED_INTERFACE_MEMBERS, "BaseMethod", 0),
+    );
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(INHERITED_INTERFACE_MEMBERS, "Obj.Ba", 0),
+        )
+        .expect("inherited interface completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseMethod"]
+    );
+}
+
+#[test]
+fn nested_member_type_lookup_uses_the_declaring_unit_context() {
+    let provider_uri = uri("DeclaredMemberTypeProvider");
+    let consumer_uri = uri("DeclaredMemberTypeConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(
+            provider_uri.clone(),
+            DECLARED_MEMBER_TYPE_PROVIDER.to_owned(),
+        )
+        .expect("declared member type provider parses");
+    index
+        .update(
+            consumer_uri.clone(),
+            DECLARED_MEMBER_TYPE_CONSUMER.to_owned(),
+        )
+        .expect("declared member type consumer parses");
+
+    let usage = position_of(DECLARED_MEMBER_TYPE_CONSUMER, "Shared", 1);
+    let locations = index.navigate(&consumer_uri, usage, NavigationTarget::Declaration);
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &provider_uri,
+        position_of(DECLARED_MEMBER_TYPE_PROVIDER, "Shared", 0),
+    );
+
+    let hover = index
+        .hover(&consumer_uri, usage)
+        .expect("declared member type hover");
+    let text = hover_text(&hover);
+    assert!(text.contains("Shared: Integer"), "unexpected hover: {text}");
+    assert!(!text.contains("Shared: string"), "wrong hover: {text}");
+}
+
+#[test]
+fn class_lookup_excludes_implemented_interface_members() {
+    let source_uri = uri("ClassInterfaceParents");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), CLASS_INTERFACE_PARENTS.to_owned())
+        .expect("class/interface parent source parses");
+
+    let contract = index.navigate(
+        &source_uri,
+        position_of(CLASS_INTERFACE_PARENTS, "ContractOnly", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        contract.is_empty(),
+        "implemented interface contract leaked into class lookup: {contract:?}"
+    );
+
+    let base_method = index.navigate(
+        &source_uri,
+        position_of(CLASS_INTERFACE_PARENTS, "Shared", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_method.len(), 1);
+    assert_location_start(
+        &base_method[0],
+        &source_uri,
+        position_of(CLASS_INTERFACE_PARENTS, "Shared", 1),
+    );
+
+    let completion = index
+        .completion(
+            &source_uri,
+            position_after(CLASS_INTERFACE_PARENTS, "Obj.Co", 0),
+        )
+        .expect("class/interface parent completion");
+    assert!(
+        completion.items.is_empty(),
+        "implemented interface contract completion leaked: {:?}",
+        completion.items
+    );
+}
+
+#[test]
+fn completion_keeps_proven_members_when_an_inherited_name_is_ambiguous() {
+    let source_uri = uri("PerNameAmbiguousInheritance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(
+            source_uri.clone(),
+            PER_NAME_AMBIGUOUS_INHERITANCE.to_owned(),
+        )
+        .expect("per-name ambiguous inheritance source parses");
+
+    let unique = index.navigate(
+        &source_uri,
+        position_of(PER_NAME_AMBIGUOUS_INHERITANCE, "Unique", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(unique.len(), 1);
+    assert_location_start(
+        &unique[0],
+        &source_uri,
+        position_of(PER_NAME_AMBIGUOUS_INHERITANCE, "Unique", 0),
+    );
+
+    let unique_completion = index
+        .completion(
+            &source_uri,
+            position_after(PER_NAME_AMBIGUOUS_INHERITANCE, "C.Unique", 0),
+        )
+        .expect("unambiguous inherited completion");
+    assert_eq!(
+        unique_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Unique"]
+    );
+    assert!(!unique_completion.is_incomplete);
+
+    let shared_completion = index
+        .completion(
+            &source_uri,
+            position_after(PER_NAME_AMBIGUOUS_INHERITANCE, "C.Shared", 0),
+        )
+        .expect("direct shadowing completion");
+    assert_eq!(
+        shared_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Shared"]
+    );
+    assert!(!shared_completion.is_incomplete);
+}
+
+#[test]
+fn cross_unit_inherited_private_members_are_not_completion_visible() {
+    let provider = r#"unit PrivateInheritedProvider;
+interface
+type
+  TBase = class
+  private
+    Hidden: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit PrivateInheritedConsumer;
+interface
+uses PrivateInheritedProvider;
+type
+  TChild = class(PrivateInheritedProvider.TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Hid;
+end;
+end.
+"#;
+    let provider_uri = uri("PrivateInheritedProvider");
+    let consumer_uri = uri("PrivateInheritedConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("private inherited provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("private inherited consumer parses");
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Obj.Hid", 0))
+        .expect("private inherited completion");
+    assert!(
+        completion.items.is_empty(),
+        "private inherited member leaked into completion: {:?}",
+        completion.items
+    );
+}
+
+#[test]
+fn unqualified_inherited_member_completion_keeps_proven_members() {
+    let source = r#"unit UnqualifiedInheritedCompletion;
+interface
+type
+  TBase = class
+    BaseField: Integer;
+  end;
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  BaseF;
+end;
+end.
+"#;
+    let source_uri = uri("UnqualifiedInheritedCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unqualified inherited completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "  BaseF", 1))
+        .expect("unqualified inherited completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["BaseField"]
+    );
+}
+
+#[test]
+fn unknown_ancestry_completion_is_reported_incomplete() {
+    let source = r#"unit UnknownAncestryCompletion;
+interface
+type
+  TChild = class(TMissing)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Un;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownAncestryCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown ancestry completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Obj.Un", 0))
+        .expect("unknown ancestry completion");
+    assert!(completion.items.is_empty());
+    assert!(
+        completion.is_incomplete,
+        "unknown ancestry was reported as complete"
+    );
+}
+
+#[test]
+fn helper_completion_retains_unknown_target_ancestry_with_proven_members() {
+    let source = r#"unit UnknownHelperAncestryCompletion;
+interface
+type
+  T = class(TMissing)
+    X: Integer;
+  end;
+  H = class helper for T
+    procedure P;
+  end;
+var
+  V: T;
+implementation
+procedure H.P;
+begin
+  Self.X := 1;
+  ;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownHelperAncestryCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown helper ancestry source parses");
+
+    let qualified = index
+        .completion(&source_uri, position_after(source, "Self.", 0))
+        .expect("qualified helper completion");
+    let qualified_labels = qualified
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        qualified_labels.contains(&"P"),
+        "helper member missing: {qualified_labels:?}"
+    );
+    assert!(
+        qualified_labels.contains(&"X"),
+        "target member missing: {qualified_labels:?}"
+    );
+    assert!(
+        qualified.is_incomplete,
+        "unknown target ancestry was reported as complete: {qualified_labels:?}"
+    );
+
+    let blank = position_of(source, "  ;", 0);
+    let implicit = index
+        .completion(&source_uri, Position::new(blank.line, blank.character + 2))
+        .expect("implicit helper completion");
+    let implicit_labels = implicit
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        implicit_labels.contains(&"P"),
+        "helper member missing: {implicit_labels:?}"
+    );
+    assert!(
+        implicit_labels.contains(&"X"),
+        "target member missing: {implicit_labels:?}"
+    );
+    assert!(
+        !implicit_labels.contains(&"V"),
+        "unrelated global leaked through unknown target ancestry: {implicit_labels:?}"
+    );
+    assert!(
+        implicit.is_incomplete,
+        "unknown target ancestry was reported as complete: {implicit_labels:?}"
+    );
+}
+
+#[test]
+fn ambiguous_interface_completion_is_reported_incomplete() {
+    let source = r#"unit AmbiguousInterfaceCompletion;
+interface
+type
+  IA = interface
+    procedure Shared;
+  end;
+  IB = interface
+    procedure Shared;
+  end;
+  IChild = interface(IA, IB)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: IChild;
+begin
+  Obj.Sh;
+end;
+end.
+"#;
+    let source_uri = uri("AmbiguousInterfaceCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ambiguous interface completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Obj.Sh", 0))
+        .expect("ambiguous interface completion");
+    assert!(completion.items.is_empty());
+    assert!(
+        completion.is_incomplete,
+        "ambiguous interface lookup was reported as complete"
+    );
+}
+
+#[test]
+fn direct_derived_members_shadow_inherited_members_and_completions() {
+    let source = r#"unit DerivedShadow;
+interface
+type
+  TBase = class
+    Shared: Integer;
+    procedure Run;
+  end;
+  TChild = class(TBase)
+    Shared: string;
+    procedure Run;
+  end;
+implementation
+procedure TBase.Run;
+begin
+end;
+procedure TChild.Run;
+begin
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Shared;
+  Obj.Run;
+end;
+end.
+"#;
+    let source_uri = uri("DerivedShadow");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("derived shadow source parses");
+
+    let shared = index.navigate(
+        &source_uri,
+        position_of(source, "Shared", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shared.len(), 1);
+    assert_location_start(&shared[0], &source_uri, position_of(source, "Shared", 1));
+
+    let shared_completion = index
+        .completion(&source_uri, position_after(source, "Obj.Sh", 0))
+        .expect("derived shadow field completion");
+    assert_eq!(
+        shared_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Shared"]
+    );
+
+    let run_completion = index
+        .completion(&source_uri, position_after(source, "Obj.Ru", 0))
+        .expect("derived override completion");
+    assert_eq!(
+        run_completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Run"]
+    );
+}
+
+#[test]
+fn unresolved_ancestry_does_not_fall_back_to_unrelated_members() {
+    let source = r#"unit MissingAncestor;
+interface
+type
+  TChild = class(TMissing)
+    procedure Run;
+  end;
+const
+  GlobalName = 1;
+implementation
+procedure TChild.Run;
+begin
+  GlobalName;
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.UnknownMember;
+end;
+end.
+"#;
+    let source_uri = uri("MissingAncestor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("missing ancestor source parses");
+
+    assert!(
+        index
+            .navigate(
+                &source_uri,
+                position_of(source, "GlobalName", 1),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+    assert!(
+        index
+            .completion(&source_uri, position_after(source, "Obj.Un", 0))
+            .expect("missing ancestor completion")
+            .items
+            .is_empty()
+    );
+}
+
+#[test]
+fn cyclic_ancestry_fails_closed_without_recursive_lookup() {
+    let source = r#"unit CyclicAncestor;
+interface
+type
+  TA = class(TB)
+    procedure Run;
+  end;
+  TB = class(TA)
+    CycleField: Integer;
+  end;
+implementation
+procedure TA.Run;
+begin
+  CycleField;
+end;
+procedure Caller;
+var
+  Obj: TA;
+begin
+  Obj.CycleField;
+end;
+end.
+"#;
+    let source_uri = uri("CyclicAncestor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("cyclic ancestor source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "CycleField", 2),
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn ambiguous_ancestry_fails_closed_without_selecting_a_parent() {
+    let parent_a = r#"unit ParentA;
+interface
+type
+  TBase = class
+    Shared: Integer;
+  end;
+end.
+"#;
+    let parent_b = r#"unit ParentB;
+interface
+type
+  TBase = class
+    Shared: string;
+  end;
+end.
+"#;
+    let consumer = r#"unit AmbiguousAncestor;
+interface
+uses ParentA, ParentB;
+type
+  TChild = class(TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.Shared;
+end;
+end.
+"#;
+    let parent_a_uri = uri("ParentA");
+    let parent_b_uri = uri("ParentB");
+    let consumer_uri = uri("AmbiguousAncestor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(parent_a_uri, parent_a.to_owned())
+        .expect("first ambiguous parent parses");
+    index
+        .update(parent_b_uri, parent_b.to_owned())
+        .expect("second ambiguous parent parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("ambiguous consumer parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Shared", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty()
+    );
+}
+
+#[test]
 fn unqualified_class_members_precede_unit_and_imported_globals() {
     let mut index = NavigationIndex::new();
     let caller_uri = uri("MemberPrecedenceCaller");
@@ -2673,6 +9162,2265 @@ fn conditional_method_attributes_preserve_cross_unit_type_navigation() {
         &receiver_definition[0],
         &provider_uri,
         position_of(CONDITIONAL_TYPE_PROVIDER, "Execute", 1),
+    );
+}
+
+#[test]
+fn generic_field_specialization_resolves_nested_member_navigation() {
+    let source = r#"unit GenericField;
+interface
+type
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+    property Item: T read Value;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+procedure Caller;
+implementation
+function TBox<T>.GetValue: T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Nested: TBox<TBox<TWidget>>;
+begin
+  Box.Value.Member;
+  Box.GetValue().Member;
+  Box.Item.Member;
+  Nested.Value.Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericField");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic field source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let result_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(result_locations.len(), 1);
+    assert_location_start(
+        &result_locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let property_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(property_locations.len(), 1);
+    assert_location_start(
+        &property_locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let nested_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        4,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(nested_locations.len(), 1);
+    assert_location_start(
+        &nested_locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_inherited_specialization_resolves_members() {
+    let source = r#"unit GenericInherited;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+  TChild = class(TBox<TWidget>)
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Child: TChild;
+begin
+  Child.Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInherited");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inherited source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_constructor_result_preserves_specialization() {
+    let source = r#"unit GenericConstructor;
+interface
+type
+  TBox<T> = class
+    constructor Create(Value: T);
+    Value: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+implementation
+constructor TBox<T>.Create(Value: T);
+begin
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  TBox<TWidget>.Create(Widget).Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericConstructor");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic constructor source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_routine_explicit_and_inferred_results_resolve_members() {
+    let source = r#"unit GenericRoutine;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Identity<TWidget>(Widget).Member;
+  Identity(Widget).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericRoutine");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic routine source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "Member",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            locations.len(),
+            1,
+            "generic routine occurrence {occurrence}"
+        );
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "Member: Integer", 0),
+        );
+    }
+}
+
+#[test]
+fn generic_routine_inference_requires_consistent_type_arguments() {
+    let source = r#"unit GenericInference;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    Member: Integer;
+  end;
+function Same<T>(Left: T; Right: T): T;
+implementation
+function Same<T>(Left: T; Right: T): T;
+begin
+  Result := Left;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+  Other: TOther;
+begin
+  Same(Widget, Widget).Member;
+  Same(Widget, Other).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInference");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inference source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let ambiguous = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(ambiguous.is_empty());
+}
+
+#[test]
+fn generic_routine_constraints_reject_unproven_actual_types() {
+    let source = r#"unit GenericConstraints;
+interface
+type
+  TBase = class
+    BaseMember: Integer;
+  end;
+  TChild = class(TBase)
+  end;
+  TUnrelated = class
+    Member: Integer;
+  end;
+function Need<T: TBase>(Value: T): T;
+implementation
+function Need<T: TBase>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Child: TChild;
+  Unrelated: TUnrelated;
+begin
+  Need(Child).BaseMember;
+  Need(Unrelated).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BaseMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "BaseMember: Integer", 0),
+    );
+
+    let rejected = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(rejected.is_empty());
+}
+
+#[test]
+fn unsupported_generic_constraints_fail_closed() {
+    let source = r#"unit UnsupportedGenericConstraint;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+function Bad<U: ^TWidget>(Value: U): U;
+implementation
+function Bad<U: ^TWidget>(Value: U): U;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Bad(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnsupportedGenericConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unsupported generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn generic_routine_inference_preserves_specialized_actual_types() {
+    let source = r#"unit GenericNestedInference;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Identity(Box).Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericNestedInference");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested generic inference source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_specialization_preserves_same_spelling_cross_unit_types() {
+    let provider_a = r#"unit GenericProviderA;
+interface
+type
+  TWidget = class
+    AMember: Integer;
+  end;
+implementation
+end.
+"#;
+    let provider_b = r#"unit GenericProviderB;
+interface
+type
+  TWidget = class
+    BMember: Integer;
+  end;
+implementation
+end.
+"#;
+    let consumer = r#"unit GenericCrossConsumer;
+interface
+uses GenericProviderA, GenericProviderB;
+type
+  TBox<T> = class
+    Value: T;
+  end;
+implementation
+procedure Caller;
+var
+  Box: TBox<GenericProviderA.TWidget>;
+begin
+  Box.Value.AMember;
+  Box.Value.BMember;
+end;
+end.
+"#;
+    let provider_a_uri = uri("GenericProviderA");
+    let provider_b_uri = uri("GenericProviderB");
+    let consumer_uri = uri("GenericCrossConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_a_uri, provider_a.to_owned())
+        .expect("generic provider A parses");
+    index
+        .update(provider_b_uri, provider_b.to_owned())
+        .expect("generic provider B parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("generic cross-unit consumer parses");
+
+    let a_member = locations_at(
+        &index,
+        &consumer_uri,
+        consumer,
+        "AMember",
+        0,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(a_member.len(), 1);
+    assert_location_start(
+        &a_member[0],
+        &uri("GenericProviderA"),
+        position_of(provider_a, "AMember: Integer", 0),
+    );
+
+    let b_member = locations_at(
+        &index,
+        &consumer_uri,
+        consumer,
+        "BMember",
+        0,
+        NavigationTarget::Declaration,
+    );
+    assert!(b_member.is_empty());
+}
+
+#[test]
+fn generic_method_parameters_shadow_and_retain_owner_parameters() {
+    let source = r#"unit GenericMethodShadowing;
+interface
+type
+  TBox<T> = class
+    function Shadow<T>(Value: T): T;
+    function Keep<U>(Value: U): T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+implementation
+function TBox<T>.Shadow<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+function TBox<T>.Keep<U>(Value: U): T;
+begin
+  Result := Default(T);
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Other: TOther;
+begin
+  Box.Shadow<TOther>(Other).OtherMember;
+  Box.Keep<TOther>(Other).Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodShadowing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method shadowing source parses");
+
+    let shadowed = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shadowed.len(), 1);
+    assert_location_start(
+        &shadowed[0],
+        &source_uri,
+        position_of(source, "OtherMember: Integer", 0),
+    );
+
+    let owner = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(owner.len(), 1);
+    assert_location_start(
+        &owner[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_method_assistance_uses_explicit_and_inferred_method_substitutions() {
+    let source = r#"unit GenericMethodAssistance;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    function Shadow<T>(Value: T): T;
+  end;
+implementation
+function TBox<T>.Shadow<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  B: TBox<TWidget>;
+  Other: TOther;
+begin
+  B.Shadow<TOther>(Other).OtherMember;
+  B.Shadow(Other).OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method assistance source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "OtherMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "OtherMember", 0);
+    }
+
+    for occurrence in [2, 3] {
+        let position = position_of(source, "Shadow", occurrence);
+        let type_definition = index.type_definitions(&source_uri, position);
+        assert_exact_type_location(&type_definition, &source_uri, source, "TOther", 0);
+
+        let hover = index
+            .hover(&source_uri, position)
+            .expect("generic method hover");
+        assert!(
+            hover_text(&hover).contains("function Shadow<T>(Value: TOther): TOther;"),
+            "{}",
+            hover_text(&hover)
+        );
+    }
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "B.Shadow(", 0))
+        .expect("generic method signature help")
+        .expect("generic method signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].label,
+        "function Shadow<T>(Value: TOther): TOther;"
+    );
+
+    for needle in ["B.Shadow<TOther>(", "B.Shadow<TOther>(Other"] {
+        let signature = index
+            .signature_help(&source_uri, position_after(source, needle, 0))
+            .expect("explicit generic method signature help")
+            .expect("explicit generic method signature");
+        assert_eq!(signature.signatures.len(), 1);
+        assert_eq!(signature.active_signature, Some(0));
+        assert_eq!(signature.active_parameter, Some(0));
+        assert_eq!(
+            signature.signatures[0].label,
+            "function Shadow<T>(Value: TOther): TOther;"
+        );
+    }
+}
+
+#[test]
+fn generic_method_type_definitions_require_a_selected_method_substitution() {
+    let source = r#"unit GenericMethodUnknownTypeDefinition;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    function Shadow<T>(Value: T): T;
+  end;
+implementation
+function TBox<T>.Shadow<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.Shadow();
+  Box.Shadow(UnknownValue);
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodUnknownTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown generic method source parses");
+
+    for occurrence in [2, 3] {
+        let type_definition =
+            index.type_definitions(&source_uri, position_of(source, "Shadow", occurrence));
+        assert!(
+            type_definition.is_empty(),
+            "unselected generic method occurrence {occurrence} must not use the owner substitution"
+        );
+    }
+}
+
+#[test]
+fn generic_type_constraints_reject_invalid_specializations() {
+    let source = r#"unit GenericTypeConstraints;
+interface
+type
+  TBase = class
+    BaseMember: Integer;
+  end;
+  TBox<T: TBase> = class
+    Value: T;
+  end;
+  TChild = class(TBase)
+  end;
+  TUnrelated = class
+    Member: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Valid: TBox<TChild>;
+  Invalid: TBox<TUnrelated>;
+begin
+  Valid.Value.BaseMember;
+  Invalid.Value.Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericTypeConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic type constraint source parses");
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BaseMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid.len(), 1);
+    assert_location_start(
+        &valid[0],
+        &source_uri,
+        position_of(source, "BaseMember: Integer", 0),
+    );
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn generic_kind_constraints_accept_only_matching_specializations() {
+    let source = r#"unit GenericKindConstraints;
+interface
+type
+  TClassBox<T: class> = class
+    Value: T;
+  end;
+  TRecordBox<T: record> = class
+    Value: T;
+  end;
+  TInterfaceBox<T: interface> = class
+    Value: T;
+  end;
+  TClass = class
+    ClassMember: Integer;
+  end;
+  TRecord = record
+    RecordMember: Integer;
+  end;
+  TInterface = interface
+    procedure InterfaceMethod;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  ValidClass: TClassBox<TClass>;
+  InvalidClass: TClassBox<TRecord>;
+  ValidRecord: TRecordBox<TRecord>;
+  InvalidRecord: TRecordBox<TClass>;
+  ValidInterface: TInterfaceBox<TInterface>;
+  InvalidInterface: TInterfaceBox<TClass>;
+begin
+  ValidClass.Value.ClassMember;
+  InvalidClass.Value.RecordMember;
+  ValidRecord.Value.RecordMember;
+  InvalidRecord.Value.ClassMember;
+  ValidInterface.Value.InterfaceMethod;
+  InvalidInterface.Value.ClassMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericKindConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic kind constraint source parses");
+
+    let valid_class = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "ClassMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid_class.len(), 1);
+    assert_location_start(
+        &valid_class[0],
+        &source_uri,
+        position_of(source, "ClassMember: Integer", 0),
+    );
+
+    let invalid_class = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "RecordMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid_class.is_empty());
+
+    let valid_record = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "RecordMember",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid_record.len(), 1);
+    assert_location_start(
+        &valid_record[0],
+        &source_uri,
+        position_of(source, "RecordMember: Integer", 0),
+    );
+
+    let invalid_record = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "ClassMember",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid_record.is_empty());
+
+    let valid_interface = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "InterfaceMethod",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid_interface.len(), 1);
+    assert_location_start(
+        &valid_interface[0],
+        &source_uri,
+        position_of(source, "InterfaceMethod", 0),
+    );
+
+    let invalid_interface = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "ClassMember",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid_interface.is_empty());
+}
+
+#[test]
+fn generic_constructor_constraints_require_a_proven_constructor() {
+    let source = r#"unit GenericConstructorConstraints;
+interface
+type
+  TBox<T: constructor> = class
+    Value: T;
+  end;
+  TConstructible = class
+    constructor Create;
+    Member: Integer;
+  end;
+  TUnconstructible = class
+    OtherMember: Integer;
+  end;
+procedure Caller;
+implementation
+constructor TConstructible.Create;
+begin
+end;
+procedure Caller;
+var
+  Valid: TBox<TConstructible>;
+  Invalid: TBox<TUnconstructible>;
+begin
+  Valid.Value.Member;
+  Invalid.Value.OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericConstructorConstraints");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic constructor constraint source parses");
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Member",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(valid.len(), 1);
+    assert_location_start(
+        &valid[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn generic_primitive_results_feed_overload_selection() {
+    let source = r#"unit GenericPrimitiveOverload;
+interface
+function Identity<T>(Value: T): T;
+procedure Consume(Value: Integer); overload;
+procedure Consume(Value: String); overload;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+begin
+  Consume(Identity(1));
+end;
+end.
+"#;
+    let source_uri = uri("GenericPrimitiveOverload");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic primitive overload source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "Consume",
+        2,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "Consume(Value: Integer)", 0),
+    );
+}
+
+#[test]
+fn generic_specialized_receivers_feed_completion_hover_and_type_definition() {
+    let source = r#"unit GenericAssistance;
+interface
+type
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+  end;
+  TWidget = class
+    Member: Integer;
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.Value.Me;
+  Box.GetValue().Member;
+end;
+end.
+"#;
+    let source_uri = uri("GenericAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic assistance source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Box.Value.Me", 0))
+        .expect("generic specialized completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Member"]
+    );
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Member", 1))
+        .expect("generic specialized hover");
+    assert!(hover_text(&hover).contains("Member: Integer"));
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Value", 4));
+    assert_exact_type_location(&type_definition, &source_uri, source, "TWidget", 0);
+}
+
+#[test]
+fn inherited_generic_routine_result_preserves_parent_specialization() {
+    let source = r#"unit GenericInheritedRoutine;
+interface
+type
+  TBox<T> = class
+    function GetValue: T;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TChild = class(TBox<TWidget>)
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+end;
+procedure Caller;
+var
+  Child: TChild;
+begin
+  Child.GetValue().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInheritedRoutine");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inherited routine source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "WidgetMember: Integer", 0),
+    );
+}
+
+#[test]
+fn uninferred_generic_method_does_not_use_the_owner_specialization() {
+    let source = r#"unit GenericMethodInference;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    function Shadow<T>: T;
+  end;
+implementation
+function TBox<T>.Shadow<T>: T;
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.Shadow().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodInference");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method inference source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn generic_receiver_specialization_selects_the_compatible_overload() {
+    let source = r#"unit GenericOverloadSpecialization;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+  end;
+function Choose(B: TBox<TOther>; N: Integer): TOther; overload;
+function Choose(B: TBox<TWidget>; N: Real): TWidget; overload;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Choose(Box, 1).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericOverloadSpecialization");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic overload specialization source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &source_uri,
+        position_of(source, "WidgetMember: Integer", 0),
+    );
+}
+
+#[test]
+fn generic_call_with_wrong_explicit_arity_fails_closed() {
+    let source = r#"unit GenericCallArity;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Identity<TWidget, TOther>(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericCallArity");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic call arity source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn generic_actuals_use_call_site_scope_and_preserve_multi_argument_arity() {
+    let source = r#"unit GenericActualScope;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  T = class
+    LocalMember: Integer;
+  end;
+  TBox<T> = class
+    function Pick<U>: U;
+  end;
+function GlobalPick<A, B>: B;
+implementation
+function TBox<T>.Pick<U>: U;
+begin
+end;
+function GlobalPick<A, B>: B;
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  GlobalPick<TWidget, T>().LocalMember;
+  GlobalPick<TWidget, T>().WidgetMember;
+  Box.Pick<T>().LocalMember;
+  Box.Pick<T>().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericActualScope");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic actual scope source parses");
+
+    for (member, occurrence) in [("LocalMember", 1), ("LocalMember", 2)] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            member,
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "{member} occurrence {occurrence}");
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "LocalMember: Integer", 0),
+        );
+    }
+
+    for (member, occurrence) in [("WidgetMember", 1), ("WidgetMember", 2)] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            member,
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "{member} occurrence {occurrence} must not use the owner or declaration scope"
+        );
+    }
+}
+
+#[test]
+fn inherited_generic_routine_results_keep_the_declared_parent_arguments() {
+    let source = r#"unit GenericInheritedRoutineArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+  end;
+  TChild<T> = class(TBox<TWidget>)
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+end;
+procedure Caller;
+var
+  Child: TChild<TOther>;
+begin
+  Child.GetValue().WidgetMember;
+  Child.GetValue().OtherMember;
+  Child.Value.WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInheritedRoutineArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited generic routine argument source parses");
+
+    for (member, occurrence) in [("WidgetMember", 1), ("WidgetMember", 2)] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            member,
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "{member} occurrence {occurrence}");
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "WidgetMember: Integer", 0),
+        );
+    }
+
+    let other_locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(other_locations.is_empty());
+}
+
+#[test]
+fn unknown_generic_constraint_prevents_selecting_a_proven_overload() {
+    let source = r#"unit UnknownGenericConstraintOverload;
+interface
+type
+  IFoo = interface
+    procedure Foo;
+  end;
+  TBase = class
+  end;
+  TChild = class(TBase, IFoo)
+    procedure Foo;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Choose<T: IFoo>(Value: T): TOther; overload;
+function Choose(Value: TBase): TWidget; overload;
+implementation
+procedure TChild.Foo;
+begin
+end;
+procedure Caller;
+var
+  Child: TChild;
+begin
+  Choose(Child).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownGenericConstraintOverload");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        locations.is_empty(),
+        "an unknown generic constraint must not select the proven fallback overload"
+    );
+}
+
+#[test]
+fn contradictory_generic_constraints_fail_closed() {
+    let source = r#"unit ContradictoryGenericConstraint;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+function Bad<T: class, record>(Value: T): T;
+implementation
+function Bad<T: class, record>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Bad(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("ContradictoryGenericConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("contradictory constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn generic_formal_lookup_does_not_capture_qualified_types_or_members() {
+    let source = r#"unit QualifiedRename;
+interface
+type
+  T = class
+    GlobalMember: Integer;
+  end;
+  Holder = class
+    T: Integer;
+  end;
+procedure Run<T>(Obj: Holder);
+implementation
+procedure Run<T>(Obj: Holder);
+var
+  Qualified: QualifiedRename.T;
+begin
+  Qualified.GlobalMember;
+  Obj.T := 1;
+end;
+end.
+"#;
+    let source_uri = uri("QualifiedRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("qualified generic formal source parses");
+
+    let qualified_type = index.navigate(
+        &source_uri,
+        final_qualified_type_position(source, "QualifiedRename.T"),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_type.len(), 1);
+    assert_location_start(
+        &qualified_type[0],
+        &source_uri,
+        position_of(source, "T = class", 0),
+    );
+
+    let member = index.navigate(
+        &source_uri,
+        final_qualified_type_position(source, "Obj.T"),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(member.len(), 1);
+    assert_location_start(
+        &member[0],
+        &source_uri,
+        position_of(source, "T: Integer", 0),
+    );
+}
+
+#[test]
+fn inferred_and_explicit_generic_actuals_keep_the_caller_type_scope() {
+    let source = r#"unit GenericInferenceScope;
+interface
+type
+  T = class
+    LocalMember: Integer;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TBox<T> = class
+    function Pick<U>(Value: U): U;
+  end;
+implementation
+function TBox<T>.Pick<U>(Value: U): U;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  B: TBox<TWidget>;
+  Obj: T;
+begin
+  B.Pick(Obj).LocalMember;
+  B.Pick(Obj).WidgetMember;
+  B.Pick<T>(Obj).LocalMember;
+  B.Pick<T>(Obj).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInferenceScope");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic inference scope source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "LocalMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1);
+        assert_location_start(
+            &locations[0],
+            &source_uri,
+            position_of(source, "LocalMember: Integer", 0),
+        );
+    }
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "generic occurrence {occurrence} used Widget"
+        );
+    }
+}
+
+#[test]
+fn inherited_constructors_satisfy_constructor_constraints_without_fallback() {
+    let source = r#"unit InheritedConstructorConstraint;
+interface
+type
+  TBase = class
+    constructor Create;
+  end;
+  TChild = class(TBase)
+  end;
+  TGood = class
+    GoodMember: Integer;
+  end;
+  TBad = class
+    BadMember: Integer;
+  end;
+function Choose<T: constructor>(Value: T): TGood; overload;
+function Choose(Value: TBase): TBad; overload;
+implementation
+constructor TBase.Create;
+begin
+end;
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Choose(Obj).GoodMember;
+  Choose(Obj).BadMember;
+end;
+end.
+"#;
+    let source_uri = uri("InheritedConstructorConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("inherited constructor constraint source parses");
+
+    let good = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "GoodMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&good, &source_uri, source, "GoodMember", 0);
+
+    let bad = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BadMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(bad.is_empty());
+}
+
+#[test]
+fn unproven_constructor_constraints_do_not_select_a_fallback_overload() {
+    let source = r#"unit UnknownConstructorConstraint;
+interface
+type
+  TBase = class
+  end;
+  TChild = class(TBase)
+  end;
+  TGood = class
+    GoodMember: Integer;
+  end;
+  TBad = class
+    BadMember: Integer;
+  end;
+function Choose<T: constructor>(Value: T): TGood; overload;
+function Choose(Value: TBase): TBad; overload;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Choose(Obj).GoodMember;
+  Choose(Obj).BadMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownConstructorConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unproven constructor constraint source parses");
+
+    let good = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "GoodMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        good.is_empty(),
+        "an unproven constructor constraint must not select the generic overload"
+    );
+
+    let bad = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "BadMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        bad.is_empty(),
+        "an unproven constructor constraint must not select the fallback overload"
+    );
+}
+
+#[test]
+fn generic_ancestry_preserves_instantiated_parent_arguments() {
+    let source = r#"unit GenericInstantiatedAncestry;
+interface
+type
+  TBox<T> = class
+  end;
+  TChild<T> = class(TBox<T>)
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Good(Value: TBox<TWidget>): TWidget;
+function Bad(Value: TBox<TOther>): TOther;
+implementation
+procedure Caller;
+var
+  Child: TChild<TWidget>;
+begin
+  Good(Child).WidgetMember;
+  Bad(Child).OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericInstantiatedAncestry");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("instantiated ancestry source parses");
+
+    let good = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&good, &source_uri, source, "WidgetMember", 0);
+
+    let bad = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(bad.is_empty());
+}
+
+#[test]
+fn recovered_generic_constraint_declarations_are_unsupported() {
+    let source = r#"unit RecoveredGenericConstraint;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+function Bad<U: class, record>(Value: U): U;
+implementation
+function Bad<U: class, record>(Value: U): U;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  Bad<TWidget, TWidget>(Obj).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("RecoveredGenericConstraint");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("recovered generic constraint source parses");
+
+    let locations = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty());
+}
+
+#[test]
+fn generic_type_expression_arguments_preserve_all_parameters() {
+    let source = r#"unit GenericTypeExpressionArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T; U> = class
+    Value: U;
+  end;
+  TPair<T; U> = class
+    Second: U;
+  end;
+implementation
+procedure Caller;
+begin
+  TBox<TWidget, TOther>.Value.WidgetMember;
+  TPair<TWidget, TOther>.Second.OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericTypeExpressionArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic type expression source parses");
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&valid, &source_uri, source, "OtherMember", 0);
+}
+
+#[test]
+fn unsupported_generic_type_actuals_preserve_arity_and_nested_failure() {
+    let source = r#"unit UnsupportedGenericTypeActuals;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function Create: TBox<T>;
+  end;
+  TPair<T; U> = class
+    Value: U;
+  end;
+implementation
+function TBox<T>.Create: TBox<T>;
+begin
+end;
+procedure Caller;
+var
+  Other: TOther;
+begin
+  TBox<^TOther, TWidget>.Create().Value.WidgetMember;
+  TBox<TWidget, ^TOther>.Create().Value.WidgetMember;
+  TBox<TBox<^TOther, TWidget>>.Create().Value.Value.WidgetMember;
+  TPair<TWidget, TOther>.Value.OtherMember;
+end;
+end.
+"#;
+    let source_uri = uri("UnsupportedGenericTypeActuals");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unsupported generic type actual source parses");
+
+    for occurrence in [1, 2, 3] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "unsupported actual occurrence {occurrence} must fail closed"
+        );
+    }
+
+    let valid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&valid, &source_uri, source, "OtherMember", 0);
+}
+
+#[test]
+fn generic_type_arguments_ignore_comments_but_reject_unsupported_actuals() {
+    let source = r#"unit GenericCommentedTypeArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function Create: TBox<T>;
+  end;
+  TPair<T; U> = class
+    Value: U;
+  end;
+implementation
+function TBox<T>.Create: TBox<T>;
+begin
+end;
+procedure Caller;
+begin
+  TBox<TWidget {brace note}>.Create().Value.WidgetMember;
+  TBox<TWidget (*paren-star note*)>.Create().Value.WidgetMember;
+  TPair<TWidget {first actual note}, TOther (*second actual note*)>.Value.OtherMember;
+  TBox<TWidget, ^TOther>.Create().Value.WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericCommentedTypeArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("commented generic type argument source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "WidgetMember", 0);
+    }
+
+    let pair = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "OtherMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert_exact_type_location(&pair, &source_uri, source, "OtherMember", 0);
+
+    let unsupported = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(unsupported.is_empty());
+}
+
+#[test]
+fn generic_call_arguments_ignore_comments_but_preserve_arity() {
+    let source = r#"unit GenericCommentArguments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Obj: TWidget;
+begin
+  Identity<TWidget { brace note }>(Obj).WidgetMember;
+  Identity<TWidget (* star note *)>(Obj).WidgetMember;
+  Identity<TWidget, TOther { invalid extra actual }>(Obj).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericCommentArguments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic comment argument source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "WidgetMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "WidgetMember", 0);
+    }
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        3,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn generic_declaration_comments_do_not_create_constraints_or_reenable_recovery() {
+    let source = r#"unit GenericDeclarationComments;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+function Pick<T {note: harmless}, U>(Value: U): U;
+function PickStar<T (*block: harmless*), U>(Value: U): U;
+function Bad<T: class, record>(Value: T): T;
+implementation
+function Pick<T {note: harmless}, U>(Value: U): U;
+begin
+  Result := Value;
+end;
+function PickStar<T (*block: harmless*), U>(Value: U): U;
+begin
+  Result := Value;
+end;
+function Bad<T: class, record>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Caller;
+var
+  Widget: TWidget;
+  Other: TOther;
+begin
+  Pick<TWidget, TOther>(Other).OtherMember;
+  PickStar<TWidget, TOther>(Other).OtherMember;
+  Bad<TWidget, TWidget>(Widget).WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericDeclarationComments");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic declaration comment source parses");
+
+    for occurrence in [1, 2] {
+        let locations = locations_at(
+            &index,
+            &source_uri,
+            source,
+            "OtherMember",
+            occurrence,
+            NavigationTarget::Declaration,
+        );
+        assert_exact_type_location(&locations, &source_uri, source, "OtherMember", 0);
+    }
+
+    let invalid = locations_at(
+        &index,
+        &source_uri,
+        source,
+        "WidgetMember",
+        1,
+        NavigationTarget::Declaration,
+    );
+    assert!(invalid.is_empty());
+}
+
+#[test]
+fn type_definition_resolves_a_specialized_generic_routine_result() {
+    let source = r#"unit GenericRoutineTypeDefinition;
+interface
+type
+  TBox<T> = class
+    function GetValue: T;
+  end;
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+implementation
+function TBox<T>.GetValue: T;
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.GetValue().WidgetMember;
+end;
+end.
+"#;
+    let source_uri = uri("GenericRoutineTypeDefinition");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic routine type definition source parses");
+
+    let type_definition = index.type_definitions(
+        &source_uri,
+        final_qualified_type_position(source, "Box.GetValue"),
+    );
+    assert_eq!(type_definition.len(), 1);
+    assert_location_start(
+        &type_definition[0],
+        &source_uri,
+        position_of(source, "TWidget = class", 0),
+    );
+}
+
+#[test]
+fn generic_member_completion_excludes_formal_declarations() {
+    let source = r#"unit GenericMemberCompletion;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+begin
+  Box.
+end;
+end.
+"#;
+    let source_uri = uri("GenericMemberCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic member completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Box.", 0))
+        .expect("generic member completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Value"]
+    );
+}
+
+#[test]
+fn specialized_generic_assistance_renders_bound_routine_labels() {
+    let source = r#"unit GenericAssistanceLabels;
+interface
+type
+  TWidget = class
+    WidgetMember: Integer;
+  end;
+  TOther = class
+    OtherMember: Integer;
+  end;
+  T = class
+  end;
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+    procedure Put(Value: T);
+  end;
+implementation
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Obj: TWidget;
+begin
+  Box.GetValue().WidgetMember;
+  Box.Value.WidgetMember;
+  Box.Put(Obj);
+end;
+end.
+"#;
+    let source_uri = uri("GenericAssistanceLabels");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic assistance labels source parses");
+
+    let mut value_position = position_of(source, "Box.Value.WidgetMember", 0);
+    value_position.character += "Box.".encode_utf16().count() as u32;
+    let value_hover = index
+        .hover(&source_uri, value_position)
+        .expect("specialized generic field hover");
+    assert!(hover_text(&value_hover).contains("Value: TWidget;"));
+    assert!(!hover_text(&value_hover).contains("Value: T;"));
+
+    let get_value_position = final_qualified_type_position(source, "Box.GetValue");
+    let hover = index
+        .hover(&source_uri, get_value_position)
+        .expect("specialized generic routine hover");
+    assert!(hover_text(&hover).contains("function GetValue: TWidget;"));
+    assert!(!hover_text(&hover).contains("function GetValue: T;"));
+    assert_eq!(
+        hover.range,
+        Some(Range::new(
+            get_value_position,
+            Position::new(
+                get_value_position.line,
+                get_value_position.character + "GetValue".encode_utf16().count() as u32,
+            ),
+        ))
+    );
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "Box.Put(", 0))
+        .expect("specialized generic routine signature help")
+        .expect("specialized generic routine signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].label,
+        "procedure Put(Value: TWidget);"
     );
 }
 
@@ -3805,7 +12553,7 @@ fn uses_unit_and_case_insensitive_navigation_are_supported() {
 }
 
 #[test]
-fn overloads_return_all_viable_candidates() {
+fn overload_navigation_selects_a_known_argument_candidate() {
     let mut index = NavigationIndex::new();
     let main_uri = uri("Main");
     let provider_uri = uri("Provider");
@@ -3824,9 +12572,38 @@ fn overloads_return_all_viable_candidates() {
         0,
         NavigationTarget::Declaration,
     );
-    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates.len(), 1);
+    assert_location_start(
+        &candidates[0],
+        &provider_uri,
+        position_of(PROVIDER, "Overloaded(Value: Integer)", 0),
+    );
+
+    let unknown_uri = uri("UnknownOverloadCall");
+    let unknown_source = r#"unit UnknownOverloadCall;
+interface
+uses Provider;
+implementation
+procedure Run;
+begin
+  Overloaded(UnknownValue);
+end;
+end.
+"#;
+    index
+        .update(unknown_uri.clone(), unknown_source.to_owned())
+        .expect("unknown overload source parses");
+    let unknown_candidates = locations_at(
+        &index,
+        &unknown_uri,
+        unknown_source,
+        "Overloaded",
+        0,
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(unknown_candidates.len(), 2);
     assert!(
-        candidates
+        unknown_candidates
             .iter()
             .all(|location| location.uri == provider_uri)
     );
@@ -5035,7 +13812,7 @@ fn hover_fails_closed_for_unqualified_routines_in_unknown_class_ancestors() {
     let source = r#"unit InheritedRoutine;
 interface
 type
-  TParent = class
+  TParent = class(TMissing)
     procedure Reset(X: Integer);
   end;
   TChild = class(TParent)
@@ -5094,7 +13871,7 @@ end.
 interface
 uses ImportedProvider;
 type
-  TChild = class
+  TChild = class(TMissing)
     procedure Run;
   end;
 implementation
@@ -5484,4 +14261,1063 @@ end.
         final_qualified_type_position(source, "QualifiedTypeShadow.TFoo"),
     );
     assert_exact_type_location(&qualified_type, &source_uri, source, "TFoo", 0);
+}
+
+#[test]
+fn accessibility_is_shared_across_navigation_assistance_and_type_definition() {
+    let provider = r#"unit AccessibilityProvider;
+interface
+type
+  TPayload = class
+  end;
+  TBase = class
+    DefaultField: Integer;
+    procedure Check;
+  private
+    PrivateField: TPayload;
+    procedure PrivateMethod(Value: Integer);
+  protected
+    ProtectedField: Integer;
+    procedure ProtectedMethod(Value: Integer);
+  strict private
+    StrictPrivateSlot: Integer;
+    procedure StrictPrivateCall(Value: Integer);
+  strict protected
+    StrictProtectedSlot: Integer;
+    procedure StrictProtectedCall(Value: Integer);
+  public
+    PublicField: Integer;
+    procedure PublicMethod(Value: Integer);
+  published
+    PublishedField: Integer;
+  end;
+  TRecord = record
+    RecordField: Integer;
+  end;
+  IContract = interface
+    procedure InterfaceMethod;
+  end;
+implementation
+procedure TBase.Check;
+var
+  Obj: TBase;
+begin
+  Self.PrivateField;
+  Self.ProtectedField;
+  Self.StrictPrivateSlot;
+  Self.StrictProtectedSlot;
+end;
+procedure SameUnit;
+var
+  Obj: TBase;
+begin
+  Obj.PrivateField;
+  Obj.ProtectedField;
+  Obj.StrictPrivateSlot;
+  Obj.StrictProtectedSlot;
+end;
+end.
+"#;
+    let consumer = r#"unit AccessibilityConsumer;
+interface
+uses AccessibilityProvider;
+type
+  TChild = class(AccessibilityProvider.TBase)
+    procedure Check;
+  end;
+  TUnrelated = class
+    procedure Check;
+  end;
+implementation
+procedure TChild.Check;
+var
+  Obj: TBase;
+  R: TRecord;
+  Contract: IContract;
+begin
+  Obj.ProtectedField;
+  Obj.StrictProtectedSlot;
+  Obj.PrivateField;
+  Obj.StrictPrivateSlot;
+  Obj.DefaultField;
+  Obj.PublicField;
+  Obj.PublishedField;
+  Obj.ProtectedMethod(1);
+  Obj.StrictProtectedCall(1);
+  Obj.PrivateMethod(1);
+  Obj.StrictPrivateCall(1);
+  R.RecordField;
+  Contract.InterfaceMethod;
+end;
+procedure TUnrelated.Check;
+var
+  Obj: TBase;
+begin
+  Obj.ProtectedField;
+  Obj.StrictProtectedSlot;
+  Obj.PrivateField;
+  Obj.StrictPrivateSlot;
+  Obj.DefaultField;
+  Obj.PublicField;
+  Obj.PublishedField;
+end;
+end.
+"#;
+    let provider_uri = uri("AccessibilityProvider");
+    let consumer_uri = uri("AccessibilityConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("accessibility provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("accessibility consumer parses");
+
+    let assert_access = |source_uri: &Url,
+                         source: &str,
+                         member: &str,
+                         member_occurrence: usize,
+                         completion_prefix: &str,
+                         completion_occurrence: usize,
+                         accessible: bool| {
+        let position = position_of(source, member, member_occurrence);
+        let navigation = index.navigate(source_uri, position, NavigationTarget::Declaration);
+        assert_eq!(
+            navigation.len(),
+            usize::from(accessible),
+            "unexpected navigation for {member} at {source_uri}: {navigation:?}"
+        );
+        if accessible {
+            assert_location_start(
+                &navigation[0],
+                &provider_uri,
+                position_of(provider, member, 0),
+            );
+        }
+
+        let completion = index
+            .completion(
+                source_uri,
+                position_after(source, completion_prefix, completion_occurrence),
+            )
+            .expect("accessibility completion");
+        let labels = completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        if accessible {
+            assert_eq!(labels, [member], "unexpected completion for {member}");
+        } else {
+            assert!(
+                labels.is_empty(),
+                "inaccessible member {member} leaked into completion: {labels:?}"
+            );
+        }
+    };
+
+    // A declaring class can use every class member, while another routine in
+    // the same unit gets ordinary private/protected access but not strict access.
+    assert_access(
+        &provider_uri,
+        provider,
+        "PrivateField",
+        1,
+        "Self.PrivateF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictPrivateSlot",
+        1,
+        "Self.StrictPrivateS",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "PrivateField",
+        2,
+        "Obj.PrivateF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictPrivateSlot",
+        2,
+        "Obj.StrictPrivateS",
+        0,
+        false,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "ProtectedField",
+        1,
+        "Self.ProtectedF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictProtectedSlot",
+        1,
+        "Self.StrictProtectedS",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "ProtectedField",
+        2,
+        "Obj.ProtectedF",
+        0,
+        true,
+    );
+    assert_access(
+        &provider_uri,
+        provider,
+        "StrictProtectedSlot",
+        2,
+        "Obj.StrictProtectedS",
+        0,
+        false,
+    );
+
+    // A descendant in another unit gets protected access, including strict
+    // protected access, but neither form of private access.
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "ProtectedField",
+        0,
+        "Obj.ProtectedF",
+        0,
+        true,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictProtectedSlot",
+        0,
+        "Obj.StrictProtectedS",
+        0,
+        true,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "PrivateField",
+        0,
+        "Obj.PrivateF",
+        0,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictPrivateSlot",
+        0,
+        "Obj.StrictPrivateS",
+        0,
+        false,
+    );
+    for (member, prefix) in [
+        ("DefaultField", "Obj.DefaultF"),
+        ("PublicField", "Obj.PublicF"),
+        ("PublishedField", "Obj.PublishedF"),
+        ("RecordField", "R.RecordF"),
+        ("InterfaceMethod", "Contract.InterfaceM"),
+    ] {
+        assert_access(&consumer_uri, consumer, member, 0, prefix, 0, true);
+    }
+
+    // An unrelated cross-unit caller cannot see restricted members, even when
+    // the receiver's static type is the declaring class.
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "ProtectedField",
+        1,
+        "Obj.ProtectedF",
+        1,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictProtectedSlot",
+        1,
+        "Obj.StrictProtectedS",
+        1,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "PrivateField",
+        1,
+        "Obj.PrivateF",
+        1,
+        false,
+    );
+    assert_access(
+        &consumer_uri,
+        consumer,
+        "StrictPrivateSlot",
+        1,
+        "Obj.StrictPrivateS",
+        1,
+        false,
+    );
+    for (member, prefix) in [
+        ("DefaultField", "Obj.DefaultF"),
+        ("PublicField", "Obj.PublicF"),
+        ("PublishedField", "Obj.PublishedF"),
+    ] {
+        assert_access(&consumer_uri, consumer, member, 0, prefix, 1, true);
+    }
+
+    let private_field_position = position_of(consumer, "PrivateField", 0);
+    assert!(
+        index.hover(&consumer_uri, private_field_position).is_none(),
+        "inaccessible member leaked into hover"
+    );
+    assert!(
+        index
+            .type_definitions(&consumer_uri, private_field_position)
+            .is_empty(),
+        "inaccessible member leaked into type definition"
+    );
+
+    let private_method_position = position_of(consumer, "PrivateMethod", 0);
+    assert!(
+        index
+            .signature_help(
+                &consumer_uri,
+                position_after(consumer, "Obj.PrivateMethod(1", 0),
+            )
+            .expect("inaccessible signature help")
+            .is_none(),
+        "inaccessible member leaked into signature help"
+    );
+    assert!(
+        index
+            .hover(&consumer_uri, private_method_position)
+            .is_none(),
+        "inaccessible method leaked into hover"
+    );
+
+    let protected_method_position = position_of(consumer, "ProtectedMethod", 0);
+    assert!(
+        index
+            .hover(&consumer_uri, protected_method_position)
+            .is_some(),
+        "accessible protected method lost hover"
+    );
+    assert!(
+        index
+            .signature_help(
+                &consumer_uri,
+                position_after(consumer, "Obj.ProtectedMethod(1", 0),
+            )
+            .expect("accessible signature help")
+            .is_some(),
+        "accessible protected method lost signature help"
+    );
+}
+
+#[test]
+fn lexical_declaration_order_keeps_future_bindings_out_of_scope() {
+    let source = r#"unit DeclarationOrder;
+interface
+var
+  Value: Integer;
+type
+  TWidget = class
+    property ReadLater: Integer read LaterField;
+    LaterField: Integer;
+  end;
+  TInterface = class
+    Field: TImplementationOnly;
+  end;
+implementation
+type
+  TImplementationOnly = class
+  end;
+procedure TWidget.Check;
+begin
+  Self.LaterField;
+end;
+procedure Outer;
+  procedure Forwarded; forward;
+  procedure Uses;
+  begin
+    Forwarded;
+    Later;
+  end;
+  procedure Forwarded;
+  begin
+  end;
+  procedure Later;
+  begin
+  end;
+begin
+  Uses;
+  Later;
+end;
+procedure Inline;
+begin
+  Value := 1;
+  var Value: Integer;
+  Value := 2;
+end;
+end.
+"#;
+    let source_uri = uri("DeclarationOrder");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("declaration order source parses");
+
+    let early_later = index.navigate(
+        &source_uri,
+        position_of(source, "Later;", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        early_later.is_empty(),
+        "future nested routine captured an earlier call: {early_later:?}"
+    );
+
+    let forwarded = index.navigate(
+        &source_uri,
+        position_of(source, "Forwarded;", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        !forwarded.is_empty(),
+        "forward-declared nested routine was not available"
+    );
+
+    let later = index.navigate(
+        &source_uri,
+        position_of(source, "Later;", 2),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        !later.is_empty(),
+        "declared nested routine was not available after its declaration"
+    );
+
+    let inline_before = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        inline_before.len(),
+        1,
+        "the earlier use should resolve the unit-level declaration"
+    );
+    assert_location_start(
+        &inline_before[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let inline_after = index.navigate(
+        &source_uri,
+        position_of(source, "Value := 2", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(inline_after.len(), 1);
+    assert_location_start(
+        &inline_after[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 1),
+    );
+
+    let class_member = index.navigate(
+        &source_uri,
+        position_of(source, "LaterField", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(class_member.len(), 1);
+    assert_location_start(
+        &class_member[0],
+        &source_uri,
+        position_of(source, "LaterField", 1),
+    );
+
+    assert!(
+        index
+            .navigate(
+                &source_uri,
+                position_of(source, "TImplementationOnly", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "interface code captured an implementation-only type"
+    );
+}
+
+#[test]
+fn local_const_type_and_var_initializers_use_only_prior_bindings() {
+    let source = r#"unit LocalDeclarationOrder;
+interface
+const
+  Value = 1;
+type
+  TGlobal = Integer;
+implementation
+procedure Run;
+const
+  BeforeValue = Value;
+  Value = 2;
+type
+  TBefore = TGlobal;
+  TGlobal = string;
+var
+  BeforeVar: TGlobal;
+begin
+  WriteLn(Value);
+end;
+end.
+"#;
+    let source_uri = uri("LocalDeclarationOrder");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("local declaration order source parses");
+
+    let before_value = index.navigate(
+        &source_uri,
+        position_after(source, "BeforeValue = ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(before_value.len(), 1);
+    assert_location_start(
+        &before_value[0],
+        &source_uri,
+        position_of(source, "Value = 1", 0),
+    );
+
+    let local_value = index.navigate(
+        &source_uri,
+        position_after(source, "WriteLn(", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local_value.len(), 1);
+    assert_location_start(
+        &local_value[0],
+        &source_uri,
+        position_of(source, "Value = 2", 0),
+    );
+
+    let before_type = index.navigate(
+        &source_uri,
+        position_of(source, "TGlobal;", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(before_type.len(), 1);
+    assert_location_start(
+        &before_type[0],
+        &source_uri,
+        position_of(source, "TGlobal = Integer", 0),
+    );
+
+    let local_type = index.navigate(
+        &source_uri,
+        position_after(source, "BeforeVar: ", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local_type.len(), 1);
+    assert_location_start(
+        &local_type[0],
+        &source_uri,
+        position_of(source, "TGlobal = string", 0),
+    );
+}
+
+#[test]
+fn completion_filters_future_bindings_before_shadowing_precedence() {
+    let source = r#"unit CompletionDeclarationOrder;
+interface
+const
+  Value = 1;
+implementation
+procedure Run;
+begin
+  if True then
+  begin
+    Val;
+    var Value: Integer;
+    Value := 2;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("CompletionDeclarationOrder");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("completion declaration order source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Val", 1))
+        .expect("completion before future local declaration");
+    assert_eq!(completion.items.len(), 1);
+    assert_eq!(completion.items[0].label, "Value");
+    assert_eq!(completion.items[0].kind, Some(CompletionItemKind::CONSTANT));
+}
+
+#[test]
+fn completion_filters_inaccessible_members_before_shadowing_precedence() {
+    let provider = r#"unit CompletionAccessProvider;
+interface
+type
+  TBase = class
+  private
+    Value: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit CompletionAccessConsumer;
+interface
+uses CompletionAccessProvider;
+const
+  Value = 1;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Value;
+  Val
+end;
+end.
+"#;
+    let provider_uri = uri("CompletionAccessProvider");
+    let consumer_uri = uri("CompletionAccessConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("completion access provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("completion access consumer parses");
+
+    let value_position = position_of(consumer, "Value;", 0);
+    assert!(
+        index
+            .navigate(&consumer_uri, value_position, NavigationTarget::Declaration,)
+            .is_empty(),
+        "inaccessible member leaked through navigation"
+    );
+    assert!(
+        index.hover(&consumer_uri, value_position).is_none(),
+        "inaccessible member leaked through hover"
+    );
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Val", 2))
+        .expect("completion with inaccessible member collision");
+    assert!(
+        completion.items.is_empty(),
+        "inaccessible member leaked through completion: {completion:?}"
+    );
+}
+
+#[test]
+fn inaccessible_member_cannot_be_used_as_a_receiver_for_nested_lookup() {
+    let provider = r#"unit NestedAccessProvider;
+interface
+type
+  TPayload = class
+    Exposed: Integer;
+  end;
+  TBase = class
+  private
+    Hidden: TPayload;
+  end;
+end.
+"#;
+    let consumer = r#"unit NestedAccessConsumer;
+interface
+uses NestedAccessProvider;
+procedure ReadValue;
+implementation
+procedure ReadValue;
+var
+  Obj: TBase;
+begin
+  Obj.Hidden.Exposed;
+end;
+end.
+"#;
+    let provider_uri = uri("NestedAccessProvider");
+    let consumer_uri = uri("NestedAccessConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("nested access provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("nested access consumer parses");
+
+    let exposed_position = position_of(consumer, "Exposed", 0);
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                exposed_position,
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "nested lookup traversed an inaccessible receiver"
+    );
+    assert!(
+        index.hover(&consumer_uri, exposed_position).is_none(),
+        "nested lookup leaked an inaccessible receiver into hover"
+    );
+
+    let completion = index
+        .completion(
+            &consumer_uri,
+            position_after(consumer, "Obj.Hidden.Expos", 0),
+        )
+        .expect("nested access completion");
+    assert!(
+        completion.items.iter().all(|item| item.label != "Exposed"),
+        "nested lookup leaked an inaccessible receiver into completion"
+    );
+}
+
+#[test]
+fn unqualified_inaccessible_receiver_is_filtered_before_nested_lookup() {
+    let provider = r#"unit UnqualifiedReceiverProvider;
+interface
+type
+  TPayload = class
+    Exposed: Integer;
+  end;
+  TBase = class
+  private
+    Hidden: TPayload;
+  end;
+end.
+"#;
+    let consumer = r#"unit UnqualifiedReceiverConsumer;
+interface
+uses UnqualifiedReceiverProvider;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Hidden.Exposed := 1;
+end;
+end.
+"#;
+    let provider_uri = uri("UnqualifiedReceiverProvider");
+    let consumer_uri = uri("UnqualifiedReceiverConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("unqualified receiver provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("unqualified receiver consumer parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Hidden", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "inaccessible unqualified receiver was exposed"
+    );
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Exposed", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "nested member lookup traversed an inaccessible unqualified receiver"
+    );
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Hidden.Exp", 0))
+        .expect("unqualified receiver completion");
+    assert!(
+        completion.items.is_empty(),
+        "inaccessible unqualified receiver leaked nested members: {completion:?}"
+    );
+}
+
+#[test]
+fn inaccessible_unqualified_receiver_does_not_fall_back_to_imported_unit() {
+    let provider = r#"unit ReceiverUnitProvider;
+interface
+type
+  TBase = class
+  private
+    Value: Integer;
+    Hidden: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit ReceiverUnitConsumer;
+interface
+uses ReceiverUnitProvider, Hidden;
+const
+  Value = 1;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Value;
+  Hidden.Exposed := 1;
+end;
+end.
+"#;
+    let hidden = r#"unit Hidden;
+interface
+var
+  Exposed: Integer;
+implementation
+end.
+"#;
+    let provider_uri = uri("ReceiverUnitProvider");
+    let consumer_uri = uri("ReceiverUnitConsumer");
+    let hidden_uri = uri("Hidden");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("receiver unit provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("receiver unit consumer parses");
+    index
+        .update(hidden_uri, hidden.to_owned())
+        .expect("hidden unit parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Hidden.Exposed", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "inaccessible receiver fell back to an unrelated unit"
+    );
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Exposed", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "unit member navigation survived an inaccessible receiver"
+    );
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Hidden.Exp", 0))
+        .expect("receiver unit completion");
+    assert!(
+        completion.items.is_empty(),
+        "inaccessible receiver fell back to an unrelated unit in completion: {completion:?}"
+    );
+}
+
+#[test]
+fn free_procedure_rejects_restricted_members_but_selects_public_overload() {
+    for visibility in ["private", "strict private", "strict protected", "protected"] {
+        let provider = format!(
+            r#"unit FreeProcedureAccessProvider;
+interface
+type
+  TBase = class
+  {visibility}
+    procedure Pick(X: Integer); overload;
+  public
+    procedure Pick(X: string); overload;
+  end;
+end.
+"#
+        );
+        let consumer = r#"unit FreeProcedureAccessConsumer;
+interface
+uses FreeProcedureAccessProvider;
+implementation
+procedure Run;
+var
+  Obj: TBase;
+  S: string;
+begin
+  Obj.Pick(S);
+end;
+end.
+"#;
+        let provider_uri = uri("FreeProcedureAccessProvider");
+        let consumer_uri = uri("FreeProcedureAccessConsumer");
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.clone())
+            .expect("free procedure provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("free procedure consumer parses");
+
+        let navigation = index.navigate(
+            &consumer_uri,
+            position_of(consumer, "Pick(S)", 0),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            navigation.len(),
+            1,
+            "free procedure restricted visibility blocked public overload: {visibility}"
+        );
+        assert_location_start(
+            &navigation[0],
+            &provider_uri,
+            position_of(&provider, "Pick(X: string)", 0),
+        );
+
+        let signature = index
+            .signature_help(&consumer_uri, position_after(consumer, "Obj.Pick(S", 0))
+            .expect("free procedure signature help");
+        let signature = signature
+            .as_ref()
+            .expect("public overload signature is available");
+        assert_eq!(
+            signature.signatures.len(),
+            1,
+            "restricted overload leaked into free procedure signature help: {visibility}"
+        );
+        assert!(
+            signature.signatures[0].label.contains("string"),
+            "public string overload was not selected: {signature:?}"
+        );
+    }
+}
+
+#[test]
+fn unknown_access_ancestry_is_hidden_and_marks_completion_incomplete() {
+    let provider = r#"unit UnknownAccessProvider;
+interface
+type
+  TBase = class
+  protected
+    ProtectedField: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit UnknownAccessConsumer;
+interface
+uses UnknownAccessProvider;
+type
+  TUnknownChild = class(MissingBase)
+    procedure ReadValue;
+  end;
+implementation
+procedure TUnknownChild.ReadValue;
+var
+  Obj: TBase;
+begin
+  Obj.ProtectedField;
+end;
+end.
+"#;
+    let provider_uri = uri("UnknownAccessProvider");
+    let consumer_uri = uri("UnknownAccessConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("unknown access provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("unknown access consumer parses");
+
+    let position = position_of(consumer, "ProtectedField", 0);
+    assert!(
+        index
+            .navigate(&consumer_uri, position, NavigationTarget::Declaration)
+            .is_empty(),
+        "unknown ancestry guessed protected access"
+    );
+
+    let completion = index
+        .completion(&consumer_uri, position_after(consumer, "Obj.ProtectedF", 0))
+        .expect("unknown access completion");
+    assert!(
+        completion
+            .items
+            .iter()
+            .all(|item| item.label != "ProtectedField"),
+        "unknown ancestry leaked protected completion"
+    );
+    assert!(
+        completion.is_incomplete,
+        "unknown ancestry should make completion conservative"
+    );
+}
+
+#[test]
+fn generic_descendant_proves_strict_protected_access() {
+    let source = r#"unit GenericAccess;
+interface
+type
+  TBase<T> = class
+  strict protected
+    ProtectedField: Integer;
+  end;
+  TChild<T> = class(TBase<T>)
+    procedure ReadValue;
+  end;
+implementation
+procedure TChild<T>.ReadValue;
+var
+  Obj: TBase<Integer>;
+begin
+  Obj.ProtectedField;
+end;
+end.
+"#;
+    let source_uri = uri("GenericAccess");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic access source parses");
+
+    let position = position_of(source, "ProtectedField", 1);
+    let navigation = index.navigate(&source_uri, position, NavigationTarget::Declaration);
+    assert_eq!(navigation.len(), 1, "generic descendant lost strict access");
+    assert_location_start(
+        &navigation[0],
+        &source_uri,
+        position_of(source, "ProtectedField", 0),
+    );
 }

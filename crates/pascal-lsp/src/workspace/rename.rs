@@ -203,10 +203,10 @@ fn context_incomplete_for_mode(mode: SnapshotMode, context: &ProjectContext) -> 
 }
 
 #[cfg(test)]
-type SnapshotPriorityBarrier = (Url, Sender<()>, Receiver<()>);
+type SnapshotPriorityBarrier = (Sender<()>, Receiver<()>);
 
 #[cfg(test)]
-static SNAPSHOT_PRIORITY_BARRIER: OnceLock<Mutex<Option<SnapshotPriorityBarrier>>> =
+static SNAPSHOT_PRIORITY_BARRIERS: OnceLock<Mutex<HashMap<Url, SnapshotPriorityBarrier>>> =
     OnceLock::new();
 
 #[cfg(test)]
@@ -215,27 +215,24 @@ pub(crate) fn install_snapshot_priority_barrier(
     ready: Sender<()>,
     release: Receiver<()>,
 ) {
-    SNAPSHOT_PRIORITY_BARRIER
-        .get_or_init(|| Mutex::new(None))
+    SNAPSHOT_PRIORITY_BARRIERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("snapshot barrier lock")
-        .replace((priority_uri, ready, release));
+        .insert(priority_uri, (ready, release));
 }
 
 #[cfg(test)]
 fn wait_at_snapshot_priority_barrier(priority: &[Url]) {
-    let mut barrier = SNAPSHOT_PRIORITY_BARRIER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("snapshot barrier lock");
     let Some(priority_uri) = priority.first() else {
         return;
     };
-    if barrier
-        .as_ref()
-        .is_some_and(|(expected, _, _)| expected == priority_uri)
-    {
-        let (_, ready, release) = barrier.take().expect("snapshot barrier is present");
+    let barrier = SNAPSHOT_PRIORITY_BARRIERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("snapshot barrier lock")
+        .remove(priority_uri);
+    if let Some((ready, release)) = barrier {
         ready.send(()).expect("snapshot barrier ready receiver");
         release.recv().expect("snapshot barrier release sender");
     }
@@ -3403,7 +3400,7 @@ fn capture_context_baseline(
                 baseline,
                 directory.clone(),
                 membership.clone(),
-                observe_directory_stamps,
+                observe_directory_stamps && workspace.accepts_path(directory),
             );
         }
         for observation in &state.project_read_observations {
@@ -6029,6 +6026,62 @@ mod tests {
                     && baseline.candidate_membership == Some(membership.clone())
             }));
         }
+    }
+
+    #[test]
+    fn candidate_membership_outside_workspace_does_not_capture_a_directory_stamp() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let workspace_root = temp.path().join("workspace");
+        let directory = temp.path().join("external");
+        fs::create_dir(&workspace_root).expect("workspace root");
+        fs::create_dir(&directory).expect("candidate directory");
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: None,
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let membership = ProjectCandidateMembership {
+            paths: Vec::new(),
+            readable: true,
+        };
+        let mut workspace = test_workspace(vec![workspace_root], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                project_candidate_memberships: HashMap::from([(
+                    directory.clone(),
+                    Ok(membership.clone()),
+                )]),
+                ..ContextState::default()
+            },
+        );
+        let mut baseline = BaselineAccumulator::default();
+        let mut hashes = HashMap::new();
+        let mut contents = HashMap::new();
+
+        capture_context_baseline(
+            &workspace,
+            &key,
+            &mut baseline,
+            &mut hashes,
+            &mut contents,
+            true,
+            &AtomicBool::new(false),
+        )
+        .expect("candidate membership baseline");
+
+        let baseline_path = baseline
+            .paths
+            .iter()
+            .find(|path| path.path == directory)
+            .expect("candidate directory baseline");
+        assert_eq!(baseline_path.candidate_membership, Some(membership));
+        assert_eq!(baseline_path.stamp, None);
     }
 
     #[test]

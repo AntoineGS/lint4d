@@ -92,6 +92,38 @@ fn resolves_relative_paths_against_base_dir() {
     assert_eq!(result.paths[0], base_dir.join(relative_path));
 }
 
+#[cfg(not(windows))]
+#[test]
+fn resolves_foreign_windows_rooted_and_drive_relative_paths_lexically() {
+    let output = "UNIT_SEARCH=\\Shared\\units;D:units\n";
+    let base_dir = PathBuf::from(r"C:\MyProject");
+    let result = parse_msbuild_output(output, &base_dir);
+
+    assert!(result.paths.contains(&PathBuf::from(r"C:\Shared\units")));
+    assert!(result.paths.contains(&PathBuf::from(r"D:units")));
+    assert!(
+        !result
+            .paths
+            .contains(&PathBuf::from(r"C:\MyProject\Shared\units"))
+    );
+    assert!(
+        !result
+            .paths
+            .contains(&PathBuf::from(r"C:\MyProject\D:units"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_join_preserves_rooted_and_drive_relative_paths() {
+    let output = "UNIT_SEARCH=\\Shared\\units;D:units\n";
+    let base_dir = PathBuf::from(r"C:\MyProject");
+    let result = parse_msbuild_output(output, &base_dir);
+
+    assert!(result.paths.contains(&PathBuf::from(r"C:\Shared\units")));
+    assert!(result.paths.contains(&PathBuf::from(r"D:units")));
+}
+
 #[test]
 fn deduplicates_paths() {
     let first_path = native_absolute_path(&["path", "one"]);

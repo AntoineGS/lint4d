@@ -236,6 +236,181 @@ end.
 }
 
 #[test]
+fn renames_record_helper_members_and_uses() {
+    let source = r#"unit HelperRename;
+interface
+type
+  TPoint = record
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TPointHelper.Offset;
+begin
+end;
+
+procedure Run;
+var
+  Point: TPoint;
+begin
+  Point.Offset;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper rename source parses");
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Offset", 0), "Shift")
+        .expect("helper rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Offset", 0),
+                "Shift".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Offset", 1),
+                "Shift".to_owned(),
+            ),
+            (
+                source_uri,
+                range_of(source, "Offset", 2),
+                "Shift".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn renames_imported_class_helper_members_and_uses() {
+    let target = r#"unit HelperTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let helper = r#"unit WidgetHelper;
+interface
+uses HelperTarget;
+type
+  TWidgetHelper = class helper for TWidget
+    procedure Touch;
+  end;
+implementation
+procedure TWidgetHelper.Touch;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit HelperConsumer;
+interface
+uses HelperTarget, WidgetHelper;
+procedure Run;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let target_uri = update(&mut index, "HelperTarget", target);
+    let helper_uri = update(&mut index, "WidgetHelper", helper);
+    let consumer_uri = update(&mut index, "HelperConsumer", consumer);
+
+    let edits = index
+        .rename_edits(&helper_uri, position_of(helper, "Touch", 0), "Activate")
+        .expect("imported helper rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                helper_uri.clone(),
+                range_of(helper, "Touch", 0),
+                "Activate".to_owned(),
+            ),
+            (
+                helper_uri,
+                range_of(helper, "Touch", 1),
+                "Activate".to_owned(),
+            ),
+            (
+                consumer_uri,
+                range_of(consumer, "Touch", 0),
+                "Activate".to_owned(),
+            ),
+        ],
+    );
+    assert!(!edits.contains_key(&target_uri));
+}
+
+#[test]
+fn renames_helper_member_instead_of_colliding_helped_type_member() {
+    let source = r#"unit HelperRenamePrecedence;
+interface
+type
+  TWidget = record
+    Value: Integer;
+  end;
+  TWidgetHelper = record helper for TWidget
+    property Value: Integer;
+  end;
+
+implementation
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  WriteLn(Widget.Value);
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperRenamePrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper rename precedence source parses");
+
+    let edits = index
+        .rename_edits(&source_uri, property_position(source, "Value"), "Activate")
+        .expect("helper rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "property Value", "Value", 0),
+                "Activate".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "Widget.Value", "Value", 0),
+                "Activate".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
 fn binding_locations_filter_both_parameter_declaration_sites() {
     let source = "unit ParameterReferences;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\n  Value := Value + 1;\nend;\nend.\n";
     let uri = uri("ParameterReferences");
@@ -996,6 +1171,289 @@ end.
 }
 
 #[test]
+fn function_result_member_uses_are_renamed_without_guessing_a_type() {
+    let source = "unit FunctionResultMemberRename;
+interface
+type
+  TObj = class
+    Member: Integer;
+  end;
+function MakeValue: TObj;
+implementation
+function MakeValue: TObj;
+begin
+  Result := TObj.Create;
+end;
+procedure Caller;
+begin
+  MakeValue().Member := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "FunctionResultMemberRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Member", 1),
+            "RenamedMember",
+        )
+        .expect("function result member rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Member", 1),
+                "RenamedMember".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Member", 2),
+                "RenamedMember".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn implementation_only_function_result_rename_excludes_its_body_type_member() {
+    let provider_uri = uri("ImplementationOnlyRenameSource");
+    let consumer_uri = uri("ImplementationOnlyRenameConsumer");
+    let provider = "unit ImplementationOnlyRenameSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+";
+    let consumer = "unit ImplementationOnlyRenameConsumer;
+interface
+uses ImplementationOnlyRenameSource;
+implementation
+function Make: TResult;
+type
+  TResult = record
+    Name: string;
+  end;
+begin
+  Result.Name := '';
+end;
+procedure Caller;
+begin
+  Make().Name := 1;
+end;
+end.
+";
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("rename provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("rename consumer parses");
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "ImplementationOnlyRenameSource".to_owned(),
+        provider_uri.clone(),
+    );
+    index.bind_imports(&consumer_uri, bindings);
+
+    let edits = index
+        .rename_edits(
+            &provider_uri,
+            position_of(provider, "Name", 0),
+            "RenamedName",
+        )
+        .expect("implementation-only result rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "Name", 0),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Name", 1),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Name", 2),
+                "RenamedName".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn nested_function_result_rename_keeps_the_declaration_type_scope() {
+    let provider_uri = uri("NestedResultRenameSource");
+    let consumer_uri = uri("NestedResultRenameConsumer");
+    let provider = r#"unit NestedResultRenameSource;
+interface
+type
+  TResult = class
+    Name: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit NestedResultRenameConsumer;
+interface
+uses NestedResultRenameSource;
+implementation
+procedure Outer;
+type
+  TResult = record
+    Name: string;
+  end;
+  function Make: TResult;
+  type
+    TResult = record
+      Name: Boolean;
+    end;
+  begin
+    Result.Name := False;
+  end;
+begin
+  Make().Name := '';
+end;
+end.
+"#;
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("nested rename provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("nested rename consumer parses");
+    let mut bindings = HashMap::new();
+    bindings.insert("NestedResultRenameSource".to_owned(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+
+    let edits = index
+        .rename_edits(
+            &consumer_uri,
+            position_of(consumer, "Name", 0),
+            "RenamedName",
+        )
+        .expect("nested result rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Name", 0),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Name", 2),
+                "RenamedName".to_owned(),
+            ),
+            (
+                consumer_uri,
+                range_of(consumer, "Name", 3),
+                "RenamedName".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn shadowed_qualified_cast_type_root_does_not_authorize_a_member_rename() {
+    let provider_uri = uri("ShadowedCastRenameSource");
+    let consumer_uri = uri("ShadowedCastRenameConsumer");
+    let provider = "unit ShadowedCastRenameSource;
+interface
+type
+  TResult = class
+    Member: Integer;
+  end;
+end.
+";
+    let consumer = "unit ShadowedCastRenameConsumer;
+interface
+uses ShadowedCastRenameSource;
+type
+  TWidget = class
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  ShadowedCastRenameSource: Integer;
+begin
+  (Obj as ShadowedCastRenameSource.TResult).Member := 1;
+end;
+end.
+";
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("shadowed cast rename provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("shadowed cast rename consumer parses");
+    let mut bindings = HashMap::new();
+    bindings.insert("ShadowedCastRenameSource".to_owned(), provider_uri.clone());
+    index.bind_imports(&consumer_uri, bindings);
+
+    assert!(
+        index
+            .rename_edits(
+                &provider_uri,
+                position_of(provider, "Member", 0),
+                "RenamedMember",
+            )
+            .is_err(),
+        "a shadowed cast root must not authorize a partial member rename"
+    );
+}
+
+#[test]
+fn invalid_cast_variable_rhs_does_not_authorize_a_member_rename() {
+    let source = "unit InvalidCastVariableRename;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TOther = class
+    Member: Integer;
+  end;
+procedure Caller;
+var
+  Obj: TWidget;
+  OtherObj: TOther;
+begin
+  Obj.Member := 1;
+  (Obj as OtherObj).Member := 2;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "InvalidCastVariableRename", source);
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Member", 1),
+                "RenamedMember"
+            )
+            .is_err(),
+        "an invalid cast receiver must not produce a partial member rename"
+    );
+}
+
+#[test]
 fn unrelated_class_homonyms_are_not_renamed() {
     let source = "unit ClassHomonyms;
 interface
@@ -1550,6 +2008,94 @@ end.
 }
 
 #[test]
+fn unrelated_local_rename_inside_with_body_remains_safe() {
+    let source = "unit WithSafeLocalRename;
+interface
+type
+  TBox = class
+    Value: Integer;
+  end;
+implementation
+procedure Run(Box: TBox);
+var
+  LocalValue: Integer;
+begin
+  with Box do
+    LocalValue := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithSafeLocalRename", source);
+    let declaration = range_in(source, "LocalValue: Integer", "LocalValue", 0);
+
+    let edits = index
+        .rename_edits(&source_uri, declaration.start, "RenamedLocal")
+        .expect("an unrelated local inside with can be renamed safely");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (source_uri.clone(), declaration, "RenamedLocal".to_owned()),
+            (
+                source_uri,
+                range_in(source, "LocalValue := 1", "LocalValue", 0),
+                "RenamedLocal".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn receiver_list_binding_keeps_local_rename_edits_exact() {
+    let source = "unit WithReceiverListRename;
+interface
+type
+  TInner = record
+    Value: Integer;
+  end;
+  TOuter = record
+    Inner: TInner;
+  end;
+implementation
+procedure Run;
+var
+  OuterValue: TOuter;
+  Inner: TInner;
+begin
+  with OuterValue, Inner do
+    Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithReceiverListRename", source);
+    let local_declaration = range_in(source, "Inner: TInner", "Inner", 1);
+
+    let edits = index
+        .rename_edits(&source_uri, local_declaration.start, "RenamedInner")
+        .expect("unused local rename remains safe");
+    assert_exact_edits(
+        &edits,
+        vec![(
+            source_uri.clone(),
+            local_declaration,
+            "RenamedInner".to_owned(),
+        )],
+    );
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Inner do", 0),
+                "RenamedInner",
+            )
+            .is_err(),
+        "with-dependent receiver rename must be rejected"
+    );
+}
+
+#[test]
 fn inherited_member_reference_aborts_without_partial_edits() {
     let source = "unit InheritedRename;
 interface
@@ -1575,6 +2121,67 @@ end.
             .rename_edits(&source_uri, position_of(source, "Value", 0), "RenamedValue",)
             .is_err(),
         "inherited references must not produce a partial rename"
+    );
+}
+
+#[test]
+fn nested_member_rename_uses_the_declaring_type_context() {
+    let provider = r#"unit NestedMemberRenameProvider;
+interface
+type
+  TP = class
+    Shared: Integer;
+  end;
+  TBase = class
+    F: TP;
+  end;
+implementation
+end.
+"#;
+    let consumer = r#"unit NestedMemberRenameConsumer;
+interface
+uses NestedMemberRenameProvider;
+type
+  TP = class
+    Shared: string;
+  end;
+  TChild = class(NestedMemberRenameProvider.TBase)
+  end;
+implementation
+procedure Caller;
+var
+  Obj: TChild;
+begin
+  Obj.F.Shared;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let provider_uri = update(&mut index, "NestedMemberRenameProvider", provider);
+    let consumer_uri = update(&mut index, "NestedMemberRenameConsumer", consumer);
+
+    let edits = index
+        .rename_edits(
+            &consumer_uri,
+            position_of(consumer, "Shared", 1),
+            "RenamedShared",
+        )
+        .expect("nested member rename resolves its declaring type");
+    assert_eq!(
+        exact_edit_signatures(&edits),
+        vec![
+            edit_signature(
+                &consumer_uri,
+                range_of(consumer, "Shared", 1),
+                "RenamedShared",
+            ),
+            edit_signature(
+                &provider_uri,
+                range_of(provider, "Shared", 0),
+                "RenamedShared",
+            ),
+        ],
+        "nested member rename must not edit the consumer's unrelated TP.Shared"
     );
 }
 
@@ -2196,5 +2803,522 @@ fn mixed_boolean_and_comparison_precedence_keeps_the_active_include_audited() {
             )
             .is_err(),
         "Pascal's lower-precedence comparison must leave the ELSE include active"
+    );
+}
+
+#[test]
+fn generic_type_parameter_rename_fails_closed_until_instantiations_are_modeled() {
+    let source = r#"unit GenericRename;
+interface
+type
+  TBox<T> = class
+    Value: T;
+  end;
+  TWidget = class
+  end;
+var
+  Box: TBox<TWidget>;
+implementation
+procedure Run;
+begin
+  Box.Value := TWidget.Create;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "GenericRename", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, Position::new(3, 7), "TOther")
+            .is_err(),
+        "generic parameter rename must remain conservative"
+    );
+}
+
+#[test]
+fn global_type_rename_excludes_routine_generic_formals() {
+    let source = r#"unit GenericFormalShadow;
+interface
+type
+  T = class
+    LocalMember: Integer;
+  end;
+function Identity<T>(Value: T): T;
+implementation
+function Identity<T>(Value: T): T;
+begin
+  Result := Value;
+end;
+procedure Run;
+var
+  Obj: T;
+begin
+  Identity(Obj).LocalMember;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "GenericFormalShadow", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "T = class", 0), "TRenamed")
+        .expect("global type rename must remain resolvable");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "T = class", "T", 0),
+                "TRenamed".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "Obj: T", "T", 0),
+                "TRenamed".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn field_rename_resolves_call_expression_members_without_capturing_formals() {
+    let source = r#"unit ExpressionReceiverRename;
+interface
+type
+  THolder = class
+    T: Integer;
+  end;
+function GetHolder: THolder;
+procedure Run<T>(Value: T);
+implementation
+function GetHolder: THolder;
+begin
+end;
+procedure Run<T>(Value: T);
+begin
+  GetHolder().T := 1;
+  THolder(GetHolder()).T := 2;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ExpressionReceiverRename", source);
+    let declaration = range_in(source, "T: Integer", "T", 0);
+    let use_range = range_in(source, "GetHolder().T", "T", 0);
+    let cast_range = range_in_occurrence(source, "THolder(GetHolder()).T", "T", 0, 1);
+
+    let edits = index
+        .rename_edits(&source_uri, declaration.start, "Renamed")
+        .expect("field rename through a call receiver succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (source_uri.clone(), declaration, "Renamed".to_owned()),
+            (source_uri.clone(), use_range, "Renamed".to_owned()),
+            (source_uri.clone(), cast_range, "Renamed".to_owned()),
+        ],
+    );
+
+    let bindings = index
+        .binding_locations(&source_uri, use_range.start, true)
+        .expect("call receiver field bindings resolve");
+    assert_exact_locations(
+        &bindings,
+        vec![
+            (source_uri.clone(), declaration),
+            (source_uri.clone(), use_range),
+            (source_uri, cast_range),
+        ],
+    );
+}
+
+#[test]
+fn class_field_rename_keeps_qualified_type_and_routine_formals_disjoint() {
+    let source = r#"unit QualifiedFieldRename;
+interface
+type
+  T = class
+    GlobalMember: Integer;
+  end;
+  Holder = class
+    T: Integer;
+  end;
+procedure Run<T>(Obj: Holder);
+implementation
+procedure Run<T>(Obj: Holder);
+var
+  Qualified: QualifiedFieldRename.T;
+begin
+  Qualified.GlobalMember;
+  Obj.T := 1;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "QualifiedFieldRename", source);
+    let target = range_in(source, "T: Integer", "T", 0);
+
+    let edits = index
+        .rename_edits(&source_uri, target.start, "FieldValue")
+        .expect("qualified class field rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (source_uri.clone(), target, "FieldValue".to_owned()),
+            (
+                source_uri,
+                range_in(source, "Obj.T", "T", 0),
+                "FieldValue".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn rename_respects_private_protected_and_strict_private_access() {
+    let provider = r#"unit RenameAccessibilityProvider;
+interface
+type
+  TBase = class
+  private
+    PrivateField: Integer;
+  protected
+    ProtectedField: Integer;
+  strict private
+    StrictSecretField: Integer;
+  end;
+  procedure SameUnit;
+implementation
+procedure SameUnit;
+var
+  Obj: TBase;
+begin
+  Obj.PrivateField := 1;
+end;
+end.
+"#;
+    let consumer = r#"unit RenameAccessibilityConsumer;
+interface
+uses RenameAccessibilityProvider;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+  TUnrelated = class
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+var
+  Obj: TBase;
+begin
+  Obj.ProtectedField := 1;
+end;
+procedure TUnrelated.Run;
+var
+  Obj: TBase;
+begin
+  Obj.StrictSecretField := 1;
+end;
+end.
+"#;
+    let provider_uri = uri("RenameAccessibilityProvider");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("rename accessibility provider parses");
+    let consumer_uri = update(&mut index, "RenameAccessibilityConsumer", consumer);
+
+    let private_declaration = position_of(provider, "PrivateField", 0);
+    let private_edits = index
+        .rename_edits(&provider_uri, private_declaration, "RenamedPrivate")
+        .expect("ordinary private rename within its unit succeeds");
+    assert_exact_edits(
+        &private_edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "PrivateField", 0),
+                "RenamedPrivate".to_owned(),
+            ),
+            (
+                provider_uri.clone(),
+                range_of(provider, "PrivateField", 1),
+                "RenamedPrivate".to_owned(),
+            ),
+        ],
+    );
+
+    let protected_declaration = position_of(provider, "ProtectedField", 0);
+    let protected_edits = index
+        .rename_edits(&provider_uri, protected_declaration, "RenamedProtected")
+        .expect("protected rename from a descendant succeeds");
+    assert_exact_edits(
+        &protected_edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "ProtectedField", 0),
+                "RenamedProtected".to_owned(),
+            ),
+            (
+                consumer_uri,
+                range_of(consumer, "ProtectedField", 0),
+                "RenamedProtected".to_owned(),
+            ),
+        ],
+    );
+
+    assert!(
+        index
+            .rename_edits(
+                &provider_uri,
+                position_of(provider, "StrictSecretField", 0),
+                "RenamedStrictPrivate",
+            )
+            .is_err(),
+        "strict-private access from another class must reject a partial rename"
+    );
+}
+
+#[test]
+fn inline_variable_rename_stays_within_each_nested_block() {
+    let source = r#"unit BlockInlineRename;
+interface
+var
+  Value: Integer;
+implementation
+procedure Run;
+begin
+  Value := 1;
+  if True then
+  begin
+    var Value: Integer;
+    Value := 2;
+    if True then
+    begin
+      var Value: Integer;
+      Value := 3;
+    end;
+    Value := 4;
+  end;
+  Value := 5;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "BlockInlineRename", source);
+
+    let global_declaration = range_in(source, "Value: Integer", "Value", 0);
+    let outer_declaration = range_in(source, "Value: Integer", "Value", 1);
+    let inner_declaration = range_in(source, "Value: Integer", "Value", 2);
+
+    let global_edits = index
+        .rename_edits(&source_uri, global_declaration.start, "GlobalValue")
+        .expect("global inline-shadow rename succeeds");
+    assert_exact_edits(
+        &global_edits,
+        vec![
+            (
+                source_uri.clone(),
+                global_declaration,
+                "GlobalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 1", "Value", 0),
+                "GlobalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 5", "Value", 0),
+                "GlobalValue".to_owned(),
+            ),
+        ],
+    );
+
+    let outer_edits = index
+        .rename_edits(&source_uri, outer_declaration.start, "OuterValue")
+        .expect("outer inline rename succeeds");
+    assert_exact_edits(
+        &outer_edits,
+        vec![
+            (
+                source_uri.clone(),
+                outer_declaration,
+                "OuterValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 2", "Value", 0),
+                "OuterValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "Value := 4", "Value", 0),
+                "OuterValue".to_owned(),
+            ),
+        ],
+    );
+
+    let inner_edits = index
+        .rename_edits(&source_uri, inner_declaration.start, "InnerValue")
+        .expect("inner inline rename succeeds");
+    assert_exact_edits(
+        &inner_edits,
+        vec![
+            (
+                source_uri.clone(),
+                inner_declaration,
+                "InnerValue".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "Value := 3", "Value", 0),
+                "InnerValue".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn local_declaration_rename_respects_prior_initializer_bindings() {
+    let source = r#"unit DeclarationOrderRename;
+interface
+const
+  Value = 1;
+type
+  TGlobal = Integer;
+implementation
+procedure Run;
+const
+  BeforeValue = Value;
+  Value = 2;
+type
+  TBefore = TGlobal;
+  TGlobal = string;
+var
+  BeforeVar: TGlobal;
+begin
+  WriteLn(Value);
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "DeclarationOrderRename", source);
+
+    let global_value_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value = 1", 0),
+            "GlobalValue",
+        )
+        .expect("global constant rename succeeds");
+    assert_exact_edits(
+        &global_value_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "Value = 1", "Value", 0),
+                "GlobalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in_occurrence(source, "BeforeValue = Value", "Value", 0, 1),
+                "GlobalValue".to_owned(),
+            ),
+        ],
+    );
+
+    let local_value_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Value = 2", 0),
+            "LocalValue",
+        )
+        .expect("local constant rename succeeds");
+    assert_exact_edits(
+        &local_value_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "Value = 2", "Value", 0),
+                "LocalValue".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_in(source, "WriteLn(Value)", "Value", 0),
+                "LocalValue".to_owned(),
+            ),
+        ],
+    );
+
+    let local_type_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "TGlobal = string", 0),
+            "LocalType",
+        )
+        .expect("local type rename succeeds");
+    assert_exact_edits(
+        &local_type_edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "TGlobal = string", "TGlobal", 0),
+                "LocalType".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "BeforeVar: TGlobal", "TGlobal", 0),
+                "LocalType".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn rename_rejects_inaccessible_receiver_unit_fallback() {
+    let provider = r#"unit RenameReceiverUnitProvider;
+interface
+type
+  TBase = class
+  private
+    Hidden: Integer;
+  end;
+end.
+"#;
+    let consumer = r#"unit RenameReceiverUnitConsumer;
+interface
+uses RenameReceiverUnitProvider, Hidden;
+type
+  TChild = class(TBase)
+    procedure Run;
+  end;
+implementation
+procedure TChild.Run;
+begin
+  Hidden.Exposed := 1;
+end;
+end.
+"#;
+    let hidden = r#"unit Hidden;
+interface
+var
+  Exposed: Integer;
+implementation
+end.
+"#;
+    let hidden_uri = uri("Hidden");
+    let mut index = NavigationIndex::new();
+    update(&mut index, "RenameReceiverUnitProvider", provider);
+    update(&mut index, "RenameReceiverUnitConsumer", consumer);
+    update(&mut index, "Hidden", hidden);
+
+    let result = index.rename_edits(&hidden_uri, position_of(hidden, "Exposed", 0), "Changed");
+    assert!(
+        result.is_err(),
+        "rename accepted an inaccessible receiver's unit fallback: {result:?}"
     );
 }

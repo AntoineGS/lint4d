@@ -1842,6 +1842,613 @@ fn completion_request_returns_semantic_items_and_plain_text_edits() {
 }
 
 #[test]
+fn deep_method_receiver_completion_stays_stack_safe_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepMethodReceivers.pas");
+    let method_chain = |count: usize| {
+        let mut expression = String::from("Obj");
+        for _ in 0..count {
+            expression.push_str(".Next()");
+        }
+        expression.push_str(".Me");
+        expression
+    };
+    let chain_256 = method_chain(256);
+    let chain_512 = method_chain(512);
+    let source = format!(
+        "unit DeepMethodReceivers;\ninterface\ntype\n  TObj = class\n    function Next: TObj;\n    Member: Integer;\n  end;\nimplementation\nfunction TObj.Next: TObj;\nbegin\n  Result := Self;\nend;\nprocedure Run256;\nvar\n  Obj: TObj;\nbegin\n  {chain_256};\nend;\nprocedure Run512;\nvar\n  Obj: TObj;\nbegin\n  {chain_512};\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let outline_id = RequestId::from("deep-method-outline".to_string());
+    server.send_request(
+        outline_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let outline = server.response(&outline_id);
+    assert!(
+        outline.error.is_none(),
+        "document symbols failed: {outline:?}"
+    );
+
+    for (request_name, chain) in [
+        ("deep-method-completion-256", &chain_256),
+        ("deep-method-completion-512", &chain_512),
+    ] {
+        let id = RequestId::from(request_name.to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(&source, chain, 0),
+            }),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "deep completion failed: {response:?}"
+        );
+        assert_eq!(
+            response.result.expect("deep completion result")["isIncomplete"],
+            true
+        );
+    }
+
+    let cancelled_id = RequestId::from("deep-method-completion-cancelled".to_string());
+    server.send_request(
+        cancelled_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(&source, &chain_512, 0),
+        }),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "deep-method-completion-cancelled"}),
+    );
+    let cancelled = server.response(&cancelled_id);
+    let error = cancelled
+        .error
+        .expect("cancelled deep completion must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+
+    let responsive_id = RequestId::from("deep-method-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn deeply_nested_generic_receiver_completion_stays_bounded_and_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepGenericReceivers.pas");
+    let depth = 512;
+    let mut nested_type = String::from("TWidget");
+    for _ in 0..depth {
+        nested_type = format!("TBox<{nested_type}>");
+    }
+    let mut expression = String::from("Box");
+    for _ in 0..depth {
+        expression.push_str(".Value");
+    }
+    expression.push_str(".Me");
+    let source = format!(
+        "unit DeepGenericReceivers;\ninterface\ntype\n  TBox<T> = class\n    Value: T;\n  end;\n  TWidget = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: {nested_type};\nbegin\n  {expression};\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let outline_id = RequestId::from("deep-generic-outline".to_string());
+    server.send_request(
+        outline_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let outline = server.response(&outline_id);
+    assert!(
+        outline.error.is_none(),
+        "deep generic document symbols failed: {outline:?}"
+    );
+
+    let id = RequestId::from("deep-generic-completion".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(&source, &expression, 0),
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "deep generic completion failed: {response:?}"
+    );
+    let result = response.result.expect("deep generic completion result");
+    assert_eq!(result["items"], json!([]));
+
+    let cancelled_id = RequestId::from("deep-generic-completion-cancelled".to_string());
+    server.send_request(
+        cancelled_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(&source, &expression, 0),
+        }),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "deep-generic-completion-cancelled"}),
+    );
+    let cancelled = server.response(&cancelled_id);
+    let error = cancelled
+        .error
+        .expect("cancelled deep generic completion must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+
+    let responsive_id = RequestId::from("deep-generic-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep generic completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn deeply_nested_with_completion_cancels_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepWithReceivers.pas");
+    let depth = 512;
+    let mut source = String::from(
+        "unit DeepWithReceivers;\ninterface\ntype\n  TObj = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Obj: TObj;\nbegin\n",
+    );
+    for _ in 0..depth {
+        source.push_str("  with Obj do begin\n");
+    }
+    let cursor_line = source[..source.len()]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32;
+    source.push_str("    \n");
+    for _ in 0..depth {
+        source.push_str("  end;\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let position = Position::new(cursor_line, 4);
+
+    let completion_id = RequestId::from("deep-with-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position,
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "deep with completion failed: {completion:?}"
+    );
+    assert_eq!(
+        completion.result.expect("deep with completion result")["isIncomplete"],
+        true
+    );
+
+    let cancelled_id = RequestId::from("deep-with-completion-cancelled".to_string());
+    server.send_request(
+        cancelled_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position,
+        }),
+    );
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "deep-with-completion-cancelled"}),
+    );
+    let cancelled = server.response(&cancelled_id);
+    let error = cancelled
+        .error
+        .expect("cancelled deep with completion must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+
+    let responsive_id = RequestId::from("deep-with-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep with completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn cyclic_generic_member_types_fail_closed_and_keep_the_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("CyclicGeneric.pas");
+    let source = "unit CyclicGeneric;\ninterface\ntype\n  TNode<T> = class\n    Next: TNode<T>;\n  end;\nimplementation\nprocedure Run;\nvar\n  Node: TNode<Integer>;\nbegin\n  Node.Next.Mis;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let completion_id = RequestId::from("cyclic-generic-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Node.Next.Mis", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "cyclic generic completion failed: {completion:?}"
+    );
+    assert_eq!(
+        completion.result.expect("cyclic generic completion result")["items"],
+        json!([])
+    );
+
+    let responsive_id = RequestId::from("cyclic-generic-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after cyclic generic completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn invalid_helper_ancestry_fails_closed_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("InvalidHelperAncestry.pas");
+    let source = "unit InvalidHelperAncestry;\ninterface\ntype\n  TBase = class\n  end;\n  TWidget = class\n  end;\n  TWidgetHelper = class helper (TBase) for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TWidgetHelper.Touch;\nbegin\nend;\nprocedure Run;\nvar\n  Widget: TWidget;\nbegin\n  Widget.Touch;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let definition_id = RequestId::from("invalid-helper-ancestry-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, source, "Touch", 2),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert!(
+        locations.is_empty(),
+        "invalid helper ancestry must fail closed: {locations:?}"
+    );
+
+    let responsive_id = RequestId::from("invalid-helper-ancestry-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after invalid helper ancestry: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn helper_owner_keeps_lexical_members_when_another_helper_is_active() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("HelperOwnerLexical.pas");
+    let source = "unit HelperOwnerLexical;\ninterface\ntype\n  TWidget = class\n  end;\n  TFirstHelper = class helper for TWidget\n    procedure First;\n    procedure Second;\n  end;\n  TSecondHelper = class helper for TWidget\n    procedure Other;\n  end;\nimplementation\nprocedure TFirstHelper.Second;\nbegin\nend;\nprocedure TSecondHelper.Other;\nbegin\nend;\nprocedure TFirstHelper.First;\nvar\n  Second: Integer;\nbegin\n  Second := 1;\n  Self.Second;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let local_id = RequestId::from("helper-owner-local".to_string());
+    server.send_request(
+        local_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, source, "Second :=", 0),
+    );
+    let local_locations = result_locations(server.response(&local_id));
+    assert_exact_location_signatures(
+        &local_locations,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "Second",
+            4,
+        )],
+    );
+
+    let self_id = RequestId::from("helper-owner-self".to_string());
+    server.send_request(
+        self_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": final_qualified_type_position(source, "Self.Second"),
+        }),
+    );
+    let self_locations = result_locations(server.response(&self_id));
+    assert_exact_location_signatures(
+        &self_locations,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "Second",
+            2,
+        )],
+    );
+
+    let completion_id = RequestId::from("helper-owner-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Self.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "helper owner completion failed: {completion:?}"
+    );
+    let completion_result = completion.result.expect("helper owner completion result");
+    let items = completion_result["items"]
+        .as_array()
+        .expect("helper owner completion items");
+    let labels = items
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect::<HashSet<_>>();
+    assert!(
+        labels.contains("Second"),
+        "own helper member missing: {labels:?}"
+    );
+    assert!(
+        !labels.contains("Other"),
+        "external helper leaked: {labels:?}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn unknown_conditional_import_does_not_select_a_known_helper() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let target_path = temp.path().join("ConditionalHelperTarget.pas");
+    let known_path = temp.path().join("KnownConditionalHelper.pas");
+    let maybe_path = temp.path().join("MaybeConditionalHelper.pas");
+    let consumer_path = temp.path().join("ConditionalHelperConsumer.pas");
+    let target = "unit ConditionalHelperTarget;\ninterface\ntype\n  TWidget = class\n  end;\nimplementation\nend.\n";
+    let known = "unit KnownConditionalHelper;\ninterface\nuses ConditionalHelperTarget;\ntype\n  TKnownHelper = class helper for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TKnownHelper.Touch;\nbegin\nend;\nend.\n";
+    let maybe = "unit MaybeConditionalHelper;\ninterface\nuses ConditionalHelperTarget;\ntype\n  TMaybeHelper = class helper for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TMaybeHelper.Touch;\nbegin\nend;\nend.\n";
+    let consumer = "unit ConditionalHelperConsumer;\ninterface\nuses\n  ConditionalHelperTarget,\n  KnownConditionalHelper,\n  {$IF CompilerVersion >= 24}\n  MaybeConditionalHelper\n  {$ENDIF};\nimplementation\nprocedure Run;\nvar\n  Widget: ConditionalHelperTarget.TWidget;\nbegin\n  Widget.Touch;\nend;\nend.\n";
+    write_file(&target_path, target);
+    write_file(&known_path, known);
+    write_file(&maybe_path, maybe);
+    write_file(&consumer_path, consumer);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let definition_id = RequestId::from("unknown-conditional-helper-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer_path, consumer, "Touch", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert!(
+        locations.is_empty(),
+        "unknown conditional helper must block definition selection: {locations:?}"
+    );
+
+    let completion_id = RequestId::from("unknown-conditional-helper-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&consumer_path)},
+            "position": position_after(consumer, "Widget.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    let error = completion
+        .error
+        .expect("unknown conditional helper completion must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error
+            .message
+            .contains("one or more imports could not be resolved")
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn cyclic_generic_constraints_fail_closed_and_keep_the_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("CyclicGenericConstraint.pas");
+    let source = "unit CyclicGenericConstraint;\ninterface\ntype\n  TNode<T: TNode<T>> = class\n    Value: T;\n  end;\n  TImpl = class(TNode<TImpl>)\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: TNode<TImpl>;\nbegin\n  Box.Value.Member;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let completion_id = RequestId::from("cyclic-generic-constraint-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Box.Value.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "cyclic generic constraint completion failed: {completion:?}"
+    );
+    assert_eq!(
+        completion
+            .result
+            .expect("cyclic generic constraint completion result")["items"],
+        json!([])
+    );
+
+    let responsive_id = RequestId::from("cyclic-generic-constraint-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after cyclic generic constraint completion: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn deeply_parenthesized_overload_request_survives_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeepParenthesizedOverload.pas");
+    let mut argument = String::new();
+    for _ in 0..65_536 {
+        argument.push('(');
+    }
+    argument.push('1');
+    for _ in 0..65_536 {
+        argument.push(')');
+    }
+    let source = format!(
+        "unit DeepParenthesizedOverload;\ninterface\ntype\n  TIntResult = class\n    IntMember: Integer;\n  end;\n  TStringResult = class\n    StringMember: Integer;\n  end;\nfunction Pick(Value: Integer): TIntResult; overload;\nfunction Pick(Value: string): TStringResult; overload;\nimplementation\nprocedure Caller;\nbegin\n  Pick({argument}).IntMember;\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let definition_id = RequestId::from("deep-parenthesized-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &source, "Pick(", 0),
+    );
+    let definition = result_locations(server.response(&definition_id));
+    assert_eq!(
+        definition.len(),
+        1,
+        "deep parenthesized integer call must resolve"
+    );
+
+    let responsive_id = RequestId::from("deep-parenthesized-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after deep parenthesized overload selection: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_request_marks_unqualified_unknown_ancestry_incomplete() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("UnknownUnqualifiedProtocol.pas");
+    let source = "unit UnknownUnqualifiedProtocol;\ninterface\ntype\n  TChild = class(TMissing)\n    procedure Run;\n  end;\nimplementation\nprocedure TChild.Run;\nbegin\n  Unknown;\n  Self.Unknown;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let unqualified_id = RequestId::from("unknown-unqualified-completion".to_string());
+    server.send_request(
+        unqualified_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Unknown", 0),
+        }),
+    );
+    let unqualified = server
+        .response(&unqualified_id)
+        .result
+        .expect("unqualified completion result");
+    assert_eq!(unqualified["items"], json!([]));
+    assert_eq!(unqualified["isIncomplete"], true);
+
+    let qualified_id = RequestId::from("unknown-qualified-completion".to_string());
+    server.send_request(
+        qualified_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Self.Unknown", 0),
+        }),
+    );
+    let qualified = server
+        .response(&qualified_id)
+        .result
+        .expect("qualified completion result");
+    assert_eq!(qualified["items"], json!([]));
+    assert_eq!(qualified["isIncomplete"], true);
+
+    server.shutdown();
+}
+
+#[test]
 fn completion_request_rejects_an_unresolved_import_without_partial_items() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("UnresolvedCompletion.pas");
@@ -1923,6 +2530,39 @@ fn signature_help_request_returns_nested_argument_selection_and_source_labels() 
             json!([29, 30]),
             json!([40, 41])
         ]
+    );
+    server.shutdown();
+}
+
+#[test]
+fn generic_signature_help_request_returns_the_generic_source_label() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("GenericSignature.pas");
+    let source = "unit GenericSignature;\ninterface\nfunction Identity<T>(Value: T): T;\nimplementation\nfunction Identity<T>(Value: T): T;\nbegin\n  Result := Value;\nend;\nprocedure Caller;\nbegin\n  Identity(1);\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("generic-signature-help-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Identity(1", 0),
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "generic signature help failed: {response:?}"
+    );
+    let result = response.result.expect("generic signature help result");
+    assert_eq!(result["activeSignature"], 0);
+    assert_eq!(result["activeParameter"], 0);
+    assert_eq!(
+        result["signatures"][0]["label"],
+        "function Identity<T>(Value: T): T;"
     );
     server.shutdown();
 }
@@ -2473,6 +3113,48 @@ fn type_definition_request_returns_the_source_type_declaration() {
 }
 
 #[test]
+fn type_definition_request_resolves_a_function_result_with_utf16_positions() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("ResultProvider.pas");
+    let consumer = temp.path().join("ResultConsumer.pas");
+    let provider_source = "unit ResultProvider;\ninterface\ntype\n  TResult = class\n    Member: Integer;\n  end;\nfunction MakeValue: TResult;\nimplementation\nfunction MakeValue: TResult;\nbegin\n  Result := TResult.Create;\nend;\nend.\n";
+    let consumer_source = "unit ResultConsumer;\ninterface\nuses ResultProvider;\nimplementation\nprocedure Run;\nbegin\n  {😀} ResultProvider.MakeValue().Member := 1;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("function-result-type-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&consumer, consumer_source, "MakeValue", 0),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "function result type definition failed: {response:?}"
+    );
+    let result = response
+        .result
+        .expect("function result type definition result");
+    let locations = result
+        .as_array()
+        .expect("function result type definition locations");
+    assert_eq!(
+        locations,
+        &vec![json!({
+            "uri": uri(&provider),
+            "range": {
+                "start": {"line": 3, "character": 2},
+                "end": {"line": 3, "character": 9}
+            }
+        })]
+    );
+    server.shutdown();
+}
+
+#[test]
 fn type_definition_returns_empty_for_primitives_unknowns_and_malformed_positions() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("UnsupportedTypeDefinition.pas");
@@ -2940,6 +3622,64 @@ fn references_include_unopened_consumers() {
     assert_eq!(locations[0]["uri"], uri(&consumer).to_string());
     assert_eq!(locations[1]["uri"], uri(&consumer).to_string());
     assert_eq!(locations[2]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn references_reject_a_variable_rhs_in_a_cast_receiver() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("InvalidCastReferences.pas");
+    let source = "unit InvalidCastReferences;\ninterface\ntype\n  TWidget = class\n    Member: Integer;\n  end;\n  TOther = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Caller;\nvar\n  Obj: TWidget;\n  OtherObj: TOther;\nbegin\n  (Obj as OtherObj).Member := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("invalid-cast-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "Member", 1),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "an unresolved cast receiver must not return references"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn references_reject_a_shadowed_qualified_cast_type_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider_path = temp.path().join("CastTypes.pas");
+    let consumer_path = temp.path().join("QualifiedCastRootShadow.pas");
+    let provider =
+        "unit CastTypes;\ninterface\ntype\n  TResult = class\n    Member: Integer;\n  end;\nend.\n";
+    let consumer = "unit QualifiedCastRootShadow;\ninterface\nuses CastTypes;\ntype\n  TWidget = class\n  end;\nprocedure Caller;\nvar\n  Obj: TWidget;\n  CastTypes: Integer;\nbegin\n  (Obj as CastTypes.TResult).Member := 1;\nend;\nend.\n";
+    write_file(&provider_path, provider);
+    write_file(&consumer_path, consumer);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("shadowed-qualified-cast-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&consumer_path)},
+            "position": position_of(consumer, "Member", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "a shadowed cast root must not return imported references"
+    );
     server.shutdown();
 }
 
@@ -16967,5 +17707,49 @@ fn rename_cancellation_during_final_content_hash_returns_request_canceled() {
     let error = response.error.expect("cancelled rename must fail");
     assert_eq!(error.code, -32800);
     assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn recursive_generic_constraint_completion_fails_closed_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("RecursiveGenericConstraint.pas");
+    let source = "unit RecursiveGenericConstraint;\ninterface\ntype\n  TWrap<T> = class\n    Value: T;\n  end;\n  TNode<T: TNode<TWrap<T>>> = class\n    Value: T;\n  end;\n  TImpl = class(TNode<TImpl>)\n    Member: Integer;\n  end;\nimplementation\nprocedure Run;\nvar\n  Box: TNode<TImpl>;\nbegin\n  Box.Value.Member;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let completion_id = RequestId::from("recursive-generic-constraint-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Box.Value.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "recursive generic completion failed: {completion:?}"
+    );
+    let result = completion
+        .result
+        .expect("recursive generic completion result");
+    assert!(result["items"].is_array());
+    assert_eq!(result["isIncomplete"], true);
+
+    let responsive_id = RequestId::from("recursive-generic-constraint-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after recursive generic completion: {responsive:?}"
+    );
     server.shutdown();
 }

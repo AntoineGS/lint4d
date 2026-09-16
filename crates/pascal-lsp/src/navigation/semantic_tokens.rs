@@ -389,11 +389,13 @@ fn resolved_identifier_type(
         None => return Ok(None),
         Some(false) => {}
     }
-    let candidates = index.resolve_candidates_at_with_budget(
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
         uri,
         document,
         identifier.start_byte(),
         identifier,
+        &mut super::ResolutionState::new(),
+        0,
         cancel,
         budget,
     )?;

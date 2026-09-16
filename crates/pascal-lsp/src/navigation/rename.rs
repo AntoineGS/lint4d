@@ -431,14 +431,6 @@ impl NavigationIndex {
             })
     }
 
-    pub(super) fn owner_has_unknown_class_ancestor(
-        &self,
-        document: &Document,
-        owner_type: &str,
-    ) -> bool {
-        self.has_unknown_class_ancestor(document, owner_type)
-    }
-
     fn candidate_is_global(&self, candidate: &Candidate) -> bool {
         self.symbol(candidate).is_some_and(|symbol| {
             symbol.scope == ROOT_SCOPE
@@ -452,14 +444,10 @@ impl NavigationIndex {
     }
 
     fn has_unknown_class_ancestor(&self, document: &Document, owner_type: &str) -> bool {
-        // The resolver does not establish a complete inheritance or type-alias
-        // chain here. A same-document parent name is therefore not proof that
-        // inherited lookup is complete, and an omitted parent still has
-        // implicit TObject ancestry that is not modeled. Established
-        // non-class owners do not have class-inheritance lookup to complete;
-        // an owner missing from both caches remains unresolved and therefore
-        // conservatively unknown. The parse-time cache keeps this policy out
-        // of request-time tree walks.
+        // Task 01 does not establish a complete override/rename model. Even
+        // a source-visible parent is not proof that every inherited binding
+        // and override family can be edited safely, so keep rename/reference
+        // operations conservative until that model is implemented.
         document.unknown_class_owners.contains(owner_type)
             || !document.known_non_class_owners.contains(owner_type)
     }
@@ -759,6 +747,19 @@ impl NavigationIndex {
         if binding.kind == SymbolKind::Unit {
             return Err("unit/module rename requires RenameFile support".to_string());
         }
+        if binding.members.iter().any(|member| {
+            self.documents
+                .get(&member.uri)
+                .and_then(|document| {
+                    document
+                        .symbols
+                        .iter()
+                        .find(|symbol| symbol_id(&member.uri, symbol) == *member)
+                })
+                .is_some_and(|symbol| symbol.generic_parameter.is_some())
+        }) {
+            return Err("generic parameter rename is not supported".to_string());
+        }
         if binding.kind == SymbolKind::Type && has_forward_class_pair(self, &binding) {
             return Err("forward class/completion type rename is not supported".to_string());
         }
@@ -832,10 +833,12 @@ impl NavigationIndex {
                     if !strict_resolution && !is_binding_member {
                         continue;
                     }
-                    return Err(format!(
-                        "rename does not support with/inherited references at {}:{}",
-                        uri, span.start
-                    ));
+                    if has_ancestor_kind(identifier, "inherited") || binding_has_class_owner {
+                        return Err(format!(
+                            "rename does not support with/inherited references at {}:{}",
+                            uri, span.start
+                        ));
+                    }
                 }
                 if !include_declaration && is_binding_member {
                     continue;
@@ -934,6 +937,50 @@ impl NavigationIndex {
                     .iter()
                     .filter(|candidate| binding.matches_candidate(self, candidate))
                     .count();
+                if has_ancestor_kind(identifier, "with")
+                    && !binding_has_class_owner
+                    && !is_binding_member
+                {
+                    if candidates.is_empty() {
+                        if !strict_resolution {
+                            continue;
+                        }
+                        return Err(format!(
+                            "rename cannot prove the local binding through with at {}:{}",
+                            uri, span.start
+                        ));
+                    }
+                    if matching == 0 {
+                        continue;
+                    }
+                    if matching != candidates.len() {
+                        if !strict_resolution {
+                            continue;
+                        }
+                        return Err(format!(
+                            "rename cannot prove the local binding through with at {}:{}",
+                            uri, span.start
+                        ));
+                    }
+                    if !strict_resolution {
+                        continue;
+                    }
+                }
+                if matching > 0 && binding_has_class_owner && !is_direct_declaration {
+                    if let Some(dot) = member_expression {
+                        if self.member_reference_uses_inherited_class_owner(
+                            binding, uri, document, span.start, dot,
+                        ) {
+                            if !strict_resolution && !is_binding_member {
+                                continue;
+                            }
+                            return Err(format!(
+                                "rename does not support inherited class lookup at {}:{}",
+                                uri, span.start
+                            ));
+                        }
+                    }
+                }
                 if matching > 0 {
                     if matching != candidates.len() {
                         if !strict_resolution && !is_binding_member {
@@ -1062,6 +1109,57 @@ impl NavigationIndex {
         document
             .owner_type_at(offset)
             .is_some_and(|owner| !owners.contains(&(occurrence_uri.clone(), owner)))
+    }
+
+    fn member_reference_uses_inherited_class_owner(
+        &self,
+        binding: &Binding,
+        occurrence_uri: &Url,
+        document: &Document,
+        offset: usize,
+        dot: Node<'_>,
+    ) -> bool {
+        if binding.members.iter().any(|member| {
+            self.documents
+                .get(&member.uri)
+                .and_then(|document| {
+                    document
+                        .symbols
+                        .iter()
+                        .enumerate()
+                        .find(|(_, symbol)| symbol_id(&member.uri, symbol) == *member)
+                        .map(|(index, _)| Candidate {
+                            uri: member.uri.clone(),
+                            index,
+                        })
+                })
+                .is_some_and(|candidate| self.candidate_is_helper_member(&candidate))
+        }) {
+            return false;
+        }
+        let Some(lhs) = dot.child_by_field_name("lhs") else {
+            return true;
+        };
+        let receivers = self.resolve_receivers(occurrence_uri, document, offset, lhs);
+        for receiver in receivers {
+            let super::Receiver::Type(instance) = receiver else {
+                continue;
+            };
+            let direct = self.direct_member_candidates(
+                &instance.uri,
+                &instance.key,
+                instance.scope,
+                Some(&binding.old_key),
+                instance.uri == *occurrence_uri,
+            );
+            if direct
+                .iter()
+                .any(|candidate| binding.matches_candidate(self, candidate))
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn check_declaration_collisions(&self, binding: &Binding, new_key: &str) -> Result<(), String> {

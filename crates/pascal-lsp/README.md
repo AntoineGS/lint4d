@@ -79,9 +79,10 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `:checkhealth vim.lsp` | Inspect attachment, executable, and client configuration |
 | `:lua print(vim.lsp.log.get_filename())` | Locate the LSP log, including server stderr |
 
-If several overloads/candidates remain, Neovim presents multiple locations
-rather than the server guessing based on argument types. Keep the cursor on the
-identifier, not on whitespace following it.
+If argument types identify one supported overload, Neovim receives that
+declaration/result; otherwise it presents the retained overload set rather than
+the server guessing. Keep the cursor on the identifier, not on whitespace
+following it.
 
 Neovim 0.13-dev may show a quickfix list even for a singleton `gi` result; use
 `:cfirst` and choose the entry to navigate. Older clients may jump directly.
@@ -92,8 +93,10 @@ argument, or constructor receiver to jump to the class declaration. These use
 the standard LSP definition/declaration requests, not a new editor-specific
 command. The server also advertises `textDocument/typeDefinition`: on a
 variable, parameter, field, or property it opens the source declaration of the
-named type, and on a type identifier it opens that type declaration. Unsaved
-buffers and the selected project context are used for the bounded lookup.
+named type, on a type identifier it opens that type declaration, and on a
+source-backed function or constructor it opens the declared result/constructed
+type. Unsaved buffers and the selected project context are used for the bounded
+lookup.
 
 Type-definition lookup is source-based rather than compiler-based. Type aliases
 retain their own declaration as the target, alias cycles are bounded, and
@@ -109,15 +112,53 @@ identifier `TextEdit`s; it does not insert snippets, imports, or additional
 edits. Imported private/protected members and unrelated workspace names are not
 offered. Conditional uncertainty, ambiguous receivers, and bounded candidate
 truncation are reported conservatively with `CompletionList.isIncomplete` rather
-than as a falsely complete result.
+than as a falsely complete result. Expression receivers are resolved source-first
+as well: calls such as `MakeValue().Member`, constructors such as
+`TWidget.Create.Member`, casts such as `TWidget(Value).Member` and
+`(Value as TWidget).Member`, and nested result chains are supported when their
+named types are unambiguous. The receiver's declaring unit is retained when a
+result type has the same spelling as a type in the consuming unit.
 
-Signature help reports every supported source declaration that remains viable,
-including overloads. The active parameter is counted syntactically while
-skipping nested calls, indexers, Pascal strings, and comments; grouped formal
-parameter names are expanded individually. The server does not infer argument
-types, select an active overload, resolve `with`/`inherited` receivers, or infer
-anonymous/generic callables, and returns no signature for opaque or unknown
-calls.
+Class and interface member lookup follows the source ancestry retained for each
+indexed type, including inherited fields and routines and parents in imported
+units. A direct member shadows an inherited member, while missing, ambiguous,
+cyclic, or conditionally uncertain ancestry does not justify guessing a member
+from an unrelated type or global declaration. Rename remains conservative and
+rejects inherited class-member references until the complete override model is
+available.
+
+Signature help reports every supported source declaration, including overloads.
+When source-resolved argument types identify one exact, safe widening, or safe
+class upcast match, `active_signature` identifies that overload while retaining
+the complete candidate list. Unknown arguments, equal-ranked matches,
+unsupported relationships, `with`/`inherited` receivers, and anonymous or
+generic callables remain unselected; opaque calls return no signature. The
+active parameter is counted syntactically while skipping nested calls, indexers,
+Pascal strings, and comments; grouped formal parameter names are expanded
+individually. Callable members reached through source-backed function results,
+constructors, casts, and nested expression receivers use the same bounded
+selection as completion and navigation.
+
+Overload matching is intentionally conservative and source-based. It recognizes
+Delphi built-in integer, real, string, character, Boolean, and `nil` literals,
+including radix integers and concatenated string fragments, typed
+variables/parameters, defaults, and `var`/`out` lvalue requirements. Character
+values can match string parameters, but ordinal numeric conversion requires an
+explicit source call such as `Ord(value)`. Integer literal ranges and declared
+integer widths are preserved, including the proven `Integer`/`LongInt` alias;
+`var`/`out` matches require an exact known type and a writable argument (value
+parameters are writable, while `const` parameters and properties are not), and
+omitted defaults do not make an otherwise less-specific overload win. Inherited
+routine overloads are combined only when source `overload`/`override` metadata
+proves the relationship; direct methods with `reintroduce` or otherwise hidden
+signatures remain authoritative, while direct fields and properties still
+shadow inherited members. Deep parenthesized arguments are traversed iteratively
+under the existing work/byte budgets and honor request cancellation.
+Explicit named types retain their declaring-unit identity, so same-spelled types
+from different units do not match. Generic inference, anonymous callable types,
+full pointer/variant/record compatibility, and compiler-level overload rules are
+outside this source-only model; ambiguous or unsupported calls stay incomplete
+instead of selecting arbitrarily.
 
 ## Source Paths and Configuration
 
@@ -454,7 +495,7 @@ support.
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial
 location list. Unsupported or ambiguous bindings are rejected rather than
-guessed; inherited and `with` lookup, unknown class ancestors, and unsupported
+guessed; inherited or `with`-dependent lookup, unknown class ancestors, and unsupported
 overload relationships can therefore make a reference request fail.
 
 ### Document highlights
@@ -517,7 +558,17 @@ Implemented and covered by tests:
 - Routine and class-method declaration/implementation pairing, including unique
   abbreviated implementation headers.
 - Qualified unit/type names, namespaced units, straightforward declared-type
-  member access, and `Self` members.
+  member access, class/record helper members (including class-target ancestry),
+  parent-helper members, and `Self` members.
+- Typed `with` scopes for class/record variables, `Self`, qualified fields,
+  factory and generic receiver expressions, nested and comma-separated
+  receivers, ordered shadowing, and single-statement or block body boundaries.
+  Receiver expressions are evaluated in their enclosing lexical scope; unknown
+  receiver, ancestry, helper, or conditional resolution fails closed.
+- Class and record helpers are selected using lexical visibility and ordered
+  `uses` clauses. Helper members feed navigation, completion, hover, signature
+  help, type definitions, and safe binding-based rename; unresolved or
+  ambiguous helper targets fail closed.
 - Source-based `textDocument/typeDefinition` for named variable, parameter,
   field, property, and type declarations, including bounded aliases and
   selected-project unit bindings.
@@ -528,6 +579,13 @@ Implemented and covered by tests:
 - Document/workspace symbols, semantic references, document-local highlights,
   and semantic tokens use the standard LSP requests and preserve UTF-16 source
   ranges.
+- Generic type and routine substitution/inference covers explicit and inferred
+  calls, nested and inherited specializations, constructor results, consistent
+  multi-parameter inference, cross-unit type identity, and method/formal
+  shadowing. Unsupported or unproven constraints fail closed.
+- Specialized generic results feed source-based navigation, completion, hover,
+  signature help, type definitions, and overload selection, including primitive
+  literal substitutions.
 - Bounded, conservative conditional analysis recognizes `IFDEF`, `IFNDEF`,
   `IF`, `IFOPT`, `ELSEIF`/`ELIF`, `ELSE`, `ENDIF`, local `DEFINE`/`UNDEF`, and
   `DEFINED(...)`. Known-inactive source is omitted from the index; unknown
@@ -536,8 +594,6 @@ Implemented and covered by tests:
 
 Not implemented or incomplete:
 
-- Inherited-member lookup, `with` resolution, helpers, generic inference,
-  function-result expression typing, and argument-based overload selection.
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
 - Full compiler-equivalent conditional evaluation and include-file expansion.
@@ -546,10 +602,10 @@ Not implemented or incomplete:
   content can therefore produce no navigation result or block rename.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
-- Compiler-equivalent overload selection, generic inference, auto-imports,
-  snippets, and anonymous callable inference are not implemented. Completion
-  and signature help remain conservative when imports, conditionals, receivers,
-  or parser state are unknown.
+- Compiler-equivalent overload selection, auto-imports, snippets, and anonymous
+  callable inference are not implemented. Completion and signature help remain
+  conservative when imports, conditionals, receivers, or parser state are
+  unknown.
 - A general Delphi type checker is not implemented; semantic-token precision is
   limited to bindings proven by the source index.
 
@@ -587,7 +643,7 @@ conditional expressions and relevant source-bearing includes remain unsupported;
 missing or unreadable includes cannot be treated as evidence that no reference
 exists. Source conditional compilation is projected for analysis rather than
 textually expanded. Unit/module renames (which require
-`RenameFile`), inherited/`with` lookup, overloaded/override relationships,
+`RenameFile`), inherited or `with`-dependent lookup, overloaded/override relationships,
 compiled-only consumers, and other unsupported bindings are also rejected by
 the shared planner. Name collisions and reference capture are rejected before
 any edit is returned. Unresolved imports can be irrelevant when all candidate
@@ -635,8 +691,9 @@ context or a call, 128 signatures, 64 KiB of signature-argument scanning, 256
 nested parentheses/indexers, 128 KiB per rendered signature label, 4,096 formal
 parameters, and 256 KiB of aggregate signature metadata. Completion reports
 item truncation as `isIncomplete` and fails closed when context traversal cannot
-finish; signature help fails closed when its bounded parser or output limit is
-exceeded.
+finish; typed `with` context traversal is capped at 64 nested contexts and also
+reports incomplete rather than guessing. Signature help fails closed when its
+bounded parser or output limit is exceeded.
 
 Linting and formatting reject syntax trees deeper than 256 levels to protect
 their recursive analysis pipelines. Navigation uses iterative tree walks. LSP

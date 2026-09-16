@@ -7177,6 +7177,81 @@ end.
 }
 
 #[test]
+fn helper_completion_retains_unknown_target_ancestry_with_proven_members() {
+    let source = r#"unit UnknownHelperAncestryCompletion;
+interface
+type
+  T = class(TMissing)
+    X: Integer;
+  end;
+  H = class helper for T
+    procedure P;
+  end;
+var
+  V: T;
+implementation
+procedure H.P;
+begin
+  Self.X := 1;
+  ;
+end;
+end.
+"#;
+    let source_uri = uri("UnknownHelperAncestryCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown helper ancestry source parses");
+
+    let qualified = index
+        .completion(&source_uri, position_after(source, "Self.", 0))
+        .expect("qualified helper completion");
+    let qualified_labels = qualified
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        qualified_labels.contains(&"P"),
+        "helper member missing: {qualified_labels:?}"
+    );
+    assert!(
+        qualified_labels.contains(&"X"),
+        "target member missing: {qualified_labels:?}"
+    );
+    assert!(
+        qualified.is_incomplete,
+        "unknown target ancestry was reported as complete: {qualified_labels:?}"
+    );
+
+    let blank = position_of(source, "  ;", 0);
+    let implicit = index
+        .completion(&source_uri, Position::new(blank.line, blank.character + 2))
+        .expect("implicit helper completion");
+    let implicit_labels = implicit
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        implicit_labels.contains(&"P"),
+        "helper member missing: {implicit_labels:?}"
+    );
+    assert!(
+        implicit_labels.contains(&"X"),
+        "target member missing: {implicit_labels:?}"
+    );
+    assert!(
+        !implicit_labels.contains(&"V"),
+        "unrelated global leaked through unknown target ancestry: {implicit_labels:?}"
+    );
+    assert!(
+        implicit.is_incomplete,
+        "unknown target ancestry was reported as complete: {implicit_labels:?}"
+    );
+}
+
+#[test]
 fn ambiguous_interface_completion_is_reported_incomplete() {
     let source = r#"unit AmbiguousInterfaceCompletion;
 interface

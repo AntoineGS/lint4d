@@ -4665,14 +4665,15 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        let ordinary_ancestry_known = ordinary.ancestry_known;
         if let Some(member_key) = member_key {
-            return Ok(
+            let lookup =
                 if !helper.candidates.is_empty() || helper.ambiguous_names.contains(member_key) {
                     helper
                 } else {
                     ordinary
-                },
-            );
+                };
+            return Ok(lookup.with_ancestry_known(ordinary_ancestry_known));
         }
 
         let helper_keys = helper
@@ -4693,11 +4694,12 @@ impl NavigationIndex {
         for name in ordinary.ambiguous_names {
             ambiguous_names.insert(name);
         }
-        Ok(if ambiguous_names.is_empty() {
+        Ok((if ambiguous_names.is_empty() {
             MemberLookup::known(candidates)
         } else {
             MemberLookup::ambiguous(candidates, ambiguous_names)
         })
+        .with_ancestry_known(ordinary_ancestry_known))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6829,6 +6831,11 @@ impl MemberLookup {
             ancestry_known: true,
             ambiguous_names,
         }
+    }
+
+    fn with_ancestry_known(mut self, ancestry_known: bool) -> Self {
+        self.ancestry_known &= ancestry_known;
+        self
     }
 }
 

@@ -6465,6 +6465,80 @@ end.
 }
 
 #[test]
+fn unresolved_with_root_keeps_the_bound_member_and_fails_closed_after_type_failure() {
+    let source = r#"unit TypedWithUnknownRoot;
+interface
+type
+  TOuter = record
+    Child: TUnknown;
+  end;
+  TLocal = record
+    Value: string;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Obj: TOuter;
+  Child: TLocal;
+begin
+  with Obj do begin
+    Child.Value := 1;
+    Child.Va := 1;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownRoot");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown typed-with root source parses");
+
+    let child = index.navigate(
+        &source_uri,
+        position_of(source, "Child.Value", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child.len(), 1);
+    assert_location_start(
+        &child[0],
+        &source_uri,
+        position_of(source, "Child: TUnknown", 0),
+    );
+
+    let value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        value.is_empty(),
+        "an unresolved bound field must not fall back to the local Value: {value:?}"
+    );
+    assert!(
+        index
+            .hover(&source_uri, position_of(source, "Value :=", 0))
+            .is_none(),
+        "an unresolved bound field must not expose the local hover"
+    );
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Child.Va", 0))
+        .expect("unknown typed-with root completion");
+    assert!(
+        completion.items.iter().all(|item| item.label != "Value"),
+        "an unresolved bound field must not expose local completion: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(completion.is_incomplete);
+}
+
+#[test]
 fn unknown_with_receiver_blocks_an_unrelated_global_fallback() {
     let source = r#"unit TypedWithUnknown;
 interface
@@ -6739,9 +6813,11 @@ end.
         position_of(source, "Value :=", 0),
         NavigationTarget::Declaration,
     );
-    assert!(
-        comma_value.is_empty(),
-        "an unknown comma receiver must block body fallback: {comma_value:?}"
+    assert_eq!(comma_value.len(), 1);
+    assert_location_start(
+        &comma_value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
     );
 
     let nested_value = index.navigate(
@@ -6755,6 +6831,264 @@ end.
         &source_uri,
         position_of(source, "Value: Integer", 0),
     );
+}
+
+#[test]
+fn nested_comma_receiver_prefix_precedes_outer_context_across_assistance_endpoints() {
+    let source = r#"unit TypedWithNestedCommaPrecedence;
+interface
+type
+  TFirst = class
+    Value: Integer;
+    FirstOnly: Integer;
+    procedure Run(A: Integer);
+  end;
+  TWrong = class
+    Value: string;
+    WrongOnly: string;
+    procedure Run(A: string);
+  end;
+  TLeft = class
+    Inner: TFirst;
+  end;
+  TOuter = class
+    Left: TLeft;
+    Inner: TWrong;
+  end;
+procedure Caller;
+implementation
+procedure TFirst.Run(A: Integer);
+begin
+end;
+procedure TWrong.Run(A: string);
+begin
+end;
+procedure Caller;
+var
+  OuterValue: TOuter;
+begin
+  with OuterValue do
+    with Left, Inner do begin
+      Value := 1;
+      Fir := 1;
+      Run(1);
+    end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithNestedCommaPrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested comma precedence source parses");
+
+    let receiver = index.navigate(
+        &source_uri,
+        position_of(source, "Inner do", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(receiver.len(), 1);
+    assert_location_start(
+        &receiver[0],
+        &source_uri,
+        position_of(source, "Inner: TFirst", 0),
+    );
+
+    let value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(value.len(), 1);
+    assert_location_start(
+        &value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "Value :=", 0))
+        .expect("nested comma value hover");
+    assert!(hover_text(&hover).contains("Value: Integer"));
+
+    let type_definition = index.type_definitions(&source_uri, position_of(source, "Inner do", 0));
+    assert_exact_type_location(&type_definition, &source_uri, source, "TFirst", 0);
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "      Fir", 0))
+        .expect("nested comma member completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["FirstOnly"]
+    );
+    assert!(!completion.is_incomplete);
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "      Run(", 0))
+        .expect("nested comma signature help")
+        .expect("nested comma method signature");
+    assert_eq!(
+        signature
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect::<Vec<_>>(),
+        ["procedure Run(A: Integer);"]
+    );
+}
+
+#[test]
+fn nested_comma_receiver_rename_fails_closed_without_partial_edits() {
+    let source = r#"unit TypedWithNestedCommaRename;
+interface
+type
+  TFirst = class
+    Value: Integer;
+  end;
+  TLeft = class
+    Inner: TFirst;
+  end;
+  TOuter = class
+    Left: TLeft;
+    Inner: TFirst;
+  end;
+implementation
+procedure Caller;
+var
+  OuterValue: TOuter;
+begin
+  with OuterValue do
+    with Left, Inner do
+      Value := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithNestedCommaRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested comma rename source parses");
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Inner: TFirst", 0),
+                "RenamedInner",
+            )
+            .is_err(),
+        "a nested comma receiver rename must fail closed"
+    );
+}
+
+#[test]
+fn completion_resolves_nested_comma_receiver_prefixes_and_unknown_barriers() {
+    let source = r#"unit TypedWithReceiverCompletion;
+interface
+type
+  TTarget = record
+    Value: Integer;
+  end;
+  TLeft = record
+    Inner: TTarget;
+  end;
+  TOuter = record
+    Left: TLeft;
+  end;
+const
+  LeftGlobal = 1;
+  InnerGlobal = 2;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  OuterValue: TOuter;
+begin
+  with OuterValue do
+    with Left, Inn do begin
+      Value := 1;
+    end;
+  with UnknownOuter do
+    with Left, Inn do begin
+      Value := 2;
+    end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithReceiverCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("receiver completion source parses");
+
+    let first_receiver = index
+        .completion(&source_uri, position_after(source, "with Left", 0))
+        .expect("first nested receiver completion");
+    assert!(
+        first_receiver.items.iter().any(|item| item.label == "Left"),
+        "the outer receiver must complete the first nested receiver: {:?}",
+        first_receiver
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(!first_receiver.is_incomplete);
+
+    let second_receiver = index
+        .completion(&source_uri, position_after(source, "with Left, Inn", 0))
+        .expect("second nested receiver completion");
+    assert!(
+        second_receiver
+            .items
+            .iter()
+            .any(|item| item.label == "Inner"),
+        "the earlier nested receiver must complete Outer.Left.Inner: {:?}",
+        second_receiver
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(!second_receiver.is_incomplete);
+
+    let unknown_first = index
+        .completion(&source_uri, position_after(source, "with Left", 1))
+        .expect("unknown outer first receiver completion");
+    assert!(
+        unknown_first
+            .items
+            .iter()
+            .all(|item| item.label != "Left" && item.label != "LeftGlobal"),
+        "an unknown outer receiver must block lower-priority first-receiver globals: {:?}",
+        unknown_first
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(unknown_first.is_incomplete);
+
+    let unknown_second = index
+        .completion(&source_uri, position_after(source, "with Left, Inn", 1))
+        .expect("unknown outer second receiver completion");
+    assert!(
+        unknown_second
+            .items
+            .iter()
+            .all(|item| item.label != "Inner" && item.label != "InnerGlobal"),
+        "an unknown outer receiver must block lower-priority second-receiver globals: {:?}",
+        unknown_second
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(unknown_second.is_incomplete);
 }
 
 #[test]

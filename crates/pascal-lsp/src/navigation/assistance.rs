@@ -954,14 +954,51 @@ impl NavigationIndex {
         private_spans: &mut HashMap<Url, HashSet<super::Span>>,
         cancel: &AtomicBool,
     ) -> Result<(bool, usize), String> {
+        let mut precedence = 0;
+        let mut receiver_contexts = current_document.with_receiver_contexts_at(offset);
+        if receiver_contexts.is_empty() && offset > 0 {
+            receiver_contexts = current_document.with_receiver_contexts_at(offset - 1);
+        }
+        accumulator
+            .budget
+            .require_work(receiver_contexts.len(), cancel)?;
+        let mut prefix_state = super::ResolutionState::new();
+        for (context, receiver_index) in receiver_contexts {
+            let Some(receivers) = self.resolve_with_context_receiver_prefix_with_budget(
+                current_uri,
+                current_document,
+                context,
+                receiver_index,
+                &mut prefix_state,
+                cancel,
+                accumulator.budget,
+            )?
+            else {
+                accumulator.is_incomplete = true;
+                return Ok((true, precedence));
+            };
+            let (blocks_lower, next_precedence) = self.add_with_completion_receiver_slots(
+                accumulator,
+                vec![super::WithReceiverSlot::Known(receivers)],
+                current_uri,
+                private_spans,
+                precedence,
+                offset,
+                cancel,
+            )?;
+            precedence = next_precedence;
+            if blocks_lower {
+                return Ok((true, precedence));
+            }
+        }
+
         let contexts = current_document.with_contexts_at(offset);
         accumulator.budget.require_work(contexts.len(), cancel)?;
         if contexts.is_empty() {
-            return Ok((false, 0));
+            return Ok((false, precedence));
         }
 
         let mut state = super::ResolutionState::new();
-        let mut precedence = 0;
         for context in contexts {
             let Some(receiver_slots) = self.resolve_with_context_receivers_with_budget(
                 current_uri,
@@ -975,44 +1012,74 @@ impl NavigationIndex {
                 accumulator.is_incomplete = true;
                 return Ok((true, precedence));
             };
-            let mut blocks_lower = false;
-            for receivers in receiver_slots.into_iter().rev() {
-                if receivers.len() > 1 {
-                    accumulator.is_incomplete = true;
-                    blocks_lower = true;
-                }
-                for receiver in receivers.into_iter().rev() {
-                    check_cancel(cancel)?;
-                    match receiver {
-                        super::Receiver::Type(instance) => {
-                            let (ancestry_known, has_ambiguous_names) = self
-                                .add_member_completion_candidates(
-                                    accumulator,
-                                    &instance.uri,
-                                    &instance.key,
-                                    instance.scope,
-                                    &instance.substitution,
-                                    instance.helper_owner.as_ref(),
-                                    current_uri,
-                                    private_spans,
-                                    precedence,
-                                    offset,
-                                    cancel,
-                                )?;
-                            if !ancestry_known || has_ambiguous_names {
-                                accumulator.is_incomplete = true;
-                                blocks_lower = true;
-                            }
+            let (blocks_lower, next_precedence) = self.add_with_completion_receiver_slots(
+                accumulator,
+                receiver_slots.into_iter().rev().collect(),
+                current_uri,
+                private_spans,
+                precedence,
+                offset,
+                cancel,
+            )?;
+            precedence = next_precedence;
+            if blocks_lower {
+                return Ok((true, precedence));
+            }
+            if accumulator.exhausted {
+                break;
+            }
+        }
+        Ok((false, precedence))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_with_completion_receiver_slots(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        receiver_slots: Vec<super::WithReceiverSlot>,
+        current_uri: &Url,
+        private_spans: &mut HashMap<Url, HashSet<super::Span>>,
+        mut precedence: usize,
+        offset: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(bool, usize), String> {
+        for slot in receiver_slots {
+            let super::WithReceiverSlot::Known(receivers) = slot else {
+                accumulator.is_incomplete = true;
+                return Ok((true, precedence));
+            };
+            let mut blocks_lower = receivers.len() > 1;
+            if blocks_lower {
+                accumulator.is_incomplete = true;
+            }
+            for receiver in receivers.into_iter().rev() {
+                check_cancel(cancel)?;
+                match receiver {
+                    super::Receiver::Type(instance) => {
+                        let (ancestry_known, has_ambiguous_names) = self
+                            .add_member_completion_candidates(
+                                accumulator,
+                                &instance.uri,
+                                &instance.key,
+                                instance.scope,
+                                &instance.substitution,
+                                instance.helper_owner.as_ref(),
+                                current_uri,
+                                private_spans,
+                                precedence,
+                                offset,
+                                cancel,
+                            )?;
+                        if !ancestry_known || has_ambiguous_names {
+                            accumulator.is_incomplete = true;
+                            blocks_lower = true;
                         }
-                        super::Receiver::Unit(_)
-                        | super::Receiver::Builtin(_)
-                        | super::Receiver::IntegerLiteral(_) => {}
                     }
-                    precedence += 1;
-                    if accumulator.exhausted {
-                        break;
-                    }
+                    super::Receiver::Unit(_)
+                    | super::Receiver::Builtin(_)
+                    | super::Receiver::IntegerLiteral(_) => {}
                 }
+                precedence += 1;
                 if accumulator.exhausted {
                     break;
                 }

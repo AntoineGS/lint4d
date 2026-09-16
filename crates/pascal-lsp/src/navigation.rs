@@ -1713,27 +1713,6 @@ impl NavigationIndex {
             }
         }
 
-        let contexts = document.with_contexts_at(offset);
-        if contexts.len() > MAX_WITH_CONTEXT_RECURSION_DEPTH {
-            state.mark_receiver_uncertain();
-            return WithLookup::Unknown;
-        }
-        for context in contexts {
-            let Some(receiver_slots) =
-                self.resolve_with_context_receivers(uri, document, context, state)
-            else {
-                return WithLookup::Unknown;
-            };
-            for receivers in receiver_slots.iter().rev() {
-                for receiver in receivers.iter().rev() {
-                    match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
-                        WithLookup::NotFound => {}
-                        lookup => return lookup,
-                    }
-                }
-            }
-        }
-
         if overlay.is_empty() {
             for (context, receiver_index) in document.with_receiver_contexts_at(offset) {
                 let Some(receivers) = self.resolve_with_context_receiver_prefix(
@@ -1754,6 +1733,34 @@ impl NavigationIndex {
             }
         }
 
+        let contexts = document.with_contexts_at(offset);
+        if contexts.len() > MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            return WithLookup::Unknown;
+        }
+        for context in contexts {
+            let Some(receiver_slots) =
+                self.resolve_with_context_receivers(uri, document, context, state)
+            else {
+                return WithLookup::Unknown;
+            };
+            for slot in receiver_slots.iter().rev() {
+                match slot {
+                    WithReceiverSlot::Known(receivers) => {
+                        for receiver in receivers.iter().rev() {
+                            match self
+                                .with_receiver_lookup(uri, document, offset, receiver, &key, state)
+                            {
+                                WithLookup::NotFound => {}
+                                lookup => return lookup,
+                            }
+                        }
+                    }
+                    WithReceiverSlot::Unknown => return WithLookup::Unknown,
+                }
+            }
+        }
+
         WithLookup::NotFound
     }
 
@@ -1763,7 +1770,7 @@ impl NavigationIndex {
         document: &Document,
         context: &WithContext,
         state: &mut ResolutionState,
-    ) -> Option<Vec<Vec<Receiver>>> {
+    ) -> Option<Vec<WithReceiverSlot>> {
         let cache_key = (uri.clone(), context.body);
         if let Some(cached) = state.with_context_resolutions.get(&cache_key) {
             if let Some(receivers) = cached {
@@ -1796,13 +1803,14 @@ impl NavigationIndex {
             let uncertain_before = state.receiver_resolution_uncertain();
             let resolved =
                 self.resolve_receivers_with_state(uri, document, receiver_span.start, node, state);
+            let slot_unknown = resolved.is_empty() || state.receiver_resolution_uncertain();
+            state.receiver_uncertain = uncertain_before;
             state.with_receivers = initial_overlay.clone();
-            if (!uncertain_before && state.receiver_resolution_uncertain()) || resolved.is_empty() {
-                state.mark_receiver_uncertain();
-                result = None;
-                break;
+            if slot_unknown {
+                receiver_slots.push(WithReceiverSlot::Unknown);
+                continue;
             }
-            receiver_slots.push(resolved.clone());
+            receiver_slots.push(WithReceiverSlot::Known(resolved.clone()));
             overlay.extend(resolved.iter().cloned());
             state.with_receivers = overlay.clone();
         }
@@ -1935,33 +1943,10 @@ impl NavigationIndex {
             }
         }
 
-        let contexts = document.with_contexts_at(offset);
-        if contexts.len() > MAX_WITH_CONTEXT_RECURSION_DEPTH {
-            state.mark_receiver_uncertain();
-            return Ok(WithLookup::Unknown);
-        }
-        budget.require_work(contexts.len(), cancel)?;
-        for context in contexts {
-            let Some(receiver_slots) = self.resolve_with_context_receivers_with_budget(
-                uri, document, context, state, cancel, budget,
-            )?
-            else {
-                return Ok(WithLookup::Unknown);
-            };
-            for receivers in receiver_slots.iter().rev() {
-                for receiver in receivers.iter().rev() {
-                    match self.with_receiver_lookup_with_budget(
-                        uri, document, offset, receiver, &key, state, cancel, budget,
-                    )? {
-                        WithLookup::NotFound => {}
-                        lookup => return Ok(lookup),
-                    }
-                }
-            }
-        }
-
         if overlay.is_empty() {
-            for (context, receiver_index) in document.with_receiver_contexts_at(offset) {
+            let receiver_contexts = document.with_receiver_contexts_at(offset);
+            budget.require_work(receiver_contexts.len(), cancel)?;
+            for (context, receiver_index) in receiver_contexts {
                 let Some(receivers) = self.resolve_with_context_receiver_prefix_with_budget(
                     uri,
                     document,
@@ -1985,6 +1970,36 @@ impl NavigationIndex {
             }
         }
 
+        let contexts = document.with_contexts_at(offset);
+        if contexts.len() > MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            return Ok(WithLookup::Unknown);
+        }
+        budget.require_work(contexts.len(), cancel)?;
+        for context in contexts {
+            let Some(receiver_slots) = self.resolve_with_context_receivers_with_budget(
+                uri, document, context, state, cancel, budget,
+            )?
+            else {
+                return Ok(WithLookup::Unknown);
+            };
+            for slot in receiver_slots.iter().rev() {
+                match slot {
+                    WithReceiverSlot::Known(receivers) => {
+                        for receiver in receivers.iter().rev() {
+                            match self.with_receiver_lookup_with_budget(
+                                uri, document, offset, receiver, &key, state, cancel, budget,
+                            )? {
+                                WithLookup::NotFound => {}
+                                lookup => return Ok(lookup),
+                            }
+                        }
+                    }
+                    WithReceiverSlot::Unknown => return Ok(WithLookup::Unknown),
+                }
+            }
+        }
+
         Ok(WithLookup::NotFound)
     }
 
@@ -1997,7 +2012,7 @@ impl NavigationIndex {
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<Option<Vec<Vec<Receiver>>>, String> {
+    ) -> Result<Option<Vec<WithReceiverSlot>>, String> {
         let cache_key = (uri.clone(), context.body);
         if let Some(cached) = state.with_context_resolutions.get(&cache_key) {
             if let Some(receivers) = cached {
@@ -2041,15 +2056,18 @@ impl NavigationIndex {
                     budget,
                     0,
                 );
+                let slot_unknown = resolved
+                    .as_ref()
+                    .map_or(true, |resolved| resolved.is_empty())
+                    || state.receiver_resolution_uncertain();
                 state.with_receivers = initial_overlay.clone();
                 let resolved = resolved?;
-                if (!uncertain_before && state.receiver_resolution_uncertain())
-                    || resolved.is_empty()
-                {
-                    state.mark_receiver_uncertain();
-                    return Ok(None);
+                state.receiver_uncertain = uncertain_before;
+                if slot_unknown {
+                    receiver_slots.push(WithReceiverSlot::Unknown);
+                    continue;
                 }
-                receiver_slots.push(resolved.clone());
+                receiver_slots.push(WithReceiverSlot::Known(resolved.clone()));
                 overlay.extend(resolved.iter().cloned());
                 state.with_receivers = overlay.clone();
             }
@@ -2613,6 +2631,9 @@ impl NavigationIndex {
                             state.receiver_uncertain = uncertain_before;
                         }
                         return Ok(receivers);
+                    }
+                    if state.receiver_resolution_uncertain() {
+                        return Ok(Vec::new());
                     }
                     let references = self
                         .unqualified_references_with_budget_and_state_without_with(
@@ -3298,6 +3319,7 @@ impl NavigationIndex {
             budget,
         )?;
         if had_bound_reference && references.is_empty() {
+            state.mark_receiver_uncertain();
             return Ok(Vec::new());
         }
         if !references.is_empty() {
@@ -3351,6 +3373,9 @@ impl NavigationIndex {
                     }
                     _ => {}
                 }
+            }
+            if result.is_empty() {
+                state.mark_receiver_uncertain();
             }
             return Ok(result);
         }
@@ -7318,6 +7343,12 @@ enum WithLookup {
     Unknown,
 }
 
+#[derive(Debug, Clone)]
+enum WithReceiverSlot {
+    Known(Vec<Receiver>),
+    Unknown,
+}
+
 #[derive(Debug)]
 pub(super) struct AssistanceBudget {
     remaining_work: usize,
@@ -7801,7 +7832,7 @@ struct ResolutionState {
     receiver_uncertain: bool,
     with_receivers: Vec<Receiver>,
     with_context_depth: usize,
-    with_context_resolutions: HashMap<(Url, Span), Option<Vec<Vec<Receiver>>>>,
+    with_context_resolutions: HashMap<(Url, Span), Option<Vec<WithReceiverSlot>>>,
     with_member_substitutions: HashMap<(Url, usize, Candidate), Vec<GenericSubstitution>>,
     suppress_with_lookup: bool,
 }

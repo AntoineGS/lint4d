@@ -1787,6 +1787,42 @@ fn cyclic_generic_member_types_fail_closed_and_keep_the_server_responsive() {
 }
 
 #[test]
+fn invalid_helper_ancestry_fails_closed_and_keeps_server_responsive() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("InvalidHelperAncestry.pas");
+    let source = "unit InvalidHelperAncestry;\ninterface\ntype\n  TBase = class\n  end;\n  TWidget = class\n  end;\n  TWidgetHelper = class helper (TBase) for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TWidgetHelper.Touch;\nbegin\nend;\nprocedure Run;\nvar\n  Widget: TWidget;\nbegin\n  Widget.Touch;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let definition_id = RequestId::from("invalid-helper-ancestry-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, source, "Touch", 2),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert!(
+        locations.is_empty(),
+        "invalid helper ancestry must fail closed: {locations:?}"
+    );
+
+    let responsive_id = RequestId::from("invalid-helper-ancestry-responsive".to_string());
+    server.send_request(
+        responsive_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let responsive = server.response(&responsive_id);
+    assert!(
+        responsive.error.is_none(),
+        "server stopped responding after invalid helper ancestry: {responsive:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn cyclic_generic_constraints_fail_closed_and_keep_the_server_responsive() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("CyclicGenericConstraint.pas");

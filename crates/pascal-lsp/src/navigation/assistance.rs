@@ -710,6 +710,7 @@ impl NavigationIndex {
                                 &instance.uri,
                                 &instance.key,
                                 instance.scope,
+                                &instance.substitution,
                                 current_uri,
                                 &mut private_spans,
                                 0,
@@ -751,13 +752,36 @@ impl NavigationIndex {
             }
 
             if !accumulator.exhausted {
-                if let Some(owner_type) = current_document.owner_type_at(offset) {
+                if let Some(owner_type) = current_document
+                    .owner_type_at(offset)
+                    .filter(|_| !current_document.offset_is_in_helper_declaration(offset))
+                {
+                    let (member_uri, member_type, member_scope, member_substitution) = self
+                        .helper_target_for_owner_with_budget(
+                            current_uri,
+                            current_document,
+                            &owner_type,
+                            cancel,
+                            accumulator.budget,
+                        )?
+                        .map_or_else(
+                            || {
+                                (
+                                    current_uri.clone(),
+                                    owner_type.clone(),
+                                    super::ROOT_SCOPE,
+                                    super::GenericSubstitution::empty(),
+                                )
+                            },
+                            |target| (target.uri, target.key, target.scope, target.substitution),
+                        );
                     let (ancestry_known, has_ambiguous_names) = self
                         .add_member_completion_candidates(
                             &mut accumulator,
-                            current_uri,
-                            &owner_type,
-                            super::ROOT_SCOPE,
+                            &member_uri,
+                            &member_type,
+                            member_scope,
+                            &member_substitution,
                             current_uri,
                             &mut private_spans,
                             precedence,
@@ -1053,6 +1077,7 @@ impl NavigationIndex {
         type_uri: &Url,
         type_key: &str,
         type_scope: usize,
+        substitution: &super::GenericSubstitution,
         current_uri: &Url,
         private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
@@ -1069,6 +1094,7 @@ impl NavigationIndex {
             type_uri,
             type_key,
             type_scope,
+            substitution,
             type_uri == current_uri,
             cancel,
             accumulator.budget,

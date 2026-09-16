@@ -1043,16 +1043,36 @@ impl NavigationIndex {
         }
 
         if let Some(owner_type) = owner_type.as_deref() {
+            let helper_target = (!document.offset_is_in_helper_declaration(offset))
+                .then(|| {
+                    self.helper_target_for_owner_with_budget(
+                        uri, document, owner_type, cancel, budget,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let (member_uri, member_type, member_scope, member_substitution) = helper_target
+                .map_or_else(
+                    || {
+                        (
+                            uri.clone(),
+                            owner_type.to_owned(),
+                            ROOT_SCOPE,
+                            GenericSubstitution::empty(),
+                        )
+                    },
+                    |target| (target.uri, target.key, target.scope, target.substitution),
+                );
             let members = self.member_references_for_type_in_context_with_budget(
                 uri,
                 document,
                 offset,
-                uri,
-                owner_type,
-                ROOT_SCOPE,
-                &GenericSubstitution::empty(),
+                &member_uri,
+                &member_type,
+                member_scope,
+                &member_substitution,
                 &key,
-                true,
+                member_uri == *uri,
                 cancel,
                 budget,
             )?;
@@ -1701,16 +1721,31 @@ impl NavigationIndex {
         // considered before unit globals and imported declarations, and the
         // owner lookup also covers nested procedures inside a class method.
         if let Some(owner_type) = document.owner_type_at(offset) {
+            let helper_target = (!document.offset_is_in_helper_declaration(offset))
+                .then(|| self.helper_target_for_owner(uri, document, &owner_type))
+                .flatten();
+            let (member_uri, member_type, member_scope, member_substitution) = helper_target
+                .map_or_else(
+                    || {
+                        (
+                            uri.clone(),
+                            owner_type.clone(),
+                            ROOT_SCOPE,
+                            GenericSubstitution::empty(),
+                        )
+                    },
+                    |target| (target.uri, target.key, target.scope, target.substitution),
+                );
             let members = self.member_references_for_type_in_context(
                 uri,
                 document,
                 offset,
-                uri,
-                &owner_type,
-                ROOT_SCOPE,
-                &GenericSubstitution::empty(),
+                &member_uri,
+                &member_type,
+                member_scope,
+                &member_substitution,
                 &key,
-                true,
+                member_uri == *uri,
             );
             if !members.candidates.is_empty() {
                 return members.candidates;
@@ -4109,6 +4144,7 @@ impl NavigationIndex {
                         current_uri.clone(),
                         index,
                         HelperRank {
+                            target_specificity: 0,
                             local: true,
                             import_order: 0,
                             declaration_order: helper.name_span.start,
@@ -4122,6 +4158,7 @@ impl NavigationIndex {
             check_navigation_cancel(cancel)?;
             if current_document.unknown_imports.contains(unit.as_str()) {
                 unknown_ranks.push(HelperRank {
+                    target_specificity: 0,
                     local: false,
                     import_order,
                     declaration_order: usize::MAX,
@@ -4145,6 +4182,7 @@ impl NavigationIndex {
                             unit_uri.clone(),
                             index,
                             HelperRank {
+                                target_specificity: 0,
                                 local: false,
                                 import_order,
                                 declaration_order: helper.name_span.start,
@@ -4176,9 +4214,13 @@ impl NavigationIndex {
                 budget,
             )? {
                 HelperTargetMatch::No => {}
-                HelperTargetMatch::Yes => matches.push((rank, helper_uri, helper_index)),
+                HelperTargetMatch::Yes(distance) => matches.push((
+                    rank.with_target_distance(distance),
+                    helper_uri,
+                    helper_index,
+                )),
                 HelperTargetMatch::Unknown if helper_target_may_match(helper, target) => {
-                    unknown_ranks.push(rank)
+                    unknown_ranks.push(rank.with_unknown_target())
                 }
                 HelperTargetMatch::Unknown => {}
             }
@@ -4231,15 +4273,65 @@ impl NavigationIndex {
         else {
             return Ok(HelperTargetMatch::Unknown);
         };
+        if target_instances_match_for_helper(
+            &resolved,
+            target,
+            helper.target.args.is_empty(),
+            helper_uri,
+            &helper.generic_parameters,
+        ) {
+            return Ok(HelperTargetMatch::Yes(0));
+        }
+
+        if target.kind != TypeKind::Class {
+            return Ok(HelperTargetMatch::No);
+        }
+
+        let mut ancestry_state = AncestryResolutionState::new();
+        let distance = self.type_ancestor_distance_with_budget(
+            target,
+            &resolved,
+            &mut ancestry_state,
+            cancel,
+            budget,
+        )?;
+        let distance = match distance {
+            TypeAncestorMatch::No => return Ok(HelperTargetMatch::No),
+            TypeAncestorMatch::Distance(distance) => distance,
+            TypeAncestorMatch::Unknown => return Ok(HelperTargetMatch::Unknown),
+        };
+
+        let mut resolution_state = ResolutionState::new();
+        let Some(substitution) = self.member_owner_substitution_with_budget(
+            &target.uri,
+            &target.key,
+            &target.substitution,
+            &resolved.uri,
+            &resolved.key,
+            &mut resolution_state,
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(HelperTargetMatch::Unknown);
+        };
+        let ancestor = TypeInstance {
+            uri: resolved.uri.clone(),
+            key: resolved.key.clone(),
+            kind: resolved.kind,
+            scope: ROOT_SCOPE,
+            parameter_names: resolved.parameter_names.clone(),
+            substitution,
+        };
         Ok(
             if target_instances_match_for_helper(
                 &resolved,
-                target,
+                &ancestor,
                 helper.target.args.is_empty(),
                 helper_uri,
                 &helper.generic_parameters,
             ) {
-                HelperTargetMatch::Yes
+                HelperTargetMatch::Yes(distance)
             } else {
                 HelperTargetMatch::No
             },
@@ -4285,6 +4377,58 @@ impl NavigationIndex {
         Ok(unique_type_instance(receivers))
     }
 
+    fn type_ancestor_distance_with_budget(
+        &self,
+        current: &TypeInstance,
+        sought: &TypeInstance,
+        state: &mut AncestryResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<TypeAncestorMatch, String> {
+        check_navigation_cancel(cancel)?;
+        if current.uri == sought.uri && current.key == sought.key {
+            return Ok(TypeAncestorMatch::Distance(0));
+        }
+
+        let ancestry = self.resolve_type_ancestry_with_budget(
+            &current.uri,
+            &current.key,
+            state,
+            cancel,
+            budget,
+        )?;
+        if ancestry.status != AncestryStatus::Complete {
+            return Ok(TypeAncestorMatch::Unknown);
+        }
+
+        let mut best_distance: Option<usize> = None;
+        let mut unknown = false;
+        for (parent_uri, parent_key) in ancestry.parents {
+            check_navigation_cancel(cancel)?;
+            let parent = self.type_instance_for_key(
+                &parent_uri,
+                &parent_key,
+                ROOT_SCOPE,
+                &GenericSubstitution::empty(),
+            );
+            match self.type_ancestor_distance_with_budget(&parent, sought, state, cancel, budget)? {
+                TypeAncestorMatch::No => {}
+                TypeAncestorMatch::Distance(distance) => {
+                    let distance = distance.saturating_add(1);
+                    best_distance = Some(best_distance.map_or(distance, |best| best.min(distance)));
+                }
+                TypeAncestorMatch::Unknown => unknown = true,
+            }
+        }
+
+        Ok(match (best_distance, unknown) {
+            (Some(_), true) => TypeAncestorMatch::Unknown,
+            (Some(distance), false) => TypeAncestorMatch::Distance(distance),
+            (None, true) => TypeAncestorMatch::Unknown,
+            (None, false) => TypeAncestorMatch::No,
+        })
+    }
+
     fn helper_target_for_owner_with_budget(
         &self,
         helper_uri: &Url,
@@ -4308,6 +4452,29 @@ impl NavigationIndex {
             cancel,
             budget,
         )
+    }
+
+    fn helper_target_for_owner(
+        &self,
+        helper_uri: &Url,
+        helper_document: &Document,
+        owner_key: &str,
+    ) -> Option<TypeInstance> {
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            MAX_NAVIGATION_OVERLOAD_WORK,
+            MAX_NAVIGATION_OVERLOAD_BYTES,
+            "helper owner target",
+        );
+        self.helper_target_for_owner_with_budget(
+            helper_uri,
+            helper_document,
+            owner_key,
+            &cancel,
+            &mut budget,
+        )
+        .ok()
+        .flatten()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4427,9 +4594,10 @@ impl NavigationIndex {
             .filter(|(_, helper)| helper.key == parent_instance.key)
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        (matches.len() == 1)
-            .then_some((parent_instance.uri, matches[0]))
-            .map_or_else(|| Ok(None), |parent| Ok(Some(parent)))
+        if matches.len() != 1 {
+            return Ok(None);
+        }
+        Ok(Some((parent_instance.uri, matches[0])))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4492,33 +4660,33 @@ impl NavigationIndex {
             return Ok(MemberLookup::unknown(ordinary.candidates));
         }
 
-        if member_key.is_some() {
-            return Ok(if ordinary.candidates.is_empty() {
-                helper
-            } else {
-                ordinary
-            });
+        if let Some(member_key) = member_key {
+            return Ok(
+                if !helper.candidates.is_empty() || helper.ambiguous_names.contains(member_key) {
+                    helper
+                } else {
+                    ordinary
+                },
+            );
         }
 
-        let ordinary_keys = ordinary
+        let helper_keys = helper
             .candidates
             .iter()
             .filter_map(|candidate| self.symbol(candidate).map(|symbol| symbol.key.clone()))
             .collect::<HashSet<_>>();
-        let mut candidates = ordinary.candidates;
-        for candidate in helper.candidates {
+        let mut candidates = helper.candidates;
+        for candidate in ordinary.candidates {
             let Some(symbol) = self.symbol(&candidate) else {
                 continue;
             };
-            if !ordinary_keys.contains(&symbol.key) {
+            if !helper_keys.contains(&symbol.key) {
                 candidates.push(candidate);
             }
         }
         let mut ambiguous_names = ordinary.ambiguous_names;
         for name in helper.ambiguous_names {
-            if !ordinary_keys.contains(&name) {
-                ambiguous_names.insert(name);
-            }
+            ambiguous_names.insert(name);
         }
         if ambiguous_names.is_empty() {
             Ok(MemberLookup::known(candidates))
@@ -4796,6 +4964,7 @@ impl NavigationIndex {
         type_uri: &Url,
         type_key: &str,
         type_scope: usize,
+        substitution: &GenericSubstitution,
         allow_implementation: bool,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
@@ -4807,7 +4976,7 @@ impl NavigationIndex {
             type_uri,
             type_key,
             type_scope,
-            &GenericSubstitution::empty(),
+            substitution,
             None,
             allow_implementation,
             cancel,
@@ -6277,7 +6446,14 @@ struct HelperDefinition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperTargetMatch {
     No,
-    Yes,
+    Yes(usize),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeAncestorMatch {
+    No,
+    Distance(usize),
     Unknown,
 }
 
@@ -6290,9 +6466,22 @@ enum HelperSelection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct HelperRank {
+    target_specificity: usize,
     local: bool,
     import_order: usize,
     declaration_order: usize,
+}
+
+impl HelperRank {
+    fn with_target_distance(mut self, distance: usize) -> Self {
+        self.target_specificity = usize::MAX.saturating_sub(distance);
+        self
+    }
+
+    fn with_unknown_target(mut self) -> Self {
+        self.target_specificity = usize::MAX;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8037,7 +8226,7 @@ fn helper_visible_at(
     region: Region,
     offset: usize,
 ) -> bool {
-    if helper.declaration_span.start > offset {
+    if local && helper.declaration_span.start > offset {
         return false;
     }
     if local {
@@ -8055,6 +8244,10 @@ fn helper_target_may_match(helper: &HelperDefinition, target: &TypeInstance) -> 
         .path
         .last()
         .is_some_and(|name| canonical_name(name) == target.key)
+        || matches!(
+            (helper.kind, target.kind),
+            (TypeKind::Class, TypeKind::Class)
+        )
 }
 
 fn target_instances_match_for_helper(

@@ -479,6 +479,300 @@ end.
 }
 
 #[test]
+fn helper_members_shadow_helped_type_members_for_navigation() {
+    let source = r#"unit HelperMemberPrecedence;
+interface
+type
+  TWidget = class
+    Value: Integer;
+  end;
+  TWidgetHelper = class helper for TWidget
+    procedure Value;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TWidgetHelper.Value;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Value;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperMemberPrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper precedence source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Value;", 2),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Value;", 0));
+}
+
+#[test]
+fn imported_helpers_are_visible_independently_of_consumer_offsets() {
+    let target = r#"unit HelperVisibilityTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let helper = format!(
+        "unit LateHelper;\ninterface\nuses HelperVisibilityTarget;\n{}type\n  TWidgetHelper = class helper for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TWidgetHelper.Touch;\nbegin\nend;\nend.\n",
+        "\n".repeat(256)
+    );
+    let consumer = r#"unit HelperVisibilityConsumer;
+interface
+uses HelperVisibilityTarget, LateHelper;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+end.
+"#;
+
+    let target_uri = uri("HelperVisibilityTarget");
+    let helper_uri = uri("LateHelper");
+    let consumer_uri = uri("HelperVisibilityConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(target_uri, target.to_owned())
+        .expect("helper target parses");
+    index
+        .update(helper_uri.clone(), helper.clone())
+        .expect("late helper parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("helper consumer parses");
+
+    let locations = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Touch", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(
+        &locations[0],
+        &helper_uri,
+        position_of(&helper, "Touch;", 0),
+    );
+}
+
+#[test]
+fn base_helpers_apply_to_descendants_but_specific_helpers_win() {
+    let source = r#"unit HelperTargetAncestry;
+interface
+type
+  TBase = class
+  end;
+  TChild = class(TBase)
+  end;
+  TOther = class(TBase)
+  end;
+  TBaseHelper = class helper for TBase
+    procedure BaseOnly;
+    procedure Shared;
+  end;
+  TChildHelper = class helper for TChild
+    procedure Shared;
+  end;
+
+implementation
+
+procedure TBaseHelper.BaseOnly;
+begin
+end;
+
+procedure TBaseHelper.Shared;
+begin
+end;
+
+procedure TChildHelper.Shared;
+begin
+end;
+
+procedure Run;
+var
+  Child: TChild;
+  Other: TOther;
+begin
+  Other.BaseOnly;
+  Child.BaseOnly;
+  Child.Shared;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperTargetAncestry");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper ancestry source parses");
+
+    let base_only = index.navigate(
+        &source_uri,
+        position_of(source, "BaseOnly", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base_only.len(), 1);
+    assert_location_start(
+        &base_only[0],
+        &source_uri,
+        position_of(source, "BaseOnly", 0),
+    );
+
+    let shadowed_base_only = index.navigate(
+        &source_uri,
+        position_of(source, "BaseOnly", 3),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        shadowed_base_only.is_empty(),
+        "a more-specific helper must win instead of unioning helper members"
+    );
+
+    let shared = index.navigate(
+        &source_uri,
+        position_of(source, "Shared", 4),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shared.len(), 1);
+    assert_location_start(&shared[0], &source_uri, position_of(source, "Shared", 1));
+}
+
+#[test]
+fn helper_methods_resolve_implicit_target_members_without_breaking_local_shadowing() {
+    let source = r#"unit HelperImplicitMembers;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Update;
+    procedure Shadow;
+  end;
+
+implementation
+
+procedure TPointHelper.Update;
+begin
+  X := 1;
+  Self.X := 2;
+end;
+
+procedure TPointHelper.Shadow;
+var
+  X: Integer;
+begin
+  X := 3;
+  Self.X := 4;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperImplicitMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("implicit helper member source parses");
+
+    let implicit = index.navigate(
+        &source_uri,
+        position_of(source, "X := 1", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(implicit.len(), 1);
+    assert_location_start(&implicit[0], &source_uri, position_of(source, "X:", 0));
+
+    let self_start = position_of(source, "Self.X", 0);
+    let self_member = index.navigate(
+        &source_uri,
+        Position::new(self_start.line, self_start.character + 5),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(self_member.len(), 1);
+    assert_location_start(&self_member[0], &source_uri, position_of(source, "X:", 0));
+
+    let local = index.navigate(
+        &source_uri,
+        position_of(source, "X := 3", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(local.len(), 1);
+    assert_location_start(&local[0], &source_uri, position_of(source, "X: Integer", 1));
+}
+
+#[test]
+fn specialized_generic_helpers_are_available_in_completion() {
+    let source = r#"unit GenericHelperCompletion;
+interface
+type
+  TBox<T> = class
+  end;
+  TBoxHelper = class helper for TBox<Integer>
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBoxHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Box: TBox<Integer>;
+begin
+  Box.Touch;
+  Box.
+end;
+
+end.
+"#;
+    let source_uri = uri("GenericHelperCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic helper completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Box.", 1))
+        .expect("generic helper completion succeeds");
+    assert!(
+        completion.items.iter().any(|item| item.label == "Touch"),
+        "specialized helper member missing: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn imported_helpers_use_only_the_last_helper_in_uses_order() {
     let provider = r#"unit HelperTarget;
 interface

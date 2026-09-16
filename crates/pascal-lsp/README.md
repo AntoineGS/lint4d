@@ -536,8 +536,8 @@ Implemented and covered by tests:
 - Routine and class-method declaration/implementation pairing, including unique
   abbreviated implementation headers.
 - Qualified unit/type names, namespaced units, straightforward declared-type
-  member access, class/record helper members, parent-helper members, and
-  `Self` members.
+  member access, class/record helper members (including class-target ancestry),
+  parent-helper members, and `Self` members.
 - Class and record helpers are selected using lexical visibility and ordered
   `uses` clauses. Helper members feed navigation, completion, hover, signature
   help, type definitions, and safe binding-based rename; unresolved or

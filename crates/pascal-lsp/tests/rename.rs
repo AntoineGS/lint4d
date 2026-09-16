@@ -362,6 +362,55 @@ end.
 }
 
 #[test]
+fn renames_helper_member_instead_of_colliding_helped_type_member() {
+    let source = r#"unit HelperRenamePrecedence;
+interface
+type
+  TWidget = record
+    Value: Integer;
+  end;
+  TWidgetHelper = record helper for TWidget
+    property Value: Integer;
+  end;
+
+implementation
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  WriteLn(Widget.Value);
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperRenamePrecedence");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper rename precedence source parses");
+
+    let edits = index
+        .rename_edits(&source_uri, property_position(source, "Value"), "Activate")
+        .expect("helper rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_in(source, "property Value", "Value", 0),
+                "Activate".to_owned(),
+            ),
+            (
+                source_uri,
+                range_in(source, "Widget.Value", "Value", 0),
+                "Activate".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
 fn binding_locations_filter_both_parameter_declaration_sites() {
     let source = "unit ParameterReferences;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\n  Value := Value + 1;\nend;\nend.\n";
     let uri = uri("ParameterReferences");

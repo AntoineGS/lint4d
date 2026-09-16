@@ -9,6 +9,23 @@ homepage.workspace = true
 authors.workspace = true
 description = "Navigation library for a native Linux Delphi/Object Pascal LSP"
 
+[features]
+# Opt-in only: this builds the deterministic child-process harness used by the
+# `protocol_barriers` integration target. It is intentionally not a default
+# feature and must never be enabled for the production `pascal-lsp` binary.
+test-support = []
+
+[[bin]]
+name = "pascal-lsp-test-server"
+path = "src/test_server.rs"
+required-features = ["test-support"]
+test = false
+
+[[test]]
+name = "protocol_barriers"
+path = "tests/protocol_barriers.rs"
+required-features = ["test-support"]
+
 [dependencies]
 pascal-core = { path = "../pascal-core" }
 lint4d = { path = "../lint4d" }

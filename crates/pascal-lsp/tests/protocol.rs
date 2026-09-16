@@ -156,6 +156,7 @@ struct TestServer {
     _environment: Option<TempDir>,
 }
 
+#[cfg(feature = "test-support")]
 struct TestBarrier {
     entered: PathBuf,
     release: PathBuf,
@@ -176,18 +177,22 @@ impl TestServer {
         Self::launch_with_environment_path_and_variable(environment, None, None)
     }
 
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_NAVIGATION_BARRIER")
     }
 
+    #[cfg(feature = "test-support")]
     fn launch_with_formatting_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_FORMATTING_BARRIER")
     }
 
+    #[cfg(feature = "test-support")]
     fn launch_with_diagnostics_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER")
     }
 
+    #[cfg(feature = "test-support")]
     fn launch_with_barrier(environment: TempDir, variable: &str) -> (Self, TestBarrier) {
         let barrier_directory = environment.path().join("analysis-barrier");
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
@@ -200,7 +205,7 @@ impl TestServer {
             barrier.entered.display(),
             barrier.release.display()
         );
-        let mut server = Self::launch_with_environment_path_and_variable(
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
             environment.path(),
             Some(variable),
             Some(value.as_str()),
@@ -209,13 +214,33 @@ impl TestServer {
         (server, barrier)
     }
 
+    #[cfg(feature = "test-support")]
+    fn launch_test_server_with_environment_path_and_variable(
+        environment: &Path,
+        variable: Option<&str>,
+        value: Option<&str>,
+    ) -> Self {
+        let executable = env!("CARGO_BIN_EXE_pascal-lsp-test-server");
+        let child = Command::new(executable)
+            .arg("--stdio")
+            .env("HOME", environment.join("home"))
+            .env("XDG_CONFIG_HOME", environment.join("config"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .envs(variable.into_iter().zip(value))
+            .spawn()
+            .expect("launch pascal-lsp test server");
+        Self::from_child(child)
+    }
+
     fn launch_with_environment_path_and_variable(
         environment: &Path,
         variable: Option<&str>,
         value: Option<&str>,
     ) -> Self {
         let executable = env!("CARGO_BIN_EXE_pascal-lsp");
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg("--stdio")
             .env("HOME", environment.join("home"))
             .env("XDG_CONFIG_HOME", environment.join("config"))
@@ -225,6 +250,10 @@ impl TestServer {
             .envs(variable.into_iter().zip(value))
             .spawn()
             .expect("launch pascal-lsp");
+        Self::from_child(child)
+    }
+
+    fn from_child(mut child: Child) -> Self {
         let stdout = child.stdout.take().expect("child stdout");
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -293,6 +322,36 @@ impl TestServer {
         }
     }
 
+    fn response_with_timeout(
+        &mut self,
+        expected_id: &RequestId,
+        timeout: Duration,
+    ) -> Option<Response> {
+        if let Some(index) = self.pending.iter().position(
+            |message| matches!(message, Message::Response(response) if &response.id == expected_id),
+        ) {
+            return match self.pending.remove(index).expect("pending response") {
+                Message::Response(response) => Some(response),
+                _ => unreachable!("pending response predicate"),
+            };
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(Message::Response(response)))) if &response.id == expected_id => {
+                    return Some(response);
+                }
+                Ok(Ok(Some(message))) => self.pending.push_back(message),
+                Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => return None,
+                Ok(Err(error)) => panic!("failed reading response: {error}"),
+                Err(RecvTimeoutError::Timeout) => return None,
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "test-support")]
     fn assert_no_response(&mut self, expected_id: &RequestId) {
         assert!(
             !self
@@ -340,6 +399,41 @@ impl TestServer {
                 other => self.pending.push_back(other),
             }
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn diagnostic_with_timeout(&mut self, expected: &Url, timeout: Duration) -> Option<Value> {
+        let expected = expected.to_string();
+        if let Some(index) = self.pending.iter().position(|message| {
+            matches!(
+                message,
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics"
+                        && notification.params["uri"] == expected
+            )
+        }) {
+            return match self.pending.remove(index).expect("pending diagnostics") {
+                Message::Notification(notification) => Some(notification.params),
+                _ => unreachable!("pending diagnostics predicate"),
+            };
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(Message::Notification(notification))))
+                    if notification.method == "textDocument/publishDiagnostics"
+                        && notification.params["uri"] == expected =>
+                {
+                    return Some(notification.params);
+                }
+                Ok(Ok(Some(message))) => self.pending.push_back(message),
+                Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => return None,
+                Ok(Err(error)) => panic!("failed reading diagnostic: {error}"),
+                Err(RecvTimeoutError::Timeout) => return None,
+            }
+        }
+        None
     }
 
     fn request(&mut self, method: &str) -> Request {
@@ -636,6 +730,7 @@ impl TestServer {
     }
 }
 
+#[cfg(feature = "test-support")]
 impl TestBarrier {
     fn wait_until_entered(&self) {
         self.wait_for_entries(1);
@@ -670,6 +765,18 @@ impl Drop for TestServer {
             let _ = self.child.wait();
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("expected path to be created: {}", path.display());
 }
 
 fn uri(path: &Path) -> Url {
@@ -17576,6 +17683,7 @@ fn recursive_generic_constraint_completion_fails_closed_and_keeps_server_respons
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn blocked_navigation_does_not_block_unrelated_lsp_requests() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17621,6 +17729,7 @@ fn blocked_navigation_does_not_block_unrelated_lsp_requests() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn blocked_formatting_does_not_block_unrelated_lsp_requests() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17672,6 +17781,7 @@ fn blocked_formatting_does_not_block_unrelated_lsp_requests() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17718,6 +17828,7 @@ fn diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn full_analysis_queue_returns_busy_without_starting_an_extra_worker() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17764,6 +17875,7 @@ fn full_analysis_queue_returns_busy_without_starting_an_extra_worker() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn cancelling_blocked_navigation_returns_one_request_cancelled_response() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17799,6 +17911,7 @@ fn cancelling_blocked_navigation_returns_one_request_cancelled_response() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn cancelling_blocked_formatting_returns_one_request_cancelled_response() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17834,6 +17947,7 @@ fn cancelling_blocked_formatting_returns_one_request_cancelled_response() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn configuration_invalidation_discards_an_in_flight_diagnostic_result() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17882,6 +17996,7 @@ fn configuration_invalidation_discards_an_in_flight_diagnostic_result() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn rapid_document_changes_coalesce_to_one_final_diagnostic_computation() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17945,6 +18060,7 @@ fn rapid_document_changes_coalesce_to_one_final_diagnostic_computation() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn shutdown_cancels_a_blocked_analysis_worker_before_exiting() {
     let environment = tempfile::tempdir().expect("isolated server environment");
@@ -17966,4 +18082,267 @@ fn shutdown_cancels_a_blocked_analysis_worker_before_exiting() {
     );
     barrier.wait_until_entered();
     server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_open_notification_does_not_cancel_main_diagnostics() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let other = root.join("Other.pas");
+    let source = "unit Main;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+    let other_source = "unit Other;\ninterface\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(&other, other_source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules]\nconstant-naming = \"warning\"\n[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&other),
+                "languageId": "pascal",
+                "version": 1,
+                "text": other_source
+            }
+        }),
+    );
+    barrier.release();
+
+    let diagnostics = server
+        .diagnostic_with_timeout(&uri(&main), Duration::from_secs(5))
+        .expect("Main diagnostics after unrelated open");
+    assert_eq!(diagnostics["version"], 1);
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unknown_notification_does_not_cancel_main_diagnostics() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules]\nconstant-naming = \"warning\"\n[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification("$/setTrace", json!({"value": "off"}));
+    barrier.release();
+
+    let diagnostics = server
+        .diagnostic_with_timeout(&uri(&main), Duration::from_secs(5))
+        .expect("Main diagnostics after unrelated trace notification");
+    assert_eq!(diagnostics["version"], 1);
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn client_request_id_cannot_collide_with_internal_diagnostic_job() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+
+    let barrier_directory = environment.path().join("analysis-barriers");
+    fs::create_dir_all(&barrier_directory).expect("barrier directory");
+    let diagnostic_entered = barrier_directory.join("diagnostics.entered");
+    let diagnostic_release = barrier_directory.join("diagnostics.release");
+    let formatting_entered = barrier_directory.join("formatting.entered");
+    let formatting_release = barrier_directory.join("formatting.release");
+    let diagnostic_value = format!(
+        "{}|{}",
+        diagnostic_entered.display(),
+        diagnostic_release.display()
+    );
+    let formatting_value = format!(
+        "{}|{}",
+        formatting_entered.display(),
+        formatting_release.display()
+    );
+    let executable = env!("CARGO_BIN_EXE_pascal-lsp");
+    let child = Command::new(executable)
+        .arg("--stdio")
+        .env("HOME", environment.path().join("home"))
+        .env("XDG_CONFIG_HOME", environment.path().join("config"))
+        .env("PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER", &diagnostic_value)
+        .env("PASCAL_LSP_TEST_FORMATTING_BARRIER", &formatting_value)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("launch pascal-lsp");
+    let mut server = TestServer::from_child(child);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    wait_for_path(&diagnostic_entered);
+
+    let colliding_id = RequestId::from("pascal-lsp-diagnostics-0".to_string());
+    server.send_request(
+        colliding_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    wait_for_path(&formatting_entered);
+    fs::write(&diagnostic_release, "release").expect("release diagnostics barrier");
+    thread::sleep(Duration::from_millis(100));
+
+    let ping_id = RequestId::from("collision-ping".to_string());
+    server.send_request(ping_id.clone(), "review/ping", Value::Null);
+    let ping = server
+        .response_with_timeout(&ping_id, Duration::from_secs(1))
+        .expect("unrecognized request must remain responsive");
+    assert_eq!(ping.error.expect("unknown method error").code, -32601);
+
+    server.send_notification("$/cancelRequest", json!({"id": colliding_id}));
+    fs::write(&formatting_release, "release").expect("release formatting barrier");
+    let formatting = server
+        .response_with_timeout(&colliding_id, Duration::from_secs(1))
+        .expect("colliding client request must receive one response");
+    assert_eq!(
+        formatting.error.expect("cancelled formatting error").code,
+        -32800
+    );
+    server.assert_no_response(&colliding_id);
+}
+
+#[cfg(not(feature = "test-support"))]
+#[test]
+fn production_binary_does_not_activate_test_barrier_from_environment() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+    let entered = environment.path().join("formatting.entered");
+    let release = environment.path().join("formatting.release");
+    let value = format!("{}|{}", entered.display(), release.display());
+    let mut server = TestServer::launch_with_environment_path_and_variable(
+        environment.path(),
+        Some("PASCAL_LSP_TEST_FORMATTING_BARRIER"),
+        Some(&value),
+    );
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("production-barrier-probe".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server
+        .response_with_timeout(&request_id, Duration::from_secs(1))
+        .expect("production binary must not stall on test barrier environment");
+    assert!(response.error.is_none(), "formatting failed: {response:?}");
+    assert!(
+        !entered.exists(),
+        "production binary wrote a test barrier marker"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancellation_takes_precedence_over_stale_generation_for_formatting() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+
+    let (mut server, barrier) = TestServer::launch_with_formatting_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("stale-formatting-cancellation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": request_id}));
+
+    let response = server
+        .response_with_timeout(&request_id, Duration::from_secs(1))
+        .expect("cancelled formatting must respond");
+    assert_eq!(response.error.expect("cancellation error").code, -32800);
+    server.assert_no_response(&request_id);
 }

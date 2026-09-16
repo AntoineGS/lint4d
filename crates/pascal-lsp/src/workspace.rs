@@ -1175,7 +1175,8 @@ impl Workspace {
         count
     }
 
-    pub fn file_event(&mut self, uri: &Url, change: FileChange) {
+    pub fn file_event(&mut self, uri: &Url, change: FileChange) -> Vec<Url> {
+        let mut diagnostic_uris = Vec::new();
         let override_changed = uri
             .to_file_path()
             .is_ok_and(|path| is_immutable_override_file(&path));
@@ -1197,7 +1198,8 @@ impl Workspace {
         if self.open_documents.contains_key(uri) {
             // The editor buffer remains authoritative until didClose.
             self.schedule_diagnostics(uri.clone());
-            return;
+            diagnostic_uris.push(uri.clone());
+            return diagnostic_uris;
         }
         if configuration_changed {
             let open_documents = self
@@ -1206,13 +1208,15 @@ impl Workspace {
                 .filter_map(|(open_uri, document)| document.text.as_ref().map(|_| open_uri.clone()))
                 .collect::<Vec<_>>();
             for open_uri in open_documents {
-                self.schedule_diagnostics(open_uri);
+                self.schedule_diagnostics(open_uri.clone());
+                diagnostic_uris.push(open_uri);
             }
         }
         match change {
             FileChange::Deleted => self.remove_indexed(uri),
             FileChange::Created | FileChange::Changed => self.refresh_loaded_disk(uri),
         }
+        diagnostic_uris
     }
 
     pub fn update_workspace_folders(
@@ -1295,8 +1299,22 @@ impl Workspace {
     }
 
     pub(crate) fn retry_diagnostics(&mut self, uri: Url) {
-        self.pending_diagnostics
-            .insert(uri, Instant::now() + DIAGNOSTIC_RETRY);
+        if self.open_documents.contains_key(&uri) {
+            self.pending_diagnostics
+                .insert(uri, Instant::now() + DIAGNOSTIC_RETRY);
+        }
+    }
+
+    pub(crate) fn reschedule_diagnostics(&mut self, uri: Url) {
+        if self.open_documents.contains_key(&uri) {
+            self.pending_diagnostics
+                .entry(uri)
+                .or_insert_with(|| Instant::now() + DIAGNOSTIC_RETRY);
+        }
+    }
+
+    pub(crate) fn open_document_uris(&self) -> Vec<Url> {
+        self.open_documents.keys().cloned().collect()
     }
 
     pub fn take_due_diagnostics(&mut self) -> Vec<(Url, Option<i32>, Vec<LspDiagnostic>)> {

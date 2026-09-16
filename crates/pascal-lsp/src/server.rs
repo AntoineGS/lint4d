@@ -23,9 +23,11 @@ use lsp_types::{
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::io::{self, BufRead, Read, Write};
+#[cfg(feature = "test-support")]
+use std::io::Write;
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -40,12 +42,28 @@ const MAX_ANALYSIS_JOBS: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
+#[cfg(feature = "test-support")]
 const TEST_NAVIGATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_NAVIGATION_BARRIER";
+#[cfg(feature = "test-support")]
 const TEST_FORMATTING_BARRIER_ENV: &str = "PASCAL_LSP_TEST_FORMATTING_BARRIER";
+#[cfg(feature = "test-support")]
 const TEST_DIAGNOSTICS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER";
 const ANALYSIS_BUSY_MESSAGE: &str = "analysis server is busy; retry the request";
 
-fn wait_at_test_barrier(variable: &str, cancel: &AtomicBool) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum TestBarrier {
+    Navigation,
+    Formatting,
+    Diagnostics,
+}
+
+#[cfg(feature = "test-support")]
+fn wait_at_test_barrier(barrier: TestBarrier, cancel: &AtomicBool) -> Result<(), String> {
+    let variable = match barrier {
+        TestBarrier::Navigation => TEST_NAVIGATION_BARRIER_ENV,
+        TestBarrier::Formatting => TEST_FORMATTING_BARRIER_ENV,
+        TestBarrier::Diagnostics => TEST_DIAGNOSTICS_BARRIER_ENV,
+    };
     let Some(spec) = std::env::var_os(variable) else {
         return Ok(());
     };
@@ -73,6 +91,11 @@ fn wait_at_test_barrier(variable: &str, cancel: &AtomicBool) -> Result<(), Strin
         }
         thread::sleep(ANALYSIS_POLL_INTERVAL);
     }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn wait_at_test_barrier(_barrier: TestBarrier, _cancel: &AtomicBool) -> Result<(), String> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -204,6 +227,26 @@ struct DiagnosticsAnalysis {
     discard: bool,
 }
 
+#[derive(Debug, Default)]
+struct DiagnosticNotificationEffect {
+    refresh: Vec<Url>,
+    cancel: Vec<Url>,
+}
+
+impl DiagnosticNotificationEffect {
+    fn refresh_uri(&mut self, uri: Url) {
+        if !self.refresh.contains(&uri) {
+            self.refresh.push(uri);
+        }
+    }
+
+    fn cancel_uri(&mut self, uri: Url) {
+        if !self.cancel.contains(&uri) {
+            self.cancel.push(uri);
+        }
+    }
+}
+
 struct AnalysisResult {
     id: RequestId,
     source_generation: u64,
@@ -215,6 +258,11 @@ struct AnalysisResult {
 struct PendingAnalysis {
     cancellation: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+}
+
+struct PendingDiagnostic {
+    uri: Url,
+    analysis: PendingAnalysis,
 }
 
 struct FileWatcherRegistration {
@@ -317,7 +365,7 @@ struct AnalysisJobs {
     sender: Sender<AnalysisResult>,
     receiver: Receiver<AnalysisResult>,
     pending: std::collections::HashMap<RequestId, PendingAnalysis>,
-    diagnostics: HashSet<RequestId>,
+    diagnostics: HashMap<RequestId, PendingDiagnostic>,
     next_internal_id: u64,
 }
 
@@ -328,7 +376,7 @@ impl AnalysisJobs {
             sender,
             receiver,
             pending: std::collections::HashMap::new(),
-            diagnostics: HashSet::new(),
+            diagnostics: HashMap::new(),
             next_internal_id: 0,
         }
     }
@@ -340,7 +388,7 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
     ) -> Result<(), String> {
-        if self.pending.len() >= MAX_ANALYSIS_JOBS {
+        if self.pending.len().saturating_add(self.diagnostics.len()) >= MAX_ANALYSIS_JOBS {
             return Err(ANALYSIS_BUSY_MESSAGE.to_string());
         }
         let input = workspace.analysis_input();
@@ -416,7 +464,10 @@ impl AnalysisJobs {
                 Err("analysis worker failed without changing workspace state".to_string()),
             ),
         };
-        let diagnostic = matches!(&request, AnalysisRequest::Diagnostics { .. });
+        let diagnostic_uri = match &request {
+            AnalysisRequest::Diagnostics { uri } => Some(uri.clone()),
+            _ => None,
+        };
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
             .spawn(move || {
@@ -478,10 +529,9 @@ impl AnalysisJobs {
                             position,
                             target,
                         } => {
-                            if let Err(error) = wait_at_test_barrier(
-                                TEST_NAVIGATION_BARRIER_ENV,
-                                &worker_cancellation,
-                            ) {
+                            if let Err(error) =
+                                wait_at_test_barrier(TestBarrier::Navigation, &worker_cancellation)
+                            {
                                 AnalysisResult {
                                     id: worker_id.clone(),
                                     source_generation,
@@ -517,10 +567,9 @@ impl AnalysisJobs {
                             }
                         }
                         AnalysisRequest::Formatting { uri } => {
-                            if let Err(error) = wait_at_test_barrier(
-                                TEST_FORMATTING_BARRIER_ENV,
-                                &worker_cancellation,
-                            ) {
+                            if let Err(error) =
+                                wait_at_test_barrier(TestBarrier::Formatting, &worker_cancellation)
+                            {
                                 AnalysisResult {
                                     id: worker_id.clone(),
                                     source_generation,
@@ -545,10 +594,9 @@ impl AnalysisJobs {
                         }
                         AnalysisRequest::Diagnostics { uri } => {
                             let version = validation_input.document_versions.get(&uri).copied();
-                            if let Err(error) = wait_at_test_barrier(
-                                TEST_DIAGNOSTICS_BARRIER_ENV,
-                                &worker_cancellation,
-                            ) {
+                            if let Err(error) =
+                                wait_at_test_barrier(TestBarrier::Diagnostics, &worker_cancellation)
+                            {
                                 AnalysisResult {
                                     id: worker_id.clone(),
                                     source_generation,
@@ -766,15 +814,15 @@ impl AnalysisJobs {
                 let _ = sender.send(result);
             })
             .map_err(|error| format!("could not start analysis worker: {error}"))?;
-        self.pending.insert(
-            id.clone(),
-            PendingAnalysis {
-                cancellation,
-                handle,
-            },
-        );
-        if diagnostic {
-            self.diagnostics.insert(id);
+        let analysis = PendingAnalysis {
+            cancellation,
+            handle,
+        };
+        if let Some(uri) = diagnostic_uri {
+            self.diagnostics
+                .insert(id, PendingDiagnostic { uri, analysis });
+        } else {
+            self.pending.insert(id, analysis);
         }
         Ok(())
     }
@@ -804,9 +852,21 @@ impl AnalysisJobs {
         }
     }
 
-    fn cancel_diagnostics(&self) {
-        for id in &self.diagnostics {
-            self.cancel(id);
+    fn cancel_diagnostics_for(&self, uris: &[Url]) {
+        for diagnostic in self.diagnostics.values() {
+            if uris.contains(&diagnostic.uri) {
+                diagnostic
+                    .analysis
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn refresh_diagnostics(&self, workspace: &mut Workspace, uris: &[Url]) {
+        self.cancel_diagnostics_for(uris);
+        for uri in uris {
+            workspace.reschedule_diagnostics(uri.clone());
         }
     }
 
@@ -816,16 +876,33 @@ impl AnalysisJobs {
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Ok(result) = self.receiver.try_recv() {
-            self.diagnostics.remove(&result.id);
-            let Some(job) = self.pending.remove(&result.id) else {
+            let diagnostic = matches!(&result.value, AnalysisResultValue::Diagnostics(_));
+            let job = if diagnostic {
+                self.diagnostics
+                    .remove(&result.id)
+                    .map(|diagnostic| diagnostic.analysis)
+            } else {
+                self.pending.remove(&result.id)
+            };
+            let Some(job) = job else {
                 continue;
             };
             let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
             let _ = job.handle.join();
             if cancelled {
-                let mut result = result;
-                invalidate_analysis_result(&mut result, rename::CANCELLATION_MESSAGE.to_string());
-                deliver_analysis_result(connection, workspace, result)?;
+                match result.value {
+                    AnalysisResultValue::Diagnostics(diagnostics) => {
+                        workspace.reschedule_diagnostics(diagnostics.uri);
+                    }
+                    _ => {
+                        send_error(
+                            connection,
+                            result.id,
+                            ErrorCode::RequestCanceled,
+                            rename::CANCELLATION_MESSAGE,
+                        )?;
+                    }
+                }
                 continue;
             }
             deliver_analysis_result(connection, workspace, result)?;
@@ -834,18 +911,22 @@ impl AnalysisJobs {
     }
 
     fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+        self.pending.is_empty() && self.diagnostics.is_empty()
     }
 
     fn shutdown(&mut self) {
         let mut pending = std::mem::take(&mut self.pending)
             .into_values()
             .collect::<Vec<_>>();
+        pending.extend(
+            std::mem::take(&mut self.diagnostics)
+                .into_values()
+                .map(|diagnostic| diagnostic.analysis),
+        );
         for job in &pending {
             job.cancellation
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        self.diagnostics.clear();
 
         let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
         while !pending.is_empty() {
@@ -879,7 +960,8 @@ fn deliver_analysis_result(
     if result.source_generation != workspace.source_generation()
         || result.configuration_generation != workspace.configuration_generation()
     {
-        if matches!(&result.value, AnalysisResultValue::Diagnostics(_)) {
+        if let AnalysisResultValue::Diagnostics(diagnostics) = &result.value {
+            workspace.reschedule_diagnostics(diagnostics.uri.clone());
             return Ok(());
         }
         return send_error(
@@ -894,6 +976,7 @@ fn deliver_analysis_result(
         if diagnostics.discard
             || workspace.document_version(&diagnostics.uri) != diagnostics.version
         {
+            workspace.reschedule_diagnostics(diagnostics.uri.clone());
             return Ok(());
         }
     }
@@ -934,7 +1017,10 @@ fn deliver_analysis_result(
         },
         AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
             Ok(value) => send_diagnostics(connection, &diagnostics.uri, diagnostics.version, value),
-            Err(error) if error == rename::CANCELLATION_MESSAGE => Ok(()),
+            Err(error) if error == rename::CANCELLATION_MESSAGE => {
+                workspace.reschedule_diagnostics(diagnostics.uri);
+                Ok(())
+            }
             Err(error) => send_diagnostics(
                 connection,
                 &diagnostics.uri,
@@ -1352,7 +1438,8 @@ fn event_loop(
                     if source_generation != workspace.source_generation()
                         || configuration_generation != workspace.configuration_generation()
                     {
-                        jobs.cancel_diagnostics();
+                        let open_documents = workspace.open_document_uris();
+                        jobs.refresh_diagnostics(workspace, &open_documents);
                     }
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
@@ -1376,17 +1463,23 @@ fn event_loop(
                     }
                     continue;
                 }
-                if let Err(error) = handle_notification(
+                match handle_notification(
                     connection,
                     workspace,
                     notification,
                     workspace_folders_supported,
                 ) {
-                    eprintln!("pascal-lsp: notification handling failed: {error}");
-                } else if let Some(registration) = watcher_registration.as_mut() {
-                    sync_file_watcher(connection, workspace, registration)?;
+                    Ok(effect) => {
+                        if let Some(registration) = watcher_registration.as_mut() {
+                            sync_file_watcher(connection, workspace, registration)?;
+                        }
+                        jobs.cancel_diagnostics_for(&effect.cancel);
+                        jobs.refresh_diagnostics(workspace, &effect.refresh);
+                    }
+                    Err(error) => {
+                        eprintln!("pascal-lsp: notification handling failed: {error}");
+                    }
                 }
-                jobs.cancel_diagnostics();
             }
             Message::Response(response) => {
                 let watcher_response = watcher_registration
@@ -1806,11 +1899,12 @@ fn handle_notification(
     workspace: &mut Workspace,
     notification: Notification,
     workspace_folders_supported: bool,
-) -> Result<(), String> {
+) -> Result<DiagnosticNotificationEffect, String> {
     match notification.method.as_str() {
-        "initialized" => Ok(()),
+        "initialized" => Ok(DiagnosticNotificationEffect::default()),
         "textDocument/didOpen" => {
             let params: DidOpenTextDocumentParams = parse_notification(&notification)?;
+            let uri = params.text_document.uri.clone();
             workspace
                 .open_document(
                     params.text_document.uri,
@@ -1820,7 +1914,10 @@ fn handle_notification(
                 .map_err(|error| {
                     eprintln!("pascal-lsp: didOpen ignored: {error}");
                     error
-                })
+                })?;
+            let mut effect = DiagnosticNotificationEffect::default();
+            effect.refresh_uri(uri);
+            Ok(effect)
         }
         "textDocument/didChange" => {
             let params: DidChangeTextDocumentParams = parse_notification(&notification)?;
@@ -1835,6 +1932,7 @@ fn handle_notification(
             if change.range.is_some() {
                 return Err("pascal-lsp requires full-document text changes".to_string());
             }
+            let uri = params.text_document.uri.clone();
             workspace
                 .change_document(
                     params.text_document.uri,
@@ -1844,27 +1942,38 @@ fn handle_notification(
                 .map_err(|error| {
                     eprintln!("pascal-lsp: didChange ignored: {error}");
                     error
-                })
+                })?;
+            let mut effect = DiagnosticNotificationEffect::default();
+            effect.refresh_uri(uri);
+            Ok(effect)
         }
         "textDocument/didSave" => {
             let params: DidSaveTextDocumentParams = parse_notification(&notification)?;
+            let uri = params.text_document.uri.clone();
             workspace
                 .save_document(&params.text_document.uri, params.text)
                 .map_err(|error| {
                     eprintln!("pascal-lsp: didSave ignored: {error}");
                     error
-                })
+                })?;
+            let mut effect = DiagnosticNotificationEffect::default();
+            effect.refresh_uri(uri);
+            Ok(effect)
         }
         "textDocument/didClose" => {
             let params: DidCloseTextDocumentParams = parse_notification(&notification)?;
-            if workspace.close_document(&params.text_document.uri) {
-                send_diagnostics(connection, &params.text_document.uri, None, Vec::new())
+            let uri = params.text_document.uri;
+            if workspace.close_document(&uri) {
+                send_diagnostics(connection, &uri, None, Vec::new())
                     .map_err(|error| error.to_string())?;
             }
-            Ok(())
+            let mut effect = DiagnosticNotificationEffect::default();
+            effect.cancel_uri(uri);
+            Ok(effect)
         }
         "workspace/didChangeWatchedFiles" => {
             let params: DidChangeWatchedFilesParams = parse_notification(&notification)?;
+            let mut effect = DiagnosticNotificationEffect::default();
             for change in params.changes {
                 let kind = if change.typ == FileChangeType::CREATED {
                     FileChange::Created
@@ -1873,9 +1982,11 @@ fn handle_notification(
                 } else {
                     FileChange::Deleted
                 };
-                workspace.file_event(&change.uri, kind);
+                for uri in workspace.file_event(&change.uri, kind) {
+                    effect.refresh_uri(uri);
+                }
             }
-            Ok(())
+            Ok(effect)
         }
         "workspace/didChangeWorkspaceFolders" if workspace_folders_supported => {
             let params: lsp_types::DidChangeWorkspaceFoldersParams =
@@ -1891,7 +2002,11 @@ fn handle_notification(
                 .into_iter()
                 .filter_map(|folder| folder.uri.to_file_path().ok());
             workspace.update_workspace_folders(added, removed);
-            Ok(())
+            let mut effect = DiagnosticNotificationEffect::default();
+            for uri in workspace.open_document_uris() {
+                effect.refresh_uri(uri);
+            }
+            Ok(effect)
         }
         "workspace/didChangeWorkspaceFolders" => {
             Err("workspace/didChangeWorkspaceFolders was not advertised by this client".to_string())

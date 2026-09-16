@@ -1051,31 +1051,55 @@ impl NavigationIndex {
                 })
                 .transpose()?
                 .flatten();
-            let (member_uri, member_type, member_scope, member_substitution) = helper_target
-                .map_or_else(
+            let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
+                helper_target.map_or_else(
                     || {
                         (
                             uri.clone(),
                             owner_type.to_owned(),
                             ROOT_SCOPE,
                             GenericSubstitution::empty(),
+                            None,
                         )
                     },
-                    |target| (target.uri, target.key, target.scope, target.substitution),
+                    |target| {
+                        (
+                            target.uri,
+                            target.key,
+                            target.scope,
+                            target.substitution,
+                            target.helper_owner,
+                        )
+                    },
                 );
-            let members = self.member_references_for_type_in_context_with_budget(
-                uri,
-                document,
-                offset,
-                &member_uri,
-                &member_type,
-                member_scope,
-                &member_substitution,
-                &key,
-                member_uri == *uri,
-                cancel,
-                budget,
-            )?;
+            let members = if let Some(helper_owner) = helper_owner.as_ref() {
+                self.member_candidates_for_helper_owner_in_context_with_budget(
+                    uri,
+                    &member_uri,
+                    &member_type,
+                    member_scope,
+                    &member_substitution,
+                    helper_owner,
+                    Some(&key),
+                    member_uri == *uri,
+                    cancel,
+                    budget,
+                )?
+            } else {
+                self.member_references_for_type_in_context_with_budget(
+                    uri,
+                    document,
+                    offset,
+                    &member_uri,
+                    &member_type,
+                    member_scope,
+                    &member_substitution,
+                    &key,
+                    member_uri == *uri,
+                    cancel,
+                    budget,
+                )?
+            };
             if !members.candidates.is_empty() {
                 return Ok(members.candidates);
             }
@@ -1265,14 +1289,11 @@ impl NavigationIndex {
                     )?);
                 }
                 Receiver::Type(instance) => references.extend(
-                    self.member_references_for_type_in_context_with_budget(
+                    self.member_references_for_instance_with_budget(
                         current_uri,
                         current_document,
                         offset,
-                        &instance.uri,
-                        &instance.key,
-                        instance.scope,
-                        &instance.substitution,
+                        &instance,
                         &key,
                         instance.uri == *current_uri,
                         cancel,
@@ -1724,29 +1745,51 @@ impl NavigationIndex {
             let helper_target = (!document.offset_is_in_helper_declaration(offset))
                 .then(|| self.helper_target_for_owner(uri, document, &owner_type))
                 .flatten();
-            let (member_uri, member_type, member_scope, member_substitution) = helper_target
-                .map_or_else(
+            let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
+                helper_target.map_or_else(
                     || {
                         (
                             uri.clone(),
                             owner_type.clone(),
                             ROOT_SCOPE,
                             GenericSubstitution::empty(),
+                            None,
                         )
                     },
-                    |target| (target.uri, target.key, target.scope, target.substitution),
+                    |target| {
+                        (
+                            target.uri,
+                            target.key,
+                            target.scope,
+                            target.substitution,
+                            target.helper_owner,
+                        )
+                    },
                 );
-            let members = self.member_references_for_type_in_context(
-                uri,
-                document,
-                offset,
-                &member_uri,
-                &member_type,
-                member_scope,
-                &member_substitution,
-                &key,
-                member_uri == *uri,
-            );
+            let members = if let Some(helper_owner) = helper_owner.as_ref() {
+                self.member_candidates_for_helper_owner_in_context(
+                    uri,
+                    &member_uri,
+                    &member_type,
+                    member_scope,
+                    &member_substitution,
+                    helper_owner,
+                    Some(&key),
+                    member_uri == *uri,
+                )
+            } else {
+                self.member_references_for_type_in_context(
+                    uri,
+                    document,
+                    offset,
+                    &member_uri,
+                    &member_type,
+                    member_scope,
+                    &member_substitution,
+                    &key,
+                    member_uri == *uri,
+                )
+            };
             if !members.candidates.is_empty() {
                 return members.candidates;
             }
@@ -1863,14 +1906,11 @@ impl NavigationIndex {
                         }),
                 ),
                 Receiver::Type(instance) => {
-                    let members = self.member_references_for_type_in_context(
+                    let members = self.member_references_for_instance(
                         current_uri,
                         current_document,
                         offset,
-                        &instance.uri,
-                        &instance.key,
-                        instance.scope,
-                        &instance.substitution,
+                        &instance,
                         &key,
                         instance.uri == *current_uri,
                     );
@@ -1919,16 +1959,19 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
         match node.kind() {
-            "identifier" => self.resolve_identifier_receiver_with_budget(
-                current_uri,
-                current_document,
-                offset,
-                node_text_with_budget(node, &current_document.source, cancel, budget)?,
-                lookup_identifier,
-                state,
-                cancel,
-                budget,
-            ),
+            "identifier" => {
+                let name = node_text_with_budget(node, &current_document.source, cancel, budget)?;
+                self.resolve_identifier_receiver_with_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    name,
+                    lookup_identifier,
+                    state,
+                    cancel,
+                    budget,
+                )
+            }
             "exprParens" => first_named_child(node)
                 .map(|operand| {
                     self.resolve_receivers_with_state_and_budget(
@@ -2066,6 +2109,7 @@ impl NavigationIndex {
                                 instance.uri == *current_uri,
                                 instance.scope,
                                 &instance.substitution,
+                                instance.helper_owner.as_ref(),
                                 lookup_identifier,
                                 state,
                                 cancel,
@@ -2342,6 +2386,7 @@ impl NavigationIndex {
                             instance.uri == *current_uri,
                             instance.scope,
                             &instance.substitution,
+                            instance.helper_owner.as_ref(),
                             lookup_identifier,
                             state,
                             cancel,
@@ -2412,6 +2457,7 @@ impl NavigationIndex {
                             instance.uri == *current_uri,
                             instance.scope,
                             &instance.substitution,
+                            instance.helper_owner.as_ref(),
                             lookup_identifier,
                             state,
                             cancel,
@@ -2453,6 +2499,7 @@ impl NavigationIndex {
                         instance.uri == *current_uri,
                         instance.scope,
                         &instance.substitution,
+                        instance.helper_owner.as_ref(),
                         lookup_identifier,
                         state,
                         cancel,
@@ -3163,6 +3210,7 @@ impl NavigationIndex {
                             instance.uri == *current_uri,
                             instance.scope,
                             &instance.substitution,
+                            instance.helper_owner.as_ref(),
                             lookup_identifier,
                             state,
                             cancel,
@@ -3219,6 +3267,7 @@ impl NavigationIndex {
                         instance.uri == *current_uri,
                         instance.scope,
                         &instance.substitution,
+                        instance.helper_owner.as_ref(),
                         lookup_identifier,
                         state,
                         cancel,
@@ -3549,6 +3598,7 @@ impl NavigationIndex {
         allow_implementation: bool,
         type_scope: usize,
         substitution: &GenericSubstitution,
+        helper_owner: Option<&HelperOwner>,
         lookup_identifier: Node<'_>,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
@@ -3565,19 +3615,34 @@ impl NavigationIndex {
         if !state.active_members.insert(resolution_key.clone()) {
             return Ok(Vec::new());
         }
-        let lookup = self.member_references_for_type_in_context_with_budget(
-            current_uri,
-            current_document,
-            offset,
-            type_uri,
-            type_key,
-            type_scope,
-            substitution,
-            &member_key,
-            allow_implementation,
-            cancel,
-            budget,
-        )?;
+        let lookup = if let Some(helper_owner) = helper_owner {
+            self.member_candidates_for_helper_owner_in_context_with_budget(
+                current_uri,
+                type_uri,
+                type_key,
+                type_scope,
+                substitution,
+                helper_owner,
+                Some(&member_key),
+                allow_implementation,
+                cancel,
+                budget,
+            )?
+        } else {
+            self.member_references_for_type_in_context_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                type_uri,
+                type_key,
+                type_scope,
+                substitution,
+                &member_key,
+                allow_implementation,
+                cancel,
+                budget,
+            )?
+        };
         if !lookup.ancestry_known {
             state.mark_receiver_uncertain();
             state.active_members.remove(&resolution_key);
@@ -3636,6 +3701,7 @@ impl NavigationIndex {
                         scope: type_scope,
                         parameter_names: Vec::new(),
                         substitution: substitution.clone(),
+                        helper_owner: None,
                     }));
                 }
                 continue;
@@ -3828,6 +3894,7 @@ impl NavigationIndex {
                             instance.uri == *current_uri,
                             instance.scope,
                             &instance.substitution,
+                            instance.helper_owner.as_ref(),
                             state,
                         ),
                         Receiver::Unit(_) => Vec::new(),
@@ -3869,6 +3936,7 @@ impl NavigationIndex {
                         instance.uri == *current_uri,
                         instance.scope,
                         &instance.substitution,
+                        instance.helper_owner.as_ref(),
                         state,
                     ),
                     Receiver::Unit(_) => Vec::new(),
@@ -4158,7 +4226,7 @@ impl NavigationIndex {
             check_navigation_cancel(cancel)?;
             if current_document.unknown_imports.contains(unit.as_str()) {
                 unknown_ranks.push(HelperRank {
-                    target_specificity: 0,
+                    target_specificity: usize::MAX,
                     local: false,
                     import_order,
                     declaration_order: usize::MAX,
@@ -4322,6 +4390,7 @@ impl NavigationIndex {
             scope: ROOT_SCOPE,
             parameter_names: resolved.parameter_names.clone(),
             substitution,
+            helper_owner: None,
         };
         Ok(
             if target_instances_match_for_helper(
@@ -4440,18 +4509,28 @@ impl NavigationIndex {
         let helpers = helper_document
             .helpers
             .iter()
-            .filter(|helper| helper.key == owner_key)
+            .enumerate()
+            .filter(|(_, helper)| helper.key == owner_key)
             .collect::<Vec<_>>();
         if helpers.len() != 1 {
             return Ok(None);
         }
-        self.helper_target_instance_with_budget(
+        let (helper_index, helper) = helpers[0];
+        let Some(mut target) = self.helper_target_instance_with_budget(
             helper_uri,
             helper_document,
-            helpers[0],
+            helper,
             cancel,
             budget,
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        target.helper_owner = Some(HelperOwner {
+            uri: helper_uri.clone(),
+            index: helper_index,
+        });
+        Ok(Some(target))
     }
 
     fn helper_target_for_owner(
@@ -4545,6 +4624,113 @@ impl NavigationIndex {
         })();
         state.active_helpers.remove(&identity);
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_candidates_for_helper_owner_in_context_with_budget(
+        &self,
+        current_uri: &Url,
+        type_uri: &Url,
+        type_key: &str,
+        type_scope: usize,
+        _substitution: &GenericSubstitution,
+        helper_owner: &HelperOwner,
+        member_key: Option<&str>,
+        allow_implementation: bool,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<MemberLookup, String> {
+        let mut state = AncestryResolutionState::new();
+        let helper = self.helper_member_candidates_for_definition_with_budget(
+            current_uri,
+            &helper_owner.uri,
+            helper_owner.index,
+            member_key,
+            allow_implementation,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if !helper.ancestry_known {
+            return Ok(helper);
+        }
+
+        let ordinary = self.member_candidates_for_type_with_state_and_budget(
+            type_uri,
+            type_key,
+            type_scope,
+            member_key,
+            allow_implementation,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if let Some(member_key) = member_key {
+            return Ok(
+                if !helper.candidates.is_empty() || helper.ambiguous_names.contains(member_key) {
+                    helper
+                } else {
+                    ordinary
+                },
+            );
+        }
+
+        let helper_keys = helper
+            .candidates
+            .iter()
+            .filter_map(|candidate| self.symbol(candidate).map(|symbol| symbol.key.clone()))
+            .collect::<HashSet<_>>();
+        let mut candidates = helper.candidates;
+        for candidate in ordinary.candidates {
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            if !helper_keys.contains(&symbol.key) {
+                candidates.push(candidate);
+            }
+        }
+        let mut ambiguous_names = helper.ambiguous_names;
+        for name in ordinary.ambiguous_names {
+            ambiguous_names.insert(name);
+        }
+        Ok(if ambiguous_names.is_empty() {
+            MemberLookup::known(candidates)
+        } else {
+            MemberLookup::ambiguous(candidates, ambiguous_names)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_candidates_for_helper_owner_in_context(
+        &self,
+        current_uri: &Url,
+        type_uri: &Url,
+        type_key: &str,
+        type_scope: usize,
+        _substitution: &GenericSubstitution,
+        helper_owner: &HelperOwner,
+        member_key: Option<&str>,
+        allow_implementation: bool,
+    ) -> MemberLookup {
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            MAX_NAVIGATION_OVERLOAD_WORK,
+            MAX_NAVIGATION_OVERLOAD_BYTES,
+            "lexical helper member lookup",
+        );
+        self.member_candidates_for_helper_owner_in_context_with_budget(
+            current_uri,
+            type_uri,
+            type_key,
+            type_scope,
+            _substitution,
+            helper_owner,
+            member_key,
+            allow_implementation,
+            &cancel,
+            &mut budget,
+        )
+        .unwrap_or_else(|_| MemberLookup::unknown(Vec::new()))
     }
 
     fn helper_parent_definition_with_budget(
@@ -4709,6 +4895,7 @@ impl NavigationIndex {
             scope,
             parameter_names: Vec::new(),
             substitution: substitution.clone(),
+            helper_owner: None,
         };
         if let Some(document) = self.documents.get(uri) {
             if let Some(indices) = document.type_symbol_indices.get(key) {
@@ -4739,6 +4926,7 @@ impl NavigationIndex {
         allow_implementation: bool,
         type_scope: usize,
         substitution: &GenericSubstitution,
+        helper_owner: Option<&HelperOwner>,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
         let member_key = canonical_name(name);
@@ -4752,17 +4940,30 @@ impl NavigationIndex {
         if !state.active_members.insert(resolution_key.clone()) {
             return Vec::new();
         }
-        let lookup = self.member_references_for_type_in_context(
-            current_uri,
-            current_document,
-            offset,
-            type_uri,
-            type_key,
-            type_scope,
-            substitution,
-            &member_key,
-            allow_implementation,
-        );
+        let lookup = if let Some(helper_owner) = helper_owner {
+            self.member_candidates_for_helper_owner_in_context(
+                current_uri,
+                type_uri,
+                type_key,
+                type_scope,
+                substitution,
+                helper_owner,
+                Some(&member_key),
+                allow_implementation,
+            )
+        } else {
+            self.member_references_for_type_in_context(
+                current_uri,
+                current_document,
+                offset,
+                type_uri,
+                type_key,
+                type_scope,
+                substitution,
+                &member_key,
+                allow_implementation,
+            )
+        };
         if !lookup.ancestry_known {
             state.mark_receiver_uncertain();
             state.active_members.remove(&resolution_key);
@@ -4826,6 +5027,7 @@ impl NavigationIndex {
                         scope: type_scope,
                         parameter_names: Vec::new(),
                         substitution: substitution.clone(),
+                        helper_owner: None,
                     }));
                 }
                 continue;
@@ -4928,6 +5130,84 @@ impl NavigationIndex {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn member_references_for_instance_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        instance: &TypeInstance,
+        member_key: &str,
+        allow_implementation: bool,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<MemberLookup, String> {
+        if let Some(helper_owner) = instance.helper_owner.as_ref() {
+            self.member_candidates_for_helper_owner_in_context_with_budget(
+                current_uri,
+                &instance.uri,
+                &instance.key,
+                instance.scope,
+                &instance.substitution,
+                helper_owner,
+                Some(member_key),
+                allow_implementation,
+                cancel,
+                budget,
+            )
+        } else {
+            self.member_references_for_type_in_context_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &instance.uri,
+                &instance.key,
+                instance.scope,
+                &instance.substitution,
+                member_key,
+                allow_implementation,
+                cancel,
+                budget,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_references_for_instance(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        instance: &TypeInstance,
+        member_key: &str,
+        allow_implementation: bool,
+    ) -> MemberLookup {
+        if let Some(helper_owner) = instance.helper_owner.as_ref() {
+            self.member_candidates_for_helper_owner_in_context(
+                current_uri,
+                &instance.uri,
+                &instance.key,
+                instance.scope,
+                &instance.substitution,
+                helper_owner,
+                Some(member_key),
+                allow_implementation,
+            )
+        } else {
+            self.member_references_for_type_in_context(
+                current_uri,
+                current_document,
+                offset,
+                &instance.uri,
+                &instance.key,
+                instance.scope,
+                &instance.substitution,
+                member_key,
+                allow_implementation,
+            )
+        }
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn member_references_for_type_with_budget(
@@ -4965,23 +5245,39 @@ impl NavigationIndex {
         type_key: &str,
         type_scope: usize,
         substitution: &GenericSubstitution,
+        helper_owner: Option<&HelperOwner>,
         allow_implementation: bool,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<MemberLookup, String> {
-        self.member_candidates_for_type_in_context_with_budget(
-            current_uri,
-            current_document,
-            offset,
-            type_uri,
-            type_key,
-            type_scope,
-            substitution,
-            None,
-            allow_implementation,
-            cancel,
-            budget,
-        )
+        if let Some(helper_owner) = helper_owner {
+            self.member_candidates_for_helper_owner_in_context_with_budget(
+                current_uri,
+                type_uri,
+                type_key,
+                type_scope,
+                substitution,
+                helper_owner,
+                None,
+                allow_implementation,
+                cancel,
+                budget,
+            )
+        } else {
+            self.member_candidates_for_type_in_context_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                type_uri,
+                type_key,
+                type_scope,
+                substitution,
+                None,
+                allow_implementation,
+                cancel,
+                budget,
+            )
+        }
     }
 
     #[cfg(test)]
@@ -6159,6 +6455,13 @@ struct TypeInstance {
     scope: usize,
     parameter_names: Vec<String>,
     substitution: GenericSubstitution,
+    helper_owner: Option<HelperOwner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HelperOwner {
+    uri: Url,
+    index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -6578,6 +6881,7 @@ fn type_instance_from_symbol(candidate: &Candidate, symbol: &Symbol) -> TypeInst
             .map(|parameter| parameter.name.clone())
             .collect(),
         substitution: GenericSubstitution::empty(),
+        helper_owner: None,
     }
 }
 
@@ -6597,6 +6901,7 @@ fn symbolic_generic_substitution(
                 scope,
                 parameter_names: Vec::new(),
                 substitution: GenericSubstitution::empty(),
+                helper_owner: None,
             }),
         );
     }

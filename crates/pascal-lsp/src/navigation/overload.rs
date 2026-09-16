@@ -797,6 +797,7 @@ fn resolved_type_from_identity(
                 scope: symbol.scope,
                 parameter_names,
                 substitution,
+                helper_owner: None,
             }))
         }
     }

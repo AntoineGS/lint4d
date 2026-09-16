@@ -711,6 +711,7 @@ impl NavigationIndex {
                                 &instance.key,
                                 instance.scope,
                                 &instance.substitution,
+                                instance.helper_owner.as_ref(),
                                 current_uri,
                                 &mut private_spans,
                                 0,
@@ -756,8 +757,8 @@ impl NavigationIndex {
                     .owner_type_at(offset)
                     .filter(|_| !current_document.offset_is_in_helper_declaration(offset))
                 {
-                    let (member_uri, member_type, member_scope, member_substitution) = self
-                        .helper_target_for_owner_with_budget(
+                    let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
+                        self.helper_target_for_owner_with_budget(
                             current_uri,
                             current_document,
                             &owner_type,
@@ -771,9 +772,18 @@ impl NavigationIndex {
                                     owner_type.clone(),
                                     super::ROOT_SCOPE,
                                     super::GenericSubstitution::empty(),
+                                    None,
                                 )
                             },
-                            |target| (target.uri, target.key, target.scope, target.substitution),
+                            |target| {
+                                (
+                                    target.uri,
+                                    target.key,
+                                    target.scope,
+                                    target.substitution,
+                                    target.helper_owner,
+                                )
+                            },
                         );
                     let (ancestry_known, has_ambiguous_names) = self
                         .add_member_completion_candidates(
@@ -782,6 +792,7 @@ impl NavigationIndex {
                             &member_type,
                             member_scope,
                             &member_substitution,
+                            helper_owner.as_ref(),
                             current_uri,
                             &mut private_spans,
                             precedence,
@@ -1078,6 +1089,7 @@ impl NavigationIndex {
         type_key: &str,
         type_scope: usize,
         substitution: &super::GenericSubstitution,
+        helper_owner: Option<&super::HelperOwner>,
         current_uri: &Url,
         private_spans: &mut HashMap<Url, HashSet<Span>>,
         precedence: usize,
@@ -1095,6 +1107,7 @@ impl NavigationIndex {
             type_key,
             type_scope,
             substitution,
+            helper_owner,
             type_uri == current_uri,
             cancel,
             accumulator.budget,

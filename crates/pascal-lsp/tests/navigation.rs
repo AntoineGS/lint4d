@@ -925,6 +925,110 @@ end.
     );
 }
 
+#[test]
+fn unknown_conditional_import_blocks_known_helper_selection() {
+    let target = r#"unit ConditionalHelperTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let known_helper = r#"unit KnownConditionalHelper;
+interface
+uses ConditionalHelperTarget;
+type
+  TKnownHelper = class helper for TWidget
+    procedure Touch;
+  end;
+implementation
+procedure TKnownHelper.Touch;
+begin
+end;
+end.
+"#;
+    let maybe_helper = r#"unit MaybeConditionalHelper;
+interface
+uses ConditionalHelperTarget;
+type
+  TMaybeHelper = class helper for TWidget
+    procedure Touch;
+  end;
+implementation
+procedure TMaybeHelper.Touch;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit ConditionalHelperConsumer;
+interface
+uses
+  ConditionalHelperTarget,
+  KnownConditionalHelper,
+  {$IF CompilerVersion >= 24}
+  MaybeConditionalHelper
+  {$ENDIF};
+implementation
+procedure Run;
+var
+  Widget: ConditionalHelperTarget.TWidget;
+begin
+  Widget.Touch;
+end;
+end.
+"#;
+
+    let target_uri = uri("ConditionalHelperTarget");
+    let known_uri = uri("KnownConditionalHelper");
+    let maybe_uri = uri("MaybeConditionalHelper");
+    let consumer_uri = uri("ConditionalHelperConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(target_uri, target.to_owned())
+        .expect("conditional helper target parses");
+    index
+        .update(known_uri, known_helper.to_owned())
+        .expect("known conditional helper parses");
+    index
+        .update(maybe_uri, maybe_helper.to_owned())
+        .expect("maybe conditional helper parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("conditional helper consumer parses");
+
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "Touch", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "a matching helper hidden behind an unknown conditional import must block a unique target"
+    );
+
+    let reverse_consumer = consumer.replace(
+        "ConditionalHelperTarget,\n  KnownConditionalHelper,\n  {$IF CompilerVersion >= 24}\n  MaybeConditionalHelper\n  {$ENDIF};",
+        "ConditionalHelperTarget,\n  {$IF CompilerVersion >= 24}\n  MaybeConditionalHelper\n  {$ENDIF},\n  KnownConditionalHelper;",
+    );
+    let reverse_uri = uri("ReverseConditionalHelperConsumer");
+    index
+        .update(reverse_uri.clone(), reverse_consumer.clone())
+        .expect("reverse conditional helper consumer parses");
+    let reverse_locations = index.navigate(
+        &reverse_uri,
+        position_of(&reverse_consumer, "Touch", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(reverse_locations.len(), 1);
+    assert_location_start(
+        &reverse_locations[0],
+        &uri("KnownConditionalHelper"),
+        position_of(known_helper, "Touch;", 0),
+    );
+}
+
 const PROVIDER: &str = r#"unit Provider;
 interface
 

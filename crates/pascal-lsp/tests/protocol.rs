@@ -1823,6 +1823,141 @@ fn invalid_helper_ancestry_fails_closed_and_keeps_server_responsive() {
 }
 
 #[test]
+fn helper_owner_keeps_lexical_members_when_another_helper_is_active() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("HelperOwnerLexical.pas");
+    let source = "unit HelperOwnerLexical;\ninterface\ntype\n  TWidget = class\n  end;\n  TFirstHelper = class helper for TWidget\n    procedure First;\n    procedure Second;\n  end;\n  TSecondHelper = class helper for TWidget\n    procedure Other;\n  end;\nimplementation\nprocedure TFirstHelper.Second;\nbegin\nend;\nprocedure TSecondHelper.Other;\nbegin\nend;\nprocedure TFirstHelper.First;\nvar\n  Second: Integer;\nbegin\n  Second := 1;\n  Self.Second;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let local_id = RequestId::from("helper-owner-local".to_string());
+    server.send_request(
+        local_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, source, "Second :=", 0),
+    );
+    let local_locations = result_locations(server.response(&local_id));
+    assert_exact_location_signatures(
+        &local_locations,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "Second",
+            4,
+        )],
+    );
+
+    let self_id = RequestId::from("helper-owner-self".to_string());
+    server.send_request(
+        self_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": final_qualified_type_position(source, "Self.Second"),
+        }),
+    );
+    let self_locations = result_locations(server.response(&self_id));
+    assert_exact_location_signatures(
+        &self_locations,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "Second",
+            2,
+        )],
+    );
+
+    let completion_id = RequestId::from("helper-owner-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "Self.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "helper owner completion failed: {completion:?}"
+    );
+    let completion_result = completion.result.expect("helper owner completion result");
+    let items = completion_result["items"]
+        .as_array()
+        .expect("helper owner completion items");
+    let labels = items
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect::<HashSet<_>>();
+    assert!(
+        labels.contains("Second"),
+        "own helper member missing: {labels:?}"
+    );
+    assert!(
+        !labels.contains("Other"),
+        "external helper leaked: {labels:?}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn unknown_conditional_import_does_not_select_a_known_helper() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let target_path = temp.path().join("ConditionalHelperTarget.pas");
+    let known_path = temp.path().join("KnownConditionalHelper.pas");
+    let maybe_path = temp.path().join("MaybeConditionalHelper.pas");
+    let consumer_path = temp.path().join("ConditionalHelperConsumer.pas");
+    let target = "unit ConditionalHelperTarget;\ninterface\ntype\n  TWidget = class\n  end;\nimplementation\nend.\n";
+    let known = "unit KnownConditionalHelper;\ninterface\nuses ConditionalHelperTarget;\ntype\n  TKnownHelper = class helper for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TKnownHelper.Touch;\nbegin\nend;\nend.\n";
+    let maybe = "unit MaybeConditionalHelper;\ninterface\nuses ConditionalHelperTarget;\ntype\n  TMaybeHelper = class helper for TWidget\n    procedure Touch;\n  end;\nimplementation\nprocedure TMaybeHelper.Touch;\nbegin\nend;\nend.\n";
+    let consumer = "unit ConditionalHelperConsumer;\ninterface\nuses\n  ConditionalHelperTarget,\n  KnownConditionalHelper,\n  {$IF CompilerVersion >= 24}\n  MaybeConditionalHelper\n  {$ENDIF};\nimplementation\nprocedure Run;\nvar\n  Widget: ConditionalHelperTarget.TWidget;\nbegin\n  Widget.Touch;\nend;\nend.\n";
+    write_file(&target_path, target);
+    write_file(&known_path, known);
+    write_file(&maybe_path, maybe);
+    write_file(&consumer_path, consumer);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let definition_id = RequestId::from("unknown-conditional-helper-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer_path, consumer, "Touch", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert!(
+        locations.is_empty(),
+        "unknown conditional helper must block definition selection: {locations:?}"
+    );
+
+    let completion_id = RequestId::from("unknown-conditional-helper-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&consumer_path)},
+            "position": position_after(consumer, "Widget.", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    let error = completion
+        .error
+        .expect("unknown conditional helper completion must fail closed");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error
+            .message
+            .contains("one or more imports could not be resolved")
+    );
+
+    server.shutdown();
+}
+
+#[test]
 fn cyclic_generic_constraints_fail_closed_and_keep_the_server_responsive() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("CyclicGenericConstraint.pas");

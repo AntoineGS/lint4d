@@ -1705,10 +1705,19 @@ impl NavigationIndex {
 
         let overlay = state.with_receivers.clone();
         if !overlay.is_empty() {
-            for receiver in overlay.iter().rev() {
-                match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
-                    WithLookup::NotFound => {}
-                    lookup => return lookup,
+            for slot in overlay.iter().rev() {
+                match slot {
+                    WithReceiverSlot::Known(receivers) => {
+                        for receiver in receivers.iter().rev() {
+                            match self
+                                .with_receiver_lookup(uri, document, offset, receiver, &key, state)
+                            {
+                                WithLookup::NotFound => {}
+                                lookup => return lookup,
+                            }
+                        }
+                    }
+                    WithReceiverSlot::Unknown => return WithLookup::Unknown,
                 }
             }
         }
@@ -1724,10 +1733,19 @@ impl NavigationIndex {
                 ) else {
                     return WithLookup::Unknown;
                 };
-                for receiver in receivers.iter().rev() {
-                    match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
-                        WithLookup::NotFound => {}
-                        lookup => return lookup,
+                for slot in receivers.iter().rev() {
+                    match slot {
+                        WithReceiverSlot::Known(receivers) => {
+                            for receiver in receivers.iter().rev() {
+                                match self.with_receiver_lookup(
+                                    uri, document, offset, receiver, &key, state,
+                                ) {
+                                    WithLookup::NotFound => {}
+                                    lookup => return lookup,
+                                }
+                            }
+                        }
+                        WithReceiverSlot::Unknown => return WithLookup::Unknown,
                     }
                 }
             }
@@ -1808,10 +1826,12 @@ impl NavigationIndex {
             state.with_receivers = initial_overlay.clone();
             if slot_unknown {
                 receiver_slots.push(WithReceiverSlot::Unknown);
+                overlay.push(WithReceiverSlot::Unknown);
+                state.with_receivers = overlay.clone();
                 continue;
             }
             receiver_slots.push(WithReceiverSlot::Known(resolved.clone()));
-            overlay.extend(resolved.iter().cloned());
+            overlay.push(WithReceiverSlot::Known(resolved.clone()));
             state.with_receivers = overlay.clone();
         }
         state.with_receivers = initial_overlay;
@@ -1832,7 +1852,7 @@ impl NavigationIndex {
         context: &WithContext,
         receiver_index: usize,
         state: &mut ResolutionState,
-    ) -> Option<Vec<Receiver>> {
+    ) -> Option<Vec<WithReceiverSlot>> {
         if receiver_index == 0 {
             return Some(Vec::new());
         }
@@ -1843,7 +1863,7 @@ impl NavigationIndex {
         state.with_context_depth += 1;
         let previous = state.with_receivers.clone();
         let mut overlay = previous.clone();
-        let mut receivers = Vec::new();
+        let mut receiver_slots = Vec::new();
         let mut result = Some(Vec::new());
         for receiver_span in context.receiver_spans.iter().take(receiver_index) {
             let Some(node) = document
@@ -1865,13 +1885,13 @@ impl NavigationIndex {
                 result = None;
                 break;
             }
-            overlay.extend(resolved.iter().cloned());
-            receivers.extend(resolved);
+            receiver_slots.push(WithReceiverSlot::Known(resolved.clone()));
+            overlay.push(WithReceiverSlot::Known(resolved));
         }
         state.with_receivers = previous;
         state.with_context_depth -= 1;
         if result.is_some() {
-            result = Some(receivers);
+            result = Some(receiver_slots);
         }
         result
     }
@@ -1934,12 +1954,19 @@ impl NavigationIndex {
         budget.require_bytes(name.len(), cancel)?;
         let key = canonical_name(name);
         let overlay = state.with_receivers.clone();
-        for receiver in overlay.iter().rev() {
-            match self.with_receiver_lookup_with_budget(
-                uri, document, offset, receiver, &key, state, cancel, budget,
-            )? {
-                WithLookup::NotFound => {}
-                lookup => return Ok(lookup),
+        for slot in overlay.iter().rev() {
+            match slot {
+                WithReceiverSlot::Known(receivers) => {
+                    for receiver in receivers.iter().rev() {
+                        match self.with_receiver_lookup_with_budget(
+                            uri, document, offset, receiver, &key, state, cancel, budget,
+                        )? {
+                            WithLookup::NotFound => {}
+                            lookup => return Ok(lookup),
+                        }
+                    }
+                }
+                WithReceiverSlot::Unknown => return Ok(WithLookup::Unknown),
             }
         }
 
@@ -1959,12 +1986,19 @@ impl NavigationIndex {
                 else {
                     return Ok(WithLookup::Unknown);
                 };
-                for receiver in receivers.iter().rev() {
-                    match self.with_receiver_lookup_with_budget(
-                        uri, document, offset, receiver, &key, state, cancel, budget,
-                    )? {
-                        WithLookup::NotFound => {}
-                        lookup => return Ok(lookup),
+                for slot in receivers.iter().rev() {
+                    match slot {
+                        WithReceiverSlot::Known(receivers) => {
+                            for receiver in receivers.iter().rev() {
+                                match self.with_receiver_lookup_with_budget(
+                                    uri, document, offset, receiver, &key, state, cancel, budget,
+                                )? {
+                                    WithLookup::NotFound => {}
+                                    lookup => return Ok(lookup),
+                                }
+                            }
+                        }
+                        WithReceiverSlot::Unknown => return Ok(WithLookup::Unknown),
                     }
                 }
             }
@@ -2065,10 +2099,12 @@ impl NavigationIndex {
                 state.receiver_uncertain = uncertain_before;
                 if slot_unknown {
                     receiver_slots.push(WithReceiverSlot::Unknown);
+                    overlay.push(WithReceiverSlot::Unknown);
+                    state.with_receivers = overlay.clone();
                     continue;
                 }
                 receiver_slots.push(WithReceiverSlot::Known(resolved.clone()));
-                overlay.extend(resolved.iter().cloned());
+                overlay.push(WithReceiverSlot::Known(resolved.clone()));
                 state.with_receivers = overlay.clone();
             }
             state.with_receivers = initial_overlay;
@@ -2093,7 +2129,7 @@ impl NavigationIndex {
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<Option<Vec<Receiver>>, String> {
+    ) -> Result<Option<Vec<WithReceiverSlot>>, String> {
         if receiver_index == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -2106,7 +2142,7 @@ impl NavigationIndex {
             budget.require_work(receiver_index, cancel)?;
             let previous = state.with_receivers.clone();
             let mut overlay = previous.clone();
-            let mut receivers = Vec::new();
+            let mut receiver_slots = Vec::new();
             for receiver_span in context.receiver_spans.iter().take(receiver_index) {
                 check_navigation_cancel(cancel)?;
                 let Some(node) = document
@@ -2139,11 +2175,11 @@ impl NavigationIndex {
                     state.mark_receiver_uncertain();
                     return Ok(None);
                 }
-                overlay.extend(resolved.iter().cloned());
-                receivers.extend(resolved);
+                receiver_slots.push(WithReceiverSlot::Known(resolved.clone()));
+                overlay.push(WithReceiverSlot::Known(resolved));
             }
             state.with_receivers = previous;
-            Ok(Some(receivers))
+            Ok(Some(receiver_slots))
         })();
         state.with_context_depth -= 1;
         result
@@ -7830,7 +7866,7 @@ struct ResolutionState {
     active_members: HashSet<(Url, String, String, usize, GenericSubstitution)>,
     active_generic_constraints: HashSet<(Url, String)>,
     receiver_uncertain: bool,
-    with_receivers: Vec<Receiver>,
+    with_receivers: Vec<WithReceiverSlot>,
     with_context_depth: usize,
     with_context_resolutions: HashMap<(Url, Span), Option<Vec<WithReceiverSlot>>>,
     with_member_substitutions: HashMap<(Url, usize, Candidate), Vec<GenericSubstitution>>,

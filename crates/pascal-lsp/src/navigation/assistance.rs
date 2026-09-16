@@ -964,7 +964,7 @@ impl NavigationIndex {
             .require_work(receiver_contexts.len(), cancel)?;
         let mut prefix_state = super::ResolutionState::new();
         for (context, receiver_index) in receiver_contexts {
-            let Some(receivers) = self.resolve_with_context_receiver_prefix_with_budget(
+            let Some(receiver_slots) = self.resolve_with_context_receiver_prefix_with_budget(
                 current_uri,
                 current_document,
                 context,
@@ -979,7 +979,7 @@ impl NavigationIndex {
             };
             let (blocks_lower, next_precedence) = self.add_with_completion_receiver_slots(
                 accumulator,
-                vec![super::WithReceiverSlot::Known(receivers)],
+                receiver_slots.into_iter().rev().collect(),
                 current_uri,
                 private_spans,
                 precedence,

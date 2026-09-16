@@ -6834,6 +6834,170 @@ end.
 }
 
 #[test]
+fn unknown_middle_with_slots_preserve_overlay_barriers_for_comma_and_nested_forms() {
+    let source = r#"unit TypedWithUnknownMiddleOverlay;
+interface
+type
+  TInner = class
+    constructor Create;
+    Value: Integer;
+  end;
+  TOuter = record
+    Inner: TInner;
+  end;
+const
+  Value = 0;
+procedure CommaCaller;
+procedure NestedCaller;
+procedure QualifiedCaller;
+implementation
+constructor TInner.Create;
+begin
+end;
+procedure CommaCaller;
+var
+  Obj: TOuter;
+begin
+  with Obj, UnknownReceiver, Inner do begin
+    Value := 1;
+    Va := 1;
+  end;
+end;
+procedure NestedCaller;
+var
+  Obj: TOuter;
+begin
+  with Obj do
+    with UnknownReceiver do
+      with Inner do begin
+        Value := 2;
+        Va := 2;
+      end;
+end;
+procedure QualifiedCaller;
+var
+  Obj: TOuter;
+begin
+  with Obj, UnknownReceiver, TypedWithUnknownMiddleOverlay.TInner.Create do begin
+    Value := 3;
+    Va := 3;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownMiddleOverlay");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown middle with source parses");
+
+    for occurrence in 0..2 {
+        let receiver = index.navigate(
+            &source_uri,
+            position_of(source, "Inner do", occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            receiver.is_empty(),
+            "an unknown middle receiver must keep an unqualified later slot unresolved: {receiver:?}"
+        );
+        assert!(
+            index
+                .type_definitions(&source_uri, position_of(source, "Inner do", occurrence))
+                .is_empty(),
+            "an unknown middle receiver must not invent a type for the later slot"
+        );
+    }
+
+    for occurrence in 0..2 {
+        let completion_position = position_of(source, "Va :=", occurrence);
+        let completion_position = Position::new(
+            completion_position.line,
+            completion_position.character + "Va".encode_utf16().count() as u32,
+        );
+        let value = index.navigate(
+            &source_uri,
+            position_of(source, "Value :=", occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            value.is_empty(),
+            "an unknown middle receiver must block body fallback for comma/nested form: {value:?}"
+        );
+        assert!(
+            index
+                .hover(&source_uri, position_of(source, "Value :=", occurrence))
+                .is_none(),
+            "an unknown middle receiver must block body hover fallback"
+        );
+        let completion = index
+            .completion(&source_uri, completion_position)
+            .expect("unknown middle completion");
+        assert!(
+            completion.items.iter().all(|item| item.label != "Value"),
+            "an unknown middle receiver must block body completion fallback: {:?}",
+            completion
+                .items
+                .iter()
+                .map(|item| &item.label)
+                .collect::<Vec<_>>()
+        );
+        assert!(completion.is_incomplete);
+    }
+
+    let qualified_receiver = index.navigate(
+        &source_uri,
+        position_of(source, "TInner.Create do", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_receiver.len(), 1);
+    assert_location_start(
+        &qualified_receiver[0],
+        &source_uri,
+        position_of(source, "TInner = class", 0),
+    );
+    let qualified_type =
+        index.type_definitions(&source_uri, position_of(source, "TInner.Create do", 0));
+    assert_exact_type_location(&qualified_type, &source_uri, source, "TInner", 0);
+
+    let qualified_value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_value.len(), 1);
+    assert_location_start(
+        &qualified_value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+    let qualified_hover = index
+        .hover(&source_uri, position_of(source, "Value :=", 2))
+        .expect("independently qualified later receiver hover");
+    assert!(hover_text(&qualified_hover).contains("Value: Integer"));
+    let qualified_completion_position = position_of(source, "Va :=", 2);
+    let qualified_completion_position = Position::new(
+        qualified_completion_position.line,
+        qualified_completion_position.character + "Va".encode_utf16().count() as u32,
+    );
+    let qualified_completion = index
+        .completion(&source_uri, qualified_completion_position)
+        .expect("independently qualified later receiver completion");
+    assert!(
+        qualified_completion
+            .items
+            .iter()
+            .any(|item| item.label == "Value"),
+        "an independently qualified later receiver must retain its member: {:?}",
+        qualified_completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn nested_comma_receiver_prefix_precedes_outer_context_across_assistance_endpoints() {
     let source = r#"unit TypedWithNestedCommaPrecedence;
 interface
@@ -6983,6 +7147,120 @@ end.
             .is_err(),
         "a nested comma receiver rename must fail closed"
     );
+}
+
+#[test]
+fn completion_keeps_known_receiver_prefix_slots_ordered_and_blocks_unknown_middle_slots() {
+    let source = r#"unit TypedWithOrderedReceiverCompletion;
+interface
+type
+  TTarget = record
+    Value: Integer;
+  end;
+  TLeft = record
+    A: Integer;
+  end;
+  TRight = record
+    B: Integer;
+  end;
+  TRightMember = record
+    B: Integer;
+    LocalReceiver: TTarget;
+  end;
+procedure KnownReceivers;
+procedure RightmostMember;
+procedure UnknownMiddle;
+implementation
+procedure KnownReceivers;
+var
+  L: TLeft;
+  R: TRight;
+  LocalReceiver: TTarget;
+begin
+  with L, R, LocalReceiver do begin
+    Value := 1;
+  end;
+end;
+procedure RightmostMember;
+var
+  L: TLeft;
+  R: TRightMember;
+  LocalReceiver: TTarget;
+begin
+  with L, R, LocalReceiver do begin
+    Value := 2;
+  end;
+end;
+procedure UnknownMiddle;
+var
+  L: TLeft;
+  LocalReceiver: TTarget;
+begin
+  with L, UnknownReceiver, LocalReceiver do begin
+    Value := 3;
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithOrderedReceiverCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ordered receiver completion source parses");
+
+    let known_body = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(known_body.len(), 1);
+    assert_location_start(
+        &known_body[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+
+    let known_none = index
+        .completion(&source_uri, position_after(source, "with L, R, Loc", 0))
+        .expect("known receiver prefix completion");
+    let known_none_item = known_none
+        .items
+        .iter()
+        .find(|item| item.label == "LocalReceiver")
+        .expect("a known three-receiver prefix must retain the local candidate");
+    assert_eq!(known_none_item.kind, Some(CompletionItemKind::VARIABLE));
+    assert!(!known_none.is_incomplete);
+
+    let rightmost = index
+        .completion(&source_uri, position_after(source, "with L, R, Loc", 1))
+        .expect("rightmost receiver member completion");
+    let rightmost_item = rightmost
+        .items
+        .iter()
+        .find(|item| item.label == "LocalReceiver")
+        .expect("the rightmost prefix member must be offered");
+    assert_eq!(rightmost_item.kind, Some(CompletionItemKind::FIELD));
+    assert!(!rightmost.is_incomplete);
+
+    let unknown_middle = index
+        .completion(
+            &source_uri,
+            position_after(source, "with L, UnknownReceiver, Loc", 0),
+        )
+        .expect("unknown middle receiver completion");
+    assert!(
+        unknown_middle
+            .items
+            .iter()
+            .all(|item| item.label != "LocalReceiver"),
+        "an unknown middle receiver must block the local third receiver: {:?}",
+        unknown_middle
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(unknown_middle.is_incomplete);
 }
 
 #[test]

@@ -2922,22 +2922,11 @@ fn handle_notification(
         }
         "textDocument/didChange" => {
             let params: DidChangeTextDocumentParams = parse_notification(&notification)?;
-            if params.content_changes.len() != 1 {
-                return Err("pascal-lsp only accepts one full-document change".to_string());
-            }
-            let change = params
-                .content_changes
-                .into_iter()
-                .next()
-                .expect("content change length checked");
-            if change.range.is_some() {
-                return Err("pascal-lsp requires full-document text changes".to_string());
-            }
             let uri = params.text_document.uri.clone();
             workspace
-                .change_document(
+                .change_document_with_changes(
                     params.text_document.uri,
-                    change.text,
+                    params.content_changes,
                     params.text_document.version,
                 )
                 .map_err(|error| {
@@ -3213,7 +3202,7 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
         "positionEncoding": "utf-16",
         "textDocumentSync": {
             "openClose": true,
-            "change": 1,
+            "change": 2,
             "save": true
         },
         "hoverProvider": true,

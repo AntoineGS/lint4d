@@ -16,7 +16,7 @@ use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{GlobSet, GlobSetBuilder};
 use lsp_types::{
     Diagnostic as LspDiagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range,
-    TextEdit, Url,
+    TextDocumentContentChangeEvent, TextEdit, Url,
 };
 use pascal_core::delphi_overrides::{
     EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
@@ -980,25 +980,139 @@ impl Workspace {
     }
 
     pub fn change_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
-        let Some(previous) = self.open_documents.get(&uri) else {
+        self.change_document_with_changes(
+            uri,
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }],
+            version,
+        )
+    }
+
+    pub fn change_document_with_changes(
+        &mut self,
+        uri: Url,
+        changes: Vec<TextDocumentContentChangeEvent>,
+        version: i32,
+    ) -> Result<(), String> {
+        let Some((previous_version, previous_text, was_rejected)) =
+            self.open_documents.get(&uri).map(|document| {
+                (
+                    document.version,
+                    document.text.clone(),
+                    document.rejection.is_some(),
+                )
+            })
+        else {
             return Err(format!("received didChange for unopened document {uri}"));
         };
-        if version <= previous.version {
+        if version <= previous_version {
             eprintln!(
                 "pascal-lsp: warning: ignored non-monotonic version {} for {} (current {})",
-                version, uri, previous.version
+                version, uri, previous_version
             );
             return Ok(());
         }
-        if let Err(reason) = self.validate_open_text(&uri, &text) {
-            self.reject_open_document(uri, version, reason);
+
+        if changes.is_empty() {
+            self.advance_document_version(&uri, version);
             return Ok(());
         }
+
+        let previous_text_len = previous_text.as_ref().map_or(0, String::len);
+        let mut candidate = previous_text.unwrap_or_default();
+        let mut full_replacement_seen = false;
+        for change in changes {
+            let Some(range) = change.range else {
+                if let Err(reason) =
+                    self.validate_candidate_text(&uri, previous_text_len, change.text.len())
+                {
+                    self.reject_open_document(uri, version, reason);
+                    return Ok(());
+                }
+                candidate = change.text;
+                full_replacement_seen = true;
+                continue;
+            };
+
+            if was_rejected && !full_replacement_seen {
+                self.reject_open_document(
+                    uri,
+                    version,
+                    "document is desynchronized; a full-document replacement is required before ranged changes"
+                        .to_string(),
+                );
+                return Ok(());
+            }
+
+            let Some(start) = text::position_to_offset(&candidate, range.start) else {
+                self.reject_open_document(
+                    uri,
+                    version,
+                    "incremental change has an invalid start UTF-16 position".to_string(),
+                );
+                return Ok(());
+            };
+            let Some(end) = text::position_to_offset(&candidate, range.end) else {
+                self.reject_open_document(
+                    uri,
+                    version,
+                    "incremental change has an invalid end UTF-16 position".to_string(),
+                );
+                return Ok(());
+            };
+            if start > end {
+                self.reject_open_document(
+                    uri,
+                    version,
+                    "incremental change range is reversed".to_string(),
+                );
+                return Ok(());
+            }
+
+            let replaced = &candidate[start..end];
+            if let Some(expected) = change.range_length {
+                let actual = replaced.encode_utf16().count();
+                if actual != expected as usize {
+                    self.reject_open_document(
+                        uri,
+                        version,
+                        format!(
+                            "incremental change rangeLength is {expected} UTF-16 units, but the range replaces {actual}"
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
+
+            let Some(candidate_len) = candidate
+                .len()
+                .checked_sub(end - start)
+                .and_then(|length| length.checked_add(change.text.len()))
+            else {
+                self.reject_open_document(
+                    uri,
+                    version,
+                    "incremental change size overflows the platform usize".to_string(),
+                );
+                return Ok(());
+            };
+            if let Err(reason) =
+                self.validate_candidate_text(&uri, previous_text_len, candidate_len)
+            {
+                self.reject_open_document(uri, version, reason);
+                return Ok(());
+            }
+            candidate.replace_range(start..end, &change.text);
+        }
+
         let context_key = self.context_for_uri(&uri)?;
-        let open_bytes_after = self.open_bytes_after(&uri, text.len());
+        let open_bytes_after = self.open_bytes_after(&uri, candidate.len());
         let mut pinned = HashSet::new();
         pinned.insert(uri.clone());
-        if !self.make_room_for(&uri, text.len(), &pinned, open_bytes_after) {
+        if !self.make_room_for(&uri, candidate.len(), &pinned, open_bytes_after) {
             let retained_files = self.retained_file_count_after_open(&uri);
             let reason = if retained_files > self.options.limits.max_files {
                 format!(
@@ -1014,7 +1128,7 @@ impl Workspace {
             self.reject_open_document(uri, version, reason);
             return Ok(());
         }
-        self.accept_open_document(uri, text, version, context_key)
+        self.accept_open_document(uri, candidate, version, context_key)
     }
 
     pub fn save_document(&mut self, uri: &Url, saved_text: Option<String>) -> Result<(), String> {
@@ -1128,19 +1242,33 @@ impl Workspace {
     }
 
     fn validate_open_text(&self, uri: &Url, text: &str) -> Result<(), String> {
-        if text.len() > self.options.limits.max_file_bytes {
-            return Err(self.file_too_large_message(uri, text.len()));
-        }
-
         let previous_open_bytes = self
             .open_documents
             .get(uri)
             .and_then(|document| document.text.as_ref())
             .map_or(0, String::len);
-        let open_bytes_after = self
+        self.validate_candidate_text(uri, previous_open_bytes, text.len())
+    }
+
+    fn validate_candidate_text(
+        &self,
+        uri: &Url,
+        previous_text_len: usize,
+        candidate_len: usize,
+    ) -> Result<(), String> {
+        if candidate_len > self.options.limits.max_file_bytes {
+            return Err(self.file_too_large_message(uri, candidate_len));
+        }
+
+        let open_bytes_without_previous = self
             .open_text_bytes
-            .saturating_sub(previous_open_bytes)
-            .saturating_add(text.len());
+            .checked_sub(previous_text_len)
+            .ok_or_else(|| "open document byte accounting is inconsistent".to_string())?;
+        let open_bytes_after = open_bytes_without_previous
+            .checked_add(candidate_len)
+            .ok_or_else(|| {
+                "open document byte accounting overflows the platform usize".to_string()
+            })?;
         if open_bytes_after > self.options.limits.max_total_bytes {
             return Err(format!(
                 "open document text uses {open_bytes_after} bytes; the configured total source limit is {}",
@@ -1148,6 +1276,14 @@ impl Workspace {
             ));
         }
         Ok(())
+    }
+
+    fn advance_document_version(&mut self, uri: &Url, version: i32) {
+        self.bump_source_generation();
+        if let Some(document) = self.open_documents.get_mut(uri) {
+            document.version = version;
+        }
+        self.schedule_diagnostics(uri.clone());
     }
 
     fn open_bytes_after(&self, uri: &Url, incoming_len: usize) -> usize {
@@ -5632,7 +5768,7 @@ mod tests {
     };
     use crate::NavigationTarget;
     use crate::project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance};
-    use lsp_types::{Position, Url};
+    use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
     use pascal_core::delphi_overrides::{
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
     };
@@ -5647,6 +5783,430 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    fn text_change(
+        source: &str,
+        start: usize,
+        end: usize,
+        text: &str,
+        range_length: Option<u32>,
+    ) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: Some(Range::new(
+                crate::text::offset_to_position(source, start).expect("change start position"),
+                crate::text::offset_to_position(source, end).expect("change end position"),
+            )),
+            range_length,
+            text: text.to_owned(),
+        }
+    }
+
+    fn overlay_text(workspace: &Workspace, uri: &Url) -> Option<String> {
+        workspace
+            .analysis_input()
+            .overlays
+            .get(uri)
+            .map(|overlay| overlay.text.clone())
+    }
+
+    #[test]
+    fn incremental_changes_apply_sequentially_against_each_intermediate_text() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\ninterface\nconst first = 1; second = 2;\nimplementation\nend.\n";
+        let after_first = source.replacen("first", "firstLong", 1);
+        let updated = after_first.replacen("second", "secondLong", 1);
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        let generation = workspace.source_generation();
+
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![
+                    text_change(
+                        source,
+                        source.find("first").expect("first name"),
+                        source.find("first").expect("first name") + "first".len(),
+                        "firstLong",
+                        Some("first".encode_utf16().count() as u32),
+                    ),
+                    text_change(
+                        &after_first,
+                        after_first.find("second").expect("second name"),
+                        after_first.find("second").expect("second name") + "second".len(),
+                        "secondLong",
+                        Some("second".encode_utf16().count() as u32),
+                    ),
+                ],
+                2,
+            )
+            .expect("incremental changes");
+
+        assert_eq!(
+            overlay_text(&workspace, &uri).as_deref(),
+            Some(updated.as_str())
+        );
+        assert_eq!(workspace.document_version(&uri), Some(2));
+        assert_eq!(workspace.source_generation(), generation + 1);
+    }
+
+    #[test]
+    fn mixed_full_and_ranged_changes_use_the_current_intermediate_text() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\ninterface\nimplementation\nend.\n";
+        let full = "unit Main;\ninterface\nconst Alpha = 1;\nimplementation\nend.\n";
+        let updated = full.replacen("Alpha", "Beta", 1);
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![
+                    TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: full.to_owned(),
+                    },
+                    text_change(
+                        full,
+                        full.find("Alpha").expect("Alpha name"),
+                        full.find("Alpha").expect("Alpha name") + "Alpha".len(),
+                        "Beta",
+                        None,
+                    ),
+                ],
+                2,
+            )
+            .expect("mixed changes");
+
+        assert_eq!(
+            overlay_text(&workspace, &uri).as_deref(),
+            Some(updated.as_str())
+        );
+    }
+
+    #[test]
+    fn incremental_deletion_removes_the_selected_utf16_span() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\ninterface\nconst Keep = 1; Remove = 2;\nimplementation\nend.\n";
+        let deleted = "; Remove = 2";
+        let start = source.find(deleted).expect("deletion span");
+        let end = start + deleted.len();
+        let updated = source.replacen(deleted, "", 1);
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![text_change(
+                    source,
+                    start,
+                    end,
+                    "",
+                    Some(deleted.encode_utf16().count() as u32),
+                )],
+                2,
+            )
+            .expect("incremental deletion");
+
+        assert_eq!(
+            overlay_text(&workspace, &uri).as_deref(),
+            Some(updated.as_str())
+        );
+        assert_eq!(workspace.document_version(&uri), Some(2));
+    }
+
+    #[test]
+    fn invalid_later_change_is_atomic_and_requires_full_resynchronization() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\ninterface\nconst Name = 1;\nimplementation\nend.\n";
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![
+                    text_change(
+                        source,
+                        source.find("Name").expect("Name name"),
+                        source.find("Name").expect("Name name") + "Name".len(),
+                        "ChangedName",
+                        None,
+                    ),
+                    TextDocumentContentChangeEvent {
+                        range: Some(Range::new(Position::new(100, 0), Position::new(100, 0))),
+                        range_length: None,
+                        text: "ignored".to_owned(),
+                    },
+                ],
+                2,
+            )
+            .expect("invalid notifications are recorded as rejected documents");
+
+        let input = workspace.analysis_input();
+        assert!(input.rejected_documents.contains(&uri));
+        assert!(!input.overlays.contains_key(&uri));
+        assert_eq!(workspace.document_version(&uri), Some(2));
+
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![text_change("", 0, 0, "still invalid", None)],
+                3,
+            )
+            .expect("incremental changes remain rejected while desynchronized");
+        assert!(workspace.analysis_input().rejected_documents.contains(&uri));
+        assert!(!workspace.analysis_input().overlays.contains_key(&uri));
+        assert_eq!(workspace.document_version(&uri), Some(3));
+
+        let resynchronized = "unit Main;\ninterface\nconst Recovered = 1;\nimplementation\nend.\n";
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: resynchronized.to_owned(),
+                }],
+                4,
+            )
+            .expect("full replacement resynchronizes document");
+        assert_eq!(
+            overlay_text(&workspace, &uri).as_deref(),
+            Some(resynchronized)
+        );
+        assert!(!workspace.analysis_input().rejected_documents.contains(&uri));
+    }
+
+    #[test]
+    fn empty_change_batch_advances_version_once_and_stale_versions_are_ignored() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main; interface implementation end.\n";
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        let generation = workspace.source_generation();
+        workspace
+            .change_document_with_changes(uri.clone(), Vec::new(), 2)
+            .expect("empty change batch");
+        assert_eq!(workspace.document_version(&uri), Some(2));
+        assert_eq!(workspace.source_generation(), generation + 1);
+
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "unit Changed; interface implementation end.\n".to_owned(),
+                }],
+                2,
+            )
+            .expect("stale version is ignored");
+        assert_eq!(workspace.document_version(&uri), Some(2));
+        assert_eq!(workspace.source_generation(), generation + 1);
+        assert_eq!(overlay_text(&workspace, &uri).as_deref(), Some(source));
+    }
+
+    #[test]
+    fn invalid_utf16_boundary_and_range_length_reject_the_notification() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\ninterface\nconst 😀Name = 1;\nimplementation\nend.\n";
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(2, 7), Position::new(2, 7))),
+                    range_length: None,
+                    text: "x".to_owned(),
+                }],
+                2,
+            )
+            .expect("invalid UTF-16 boundary is recorded as rejection");
+        assert!(workspace.analysis_input().rejected_documents.contains(&uri));
+
+        let recovered = source.to_owned();
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: recovered.clone(),
+                }],
+                3,
+            )
+            .expect("full replacement resynchronizes the document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![text_change(
+                    &recovered,
+                    recovered.find("Name").expect("Name name"),
+                    recovered.find("Name").expect("Name name") + "Name".len(),
+                    "Renamed",
+                    Some(99),
+                )],
+                4,
+            )
+            .expect("rangeLength mismatch is recorded as rejection");
+        assert!(workspace.analysis_input().rejected_documents.contains(&uri));
+        assert!(!workspace.analysis_input().overlays.contains_key(&uri));
+    }
+
+    #[test]
+    fn incremental_changes_handle_non_bmp_crlf_and_eof_positions() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\r\ninterface\r\nconst 😀Name = 1;\r\nend.\r\n";
+        let emoji_start = source.find('😀').expect("emoji");
+        let after_emoji = format!(
+            "{}🙂{}",
+            &source[..emoji_start],
+            &source[emoji_start + '😀'.len_utf8()..]
+        );
+        let name_start = after_emoji.find("Name").expect("Name name");
+        let after_name = after_emoji.replacen("Name", "Renamed", 1);
+        let updated = format!("{after_name}// eof");
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![
+                    text_change(
+                        source,
+                        emoji_start,
+                        emoji_start + '😀'.len_utf8(),
+                        "🙂",
+                        Some(2),
+                    ),
+                    text_change(
+                        &after_emoji,
+                        name_start,
+                        name_start + "Name".len(),
+                        "Renamed",
+                        Some(4),
+                    ),
+                    text_change(
+                        &after_name,
+                        after_name.len(),
+                        after_name.len(),
+                        "// eof",
+                        Some(0),
+                    ),
+                ],
+                2,
+            )
+            .expect("CRLF and non-BMP incremental changes");
+
+        assert_eq!(
+            overlay_text(&workspace, &uri).as_deref(),
+            Some(updated.as_str())
+        );
+    }
+
+    #[test]
+    fn reversed_incremental_ranges_are_rejected() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main;\ninterface\nimplementation\nend.\n";
+        fs::write(&path, source).expect("source");
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(2, 8), Position::new(2, 4))),
+                    range_length: None,
+                    text: "invalid".to_owned(),
+                }],
+                2,
+            )
+            .expect("reversed range is recorded as rejection");
+
+        assert!(workspace.analysis_input().rejected_documents.contains(&uri));
+        assert!(!workspace.analysis_input().overlays.contains_key(&uri));
+    }
+
+    #[test]
+    fn oversized_intermediate_change_is_rejected_before_it_becomes_authoritative() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("Main.pas");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let source = "unit Main; end.\n";
+        fs::write(&path, source).expect("source");
+        let options = WorkspaceOptions {
+            limits: ResourceLimits {
+                max_files: 10,
+                max_file_bytes: source.len() + 3,
+                max_total_bytes: source.len() + 3,
+            },
+            ..WorkspaceOptions::default()
+        };
+
+        let mut workspace = test_workspace(vec![temp.path().to_owned()], options);
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        workspace
+            .change_document_with_changes(
+                uri.clone(),
+                vec![text_change(source, 0, 0, &"x".repeat(4), Some(0))],
+                2,
+            )
+            .expect("oversized notification is recorded as rejection");
+
+        assert!(workspace.analysis_input().rejected_documents.contains(&uri));
+        assert!(!workspace.analysis_input().overlays.contains_key(&uri));
     }
 
     #[test]

@@ -121,6 +121,24 @@ a stale or cancelled diagnostic is silently discarded. Cancelling a navigation
 or formatting request returns the standard LSP `RequestCanceled` error
 (`-32800`) exactly once.
 
+### Open-document synchronization
+
+The server advertises UTF-16 incremental synchronization for
+`textDocument/didChange`. It accepts both full-document replacement events and
+arrays of ranged edits; ranged edits are applied in order, with each range
+measured against the text produced by the preceding edit in that notification.
+Positions use UTF-16 code units, including for non-BMP characters, and handle
+CRLF line endings and end-of-file positions. `rangeLength`, when supplied, is
+validated in UTF-16 units but is optional.
+
+Each notification is applied atomically. Invalid ranges, reversed ranges,
+invalid UTF-16 boundaries, or source-limit violations discard the whole
+notification and remove the stale overlay rather than publishing a partial
+edit. A rejected document must receive a full-text replacement (or be closed
+and reopened) before ranged edits are accepted again. Older document versions
+are ignored; an empty change array advances the version as a no-op. Closing an
+open document removes its overlay and restores the current disk contents.
+
 If argument types identify one supported overload, Neovim receives that
 declaration/result; otherwise it presents the retained overload set rather than
 the server guessing. Keep the cursor on the identifier, not on whitespace

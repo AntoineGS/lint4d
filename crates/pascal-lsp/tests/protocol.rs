@@ -1871,7 +1871,7 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     let result = server.initialize(root, Value::Null);
     let capabilities = &result["capabilities"];
     assert_eq!(capabilities["positionEncoding"], "utf-16");
-    assert_eq!(capabilities["textDocumentSync"]["change"], 1);
+    assert_eq!(capabilities["textDocumentSync"]["change"], 2);
     assert_eq!(capabilities["declarationProvider"], true);
     assert_eq!(capabilities["definitionProvider"], true);
     assert_eq!(capabilities["implementationProvider"], true);
@@ -1883,6 +1883,69 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     assert_eq!(capabilities["typeDefinitionProvider"], true);
     assert_eq!(capabilities["documentFormattingProvider"], true);
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[test]
+fn incremental_did_change_updates_overlay_for_navigation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure OldRoutine;\nimplementation\nprocedure OldRoutine;\nprocedure Use;\nbegin\n  OldRoutine;\nend;\nend.\n";
+    let updated = source.replace("OldRoutine", "NewLongRoutine");
+    let after_first_edit = source.replacen("OldRoutine", "NewLongRoutine", 1);
+    let after_second_edit = after_first_edit.replacen("OldRoutine", "NewLongRoutine", 1);
+    write_file(&source_path, source);
+
+    let first_start = position_of(source, "OldRoutine", 0);
+    let first_end = position_after(source, "OldRoutine", 0);
+    let second_start = position_of(&after_first_edit, "OldRoutine", 0);
+    let second_end = position_after(&after_first_edit, "OldRoutine", 0);
+    let third_start = position_of(&after_second_edit, "OldRoutine", 0);
+    let third_end = position_after(&after_second_edit, "OldRoutine", 0);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [
+                {"range": {"start": first_start, "end": first_end}, "text": "NewLongRoutine"},
+                {"range": {"start": second_start, "end": second_end}, "text": "NewLongRoutine"},
+                {"range": {"start": third_start, "end": third_end}, "text": "NewLongRoutine"}
+            ]
+        }),
+    );
+
+    let id = RequestId::from("incremental-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &updated, "NewLongRoutine", 2),
+    );
+    let locations = result_locations(server.response(&id));
+    assert!(
+        locations.iter().any(|location| {
+            location["uri"] == uri(&source_path).to_string()
+                && location["range"]
+                    == json!({
+                        "start": position_of(&updated, "NewLongRoutine", 0),
+                        "end": position_after(&updated, "NewLongRoutine", 0)
+                    })
+        }),
+        "definition should use the incrementally updated declaration: {locations:?}"
+    );
     server.shutdown();
 }
 
@@ -17961,7 +18024,8 @@ fn diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
     let root = environment.path().join("workspace");
     let main = root.join("Main.pas");
     let first_source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
-    let second_source = first_source.replace("badConst", "GoodConst");
+    let changed_start = position_of(first_source, "badConst", 0);
+    let changed_end = position_after(first_source, "badConst", 0);
     write_file(&main, first_source);
     write_file(
         &root.join(".lint4d.toml"),
@@ -17987,7 +18051,11 @@ fn diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
         "textDocument/didChange",
         json!({
             "textDocument": {"uri": uri(&main), "version": 2},
-            "contentChanges": [{"text": second_source}]
+            "contentChanges": [{
+                "range": {"start": changed_start, "end": changed_end},
+                "rangeLength": 8,
+                "text": "GoodConst"
+            }]
         }),
     );
     barrier.release();

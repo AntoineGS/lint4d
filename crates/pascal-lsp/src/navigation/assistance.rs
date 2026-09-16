@@ -1059,7 +1059,13 @@ impl NavigationIndex {
         offset: usize,
         cancel: &AtomicBool,
     ) -> Result<(bool, bool), String> {
+        let Some(current_document) = self.documents.get(current_uri) else {
+            return Ok((false, false));
+        };
         let lookup = self.member_candidates_for_completion_with_budget(
+            current_uri,
+            current_document,
+            offset,
             type_uri,
             type_key,
             type_scope,

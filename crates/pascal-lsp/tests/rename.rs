@@ -236,6 +236,132 @@ end.
 }
 
 #[test]
+fn renames_record_helper_members_and_uses() {
+    let source = r#"unit HelperRename;
+interface
+type
+  TPoint = record
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TPointHelper.Offset;
+begin
+end;
+
+procedure Run;
+var
+  Point: TPoint;
+begin
+  Point.Offset;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper rename source parses");
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Offset", 0), "Shift")
+        .expect("helper rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Offset", 0),
+                "Shift".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Offset", 1),
+                "Shift".to_owned(),
+            ),
+            (
+                source_uri,
+                range_of(source, "Offset", 2),
+                "Shift".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn renames_imported_class_helper_members_and_uses() {
+    let target = r#"unit HelperTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let helper = r#"unit WidgetHelper;
+interface
+uses HelperTarget;
+type
+  TWidgetHelper = class helper for TWidget
+    procedure Touch;
+  end;
+implementation
+procedure TWidgetHelper.Touch;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit HelperConsumer;
+interface
+uses HelperTarget, WidgetHelper;
+procedure Run;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+end.
+"#;
+    let mut index = NavigationIndex::new();
+    let target_uri = update(&mut index, "HelperTarget", target);
+    let helper_uri = update(&mut index, "WidgetHelper", helper);
+    let consumer_uri = update(&mut index, "HelperConsumer", consumer);
+
+    let edits = index
+        .rename_edits(&helper_uri, position_of(helper, "Touch", 0), "Activate")
+        .expect("imported helper rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                helper_uri.clone(),
+                range_of(helper, "Touch", 0),
+                "Activate".to_owned(),
+            ),
+            (
+                helper_uri,
+                range_of(helper, "Touch", 1),
+                "Activate".to_owned(),
+            ),
+            (
+                consumer_uri,
+                range_of(consumer, "Touch", 0),
+                "Activate".to_owned(),
+            ),
+        ],
+    );
+    assert!(!edits.contains_key(&target_uri));
+}
+
+#[test]
 fn binding_locations_filter_both_parameter_declaration_sites() {
     let source = "unit ParameterReferences;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\n  Value := Value + 1;\nend;\nend.\n";
     let uri = uri("ParameterReferences");

@@ -442,21 +442,11 @@ impl NavigationIndex {
             return None;
         }
         let symbol = document.symbols.get(*indices.first()?)?;
-        let mut substitution = GenericSubstitution::empty();
-        for parameter in &symbol.generic_parameters {
-            substitution.insert(
-                &parameter.name,
-                ResolvedType::Named(TypeInstance {
-                    uri: current_uri.clone(),
-                    key: parameter.name.clone(),
-                    kind: TypeKind::Other,
-                    scope: symbol.scope,
-                    parameter_names: Vec::new(),
-                    substitution: GenericSubstitution::empty(),
-                }),
-            );
-        }
-        Some(substitution)
+        Some(symbolic_generic_substitution(
+            current_uri,
+            &symbol.generic_parameters,
+            symbol.scope,
+        ))
     }
 
     fn owner_type_substitution_with_budget(
@@ -1053,11 +1043,21 @@ impl NavigationIndex {
         }
 
         if let Some(owner_type) = owner_type.as_deref() {
-            let members = self.member_references_for_type_with_budget(
-                uri, owner_type, ROOT_SCOPE, &key, true, cancel, budget,
+            let members = self.member_references_for_type_in_context_with_budget(
+                uri,
+                document,
+                offset,
+                uri,
+                owner_type,
+                ROOT_SCOPE,
+                &GenericSubstitution::empty(),
+                &key,
+                true,
+                cancel,
+                budget,
             )?;
-            if !members.is_empty() {
-                return Ok(members);
+            if !members.candidates.is_empty() {
+                return Ok(members.candidates);
             }
         }
 
@@ -1244,17 +1244,22 @@ impl NavigationIndex {
                         &unit_uri, &key, cancel, budget,
                     )?);
                 }
-                Receiver::Type(instance) => {
-                    references.extend(self.member_references_for_type_with_budget(
+                Receiver::Type(instance) => references.extend(
+                    self.member_references_for_type_in_context_with_budget(
+                        current_uri,
+                        current_document,
+                        offset,
                         &instance.uri,
                         &instance.key,
                         instance.scope,
+                        &instance.substitution,
                         &key,
                         instance.uri == *current_uri,
                         cancel,
                         budget,
-                    )?)
-                }
+                    )?
+                    .candidates,
+                ),
                 Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {}
             }
         }
@@ -1696,9 +1701,19 @@ impl NavigationIndex {
         // considered before unit globals and imported declarations, and the
         // owner lookup also covers nested procedures inside a class method.
         if let Some(owner_type) = document.owner_type_at(offset) {
-            let members = self.member_references_for_type(uri, &owner_type, ROOT_SCOPE, &key, true);
-            if !members.is_empty() {
-                return members;
+            let members = self.member_references_for_type_in_context(
+                uri,
+                document,
+                offset,
+                uri,
+                &owner_type,
+                ROOT_SCOPE,
+                &GenericSubstitution::empty(),
+                &key,
+                true,
+            );
+            if !members.candidates.is_empty() {
+                return members.candidates;
             }
         }
 
@@ -1813,14 +1828,18 @@ impl NavigationIndex {
                         }),
                 ),
                 Receiver::Type(instance) => {
-                    let members = self.member_references_for_type(
+                    let members = self.member_references_for_type_in_context(
+                        current_uri,
+                        current_document,
+                        offset,
                         &instance.uri,
                         &instance.key,
                         instance.scope,
+                        &instance.substitution,
                         &key,
                         instance.uri == *current_uri,
                     );
-                    references.extend(members)
+                    references.extend(members.candidates)
                 }
                 Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {}
             }
@@ -2435,19 +2454,26 @@ impl NavigationIndex {
     ) -> Result<Vec<Receiver>, String> {
         if name.eq_ignore_ascii_case("Self") {
             let scope = self.budgeted_scope_at(current_document, offset, cancel, budget)?;
-            return Ok(current_document
-                .owner_type_at_identifier(lookup_identifier, scope)
-                .map(|owner_type| {
-                    vec![Receiver::Type(TypeInstance {
-                        uri: current_uri.clone(),
-                        key: owner_type,
-                        kind: TypeKind::Other,
-                        scope: ROOT_SCOPE,
-                        parameter_names: Vec::new(),
-                        substitution: GenericSubstitution::empty(),
-                    })]
-                })
-                .unwrap_or_default());
+            let Some(owner_type) =
+                current_document.owner_type_at_identifier(lookup_identifier, scope)
+            else {
+                return Ok(Vec::new());
+            };
+            if let Some(helped_type) = self.helper_target_for_owner_with_budget(
+                current_uri,
+                current_document,
+                &owner_type,
+                cancel,
+                budget,
+            )? {
+                return Ok(vec![Receiver::Type(helped_type)]);
+            }
+            return Ok(vec![Receiver::Type(self.type_instance_for_key(
+                current_uri,
+                &owner_type,
+                ROOT_SCOPE,
+                &GenericSubstitution::empty(),
+            ))]);
         }
         if name.eq_ignore_ascii_case("Result") {
             let scope = self.budgeted_scope_at(current_document, offset, cancel, budget)?;
@@ -3504,15 +3530,25 @@ impl NavigationIndex {
         if !state.active_members.insert(resolution_key.clone()) {
             return Ok(Vec::new());
         }
-        let candidates = self.member_references_for_type_with_budget(
+        let lookup = self.member_references_for_type_in_context_with_budget(
+            current_uri,
+            current_document,
+            offset,
             type_uri,
             type_key,
             type_scope,
+            substitution,
             &member_key,
             allow_implementation,
             cancel,
             budget,
         )?;
+        if !lookup.ancestry_known {
+            state.mark_receiver_uncertain();
+            state.active_members.remove(&resolution_key);
+            return Ok(Vec::new());
+        }
+        let candidates = lookup.candidates;
         if candidates
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -3570,17 +3606,22 @@ impl NavigationIndex {
                 continue;
             }
             let owner_key = symbol.owner_type.as_deref().unwrap_or(type_key);
-            let Some(member_substitution) = self.member_owner_substitution_with_budget(
-                type_uri,
-                type_key,
-                substitution,
-                &candidate.uri,
-                owner_key,
-                state,
-                cancel,
-                budget,
-            )?
-            else {
+            let member_substitution = self
+                .member_owner_substitution_with_budget(
+                    type_uri,
+                    type_key,
+                    substitution,
+                    &candidate.uri,
+                    owner_key,
+                    state,
+                    cancel,
+                    budget,
+                )?
+                .or_else(|| {
+                    self.candidate_is_helper_member(&candidate)
+                        .then(|| substitution.clone())
+                });
+            let Some(member_substitution) = member_substitution else {
                 continue;
             };
             let Some(document) = self.documents.get(&candidate.uri) else {
@@ -4040,6 +4081,484 @@ impl NavigationIndex {
         Ok(result)
     }
 
+    fn active_helper_for_type_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        target: &TypeInstance,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<HelperSelection, String> {
+        if !matches!(target.kind, TypeKind::Class | TypeKind::Record) {
+            return Ok(HelperSelection::None);
+        }
+
+        let region = current_document.region_at(offset);
+        let active_uses = current_document.active_uses_with_budget(region, cancel, budget)?;
+        let mut visible = Vec::new();
+        let mut unknown_ranks = Vec::new();
+        let mut seen = HashSet::new();
+
+        budget.require_work(current_document.helpers.len(), cancel)?;
+        for (index, helper) in current_document.helpers.iter().enumerate() {
+            if helper_visible_at(helper, true, region, offset) {
+                let identity = (current_uri.clone(), index);
+                if seen.insert(identity) {
+                    visible.push((
+                        current_uri.clone(),
+                        index,
+                        HelperRank {
+                            local: true,
+                            import_order: 0,
+                            declaration_order: helper.name_span.start,
+                        },
+                    ));
+                }
+            }
+        }
+
+        for (import_order, unit) in active_uses.into_iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            if current_document.unknown_imports.contains(unit.as_str()) {
+                unknown_ranks.push(HelperRank {
+                    local: false,
+                    import_order,
+                    declaration_order: usize::MAX,
+                });
+                continue;
+            }
+            for unit_uri in
+                self.unit_urls_for_import_with_budget(current_document, unit, cancel, budget)?
+            {
+                let Some(unit_document) = self.documents.get(&unit_uri) else {
+                    continue;
+                };
+                budget.require_work(unit_document.helpers.len(), cancel)?;
+                for (index, helper) in unit_document.helpers.iter().enumerate() {
+                    if !helper_visible_at(helper, false, region, offset) {
+                        continue;
+                    }
+                    let identity = (unit_uri.clone(), index);
+                    if seen.insert(identity) {
+                        visible.push((
+                            unit_uri.clone(),
+                            index,
+                            HelperRank {
+                                local: false,
+                                import_order,
+                                declaration_order: helper.name_span.start,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut matches = Vec::new();
+        for (helper_uri, helper_index, rank) in visible {
+            check_navigation_cancel(cancel)?;
+            let Some(helper_document) = self.documents.get(&helper_uri) else {
+                continue;
+            };
+            let Some(helper) = helper_document.helpers.get(helper_index) else {
+                continue;
+            };
+            if helper.kind != target.kind {
+                continue;
+            }
+            match self.helper_target_matches_with_budget(
+                &helper_uri,
+                helper_document,
+                helper,
+                target,
+                cancel,
+                budget,
+            )? {
+                HelperTargetMatch::No => {}
+                HelperTargetMatch::Yes => matches.push((rank, helper_uri, helper_index)),
+                HelperTargetMatch::Unknown if helper_target_may_match(helper, target) => {
+                    unknown_ranks.push(rank)
+                }
+                HelperTargetMatch::Unknown => {}
+            }
+        }
+
+        let Some(best_rank) = matches.iter().map(|(rank, _, _)| *rank).max() else {
+            return Ok(if unknown_ranks.is_empty() {
+                HelperSelection::None
+            } else {
+                HelperSelection::Unknown
+            });
+        };
+        if unknown_ranks.iter().any(|rank| *rank >= best_rank) {
+            return Ok(HelperSelection::Unknown);
+        }
+
+        let best = matches
+            .into_iter()
+            .filter(|(rank, _, _)| *rank == best_rank)
+            .collect::<Vec<_>>();
+        if best.len() != 1 {
+            return Ok(HelperSelection::Unknown);
+        }
+        let (_, uri, index) = best
+            .into_iter()
+            .next()
+            .expect("a non-empty best helper set");
+        Ok(HelperSelection::Selected { uri, index })
+    }
+
+    fn helper_target_matches_with_budget(
+        &self,
+        helper_uri: &Url,
+        helper_document: &Document,
+        helper: &HelperDefinition,
+        target: &TypeInstance,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<HelperTargetMatch, String> {
+        if helper.kind != target.kind {
+            return Ok(HelperTargetMatch::No);
+        }
+        let Some(resolved) = self.helper_target_instance_with_budget(
+            helper_uri,
+            helper_document,
+            helper,
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(HelperTargetMatch::Unknown);
+        };
+        Ok(
+            if target_instances_match_for_helper(
+                &resolved,
+                target,
+                helper.target.args.is_empty(),
+                helper_uri,
+                &helper.generic_parameters,
+            ) {
+                HelperTargetMatch::Yes
+            } else {
+                HelperTargetMatch::No
+            },
+        )
+    }
+
+    fn helper_target_instance_with_budget(
+        &self,
+        helper_uri: &Url,
+        helper_document: &Document,
+        helper: &HelperDefinition,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<TypeInstance>, String> {
+        let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+            helper_document.tree.root_node(),
+            helper.target.span.start,
+            cancel,
+            budget,
+            "class/record helper target",
+        )?
+        else {
+            return Ok(None);
+        };
+        let substitution =
+            symbolic_generic_substitution(helper_uri, &helper.generic_parameters, ROOT_SCOPE);
+        let mut state = ResolutionState::new();
+        let receivers = self.type_receivers_for_type_ref_with_budget(
+            helper_uri,
+            helper_document,
+            helper.target.span.start,
+            &helper.target,
+            lookup_identifier,
+            None,
+            &substitution,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if state.receiver_resolution_uncertain() {
+            return Ok(None);
+        }
+        Ok(unique_type_instance(receivers))
+    }
+
+    fn helper_target_for_owner_with_budget(
+        &self,
+        helper_uri: &Url,
+        helper_document: &Document,
+        owner_key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<TypeInstance>, String> {
+        let helpers = helper_document
+            .helpers
+            .iter()
+            .filter(|helper| helper.key == owner_key)
+            .collect::<Vec<_>>();
+        if helpers.len() != 1 {
+            return Ok(None);
+        }
+        self.helper_target_instance_with_budget(
+            helper_uri,
+            helper_document,
+            helpers[0],
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn helper_member_candidates_for_definition_with_budget(
+        &self,
+        current_uri: &Url,
+        helper_uri: &Url,
+        helper_index: usize,
+        member_key: Option<&str>,
+        allow_implementation: bool,
+        state: &mut AncestryResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<MemberLookup, String> {
+        let identity = (
+            helper_uri.clone(),
+            helper_index,
+            member_key.map(str::to_owned),
+            allow_implementation,
+        );
+        if !state.active_helpers.insert(identity.clone()) {
+            return Ok(MemberLookup::unknown(Vec::new()));
+        }
+
+        let result = (|| {
+            let Some(helper_document) = self.documents.get(helper_uri) else {
+                return Ok(MemberLookup::unknown(Vec::new()));
+            };
+            let Some(helper) = helper_document.helpers.get(helper_index) else {
+                return Ok(MemberLookup::unknown(Vec::new()));
+            };
+            let direct = self.direct_member_candidates_with_budget(
+                helper_uri,
+                &helper.key,
+                ROOT_SCOPE,
+                member_key,
+                allow_implementation && helper_uri == current_uri,
+                cancel,
+                budget,
+            )?;
+            let Some(parent) = helper.parent.as_ref() else {
+                return Ok(MemberLookup::known(direct));
+            };
+            let Some((parent_uri, parent_index)) = self.helper_parent_definition_with_budget(
+                helper_uri,
+                helper_document,
+                parent,
+                cancel,
+                budget,
+            )?
+            else {
+                return Ok(MemberLookup::unknown(Vec::new()));
+            };
+            let parent_lookup = self.helper_member_candidates_for_definition_with_budget(
+                current_uri,
+                &parent_uri,
+                parent_index,
+                member_key,
+                allow_implementation && parent_uri == *current_uri,
+                state,
+                cancel,
+                budget,
+            )?;
+            if !parent_lookup.ancestry_known {
+                return Ok(MemberLookup::unknown(Vec::new()));
+            }
+            Ok(self.merge_member_candidates(direct, vec![parent_lookup], member_key))
+        })();
+        state.active_helpers.remove(&identity);
+        result
+    }
+
+    fn helper_parent_definition_with_budget(
+        &self,
+        helper_uri: &Url,
+        helper_document: &Document,
+        parent: &TypeRef,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<(Url, usize)>, String> {
+        let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+            helper_document.tree.root_node(),
+            parent.span.start,
+            cancel,
+            budget,
+            "helper ancestry",
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut state = ResolutionState::new();
+        let receivers = self.type_receivers_for_type_ref_with_budget(
+            helper_uri,
+            helper_document,
+            parent.span.start,
+            parent,
+            lookup_identifier,
+            None,
+            &GenericSubstitution::empty(),
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if state.receiver_resolution_uncertain() || receivers.len() != 1 {
+            return Ok(None);
+        }
+        let Some(Receiver::Type(parent_instance)) = receivers.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(parent_document) = self.documents.get(&parent_instance.uri) else {
+            return Ok(None);
+        };
+        let matches = parent_document
+            .helpers
+            .iter()
+            .enumerate()
+            .filter(|(_, helper)| helper.key == parent_instance.key)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        (matches.len() == 1)
+            .then_some((parent_instance.uri, matches[0]))
+            .map_or_else(|| Ok(None), |parent| Ok(Some(parent)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn member_candidates_for_type_in_context_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        type_uri: &Url,
+        type_key: &str,
+        type_scope: usize,
+        substitution: &GenericSubstitution,
+        member_key: Option<&str>,
+        allow_implementation: bool,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<MemberLookup, String> {
+        let mut ancestry_state = AncestryResolutionState::new();
+        let ordinary = self.member_candidates_for_type_with_state_and_budget(
+            type_uri,
+            type_key,
+            type_scope,
+            member_key,
+            allow_implementation,
+            &mut ancestry_state,
+            cancel,
+            budget,
+        )?;
+        if !ordinary.ancestry_known {
+            return Ok(ordinary);
+        }
+        if current_document.offset_is_in_helper_declaration(offset) {
+            return Ok(ordinary);
+        }
+
+        let target = self.type_instance_for_key(type_uri, type_key, type_scope, substitution);
+        let helper = match self.active_helper_for_type_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            &target,
+            cancel,
+            budget,
+        )? {
+            HelperSelection::None => MemberLookup::known(Vec::new()),
+            HelperSelection::Unknown => MemberLookup::unknown(Vec::new()),
+            HelperSelection::Selected { uri, index } => self
+                .helper_member_candidates_for_definition_with_budget(
+                    current_uri,
+                    &uri,
+                    index,
+                    member_key,
+                    allow_implementation,
+                    &mut ancestry_state,
+                    cancel,
+                    budget,
+                )?,
+        };
+        if !helper.ancestry_known {
+            return Ok(MemberLookup::unknown(ordinary.candidates));
+        }
+
+        if member_key.is_some() {
+            return Ok(if ordinary.candidates.is_empty() {
+                helper
+            } else {
+                ordinary
+            });
+        }
+
+        let ordinary_keys = ordinary
+            .candidates
+            .iter()
+            .filter_map(|candidate| self.symbol(candidate).map(|symbol| symbol.key.clone()))
+            .collect::<HashSet<_>>();
+        let mut candidates = ordinary.candidates;
+        for candidate in helper.candidates {
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            if !ordinary_keys.contains(&symbol.key) {
+                candidates.push(candidate);
+            }
+        }
+        let mut ambiguous_names = ordinary.ambiguous_names;
+        for name in helper.ambiguous_names {
+            if !ordinary_keys.contains(&name) {
+                ambiguous_names.insert(name);
+            }
+        }
+        if ambiguous_names.is_empty() {
+            Ok(MemberLookup::known(candidates))
+        } else {
+            Ok(MemberLookup::ambiguous(candidates, ambiguous_names))
+        }
+    }
+
+    fn type_instance_for_key(
+        &self,
+        uri: &Url,
+        key: &str,
+        scope: usize,
+        substitution: &GenericSubstitution,
+    ) -> TypeInstance {
+        let mut instance = TypeInstance {
+            uri: uri.clone(),
+            key: key.to_owned(),
+            kind: self.type_kind(uri, key).unwrap_or(TypeKind::Other),
+            scope,
+            parameter_names: Vec::new(),
+            substitution: substitution.clone(),
+        };
+        if let Some(document) = self.documents.get(uri) {
+            if let Some(indices) = document.type_symbol_indices.get(key) {
+                if indices.len() == 1 {
+                    if let Some(symbol) = document.symbols.get(indices[0]) {
+                        instance.parameter_names = symbol
+                            .generic_parameters
+                            .iter()
+                            .map(|parameter| parameter.name.clone())
+                            .collect();
+                        instance.kind = symbol.type_kind;
+                    }
+                }
+            }
+        }
+        instance
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn member_type_receivers(
         &self,
@@ -4065,13 +4584,23 @@ impl NavigationIndex {
         if !state.active_members.insert(resolution_key.clone()) {
             return Vec::new();
         }
-        let candidates = self.member_references_for_type(
+        let lookup = self.member_references_for_type_in_context(
+            current_uri,
+            current_document,
+            offset,
             type_uri,
             type_key,
             type_scope,
+            substitution,
             &member_key,
             allow_implementation,
         );
+        if !lookup.ancestry_known {
+            state.mark_receiver_uncertain();
+            state.active_members.remove(&resolution_key);
+            return Vec::new();
+        }
+        let candidates = lookup.candidates;
         if candidates
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -4134,14 +4663,20 @@ impl NavigationIndex {
                 continue;
             }
             let owner_key = symbol.owner_type.as_deref().unwrap_or(type_key);
-            let Some(member_substitution) = self.member_owner_substitution(
-                type_uri,
-                type_key,
-                substitution,
-                &candidate.uri,
-                owner_key,
-                state,
-            ) else {
+            let member_substitution = self
+                .member_owner_substitution(
+                    type_uri,
+                    type_key,
+                    substitution,
+                    &candidate.uri,
+                    owner_key,
+                    state,
+                )
+                .or_else(|| {
+                    self.candidate_is_helper_member(&candidate)
+                        .then(|| substitution.clone())
+                });
+            let Some(member_substitution) = member_substitution else {
                 continue;
             };
             let Some(document) = self.documents.get(&candidate.uri) else {
@@ -4160,26 +4695,72 @@ impl NavigationIndex {
         result
     }
 
-    fn member_references_for_type(
+    #[allow(clippy::too_many_arguments)]
+    fn member_references_for_type_in_context(
         &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
         type_uri: &Url,
         type_key: &str,
         type_scope: usize,
+        substitution: &GenericSubstitution,
         member_key: &str,
         allow_implementation: bool,
-    ) -> Vec<Candidate> {
-        let mut state = AncestryResolutionState::new();
-        self.member_candidates_for_type_with_state(
+    ) -> MemberLookup {
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            MAX_NAVIGATION_OVERLOAD_WORK,
+            MAX_NAVIGATION_OVERLOAD_BYTES,
+            "contextual member lookup",
+        );
+        self.member_references_for_type_in_context_with_budget(
+            current_uri,
+            current_document,
+            offset,
             type_uri,
             type_key,
             type_scope,
-            Some(member_key),
+            substitution,
+            member_key,
             allow_implementation,
-            &mut state,
+            &cancel,
+            &mut budget,
         )
-        .candidates
+        .unwrap_or_else(|_| MemberLookup::unknown(Vec::new()))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn member_references_for_type_in_context_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        type_uri: &Url,
+        type_key: &str,
+        type_scope: usize,
+        substitution: &GenericSubstitution,
+        member_key: &str,
+        allow_implementation: bool,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<MemberLookup, String> {
+        self.member_candidates_for_type_in_context_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            type_uri,
+            type_key,
+            type_scope,
+            substitution,
+            Some(member_key),
+            allow_implementation,
+            cancel,
+            budget,
+        )
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn member_references_for_type_with_budget(
         &self,
@@ -4206,8 +4787,12 @@ impl NavigationIndex {
             .candidates)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn member_candidates_for_completion_with_budget(
         &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
         type_uri: &Url,
         type_key: &str,
         type_scope: usize,
@@ -4215,19 +4800,22 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<MemberLookup, String> {
-        let mut state = AncestryResolutionState::new();
-        self.member_candidates_for_type_with_state_and_budget(
+        self.member_candidates_for_type_in_context_with_budget(
+            current_uri,
+            current_document,
+            offset,
             type_uri,
             type_key,
             type_scope,
+            &GenericSubstitution::empty(),
             None,
             allow_implementation,
-            &mut state,
             cancel,
             budget,
         )
     }
 
+    #[cfg(test)]
     fn member_candidates_for_type_with_state(
         &self,
         type_uri: &Url,
@@ -5085,6 +5673,31 @@ impl NavigationIndex {
             .and_then(|document| document.symbols.get(candidate.index))
     }
 
+    fn candidate_is_helper_member(&self, candidate: &Candidate) -> bool {
+        let Some(symbol) = self.symbol(candidate) else {
+            return false;
+        };
+        let Some(owner_type) = symbol.owner_type.as_deref() else {
+            return false;
+        };
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return false;
+        };
+        if document
+            .type_symbol_indices
+            .get(owner_type)
+            .is_none_or(|indices| indices.len() != 1)
+        {
+            return false;
+        }
+        document
+            .helpers
+            .iter()
+            .filter(|helper| helper.key == owner_type)
+            .count()
+            == 1
+    }
+
     fn type_kind(&self, uri: &Url, key: &str) -> Option<TypeKind> {
         let document = self.documents.get(uri)?;
         let indices = document.type_symbol_indices.get(key)?;
@@ -5649,6 +6262,39 @@ struct TypeAncestry {
     parents: Vec<ParentType>,
 }
 
+#[derive(Debug, Clone)]
+struct HelperDefinition {
+    key: String,
+    name_span: Span,
+    declaration_span: Span,
+    kind: TypeKind,
+    generic_parameters: Vec<GenericParameter>,
+    target: TypeRef,
+    parent: Option<TypeRef>,
+    region: Region,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperTargetMatch {
+    No,
+    Yes,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelperSelection {
+    None,
+    Selected { uri: Url, index: usize },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct HelperRank {
+    local: bool,
+    import_order: usize,
+    declaration_order: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AncestryStatus {
     Complete,
@@ -5700,6 +6346,7 @@ struct AncestryResolutionState {
     resolved_types: HashMap<(Url, String), TypeAncestryResolution>,
     active_members: HashSet<(Url, String, usize, Option<String>, bool)>,
     resolved_members: HashMap<(Url, String, usize, Option<String>, bool), MemberLookup>,
+    active_helpers: HashSet<(Url, usize, Option<String>, bool)>,
 }
 
 impl AncestryResolutionState {
@@ -5710,6 +6357,7 @@ impl AncestryResolutionState {
             resolved_types: HashMap::new(),
             active_members: HashSet::new(),
             resolved_members: HashMap::new(),
+            active_helpers: HashSet::new(),
         }
     }
 
@@ -5742,6 +6390,28 @@ fn type_instance_from_symbol(candidate: &Candidate, symbol: &Symbol) -> TypeInst
             .collect(),
         substitution: GenericSubstitution::empty(),
     }
+}
+
+fn symbolic_generic_substitution(
+    uri: &Url,
+    parameters: &[GenericParameter],
+    scope: usize,
+) -> GenericSubstitution {
+    let mut substitution = GenericSubstitution::empty();
+    for parameter in parameters {
+        substitution.insert(
+            &parameter.name,
+            ResolvedType::Named(TypeInstance {
+                uri: uri.clone(),
+                key: parameter.name.clone(),
+                kind: TypeKind::Other,
+                scope,
+                parameter_names: Vec::new(),
+                substitution: GenericSubstitution::empty(),
+            }),
+        );
+    }
+    substitution
 }
 
 fn type_identity_from_resolved_type(resolved: &ResolvedType) -> Option<TypeIdentity> {
@@ -5902,6 +6572,7 @@ struct Document {
     routine_symbol_indices_by_body_scope: HashMap<usize, Vec<usize>>,
     exported_symbol_indices: Vec<usize>,
     interface_member_routine_keys: HashMap<String, HashSet<String>>,
+    helpers: Vec<HelperDefinition>,
 }
 
 impl Document {
@@ -5990,10 +6661,10 @@ impl Document {
                 Region::Other => implementation_uses.push(name),
             }
         }
-        interface_uses.sort();
-        interface_uses.dedup();
-        implementation_uses.sort();
-        implementation_uses.dedup();
+        let mut seen_interface_uses = HashSet::new();
+        interface_uses.retain(|name| seen_interface_uses.insert(name.clone()));
+        let mut seen_implementation_uses = HashSet::new();
+        implementation_uses.retain(|name| seen_implementation_uses.insert(name.clone()));
         let unknown_imports = imports
             .iter()
             .filter(|import| {
@@ -6059,6 +6730,7 @@ impl Document {
         inherit_member_routine_visibility(&mut symbols);
         let conditional_unknown_symbols =
             conditional_unknown_symbols(root, &conditionals, &symbols);
+        let helpers = collect_helpers(root, &source);
         let type_ancestry = collect_type_ancestry(root, &source);
         let unknown_class_owners = symbols
             .iter()
@@ -6217,6 +6889,7 @@ impl Document {
             routine_symbol_indices_by_body_scope,
             exported_symbol_indices,
             interface_member_routine_keys,
+            helpers,
         })
     }
 
@@ -6234,6 +6907,12 @@ impl Document {
         } else {
             Region::Other
         }
+    }
+
+    fn offset_is_in_helper_declaration(&self, offset: usize) -> bool {
+        self.helpers
+            .iter()
+            .any(|helper| helper.declaration_span.contains_offset(offset))
     }
 
     fn active_uses(&self, region: Region) -> Vec<&String> {
@@ -7201,6 +7880,7 @@ fn type_kind_for_declaration(node: Node<'_>) -> TypeKind {
             "declIntf" => return TypeKind::Interface,
             "declEnum" => return TypeKind::Enum,
             "declRecord" => return TypeKind::Record,
+            "declHelper" => return helper_kind(current),
             "declArray" | "kArray" | "declSet" => return TypeKind::Array,
             "declProcRef" | "kProcedure" | "kFunction" => return TypeKind::Callable,
             "declString" | "kString" => return TypeKind::String,
@@ -7225,6 +7905,263 @@ fn type_kind_for_declaration(node: Node<'_>) -> TypeKind {
         }
     }
     TypeKind::Other
+}
+
+fn helper_kind(node: Node<'_>) -> TypeKind {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| match child.kind() {
+            "kClass" => Some(TypeKind::Class),
+            "kRecord" => Some(TypeKind::Record),
+            "kType" => Some(TypeKind::Other),
+            _ => None,
+        })
+        .unwrap_or(TypeKind::Other)
+}
+
+fn is_type_reference_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "type" | "typeref" | "typerefDot" | "typerefTpl" | "typerefPtr" | "typerefArgs"
+    )
+}
+
+fn helper_target_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
+    let for_end = {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "kFor")
+            .map(|child| child.end_byte())?
+    };
+    let mut candidates = Vec::new();
+    collect_nodes(node, &mut |child| {
+        if child.start_byte() >= for_end
+            && is_type_reference_node(child)
+            && type_ref_from_node(child, source).is_some()
+        {
+            candidates.push(child);
+        }
+    });
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.start_byte(),
+            std::cmp::Reverse(candidate.end_byte().saturating_sub(candidate.start_byte())),
+        )
+    });
+    candidates.into_iter().next()
+}
+
+fn helper_parent_node<'a>(node: Node<'a>, for_start: usize, source: &str) -> Option<Node<'a>> {
+    let mut candidates = Vec::new();
+    collect_nodes(node, &mut |child| {
+        if child.end_byte() <= for_start
+            && is_type_reference_node(child)
+            && type_ref_from_node(child, source).is_some()
+        {
+            candidates.push(child);
+        }
+    });
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.start_byte(),
+            std::cmp::Reverse(candidate.end_byte().saturating_sub(candidate.start_byte())),
+        )
+    });
+    candidates.into_iter().next()
+}
+
+fn collect_helpers(root: Node<'_>, source: &str) -> Vec<HelperDefinition> {
+    let mut helpers = Vec::new();
+    for declaration in collect_nodes_matching(root, "declType") {
+        if enclosing_type(declaration, source).is_some() {
+            continue;
+        }
+        let Some(type_node) = declaration.child_by_field_name("type") else {
+            continue;
+        };
+        let Some(helper_node) = ({
+            let mut found = None;
+            collect_nodes(type_node, &mut |child| {
+                if found.is_none() && child.kind() == "declHelper" {
+                    found = Some(child);
+                }
+            });
+            found
+        }) else {
+            continue;
+        };
+        let kind = helper_kind(helper_node);
+        if !matches!(kind, TypeKind::Class | TypeKind::Record) {
+            continue;
+        }
+        let Some(name) = declaration_name_identifiers(declaration).last().copied() else {
+            continue;
+        };
+        let Some(target_node) = helper_target_node(helper_node, source) else {
+            continue;
+        };
+        let Some(target) = type_ref_from_node(target_node, source) else {
+            continue;
+        };
+        let generic_parameters = generic_parameters_for_node(declaration, source);
+        let parent = {
+            let for_start = {
+                let mut cursor = helper_node.walk();
+                helper_node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "kFor")
+                    .map(|child| child.start_byte())
+            };
+            for_start
+                .and_then(|for_start| helper_parent_node(helper_node, for_start, source))
+                .and_then(|parent| type_ref_from_node(parent, source))
+        };
+        helpers.push(HelperDefinition {
+            key: canonical_name(&node_text(name, source)),
+            name_span: Span::from_node(name),
+            declaration_span: Span::from_node(declaration),
+            kind,
+            generic_parameters,
+            target,
+            parent,
+            region: region_for_node(declaration),
+        });
+    }
+    helpers.sort_by_key(|helper| helper.declaration_span.start);
+    helpers
+}
+
+fn helper_visible_at(
+    helper: &HelperDefinition,
+    local: bool,
+    region: Region,
+    offset: usize,
+) -> bool {
+    if helper.declaration_span.start > offset {
+        return false;
+    }
+    if local {
+        helper.region == Region::Interface
+            || (helper.region == Region::Implementation
+                && matches!(region, Region::Implementation | Region::Other))
+    } else {
+        helper.region == Region::Interface
+    }
+}
+
+fn helper_target_may_match(helper: &HelperDefinition, target: &TypeInstance) -> bool {
+    helper
+        .target
+        .path
+        .last()
+        .is_some_and(|name| canonical_name(name) == target.key)
+}
+
+fn target_instances_match_for_helper(
+    resolved: &TypeInstance,
+    target: &TypeInstance,
+    unspecialized_target: bool,
+    helper_uri: &Url,
+    generic_parameters: &[GenericParameter],
+) -> bool {
+    if resolved.uri != target.uri || resolved.key != target.key || resolved.kind != target.kind {
+        return false;
+    }
+    if generic_parameters.is_empty() {
+        return target_instances_match(resolved, target, unspecialized_target);
+    }
+    if unspecialized_target {
+        return true;
+    }
+    if resolved.parameter_names != target.parameter_names {
+        return false;
+    }
+
+    let mut bindings = GenericSubstitution::empty();
+    resolved.parameter_names.iter().all(|name| {
+        match (
+            resolved.substitution.get(name),
+            target.substitution.get(name),
+        ) {
+            (Some(pattern), Some(actual)) => helper_type_pattern_matches(
+                pattern,
+                actual,
+                helper_uri,
+                generic_parameters,
+                &mut bindings,
+            ),
+            (None, None) => true,
+            _ => false,
+        }
+    })
+}
+
+fn helper_type_pattern_matches(
+    pattern: &ResolvedType,
+    actual: &ResolvedType,
+    helper_uri: &Url,
+    generic_parameters: &[GenericParameter],
+    bindings: &mut GenericSubstitution,
+) -> bool {
+    if let ResolvedType::Named(instance) = pattern {
+        if instance.uri == *helper_uri
+            && instance.kind == TypeKind::Other
+            && instance.parameter_names.is_empty()
+            && instance.substitution.0.is_empty()
+            && generic_parameters
+                .iter()
+                .any(|parameter| parameter.name == instance.key)
+        {
+            return match bindings.get(&instance.key) {
+                Some(bound) => bound == actual,
+                None => {
+                    bindings.insert(&instance.key, actual.clone());
+                    true
+                }
+            };
+        }
+    }
+
+    match (pattern, actual) {
+        (ResolvedType::Builtin(pattern), ResolvedType::Builtin(actual)) => pattern == actual,
+        (ResolvedType::IntegerLiteral(pattern), ResolvedType::IntegerLiteral(actual)) => {
+            pattern == actual
+        }
+        (ResolvedType::Named(pattern), ResolvedType::Named(actual)) => {
+            pattern.uri == actual.uri
+                && pattern.key == actual.key
+                && pattern.kind == actual.kind
+                && pattern.parameter_names == actual.parameter_names
+                && pattern.parameter_names.iter().all(|name| {
+                    match (
+                        pattern.substitution.get(name),
+                        actual.substitution.get(name),
+                    ) {
+                        (Some(pattern), Some(actual)) => helper_type_pattern_matches(
+                            pattern,
+                            actual,
+                            helper_uri,
+                            generic_parameters,
+                            bindings,
+                        ),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                })
+        }
+        _ => false,
+    }
+}
+
+fn target_instances_match(
+    resolved: &TypeInstance,
+    target: &TypeInstance,
+    unspecialized_target: bool,
+) -> bool {
+    resolved.uri == target.uri
+        && resolved.key == target.key
+        && resolved.kind == target.kind
+        && (unspecialized_target || resolved.substitution == target.substitution)
 }
 
 fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<TypeAncestry>> {

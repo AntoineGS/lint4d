@@ -1088,6 +1088,24 @@ impl NavigationIndex {
         offset: usize,
         dot: Node<'_>,
     ) -> bool {
+        if binding.members.iter().any(|member| {
+            self.documents
+                .get(&member.uri)
+                .and_then(|document| {
+                    document
+                        .symbols
+                        .iter()
+                        .enumerate()
+                        .find(|(_, symbol)| symbol_id(&member.uri, symbol) == *member)
+                        .map(|(index, _)| Candidate {
+                            uri: member.uri.clone(),
+                            index,
+                        })
+                })
+                .is_some_and(|candidate| self.candidate_is_helper_member(&candidate))
+        }) {
+            return false;
+        }
         let Some(lhs) = dot.child_by_field_name("lhs") else {
             return true;
         };

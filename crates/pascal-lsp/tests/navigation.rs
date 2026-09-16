@@ -70,6 +70,567 @@ fn assert_location_start(location: &Location, expected_uri: &Url, expected: Posi
     assert_eq!(location.range.start, expected);
 }
 
+#[test]
+fn class_helper_members_navigate_from_the_helped_class() {
+    let source = r#"unit ClassHelperNavigation;
+interface
+type
+  TWidget = class
+  end;
+  TWidgetHelper = class helper for TWidget
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TWidgetHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("ClassHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("class helper source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Touch", 2),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Touch", 0));
+}
+
+#[test]
+fn class_helper_inheritance_exposes_parent_helper_members() {
+    let source = r#"unit ClassHelperInheritance;
+interface
+type
+  TWidget = class
+  end;
+  TBaseWidgetHelper = class helper for TWidget
+    procedure Base;
+  end;
+  TDerivedWidgetHelper = class helper (TBaseWidgetHelper) for TWidget
+    procedure Derived;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBaseWidgetHelper.Base;
+begin
+end;
+
+procedure TDerivedWidgetHelper.Derived;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Base;
+  Widget.Derived;
+end;
+
+end.
+"#;
+    let source_uri = uri("ClassHelperInheritance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("class helper inheritance source parses");
+
+    let base = index.navigate(
+        &source_uri,
+        position_of(source, "Base;", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(base.len(), 1);
+    assert_location_start(&base[0], &source_uri, position_of(source, "Base;", 0));
+
+    let derived = index.navigate(
+        &source_uri,
+        position_of(source, "Derived;", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(derived.len(), 1);
+    assert_location_start(&derived[0], &source_uri, position_of(source, "Derived;", 0));
+}
+
+#[test]
+fn record_helper_members_navigate_from_the_helped_record() {
+    let source = r#"unit RecordHelperNavigation;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TPointHelper.Offset;
+begin
+end;
+
+procedure Run;
+var
+  Point: TPoint;
+begin
+  Point.Offset;
+end;
+
+end.
+"#;
+    let source_uri = uri("RecordHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("record helper source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Offset", 2),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Offset", 0));
+}
+
+#[test]
+fn helper_self_uses_the_helped_type_and_helper_members() {
+    let source = r#"unit HelperSelfNavigation;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset;
+  end;
+
+implementation
+
+procedure TPointHelper.Offset;
+begin
+  Self.X := 1;
+  Self.Offset;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperSelfNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper self source parses");
+
+    let field = index.navigate(
+        &source_uri,
+        position_of(source, "X", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(field.len(), 1);
+    assert_location_start(&field[0], &source_uri, position_of(source, "X", 0));
+
+    let method = index.navigate(
+        &source_uri,
+        position_of(source, "Offset", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(method.len(), 1);
+    assert_location_start(&method[0], &source_uri, position_of(source, "Offset", 0));
+}
+
+#[test]
+fn helper_members_feed_completion_hover_and_signature_help() {
+    let source = r#"unit HelperAssistance;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+  TPointHelper = record helper for TPoint
+    procedure Offset(Value: Integer);
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TPointHelper.Offset(Value: Integer);
+begin
+end;
+
+procedure Run;
+var
+  Point: TPoint;
+begin
+  Point.Offset(1);
+  Point.
+  Point.Offset(1);
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper assistance source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Point.", 1))
+        .expect("helper completion");
+    let labels = completion
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        labels.contains(&"Offset"),
+        "helper member missing: {labels:?}"
+    );
+
+    assert!(
+        index
+            .hover(&source_uri, position_of(source, "Offset", 2))
+            .is_some(),
+        "helper member hover should resolve"
+    );
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "Point.Offset(1", 0))
+        .expect("helper signature help")
+        .expect("helper method signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert!(signature.signatures[0].label.contains("Offset"));
+}
+
+#[test]
+fn helper_method_results_feed_nested_member_navigation() {
+    let source = r#"unit HelperResultNavigation;
+interface
+type
+  TChild = class
+    procedure Run;
+  end;
+  TWidget = class
+  end;
+  TWidgetHelper = class helper for TWidget
+    function Child: TChild;
+  end;
+
+implementation
+
+procedure TChild.Run;
+begin
+end;
+
+function TWidgetHelper.Child: TChild;
+begin
+end;
+
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Widget.Child().Run;
+end;
+
+end.
+"#;
+    let source_uri = uri("HelperResultNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("helper result source parses");
+
+    let child = index.navigate(
+        &source_uri,
+        position_of(source, "Child", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child.len(), 1);
+    assert_location_start(&child[0], &source_uri, position_of(source, "TChild", 0));
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Run", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Run", 0));
+
+    let child_type = index.type_definitions(&source_uri, position_of(source, "Child", 5));
+    assert_eq!(child_type.len(), 1);
+    assert_location_start(
+        &child_type[0],
+        &source_uri,
+        position_of(source, "TChild", 0),
+    );
+}
+
+#[test]
+fn specialized_generic_helper_targets_match_specialized_receivers() {
+    let source = r#"unit GenericHelperNavigation;
+interface
+type
+  TBox<T> = class
+  end;
+  TBoxHelper = class helper for TBox<Integer>
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBoxHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Box: TBox<Integer>;
+begin
+  Box.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("GenericHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic helper source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Touch", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Touch", 0));
+}
+
+#[test]
+fn generic_helpers_match_their_generic_target_specialization() {
+    let source = r#"unit GenericHelperNavigation;
+interface
+type
+  TBox<T> = class
+  end;
+  TBoxHelper<T> = class helper for TBox<T>
+    procedure Touch;
+  end;
+
+procedure Run;
+
+implementation
+
+procedure TBoxHelper<T>.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Box: TBox<Integer>;
+begin
+  Box.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("GenericHelperNavigation");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic helper specialization source parses");
+
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "Touch", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1);
+    assert_location_start(&locations[0], &source_uri, position_of(source, "Touch", 0));
+}
+
+#[test]
+fn imported_helpers_use_only_the_last_helper_in_uses_order() {
+    let provider = r#"unit HelperTarget;
+interface
+type
+  TWidget = class
+  end;
+implementation
+end.
+"#;
+    let first_helper = r#"unit FirstWidgetHelper;
+interface
+uses HelperTarget;
+type
+  TFirstWidgetHelper = class helper for TWidget
+    procedure Shared;
+    procedure FirstOnly;
+  end;
+implementation
+procedure TFirstWidgetHelper.Shared;
+begin
+end;
+procedure TFirstWidgetHelper.FirstOnly;
+begin
+end;
+end.
+"#;
+    let second_helper = r#"unit SecondWidgetHelper;
+interface
+uses HelperTarget;
+type
+  TSecondWidgetHelper = class helper for TWidget
+    procedure Shared;
+    procedure SecondOnly;
+  end;
+implementation
+procedure TSecondWidgetHelper.Shared;
+begin
+end;
+procedure TSecondWidgetHelper.SecondOnly;
+begin
+end;
+end.
+"#;
+    let consumer = r#"unit HelperConsumer;
+interface
+uses HelperTarget, FirstWidgetHelper, SecondWidgetHelper;
+procedure Run;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Shared;
+  Widget.FirstOnly;
+  Widget.SecondOnly;
+end;
+end.
+"#;
+    let reverse_consumer = r#"unit ReverseHelperConsumer;
+interface
+uses HelperTarget, SecondWidgetHelper, FirstWidgetHelper;
+procedure Run;
+implementation
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Shared;
+  Widget.FirstOnly;
+  Widget.SecondOnly;
+end;
+end.
+"#;
+
+    let provider_uri = uri("HelperTarget");
+    let first_uri = uri("FirstWidgetHelper");
+    let second_uri = uri("SecondWidgetHelper");
+    let consumer_uri = uri("HelperConsumer");
+    let reverse_uri = uri("ReverseHelperConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri, provider.to_owned())
+        .expect("helper target parses");
+    index
+        .update(first_uri.clone(), first_helper.to_owned())
+        .expect("first helper parses");
+    index
+        .update(second_uri.clone(), second_helper.to_owned())
+        .expect("second helper parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("helper consumer parses");
+    index
+        .update(reverse_uri.clone(), reverse_consumer.to_owned())
+        .expect("reverse helper consumer parses");
+
+    let shared = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Shared", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(shared.len(), 1);
+    assert_location_start(
+        &shared[0],
+        &second_uri,
+        position_of(second_helper, "Shared", 0),
+    );
+    assert!(
+        index
+            .navigate(
+                &consumer_uri,
+                position_of(consumer, "FirstOnly", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "an inactive helper must not leak its unique member"
+    );
+    let second_only = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "SecondOnly", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(second_only.len(), 1);
+    assert_location_start(
+        &second_only[0],
+        &second_uri,
+        position_of(second_helper, "SecondOnly", 0),
+    );
+
+    let reverse_shared = index.navigate(
+        &reverse_uri,
+        position_of(reverse_consumer, "Shared", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(reverse_shared.len(), 1);
+    assert_location_start(
+        &reverse_shared[0],
+        &first_uri,
+        position_of(first_helper, "Shared", 0),
+    );
+    assert!(
+        index
+            .navigate(
+                &reverse_uri,
+                position_of(reverse_consumer, "SecondOnly", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "reversing uses order must switch the active helper"
+    );
+}
+
 const PROVIDER: &str = r#"unit Provider;
 interface
 
@@ -3782,6 +4343,54 @@ end.
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>(),
         ["Member"]
+    );
+}
+
+#[test]
+fn unknown_conditional_helpers_do_not_yield_a_unique_member() {
+    let source = r#"unit UnknownConditionalHelper;
+interface
+type
+  TWidget = class
+  end;
+{$IF CompilerVersion >= 24}
+  TWidgetHelper = class helper for TWidget
+    procedure Touch;
+  end;
+{$ENDIF}
+
+procedure Run;
+
+implementation
+
+procedure TWidgetHelper.Touch;
+begin
+end;
+
+procedure Run;
+var
+  Widget: TWidget;
+begin
+  Widget.Touch;
+end;
+
+end.
+"#;
+    let source_uri = uri("UnknownConditionalHelper");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown conditional helper source parses");
+
+    assert!(
+        index
+            .navigate(
+                &source_uri,
+                position_of(source, "Touch", 2),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "an unknown conditional helper must not produce a unique member"
     );
 }
 

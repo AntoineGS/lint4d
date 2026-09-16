@@ -536,7 +536,12 @@ Implemented and covered by tests:
 - Routine and class-method declaration/implementation pairing, including unique
   abbreviated implementation headers.
 - Qualified unit/type names, namespaced units, straightforward declared-type
-  member access, and `Self` members.
+  member access, class/record helper members, parent-helper members, and
+  `Self` members.
+- Class and record helpers are selected using lexical visibility and ordered
+  `uses` clauses. Helper members feed navigation, completion, hover, signature
+  help, type definitions, and safe binding-based rename; unresolved or
+  ambiguous helper targets fail closed.
 - Source-based `textDocument/typeDefinition` for named variable, parameter,
   field, property, and type declarations, including bounded aliases and
   selected-project unit bindings.
@@ -561,7 +566,7 @@ Implemented and covered by tests:
 
 Not implemented or incomplete:
 
-- `with` resolution and helpers.
+- `with` resolution.
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
 - Full compiler-equivalent conditional evaluation and include-file expansion.

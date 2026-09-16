@@ -95,6 +95,15 @@ neither lower-priority class can starve. Queue overflow returns an explicit
 request`; the server does not capture source snapshots until a job is
 dispatched.
 
+Client request recipients have a separate total bound of 33 outstanding
+request IDs across running jobs, queued jobs, and coalesced attachments. Every
+coalesced client request consumes one recipient slot, even when it asks for
+the same computation as another request; reaching this limit returns the same
+explicit overflow response rather than attaching an unbounded number of
+clients. Cancelling a client request releases its recipient slot immediately,
+while the shared computation may remain queued or running for its other
+recipients.
+
 Diagnostics stay debounced and coalesced per document; if both worker slots are
 occupied, the diagnostic request is retried rather than spawning an unbounded
 worker. Identical observational requests share a computation only when their

@@ -47,6 +47,10 @@ const MAX_ANALYSIS_JOBS: usize = 2;
 const MAX_ANALYSIS_QUEUE: usize = 32;
 // Keep one queue slot available for diagnostics while client work is busy.
 const MAX_CLIENT_ANALYSIS_QUEUE: usize = MAX_ANALYSIS_QUEUE.saturating_sub(1);
+/// Maximum number of client request recipients retained across running and
+/// queued computations, including coalesced requests attached to one
+/// computation.
+const MAX_CLIENT_ANALYSIS_RECIPIENTS: usize = MAX_ANALYSIS_JOBS + MAX_CLIENT_ANALYSIS_QUEUE;
 const MAX_INTERACTIVE_BURST: usize = 3;
 const MAX_DIAGNOSTIC_BURST: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -128,6 +132,13 @@ impl<T> PriorityQueue<T> {
 
     fn is_empty(&self) -> bool {
         self.interactive.is_empty() && self.diagnostics.is_empty() && self.bulk.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.interactive
+            .iter()
+            .chain(self.diagnostics.iter())
+            .chain(self.bulk.iter())
     }
 
     fn pop(&mut self) -> Option<T> {
@@ -490,10 +501,13 @@ impl DiagnosticNotificationEffect {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AnalysisComputationId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AnalysisJobId {
-    Client(RequestId),
-    Diagnostic(u64),
+    Client(AnalysisComputationId),
+    Diagnostic(AnalysisComputationId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -676,7 +690,7 @@ impl ObservationKey {
 
 #[derive(Debug)]
 struct QueuedClientAnalysis {
-    id: RequestId,
+    id: AnalysisComputationId,
     request: AnalysisRequest,
     features: ClientFeatures,
     client_ids: Vec<RequestId>,
@@ -685,7 +699,7 @@ struct QueuedClientAnalysis {
 
 #[derive(Debug)]
 struct QueuedDiagnostic {
-    id: u64,
+    id: AnalysisComputationId,
     uri: Url,
 }
 
@@ -821,14 +835,14 @@ impl FileWatcherRegistration {
 struct AnalysisJobs {
     sender: Sender<AnalysisResult>,
     receiver: Receiver<AnalysisResult>,
-    pending: std::collections::HashMap<RequestId, PendingAnalysis>,
-    diagnostics: HashMap<u64, PendingDiagnostic>,
+    pending: std::collections::HashMap<AnalysisComputationId, PendingAnalysis>,
+    diagnostics: HashMap<AnalysisComputationId, PendingDiagnostic>,
     queue: PriorityQueue<QueuedAnalysis>,
-    request_to_job: HashMap<RequestId, RequestId>,
-    observation_jobs: HashMap<ObservationKey, RequestId>,
-    diagnostic_jobs: HashMap<Url, u64>,
+    request_to_job: HashMap<RequestId, AnalysisComputationId>,
+    observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
+    diagnostic_jobs: HashMap<Url, AnalysisComputationId>,
     test_barriers: TestBarrierConfig,
-    next_internal_id: u64,
+    next_computation_id: u64,
     shutting_down: bool,
 }
 
@@ -850,7 +864,7 @@ impl AnalysisJobs {
             observation_jobs: HashMap::new(),
             diagnostic_jobs: HashMap::new(),
             test_barriers,
-            next_internal_id: 0,
+            next_computation_id: 0,
             shutting_down: false,
         }
     }
@@ -869,8 +883,8 @@ impl AnalysisJobs {
         let worker_cancellation = Arc::clone(&cancellation);
         let test_barriers = self.test_barriers.clone();
         let sender = self.sender.clone();
-        let worker_id = id.clone();
-        let panic_id = id.clone();
+        let worker_id = id;
+        let panic_id = id;
         let panic_value = match &request {
             AnalysisRequest::Hover { .. } => AnalysisResultValue::Hover(Err(
                 "analysis worker failed without changing workspace state".to_string(),
@@ -955,7 +969,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -970,7 +984,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -985,7 +999,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1003,7 +1017,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             ) {
                                 AnalysisResult {
-                                    id: worker_id.clone(),
+                                    id: worker_id,
                                     source_generation,
                                     configuration_generation,
                                     records: Vec::new(),
@@ -1025,7 +1039,7 @@ impl AnalysisJobs {
                                     Err(error) => (Err(error), None),
                                 };
                                 AnalysisResult {
-                                    id: worker_id.clone(),
+                                    id: worker_id,
                                     source_generation: computed.source_generation,
                                     configuration_generation: computed.configuration_generation,
                                     records: computed.records,
@@ -1043,7 +1057,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             ) {
                                 AnalysisResult {
-                                    id: worker_id.clone(),
+                                    id: worker_id,
                                     source_generation,
                                     configuration_generation,
                                     records: Vec::new(),
@@ -1056,7 +1070,7 @@ impl AnalysisJobs {
                                     &worker_cancellation,
                                 );
                                 AnalysisResult {
-                                    id: worker_id.clone(),
+                                    id: worker_id,
                                     source_generation: computed.source_generation,
                                     configuration_generation: computed.configuration_generation,
                                     records: computed.records,
@@ -1072,7 +1086,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             ) {
                                 AnalysisResult {
-                                    id: worker_id.clone(),
+                                    id: worker_id,
                                     source_generation,
                                     configuration_generation,
                                     records: Vec::new(),
@@ -1096,7 +1110,7 @@ impl AnalysisJobs {
                                     discard: false,
                                 });
                                 AnalysisResult {
-                                    id: worker_id.clone(),
+                                    id: worker_id,
                                     source_generation: computed.source_generation,
                                     configuration_generation: computed.configuration_generation,
                                     records: computed.records,
@@ -1122,7 +1136,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1137,7 +1151,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1158,7 +1172,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1177,7 +1191,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1196,7 +1210,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1210,7 +1224,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1228,7 +1242,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1248,7 +1262,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1263,7 +1277,7 @@ impl AnalysisJobs {
                                 &worker_cancellation,
                             );
                             AnalysisResult {
-                                id: worker_id.clone(),
+                                id: worker_id,
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
@@ -1307,6 +1321,32 @@ impl AnalysisJobs {
         self.enqueue_client(id, request, workspace, features, None)
     }
 
+    fn next_computation_id(&mut self) -> Result<AnalysisComputationId, String> {
+        let id = AnalysisComputationId(self.next_computation_id);
+        self.next_computation_id = self
+            .next_computation_id
+            .checked_add(1)
+            .ok_or_else(|| "analysis computation ID space exhausted".to_string())?;
+        Ok(id)
+    }
+
+    fn client_recipient_count(&self) -> usize {
+        let running = self
+            .pending
+            .values()
+            .map(|job| job.client_ids.len())
+            .sum::<usize>();
+        let queued = self
+            .queue
+            .iter()
+            .map(|job| match job {
+                QueuedAnalysis::Client(job) => job.client_ids.len(),
+                QueuedAnalysis::Diagnostic(_) => 0,
+            })
+            .sum::<usize>();
+        running.saturating_add(queued)
+    }
+
     fn start_diagnostics(&mut self, uri: Url, _workspace: &Workspace) -> Result<(), String> {
         if self.shutting_down || self.diagnostic_jobs.contains_key(&uri) {
             return Ok(());
@@ -1314,8 +1354,7 @@ impl AnalysisJobs {
         if self.queue.len() >= MAX_ANALYSIS_QUEUE {
             return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
         }
-        let id = self.next_internal_id;
-        self.next_internal_id = self.next_internal_id.wrapping_add(1);
+        let id = self.next_computation_id()?;
         self.diagnostic_jobs.insert(uri.clone(), id);
         self.queue.push(
             AnalysisPriority::Diagnostics,
@@ -1335,6 +1374,9 @@ impl AnalysisJobs {
         if self.shutting_down {
             return Err("analysis server is shutting down".to_string());
         }
+        if self.request_to_job.contains_key(&id) {
+            return Err("analysis request ID is already in use".to_string());
+        }
 
         let key = ObservationKey::for_request(&request, workspace);
         if let Some(key) = key.as_ref() {
@@ -1342,13 +1384,16 @@ impl AnalysisJobs {
                 .observation_jobs
                 .iter()
                 .filter(|(existing, _)| existing.is_superseded_by(key))
-                .map(|(_, id)| id.clone())
+                .map(|(_, id)| *id)
                 .collect::<Vec<_>>();
             for primary_id in superseded {
                 self.supersede_client(&primary_id, connection)?;
             }
 
             if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
+                if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS {
+                    return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
+                }
                 if self.attach_client(&primary_id, id.clone()) {
                     self.request_to_job.insert(id, primary_id);
                     return Ok(());
@@ -1357,22 +1402,24 @@ impl AnalysisJobs {
             }
         }
 
-        if self.queue.len() >= MAX_CLIENT_ANALYSIS_QUEUE {
+        if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+            || self.queue.len() >= MAX_CLIENT_ANALYSIS_QUEUE
+        {
             return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
         }
 
-        let primary_id = id.clone();
-        self.request_to_job.insert(id, primary_id.clone());
+        let primary_id = self.next_computation_id()?;
+        self.request_to_job.insert(id.clone(), primary_id);
         if let Some(key) = key.clone() {
-            self.observation_jobs.insert(key, primary_id.clone());
+            self.observation_jobs.insert(key, primary_id);
         }
         self.queue.push(
             AnalysisPriority::for_request(&request),
             QueuedAnalysis::Client(QueuedClientAnalysis {
-                id: primary_id.clone(),
+                id: primary_id,
                 request,
                 features,
-                client_ids: vec![primary_id],
+                client_ids: vec![id],
                 key,
             }),
         );
@@ -1380,7 +1427,7 @@ impl AnalysisJobs {
         self.handle_dispatch_failures(failures, connection)
     }
 
-    fn attach_client(&mut self, primary_id: &RequestId, id: RequestId) -> bool {
+    fn attach_client(&mut self, primary_id: &AnalysisComputationId, id: RequestId) -> bool {
         if let Some(job) = self.pending.get_mut(primary_id) {
             if !job.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
                 job.client_ids.push(id);
@@ -1396,7 +1443,7 @@ impl AnalysisJobs {
         false
     }
 
-    fn remove_client_mapping(&mut self, id: &RequestId, primary_id: &RequestId) {
+    fn remove_client_mapping(&mut self, id: &RequestId, primary_id: &AnalysisComputationId) {
         if self
             .request_to_job
             .get(id)
@@ -1406,7 +1453,11 @@ impl AnalysisJobs {
         }
     }
 
-    fn remove_observation(&mut self, key: Option<&ObservationKey>, primary_id: &RequestId) {
+    fn remove_observation(
+        &mut self,
+        key: Option<&ObservationKey>,
+        primary_id: &AnalysisComputationId,
+    ) {
         if let Some(key) = key {
             if self
                 .observation_jobs
@@ -1436,7 +1487,7 @@ impl AnalysisJobs {
 
     fn supersede_client(
         &mut self,
-        primary_id: &RequestId,
+        primary_id: &AnalysisComputationId,
         connection: Option<&Connection>,
     ) -> Result<(), String> {
         if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
@@ -1582,11 +1633,11 @@ impl AnalysisJobs {
             };
             match queued {
                 QueuedAnalysis::Client(job) => {
-                    let primary_id = job.id.clone();
+                    let primary_id = job.id;
                     self.test_barriers
                         .record_dispatch(AnalysisPriority::for_request(&job.request));
                     match self.spawn(
-                        AnalysisJobId::Client(primary_id.clone()),
+                        AnalysisJobId::Client(primary_id),
                         job.request,
                         workspace,
                         job.features,
@@ -1677,7 +1728,7 @@ impl AnalysisJobs {
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Ok(result) = self.receiver.try_recv() {
-            match result.id.clone() {
+            match result.id {
                 AnalysisJobId::Diagnostic(id) => {
                     let Some(job) = self.diagnostics.remove(&id) else {
                         continue;
@@ -1697,7 +1748,7 @@ impl AnalysisJobs {
                     if cancelled {
                         workspace.reschedule_diagnostics(job.uri);
                     } else {
-                        deliver_analysis_result(connection, workspace, result)?;
+                        deliver_analysis_result(connection, workspace, result, None)?;
                     }
                 }
                 AnalysisJobId::Client(primary_id) => {
@@ -1721,15 +1772,13 @@ impl AnalysisJobs {
                         )
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     } else if !client_ids.is_empty() {
-                        let mut client_result = result;
-                        client_result.id = AnalysisJobId::Client(
-                            client_ids.first().cloned().expect("non-empty client IDs"),
-                        );
-                        deliver_analysis_result(connection, workspace, client_result.clone())?;
-                        for id in client_ids.into_iter().skip(1) {
-                            let mut fanout = client_result.clone();
-                            fanout.id = AnalysisJobId::Client(id);
-                            deliver_analysis_result(connection, workspace, fanout)?;
+                        for id in client_ids {
+                            deliver_analysis_result(
+                                connection,
+                                workspace,
+                                result.clone(),
+                                Some(id),
+                            )?;
                         }
                     }
                 }
@@ -1835,11 +1884,8 @@ fn deliver_analysis_result(
     connection: &Connection,
     workspace: &mut Workspace,
     result: AnalysisResult,
+    client_id: Option<RequestId>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let client_id = match &result.id {
-        AnalysisJobId::Client(id) => Some(id.clone()),
-        AnalysisJobId::Diagnostic(_) => None,
-    };
     if result.source_generation != workspace.source_generation()
         || result.configuration_generation != workspace.configuration_generation()
     {
@@ -3290,11 +3336,12 @@ fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisJobId, AnalysisJobs,
-        AnalysisPriority, AnalysisRequest, AnalysisResult, AnalysisResultValue, BoundedReader,
-        ClientFeatures, FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CONFIGURATION_WATCH_PATHS,
-        MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, PriorityQueue,
-        deliver_analysis_result, invalidate_analysis_result,
+        ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
+        AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisRequest, AnalysisResult,
+        AnalysisResultValue, BoundedReader, ClientFeatures, FileWatcherRegistration,
+        MAX_ANALYSIS_QUEUE, MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES,
+        MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, PriorityQueue, deliver_analysis_result,
+        invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
     use crossbeam_channel::RecvTimeoutError;
@@ -3328,22 +3375,26 @@ mod tests {
 
     fn receive_analysis_result(jobs: &mut AnalysisJobs, id: &RequestId) -> AnalysisResult {
         let result = jobs.receiver.recv().expect("analysis worker result");
-        let pending = jobs.pending.remove(id).expect("pending analysis job");
+        let computation_id = *jobs
+            .request_to_job
+            .get(id)
+            .expect("request-to-computation mapping");
+        let pending = jobs
+            .pending
+            .remove(&computation_id)
+            .expect("pending analysis job");
         assert!(
             pending.handle.join().is_ok(),
             "analysis worker must exit cleanly"
         );
-        assert_eq!(result.id, AnalysisJobId::Client(id.clone()));
+        assert_eq!(result.id, AnalysisJobId::Client(computation_id));
         result
     }
 
-    fn deliver_successfully(workspace: &mut Workspace, result: AnalysisResult) {
-        let id = match result.id.clone() {
-            AnalysisJobId::Client(id) => id,
-            AnalysisJobId::Diagnostic(_) => panic!("expected a client analysis result"),
-        };
+    fn deliver_successfully(workspace: &mut Workspace, id: RequestId, result: AnalysisResult) {
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, workspace, result).expect("deliver control result");
+        deliver_analysis_result(&server, workspace, result, Some(id.clone()))
+            .expect("deliver control result");
         let Message::Response(response) = client.receiver.recv().expect("control response") else {
             panic!("expected a control response");
         };
@@ -3516,13 +3567,10 @@ mod tests {
         crate::text::offset_to_position(source, offset).expect("assistance position")
     }
 
-    fn assert_stale_delivery(workspace: &mut Workspace, result: AnalysisResult) {
-        let id = match result.id.clone() {
-            AnalysisJobId::Client(id) => id,
-            AnalysisJobId::Diagnostic(_) => panic!("expected a client analysis result"),
-        };
+    fn assert_stale_delivery(workspace: &mut Workspace, id: RequestId, result: AnalysisResult) {
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, workspace, result).expect("deliver stale result");
+        deliver_analysis_result(&server, workspace, result, Some(id.clone()))
+            .expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -3774,7 +3822,7 @@ mod tests {
             &server,
             &mut workspace,
             AnalysisResult {
-                id: AnalysisJobId::Client(control_id.clone()),
+                id: AnalysisJobId::Client(AnalysisComputationId(0)),
                 source_generation,
                 configuration_generation,
                 records: Vec::new(),
@@ -3783,6 +3831,7 @@ mod tests {
                     Position::new(0, 1),
                 )))),
             },
+            Some(control_id.clone()),
         )
         .expect("unchanged result response");
 
@@ -3820,7 +3869,7 @@ mod tests {
             &server,
             &mut workspace,
             AnalysisResult {
-                id: AnalysisJobId::Client(id.clone()),
+                id: AnalysisJobId::Client(AnalysisComputationId(0)),
                 source_generation: stale_source_generation,
                 configuration_generation: stale_configuration_generation,
                 records: Vec::new(),
@@ -3829,6 +3878,7 @@ mod tests {
                     Position::new(0, 1),
                 )))),
             },
+            Some(id.clone()),
         )
         .expect("stale result response");
 
@@ -3869,7 +3919,8 @@ mod tests {
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_workspace_symbols_were_computed(&control);
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, control).expect("deliver control result");
+        deliver_analysis_result(&server, &mut workspace, control, Some(control_id.clone()))
+            .expect("deliver control result");
         let Message::Response(control_response) = client.receiver.recv().expect("control response")
         else {
             panic!("expected a control response");
@@ -3898,7 +3949,8 @@ mod tests {
             .change_document(main_uri, changed.to_string(), 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, stale).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, stale, Some(stale_id.clone()))
+            .expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -3942,7 +3994,7 @@ mod tests {
         .expect("start hover control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_hover_was_computed(&control);
-        deliver_successfully(&mut workspace, control);
+        deliver_successfully(&mut workspace, control_id, control);
 
         let id = RequestId::from("hover-overlay-stale".to_string());
         jobs.start(
@@ -3963,7 +4015,7 @@ mod tests {
             .change_document(main_uri, changed.to_string(), 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, result)
+        deliver_analysis_result(&server, &mut workspace, result, Some(id.clone()))
             .expect("deliver stale hover result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
@@ -4013,7 +4065,7 @@ mod tests {
         .expect("start type-definition control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_type_definitions_were_computed(&control);
-        deliver_successfully(&mut workspace, control);
+        deliver_successfully(&mut workspace, control_id, control);
 
         let stale_id = RequestId::from("type-definition-overlay-stale".to_string());
         jobs.start(
@@ -4033,7 +4085,7 @@ mod tests {
             .change_document(provider_uri, changed_provider.to_string(), 2)
             .expect("change provider overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, stale)
+        deliver_analysis_result(&server, &mut workspace, stale, Some(stale_id.clone()))
             .expect("deliver stale type-definition result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
@@ -4077,7 +4129,7 @@ mod tests {
         .expect("start completion control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_completion_was_computed(&control);
-        deliver_successfully(&mut workspace, control);
+        deliver_successfully(&mut workspace, control_id, control);
 
         let stale_id = RequestId::from("completion-overlay-stale".to_string());
         jobs.start(
@@ -4097,7 +4149,7 @@ mod tests {
             .change_document(main_uri, changed, 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, stale)
+        deliver_analysis_result(&server, &mut workspace, stale, Some(stale_id.clone()))
             .expect("deliver stale completion result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
@@ -4141,7 +4193,7 @@ mod tests {
         .expect("start signature-help control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_signature_help_was_computed(&control);
-        deliver_successfully(&mut workspace, control);
+        deliver_successfully(&mut workspace, control_id, control);
 
         let stale_id = RequestId::from("signature-help-overlay-stale".to_string());
         jobs.start(
@@ -4161,7 +4213,7 @@ mod tests {
             .change_document(main_uri, changed, 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, stale)
+        deliver_analysis_result(&server, &mut workspace, stale, Some(stale_id.clone()))
             .expect("deliver stale signature-help result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
@@ -4212,7 +4264,8 @@ mod tests {
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_workspace_symbols_were_computed(&control);
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, control).expect("deliver control result");
+        deliver_analysis_result(&server, &mut workspace, control, Some(control_id.clone()))
+            .expect("deliver control result");
         let Message::Response(control_response) = client.receiver.recv().expect("control response")
         else {
             panic!("expected a control response");
@@ -4253,7 +4306,8 @@ mod tests {
             "project switch must invalidate configuration generation"
         );
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, stale).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, stale, Some(stale_id.clone()))
+            .expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -4305,7 +4359,7 @@ mod tests {
             &control.value,
             AnalysisResultValue::References(Ok(locations)) if locations.len() == 1
         ));
-        deliver_successfully(&mut workspace, control);
+        deliver_successfully(&mut workspace, control_id, control);
 
         let id = RequestId::from("reference-overlay-stale".to_string());
         jobs.start(
@@ -4339,7 +4393,8 @@ mod tests {
             .change_document(consumer_uri, changed_consumer, 2)
             .expect("change consumer overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, result).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, result, Some(id.clone()))
+            .expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -4385,7 +4440,7 @@ mod tests {
             &control.value,
             AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
         ));
-        deliver_successfully(&mut workspace, control);
+        deliver_successfully(&mut workspace, control_id, control);
 
         let id = RequestId::from("highlight-overlay-stale".to_string());
         jobs.start(
@@ -4418,7 +4473,8 @@ mod tests {
             .change_document(main_uri, changed, 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, result).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, result, Some(id.clone()))
+            .expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -4472,7 +4528,7 @@ mod tests {
             &reference_control.value,
             AnalysisResultValue::References(Ok(locations)) if locations.len() == 2
         ));
-        deliver_successfully(&mut workspace, reference_control);
+        deliver_successfully(&mut workspace, reference_control_id, reference_control);
 
         let highlight_control_id = RequestId::from("project-highlight-control".to_string());
         jobs.start(
@@ -4490,7 +4546,7 @@ mod tests {
             &highlight_control.value,
             AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
         ));
-        deliver_successfully(&mut workspace, highlight_control);
+        deliver_successfully(&mut workspace, highlight_control_id, highlight_control);
 
         let reference_id = RequestId::from("project-reference-stale".to_string());
         jobs.start(
@@ -4534,9 +4590,10 @@ mod tests {
             )
             .expect("switch to project B");
 
-        for result in [reference, highlight] {
+        for (id, result) in [(reference_id, reference), (highlight_id, highlight)] {
             let (server, client) = Connection::memory();
-            deliver_analysis_result(&server, &mut workspace, result).expect("deliver stale result");
+            deliver_analysis_result(&server, &mut workspace, result, Some(id))
+                .expect("deliver stale result");
             let Message::Response(response) = client.receiver.recv().expect("stale response")
             else {
                 panic!("expected a stale response");
@@ -4584,7 +4641,7 @@ mod tests {
 
         let id = RequestId::from("candidate-membership-cancel".to_string());
         let mut result = AnalysisResult {
-            id: AnalysisJobId::Client(id.clone()),
+            id: AnalysisJobId::Client(AnalysisComputationId(0)),
             source_generation: computed.source_generation,
             configuration_generation: computed.configuration_generation,
             records: computed.records,
@@ -4593,7 +4650,7 @@ mod tests {
         invalidate_analysis_result(&mut result, error);
 
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &mut workspace, result)
+        deliver_analysis_result(&server, &mut workspace, result, Some(id.clone()))
             .expect("deliver cancellation result");
         let Message::Response(response) = client.receiver.recv().expect("cancellation response")
         else {
@@ -4618,12 +4675,13 @@ mod tests {
             &server,
             &mut workspace,
             AnalysisResult {
-                id: AnalysisJobId::Client(id.clone()),
+                id: AnalysisJobId::Client(AnalysisComputationId(0)),
                 source_generation: source_generation.wrapping_add(1),
                 configuration_generation,
                 records: Vec::new(),
                 value: AnalysisResultValue::WorkspaceSymbols(Ok(Vec::new())),
             },
+            Some(id.clone()),
         )
         .expect("stale workspace symbol response");
 
@@ -4640,7 +4698,7 @@ mod tests {
         let cancellation = Arc::new(AtomicBool::new(false));
         let handle = thread::spawn(|| thread::sleep(Duration::from_millis(500)));
         jobs.pending.insert(
-            RequestId::from("non-cancellable-worker".to_string()),
+            AnalysisComputationId(0),
             PendingAnalysis {
                 cancellation: Arc::clone(&cancellation),
                 handle,
@@ -4665,10 +4723,9 @@ mod tests {
     fn poll_discards_a_result_without_a_pending_worker() {
         let mut jobs = AnalysisJobs::new();
         let mut workspace = test_workspace(Vec::new(), Default::default());
-        let id = RequestId::from("orphaned-analysis-result".to_string());
         jobs.sender
             .send(AnalysisResult {
-                id: AnalysisJobId::Client(id),
+                id: AnalysisJobId::Client(AnalysisComputationId(0)),
                 source_generation: workspace.source_generation(),
                 configuration_generation: workspace.configuration_generation(),
                 records: Vec::new(),
@@ -4779,7 +4836,11 @@ mod tests {
                 .workspace
                 .change_document(fixture.provider_uri.clone(), changed_provider, 2)
                 .expect("change provider overlay");
-            assert_stale_delivery(&mut fixture.workspace, result);
+            assert_stale_delivery(
+                &mut fixture.workspace,
+                RequestId::from(name.to_string()),
+                result,
+            );
         }
     }
 
@@ -4805,7 +4866,11 @@ mod tests {
                 .workspace
                 .select_project(&fixture.main_uri, Some(&fixture.project_b_uri))
                 .expect("switch selected project");
-            assert_stale_delivery(&mut fixture.workspace, result);
+            assert_stale_delivery(
+                &mut fixture.workspace,
+                RequestId::from(name.to_string()),
+                result,
+            );
         }
     }
 
@@ -4843,8 +4908,13 @@ mod tests {
         jobs.sender
             .send(completion)
             .expect("requeue computed completion result");
-        jobs.pending
+        let completion_computation_id = jobs
+            .request_to_job
             .get(&completion_id)
+            .copied()
+            .expect("completion request mapping");
+        jobs.pending
+            .get(&completion_computation_id)
             .expect("pending completion")
             .cancellation
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4880,8 +4950,13 @@ mod tests {
         jobs.sender
             .send(signature)
             .expect("requeue computed signature result");
-        jobs.pending
+        let signature_computation_id = jobs
+            .request_to_job
             .get(&signature_id)
+            .copied()
+            .expect("signature request mapping");
+        jobs.pending
+            .get(&signature_computation_id)
             .expect("pending signature")
             .cancellation
             .store(true, std::sync::atomic::Ordering::Relaxed);

@@ -273,6 +273,54 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_navigation_and_formatting_barriers_and_dispatch_log(
+        environment: TempDir,
+    ) -> (Self, TestBarrier, TestBarrier, TestDispatchLog) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        let dispatch_directory = environment.path().join("analysis-dispatch");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        fs::create_dir_all(&dispatch_directory).expect("dispatch directory");
+        let navigation = TestBarrier {
+            entered: barrier_directory.join("navigation.entered"),
+            release: barrier_directory.join("navigation.release"),
+        };
+        let formatting = TestBarrier {
+            entered: barrier_directory.join("formatting.entered"),
+            release: barrier_directory.join("formatting.release"),
+        };
+        let dispatch = TestDispatchLog {
+            path: dispatch_directory.join("entries"),
+        };
+        let navigation_value = format!(
+            "{}|{}",
+            navigation.entered.display(),
+            navigation.release.display()
+        );
+        let formatting_value = format!(
+            "{}|{}",
+            formatting.entered.display(),
+            formatting.release.display()
+        );
+        let dispatch_value = dispatch.path.display().to_string();
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                (
+                    "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                    navigation_value.as_str(),
+                ),
+                (
+                    "PASCAL_LSP_TEST_FORMATTING_BARRIER",
+                    formatting_value.as_str(),
+                ),
+                ("PASCAL_LSP_TEST_DISPATCH_LOG", dispatch_value.as_str()),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, navigation, formatting, dispatch)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_formatting_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_FORMATTING_BARRIER")
     }
@@ -952,6 +1000,13 @@ fn result_locations(response: Response) -> Vec<Value> {
         .as_array()
         .expect("array location result")
         .clone()
+}
+
+#[cfg(feature = "test-support")]
+fn assert_queue_overflow(response: Response) {
+    let error = response.error.expect("analysis queue overflow error");
+    assert_eq!(error.code, -32803);
+    assert_eq!(error.message, "analysis queue is full; retry the request");
 }
 
 fn location_signature(location: &Value) -> (String, u32, u32, u32, u32) {
@@ -18095,6 +18150,409 @@ fn diagnostics_use_reserved_capacity_when_the_client_queue_is_full() {
         assert!(
             response.error.is_none(),
             "reserved-capacity client request failed: {response:?}"
+        );
+    }
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn reusing_a_cancelled_request_id_keeps_attached_work_and_response_ids_exact() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, navigation, formatting, dispatch) =
+        TestServer::launch_with_navigation_and_formatting_barriers_and_dispatch_log(environment);
+    server.initialize(&root, Value::Null);
+
+    let reused_id = RequestId::from("reused-request-id".to_string());
+    let attached_id = RequestId::from("attached-request-id".to_string());
+    server.send_request(
+        reused_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    navigation.wait_until_entered();
+    server.send_request(
+        attached_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    assert!(
+        server
+            .response_with_timeout(&attached_id, Duration::from_millis(100))
+            .is_none(),
+        "an attached request must wait for the shared worker"
+    );
+
+    server.send_notification("$/cancelRequest", json!({"id": reused_id.clone()}));
+    let cancelled = server.response(&reused_id);
+    assert_eq!(cancelled.id, reused_id);
+    assert_eq!(cancelled.error.expect("cancellation error").code, -32800);
+
+    // Reuse the canceled ID for a distinct client-backed computation while
+    // the old computation remains alive for the attached request.
+    server.send_request(
+        reused_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    formatting.wait_until_entered();
+
+    let queued_id = RequestId::from("request-after-id-reuse".to_string());
+    server.send_request(
+        queued_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert!(
+        server
+            .response_with_timeout(&queued_id, Duration::from_millis(100))
+            .is_none(),
+        "a third computation must remain queued while two workers are active"
+    );
+    assert_eq!(
+        fs::read(&dispatch.path).expect("dispatch log before release"),
+        b"IB",
+        "request ID reuse must not dispatch an extra worker"
+    );
+
+    // Complete the reused-ID computation first. The attached navigation must
+    // still be retained and must not be mistaken for this result.
+    formatting.release();
+    let formatting_response = server.response(&reused_id);
+    assert_eq!(formatting_response.id, reused_id);
+    assert!(
+        formatting_response.error.is_none(),
+        "reused request ID formatting failed: {formatting_response:?}"
+    );
+    let queued_response = server.response(&queued_id);
+    assert_eq!(queued_response.id, queued_id);
+    assert!(
+        queued_response.error.is_none(),
+        "request after ID reuse failed: {queued_response:?}"
+    );
+
+    navigation.release();
+    let attached_response = server
+        .response_with_timeout(&attached_id, Duration::from_secs(1))
+        .expect("attached request must receive the old computation result");
+    assert_eq!(attached_response.id, attached_id);
+    let locations = result_locations(attached_response);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.assert_no_response(&attached_id);
+    server.assert_no_response(&reused_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn running_shared_client_recipients_are_bounded_and_cancellation_frees_capacity() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let blocker_id = RequestId::from("running-recipient-blocker".to_string());
+    server.send_request(
+        blocker_id.clone(),
+        "textDocument/definition",
+        navigation_params(&provider, provider_source, "PublicRoutine", 0),
+    );
+    let primary_id = RequestId::from("running-recipient-primary".to_string());
+    server.send_request(
+        primary_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    barrier.wait_for_entries(2);
+
+    let attachments = (0..31)
+        .map(|index| RequestId::from(format!("running-recipient-attachment-{index}")))
+        .collect::<Vec<_>>();
+    for id in &attachments {
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "Run", 0),
+        );
+    }
+    let overflow_same = RequestId::from("running-recipient-overflow-same".to_string());
+    server.send_request(
+        overflow_same.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert_queue_overflow(
+        server
+            .response_with_timeout(&overflow_same, Duration::from_secs(1))
+            .expect("same-query recipient overflow response"),
+    );
+
+    let overflow_distinct = RequestId::from("running-recipient-overflow-distinct".to_string());
+    server.send_request(
+        overflow_distinct.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert_queue_overflow(
+        server
+            .response_with_timeout(&overflow_distinct, Duration::from_secs(1))
+            .expect("distinct recipient overflow response"),
+    );
+
+    let cancelled_id = attachments[0].clone();
+    server.send_notification("$/cancelRequest", json!({"id": cancelled_id.clone()}));
+    let cancelled = server.response(&cancelled_id);
+    assert_eq!(
+        cancelled.error.expect("attachment cancellation").code,
+        -32800
+    );
+
+    let replacement_id = RequestId::from("running-recipient-replacement".to_string());
+    server.send_request(
+        replacement_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+
+    barrier.release();
+    assert!(
+        server.response(&blocker_id).error.is_none(),
+        "running blocker failed"
+    );
+    assert!(
+        server.response(&primary_id).error.is_none(),
+        "running shared primary failed"
+    );
+    for id in attachments.into_iter().skip(1) {
+        assert!(
+            server.response(&id).error.is_none(),
+            "running shared attachment failed: {id:?}"
+        );
+    }
+    assert!(
+        server.response(&replacement_id).error.is_none(),
+        "replacement recipient failed"
+    );
+    server.assert_no_response(&cancelled_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_shared_client_recipients_are_bounded_and_cancellation_frees_capacity() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let blocker_ids = [
+        RequestId::from("queued-recipient-blocker-provider".to_string()),
+        RequestId::from("queued-recipient-blocker-main".to_string()),
+    ];
+    server.send_request(
+        blocker_ids[0].clone(),
+        "textDocument/definition",
+        navigation_params(&provider, provider_source, "PublicRoutine", 0),
+    );
+    server.send_request(
+        blocker_ids[1].clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_for_entries(2);
+
+    let primary_id = RequestId::from("queued-recipient-primary".to_string());
+    let target = navigation_params(&main, main_source, "Run", 0);
+    server.send_request(
+        primary_id.clone(),
+        "textDocument/definition",
+        target.clone(),
+    );
+    let attachments = (0..30)
+        .map(|index| RequestId::from(format!("queued-recipient-attachment-{index}")))
+        .collect::<Vec<_>>();
+    for id in &attachments {
+        server.send_request(id.clone(), "textDocument/definition", target.clone());
+    }
+    let overflow_same = RequestId::from("queued-recipient-overflow-same".to_string());
+    server.send_request(
+        overflow_same.clone(),
+        "textDocument/definition",
+        target.clone(),
+    );
+    assert_queue_overflow(
+        server
+            .response_with_timeout(&overflow_same, Duration::from_secs(1))
+            .expect("queued same-query recipient overflow response"),
+    );
+
+    let overflow_distinct = RequestId::from("queued-recipient-overflow-distinct".to_string());
+    server.send_request(
+        overflow_distinct.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert_queue_overflow(
+        server
+            .response_with_timeout(&overflow_distinct, Duration::from_secs(1))
+            .expect("queued distinct recipient overflow response"),
+    );
+
+    let cancelled_id = attachments[0].clone();
+    server.send_notification("$/cancelRequest", json!({"id": cancelled_id.clone()}));
+    let cancelled = server.response(&cancelled_id);
+    assert_eq!(
+        cancelled
+            .error
+            .expect("queued attachment cancellation")
+            .code,
+        -32800
+    );
+
+    let replacement_id = RequestId::from("queued-recipient-replacement".to_string());
+    server.send_request(replacement_id.clone(), "textDocument/definition", target);
+
+    barrier.release();
+    for id in blocker_ids {
+        assert!(
+            server.response(&id).error.is_none(),
+            "queued blocker failed: {id:?}"
+        );
+    }
+    assert!(
+        server.response(&primary_id).error.is_none(),
+        "queued shared primary failed"
+    );
+    for id in attachments.into_iter().skip(1) {
+        assert!(
+            server.response(&id).error.is_none(),
+            "queued shared attachment failed: {id:?}"
+        );
+    }
+    assert!(
+        server.response(&replacement_id).error.is_none(),
+        "queued replacement recipient failed"
+    );
+    server.assert_no_response(&cancelled_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn full_client_queue_rejects_coalesced_recipients_without_unbounded_shutdown_responses() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let blocker_ids = [
+        RequestId::from("full-recipient-blocker-provider".to_string()),
+        RequestId::from("full-recipient-blocker-main".to_string()),
+    ];
+    server.send_request(
+        blocker_ids[0].clone(),
+        "textDocument/definition",
+        navigation_params(&provider, provider_source, "PublicRoutine", 0),
+    );
+    server.send_request(
+        blocker_ids[1].clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_for_entries(2);
+
+    let primary_id = RequestId::from("full-recipient-primary".to_string());
+    let target = navigation_params(&main, main_source, "Run", 0);
+    server.send_request(
+        primary_id.clone(),
+        "textDocument/definition",
+        target.clone(),
+    );
+    let bulk_ids = (0..30)
+        .map(|index| RequestId::from(format!("full-recipient-bulk-{index}")))
+        .collect::<Vec<_>>();
+    for (index, id) in bulk_ids.iter().cloned().enumerate() {
+        server.send_request(
+            id,
+            "workspace/symbol",
+            json!({"query": format!("FullRecipientMissing{index}")}),
+        );
+    }
+
+    let attachment_ids = (0..1000)
+        .map(|index| RequestId::from(format!("full-recipient-attachment-{index}")))
+        .collect::<Vec<_>>();
+    for id in &attachment_ids {
+        server.send_request(id.clone(), "textDocument/definition", target.clone());
+    }
+    for id in attachment_ids {
+        assert_queue_overflow(
+            server
+                .response_with_timeout(&id, Duration::from_secs(1))
+                .expect("every excess coalesced recipient must be rejected"),
+        );
+    }
+
+    let distinct_overflow = RequestId::from("full-recipient-distinct-overflow".to_string());
+    server.send_request(
+        distinct_overflow.clone(),
+        "workspace/symbol",
+        json!({"query": "FullRecipientOverflow"}),
+    );
+    assert_queue_overflow(
+        server
+            .response_with_timeout(&distinct_overflow, Duration::from_secs(1))
+            .expect("full client queue distinct overflow response"),
+    );
+
+    barrier.release();
+    for id in blocker_ids {
+        assert!(
+            server.response(&id).error.is_none(),
+            "full client queue blocker failed: {id:?}"
+        );
+    }
+    assert!(
+        server.response(&primary_id).error.is_none(),
+        "full client queue primary failed"
+    );
+    for id in bulk_ids {
+        assert!(
+            server.response(&id).error.is_none(),
+            "full client queue bulk request failed: {id:?}"
         );
     }
     server.shutdown();

@@ -2046,6 +2046,56 @@ end.
 }
 
 #[test]
+fn receiver_list_binding_keeps_local_rename_edits_exact() {
+    let source = "unit WithReceiverListRename;
+interface
+type
+  TInner = record
+    Value: Integer;
+  end;
+  TOuter = record
+    Inner: TInner;
+  end;
+implementation
+procedure Run;
+var
+  OuterValue: TOuter;
+  Inner: TInner;
+begin
+  with OuterValue, Inner do
+    Value := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithReceiverListRename", source);
+    let local_declaration = range_in(source, "Inner: TInner", "Inner", 1);
+
+    let edits = index
+        .rename_edits(&source_uri, local_declaration.start, "RenamedInner")
+        .expect("unused local rename remains safe");
+    assert_exact_edits(
+        &edits,
+        vec![(
+            source_uri.clone(),
+            local_declaration,
+            "RenamedInner".to_owned(),
+        )],
+    );
+
+    assert!(
+        index
+            .rename_edits(
+                &source_uri,
+                position_of(source, "Inner do", 0),
+                "RenamedInner",
+            )
+            .is_err(),
+        "with-dependent receiver rename must be rejected"
+    );
+}
+
+#[test]
 fn inherited_member_reference_aborts_without_partial_edits() {
     let source = "unit InheritedRename;
 interface

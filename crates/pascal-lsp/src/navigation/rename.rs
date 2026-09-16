@@ -940,15 +940,31 @@ impl NavigationIndex {
                 if has_ancestor_kind(identifier, "with")
                     && !binding_has_class_owner
                     && !is_binding_member
-                    && (candidates.is_empty() || matching != candidates.len())
                 {
+                    if candidates.is_empty() {
+                        if !strict_resolution {
+                            continue;
+                        }
+                        return Err(format!(
+                            "rename cannot prove the local binding through with at {}:{}",
+                            uri, span.start
+                        ));
+                    }
+                    if matching == 0 {
+                        continue;
+                    }
+                    if matching != candidates.len() {
+                        if !strict_resolution {
+                            continue;
+                        }
+                        return Err(format!(
+                            "rename cannot prove the local binding through with at {}:{}",
+                            uri, span.start
+                        ));
+                    }
                     if !strict_resolution {
                         continue;
                     }
-                    return Err(format!(
-                        "rename cannot prove the local binding through with at {}:{}",
-                        uri, span.start
-                    ));
                 }
                 if matching > 0 && binding_has_class_owner && !is_direct_declaration {
                     if let Some(dot) = member_expression {

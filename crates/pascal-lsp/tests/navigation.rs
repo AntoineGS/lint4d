@@ -6154,6 +6154,7 @@ implementation
 procedure Caller;
 var
   OuterValue: TOuter;
+  Inner: TInner;
 begin
   with OuterValue, Inner do
     Value := 1;
@@ -6165,6 +6166,18 @@ end.
     index
         .update(source_uri.clone(), source.to_owned())
         .expect("receiver-list with source parses");
+
+    let receiver = index.navigate(
+        &source_uri,
+        position_of(source, "Inner do", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(receiver.len(), 1);
+    assert_location_start(
+        &receiver[0],
+        &source_uri,
+        position_of(source, "Inner: TInner", 0),
+    );
 
     let locations = index.navigate(
         &source_uri,
@@ -6395,47 +6408,59 @@ end.
 }
 
 #[test]
-fn explicit_qualification_prefers_a_local_root_over_a_same_named_with_member() {
-    let source = r#"unit TypedWithQualificationShadow;
+fn dotted_with_root_remains_implicit_with_lookup() {
+    let source = r#"unit TypedWithDottedRoot;
 interface
 type
-  TOther = record
-    LocalField: string;
+  TLocal = record
+    Value: string;
   end;
   TInner = record
-    WithField: Integer;
+    Value: Integer;
   end;
   TObj = record
-    Other: TInner;
+    Child: TInner;
   end;
 procedure Caller;
 implementation
 procedure Caller;
 var
   Obj: TObj;
-  Other: TOther;
+  Child: TLocal;
 begin
   with Obj do
-    Other.LocalField := 'value';
+    Child.Value := 1;
 end;
 end.
 "#;
-    let source_uri = uri("TypedWithQualificationShadow");
+    let source_uri = uri("TypedWithDottedRoot");
     let mut index = NavigationIndex::new();
     index
         .update(source_uri.clone(), source.to_owned())
-        .expect("qualified shadow source parses");
+        .expect("dotted with source parses");
+
+    let child = index.navigate(
+        &source_uri,
+        position_of(source, "Child.Value", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(child.len(), 1);
+    assert_location_start(
+        &child[0],
+        &source_uri,
+        position_of(source, "Child: TInner", 0),
+    );
 
     let locations = index.navigate(
         &source_uri,
-        position_of(source, "LocalField :=", 0),
+        position_of(source, "Value :=", 0),
         NavigationTarget::Declaration,
     );
     assert_eq!(locations.len(), 1);
     assert_location_start(
         &locations[0],
         &source_uri,
-        position_of(source, "LocalField: string", 0),
+        position_of(source, "Value: Integer", 0),
     );
 }
 
@@ -6469,6 +6494,45 @@ end.
         locations.is_empty(),
         "unknown with receiver must not select the global declaration"
     );
+}
+
+#[test]
+fn unknown_with_receiver_blocks_an_unrelated_global_completion() {
+    let source = r#"unit TypedWithUnknownCompletion;
+interface
+const
+  GlobalValue = 1;
+procedure Caller;
+implementation
+procedure Caller;
+begin
+  with UnknownReceiver do
+    Glo := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown completion source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Glo", 1))
+        .expect("unknown with completion");
+    assert!(
+        completion
+            .items
+            .iter()
+            .all(|item| item.label != "GlobalValue"),
+        "unknown with receiver leaked a global: {:?}",
+        completion
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(completion.is_incomplete);
 }
 
 #[test]
@@ -6582,6 +6646,189 @@ end.
         &outer_after[0],
         &source_uri,
         position_of(source, "OuterValue = 0", 0),
+    );
+}
+
+#[test]
+fn known_with_receivers_fall_back_to_a_local_for_an_unmatched_completion() {
+    let source = r#"unit TypedWithCompletionFallback;
+interface
+type
+  TLeft = record
+    LeftField: Integer;
+  end;
+  TRight = record
+    RightField: Integer;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  LeftValue: TLeft;
+  RightValue: TRight;
+  LocalValue: Integer;
+begin
+  with LeftValue, RightValue do
+    Loc := 1;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithCompletionFallback");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("known completion fallback source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "Loc", 1))
+        .expect("known with completion fallback");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["LocalValue"]
+    );
+    assert!(!completion.is_incomplete);
+}
+
+#[test]
+fn an_unknown_comma_receiver_does_not_hide_a_later_qualified_receiver() {
+    let source = r#"unit TypedWithUnknownReceiverList;
+interface
+type
+  TInner = class
+    constructor Create;
+    Value: Integer;
+  end;
+implementation
+constructor TInner.Create;
+begin
+end;
+procedure Caller;
+begin
+  with UnknownReceiver, TypedWithUnknownReceiverList.TInner.Create do
+    Value := 1;
+  with UnknownReceiver do
+    with TypedWithUnknownReceiverList.TInner.Create do
+      Value := 2;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithUnknownReceiverList");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("unknown receiver-list source parses");
+
+    let qualified_receiver = index.navigate(
+        &source_uri,
+        position_of(source, "TInner.Create", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(qualified_receiver.len(), 1);
+    assert_location_start(
+        &qualified_receiver[0],
+        &source_uri,
+        position_of(source, "TInner = class", 0),
+    );
+
+    let comma_value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 0),
+        NavigationTarget::Declaration,
+    );
+    assert!(
+        comma_value.is_empty(),
+        "an unknown comma receiver must block body fallback: {comma_value:?}"
+    );
+
+    let nested_value = index.navigate(
+        &source_uri,
+        position_of(source, "Value :=", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(nested_value.len(), 1);
+    assert_location_start(
+        &nested_value[0],
+        &source_uri,
+        position_of(source, "Value: Integer", 0),
+    );
+}
+
+#[test]
+fn with_generic_receiver_substitution_reaches_call_result_assistance() {
+    let source = r#"unit TypedWithGenericAssistance;
+interface
+type
+  TWidget = class
+    Member: Integer;
+  end;
+  TBox<T> = class
+    Value: T;
+    function GetValue: T;
+    procedure Put(Item: T);
+  end;
+procedure Caller;
+implementation
+function TBox<T>.GetValue: T;
+begin
+  Result := Value;
+end;
+procedure TBox<T>.Put(Item: T);
+begin
+end;
+procedure Caller;
+var
+  Box: TBox<TWidget>;
+  Widget: TWidget;
+begin
+  with Box do begin
+    Value.Member;
+    GetValue().Member;
+    Put(Widget);
+  end;
+end;
+end.
+"#;
+    let source_uri = uri("TypedWithGenericAssistance");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic with assistance source parses");
+
+    let value_type = index.type_definitions(&source_uri, position_of(source, "Value.Member", 0));
+    assert_exact_type_location(&value_type, &source_uri, source, "TWidget", 0);
+
+    let call_result_type = index.type_definitions(&source_uri, position_of(source, "GetValue", 2));
+    assert_exact_type_location(&call_result_type, &source_uri, source, "TWidget", 0);
+
+    let call_member = index.navigate(
+        &source_uri,
+        position_of(source, "Member", 2),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(call_member.len(), 1);
+    assert_location_start(
+        &call_member[0],
+        &source_uri,
+        position_of(source, "Member: Integer", 0),
+    );
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "GetValue", 2))
+        .expect("generic with call-result hover");
+    assert!(hover_text(&hover).contains("function GetValue: TWidget;"));
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "Put(", 2))
+        .expect("generic with signature help")
+        .expect("generic with Put signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].label,
+        "procedure Put(Item: TWidget);"
     );
 }
 

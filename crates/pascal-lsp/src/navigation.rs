@@ -720,9 +720,15 @@ impl NavigationIndex {
         state: &mut ResolutionState,
     ) -> Vec<Candidate> {
         let name = node_text(identifier, &document.source);
+        let direct =
+            if !document.has_with_context_at(offset) || is_declaration_identifier(identifier) {
+                self.direct_symbol_references(uri, identifier)
+            } else {
+                None
+            };
         let candidates = if let Some(unit_name) = use_name_at(identifier, &document.source) {
             self.unit_references(document, &unit_name)
-        } else if let Some(direct) = self.direct_symbol_references(uri, identifier) {
+        } else if let Some(direct) = direct {
             direct
         } else if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
             generic
@@ -748,21 +754,6 @@ impl NavigationIndex {
         }
     }
 
-    fn resolve_candidates_at_with_budget(
-        &self,
-        uri: &Url,
-        document: &Document,
-        offset: usize,
-        identifier: Node<'_>,
-        cancel: &AtomicBool,
-        budget: &mut AssistanceBudget,
-    ) -> Result<Vec<Candidate>, String> {
-        let mut state = ResolutionState::new();
-        self.resolve_candidates_at_with_state_and_budget(
-            uri, document, offset, identifier, &mut state, 0, cancel, budget,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn resolve_candidates_at_with_state_and_budget(
         &self,
@@ -776,13 +767,17 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
         let name = node_text_with_budget(identifier, &document.source, cancel, budget)?;
+        let direct =
+            if !document.has_with_context_at(offset) || is_declaration_identifier(identifier) {
+                self.direct_symbol_references_with_budget(uri, identifier, cancel, budget)?
+            } else {
+                None
+            };
         let candidates = if let Some(unit_name) =
             use_name_at_with_budget(identifier, &document.source, cancel, budget)?
         {
             self.unit_references_with_budget(document, &unit_name, cancel, budget)
-        } else if let Some(direct) =
-            self.direct_symbol_references_with_budget(uri, identifier, cancel, budget)?
-        {
+        } else if let Some(direct) = direct {
             Ok(direct)
         } else if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
             budget.require_work(generic.len(), cancel)?;
@@ -1724,15 +1719,37 @@ impl NavigationIndex {
             return WithLookup::Unknown;
         }
         for context in contexts {
-            let Some(receivers) =
+            let Some(receiver_slots) =
                 self.resolve_with_context_receivers(uri, document, context, state)
             else {
                 return WithLookup::Unknown;
             };
-            for receiver in receivers.iter().rev() {
-                match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
-                    WithLookup::NotFound => {}
-                    lookup => return lookup,
+            for receivers in receiver_slots.iter().rev() {
+                for receiver in receivers.iter().rev() {
+                    match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
+                        WithLookup::NotFound => {}
+                        lookup => return lookup,
+                    }
+                }
+            }
+        }
+
+        if overlay.is_empty() {
+            for (context, receiver_index) in document.with_receiver_contexts_at(offset) {
+                let Some(receivers) = self.resolve_with_context_receiver_prefix(
+                    uri,
+                    document,
+                    context,
+                    receiver_index,
+                    state,
+                ) else {
+                    return WithLookup::Unknown;
+                };
+                for receiver in receivers.iter().rev() {
+                    match self.with_receiver_lookup(uri, document, offset, receiver, &key, state) {
+                        WithLookup::NotFound => {}
+                        lookup => return lookup,
+                    }
                 }
             }
         }
@@ -1746,7 +1763,7 @@ impl NavigationIndex {
         document: &Document,
         context: &WithContext,
         state: &mut ResolutionState,
-    ) -> Option<Vec<Receiver>> {
+    ) -> Option<Vec<Vec<Receiver>>> {
         let cache_key = (uri.clone(), context.body);
         if let Some(cached) = state.with_context_resolutions.get(&cache_key) {
             if let Some(receivers) = cached {
@@ -1761,7 +1778,9 @@ impl NavigationIndex {
             return None;
         }
         state.with_context_depth += 1;
-        let mut receivers = Vec::new();
+        let initial_overlay = state.with_receivers.clone();
+        let mut overlay = initial_overlay.clone();
+        let mut receiver_slots = Vec::new();
         let mut result = Some(Vec::new());
         for receiver_span in &context.receiver_spans {
             let Some(node) = document
@@ -1773,25 +1792,79 @@ impl NavigationIndex {
                 result = None;
                 break;
             };
-            let previous = std::mem::replace(&mut state.with_receivers, receivers.clone());
+            state.with_receivers = overlay.clone();
             let uncertain_before = state.receiver_resolution_uncertain();
             let resolved =
                 self.resolve_receivers_with_state(uri, document, receiver_span.start, node, state);
-            state.with_receivers = previous;
+            state.with_receivers = initial_overlay.clone();
             if (!uncertain_before && state.receiver_resolution_uncertain()) || resolved.is_empty() {
                 state.mark_receiver_uncertain();
                 result = None;
                 break;
             }
-            receivers.extend(resolved);
+            receiver_slots.push(resolved.clone());
+            overlay.extend(resolved.iter().cloned());
+            state.with_receivers = overlay.clone();
         }
+        state.with_receivers = initial_overlay;
         if result.is_some() {
-            result = Some(receivers);
+            result = Some(receiver_slots);
         }
         state
             .with_context_resolutions
             .insert(cache_key, result.clone());
         state.with_context_depth -= 1;
+        result
+    }
+
+    fn resolve_with_context_receiver_prefix(
+        &self,
+        uri: &Url,
+        document: &Document,
+        context: &WithContext,
+        receiver_index: usize,
+        state: &mut ResolutionState,
+    ) -> Option<Vec<Receiver>> {
+        if receiver_index == 0 {
+            return Some(Vec::new());
+        }
+        if state.with_context_depth >= MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            return None;
+        }
+        state.with_context_depth += 1;
+        let previous = state.with_receivers.clone();
+        let mut overlay = previous.clone();
+        let mut receivers = Vec::new();
+        let mut result = Some(Vec::new());
+        for receiver_span in context.receiver_spans.iter().take(receiver_index) {
+            let Some(node) = document
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(receiver_span.start, receiver_span.end)
+                .filter(|node| Span::from_node(*node) == *receiver_span)
+            else {
+                result = None;
+                break;
+            };
+            state.with_receivers = overlay.clone();
+            let uncertain_before = state.receiver_resolution_uncertain();
+            let resolved =
+                self.resolve_receivers_with_state(uri, document, receiver_span.start, node, state);
+            state.with_receivers = previous.clone();
+            if (!uncertain_before && state.receiver_resolution_uncertain()) || resolved.is_empty() {
+                state.mark_receiver_uncertain();
+                result = None;
+                break;
+            }
+            overlay.extend(resolved.iter().cloned());
+            receivers.extend(resolved);
+        }
+        state.with_receivers = previous;
+        state.with_context_depth -= 1;
+        if result.is_some() {
+            result = Some(receivers);
+        }
         result
     }
 
@@ -1869,18 +1942,45 @@ impl NavigationIndex {
         }
         budget.require_work(contexts.len(), cancel)?;
         for context in contexts {
-            let Some(receivers) = self.resolve_with_context_receivers_with_budget(
+            let Some(receiver_slots) = self.resolve_with_context_receivers_with_budget(
                 uri, document, context, state, cancel, budget,
             )?
             else {
                 return Ok(WithLookup::Unknown);
             };
-            for receiver in receivers.iter().rev() {
-                match self.with_receiver_lookup_with_budget(
-                    uri, document, offset, receiver, &key, state, cancel, budget,
-                )? {
-                    WithLookup::NotFound => {}
-                    lookup => return Ok(lookup),
+            for receivers in receiver_slots.iter().rev() {
+                for receiver in receivers.iter().rev() {
+                    match self.with_receiver_lookup_with_budget(
+                        uri, document, offset, receiver, &key, state, cancel, budget,
+                    )? {
+                        WithLookup::NotFound => {}
+                        lookup => return Ok(lookup),
+                    }
+                }
+            }
+        }
+
+        if overlay.is_empty() {
+            for (context, receiver_index) in document.with_receiver_contexts_at(offset) {
+                let Some(receivers) = self.resolve_with_context_receiver_prefix_with_budget(
+                    uri,
+                    document,
+                    context,
+                    receiver_index,
+                    state,
+                    cancel,
+                    budget,
+                )?
+                else {
+                    return Ok(WithLookup::Unknown);
+                };
+                for receiver in receivers.iter().rev() {
+                    match self.with_receiver_lookup_with_budget(
+                        uri, document, offset, receiver, &key, state, cancel, budget,
+                    )? {
+                        WithLookup::NotFound => {}
+                        lookup => return Ok(lookup),
+                    }
                 }
             }
         }
@@ -1897,7 +1997,7 @@ impl NavigationIndex {
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<Option<Vec<Receiver>>, String> {
+    ) -> Result<Option<Vec<Vec<Receiver>>>, String> {
         let cache_key = (uri.clone(), context.body);
         if let Some(cached) = state.with_context_resolutions.get(&cache_key) {
             if let Some(receivers) = cached {
@@ -1914,7 +2014,9 @@ impl NavigationIndex {
         state.with_context_depth += 1;
         let result = (|| {
             budget.require_work(context.receiver_spans.len(), cancel)?;
-            let mut receivers = Vec::new();
+            let initial_overlay = state.with_receivers.clone();
+            let mut overlay = initial_overlay.clone();
+            let mut receiver_slots = Vec::new();
             for receiver_span in &context.receiver_spans {
                 check_navigation_cancel(cancel)?;
                 let Some(node) = document
@@ -1926,7 +2028,7 @@ impl NavigationIndex {
                     state.mark_receiver_uncertain();
                     return Ok(None);
                 };
-                let previous = std::mem::replace(&mut state.with_receivers, receivers.clone());
+                state.with_receivers = overlay.clone();
                 let uncertain_before = state.receiver_resolution_uncertain();
                 let resolved = self.resolve_receivers_with_state_and_budget(
                     uri,
@@ -1939,7 +2041,7 @@ impl NavigationIndex {
                     budget,
                     0,
                 );
-                state.with_receivers = previous;
+                state.with_receivers = initial_overlay.clone();
                 let resolved = resolved?;
                 if (!uncertain_before && state.receiver_resolution_uncertain())
                     || resolved.is_empty()
@@ -1947,15 +2049,84 @@ impl NavigationIndex {
                     state.mark_receiver_uncertain();
                     return Ok(None);
                 }
-                receivers.extend(resolved);
+                receiver_slots.push(resolved.clone());
+                overlay.extend(resolved.iter().cloned());
+                state.with_receivers = overlay.clone();
             }
-            Ok(Some(receivers))
+            state.with_receivers = initial_overlay;
+            Ok(Some(receiver_slots))
         })();
         if let Ok(resolved) = &result {
             state
                 .with_context_resolutions
                 .insert(cache_key, resolved.clone());
         }
+        state.with_context_depth -= 1;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with_context_receiver_prefix_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        context: &WithContext,
+        receiver_index: usize,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Vec<Receiver>>, String> {
+        if receiver_index == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if state.with_context_depth >= MAX_WITH_CONTEXT_RECURSION_DEPTH {
+            state.mark_receiver_uncertain();
+            return Ok(None);
+        }
+        state.with_context_depth += 1;
+        let result = (|| {
+            budget.require_work(receiver_index, cancel)?;
+            let previous = state.with_receivers.clone();
+            let mut overlay = previous.clone();
+            let mut receivers = Vec::new();
+            for receiver_span in context.receiver_spans.iter().take(receiver_index) {
+                check_navigation_cancel(cancel)?;
+                let Some(node) = document
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(receiver_span.start, receiver_span.end)
+                    .filter(|node| Span::from_node(*node) == *receiver_span)
+                else {
+                    state.mark_receiver_uncertain();
+                    state.with_receivers = previous;
+                    return Ok(None);
+                };
+                state.with_receivers = overlay.clone();
+                let uncertain_before = state.receiver_resolution_uncertain();
+                let resolved = self.resolve_receivers_with_state_and_budget(
+                    uri,
+                    document,
+                    receiver_span.start,
+                    node,
+                    node,
+                    state,
+                    cancel,
+                    budget,
+                    0,
+                )?;
+                state.with_receivers = previous.clone();
+                if (!uncertain_before && state.receiver_resolution_uncertain())
+                    || resolved.is_empty()
+                {
+                    state.mark_receiver_uncertain();
+                    return Ok(None);
+                }
+                overlay.extend(resolved.iter().cloned());
+                receivers.extend(resolved);
+            }
+            state.with_receivers = previous;
+            Ok(Some(receivers))
+        })();
         state.with_context_depth -= 1;
         result
     }
@@ -2422,8 +2593,28 @@ impl NavigationIndex {
                             .child_by_field_name("lhs")
                             .is_some_and(|lhs| Span::from_node(lhs) == Span::from_node(node))
                 });
-                if is_qualified_receiver
-                    && !self
+                if is_qualified_receiver {
+                    let uncertain_before = state.receiver_resolution_uncertain();
+                    let receivers = self.resolve_identifier_receiver_with_budget(
+                        current_uri,
+                        current_document,
+                        offset,
+                        name,
+                        lookup_identifier,
+                        state,
+                        cancel,
+                        budget,
+                    )?;
+                    if !receivers.is_empty() {
+                        if receivers
+                            .iter()
+                            .all(|receiver| matches!(receiver, Receiver::Unit(_)))
+                        {
+                            state.receiver_uncertain = uncertain_before;
+                        }
+                        return Ok(receivers);
+                    }
+                    let references = self
                         .unqualified_references_with_budget_and_state_without_with(
                             current_uri,
                             current_document,
@@ -2433,21 +2624,33 @@ impl NavigationIndex {
                             state,
                             cancel,
                             budget,
-                        )?
-                        .is_empty()
-                {
-                    return self.resolve_identifier_receiver_with_budget_without_with(
+                        )?;
+                    if !references.is_empty() {
+                        return self.resolve_identifier_receiver_with_budget_without_with(
+                            current_uri,
+                            current_document,
+                            offset,
+                            name,
+                            lookup_identifier,
+                            state,
+                            cancel,
+                            budget,
+                        );
+                    }
+                    let unit_urls = self.visible_unit_urls_with_budget(
                         current_uri,
                         current_document,
                         offset,
                         name,
-                        lookup_identifier,
-                        state,
                         cancel,
                         budget,
-                    );
+                    )?;
+                    if !unit_urls.is_empty() {
+                        state.receiver_uncertain = uncertain_before;
+                    }
+                    return Ok(unit_urls.into_iter().map(Receiver::Unit).collect());
                 }
-                self.resolve_identifier_receiver_with_budget(
+                let receivers = self.resolve_identifier_receiver_with_budget(
                     current_uri,
                     current_document,
                     offset,
@@ -2456,7 +2659,8 @@ impl NavigationIndex {
                     state,
                     cancel,
                     budget,
-                )
+                )?;
+                Ok(receivers)
             }
             "exprParens" => first_named_child(node)
                 .map(|operand| {
@@ -3910,6 +4114,8 @@ impl NavigationIndex {
     #[allow(clippy::too_many_arguments)]
     fn routine_owner_substitution_with_budget(
         &self,
+        current_uri: &Url,
+        offset: usize,
         candidate: &Candidate,
         fallback: &GenericSubstitution,
         owner_instances: &[TypeInstance],
@@ -3920,6 +4126,22 @@ impl NavigationIndex {
         let Some(symbol) = self.symbol(candidate) else {
             return Ok(None);
         };
+        if owner_instances.is_empty() {
+            if let Some(substitutions) = state.with_member_substitutions.get(&(
+                current_uri.clone(),
+                offset,
+                candidate.clone(),
+            )) {
+                if substitutions.len() != 1 {
+                    return Ok(None);
+                }
+                let mut result = substitutions[0].clone();
+                for parameter in &symbol.generic_parameters {
+                    result.remove(&parameter.name);
+                }
+                return Ok(Some(result));
+            }
+        }
         let Some(owner_key) = symbol.owner_type.as_deref() else {
             let mut result = fallback.clone();
             for parameter in &symbol.generic_parameters {
@@ -7579,7 +7801,7 @@ struct ResolutionState {
     receiver_uncertain: bool,
     with_receivers: Vec<Receiver>,
     with_context_depth: usize,
-    with_context_resolutions: HashMap<(Url, Span), Option<Vec<Receiver>>>,
+    with_context_resolutions: HashMap<(Url, Span), Option<Vec<Vec<Receiver>>>>,
     with_member_substitutions: HashMap<(Url, usize, Candidate), Vec<GenericSubstitution>>,
     suppress_with_lookup: bool,
 }
@@ -8083,6 +8305,37 @@ impl Document {
             )
         });
         contexts
+    }
+
+    fn with_receiver_contexts_at(&self, offset: usize) -> Vec<(&WithContext, usize)> {
+        let mut contexts = self
+            .with_contexts
+            .iter()
+            .filter_map(|context| {
+                context
+                    .receiver_spans
+                    .iter()
+                    .position(|span| span.contains_offset(offset))
+                    .map(|receiver_index| (context, receiver_index))
+            })
+            .collect::<Vec<_>>();
+        contexts.sort_by_key(|(context, _)| {
+            (
+                context.body.end.saturating_sub(context.body.start),
+                context.body.start,
+            )
+        });
+        contexts
+    }
+
+    fn has_with_context_at(&self, offset: usize) -> bool {
+        self.with_contexts.iter().any(|context| {
+            context.body.contains_offset(offset)
+                || context
+                    .receiver_spans
+                    .iter()
+                    .any(|span| span.contains_offset(offset))
+        })
     }
 
     fn result_type_annotation_for_body_scope(&self, scope: usize) -> Option<ResultTypeAnnotation> {
@@ -9647,11 +9900,33 @@ fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Op
 
 fn declaration_name_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(name) = node.child_by_field_name("name") else {
+        if matches!(node.kind(), "varDef" | "varAssignDef") {
+            return (0..node.named_child_count())
+                .filter_map(|index| node.named_child(index))
+                .find(|child| child.kind() == "identifier")
+                .into_iter()
+                .collect();
+        }
         return Vec::new();
     };
     let mut result = Vec::new();
     collect_name_identifiers(name, &mut result);
     result
+}
+
+fn is_declaration_identifier(identifier: Node<'_>) -> bool {
+    let identifier_span = Span::from_node(identifier);
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        if declaration_name_identifiers(node)
+            .into_iter()
+            .any(|name| Span::from_node(name) == identifier_span)
+        {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
 }
 
 fn collect_name_identifiers<'a>(node: Node<'a>, result: &mut Vec<Node<'a>>) {

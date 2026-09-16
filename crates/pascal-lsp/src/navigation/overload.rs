@@ -407,6 +407,9 @@ fn generic_substitution_for_group(
     budget: &mut AssistanceBudget,
 ) -> Result<Option<(GenericSubstitution, bool)>, String> {
     let Some(owner_substitution) = index.routine_owner_substitution_with_budget(
+        current_uri,
+        call.child_by_field_name("entity")
+            .map_or(0, |entity| entity.start_byte()),
         candidate,
         receiver_substitution,
         owner_instances,

@@ -79,6 +79,22 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `:checkhealth vim.lsp` | Inspect attachment, executable, and client configuration |
 | `:lua print(vim.lsp.log.get_filename())` | Locate the LSP log, including server stderr |
 
+### Background analysis
+
+Navigation, formatting, and open-buffer diagnostics run as cancellable,
+snapshot-based background work. The server limits analysis to two concurrent
+jobs, so the stdio loop remains responsive while a source or dependency graph
+is being read. Diagnostics stay debounced and coalesced per document; if both
+worker slots are occupied, the diagnostic request is retried rather than
+spawning an unbounded worker.
+
+Results are checked against the captured source/configuration generations and
+filesystem/configuration read set; diagnostics also verify the open-document
+version. A stale navigation or formatting result is rejected for retry, while
+a stale or cancelled diagnostic is silently discarded. Cancelling a navigation
+or formatting request returns the standard LSP `RequestCanceled` error
+(`-32800`) exactly once.
+
 If argument types identify one supported overload, Neovim receives that
 declaration/result; otherwise it presents the retained overload set rather than
 the server guessing. Keep the cursor on the identifier, not on whitespace

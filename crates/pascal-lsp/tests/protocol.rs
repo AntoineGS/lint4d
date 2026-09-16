@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -156,6 +156,11 @@ struct TestServer {
     _environment: Option<TempDir>,
 }
 
+struct TestBarrier {
+    entered: PathBuf,
+    release: PathBuf,
+}
+
 impl TestServer {
     fn launch() -> Self {
         Self::launch_with_environment(tempfile::tempdir().expect("isolated server environment"))
@@ -168,6 +173,47 @@ impl TestServer {
     }
 
     fn launch_with_environment_path(environment: &Path) -> Self {
+        Self::launch_with_environment_path_and_variable(environment, None, None)
+    }
+
+    fn launch_with_navigation_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_NAVIGATION_BARRIER")
+    }
+
+    fn launch_with_formatting_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_FORMATTING_BARRIER")
+    }
+
+    fn launch_with_diagnostics_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER")
+    }
+
+    fn launch_with_barrier(environment: TempDir, variable: &str) -> (Self, TestBarrier) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_with_environment_path_and_variable(
+            environment.path(),
+            Some(variable),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    fn launch_with_environment_path_and_variable(
+        environment: &Path,
+        variable: Option<&str>,
+        value: Option<&str>,
+    ) -> Self {
         let executable = env!("CARGO_BIN_EXE_pascal-lsp");
         let mut child = Command::new(executable)
             .arg("--stdio")
@@ -176,6 +222,7 @@ impl TestServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .envs(variable.into_iter().zip(value))
             .spawn()
             .expect("launch pascal-lsp");
         let stdout = child.stdout.take().expect("child stdout");
@@ -242,6 +289,30 @@ impl TestServer {
             match message {
                 Message::Response(response) if &response.id == expected_id => return response,
                 other => self.pending.push_back(other),
+            }
+        }
+    }
+
+    fn assert_no_response(&mut self, expected_id: &RequestId) {
+        assert!(
+            !self
+                .pending
+                .iter()
+                .any(|message| matches!(message, Message::Response(response) if &response.id == expected_id)),
+            "duplicate response for {expected_id:?}"
+        );
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(Message::Response(response)))) if &response.id == expected_id => {
+                    panic!("duplicate response for {expected_id:?}: {response:?}");
+                }
+                Ok(Ok(Some(message))) => self.pending.push_back(message),
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => panic!("failed reading duplicate-response check: {error}"),
+                Err(RecvTimeoutError::Timeout) => return,
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     }
@@ -562,6 +633,32 @@ impl TestServer {
             status.success(),
             "LSP server exited unsuccessfully: {status}"
         );
+    }
+}
+
+impl TestBarrier {
+    fn wait_until_entered(&self) {
+        self.wait_for_entries(1);
+    }
+
+    fn wait_for_entries(&self, expected: usize) {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        while Instant::now() < deadline {
+            let entries = match fs::read(&self.entered) {
+                Ok(contents) => contents.len().max(1),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+                Err(error) => panic!("could not inspect analysis barrier: {error}"),
+            };
+            if entries >= expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("expected {expected} analysis workers at the test barrier");
+    }
+
+    fn release(&self) {
+        fs::write(&self.release, b"release").expect("release analysis barrier");
     }
 }
 
@@ -17476,5 +17573,397 @@ fn recursive_generic_constraint_completion_fails_closed_and_keeps_server_respons
         responsive.error.is_none(),
         "server stopped responding after recursive generic completion: {responsive:?}"
     );
+    server.shutdown();
+}
+
+#[test]
+fn blocked_navigation_does_not_block_unrelated_lsp_requests() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let navigation_id = RequestId::from("blocked-navigation".to_string());
+    server.send_request(
+        navigation_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    let symbols_id = RequestId::from("while-navigation-is-blocked".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "unrelated request was blocked by navigation: {symbols:?}"
+    );
+    assert!(
+        symbols.result.is_some(),
+        "document symbols must be returned"
+    );
+
+    barrier.release();
+    let locations = result_locations(server.response(&navigation_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn blocked_formatting_does_not_block_unrelated_lsp_requests() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+
+    let (mut server, barrier) = TestServer::launch_with_formatting_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let formatting_id = RequestId::from("blocked-formatting".to_string());
+    server.send_request(
+        formatting_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    barrier.wait_until_entered();
+
+    let symbols_id = RequestId::from("while-formatting-is-blocked".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "unrelated request was blocked by formatting: {symbols:?}"
+    );
+    assert!(
+        symbols.result.is_some(),
+        "document symbols must be returned"
+    );
+
+    barrier.release();
+    let formatting = server.response(&formatting_id);
+    assert!(
+        formatting.error.is_none(),
+        "formatting request failed: {formatting:?}"
+    );
+    assert!(
+        formatting.result.is_some(),
+        "formatting result must be returned"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let first_source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let second_source = first_source.replace("badConst", "GoodConst");
+    write_file(&main, first_source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules]\nconstant-naming = \"warning\"\n[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_source
+            }
+        }),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+    barrier.release();
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(diagnostics["version"], 2);
+    assert!(
+        diagnostics["diagnostics"].as_array().unwrap().is_empty(),
+        "stale diagnostics from version 1 were published: {diagnostics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn full_analysis_queue_returns_busy_without_starting_an_extra_worker() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let first_id = RequestId::from("full-queue-first".to_string());
+    let second_id = RequestId::from("full-queue-second".to_string());
+    for id in [first_id.clone(), second_id.clone()] {
+        server.send_request(
+            id,
+            "textDocument/definition",
+            navigation_params(&main, main_source, "PublicRoutine", 0),
+        );
+    }
+    barrier.wait_for_entries(2);
+
+    let busy_id = RequestId::from("full-queue-busy".to_string());
+    server.send_request(
+        busy_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let busy = server.response(&busy_id);
+    let error = busy
+        .error
+        .expect("full queue must reject the third request");
+    assert_eq!(error.code, -32803);
+    assert_eq!(error.message, "analysis server is busy; retry the request");
+
+    barrier.release();
+    let first_locations = result_locations(server.response(&first_id));
+    let second_locations = result_locations(server.response(&second_id));
+    assert_eq!(first_locations.len(), 1);
+    assert_eq!(second_locations.len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn cancelling_blocked_navigation_returns_one_request_cancelled_response() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("cancelled-blocked-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "cancelled-blocked-navigation"}),
+    );
+
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("cancelled navigation must return an error");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.assert_no_response(&request_id);
+    server.shutdown();
+}
+
+#[test]
+fn cancelling_blocked_formatting_returns_one_request_cancelled_response() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&main, source);
+
+    let (mut server, barrier) = TestServer::launch_with_formatting_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("cancelled-blocked-formatting".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "cancelled-blocked-formatting"}),
+    );
+
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("cancelled formatting must return an error");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.assert_no_response(&request_id);
+    server.shutdown();
+}
+
+#[test]
+fn configuration_invalidation_discards_an_in_flight_diagnostic_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let config = root.join(".lint4d.toml");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &config,
+        "[rules]\nconstant-naming = \"warning\"\n[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    barrier.wait_until_entered();
+
+    write_file(&config, "[rules]\nconstant-naming = \"off\"\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&config), "type": 2}]}),
+    );
+    barrier.release();
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(diagnostics["version"], 1);
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "constant-naming"),
+        "diagnostics from the invalidated configuration were published: {diagnostics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn rapid_document_changes_coalesce_to_one_final_diagnostic_computation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let config = root.join(".lint4d.toml");
+    let source_v1 = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let source_v2 = source_v1.replace("badConst", "anotherConst");
+    let source_v3 = source_v1.replace("badConst", "GoodConst");
+    write_file(&main, source_v1);
+    write_file(
+        &config,
+        "[rules]\nconstant-naming = \"warning\"\n[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source_v1
+            }
+        }),
+    );
+    barrier.wait_until_entered();
+    barrier.release();
+    let initial = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(initial["version"], 1);
+
+    fs::remove_file(&barrier.entered).expect("reset diagnostic barrier entry");
+    fs::remove_file(&barrier.release).expect("reset diagnostic barrier release");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": source_v2}]
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 3},
+            "contentChanges": [{"text": source_v3}]
+        }),
+    );
+    barrier.wait_until_entered();
+    let entries = fs::read(&barrier.entered).expect("read diagnostic barrier entries");
+    assert_eq!(
+        entries.len(),
+        1,
+        "rapid changes must not start more than one final diagnostic computation"
+    );
+    barrier.release();
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(diagnostics["version"], 3);
+    server.shutdown();
+}
+
+#[test]
+fn shutdown_cancels_a_blocked_analysis_worker_before_exiting() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("shutdown-blocked-navigation".to_string());
+    server.send_request(
+        request_id,
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_until_entered();
     server.shutdown();
 }

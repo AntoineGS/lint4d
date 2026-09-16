@@ -61,6 +61,7 @@ const MAX_WORKSPACE_WARNINGS: usize = 256;
 const MAX_DELETED_OVERRIDES: usize = 256;
 const MAX_DOCUMENT_OWNERS: usize = 4_096;
 const MAX_FORMAT_EXTERNAL_TRAVERSAL_ENTRIES: usize = 1_048_576;
+const DIAGNOSTIC_RETRY: Duration = Duration::from_millis(25);
 pub(crate) const MAX_CONFIGURATION_WATCH_PATHS: usize = 256;
 const CONFIGURATION_FILENAMES: [&str; 2] = [".lint4d.toml", ".fmt4d.toml"];
 
@@ -310,7 +311,7 @@ struct PackageCatalogueKey {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ContextState {
+pub(crate) struct ContextState {
     context: ProjectContext,
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
@@ -350,6 +351,16 @@ impl ContextState {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NavigationState {
+    contexts: HashMap<ContextKey, ContextState>,
+    document_contexts: HashMap<Url, ContextKey>,
+    open_document_contexts: HashMap<Url, ContextKey>,
+    document_owners: HashMap<Url, KnownDocumentOwner>,
+    owner_last_used: HashMap<Url, u64>,
+    use_clock: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +594,7 @@ pub struct Workspace {
     package_catalogue_epoch: u64,
     package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
     warnings: Vec<String>,
+    analysis_records: Option<HashMap<Url, rename::SourceRecord>>,
     source_generation: u64,
     configuration_generation: u64,
 }
@@ -629,6 +641,104 @@ impl Workspace {
             }
         }
         workspace
+    }
+
+    pub(crate) fn from_analysis_input(input: &rename::WorkspaceInput) -> Self {
+        let roots = input
+            .roots
+            .iter()
+            .cloned()
+            .map(|root| WorkspaceRoot::new(root, &input.options))
+            .collect();
+        let open_documents = input
+            .overlays
+            .iter()
+            .map(|(uri, overlay)| {
+                (
+                    uri.clone(),
+                    OpenDocument {
+                        text: Some(overlay.text.clone()),
+                        version: overlay.version,
+                        rejection: None,
+                    },
+                )
+            })
+            .chain(input.rejected_documents.iter().map(|uri| {
+                let reason = input
+                    .rejection_reasons
+                    .get(uri)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        "open document was rejected by workspace limits".to_string()
+                    });
+                (
+                    uri.clone(),
+                    OpenDocument {
+                        text: None,
+                        version: input
+                            .document_versions
+                            .get(uri)
+                            .copied()
+                            .unwrap_or_default(),
+                        rejection: Some(reason),
+                    },
+                )
+            }))
+            .collect();
+        Self {
+            options: input.options.clone(),
+            overrides: input.overrides.clone(),
+            roots,
+            open_documents,
+            deleted_overrides: input.deleted_overrides.clone(),
+            document_owners: input.document_owners.clone(),
+            project_selections: input.project_selections.clone(),
+            analysis_records: Some(HashMap::new()),
+            source_generation: input.source_generation,
+            configuration_generation: input.configuration_generation,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn navigation_state(&self) -> NavigationState {
+        NavigationState {
+            contexts: self.contexts.clone(),
+            document_contexts: self.document_contexts.clone(),
+            open_document_contexts: self.open_document_contexts.clone(),
+            document_owners: self.document_owners.clone(),
+            owner_last_used: self.owner_last_used.clone(),
+            use_clock: self.use_clock,
+        }
+    }
+
+    pub(crate) fn apply_navigation_state(&mut self, state: NavigationState) {
+        for (key, incoming) in state.contexts {
+            let preserve_existing = !incoming.context.discovery_complete
+                && self.contexts.get(&key).is_some_and(|existing| {
+                    existing.context.discovery_complete
+                        && self.context_has_open_legacy_overlay(existing)
+                });
+            if !preserve_existing {
+                self.contexts.insert(key, incoming);
+            }
+        }
+        self.document_contexts.extend(state.document_contexts);
+        self.open_document_contexts
+            .extend(state.open_document_contexts);
+        for (uri, incoming) in state.document_owners {
+            let preserve_existing = !incoming.state.context.discovery_complete
+                && self.document_owners.get(&uri).is_some_and(|existing| {
+                    existing.state.context.discovery_complete
+                        && self.context_has_open_legacy_overlay(&existing.state)
+                });
+            if !preserve_existing {
+                self.document_owners.insert(uri, incoming);
+            }
+        }
+        self.owner_last_used.extend(state.owner_last_used);
+        self.use_clock = self.use_clock.max(state.use_clock);
+        self.trim_document_owners();
+        self.prune_unused_contexts();
     }
 
     /// Kept as a compatibility no-op for callers of the original workspace
@@ -742,71 +852,68 @@ impl Workspace {
         position: Position,
         target: NavigationTarget,
     ) -> Vec<Location> {
-        self.package_catalogue_epoch = self.package_catalogue_epoch.wrapping_add(1);
-        let context_key = match self.context_for_uri(uri) {
-            Ok(context_key) => context_key,
+        let cancel = AtomicBool::new(false);
+        match self.navigate_with_cancel(uri, position, target, &cancel) {
+            Ok(locations) => locations,
             Err(error) => {
                 self.warn(error);
-                return Vec::new();
+                Vec::new()
             }
-        };
+        }
+    }
+
+    pub(crate) fn navigate_with_cancel(
+        &mut self,
+        uri: &Url,
+        position: Position,
+        target: NavigationTarget,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Location>, String> {
+        check_workspace_cancel(Some(cancel))?;
+        self.package_catalogue_epoch = self.package_catalogue_epoch.wrapping_add(1);
+        let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
         if self.context_has_invalid_project_selection(&context_key) {
-            self.warn(format!(
+            return Err(format!(
                 "project selection is invalid; navigation is unavailable for {uri}"
             ));
-            return Vec::new();
         }
         if self.context_has_override_error(&context_key) {
-            self.warn(format!(
+            return Err(format!(
                 "project override configuration is invalid; navigation is unavailable for {uri}"
             ));
-            return Vec::new();
         }
         if !self.ensure_supported_with_context(uri, &context_key) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let empty_pins = HashSet::new();
-        match self.load_source(uri, &context_key, &empty_pins) {
+        match self.load_source_with_cancel(uri, &context_key, &empty_pins, Some(cancel)) {
             Ok(true) => {}
-            Ok(false) => return Vec::new(),
-            Err(error) => {
-                self.warn(error);
-                return Vec::new();
-            }
+            Ok(false) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
         }
 
         for _attempt in 0..2 {
+            check_workspace_cancel(Some(cancel))?;
             let mut pinned = HashSet::new();
             pinned.insert(uri.clone());
-            let locations = match self.resolve_navigation_once(
+            let locations = self.resolve_navigation_once_with_cancel(
                 uri,
                 position,
                 target,
                 &context_key,
                 &mut pinned,
-            ) {
-                Ok(locations) => locations,
-                Err(error) => {
-                    self.warn(error);
-                    return Vec::new();
-                }
-            };
-            let changed = match self.revalidate_pinned(&pinned, &context_key) {
-                Ok(changed) => changed,
-                Err(error) => {
-                    self.warn(error);
-                    return Vec::new();
-                }
-            };
+                Some(cancel),
+            )?;
+            let changed =
+                self.revalidate_pinned_with_cancel(&pinned, &context_key, Some(cancel))?;
             if !changed {
-                return locations;
+                return Ok(locations);
             }
         }
-        self.warn(format!(
+        Err(format!(
             "navigation source changed repeatedly while resolving {}; result is incomplete",
             uri
-        ));
-        Vec::new()
+        ))
     }
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
@@ -1169,7 +1276,7 @@ impl Workspace {
             .min()
     }
 
-    pub fn take_due_diagnostics(&mut self) -> Vec<(Url, Option<i32>, Vec<LspDiagnostic>)> {
+    pub(crate) fn take_due_diagnostic_requests(&mut self) -> Vec<(Url, Option<i32>)> {
         let now = Instant::now();
         let due: Vec<Url> = self
             .pending_diagnostics
@@ -1182,7 +1289,22 @@ impl Workspace {
             let Some(document) = self.open_documents.get(&uri) else {
                 continue;
             };
-            let version = Some(document.version);
+            result.push((uri, Some(document.version)));
+        }
+        result
+    }
+
+    pub(crate) fn retry_diagnostics(&mut self, uri: Url) {
+        self.pending_diagnostics
+            .insert(uri, Instant::now() + DIAGNOSTIC_RETRY);
+    }
+
+    pub fn take_due_diagnostics(&mut self) -> Vec<(Url, Option<i32>, Vec<LspDiagnostic>)> {
+        let mut result = Vec::new();
+        for (uri, version) in self.take_due_diagnostic_requests() {
+            let Some(_document) = self.open_documents.get(&uri) else {
+                continue;
+            };
             result.push((uri.clone(), version, self.diagnostics_for(&uri)));
         }
         result
@@ -1305,6 +1427,152 @@ impl Workspace {
         )))
     }
 
+    pub(crate) fn formatting_edit_with_cancel(
+        &mut self,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<Option<TextEdit>, String> {
+        check_workspace_cancel(Some(cancel))?;
+        let path = uri
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("not a file URI: {uri}"))?;
+        if !is_pascal_path(&path) {
+            return Err(format!(
+                "unsupported Pascal file extension: {}",
+                path.display()
+            ));
+        }
+        let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
+        let context = self
+            .contexts
+            .get(&context_key)
+            .map(|state| state.context.clone())
+            .ok_or_else(|| format!("project context was not retained for {uri}"))?;
+        if has_invalid_project_selection(&context) {
+            return Err(format!(
+                "project selection is invalid; select a current project or Automatic for {uri}"
+            ));
+        }
+        if let Some(error) = context.override_error.as_deref() {
+            return Err(format!(
+                "project override configuration is invalid for {uri}: {error}"
+            ));
+        }
+        let legacy_route = self.legacy_route_is_current(uri, &path, &context_key);
+        if !self.ensure_supported_project_context_with_legacy_route(
+            &path,
+            &context,
+            Some(&context_key),
+            legacy_route,
+        ) {
+            return Err(format!(
+                "document is outside configured source paths: {uri}"
+            ));
+        }
+
+        let source = if let Some((source, version, rejection)) =
+            self.open_documents.get(uri).map(|document| {
+                (
+                    document.text.clone(),
+                    document.version,
+                    document.rejection.clone(),
+                )
+            }) {
+            if let Some(reason) = rejection {
+                return Err(format!("document rejected: {reason}"));
+            }
+            let Some(source) = source else {
+                return Err(format!("document rejected: {uri}"));
+            };
+            self.record_open_analysis_source(uri, &source, version);
+            source
+        } else {
+            let entry = context_path_entry(&context, &path)
+                .or_else(|| {
+                    legacy_route.then_some(ProjectPathEntry {
+                        path: path.clone(),
+                        provenance: ProjectPathProvenance::LegacyNative,
+                    })
+                })
+                .ok_or_else(|| format!("document is outside configured source paths: {uri}"))?;
+            let legacy_payload = matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                && (legacy_route
+                    || project_path_entry_for(&context, &path).is_some_and(|entry| {
+                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    }));
+            let source = read_disk_source_with_cancel(
+                &path,
+                self.options.limits.max_file_bytes,
+                &context.read_policy,
+                &entry,
+                legacy_payload,
+                Some(cancel),
+            )?;
+            self.record_closed_analysis_source(
+                uri,
+                &source.text,
+                source.stamp.clone(),
+                source.content_hash,
+                &path,
+                &context.read_policy,
+                &entry,
+            );
+            source.text
+        };
+        check_workspace_cancel(Some(cancel))?;
+        if source.len() > self.options.limits.max_file_bytes {
+            return Err(self.file_too_large_message(uri, source.len()));
+        }
+        ensure_safe_tree_depth(&path, source.as_bytes())?;
+        check_workspace_cancel(Some(cancel))?;
+        let roots = self.workspace_root_paths();
+        let candidates = project_candidates_with_cancel(&path, &roots, Some(cancel))?;
+        let project_directory =
+            self.configuration_project_directory(&path, &context, Some(&context_key), &candidates);
+        let directories = config_directories(&path, project_directory.as_deref(), &roots)?;
+        check_workspace_cancel(Some(cancel))?;
+        let resolved_config = resolve_fmt(&directories, 4 * 1024 * 1024)?;
+        self.record_configuration_reads(&resolved_config, cancel)?;
+        let config = resolved_config.value;
+        let external_units = if config.uses.group {
+            let root = config
+                .project_root
+                .as_deref()
+                .ok_or_else(|| "formatting external-unit scan has no project root".to_string())?;
+            let mut external_units = scan_external_units_with_cancel(
+                root,
+                &config.uses.external_paths,
+                &self.options.limits,
+                cancel,
+            )?;
+            for project_unit in project_unit_stems(&context, &path) {
+                external_units.remove(&project_unit);
+            }
+            external_units
+        } else {
+            HashSet::new()
+        };
+        check_workspace_cancel(Some(cancel))?;
+        let formatted = fmt4d::format_source(
+            source.as_bytes(),
+            &FileInfo::new(path.clone()),
+            &config,
+            &external_units,
+        )
+        .map_err(|error| error.to_string())?;
+        check_workspace_cancel(Some(cancel))?;
+        if formatted == source {
+            return Ok(None);
+        }
+        let end = text::offset_to_position(&source, source.len())
+            .ok_or_else(|| "could not compute full-document UTF-16 range".to_string())?;
+        Ok(Some(TextEdit::new(
+            Range::new(Position::new(0, 0), end),
+            formatted,
+        )))
+    }
+
     fn refresh_loaded_disk(&mut self, uri: &Url) {
         let Some(context_key) = self.document_contexts.get(uri).cloned() else {
             self.remove_indexed(uri);
@@ -1316,13 +1584,14 @@ impl Workspace {
         }
     }
 
-    fn resolve_navigation_once(
+    fn resolve_navigation_once_with_cancel(
         &mut self,
         uri: &Url,
         position: Position,
         target: NavigationTarget,
         context_key: &ContextKey,
         pinned: &mut HashSet<Url>,
+        cancel: Option<&AtomicBool>,
     ) -> Result<Vec<Location>, String> {
         // Rebuild the request's bindings from the current source graph. This
         // prevents a deleted or changed dependency from surviving in a stale
@@ -1334,6 +1603,7 @@ impl Workspace {
         let mut work = 0;
 
         loop {
+            check_workspace_cancel(cancel)?;
             let locations = self.index.navigate(uri, position, target);
             if !locations.is_empty() {
                 return Ok(locations);
@@ -1344,12 +1614,15 @@ impl Workspace {
 
             let mut next = Vec::new();
             for current in frontier.drain(..) {
+                check_workspace_cancel(cancel)?;
                 if !visited.insert(current.clone()) {
                     continue;
                 }
                 work += 1;
-                let dependencies = self.load_imports(&current, context_key, pinned)?;
+                let dependencies =
+                    self.load_imports_with_cancel(&current, context_key, pinned, cancel)?;
                 for dependency in dependencies {
+                    check_workspace_cancel(cancel)?;
                     if initialized.insert(dependency.clone()) {
                         self.index.clear_import_bindings(&dependency);
                     }
@@ -1371,16 +1644,8 @@ impl Workspace {
             ));
         }
 
+        check_workspace_cancel(cancel)?;
         Ok(self.index.navigate(uri, position, target))
-    }
-
-    fn load_imports(
-        &mut self,
-        uri: &Url,
-        context_key: &ContextKey,
-        pinned: &mut HashSet<Url>,
-    ) -> Result<Vec<Url>, String> {
-        self.load_imports_with_cancel(uri, context_key, pinned, None)
     }
 
     fn load_imports_with_cancel(
@@ -1562,13 +1827,19 @@ impl Workspace {
             return Ok(false);
         }
 
-        if let Some(document) = self.open_documents.get(uri) {
-            if let Some(reason) = &document.rejection {
+        if let Some((source, version, rejection)) = self.open_documents.get(uri).map(|document| {
+            (
+                document.text.clone(),
+                document.version,
+                document.rejection.clone(),
+            )
+        }) {
+            if let Some(reason) = rejection {
                 return Err(format!(
                     "document {uri} was rejected and cannot be used for analysis: {reason}"
                 ));
             }
-            let Some(source) = document.text.clone() else {
+            let Some(source) = source else {
                 return Ok(false);
             };
             if self.index.contains(uri) {
@@ -1578,9 +1849,21 @@ impl Workspace {
                 if legacy_route_granted {
                     self.remember_legacy_route(uri, context_key, &path);
                 }
+                self.record_open_analysis_source(uri, &source, version);
                 return Ok(true);
             }
-            return self.index_source_with_cancel(uri, source, None, context_key, pinned, cancel);
+            let indexed = self.index_source_with_cancel(
+                uri,
+                source.clone(),
+                None,
+                context_key,
+                pinned,
+                cancel,
+            )?;
+            if indexed {
+                self.record_open_analysis_source(uri, &source, version);
+            }
+            return Ok(indexed);
         }
 
         let Some(current_stamp) = disk_stamp(&path) else {
@@ -1595,6 +1878,17 @@ impl Workspace {
             check_workspace_cancel(cancel)?;
             self.touch(uri);
             self.set_document_context(uri, context_key)?;
+            if let Some(source) = self.index.source_text(uri).map(str::to_owned) {
+                self.record_closed_analysis_source(
+                    uri,
+                    &source,
+                    current_stamp,
+                    content_hash_bytes(source.as_bytes()),
+                    &path,
+                    &context.read_policy,
+                    &entry,
+                );
+            }
             return Ok(true);
         }
         let source = match read_disk_source_with_cancel(
@@ -1613,17 +1907,31 @@ impl Workspace {
                 return Ok(false);
             }
         };
-        let stamp = source.stamp;
+        let DiskSource {
+            text,
+            bytes,
+            stamp,
+            content_hash,
+        } = source;
         let indexed = self.index_source_with_cancel(
             uri,
-            source.text,
-            Some(source.bytes),
+            text.clone(),
+            Some(bytes),
             context_key,
             pinned,
             cancel,
         )?;
         if indexed {
-            self.disk_stamps.insert(uri.clone(), stamp);
+            self.disk_stamps.insert(uri.clone(), stamp.clone());
+            self.record_closed_analysis_source(
+                uri,
+                &text,
+                stamp.clone(),
+                content_hash,
+                &path,
+                &context.read_policy,
+                &entry,
+            );
             if legacy_route_granted {
                 self.remember_legacy_route(uri, context_key, &path);
             }
@@ -1762,14 +2070,16 @@ impl Workspace {
         self.last_used.insert(uri.clone(), self.use_clock);
     }
 
-    fn revalidate_pinned(
+    fn revalidate_pinned_with_cancel(
         &mut self,
         pinned: &HashSet<Url>,
         context_key: &ContextKey,
+        cancel: Option<&AtomicBool>,
     ) -> Result<bool, String> {
         let mut changed = false;
         let pins = HashSet::new();
         for uri in pinned {
+            check_workspace_cancel(cancel)?;
             if self.open_documents.contains_key(uri) {
                 continue;
             }
@@ -1777,11 +2087,130 @@ impl Workspace {
                 continue;
             };
             if disk_stamp(&path) != self.disk_stamps.get(uri).cloned() {
-                self.load_source(uri, context_key, &pins)?;
+                self.load_source_with_cancel(uri, context_key, &pins, cancel)?;
                 changed = true;
             }
         }
         Ok(changed)
+    }
+
+    fn record_open_analysis_source(&mut self, uri: &Url, text: &str, version: i32) {
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        records.insert(
+            uri.clone(),
+            rename::SourceRecord {
+                uri: uri.clone(),
+                text: text.to_string(),
+                version: Some(version),
+                stamp: None,
+                open: true,
+                path: None,
+                path_stamp: None,
+                content_hash: None,
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: None,
+                path_entry: None,
+                include_payload: false,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_closed_analysis_source(
+        &mut self,
+        uri: &Url,
+        text: &str,
+        stamp: DiskStamp,
+        content_hash: u64,
+        path: &Path,
+        read_policy: &crate::project::ReadPolicy,
+        path_entry: &ProjectPathEntry,
+    ) {
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        records.insert(
+            uri.clone(),
+            rename::SourceRecord {
+                uri: uri.clone(),
+                text: text.to_string(),
+                version: None,
+                stamp: Some(stamp),
+                open: false,
+                path: Some(path.to_path_buf()),
+                path_stamp: path_stamp(path),
+                content_hash: Some(content_hash),
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: Some(read_policy.clone()),
+                path_entry: Some(path_entry.clone()),
+                include_payload: false,
+            },
+        );
+    }
+
+    pub(crate) fn analysis_records(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<rename::SourceRecord>, String> {
+        let mut records = self
+            .analysis_records
+            .as_ref()
+            .map(|records| records.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for state in self.contexts.values() {
+            records.extend(rename::consumed_context_records(state, cancel)?);
+        }
+        Ok(records)
+    }
+
+    fn record_configuration_reads<T>(
+        &mut self,
+        resolved: &crate::configuration::ResolvedConfig<T>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let Some(records) = self.analysis_records.as_mut() else {
+            return Ok(());
+        };
+        for (path, content) in resolved
+            .checked_paths
+            .iter()
+            .zip(resolved.checked_contents.iter())
+        {
+            check_workspace_cancel(Some(cancel))?;
+            let path = absolute_path(path.clone());
+            let path_stamp = path_stamp_result(&path).map_err(|error| {
+                format!(
+                    "could not inspect configuration candidate {}: {error}",
+                    path.display()
+                )
+            })?;
+            let Some(uri) = Url::from_file_path(&path).ok() else {
+                continue;
+            };
+            records.insert(
+                uri.clone(),
+                rename::SourceRecord {
+                    uri,
+                    text: String::new(),
+                    version: None,
+                    stamp: None,
+                    open: false,
+                    path: Some(path),
+                    path_stamp,
+                    content_hash: content.as_ref().map(|bytes| content_hash_bytes(bytes)),
+                    content_bytes: content.clone(),
+                    candidate_membership: None,
+                    read_policy: None,
+                    path_entry: None,
+                    include_payload: false,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn context_for_uri(&mut self, uri: &Url) -> Result<ContextKey, String> {
@@ -4086,6 +4515,12 @@ impl Workspace {
         self.configuration_generation
     }
 
+    pub(crate) fn document_version(&self, uri: &Url) -> Option<i32> {
+        self.open_documents
+            .get(uri)
+            .map(|document| document.version)
+    }
+
     fn bump_source_generation(&mut self) {
         self.source_generation = self.source_generation.wrapping_add(1);
     }
@@ -4128,97 +4563,108 @@ impl Workspace {
             .insert(uri, Instant::now() + DIAGNOSTIC_DEBOUNCE);
     }
 
-    fn diagnostics_for(&self, uri: &Url) -> Vec<LspDiagnostic> {
+    fn diagnostics_for(&mut self, uri: &Url) -> Vec<LspDiagnostic> {
+        let cancel = AtomicBool::new(false);
+        match self.diagnostics_for_with_cancel(uri, &cancel) {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
+        }
+    }
+
+    pub(crate) fn diagnostics_for_with_cancel(
+        &mut self,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<LspDiagnostic>, String> {
+        check_workspace_cancel(Some(cancel))?;
         let Some(document) = self.open_documents.get(uri) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if let Some(rejection) = &document.rejection {
-            return vec![server_diagnostic(rejection, DiagnosticSeverity::ERROR)];
+            return Ok(vec![server_diagnostic(
+                rejection,
+                DiagnosticSeverity::ERROR,
+            )]);
         }
         let source = document
             .text
             .as_deref()
             .expect("accepted open documents retain their text");
         let lint_source = normalize_line_endings(source);
+        check_workspace_cancel(Some(cancel))?;
         let path = match uri.to_file_path() {
             Ok(path) => absolute_path(path),
-            Err(()) => {
-                return vec![server_diagnostic(
-                    "not a file URI",
-                    DiagnosticSeverity::ERROR,
-                )];
-            }
+            Err(()) => return Err("not a file URI".to_string()),
         };
         if let Err(error) = ensure_safe_tree_depth(&path, lint_source.as_bytes()) {
-            return vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)];
+            return Ok(vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)]);
         }
-        let roots = self
-            .roots
-            .iter()
-            .map(|root| root.path.clone())
-            .collect::<Vec<_>>();
-        let project_options = self.project_options();
-        let (context_key, context) =
-            match self.readonly_context_for_uri(uri, &path, &roots, &project_options) {
-                Ok(result) => result,
-                Err(error) => {
-                    return vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)];
-                }
-            };
+        let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
+        let context = self
+            .contexts
+            .get(&context_key)
+            .map(|state| state.context.clone())
+            .ok_or_else(|| format!("project context was not retained for {uri}"))?;
         if has_invalid_project_selection(&context) {
-            return vec![server_diagnostic(
+            return Ok(vec![server_diagnostic(
                 "project selection is invalid; select a current project or Automatic",
                 DiagnosticSeverity::ERROR,
-            )];
+            )]);
         }
-        let candidates = match project_candidates(&path, &roots) {
-            Ok(candidates) => candidates,
-            Err(error) => return vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
-        };
+        if let Some(error) = context.override_error.as_deref() {
+            return Ok(vec![server_diagnostic(
+                &format!("project override configuration is invalid for {uri}: {error}"),
+                DiagnosticSeverity::ERROR,
+            )]);
+        }
+        check_workspace_cancel(Some(cancel))?;
+        let roots = self.workspace_root_paths();
+        let candidates = project_candidates_with_cancel(&path, &roots, Some(cancel))?;
         let project_directory =
             self.configuration_project_directory(&path, &context, Some(&context_key), &candidates);
-        let directories = match config_directories(&path, project_directory.as_deref(), &roots) {
-            Ok(directories) => directories,
-            Err(error) => return vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
-        };
-        let resolved_config = match resolve_lint(&directories, 4 * 1024 * 1024) {
-            Ok(config) => config,
-            Err(error) => return vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
-        };
+        check_workspace_cancel(Some(cancel))?;
+        let directories = config_directories(&path, project_directory.as_deref(), &roots)?;
+        check_workspace_cancel(Some(cancel))?;
+        let resolved_config = resolve_lint(&directories, 4 * 1024 * 1024)?;
+        self.record_configuration_reads(&resolved_config, cancel)?;
+        check_workspace_cancel(Some(cancel))?;
         if is_lint_excluded(
             &path,
             resolved_config.path.as_deref(),
             &resolved_config.value.exclude,
         ) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let config = resolved_config.value;
+        check_workspace_cancel(Some(cancel))?;
         let raw = lint4d::engine::run_lint(&FileInfo::new(path), lint_source.as_bytes(), &config);
+        check_workspace_cancel(Some(cancel))?;
         let line_index = DiagnosticLineIndex::new(&lint_source);
-        raw.into_iter()
-            .map(|diagnostic| {
-                let range = line_index.range(
-                    diagnostic.line,
-                    diagnostic.column,
-                    diagnostic.end_line,
-                    diagnostic.end_column,
-                );
-                let severity = match diagnostic.severity {
-                    Severity::Error => DiagnosticSeverity::ERROR,
-                    Severity::Warning => DiagnosticSeverity::WARNING,
-                    Severity::Hint => DiagnosticSeverity::HINT,
-                };
-                LspDiagnostic::new(
-                    range,
-                    Some(severity),
-                    Some(NumberOrString::String(diagnostic.rule_id)),
-                    Some("lint4d".to_string()),
-                    diagnostic.message,
-                    None,
-                    None,
-                )
-            })
-            .collect()
+        let mut diagnostics = Vec::with_capacity(raw.len());
+        for diagnostic in raw {
+            check_workspace_cancel(Some(cancel))?;
+            let range = line_index.range(
+                diagnostic.line,
+                diagnostic.column,
+                diagnostic.end_line,
+                diagnostic.end_column,
+            );
+            let severity = match diagnostic.severity {
+                Severity::Error => DiagnosticSeverity::ERROR,
+                Severity::Warning => DiagnosticSeverity::WARNING,
+                Severity::Hint => DiagnosticSeverity::HINT,
+            };
+            diagnostics.push(LspDiagnostic::new(
+                range,
+                Some(severity),
+                Some(NumberOrString::String(diagnostic.rule_id)),
+                Some("lint4d".to_string()),
+                diagnostic.message,
+                None,
+                None,
+            ));
+        }
+        Ok(diagnostics)
     }
 }
 
@@ -4227,12 +4673,23 @@ fn scan_external_units(
     external_paths: &[String],
     limits: &ResourceLimits,
 ) -> Result<HashSet<String>, String> {
+    let cancel = AtomicBool::new(false);
+    scan_external_units_with_cancel(project_root, external_paths, limits, &cancel)
+}
+
+fn scan_external_units_with_cancel(
+    project_root: &Path,
+    external_paths: &[String],
+    limits: &ResourceLimits,
+    cancel: &AtomicBool,
+) -> Result<HashSet<String>, String> {
     let mut units = HashSet::new();
     let mut visited_entries = 0usize;
     let mut scanned_files = 0usize;
     let mut scanned_bytes = 0usize;
 
     for configured_path in external_paths {
+        check_workspace_cancel(Some(cancel))?;
         let configured_path = configured_path.replace('\\', "/");
         let configured_path = PathBuf::from(configured_path);
         let path = if configured_path.is_absolute() {
@@ -4261,6 +4718,7 @@ fn scan_external_units(
         }
 
         for entry in WalkDir::new(&path).follow_links(false).into_iter() {
+            check_workspace_cancel(Some(cancel))?;
             let entry = entry.map_err(|error| {
                 format!(
                     "could not scan formatting external path {}: {error}",
@@ -4287,6 +4745,7 @@ fn scan_external_units(
             }
 
             let file_path = entry.path();
+            check_workspace_cancel(Some(cancel))?;
             let metadata = fs::symlink_metadata(file_path).map_err(|error| {
                 format!(
                     "could not inspect formatting external unit {}: {error}",
@@ -4449,7 +4908,7 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
     Ok(true)
 }
 
-fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> LspDiagnostic {
+pub(crate) fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> LspDiagnostic {
     LspDiagnostic::new(
         Range::new(Position::new(0, 0), Position::new(0, 0)),
         Some(severity),

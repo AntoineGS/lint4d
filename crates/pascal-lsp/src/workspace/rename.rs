@@ -30,7 +30,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
@@ -97,6 +97,9 @@ pub(crate) struct WorkspaceInput {
     pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
     pub(crate) rejected_documents: HashSet<Url>,
+    pub(crate) rejection_reasons: HashMap<Url, String>,
+    pub(crate) document_versions: HashMap<Url, i32>,
+    pub(crate) deleted_overrides: HashMap<Url, Option<DiskStamp>>,
     pub(crate) source_generation: u64,
     pub(crate) configuration_generation: u64,
 }
@@ -574,6 +577,21 @@ impl Workspace {
                 document.rejection.as_ref().map(|_| canonical_file_uri(uri))
             })
             .collect();
+        let rejection_reasons = self
+            .open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                document
+                    .rejection
+                    .as_ref()
+                    .map(|reason| (canonical_file_uri(uri), reason.clone()))
+            })
+            .collect();
+        let document_versions = self
+            .open_documents
+            .iter()
+            .map(|(uri, document)| (canonical_file_uri(uri), document.version))
+            .collect();
         WorkspaceInput {
             roots: self.roots.iter().map(|root| root.path.clone()).collect(),
             options: self.options.clone(),
@@ -582,6 +600,9 @@ impl Workspace {
             document_owners: self.document_owners.clone(),
             overlays,
             rejected_documents,
+            rejection_reasons,
+            document_versions,
+            deleted_overrides: self.deleted_overrides.clone(),
             source_generation: self.source_generation,
             configuration_generation: self.configuration_generation,
         }
@@ -1145,13 +1166,7 @@ pub(crate) fn owner_for_input(
     let uri = canonical_file_uri(uri);
     let owner_origin = input.document_owners.get(&uri).map(|owner| owner.origin);
 
-    let mut workspace = Workspace::with_override_session(
-        input.roots.clone(),
-        input.options.clone(),
-        input.overrides.clone(),
-    );
-    workspace.project_selections = input.project_selections.clone();
-    workspace.document_owners = input.document_owners.clone();
+    let mut workspace = Workspace::from_analysis_input(input);
     let key = workspace.context_for_uri_with_cancel(&uri, Some(cancel))?;
     let state = workspace
         .contexts
@@ -1297,13 +1312,7 @@ pub(crate) fn project_context_and_metadata_for_input(
     uri: &Url,
     cancel: &AtomicBool,
 ) -> Result<(ProjectContext, Vec<SourceRecord>), String> {
-    let mut workspace = Workspace::with_override_session(
-        input.roots.clone(),
-        input.options.clone(),
-        input.overrides.clone(),
-    );
-    workspace.project_selections = input.project_selections.clone();
-    workspace.document_owners = input.document_owners.clone();
+    let mut workspace = Workspace::from_analysis_input(input);
     let context_key = workspace.context_for_uri_with_cancel(uri, Some(cancel))?;
     let state = workspace
         .contexts
@@ -1322,7 +1331,7 @@ pub(crate) fn project_context_and_metadata_for_owner(
     Ok((owner.state.context.clone(), records))
 }
 
-fn consumed_context_records(
+pub(crate) fn consumed_context_records(
     state: &super::ContextState,
     cancel: &AtomicBool,
 ) -> Result<Vec<SourceRecord>, String> {
@@ -4962,6 +4971,9 @@ fn read_record_content_bytes(
             "include payload does not have a byte-for-byte revalidation record".to_string(),
         );
     }
+    if is_configuration_file(path) && record.read_policy.is_none() && record.path_entry.is_none() {
+        return read_configuration_record_bytes(path, cancel);
+    }
     let (read_policy, path_entry) = record.payload_dependency()?;
     read_exact_file_bytes(path, read_policy, path_entry, cancel)
 }
@@ -4983,8 +4995,82 @@ fn read_record_content_hash(
         }
         return Ok(super::content_hash_bytes(&bytes));
     }
+    if is_configuration_file(path) && record.read_policy.is_none() && record.path_entry.is_none() {
+        let bytes = read_configuration_record_bytes(path, cancel)?;
+        return Ok(super::content_hash_bytes(&bytes));
+    }
     let (read_policy, path_entry) = record.payload_dependency()?;
     file_content_hash(path, read_policy, path_entry, cancel)
+}
+
+fn read_configuration_record_bytes(path: &Path, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let link_metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "could not inspect configuration candidate {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = if link_metadata.file_type().is_symlink() {
+        fs::metadata(path).map_err(|error| {
+            format!(
+                "could not inspect configuration candidate {}: {error}",
+                path.display()
+            )
+        })?
+    } else {
+        link_metadata
+    };
+    if !metadata.is_file() {
+        return Err(format!(
+            "configuration candidate {} is not a regular file",
+            path.display()
+        ));
+    }
+    let file = open_configuration_record(path).map_err(|error| {
+        format!(
+            "could not read configuration candidate {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_RENAME_CONFIG_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "could not read configuration candidate {}: {error}",
+                path.display()
+            )
+        })?;
+    if bytes.len() > MAX_RENAME_CONFIG_BYTES {
+        return Err(format!(
+            "configuration candidate {} exceeds the maximum size of {MAX_RENAME_CONFIG_BYTES} bytes",
+            path.display()
+        ));
+    }
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn open_configuration_record(path: &Path) -> io::Result<fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const O_NONBLOCK: i32 = 0o4000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_configuration_record(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
 }
 
 #[allow(dead_code)]

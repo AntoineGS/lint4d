@@ -4,7 +4,8 @@ use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
-    FileChange, MAX_CONFIGURATION_WATCH_PATHS, Workspace, WorkspaceOptions, canonical_file_uri,
+    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, Workspace, WorkspaceOptions,
+    canonical_file_uri,
 };
 use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
@@ -24,12 +25,12 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error;
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SERVER_NAME: &str = "pascal-lsp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -37,7 +38,42 @@ const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_ANALYSIS_JOBS: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
+const TEST_NAVIGATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_NAVIGATION_BARRIER";
+const TEST_FORMATTING_BARRIER_ENV: &str = "PASCAL_LSP_TEST_FORMATTING_BARRIER";
+const TEST_DIAGNOSTICS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER";
+const ANALYSIS_BUSY_MESSAGE: &str = "analysis server is busy; retry the request";
+
+fn wait_at_test_barrier(variable: &str, cancel: &AtomicBool) -> Result<(), String> {
+    let Some(spec) = std::env::var_os(variable) else {
+        return Ok(());
+    };
+    let spec = spec.to_string_lossy();
+    let Some((entered, release)) = spec.split_once('|') else {
+        return Err(format!("{variable} must contain <entered>|<release>"));
+    };
+    let entered = PathBuf::from(entered);
+    let release = PathBuf::from(release);
+    let mut marker = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&entered)
+        .map_err(|error| format!("could not enter {variable}: {error}"))?;
+    marker
+        .write_all(b"x")
+        .map_err(|error| format!("could not record entry into {variable}: {error}"))?;
+    drop(marker);
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(rename::CANCELLATION_MESSAGE.to_string());
+        }
+        if release.exists() {
+            return Ok(());
+        }
+        thread::sleep(ANALYSIS_POLL_INTERVAL);
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ClientFeatures {
@@ -90,6 +126,17 @@ enum AnalysisRequest {
         uri: Url,
         position: Position,
     },
+    Navigation {
+        uri: Url,
+        position: Position,
+        target: NavigationTarget,
+    },
+    Formatting {
+        uri: Url,
+    },
+    Diagnostics {
+        uri: Url,
+    },
     TypeDefinitions {
         uri: Url,
         position: Position,
@@ -127,6 +174,9 @@ enum AnalysisResultValue {
     Hover(Result<Option<lsp_types::Hover>, String>),
     Completion(Result<lsp_types::CompletionList, String>),
     SignatureHelp(Result<Option<lsp_types::SignatureHelp>, String>),
+    Navigation(NavigationAnalysis),
+    Formatting(Result<Option<lsp_types::TextEdit>, String>),
+    Diagnostics(DiagnosticsAnalysis),
     TypeDefinitions(Result<Vec<lsp_types::Location>, String>),
     Prepare(Result<PrepareRenameResponse, String>),
     Rename(Box<Result<WorkspaceEdit, String>>),
@@ -140,6 +190,18 @@ enum AnalysisResultValue {
     WorkspaceSymbols(Result<Vec<lsp_types::SymbolInformation>, String>),
     References(Result<Vec<lsp_types::Location>, String>),
     DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
+}
+
+struct NavigationAnalysis {
+    value: Result<Vec<lsp_types::Location>, String>,
+    state: Option<NavigationState>,
+}
+
+struct DiagnosticsAnalysis {
+    uri: Url,
+    version: Option<i32>,
+    value: Result<Vec<lsp_types::Diagnostic>, String>,
+    discard: bool,
 }
 
 struct AnalysisResult {
@@ -255,6 +317,8 @@ struct AnalysisJobs {
     sender: Sender<AnalysisResult>,
     receiver: Receiver<AnalysisResult>,
     pending: std::collections::HashMap<RequestId, PendingAnalysis>,
+    diagnostics: HashSet<RequestId>,
+    next_internal_id: u64,
 }
 
 impl AnalysisJobs {
@@ -264,6 +328,8 @@ impl AnalysisJobs {
             sender,
             receiver,
             pending: std::collections::HashMap::new(),
+            diagnostics: HashSet::new(),
+            next_internal_id: 0,
         }
     }
 
@@ -275,7 +341,7 @@ impl AnalysisJobs {
         features: ClientFeatures,
     ) -> Result<(), String> {
         if self.pending.len() >= MAX_ANALYSIS_JOBS {
-            return Err("analysis server is busy; retry the request".to_string());
+            return Err(ANALYSIS_BUSY_MESSAGE.to_string());
         }
         let input = workspace.analysis_input();
         let source_generation = input.source_generation;
@@ -295,6 +361,27 @@ impl AnalysisJobs {
             AnalysisRequest::SignatureHelp { .. } => AnalysisResultValue::SignatureHelp(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
+            AnalysisRequest::Navigation { .. } => {
+                AnalysisResultValue::Navigation(NavigationAnalysis {
+                    value: Err(
+                        "analysis worker failed without changing workspace state".to_string()
+                    ),
+                    state: None,
+                })
+            }
+            AnalysisRequest::Formatting { .. } => AnalysisResultValue::Formatting(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::Diagnostics { uri } => {
+                AnalysisResultValue::Diagnostics(DiagnosticsAnalysis {
+                    uri: uri.clone(),
+                    version: input.document_versions.get(uri).copied(),
+                    value: Err(
+                        "analysis worker failed without changing workspace state".to_string()
+                    ),
+                    discard: false,
+                })
+            }
             AnalysisRequest::TypeDefinitions { .. } => AnalysisResultValue::TypeDefinitions(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
@@ -329,6 +416,7 @@ impl AnalysisJobs {
                 Err("analysis worker failed without changing workspace state".to_string()),
             ),
         };
+        let diagnostic = matches!(&request, AnalysisRequest::Diagnostics { .. });
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
             .spawn(move || {
@@ -383,6 +471,125 @@ impl AnalysisJobs {
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
                                 value: AnalysisResultValue::SignatureHelp(computed.value),
+                            }
+                        }
+                        AnalysisRequest::Navigation {
+                            uri,
+                            position,
+                            target,
+                        } => {
+                            if let Err(error) = wait_at_test_barrier(
+                                TEST_NAVIGATION_BARRIER_ENV,
+                                &worker_cancellation,
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id.clone(),
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::Navigation(NavigationAnalysis {
+                                        value: Err(error),
+                                        state: None,
+                                    }),
+                                }
+                            } else {
+                                let computed = queries::navigation_from_input(
+                                    input,
+                                    &uri,
+                                    position,
+                                    target,
+                                    &worker_cancellation,
+                                );
+                                let (value, state) = match computed.value {
+                                    Ok(result) => (Ok(result.locations), Some(result.state)),
+                                    Err(error) => (Err(error), None),
+                                };
+                                AnalysisResult {
+                                    id: worker_id.clone(),
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::Navigation(NavigationAnalysis {
+                                        value,
+                                        state,
+                                    }),
+                                }
+                            }
+                        }
+                        AnalysisRequest::Formatting { uri } => {
+                            if let Err(error) = wait_at_test_barrier(
+                                TEST_FORMATTING_BARRIER_ENV,
+                                &worker_cancellation,
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id.clone(),
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::Formatting(Err(error)),
+                                }
+                            } else {
+                                let computed = queries::formatting_from_input(
+                                    input,
+                                    &uri,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id.clone(),
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::Formatting(computed.value),
+                                }
+                            }
+                        }
+                        AnalysisRequest::Diagnostics { uri } => {
+                            let version = validation_input.document_versions.get(&uri).copied();
+                            if let Err(error) = wait_at_test_barrier(
+                                TEST_DIAGNOSTICS_BARRIER_ENV,
+                                &worker_cancellation,
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id.clone(),
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::Diagnostics(DiagnosticsAnalysis {
+                                        uri,
+                                        version,
+                                        value: Err(error),
+                                        discard: false,
+                                    }),
+                                }
+                            } else {
+                                let computed = queries::diagnostics_from_input(
+                                    input,
+                                    &uri,
+                                    &worker_cancellation,
+                                );
+                                let value = computed.value.map(|result| DiagnosticsAnalysis {
+                                    uri: result.uri,
+                                    version: result.version,
+                                    value: Ok(result.diagnostics),
+                                    discard: false,
+                                });
+                                AnalysisResult {
+                                    id: worker_id.clone(),
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: match value {
+                                        Ok(analysis) => AnalysisResultValue::Diagnostics(analysis),
+                                        Err(error) => {
+                                            AnalysisResultValue::Diagnostics(DiagnosticsAnalysis {
+                                                uri,
+                                                version,
+                                                value: Err(error),
+                                                discard: false,
+                                            })
+                                        }
+                                    },
+                                }
                             }
                         }
                         AnalysisRequest::TypeDefinitions { uri, position } => {
@@ -560,13 +767,34 @@ impl AnalysisJobs {
             })
             .map_err(|error| format!("could not start analysis worker: {error}"))?;
         self.pending.insert(
-            id,
+            id.clone(),
             PendingAnalysis {
                 cancellation,
                 handle,
             },
         );
+        if diagnostic {
+            self.diagnostics.insert(id);
+        }
         Ok(())
+    }
+
+    fn start_diagnostics(&mut self, uri: Url, workspace: &Workspace) -> Result<(), String> {
+        let id = RequestId::from(format!("pascal-lsp-diagnostics-{}", self.next_internal_id));
+        self.next_internal_id = self.next_internal_id.wrapping_add(1);
+        let features = ClientFeatures {
+            action_resolve: false,
+            action_disabled: false,
+            document_changes: false,
+            hierarchical_document_symbols: false,
+            hover_markdown: false,
+        };
+        self.start(
+            id,
+            AnalysisRequest::Diagnostics { uri },
+            workspace,
+            features,
+        )
     }
 
     fn cancel(&self, id: &RequestId) {
@@ -576,24 +804,29 @@ impl AnalysisJobs {
         }
     }
 
+    fn cancel_diagnostics(&self) {
+        for id in &self.diagnostics {
+            self.cancel(id);
+        }
+    }
+
     fn poll(
         &mut self,
         connection: &Connection,
-        workspace: &Workspace,
+        workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Ok(result) = self.receiver.try_recv() {
-            if let Some(job) = self.pending.remove(&result.id) {
-                let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
-                let _ = job.handle.join();
-                if cancelled {
-                    let mut result = result;
-                    invalidate_analysis_result(
-                        &mut result,
-                        rename::CANCELLATION_MESSAGE.to_string(),
-                    );
-                    deliver_analysis_result(connection, workspace, result)?;
-                    continue;
-                }
+            self.diagnostics.remove(&result.id);
+            let Some(job) = self.pending.remove(&result.id) else {
+                continue;
+            };
+            let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = job.handle.join();
+            if cancelled {
+                let mut result = result;
+                invalidate_analysis_result(&mut result, rename::CANCELLATION_MESSAGE.to_string());
+                deliver_analysis_result(connection, workspace, result)?;
+                continue;
             }
             deliver_analysis_result(connection, workspace, result)?;
         }
@@ -605,29 +838,69 @@ impl AnalysisJobs {
     }
 
     fn shutdown(&mut self) {
-        let pending = std::mem::take(&mut self.pending);
-        for (_, job) in pending {
+        let mut pending = std::mem::take(&mut self.pending)
+            .into_values()
+            .collect::<Vec<_>>();
+        for job in &pending {
             job.cancellation
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = job.handle.join();
+        }
+        self.diagnostics.clear();
+
+        let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
+        while !pending.is_empty() {
+            let mut remaining = Vec::with_capacity(pending.len());
+            for job in pending {
+                if job.handle.is_finished() {
+                    let _ = job.handle.join();
+                } else {
+                    remaining.push(job);
+                }
+            }
+            if remaining.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                // Workers own only immutable snapshots and channel clones, so
+                // dropping these handles safely detaches non-cancellable work.
+                break;
+            }
+            pending = remaining;
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
     }
 }
 
 fn deliver_analysis_result(
     connection: &Connection,
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     result: AnalysisResult,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if result.source_generation != workspace.source_generation()
         || result.configuration_generation != workspace.configuration_generation()
     {
+        if matches!(&result.value, AnalysisResultValue::Diagnostics(_)) {
+            return Ok(());
+        }
         return send_error(
             connection,
             result.id,
             ErrorCode::RequestFailed,
             "analysis result became stale; retry the request",
         );
+    }
+    let mut result = result;
+    if let AnalysisResultValue::Diagnostics(diagnostics) = &result.value {
+        if diagnostics.discard
+            || workspace.document_version(&diagnostics.uri) != diagnostics.version
+        {
+            return Ok(());
+        }
+    }
+    if let AnalysisResultValue::Navigation(navigation) = &mut result.value {
+        if let Some(state) = navigation.state.take() {
+            workspace.apply_navigation_state(state);
+        }
     }
     match result.value {
         AnalysisResultValue::Hover(value) => match value {
@@ -641,6 +914,36 @@ fn deliver_analysis_result(
         AnalysisResultValue::SignatureHelp(value) => match value {
             Ok(value) => send_ok(connection, result.id, value),
             Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::Navigation(navigation) => match navigation.value {
+            Ok(value) => send_ok(connection, result.id, GotoDefinitionResponse::Array(value)),
+            Err(error) => send_analysis_error(connection, result.id, error),
+        },
+        AnalysisResultValue::Formatting(value) => match value {
+            Ok(Some(edit)) => send_ok(connection, result.id, vec![edit]),
+            Ok(None) => send_ok(connection, result.id, Vec::<lsp_types::TextEdit>::new()),
+            Err(error) if error == rename::CANCELLATION_MESSAGE => {
+                send_analysis_error(connection, result.id, error)
+            }
+            Err(error) => send_error(
+                connection,
+                result.id,
+                ErrorCode::RequestFailed,
+                format!("formatting failed: {error}"),
+            ),
+        },
+        AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
+            Ok(value) => send_diagnostics(connection, &diagnostics.uri, diagnostics.version, value),
+            Err(error) if error == rename::CANCELLATION_MESSAGE => Ok(()),
+            Err(error) => send_diagnostics(
+                connection,
+                &diagnostics.uri,
+                diagnostics.version,
+                vec![crate::workspace::server_diagnostic(
+                    &error,
+                    lsp_types::DiagnosticSeverity::ERROR,
+                )],
+            ),
         },
         AnalysisResultValue::TypeDefinitions(value) => match value {
             Ok(value) => send_ok(connection, result.id, GotoDefinitionResponse::Array(value)),
@@ -695,6 +998,15 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::Hover(value) => *value = Err(error),
         AnalysisResultValue::Completion(value) => *value = Err(error),
         AnalysisResultValue::SignatureHelp(value) => *value = Err(error),
+        AnalysisResultValue::Navigation(navigation) => {
+            navigation.state = None;
+            navigation.value = Err(error);
+        }
+        AnalysisResultValue::Formatting(value) => *value = Err(error),
+        AnalysisResultValue::Diagnostics(diagnostics) => {
+            diagnostics.value = Err(error);
+            diagnostics.discard = true;
+        }
         AnalysisResultValue::TypeDefinitions(value) => *value = Err(error),
         AnalysisResultValue::Prepare(value) => *value = Err(error),
         AnalysisResultValue::Rename(value) => **value = Err(error),
@@ -993,7 +1305,9 @@ fn event_loop(
     let mut shutdown_received = false;
     let mut jobs = AnalysisJobs::new();
     loop {
-        publish_due_diagnostics(connection, workspace)?;
+        if !shutdown_received {
+            publish_due_diagnostics(connection, workspace, &mut jobs)?;
+        }
         jobs.poll(connection, workspace)?;
         let timeout = workspace
             .next_diagnostic_timeout()
@@ -1006,7 +1320,9 @@ fn event_loop(
         let message = match connection.receiver.recv_timeout(timeout) {
             Ok(message) => message,
             Err(RecvTimeoutError::Timeout) => {
-                publish_due_diagnostics(connection, workspace)?;
+                if !shutdown_received {
+                    publish_due_diagnostics(connection, workspace, &mut jobs)?;
+                }
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -1030,7 +1346,14 @@ fn event_loop(
                         "request received after shutdown",
                     )?;
                 } else {
+                    let source_generation = workspace.source_generation();
+                    let configuration_generation = workspace.configuration_generation();
                     handle_request(connection, workspace, request, client_features, &mut jobs)?;
+                    if source_generation != workspace.source_generation()
+                        || configuration_generation != workspace.configuration_generation()
+                    {
+                        jobs.cancel_diagnostics();
+                    }
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
                     }
@@ -1063,6 +1386,7 @@ fn event_loop(
                 } else if let Some(registration) = watcher_registration.as_mut() {
                     sync_file_watcher(connection, workspace, registration)?;
                 }
+                jobs.cancel_diagnostics();
             }
             Message::Response(response) => {
                 let watcher_response = watcher_registration
@@ -1432,12 +1756,20 @@ fn handle_request(
                 "textDocument/definition" => NavigationTarget::Definition,
                 _ => NavigationTarget::Implementation,
             };
-            let locations = workspace.navigate(
-                &params.text_document_position_params.text_document.uri,
-                params.text_document_position_params.position,
-                target,
-            );
-            send_ok(connection, id, GotoDefinitionResponse::Array(locations))?;
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Navigation {
+                    uri: canonical_file_uri(
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    position: params.text_document_position_params.position,
+                    target,
+                },
+                client_features,
+            )?;
         }
         "textDocument/formatting" => {
             let id = request.id.clone();
@@ -1448,16 +1780,16 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            match workspace.formatting_edit(&params.text_document.uri) {
-                Ok(Some(edit)) => send_ok(connection, id, vec![edit])?,
-                Ok(None) => send_ok(connection, id, Vec::<lsp_types::TextEdit>::new())?,
-                Err(error) => send_error(
-                    connection,
-                    id,
-                    ErrorCode::RequestFailed,
-                    format!("formatting failed: {error}"),
-                )?,
-            }
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Formatting {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                },
+                client_features,
+            )?;
         }
         _ => send_error(
             connection,
@@ -1574,9 +1906,24 @@ fn handle_notification(
 fn publish_due_diagnostics(
     connection: &Connection,
     workspace: &mut Workspace,
+    jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    for (uri, version, diagnostics) in workspace.take_due_diagnostics() {
-        send_diagnostics(connection, &uri, version, diagnostics)?;
+    for (uri, version) in workspace.take_due_diagnostic_requests() {
+        if let Err(error) = jobs.start_diagnostics(uri.clone(), workspace) {
+            if error == ANALYSIS_BUSY_MESSAGE {
+                workspace.retry_diagnostics(uri);
+            } else {
+                send_diagnostics(
+                    connection,
+                    &uri,
+                    version,
+                    vec![crate::workspace::server_diagnostic(
+                        &error,
+                        lsp_types::DiagnosticSeverity::ERROR,
+                    )],
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -1875,16 +2222,21 @@ mod tests {
     use super::{
         AnalysisJobs, AnalysisRequest, AnalysisResult, AnalysisResultValue, BoundedReader,
         ClientFeatures, FileWatcherRegistration, MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES,
-        MAX_WATCHER_REGISTRATION_RETRIES, deliver_analysis_result, invalidate_analysis_result,
+        MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, deliver_analysis_result,
+        invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
+    use crossbeam_channel::RecvTimeoutError;
     use lsp_server::{Connection, Message, RequestId, Response};
     use lsp_types::{MarkupKind, Position, PrepareRenameResponse, Range, Url};
     use pascal_core::delphi_overrides::OverrideSession;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn test_workspace(
         roots: Vec<PathBuf>,
@@ -1914,7 +2266,7 @@ mod tests {
         result
     }
 
-    fn deliver_successfully(workspace: &Workspace, result: AnalysisResult) {
+    fn deliver_successfully(workspace: &mut Workspace, result: AnalysisResult) {
         let id = result.id.clone();
         let (server, client) = Connection::memory();
         deliver_analysis_result(&server, workspace, result).expect("deliver control result");
@@ -2090,7 +2442,7 @@ mod tests {
         crate::text::offset_to_position(source, offset).expect("assistance position")
     }
 
-    fn assert_stale_delivery(workspace: &Workspace, result: AnalysisResult) {
+    fn assert_stale_delivery(workspace: &mut Workspace, result: AnalysisResult) {
         let id = result.id.clone();
         let (server, client) = Connection::memory();
         deliver_analysis_result(&server, workspace, result).expect("deliver stale result");
@@ -2298,7 +2650,7 @@ mod tests {
         let control_id = RequestId::from("generation-boundary-control".to_string());
         deliver_analysis_result(
             &server,
-            &workspace,
+            &mut workspace,
             AnalysisResult {
                 id: control_id.clone(),
                 source_generation,
@@ -2344,7 +2696,7 @@ mod tests {
         let id = RequestId::from("generation-boundary".to_string());
         deliver_analysis_result(
             &server,
-            &workspace,
+            &mut workspace,
             AnalysisResult {
                 id: id.clone(),
                 source_generation: stale_source_generation,
@@ -2395,7 +2747,7 @@ mod tests {
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_workspace_symbols_were_computed(&control);
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, control).expect("deliver control result");
+        deliver_analysis_result(&server, &mut workspace, control).expect("deliver control result");
         let Message::Response(control_response) = client.receiver.recv().expect("control response")
         else {
             panic!("expected a control response");
@@ -2424,7 +2776,7 @@ mod tests {
             .change_document(main_uri, changed.to_string(), 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, stale).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, stale).expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -2468,7 +2820,7 @@ mod tests {
         .expect("start hover control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_hover_was_computed(&control);
-        deliver_successfully(&workspace, control);
+        deliver_successfully(&mut workspace, control);
 
         let id = RequestId::from("hover-overlay-stale".to_string());
         jobs.start(
@@ -2489,7 +2841,8 @@ mod tests {
             .change_document(main_uri, changed.to_string(), 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, result).expect("deliver stale hover result");
+        deliver_analysis_result(&server, &mut workspace, result)
+            .expect("deliver stale hover result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -2538,7 +2891,7 @@ mod tests {
         .expect("start type-definition control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_type_definitions_were_computed(&control);
-        deliver_successfully(&workspace, control);
+        deliver_successfully(&mut workspace, control);
 
         let stale_id = RequestId::from("type-definition-overlay-stale".to_string());
         jobs.start(
@@ -2558,7 +2911,7 @@ mod tests {
             .change_document(provider_uri, changed_provider.to_string(), 2)
             .expect("change provider overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, stale)
+        deliver_analysis_result(&server, &mut workspace, stale)
             .expect("deliver stale type-definition result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
@@ -2602,7 +2955,7 @@ mod tests {
         .expect("start completion control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_completion_was_computed(&control);
-        deliver_successfully(&workspace, control);
+        deliver_successfully(&mut workspace, control);
 
         let stale_id = RequestId::from("completion-overlay-stale".to_string());
         jobs.start(
@@ -2622,7 +2975,7 @@ mod tests {
             .change_document(main_uri, changed, 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, stale)
+        deliver_analysis_result(&server, &mut workspace, stale)
             .expect("deliver stale completion result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
@@ -2666,7 +3019,7 @@ mod tests {
         .expect("start signature-help control request");
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_signature_help_was_computed(&control);
-        deliver_successfully(&workspace, control);
+        deliver_successfully(&mut workspace, control);
 
         let stale_id = RequestId::from("signature-help-overlay-stale".to_string());
         jobs.start(
@@ -2686,7 +3039,7 @@ mod tests {
             .change_document(main_uri, changed, 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, stale)
+        deliver_analysis_result(&server, &mut workspace, stale)
             .expect("deliver stale signature-help result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
@@ -2737,7 +3090,7 @@ mod tests {
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert_workspace_symbols_were_computed(&control);
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, control).expect("deliver control result");
+        deliver_analysis_result(&server, &mut workspace, control).expect("deliver control result");
         let Message::Response(control_response) = client.receiver.recv().expect("control response")
         else {
             panic!("expected a control response");
@@ -2778,7 +3131,7 @@ mod tests {
             "project switch must invalidate configuration generation"
         );
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, stale).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, stale).expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -2830,7 +3183,7 @@ mod tests {
             &control.value,
             AnalysisResultValue::References(Ok(locations)) if locations.len() == 1
         ));
-        deliver_successfully(&workspace, control);
+        deliver_successfully(&mut workspace, control);
 
         let id = RequestId::from("reference-overlay-stale".to_string());
         jobs.start(
@@ -2864,7 +3217,7 @@ mod tests {
             .change_document(consumer_uri, changed_consumer, 2)
             .expect("change consumer overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, result).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, result).expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -2910,7 +3263,7 @@ mod tests {
             &control.value,
             AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
         ));
-        deliver_successfully(&workspace, control);
+        deliver_successfully(&mut workspace, control);
 
         let id = RequestId::from("highlight-overlay-stale".to_string());
         jobs.start(
@@ -2943,7 +3296,7 @@ mod tests {
             .change_document(main_uri, changed, 2)
             .expect("change overlay");
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, result).expect("deliver stale result");
+        deliver_analysis_result(&server, &mut workspace, result).expect("deliver stale result");
         let Message::Response(response) = client.receiver.recv().expect("stale response") else {
             panic!("expected a stale response");
         };
@@ -2997,7 +3350,7 @@ mod tests {
             &reference_control.value,
             AnalysisResultValue::References(Ok(locations)) if locations.len() == 2
         ));
-        deliver_successfully(&workspace, reference_control);
+        deliver_successfully(&mut workspace, reference_control);
 
         let highlight_control_id = RequestId::from("project-highlight-control".to_string());
         jobs.start(
@@ -3015,7 +3368,7 @@ mod tests {
             &highlight_control.value,
             AnalysisResultValue::DocumentHighlights(Ok(highlights)) if highlights.len() == 2
         ));
-        deliver_successfully(&workspace, highlight_control);
+        deliver_successfully(&mut workspace, highlight_control);
 
         let reference_id = RequestId::from("project-reference-stale".to_string());
         jobs.start(
@@ -3061,7 +3414,7 @@ mod tests {
 
         for result in [reference, highlight] {
             let (server, client) = Connection::memory();
-            deliver_analysis_result(&server, &workspace, result).expect("deliver stale result");
+            deliver_analysis_result(&server, &mut workspace, result).expect("deliver stale result");
             let Message::Response(response) = client.receiver.recv().expect("stale response")
             else {
                 panic!("expected a stale response");
@@ -3086,7 +3439,7 @@ mod tests {
         fs::write(&provider, source).expect("provider source");
 
         let provider_uri = Url::from_file_path(&provider).expect("provider URI");
-        let workspace = test_workspace(vec![root], Default::default());
+        let mut workspace = test_workspace(vec![root], Default::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
         let computed = crate::workspace::queries::references_from_input(
@@ -3118,7 +3471,8 @@ mod tests {
         invalidate_analysis_result(&mut result, error);
 
         let (server, client) = Connection::memory();
-        deliver_analysis_result(&server, &workspace, result).expect("deliver cancellation result");
+        deliver_analysis_result(&server, &mut workspace, result)
+            .expect("deliver cancellation result");
         let Message::Response(response) = client.receiver.recv().expect("cancellation response")
         else {
             panic!("expected a cancellation response");
@@ -3134,15 +3488,17 @@ mod tests {
     #[test]
     fn delivery_rejects_a_stale_workspace_symbol_result() {
         let (server, client) = Connection::memory();
-        let workspace = test_workspace(Vec::new(), Default::default());
+        let mut workspace = test_workspace(Vec::new(), Default::default());
         let id = RequestId::from("stale-workspace-symbols".to_string());
+        let source_generation = workspace.source_generation();
+        let configuration_generation = workspace.configuration_generation();
         deliver_analysis_result(
             &server,
-            &workspace,
+            &mut workspace,
             AnalysisResult {
                 id: id.clone(),
-                source_generation: workspace.source_generation().wrapping_add(1),
-                configuration_generation: workspace.configuration_generation(),
+                source_generation: source_generation.wrapping_add(1),
+                configuration_generation,
                 records: Vec::new(),
                 value: AnalysisResultValue::WorkspaceSymbols(Ok(Vec::new())),
             },
@@ -3154,6 +3510,126 @@ mod tests {
         };
         assert_eq!(response.id, id);
         assert_eq!(response.error.expect("stale result error").code, -32803);
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_indefinitely_for_a_non_cancellable_worker() {
+        let mut jobs = AnalysisJobs::new();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let handle = thread::spawn(|| thread::sleep(Duration::from_millis(500)));
+        jobs.pending.insert(
+            RequestId::from("non-cancellable-worker".to_string()),
+            PendingAnalysis {
+                cancellation: Arc::clone(&cancellation),
+                handle,
+            },
+        );
+
+        let started = Instant::now();
+        jobs.shutdown();
+        assert!(
+            cancellation.load(std::sync::atomic::Ordering::Relaxed),
+            "shutdown must signal every worker"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "shutdown waited for a non-cancellable worker"
+        );
+    }
+
+    #[test]
+    fn poll_discards_a_result_without_a_pending_worker() {
+        let mut jobs = AnalysisJobs::new();
+        let mut workspace = test_workspace(Vec::new(), Default::default());
+        let id = RequestId::from("orphaned-analysis-result".to_string());
+        jobs.sender
+            .send(AnalysisResult {
+                id,
+                source_generation: workspace.source_generation(),
+                configuration_generation: workspace.configuration_generation(),
+                records: Vec::new(),
+                value: AnalysisResultValue::WorkspaceSymbols(Ok(Vec::new())),
+            })
+            .expect("queue orphaned result");
+        let (server, client) = Connection::memory();
+
+        jobs.poll(&server, &mut workspace)
+            .expect("poll orphaned result");
+        assert!(matches!(
+            client.receiver.recv_timeout(Duration::from_millis(25)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn formatting_read_set_rejects_changed_configuration_without_generation_event() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("Main.pas");
+        let config_path = root.join(".fmt4d.toml");
+        let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+        fs::write(&source_path, source).expect("source");
+        fs::write(&config_path, "").expect("formatting configuration");
+
+        let source_uri = Url::from_file_path(&source_path).expect("source URI");
+        let config_uri = Url::from_file_path(&config_path).expect("configuration URI");
+        let workspace = test_workspace(vec![root], Default::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed =
+            crate::workspace::queries::formatting_from_input(input.clone(), &source_uri, &cancel);
+        assert!(computed.value.is_ok(), "formatting worker must complete");
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| record.uri == config_uri),
+            "formatting result must retain the configuration read set"
+        );
+
+        fs::write(&config_path, "changed").expect("change formatting configuration");
+        let error = crate::workspace::rename::revalidate_input(&input, &computed.records, &cancel)
+            .expect_err("changed formatting configuration must invalidate the result");
+        assert!(
+            error.contains("configuration content changed")
+                || error.contains("configuration metadata or membership changed"),
+            "unexpected formatting configuration invalidation error: {error}"
+        );
+    }
+
+    #[test]
+    fn formatting_read_set_rejects_created_configuration_without_generation_event() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("Main.pas");
+        let config_path = root.join(".fmt4d.toml");
+        let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+        fs::write(&source_path, source).expect("source");
+
+        let source_uri = Url::from_file_path(&source_path).expect("source URI");
+        let config_uri = Url::from_file_path(&config_path).expect("configuration URI");
+        let workspace = test_workspace(vec![root], Default::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let computed =
+            crate::workspace::queries::formatting_from_input(input.clone(), &source_uri, &cancel);
+        assert!(computed.value.is_ok(), "formatting worker must complete");
+        assert!(
+            computed.records.iter().any(|record| {
+                record.uri == config_uri
+                    && record.path_stamp.is_none()
+                    && record.content_bytes.is_none()
+            }),
+            "formatting result must retain absent configuration candidates"
+        );
+
+        fs::write(&config_path, "created").expect("create formatting configuration");
+        let error = crate::workspace::rename::revalidate_input(&input, &computed.records, &cancel)
+            .expect_err("created formatting configuration must invalidate the result");
+        assert!(
+            error.contains("configuration metadata or membership changed"),
+            "unexpected formatting configuration invalidation error: {error}"
+        );
     }
 
     #[test]
@@ -3179,7 +3655,7 @@ mod tests {
                 .workspace
                 .change_document(fixture.provider_uri.clone(), changed_provider, 2)
                 .expect("change provider overlay");
-            assert_stale_delivery(&fixture.workspace, result);
+            assert_stale_delivery(&mut fixture.workspace, result);
         }
     }
 
@@ -3205,7 +3681,7 @@ mod tests {
                 .workspace
                 .select_project(&fixture.main_uri, Some(&fixture.project_b_uri))
                 .expect("switch selected project");
-            assert_stale_delivery(&fixture.workspace, result);
+            assert_stale_delivery(&mut fixture.workspace, result);
         }
     }
 
@@ -3249,7 +3725,7 @@ mod tests {
             .cancellation
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let (server, client) = Connection::memory();
-        jobs.poll(&server, &workspace)
+        jobs.poll(&server, &mut workspace)
             .expect("poll cancelled completion");
         let Message::Response(response) = client.receiver.recv().expect("completion response")
         else {
@@ -3286,7 +3762,7 @@ mod tests {
             .cancellation
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let (server, client) = Connection::memory();
-        jobs.poll(&server, &workspace)
+        jobs.poll(&server, &mut workspace)
             .expect("poll cancelled signature");
         let Message::Response(response) = client.receiver.recv().expect("signature response")
         else {

@@ -6,13 +6,24 @@ use super::rename::{
     reference_binding_info_for_input, snapshot_records, source_for_input_with_cancel,
     source_for_input_with_owner,
 };
-use crate::NavigationIndex;
 use crate::project::has_invalid_project_selection;
+use crate::{NavigationIndex, NavigationTarget};
 use lsp_types::{
     CompletionList, DocumentHighlight, DocumentSymbol, Hover, Location, MarkupKind, Position,
     SignatureHelp, SymbolInformation, Url,
 };
 use std::sync::atomic::AtomicBool;
+
+pub(crate) struct NavigationResult {
+    pub(crate) locations: Vec<Location>,
+    pub(crate) state: super::NavigationState,
+}
+
+pub(crate) struct DiagnosticsResult {
+    pub(crate) uri: Url,
+    pub(crate) version: Option<i32>,
+    pub(crate) diagnostics: Vec<lsp_types::Diagnostic>,
+}
 
 pub(crate) fn hover_from_input(
     input: WorkspaceInput,
@@ -702,6 +713,109 @@ pub(crate) fn document_symbols_from_input(
         value,
         records,
     }
+}
+
+pub(crate) fn navigation_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    target: NavigationTarget,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<NavigationResult> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let mut workspace = super::Workspace::from_analysis_input(&input);
+    let value = match workspace.navigate_with_cancel(&uri, position, target, cancel) {
+        Ok(locations) => Ok(locations),
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(_error) => Ok(Vec::new()),
+    };
+    let state = workspace.navigation_state();
+    let records = match workspace.analysis_records(cancel) {
+        Ok(records) => records,
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    with_records(
+        source_generation,
+        configuration_generation,
+        value.map(|locations| NavigationResult { locations, state }),
+        records,
+    )
+}
+
+pub(crate) fn formatting_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Option<lsp_types::TextEdit>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let mut workspace = super::Workspace::from_analysis_input(&input);
+    let value = match workspace.formatting_edit_with_cancel(&uri, cancel) {
+        Ok(edit) => Ok(edit),
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => Err(error),
+    };
+    let records = match workspace.analysis_records(cancel) {
+        Ok(records) => records,
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    with_records(source_generation, configuration_generation, value, records)
+}
+
+pub(crate) fn diagnostics_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<DiagnosticsResult> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    let version = input.document_versions.get(&uri).copied();
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let mut workspace = super::Workspace::from_analysis_input(&input);
+    let value = match workspace.diagnostics_for_with_cancel(&uri, cancel) {
+        Ok(diagnostics) => Ok(DiagnosticsResult {
+            uri,
+            version,
+            diagnostics,
+        }),
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => Err(error),
+    };
+    let records = match workspace.analysis_records(cancel) {
+        Ok(records) => records,
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    with_records(source_generation, configuration_generation, value, records)
 }
 
 pub(crate) fn workspace_symbols_from_input(

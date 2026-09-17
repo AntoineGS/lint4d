@@ -14295,6 +14295,50 @@ end.
 }
 
 #[test]
+fn documentation_pairing_keeps_generic_and_nongeneric_overloads_distinct() {
+    let source = r#"unit GenericDocumentationPairing;
+interface
+function Pick: Integer; overload;
+function Pick<T>: T; overload;
+implementation
+/// <summary>Generic implementation.</summary>
+function Pick<T>: T;
+begin
+  Result := Default(T);
+end;
+procedure Caller;
+begin
+  Pick<Integer>;
+end;
+end.
+"#;
+    let source_uri = uri("GenericDocumentationPairing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic documentation pairing source parses");
+
+    let generic_hover = index
+        .hover(&source_uri, position_of(source, "Pick<T>", 0))
+        .expect("generic documentation hover");
+    let generic_text = hover_text(&generic_hover);
+    assert!(
+        generic_text.contains("Generic implementation."),
+        "{generic_text}"
+    );
+    assert!(!generic_text.contains("Non-generic"), "{generic_text}");
+
+    let nongeneric_hover = index
+        .hover(&source_uri, position_of(source, "Pick: Integer", 0))
+        .expect("non-generic documentation hover");
+    let nongeneric_text = hover_text(&nongeneric_hover);
+    assert!(
+        !nongeneric_text.contains("Generic implementation."),
+        "{nongeneric_text}"
+    );
+}
+
+#[test]
 fn hover_fails_closed_for_unqualified_routines_in_unknown_class_ancestors() {
     let source = r#"unit InheritedRoutine;
 interface

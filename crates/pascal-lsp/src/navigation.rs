@@ -9229,10 +9229,12 @@ fn pair_abbreviated_definitions(
             continue;
         };
         let signature = routine_signature(node, source);
+        let generic_parameters = generic_parameters_for_node(node, source);
         let routine_key = routine_key_with_owner(
             owner_type.as_deref(),
             &name,
             &signature,
+            &generic_parameters,
             scope_for_declaration(node, scope_by_span),
         );
         declaration_nodes_by_key
@@ -9452,7 +9454,13 @@ fn add_definition_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let generic_parameters = generic_parameters_for_node(header, source);
     let routine_parameters = direct_routine_parameters(header, source);
-    let routine_key = routine_key_with_owner(owner_type.as_deref(), &name, &signature, scope);
+    let routine_key = routine_key_with_owner(
+        owner_type.as_deref(),
+        &name,
+        &signature,
+        &generic_parameters,
+        scope,
+    );
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -9520,7 +9528,13 @@ fn add_routine_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let generic_parameters = generic_parameters_for_node(node, source);
     let routine_parameters = direct_routine_parameters(node, source);
-    let routine_key = routine_key_with_owner(owner_type.as_deref(), &name, &signature, scope);
+    let routine_key = routine_key_with_owner(
+        owner_type.as_deref(),
+        &name,
+        &signature,
+        &generic_parameters,
+        scope,
+    );
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -10354,15 +10368,37 @@ fn routine_key_with_owner(
     owner_type: Option<&str>,
     name: &str,
     signature: &str,
+    generic_parameters: &[GenericParameter],
     scope: usize,
 ) -> String {
     format!(
-        "{}::{}({})@{}",
+        "{}::{}<{}>({})@{}",
         owner_type.unwrap_or_default(),
         canonical_name(name),
+        generic_shape(generic_parameters),
         signature,
         scope,
     )
+}
+
+fn generic_shape(parameters: &[GenericParameter]) -> String {
+    if parameters.is_empty() {
+        return "0".to_owned();
+    }
+    parameters
+        .iter()
+        .map(|parameter| {
+            if parameter.constraint_unsupported {
+                "!".to_owned()
+            } else {
+                parameter
+                    .constraint
+                    .as_ref()
+                    .map_or_else(|| "?".to_owned(), TypeRef::display)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn enclosing_type(node: Node<'_>, source: &str) -> Option<String> {

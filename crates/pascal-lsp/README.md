@@ -700,6 +700,8 @@ Documentation processing is bounded and cancellable:
 | Individual comment body | 64 KiB |
 | Individual XML tag | 4 KiB |
 | XML nesting depth | 64 levels |
+| Aggregate parsed documentation storage | 128 KiB |
+| Aggregate parser expansion work | 256 KiB |
 | Rendered documentation | 64 KiB |
 
 Disk discovery excludes descendants named `.git`, `.worktrees`, `target`,

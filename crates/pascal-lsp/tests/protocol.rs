@@ -4683,7 +4683,11 @@ fn documentation_formats_are_negotiated_independently_for_all_assistance_endpoin
                     "completion": {
                         "completionItem": {"documentationFormat": ["markdown"]}
                     },
-                    "signatureHelp": {"documentationFormat": ["plaintext"]}
+                    "signatureHelp": {
+                        "signatureInformation": {
+                            "documentationFormat": ["markdown", "plaintext"]
+                        }
+                    }
                 }
             }
         }),
@@ -4751,12 +4755,48 @@ fn documentation_formats_are_negotiated_independently_for_all_assistance_endpoin
     let signature = signature.result.expect("signature result");
     assert_eq!(
         signature["signatures"][0]["documentation"],
-        "Returns the value."
+        json!({"kind": "markdown", "value": "Returns `the value`."})
     );
     assert_eq!(
         signature["signatures"][0]["parameters"][0]["documentation"],
-        "The lookup name."
+        json!({"kind": "markdown", "value": "The lookup name."})
     );
+    server.shutdown();
+}
+
+#[test]
+fn bounded_documentation_expansion_keeps_the_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("BoundedDocumentation.pas");
+    let names = std::iter::repeat_n("X", 1500).collect::<Vec<_>>().join(",");
+    let value = "x".repeat(60_000);
+    let source = format!(
+        "unit BoundedDocumentation;\ninterface\n/// <param name=\"{names}\">{value}</param>\nprocedure Safe;\nimplementation\nprocedure Safe;\nbegin\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    for request_id in [
+        RequestId::from("bounded-documentation-first".to_string()),
+        RequestId::from("bounded-documentation-second".to_string()),
+    ] {
+        server.send_request(
+            request_id.clone(),
+            "textDocument/hover",
+            navigation_params(&source_path, &source, "Safe", 0),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "bounded hover failed: {response:?}"
+        );
+        assert!(
+            response.result.is_some(),
+            "bounded hover returned no result"
+        );
+    }
     server.shutdown();
 }
 

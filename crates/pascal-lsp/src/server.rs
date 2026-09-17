@@ -3644,7 +3644,12 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
     );
     let signature_help_format = preferred_documentation_format(
         &value,
-        &["textDocument", "signatureHelp", "documentationFormat"],
+        &[
+            "textDocument",
+            "signatureHelp",
+            "signatureInformation",
+            "documentationFormat",
+        ],
     );
     let folding = &value["textDocument"]["foldingRange"];
     let folding_range_limit = folding["rangeLimit"]
@@ -3801,7 +3806,11 @@ mod tests {
                 "completion": {
                     "completionItem": {"documentationFormat": ["markdown"]}
                 },
-                "signatureHelp": {"documentationFormat": ["plaintext"]}
+                "signatureHelp": {
+                    "signatureInformation": {
+                        "documentationFormat": ["markdown", "plaintext"]
+                    }
+                }
             }
         }))
         .expect("documentation capabilities");
@@ -3811,7 +3820,7 @@ mod tests {
         assert_eq!(features.completion_format, DocumentationFormat::Markdown);
         assert_eq!(
             features.signature_help_format,
-            DocumentationFormat::PlainText
+            DocumentationFormat::Markdown
         );
     }
 

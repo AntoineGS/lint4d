@@ -2,8 +2,9 @@ use super::{Document, NavigationIndex, Span};
 use crate::conditional::Truth;
 use crate::text::PositionIndex;
 use lsp_types::{FoldingRange, FoldingRangeKind, Url};
+use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use tree_sitter::Node;
 
 pub(crate) const FOLDING_KIND_COMMENT: u8 = 1;
@@ -113,6 +114,7 @@ pub(super) fn folding_ranges_with_cancel(
     let positions = PositionIndex::new_with_cancel(&document.source, cancel)
         .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
     let mut ranges = visible_ranges(document, &positions, candidates, options, cancel)?;
+    reconcile_ranges(document, &mut ranges, cancel)?;
     select_ranges(&mut ranges, options.range_limit);
     ranges.sort_by(compare_output_ranges);
     Ok(ranges.into_iter().map(|visible| visible.range).collect())
@@ -411,6 +413,177 @@ fn visible_ranges(
     Ok(unique.into_values().collect())
 }
 
+fn reconcile_ranges(
+    document: &Document,
+    ranges: &mut Vec<VisibleRange>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    ranges.sort_by(compare_reconciliation_ranges);
+    let mut retained: Vec<Option<VisibleRange>> = Vec::with_capacity(ranges.len());
+    let mut active: Vec<usize> = Vec::new();
+
+    for current in ranges.drain(..) {
+        check_cancel(cancel)?;
+        let current_start = range_start(&current.range);
+        while let Some(&parent_index) = active.last() {
+            let parent = retained[parent_index]
+                .as_ref()
+                .expect("active folding range must be retained");
+            if range_end(&parent.range) <= current_start {
+                active.pop();
+            } else {
+                break;
+            }
+        }
+
+        let current_end = range_end(&current.range);
+        let mut keep_current = true;
+        loop {
+            let Some(&parent_index) = active.last() else {
+                break;
+            };
+            let parent_end = {
+                let parent = retained[parent_index]
+                    .as_ref()
+                    .expect("active folding range must be retained");
+                range_end(&parent.range)
+            };
+            if current_end <= parent_end {
+                break;
+            }
+
+            let can_extend = {
+                let parent = retained[parent_index]
+                    .as_ref()
+                    .expect("active folding range must be retained");
+                let enclosing_end = active.iter().rev().nth(1).and_then(|&index| {
+                    retained[index]
+                        .as_ref()
+                        .map(|enclosing| range_end(&enclosing.range))
+                });
+                can_extend_range(document, parent, &current, enclosing_end)
+            };
+            if can_extend {
+                let parent = retained[parent_index]
+                    .as_mut()
+                    .expect("active folding range must be retained");
+                parent.range.end_line = current.range.end_line;
+                parent.range.end_character = current.range.end_character;
+                break;
+            }
+
+            let parent_is_preferred = {
+                let parent = retained[parent_index]
+                    .as_ref()
+                    .expect("active folding range must be retained");
+                prefer_candidate(parent.candidate, current.candidate)
+            };
+            if parent_is_preferred {
+                keep_current = false;
+                break;
+            }
+
+            retained[parent_index] = None;
+            active.pop();
+        }
+
+        if keep_current {
+            let current_index = retained.len();
+            retained.push(Some(current));
+            active.push(current_index);
+        }
+    }
+
+    *ranges = retained.into_iter().flatten().collect();
+    Ok(())
+}
+
+fn can_extend_range(
+    document: &Document,
+    parent: &VisibleRange,
+    current: &VisibleRange,
+    enclosing_end: Option<(u32, u32)>,
+) -> bool {
+    if enclosing_end.is_some_and(|end| range_end(&current.range) > end)
+        || parent.candidate.span.end >= current.candidate.span.end
+        || !trivia_between(
+            document.source.as_ref(),
+            parent.candidate.span.end,
+            current.candidate.span.end,
+        )
+    {
+        return false;
+    }
+    safe_span(
+        document,
+        Span {
+            start: parent.candidate.span.start,
+            end: current.candidate.span.end,
+        },
+    )
+}
+
+fn trivia_between(source: &str, start: usize, end: usize) -> bool {
+    let Some(tail) = source.get(start..end) else {
+        return false;
+    };
+    let bytes = tail.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\r' && bytes[index] != b'\n' {
+                index += 1;
+            }
+        } else if bytes[index] == b'{' {
+            let Some(close) = bytes[index + 1..].iter().position(|byte| *byte == b'}') else {
+                return false;
+            };
+            index += close + 2;
+        } else if bytes[index] == b'(' && bytes.get(index + 1) == Some(&b'*') {
+            let Some(close) = bytes[index + 2..]
+                .windows(2)
+                .position(|window| window == b"*)")
+            else {
+                return false;
+            };
+            index += close + 4;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn range_start(range: &FoldingRange) -> (u32, u32) {
+    (range.start_line, range.start_character.unwrap_or_default())
+}
+
+fn range_end(range: &FoldingRange) -> (u32, u32) {
+    (range.end_line, range.end_character.unwrap_or_default())
+}
+
+fn compare_reconciliation_ranges(left: &VisibleRange, right: &VisibleRange) -> Ordering {
+    range_start(&left.range)
+        .cmp(&range_start(&right.range))
+        .then_with(|| range_end(&right.range).cmp(&range_end(&left.range)))
+        .then_with(|| {
+            left.candidate
+                .category
+                .selection_rank()
+                .cmp(&right.candidate.category.selection_rank())
+        })
+        .then_with(|| left.candidate.span.start.cmp(&right.candidate.span.start))
+        .then_with(|| left.candidate.span.end.cmp(&right.candidate.span.end))
+        .then_with(|| {
+            left.candidate
+                .source_order
+                .cmp(&right.candidate.source_order)
+        })
+}
+
 fn safe_span(document: &Document, span: Span) -> bool {
     if span.start >= span.end || span.end > document.source.len() {
         return false;
@@ -530,9 +703,81 @@ fn compare_output_ranges(left: &VisibleRange, right: &VisibleRange) -> std::cmp:
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.load(AtomicOrdering::Relaxed) {
         Err(CANCELLATION_MESSAGE.to_string())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_range(
+        span_start: usize,
+        span_end: usize,
+        start_line: u32,
+        end_line: u32,
+        category: CandidateCategory,
+        source_order: usize,
+    ) -> VisibleRange {
+        VisibleRange {
+            candidate: Candidate {
+                span: Span {
+                    start: span_start,
+                    end: span_end,
+                },
+                category,
+                source_order,
+            },
+            range: FoldingRange {
+                start_line,
+                start_character: Some(0),
+                end_line,
+                end_character: Some(0),
+                kind: category.kind(),
+                collapsed_text: None,
+            },
+        }
+    }
+
+    #[test]
+    fn reconciliation_does_not_extend_nested_ranges_past_their_parent() {
+        let uri = Url::parse("file:///folding-reconciliation.pas").expect("test URI");
+        let source = format!(
+            "unit FoldingReconciliation;\ninterface\nimplementation\nend.{}",
+            " ".repeat(64)
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("synthetic reconciliation source parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let start = document.source.find("end.").expect("source suffix") + 4;
+        let mut ranges = vec![
+            synthetic_range(start, start + 10, 0, 10, CandidateCategory::Section, 0),
+            synthetic_range(start + 1, start + 20, 1, 4, CandidateCategory::Routine, 1),
+            synthetic_range(start + 2, start + 30, 2, 12, CandidateCategory::Region, 2),
+        ];
+
+        reconcile_ranges(document, &mut ranges, &AtomicBool::new(false))
+            .expect("reconciliation completes");
+        for (left_index, left) in ranges.iter().enumerate() {
+            for (right_index, right) in ranges.iter().enumerate().skip(left_index + 1) {
+                let left_start = range_start(&left.range);
+                let left_end = range_end(&left.range);
+                let right_start = range_start(&right.range);
+                let right_end = range_end(&right.range);
+                let crossing = (left_start < right_start
+                    && right_start < left_end
+                    && left_end < right_end)
+                    || (right_start < left_start && left_start < right_end && right_end < left_end);
+                assert!(
+                    !crossing,
+                    "ranges {left_index} and {right_index} cross: {left:?} vs {right:?}"
+                );
+            }
+        }
     }
 }

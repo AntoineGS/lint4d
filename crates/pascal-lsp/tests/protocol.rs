@@ -1971,6 +1971,62 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     server.shutdown();
 }
 
+fn folding_ranges_request(
+    server: &mut TestServer,
+    request_name: &str,
+    source_path: &Path,
+) -> Vec<Value> {
+    let id = RequestId::from(request_name.to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    response
+        .result
+        .expect("folding range result")
+        .as_array()
+        .expect("folding range array")
+        .clone()
+}
+
+fn assert_folding_ranges_non_crossing(ranges: &[Value], include_characters: bool) {
+    let point = |range: &Value, prefix: &str| {
+        let line = range[format!("{prefix}Line")]
+            .as_u64()
+            .expect("folding range line");
+        let character = include_characters
+            .then(|| {
+                range[format!("{prefix}Character")]
+                    .as_u64()
+                    .expect("character-mode folding range character")
+            })
+            .unwrap_or_default();
+        (line, character)
+    };
+
+    for (left_index, left) in ranges.iter().enumerate() {
+        let left_start = point(left, "start");
+        let left_end = point(left, "end");
+        for (right_index, right) in ranges.iter().enumerate().skip(left_index + 1) {
+            let right_start = point(right, "start");
+            let right_end = point(right, "end");
+            let crossing =
+                (left_start < right_start && right_start < left_end && left_end < right_end)
+                    || (right_start < left_start && left_start < right_end && right_end < left_end);
+            assert!(
+                !crossing,
+                "folding ranges {left_index} and {right_index} cross: {left:?} vs {right:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn folding_ranges_return_multiline_syntax_ranges_over_the_protocol() {
     let temp = tempfile::tempdir().expect("temporary workspace");
@@ -2014,6 +2070,110 @@ fn folding_ranges_return_multiline_syntax_ranges_over_the_protocol() {
         "if range missing from response: {ranges:?}"
     );
     server.shutdown();
+}
+
+#[test]
+fn folding_ranges_reconcile_crossing_implementation_and_region_candidates() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingCrossing.pas");
+    let source = "unit X;\ninterface\nimplementation\n{$REGION R}\nprocedure P;\nbegin\nend;\n{$ENDREGION}\nend.\n";
+    write_file(&source_path, source);
+
+    let mut character_server = TestServer::launch();
+    character_server.initialize(temp.path(), Value::Null);
+    let character_ranges = folding_ranges_request(
+        &mut character_server,
+        "folding-crossing-characters",
+        &source_path,
+    );
+    assert_folding_ranges_non_crossing(&character_ranges, true);
+    assert!(
+        character_ranges.iter().any(|range| {
+            range["kind"] == "region"
+                && range["startLine"] == 3
+                && range["startCharacter"] == 0
+                && range["endLine"] == 7
+                && range["endCharacter"] == 12
+        }),
+        "balanced region range must be preserved: {character_ranges:?}"
+    );
+    assert!(
+        character_ranges.iter().any(|range| {
+            range["startLine"] == 4
+                && range["startCharacter"] == 0
+                && range["endLine"] == 6
+                && range["endCharacter"] == 4
+        }),
+        "routine range nested inside the region must be preserved: {character_ranges:?}"
+    );
+    assert!(
+        character_ranges.iter().any(|range| {
+            range["startLine"] == 2
+                && range["startCharacter"] == 0
+                && range["endLine"] == 7
+                && range["endCharacter"] == 12
+        }),
+        "implementation section must be extended over trailing region trivia: {character_ranges:?}"
+    );
+    character_server.shutdown();
+
+    let mut line_only_server = TestServer::launch();
+    line_only_server
+        .initialize_with_folding_capabilities(temp.path(), json!({"lineFoldingOnly": true}));
+    let line_only_ranges = folding_ranges_request(
+        &mut line_only_server,
+        "folding-crossing-line-only",
+        &source_path,
+    );
+    assert_folding_ranges_non_crossing(&line_only_ranges, false);
+    assert!(
+        line_only_ranges.iter().all(|range| {
+            !range.as_object().is_some_and(|range| {
+                range.contains_key("startCharacter") || range.contains_key("endCharacter")
+            })
+        }),
+        "line-only folding ranges must omit character fields: {line_only_ranges:?}"
+    );
+    assert!(
+        line_only_ranges.iter().any(|range| {
+            range["kind"] == "region" && range["startLine"] == 3 && range["endLine"] == 7
+        }),
+        "line-only region range must be preserved: {line_only_ranges:?}"
+    );
+    assert!(
+        line_only_ranges
+            .iter()
+            .any(|range| { range["startLine"] == 2 && range["endLine"] == 7 }),
+        "line-only implementation section must include the trailing region directive: {line_only_ranges:?}"
+    );
+    line_only_server.shutdown();
+
+    let mut zero_limit_server = TestServer::launch();
+    zero_limit_server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 0}));
+    let zero_limit_ranges = folding_ranges_request(
+        &mut zero_limit_server,
+        "folding-crossing-zero-limit",
+        &source_path,
+    );
+    assert!(
+        zero_limit_ranges.is_empty(),
+        "zero range limit must remain empty"
+    );
+    zero_limit_server.shutdown();
+
+    let mut small_limit_server = TestServer::launch();
+    small_limit_server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 2}));
+    let small_limit_ranges = folding_ranges_request(
+        &mut small_limit_server,
+        "folding-crossing-small-limit",
+        &source_path,
+    );
+    assert!(
+        small_limit_ranges.len() <= 2,
+        "small range limit must be honored: {small_limit_ranges:?}"
+    );
+    assert_folding_ranges_non_crossing(&small_limit_ranges, true);
+    small_limit_server.shutdown();
 }
 
 #[test]

@@ -120,9 +120,10 @@ verify the open-document version. Hover, completion, signature help,
 declaration/definition/implementation/type-definition navigation, document
 symbols, document highlights, formatting, and diagnostics can survive an
 unrelated open-file or configuration change when their recorded source,
-provider, project metadata, lint/fmt configuration, and negative membership
-observations are unchanged. Empty results retain the same dependency and
-absence checks. Requested sources, imported providers, consumed configuration,
+provider, project metadata, lint/fmt configuration, and negative membership or
+recursive provider-absence scope observations are unchanged. Empty results
+retain the same dependency and absence checks. Requested sources, imported
+providers, consumed configuration,
 project selection, and workspace-folder changes invalidate the result.
 
 Workspace symbols, references, prepare/rename, code actions, and code-action

@@ -18760,6 +18760,183 @@ fn absent_provider_overlay_invalidates_blocked_empty_navigation_result() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn nested_absent_provider_overlay_invalidates_blocked_empty_navigation_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let nested_root = root.join("nested");
+    let main = root.join("Main.pas");
+    let provider = nested_root.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let provider_source = "unit ReviewTask12Provider;\ninterface\nprocedure ReviewTask12Routine;\nimplementation\nprocedure ReviewTask12Routine;\nbegin\nend;\nend.\n";
+    fs::create_dir_all(&nested_root).expect("existing nested source root");
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("nested-absent-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("nested fulfilled negative provider lookup must stale the old result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+
+    let fresh_request_id = RequestId::from("nested-absent-provider-navigation-fresh".to_string());
+    server.send_request(
+        fresh_request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    let locations = result_locations(server.response(&fresh_request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_nested_and_outside_provider_changes_do_not_stale_blocked_navigation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let nested_root = root.join("nested");
+    let outside_root = environment.path().join("outside");
+    let main = root.join("Main.pas");
+    let unrelated_nested = nested_root.join("DifferentProvider.pas");
+    let outside_provider = outside_root.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let unrelated_source = "unit DifferentProvider;\ninterface\nimplementation\nend.\n";
+    fs::create_dir_all(&nested_root).expect("existing nested source root");
+    fs::create_dir_all(&outside_root).expect("existing outside source root");
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("unrelated-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated_nested),
+                "languageId": "pascal",
+                "version": 1,
+                "text": unrelated_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&outside_provider), "type": 1}]}),
+    );
+    let unrelated_ack = root.join("UnrelatedAck.pas");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated_ack),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit UnrelatedAck;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "unrelated provider changes must not stale the result: {response:?}"
+    );
+    assert!(result_locations(response).is_empty());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn excluded_nested_provider_change_does_not_stale_blocked_navigation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let excluded_root = root.join("excluded");
+    let main = root.join("Main.pas");
+    let provider = excluded_root.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    fs::create_dir_all(&excluded_root).expect("existing excluded source root");
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, json!({"exclude": ["excluded/**"]}));
+
+    let request_id = RequestId::from("excluded-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&provider), "type": 1}]}),
+    );
+    let excluded_ack = root.join("ExcludedAck.pas");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&excluded_ack),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit ExcludedAck;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "excluded provider changes must not stale the result: {response:?}"
+    );
+    assert!(result_locations(response).is_empty());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn unrelated_configuration_change_does_not_discard_blocked_formatting_result() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");

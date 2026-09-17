@@ -137,6 +137,37 @@ pub(crate) struct SourceRecord {
     /// Unlike a positive source URI, this is invalidated by a matching source
     /// change even when the file was not part of the worker's read set.
     pub(crate) missing_provider_candidate: bool,
+    /// A complete projectless recursive filename lookup found no provider with
+    /// any of these names below this root.  The scope is retained separately
+    /// from the synthetic direct candidate so live validation can notice a
+    /// provider overlay in an existing nested directory without rescanning.
+    pub(crate) missing_provider_scope: Option<MissingProviderScope>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MissingProviderScope {
+    pub(crate) root: PathBuf,
+    pub(crate) names: Vec<String>,
+    pub(crate) read_policy: ReadPolicy,
+    pub(crate) path_entry: ProjectPathEntry,
+}
+
+impl MissingProviderScope {
+    pub(crate) fn matches(&self, path: &Path) -> bool {
+        path_starts_with_ci(path, &self.root)
+            && path.file_name().is_some_and(|file_name| {
+                self.names.iter().any(|name| {
+                    file_name
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(name.as_str())
+                })
+            })
+    }
+
+    pub(crate) fn allows_without_filesystem(&self, path: &Path) -> bool {
+        self.read_policy
+            .allows_path_without_filesystem(path, &self.path_entry.provenance)
+    }
 }
 
 impl SourceRecord {
@@ -1031,6 +1062,7 @@ fn path_record_at(
         path_entry,
         include_payload,
         missing_provider_candidate: false,
+        missing_provider_scope: None,
     })
 }
 
@@ -1072,6 +1104,7 @@ pub(crate) fn source_for_input_with_cancel(
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                missing_provider_scope: None,
             },
         ));
     }
@@ -1112,6 +1145,7 @@ pub(crate) fn source_for_input_with_owner(
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                missing_provider_scope: None,
             },
         ));
     }
@@ -1166,6 +1200,7 @@ pub(crate) fn source_for_input_with_owner(
         path_entry: Some(entry),
         include_payload: false,
         missing_provider_candidate: false,
+        missing_provider_scope: None,
     };
     Ok((disk.text, record))
 }
@@ -2675,6 +2710,7 @@ pub(crate) fn build_snapshot(
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
                     missing_provider_candidate: false,
+                    missing_provider_scope: None,
                 },
                 overlay.text.len(),
             )
@@ -2736,6 +2772,7 @@ pub(crate) fn build_snapshot(
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
                     missing_provider_candidate: false,
+                    missing_provider_scope: None,
                 },
                 scan.bytes,
             )
@@ -3027,6 +3064,7 @@ pub(crate) fn build_snapshot(
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    missing_provider_scope: None,
                 },
             )
         } else {
@@ -3058,6 +3096,7 @@ pub(crate) fn build_snapshot(
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    missing_provider_scope: None,
                 },
             )
         };
@@ -7576,6 +7615,7 @@ mod tests {
             path_entry: None,
             include_payload: true,
             missing_provider_candidate: false,
+            missing_provider_scope: None,
         };
 
         let error = read_record_content_hash(&include, &record, &AtomicBool::new(false))

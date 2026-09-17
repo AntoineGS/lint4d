@@ -16,8 +16,8 @@ use pascal_project::delphi_overrides::{
 use pascal_project::{
     MetadataObservation, PackageMetadata, ProjectCandidateMembership, ProjectCandidates,
     ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
-    ProjectReadObservation, ProjectReadStamp, ProjectSelections, discover_with_selections,
-    discover_with_selections_and_observations_with_cancel_and_overrides,
+    ProjectReadObservation, ProjectReadStamp, ProjectSelections, ReadPolicy,
+    discover_with_selections, discover_with_selections_and_observations_with_cancel_and_overrides,
     discover_with_selections_and_observations_with_overrides, has_invalid_project_selection,
     project_candidate_membership, project_candidates, project_candidates_with_cancel,
     read_package_metadata_with_observations, runtime_project_selection,
@@ -287,6 +287,12 @@ struct ContextKey {
     config: Option<String>,
     platform: Option<String>,
     overrides: EffectiveOverrides,
+}
+
+#[derive(Debug, Clone)]
+struct SourceChangeObservation {
+    path: PathBuf,
+    generation: u64,
 }
 
 /// A legacy sibling lookup is a per-document fact, not a directory grant.  A
@@ -593,7 +599,7 @@ pub struct Workspace {
     source_generation: u64,
     configuration_generation: u64,
     source_change_generations: HashMap<Url, u64>,
-    source_change_generations_case_insensitive: HashMap<String, u64>,
+    source_change_generations_case_insensitive: HashMap<String, SourceChangeObservation>,
     configuration_change_generations: HashMap<Url, u64>,
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
@@ -2312,6 +2318,7 @@ impl Workspace {
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                missing_provider_scope: None,
             },
         );
     }
@@ -2347,6 +2354,7 @@ impl Workspace {
                 path_entry: Some(path_entry.clone()),
                 include_payload: false,
                 missing_provider_candidate: false,
+                missing_provider_scope: None,
             },
         );
     }
@@ -2407,6 +2415,7 @@ impl Workspace {
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    missing_provider_scope: None,
                 },
             );
         }
@@ -4348,9 +4357,6 @@ impl Workspace {
         };
         let directory = absolute_path(directory.to_path_buf());
         for name in names {
-            // Retain a negative lookup only when no disk or overlay entry
-            // matched this filename. The live validator can then invalidate
-            // the result if that specific provider appears later.
             if entries.iter().any(|path| {
                 path.file_name()
                     .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
@@ -4361,9 +4367,60 @@ impl Workspace {
             let Some(uri) = Url::from_file_path(&path).ok() else {
                 continue;
             };
-            records
-                .entry(uri.clone())
-                .or_insert_with(|| rename::SourceRecord {
+            match records.entry(uri.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(rename::SourceRecord {
+                        uri,
+                        text: String::new(),
+                        version: None,
+                        stamp: None,
+                        open: false,
+                        path: Some(path.clone()),
+                        path_stamp: path_stamp(&path),
+                        content_hash: None,
+                        content_bytes: None,
+                        candidate_membership: None,
+                        read_policy: None,
+                        path_entry: None,
+                        include_payload: false,
+                        missing_provider_candidate: true,
+                        missing_provider_scope: None,
+                    });
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().missing_provider_candidate = true;
+                }
+            }
+        }
+    }
+
+    fn record_missing_provider_scope(
+        &mut self,
+        root: &Path,
+        names: &[String],
+        read_policy: &ReadPolicy,
+        path_entry: &ProjectPathEntry,
+    ) {
+        let Some(first_name) = names.first() else {
+            return;
+        };
+        let root = absolute_path(root.to_path_buf());
+        let path = root.join(first_name);
+        let Some(uri) = Url::from_file_path(&path).ok() else {
+            return;
+        };
+        let scope = rename::MissingProviderScope {
+            root,
+            names: names.iter().map(|name| name.to_ascii_lowercase()).collect(),
+            read_policy: read_policy.clone(),
+            path_entry: path_entry.clone(),
+        };
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        match records.entry(uri.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(rename::SourceRecord {
                     uri,
                     text: String::new(),
                     version: None,
@@ -4377,8 +4434,26 @@ impl Workspace {
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
-                    missing_provider_candidate: true,
+                    missing_provider_candidate: false,
+                    missing_provider_scope: Some(scope),
                 });
+            }
+            Entry::Occupied(mut entry) => {
+                let record = entry.get_mut();
+                if let Some(existing) = record.missing_provider_scope.as_mut() {
+                    for name in scope.names {
+                        if !existing
+                            .names
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(&name))
+                        {
+                            existing.names.push(name);
+                        }
+                    }
+                } else {
+                    record.missing_provider_scope = Some(scope);
+                }
+            }
         }
     }
 
@@ -4475,32 +4550,66 @@ impl Workspace {
                     root.display()
                 ));
             }
+            let open_entries = self.open_document_entries_under_root(root, context_key);
+            if catalogue.complete {
+                let missing_names = names
+                    .iter()
+                    .filter(|name| {
+                        !catalogue.entries.contains_key(*name)
+                            && !open_entries.iter().any(|path| {
+                                path.file_name().is_some_and(|file_name| {
+                                    file_name.to_string_lossy().eq_ignore_ascii_case(name)
+                                })
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(path_entry) = context
+                    .search_path_entries
+                    .iter()
+                    .find(|entry| paths_equal_ci(&entry.path, root))
+                    .cloned()
+                    .or_else(|| context_path_entry(context, root))
+                {
+                    self.record_missing_provider_scope(
+                        root,
+                        &missing_names,
+                        &context.read_policy,
+                        &path_entry,
+                    );
+                }
+            }
             for name in &names {
                 if let Some(paths) = catalogue.entries.get(name) {
                     result.extend(paths.iter().cloned());
                 }
-            }
-        }
-        for (uri, document) in &self.open_documents {
-            if document.text.is_none() || !self.ensure_supported_with_context(uri, context_key) {
-                continue;
-            }
-            let Ok(path) = uri.to_file_path() else {
-                continue;
-            };
-            let path = absolute_path(path);
-            let Some(file_name) = path.file_name() else {
-                continue;
-            };
-            if names
-                .iter()
-                .any(|name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
-                && roots.iter().any(|root| path_starts_with_ci(&path, root))
-            {
-                result.push(path);
+                result.extend(open_entries.iter().filter_map(|path| {
+                    path.file_name()
+                        .is_some_and(|file_name| {
+                            file_name.to_string_lossy().eq_ignore_ascii_case(name)
+                        })
+                        .then_some(path.clone())
+                }));
             }
         }
         result
+    }
+
+    fn open_document_entries_under_root(
+        &self,
+        root: &Path,
+        context_key: &ContextKey,
+    ) -> Vec<PathBuf> {
+        self.open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                document.text.as_ref()?;
+                let path = absolute_path(uri.to_file_path().ok()?);
+                (path_starts_with_ci(&path, root)
+                    && self.ensure_supported_with_context(uri, context_key))
+                .then_some(path)
+            })
+            .collect()
     }
 
     fn filename_catalogue(&mut self, root: &Path) -> FilenameCatalogue {
@@ -4800,17 +4909,32 @@ impl Workspace {
                 && record.path.as_deref().is_some_and(|candidate| {
                     self.source_change_generations_case_insensitive
                         .get(&case_insensitive_path_key(candidate))
-                        .is_some_and(|generation| *generation > source_generation)
+                        .is_some_and(|change| change.generation > source_generation)
                 });
-            if self
+            let missing_provider_scope_changed =
+                record.missing_provider_scope.as_ref().is_some_and(|scope| {
+                    self.source_change_generations_case_insensitive
+                        .values()
+                        .any(|change| {
+                            let path = change.path.as_path();
+                            let matches = scope.matches(path);
+                            let allows = scope.allows_without_filesystem(path);
+                            let accepted = self.scope_path_is_accepted(path, scope);
+                            change.generation > source_generation && matches && allows && accepted
+                        })
+                });
+            let dependency_changed = self
                 .source_change_generations
                 .get(&dependency_uri)
-                .is_some_and(|generation| *generation > source_generation)
+                .is_some_and(|generation| *generation > source_generation);
+            let configuration_changed = self
+                .configuration_change_generations
+                .get(&dependency_uri)
+                .is_some_and(|generation| *generation > configuration_generation);
+            if dependency_changed
                 || missing_provider_candidate_changed
-                || self
-                    .configuration_change_generations
-                    .get(&dependency_uri)
-                    .is_some_and(|generation| *generation > configuration_generation)
+                || missing_provider_scope_changed
+                || configuration_changed
             {
                 return Err(format!(
                     "analysis dependency changed while resolving {}; retry the request",
@@ -4858,6 +4982,20 @@ impl Workspace {
         Ok(())
     }
 
+    fn scope_path_is_accepted(&self, path: &Path, scope: &rename::MissingProviderScope) -> bool {
+        let under_workspace = self.roots.iter().any(|root| {
+            root.source_roots
+                .iter()
+                .any(|source_root| path_starts_with_native(path, source_root))
+        });
+        !under_workspace
+            || self.accepts_path(path)
+            || matches!(
+                scope.path_entry.provenance,
+                ProjectPathProvenance::Mapped { .. }
+            )
+    }
+
     fn bump_source_generation(&mut self) {
         self.source_generation = self.source_generation.wrapping_add(1);
     }
@@ -4874,9 +5012,13 @@ impl Workspace {
             include_parent,
         );
         if let Ok(path) = uri.to_file_path() {
+            let path = absolute_path(path);
             self.source_change_generations_case_insensitive.insert(
-                case_insensitive_path_key(&absolute_path(path)),
-                self.source_generation,
+                case_insensitive_path_key(&path),
+                SourceChangeObservation {
+                    path,
+                    generation: self.source_generation,
+                },
             );
         }
     }

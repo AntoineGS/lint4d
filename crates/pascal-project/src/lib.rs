@@ -295,6 +295,33 @@ impl ReadPolicy {
         })
     }
 
+    /// Check the lexical roots and exclusions for a path without inspecting
+    /// the filesystem. This is intentionally weaker than [`Self::allows_path`]
+    /// because it does not prove that the path is a regular, symlink-free
+    /// source. Callers using this method must treat a positive result as a
+    /// cheap relevance check, not as permission to read the path.
+    pub fn allows_path_without_filesystem(
+        &self,
+        path: &Path,
+        provenance: &ProjectPathProvenance,
+    ) -> bool {
+        match provenance {
+            ProjectPathProvenance::LegacyNative => !self.is_excluded(path),
+            ProjectPathProvenance::Configured => self
+                .configured_roots
+                .iter()
+                .chain(self.mapped_roots.iter())
+                .any(|root| {
+                    project_path_starts_with(path, &root.path)
+                        && !self.is_excluded_for_root(path, root)
+                }),
+            ProjectPathProvenance::Mapped { root } => {
+                project_path_starts_with(path, root)
+                    && !self.is_excluded_for_mapped_root(path, root)
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn identity(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();

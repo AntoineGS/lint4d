@@ -740,6 +740,7 @@ fn lint_configuration_for_input(
                 path_entry: super::context_path_entry(&context, path),
                 include_payload: false,
                 missing_provider_candidate: false,
+                missing_provider_scope: None,
             })
         })
         .collect();

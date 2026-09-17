@@ -48,6 +48,9 @@ const MAX_DEPENDENCY_WORK: usize = 256;
 const MAX_DIRECTORY_CATALOGUES: usize = 1024;
 const MAX_FILENAME_CATALOGUE_ENTRIES: usize = 10_000;
 const MAX_FILENAME_CATALOGUES: usize = 256;
+#[cfg(feature = "test-support")]
+const TEST_FILENAME_CATALOGUE_ENTRIES_ENV: &str = "PASCAL_LSP_TEST_FILENAME_CATALOGUE_ENTRIES";
+const MAX_SOURCE_CHANGE_OBSERVATIONS: usize = 4_096;
 // The multidev workspace currently contains 436,705 filesystem entries when
 // counted without following links. Keep a fixed margin for normal growth, but
 // retain a hard stop so a pathological workspace cannot turn package lookup
@@ -71,6 +74,18 @@ fn check_workspace_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn filename_catalogue_entry_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    if let Some(limit) = std::env::var(TEST_FILENAME_CATALOGUE_ENTRIES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0 && *limit <= MAX_FILENAME_CATALOGUE_ENTRIES)
+    {
+        return limit;
+    }
+    MAX_FILENAME_CATALOGUE_ENTRIES
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -599,7 +614,7 @@ pub struct Workspace {
     source_generation: u64,
     configuration_generation: u64,
     source_change_generations: HashMap<Url, u64>,
-    source_change_generations_case_insensitive: HashMap<String, SourceChangeObservation>,
+    source_change_observations: HashMap<PathBuf, SourceChangeObservation>,
     configuration_change_generations: HashMap<Url, u64>,
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
@@ -4541,18 +4556,19 @@ impl Workspace {
         } else {
             context.search_paths.clone()
         };
+        let entry_limit = filename_catalogue_entry_limit();
         let mut result = Vec::new();
         for root in &roots {
             let catalogue = self.filename_catalogue(root);
             if !catalogue.complete {
                 self.warn(format!(
-                    "projectless filename catalogue reached its bounded entry limit under {}",
+                    "projectless filename catalogue reached its bounded entry limit of {entry_limit} under {}",
                     root.display()
                 ));
             }
             let open_entries = self.open_document_entries_under_root(root, context_key);
-            if catalogue.complete {
-                let missing_names = names
+            let scope_names = if catalogue.complete {
+                names
                     .iter()
                     .filter(|name| {
                         !catalogue.entries.contains_key(*name)
@@ -4563,22 +4579,26 @@ impl Workspace {
                             })
                     })
                     .cloned()
-                    .collect::<Vec<_>>();
-                if let Some(path_entry) = context
-                    .search_path_entries
-                    .iter()
-                    .find(|entry| paths_equal_ci(&entry.path, root))
-                    .cloned()
-                    .or_else(|| context_path_entry(context, root))
-                {
-                    self.record_missing_provider_scope(
-                        root,
-                        &missing_names,
-                        &context.read_policy,
-                        &path_entry,
-                    );
-                }
-            }
+                    .collect::<Vec<_>>()
+            } else {
+                names.clone()
+            };
+            let path_entry = context
+                .search_path_entries
+                .iter()
+                .find(|entry| paths_equal_ci(&entry.path, root))
+                .cloned()
+                .or_else(|| context_path_entry(context, root))
+                .unwrap_or_else(|| ProjectPathEntry {
+                    path: root.clone(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                });
+            self.record_missing_provider_scope(
+                root,
+                &scope_names,
+                &context.read_policy,
+                &path_entry,
+            );
             for name in &names {
                 if let Some(paths) = catalogue.entries.get(name) {
                     result.extend(paths.iter().cloned());
@@ -4614,6 +4634,7 @@ impl Workspace {
 
     fn filename_catalogue(&mut self, root: &Path) -> FilenameCatalogue {
         let root = absolute_path(root.to_path_buf());
+        let entry_limit = filename_catalogue_entry_limit();
         let fresh = self
             .filename_catalogues
             .get(&root)
@@ -4640,7 +4661,7 @@ impl Workspace {
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
             .map(|workspace_root| workspace_root.excludes.clone());
         for entry in WalkDir::new(&root).follow_links(false).into_iter() {
-            if visited >= MAX_FILENAME_CATALOGUE_ENTRIES {
+            if visited >= entry_limit {
                 complete = false;
                 break;
             }
@@ -4648,7 +4669,7 @@ impl Workspace {
                 continue;
             };
             visited += 1;
-            if entry.file_type().is_dir() && directories.len() < MAX_FILENAME_CATALOGUE_ENTRIES {
+            if entry.file_type().is_dir() && directories.len() < entry_limit {
                 directories.push((entry.path().to_path_buf(), path_stamp(entry.path())));
             }
             if entry.file_type().is_symlink()
@@ -4907,21 +4928,20 @@ impl Workspace {
                 .unwrap_or_else(|| canonical_file_uri(&record.uri));
             let missing_provider_candidate_changed = record.missing_provider_candidate
                 && record.path.as_deref().is_some_and(|candidate| {
-                    self.source_change_generations_case_insensitive
-                        .get(&case_insensitive_path_key(candidate))
-                        .is_some_and(|change| change.generation > source_generation)
+                    self.source_change_observations.values().any(|change| {
+                        change.generation > source_generation
+                            && paths_equal_ci(&change.path, candidate)
+                    })
                 });
             let missing_provider_scope_changed =
                 record.missing_provider_scope.as_ref().is_some_and(|scope| {
-                    self.source_change_generations_case_insensitive
-                        .values()
-                        .any(|change| {
-                            let path = change.path.as_path();
-                            let matches = scope.matches(path);
-                            let allows = scope.allows_without_filesystem(path);
-                            let accepted = self.scope_path_is_accepted(path, scope);
-                            change.generation > source_generation && matches && allows && accepted
-                        })
+                    self.source_change_observations.values().any(|change| {
+                        let path = change.path.as_path();
+                        let matches = scope.matches(path);
+                        let allows = scope.allows_without_filesystem(path);
+                        let accepted = self.scope_path_is_accepted(path, scope);
+                        change.generation > source_generation && matches && allows && accepted
+                    })
                 });
             let dependency_changed = self
                 .source_change_generations
@@ -5013,8 +5033,23 @@ impl Workspace {
         );
         if let Ok(path) = uri.to_file_path() {
             let path = absolute_path(path);
-            self.source_change_generations_case_insensitive.insert(
-                case_insensitive_path_key(&path),
+            if let Some(change) = self.source_change_observations.get_mut(&path) {
+                change.generation = self.source_generation;
+                return;
+            }
+            if self.source_change_observations.len() >= MAX_SOURCE_CHANGE_OBSERVATIONS {
+                // Dropping observations without a marker could let an older
+                // worker accept a result after the evicted change. Treat an
+                // overflow as a workspace-wide source change once; requests
+                // captured after this generation can use the fresh bounded
+                // observation set.
+                self.global_source_change_generation = self
+                    .global_source_change_generation
+                    .max(self.source_generation);
+                self.source_change_observations.clear();
+            }
+            self.source_change_observations.insert(
+                path.clone(),
                 SourceChangeObservation {
                     path,
                     generation: self.source_generation,
@@ -5700,10 +5735,6 @@ fn paths_equal_ci(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
-fn case_insensitive_path_key(path: &Path) -> String {
-    path.to_string_lossy().to_ascii_lowercase()
-}
-
 fn project_path_entry_for<'a>(
     context: &'a ProjectContext,
     path: &Path,
@@ -6118,8 +6149,9 @@ fn is_immutable_override_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextState, DiagnosticLineIndex, FileChange, ResourceLimits, Workspace, WorkspaceOptions,
-        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
+        ContextState, DiagnosticLineIndex, FileChange, MAX_SOURCE_CHANGE_OBSERVATIONS,
+        ResourceLimits, Workspace, WorkspaceOptions, context_state_is_fresh_with_cancel,
+        normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
@@ -6250,6 +6282,23 @@ mod tests {
         assert_eq!(
             overlay_text(&workspace, &uri).as_deref(),
             Some(updated.as_str())
+        );
+    }
+
+    #[test]
+    fn source_change_observation_overflow_marks_a_global_generation() {
+        let mut workspace = Workspace::default();
+        for index in 0..=MAX_SOURCE_CHANGE_OBSERVATIONS {
+            let path = std::env::temp_dir().join(format!("lint4d-source-observation-{index}.pas"));
+            let uri = Url::from_file_path(path).expect("source URI");
+            workspace.bump_source_generation();
+            workspace.mark_source_change(&uri, false);
+        }
+
+        assert!(workspace.source_change_observations.len() <= MAX_SOURCE_CHANGE_OBSERVATIONS);
+        assert_eq!(
+            workspace.global_source_change_generation,
+            workspace.source_generation
         );
     }
 

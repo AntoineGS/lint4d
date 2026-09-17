@@ -190,6 +190,37 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_navigation_barrier_and_filename_catalogue_limit(
+        environment: TempDir,
+        limit: usize,
+    ) -> (Self, TestBarrier) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let barrier_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let limit_value = limit.to_string();
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                ("PASCAL_LSP_TEST_NAVIGATION_BARRIER", barrier_value.as_str()),
+                (
+                    "PASCAL_LSP_TEST_FILENAME_CATALOGUE_ENTRIES",
+                    limit_value.as_str(),
+                ),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier_and_dispatch_log(
         environment: TempDir,
     ) -> (Self, TestBarrier, TestDispatchLog) {
@@ -18819,6 +18850,79 @@ fn nested_absent_provider_overlay_invalidates_blocked_empty_navigation_result() 
 
 #[cfg(feature = "test-support")]
 #[test]
+fn incomplete_filename_catalogue_invalidates_absent_nested_provider_overlay() {
+    const CATALOGUE_LIMIT: usize = 8;
+
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let existing_directory = root.join("crates");
+    let main = root.join("Main.pas");
+    let provider = existing_directory.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let provider_source = "unit ReviewTask12Provider;\ninterface\nprocedure ReviewTask12Routine;\nimplementation\nprocedure ReviewTask12Routine;\nbegin\nend;\nend.\n";
+    fs::create_dir_all(&existing_directory).expect("existing source directory");
+    write_file(&main, main_source);
+    for index in 0..CATALOGUE_LIMIT {
+        fs::write(
+            existing_directory.join(format!("CataloguePadding{index:05}.txt")),
+            [],
+        )
+        .expect("catalogue padding file");
+    }
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_filename_catalogue_limit(
+            environment,
+            CATALOGUE_LIMIT,
+        );
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("incomplete-catalogue-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("incomplete catalogue provider overlay must stale the old result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+
+    let fresh_request_id =
+        RequestId::from("incomplete-catalogue-provider-navigation-fresh".to_string());
+    server.send_request(
+        fresh_request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    let locations = result_locations(server.response(&fresh_request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn unrelated_nested_and_outside_provider_changes_do_not_stale_blocked_navigation() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
@@ -18933,6 +19037,121 @@ fn excluded_nested_provider_change_does_not_stale_blocked_navigation() {
     );
     assert!(result_locations(response).is_empty());
     server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn native_case_distinct_provider_changes_preserve_stale_invalidation_across_event_orders() {
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let provider_source = "unit ReviewTask12Provider;\ninterface\nprocedure ReviewTask12Routine;\nimplementation\nprocedure ReviewTask12Routine;\nbegin\nend;\nend.\n";
+
+    for (label, allowed_first) in [("allowed-first", true), ("excluded-first", false)] {
+        let environment = tempfile::tempdir().expect("isolated server environment");
+        let root = environment.path().join("workspace");
+        let nested_root = root.join("nested");
+        let main = root.join("Main.pas");
+        let allowed_provider = nested_root.join("ReviewTask12Provider.pas");
+        let excluded_provider = nested_root.join("REVIEWTASK12PROVIDER.pas");
+        fs::create_dir_all(&nested_root).expect("existing nested source root");
+        write_file(&main, main_source);
+
+        let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+        server.initialize(
+            &root,
+            json!({
+                "exclude": ["nested/REVIEWTASK12PROVIDER.pas"]
+            }),
+        );
+
+        let request_id = RequestId::from(format!("case-distinct-provider-{label}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+        );
+        barrier.wait_until_entered();
+
+        if allowed_first {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&allowed_provider),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": provider_source
+                    }
+                }),
+            );
+            let _ = server.notification("textDocument/publishDiagnostics");
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({
+                    "changes": [{"uri": uri(&excluded_provider), "type": 1}]
+                }),
+            );
+        } else {
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({
+                    "changes": [{"uri": uri(&excluded_provider), "type": 1}]
+                }),
+            );
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&allowed_provider),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": provider_source
+                    }
+                }),
+            );
+            let _ = server.notification("textDocument/publishDiagnostics");
+        }
+
+        let acknowledgement = root.join(format!("{label}-ack.pas"));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&acknowledgement),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": "unit Acknowledgement;\ninterface\nimplementation\nend.\n"
+                }
+            }),
+        );
+        let _ = server.notification("textDocument/publishDiagnostics");
+
+        barrier.release();
+        let response = server.response(&request_id);
+        let error = match response.error {
+            Some(error) => error,
+            None => panic!("{label}: native allowed change was lost: {response:?}"),
+        };
+        assert_eq!(error.code, -32803, "{label}");
+        assert_eq!(
+            error.message, "analysis result became stale; retry the request",
+            "{label}"
+        );
+
+        let fresh_request_id = RequestId::from(format!("case-distinct-provider-{label}-fresh"));
+        server.send_request(
+            fresh_request_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+        );
+        let locations = result_locations(server.response(&fresh_request_id));
+        assert_eq!(locations.len(), 1, "{label}");
+        assert_eq!(
+            locations[0]["uri"],
+            uri(&allowed_provider).to_string(),
+            "{label}"
+        );
+        server.shutdown();
+    }
 }
 
 #[cfg(feature = "test-support")]

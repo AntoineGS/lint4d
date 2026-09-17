@@ -125,6 +125,9 @@ recursive provider-absence scope observations are unchanged. Empty results
 retain the same dependency and absence checks. Requested sources, imported
 providers, consumed configuration,
 project selection, and workspace-folder changes invalidate the result.
+An incomplete recursive filename catalogue records potential provider scopes
+for conservative live revalidation and logs its bounded-entry warning instead
+of silently claiming complete absence.
 
 Workspace symbols, references, prepare/rename, code actions, and code-action
 resolution remain conservative: any source/configuration generation change

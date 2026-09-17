@@ -850,6 +850,7 @@ name = "pascal-core"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "pascal-project",
  "quick-xml",
  "serde",
  "tempfile",
@@ -872,12 +873,23 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "pascal-core",
- "quick-xml",
+ "pascal-project",
  "serde",
  "serde_json",
  "tempfile",
  "tree-sitter",
  "walkdir",
+]
+
+[[package]]
+name = "pascal-project"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "quick-xml",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

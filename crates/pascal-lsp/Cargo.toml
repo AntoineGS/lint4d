@@ -28,12 +28,12 @@ required-features = ["test-support"]
 
 [dependencies]
 pascal-core = { path = "../pascal-core" }
+pascal-project = { path = "../pascal-project" }
 lint4d = { path = "../lint4d" }
 fmt4d = { path = "../fmt4d" }
 tree-sitter = "0.24"
 lsp-types = "=0.95.1"
 lsp-server = "0.7"
-quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
@@ -41,6 +41,7 @@ globset = "0.4"
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
+pascal-project = { path = "../pascal-project", features = ["test-support"] }
 tempfile = "3"
 
 [lints]

@@ -1,5 +1,4 @@
 pub mod config_discovery;
-pub mod delphi_overrides;
 pub mod directive_fragment_rewrite;
 pub mod directives;
 pub mod discovery;
@@ -10,6 +9,8 @@ pub mod node_kind;
 pub mod parser;
 pub mod text;
 pub mod types;
+
+pub use pascal_project::delphi_overrides;
 
 pub use directives::FormatOffRegion;
 pub use text::{SourceEncoding, decode_bytes, detect_encoding, encode_as};

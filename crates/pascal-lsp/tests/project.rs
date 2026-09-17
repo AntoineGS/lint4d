@@ -1,7 +1,7 @@
 use lsp_types::{Position, Url};
-use pascal_core::delphi_overrides::OverrideSession;
 use pascal_lsp::project::{ProjectContext, ProjectOptions};
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
+use pascal_project::delphi_overrides::OverrideSession;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs;

@@ -15,17 +15,17 @@ use super::{
 use crate::NavigationIndex;
 use crate::conditional::{self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind};
 use crate::navigation::ParsedDocument;
-use crate::project::{
-    MetadataObservation, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
-    ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
-};
 use crate::text;
 use lsp_types::{
     DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
     PrepareRenameResponse, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::decode_bytes;
-use pascal_core::delphi_overrides::EffectiveOverrides;
+use pascal_project::delphi_overrides::EffectiveOverrides;
+use pascal_project::{
+    MetadataObservation, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
+    ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
+};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -102,7 +102,7 @@ pub(crate) struct CachedDocument {
 pub(crate) struct WorkspaceInput {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) options: WorkspaceOptions,
-    pub(crate) overrides: pascal_core::delphi_overrides::OverrideSession,
+    pub(crate) overrides: pascal_project::delphi_overrides::OverrideSession,
     pub(crate) project_selections: ProjectSelections,
     pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
@@ -842,7 +842,7 @@ fn revalidate_path_record(
     }
     if let Some(expected) = &record.candidate_membership {
         let actual =
-            crate::project::project_candidate_membership(path, Some(cancel)).map_err(|error| {
+            pascal_project::project_candidate_membership(path, Some(cancel)).map_err(|error| {
                 if error == CANCELLATION_MESSAGE {
                     error
                 } else {
@@ -2053,7 +2053,7 @@ fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
         }
     };
 
-    let mut add_entry = |entry: &crate::project::ProjectPathEntry| match &entry.provenance {
+    let mut add_entry = |entry: &pascal_project::ProjectPathEntry| match &entry.provenance {
         ProjectPathProvenance::Mapped { root } => add_root(root),
         ProjectPathProvenance::Configured => {
             if let Some(root) = mapped_read_roots
@@ -3491,10 +3491,10 @@ fn capture_context_baseline(
             }
             let path = observation.path();
             match observation {
-                crate::project::MetadataObservation::Stat { .. } => {
+                pascal_project::MetadataObservation::Stat { .. } => {
                     add_baseline_path_with_stamp(baseline, path.to_path_buf(), path_stamp(path));
                 }
-                crate::project::MetadataObservation::Payload {
+                pascal_project::MetadataObservation::Payload {
                     read_policy,
                     path_entry,
                     stamp,
@@ -4635,7 +4635,7 @@ fn owner_has_legacy_or_workspace_authority(
     if workspace.accepts_path(owner_path) {
         return true;
     }
-    let is_legacy = |entry: &crate::project::ProjectPathEntry| {
+    let is_legacy = |entry: &pascal_project::ProjectPathEntry| {
         matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
             && path_starts_with_native(owner_path, &entry.path)
     };
@@ -5442,7 +5442,7 @@ mod tests {
         test_cancel_in_include_analysis,
     };
     use lsp_types::{Position, Url};
-    use pascal_core::delphi_overrides::{EffectiveOverrides, OverrideSession, PathMapping};
+    use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession, PathMapping};
     use std::collections::{HashMap, HashSet};
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]

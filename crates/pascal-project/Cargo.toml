@@ -1,0 +1,25 @@
+[package]
+name = "pascal-project"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Filesystem-only Delphi/Object Pascal project discovery"
+
+[features]
+test-support = []
+
+[dependencies]
+globset = "0.4"
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use lsp_server::{Message, Notification, Request, RequestId, Response};
 use lsp_types::{Position, Url};
 use pascal_core::FileInfo;
-use pascal_core::delphi_overrides::OverrideSession;
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationTarget, ProjectContext};
+use pascal_project::delphi_overrides::OverrideSession;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 

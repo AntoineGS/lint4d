@@ -3490,7 +3490,7 @@ mod tests {
     use crossbeam_channel::RecvTimeoutError;
     use lsp_server::{Connection, Message, RequestId, Response};
     use lsp_types::{MarkupKind, Position, PrepareRenameResponse, Range, Url};
-    use pascal_core::delphi_overrides::OverrideSession;
+    use pascal_project::delphi_overrides::OverrideSession;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
     use std::path::PathBuf;
@@ -5095,7 +5095,7 @@ mod tests {
             "reference result must carry records"
         );
 
-        let _guard = crate::project::test_cancel_project_scan_after_checks(0);
+        let _guard = pascal_project::test_cancel_project_scan_after_checks(0);
         let error = crate::workspace::rename::revalidate_input(&input, &computed.records, &cancel)
             .expect_err("membership cancellation must abort result validation");
         assert_eq!(error, crate::workspace::rename::CANCELLATION_MESSAGE);

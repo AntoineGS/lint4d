@@ -1,10 +1,22 @@
 //! Lazy, filesystem-only Delphi project context discovery.
 //!
-//! This module deliberately does not try to be an MSBuild evaluator. It reads
-//! the small amount of project metadata needed by navigation, preserves
-//! ambiguity, and reports anything it cannot safely interpret as a warning.
+//! This crate resolves bounded project metadata and resolution paths from
+//! `.dproj`, `.dpr`, `.dpk`, and option-set files. It records defines, aliases,
+//! unit/include search paths, project references, provenance, and freshness
+//! observations without recursively scanning a workspace.
+//!
+//! It does not expand or look up Pascal include files, and it is not a full
+//! MSBuild evaluator. The existing basic CLI source discovery and generic
+//! MSBuild-facing discovery helpers intentionally remain in `pascal-core`.
+//! `pascal-lsp` owns stateful workspace orchestration, overlays, indexes, and
+//! the include/rename resolver that consumes this crate's bounded results.
 
-use pascal_core::delphi_overrides::{
+pub mod configuration;
+pub mod delphi_overrides;
+
+pub use configuration::{ConfigRead, config_directories, read_config};
+
+use crate::delphi_overrides::{
     EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
 };
 use quick_xml::Reader;
@@ -35,7 +47,7 @@ const MAX_OWNERSHIP_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_OWNERSHIP_WARNING_BYTES: usize = 256 * 1024;
 const UNRESOLVED_MARKER: char = '\u{1}';
 
-/// Options supplied by the LSP client for project selection and evaluation.
+/// Options supplied by a caller for project selection and evaluation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectOptions {
     /// An explicit `.dproj`, `.dpr`, or `.dpk` path. Relative paths are
@@ -45,35 +57,35 @@ pub struct ProjectOptions {
     pub build_config: Option<String>,
     /// The selected Delphi platform, such as `Win32` or `Win64`.
     pub platform: Option<String>,
-    /// Additional ordered source roots supplied by the client.
+    /// Additional ordered source roots supplied by the caller.
     pub source_paths: Vec<String>,
 }
 
-pub(crate) type ProjectSelections = HashMap<PathBuf, PathBuf>;
+pub type ProjectSelections = HashMap<PathBuf, PathBuf>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ProjectCandidates {
-    pub(crate) directory: Option<PathBuf>,
-    pub(crate) files: Vec<PathBuf>,
+pub struct ProjectCandidates {
+    pub directory: Option<PathBuf>,
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ProjectCandidateMembership {
-    pub(crate) paths: Vec<PathBuf>,
-    pub(crate) readable: bool,
+pub struct ProjectCandidateMembership {
+    pub paths: Vec<PathBuf>,
+    pub readable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum ProjectPathProvenance {
+pub enum ProjectPathProvenance {
     LegacyNative,
     Configured,
     Mapped { root: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ProjectPathEntry {
-    pub(crate) path: PathBuf,
-    pub(crate) provenance: ProjectPathProvenance,
+pub struct ProjectPathEntry {
+    pub path: PathBuf,
+    pub provenance: ProjectPathProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +95,7 @@ struct ProvenanceRange {
 }
 
 impl ProjectPathEntry {
-    pub(crate) fn legacy(path: PathBuf) -> Self {
+    pub fn legacy(path: PathBuf) -> Self {
         Self {
             path,
             provenance: ProjectPathProvenance::LegacyNative,
@@ -119,7 +131,7 @@ struct AuthorizedReadRoot {
 /// root, while a configured native entry may use one of the requester's
 /// workspace, source-path, or effective mapping destinations.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ReadPolicy {
+pub struct ReadPolicy {
     configured_roots: Vec<AuthorizedReadRoot>,
     mapped_roots: Vec<AuthorizedReadRoot>,
     exclusions: Vec<String>,
@@ -148,7 +160,7 @@ impl Hash for ReadPolicy {
 }
 
 impl ReadPolicy {
-    pub(crate) fn new(
+    pub fn new(
         roots: &[PathBuf],
         source_paths: &[String],
         exclusions: &[String],
@@ -212,7 +224,7 @@ impl ReadPolicy {
         }
     }
 
-    pub(crate) fn allows_entry(&self, entry: &ProjectPathEntry) -> bool {
+    pub fn allows_entry(&self, entry: &ProjectPathEntry) -> bool {
         match &entry.provenance {
             ProjectPathProvenance::LegacyNative => {
                 safe_regular_file(&entry.path) && !self.is_excluded(&entry.path)
@@ -232,7 +244,7 @@ impl ReadPolicy {
         }
     }
 
-    pub(crate) fn allows_location(&self, entry: &ProjectPathEntry) -> bool {
+    pub fn allows_location(&self, entry: &ProjectPathEntry) -> bool {
         match &entry.provenance {
             ProjectPathProvenance::LegacyNative => {
                 path_has_no_symlink_component(&entry.path) && !self.is_excluded(&entry.path)
@@ -252,7 +264,7 @@ impl ReadPolicy {
         }
     }
 
-    pub(crate) fn entry_for_path(&self, path: &Path) -> Option<ProjectPathEntry> {
+    pub fn entry_for_path(&self, path: &Path) -> Option<ProjectPathEntry> {
         self.mapped_roots
             .iter()
             .filter(|root| project_path_starts_with(path, &root.path))
@@ -276,7 +288,7 @@ impl ReadPolicy {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn allows_path(&self, path: &Path, provenance: &ProjectPathProvenance) -> bool {
+    pub fn allows_path(&self, path: &Path, provenance: &ProjectPathProvenance) -> bool {
         self.allows_location(&ProjectPathEntry {
             path: path.to_path_buf(),
             provenance: provenance.clone(),
@@ -295,11 +307,9 @@ impl ReadPolicy {
         entry: &ProjectPathEntry,
         limit: u64,
     ) -> Result<(String, MetadataObservation), String> {
-        let stamp = crate::workspace::path_stamp_result(&entry.path)
-            .ok()
-            .flatten();
+        let stamp = path_stamp_result(&entry.path).ok().flatten();
         let bytes = self.read_payload_bytes(entry, limit)?;
-        let content_hash = crate::workspace::content_hash_bytes(&bytes);
+        let content_hash = content_hash_bytes(&bytes);
         let observation = MetadataObservation::Payload {
             path: entry.path.clone(),
             read_policy: self.clone(),
@@ -312,7 +322,13 @@ impl ReadPolicy {
         Ok((contents, observation))
     }
 
-    pub(crate) fn read_payload_bytes(
+    /// Read an authorized payload with strict symlink-free semantics.
+    ///
+    /// This is the normal payload API: configured and mapped entries, as well
+    /// as legacy entries passed through this method, must be regular files
+    /// without symlink components. Use [`Self::read_legacy_payload_bytes`]
+    /// only for the deliberate legacy route compatibility described there.
+    pub fn read_payload_bytes(
         &self,
         entry: &ProjectPathEntry,
         limit: u64,
@@ -323,17 +339,25 @@ impl ReadPolicy {
         self.read_payload_bytes_after_authorization(entry, limit, false)
     }
 
-    pub(crate) fn allows_legacy_payload_entry(&self, entry: &ProjectPathEntry) -> bool {
+    pub fn allows_legacy_payload_entry(&self, entry: &ProjectPathEntry) -> bool {
         self.allows_legacy_route_entry(entry)
             && fs::metadata(&entry.path).is_ok_and(|metadata| metadata.is_file())
     }
 
-    pub(crate) fn allows_legacy_route_entry(&self, entry: &ProjectPathEntry) -> bool {
+    pub fn allows_legacy_route_entry(&self, entry: &ProjectPathEntry) -> bool {
         matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
             && !self.is_excluded(&entry.path)
     }
 
-    pub(crate) fn read_legacy_payload_bytes(
+    /// Read a legacy-native payload using the deliberate legacy symlink
+    /// semantics required by older include and sibling lookup routes.
+    ///
+    /// Unlike [`Self::read_payload_bytes`], this permits a legacy-native
+    /// route whose path contains symlink components when the resolved target
+    /// is a regular file. It remains limited to `LegacyNative` provenance and
+    /// exclusions still apply. Configured and mapped entries must use the
+    /// strict payload API instead.
+    pub fn read_legacy_payload_bytes(
         &self,
         entry: &ProjectPathEntry,
         limit: u64,
@@ -436,7 +460,7 @@ impl ReadPolicy {
 /// payload read.  Payload observations carry the exact policy and path entry
 /// that authorized the original read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MetadataObservation {
+pub enum MetadataObservation {
     Stat {
         path: PathBuf,
     },
@@ -444,13 +468,13 @@ pub(crate) enum MetadataObservation {
         path: PathBuf,
         read_policy: ReadPolicy,
         path_entry: ProjectPathEntry,
-        stamp: Option<crate::workspace::PathStamp>,
+        stamp: Option<ProjectReadStamp>,
         content_hash: u64,
     },
 }
 
 impl MetadataObservation {
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         match self {
             Self::Stat { path } | Self::Payload { path, .. } => path,
         }
@@ -568,23 +592,23 @@ pub struct ProjectContext {
     pub discovery_complete: bool,
     pub project_file: Option<PathBuf>,
     pub main_source: Option<PathBuf>,
-    /// Ordered project and client-provided unit search paths.
+    /// Ordered project and caller-provided unit search paths.
     pub search_paths: Vec<PathBuf>,
     /// The same search paths tagged with their source provenance. This keeps
     /// legacy native roots distinct from configured and mapped roots.
-    pub(crate) search_path_entries: Vec<ProjectPathEntry>,
+    pub search_path_entries: Vec<ProjectPathEntry>,
     /// MainSource and explicit references retain the provenance of the path
     /// expression that produced them so membership cannot bypass mapped-root
     /// safety checks.
-    pub(crate) main_source_entry: Option<ProjectPathEntry>,
-    pub(crate) explicit_unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
+    pub main_source_entry: Option<ProjectPathEntry>,
+    pub explicit_unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
     /// Ordered project-relative include paths from DCC_IncludePath.
     ///
     /// Include paths are kept separate from unit search paths because include
     /// lookup must not make an arbitrary directory a Pascal unit candidate.
     pub include_paths: Vec<PathBuf>,
     /// Include paths retain their source provenance for read authorization.
-    pub(crate) include_path_entries: Vec<ProjectPathEntry>,
+    pub include_path_entries: Vec<ProjectPathEntry>,
     pub explicit_units: HashMap<String, Vec<PathBuf>>,
     pub unit_namespaces: Vec<String>,
     pub unit_aliases: HashMap<String, String>,
@@ -594,7 +618,7 @@ pub struct ProjectContext {
     /// The immutable Delphi override snapshot used to evaluate this context.
     pub overrides: EffectiveOverrides,
     /// The requester-scoped read policy used while evaluating this context.
-    pub(crate) read_policy: ReadPolicy,
+    pub read_policy: ReadPolicy,
     /// Ordered, case-insensitively unique package names from DCC_UsePackage.
     /// Package exports are resolved lazily and are not merged into the unit
     /// search paths or the project-wide unit index.
@@ -605,34 +629,34 @@ pub struct ProjectContext {
     pub metadata_files: Vec<PathBuf>,
     /// The authorization provenance for each metadata observation. A path in
     /// `metadata_files` without a payload observation is stat-only.
-    pub(crate) metadata_observations: Vec<MetadataObservation>,
+    pub metadata_observations: Vec<MetadataObservation>,
     pub warnings: Vec<String>,
-    pub(crate) override_error: Option<String>,
+    pub override_error: Option<String>,
 }
 
 /// One file observation captured at the read which supplied bytes to project
 /// discovery. Consumers use this instead of reopening the file after parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectReadObservation {
-    pub(crate) path: PathBuf,
-    pub(crate) stamp: ProjectReadStamp,
-    pub(crate) content_hash: u64,
-    pub(crate) content_bytes: Option<Vec<u8>>,
+pub struct ProjectReadObservation {
+    pub path: PathBuf,
+    pub stamp: ProjectReadStamp,
+    pub content_hash: u64,
+    pub content_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectReadStamp {
-    pub(crate) bytes: u64,
-    pub(crate) modified: Option<SystemTime>,
-    pub(crate) is_dir: bool,
-    pub(crate) is_symlink: bool,
+pub struct ProjectReadStamp {
+    pub bytes: u64,
+    pub modified: Option<SystemTime>,
+    pub is_dir: bool,
+    pub is_symlink: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ProjectDiscovery {
-    pub(crate) context: ProjectContext,
-    pub(crate) observations: Vec<ProjectReadObservation>,
-    pub(crate) candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+pub struct ProjectDiscovery {
+    pub context: ProjectContext,
+    pub observations: Vec<ProjectReadObservation>,
+    pub candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -687,7 +711,7 @@ impl ProjectReadTracker {
 /// `metadata_files` contains every project/option-set dependency used to
 /// produce the result so callers can detect changes without file events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PackageMetadata {
+pub struct PackageMetadata {
     pub units: HashMap<String, Vec<PathBuf>>,
     pub unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
     pub warnings: Vec<String>,
@@ -697,9 +721,9 @@ pub(crate) struct PackageMetadata {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(crate) struct PackageMetadataRead {
-    pub(crate) metadata: PackageMetadata,
-    pub(crate) observations: Vec<ProjectReadObservation>,
+pub struct PackageMetadataRead {
+    pub metadata: PackageMetadata,
+    pub observations: Vec<ProjectReadObservation>,
 }
 
 impl ProjectContext {
@@ -768,14 +792,14 @@ fn production_override_session() -> (OverrideSession, Vec<String>) {
     }
 }
 
-pub(crate) fn project_candidates(
+pub fn project_candidates(
     file: &Path,
     workspace_roots: &[PathBuf],
 ) -> Result<ProjectCandidates, String> {
     project_candidates_with_cancel(file, workspace_roots, None)
 }
 
-pub(crate) fn project_candidates_with_cancel(
+pub fn project_candidates_with_cancel(
     file: &Path,
     workspace_roots: &[PathBuf],
     cancel: Option<&AtomicBool>,
@@ -789,7 +813,7 @@ pub(crate) fn project_candidates_with_cancel(
     find_project_candidates(&file_path, relevant_root.as_deref(), cancel)
 }
 
-pub(crate) fn discover_with_selections(
+pub fn discover_with_selections(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
@@ -851,7 +875,7 @@ pub(crate) fn discover_with_selections_and_observations_with_cancel(
     )
 }
 
-pub(crate) fn discover_with_selections_and_observations_with_overrides(
+pub fn discover_with_selections_and_observations_with_overrides(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
@@ -871,7 +895,7 @@ pub(crate) fn discover_with_selections_and_observations_with_overrides(
     )
 }
 
-pub(crate) fn discover_with_selections_and_observations_with_cancel_and_overrides(
+pub fn discover_with_selections_and_observations_with_cancel_and_overrides(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
@@ -1135,7 +1159,7 @@ fn discovery_file_path(absolute_file: &Path, warnings: &mut Vec<String>) -> Path
     })
 }
 
-pub(crate) fn runtime_project_selection(
+pub fn runtime_project_selection(
     file: &Path,
     candidates: &ProjectCandidates,
     selections: &ProjectSelections,
@@ -1152,18 +1176,18 @@ pub(crate) fn runtime_project_selection(
         .map(|(scope, project)| (scope.clone(), project.clone()))
 }
 
-pub(crate) fn has_invalid_project_selection(context: &ProjectContext) -> bool {
+pub fn has_invalid_project_selection(context: &ProjectContext) -> bool {
     context.warnings.iter().any(|warning| {
         warning.starts_with("selected project ")
             && warning.contains(" is not a current candidate in ")
     })
 }
 
-pub(crate) fn selected_project_is_current(scope: &Path, selected: &Path) -> Result<bool, String> {
+pub fn selected_project_is_current(scope: &Path, selected: &Path) -> Result<bool, String> {
     selected_project_is_current_with_cancel(scope, selected, None)
 }
 
-pub(crate) fn selected_project_is_current_with_cancel(
+pub fn selected_project_is_current_with_cancel(
     scope: &Path,
     selected: &Path,
     cancel: Option<&AtomicBool>,
@@ -1234,7 +1258,7 @@ fn record_candidate_memberships(
     Ok(())
 }
 
-pub(crate) fn project_candidate_membership(
+pub fn project_candidate_membership(
     directory: &Path,
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectCandidateMembership, String> {
@@ -1341,7 +1365,7 @@ fn project_directory_entries(
 }
 
 fn check_project_scan_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let force_cancel = cancel.is_some()
         && TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS.with(|budget| match budget.get() {
             Some(0) => {
@@ -1354,7 +1378,7 @@ fn check_project_scan_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> 
             }
             None => false,
         });
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if force_cancel {
         if let Some(cancel) = cancel {
             cancel.store(true, Ordering::Relaxed);
@@ -1367,10 +1391,10 @@ fn check_project_scan_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> 
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type ProjectReadHook = Box<dyn FnOnce(&Path)>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
@@ -1380,13 +1404,11 @@ thread_local! {
         std::cell::RefCell<Option<(PathBuf, ProjectReadHook)>> = std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
-pub(crate) struct TestProjectScanCancellationGuard(Option<usize>);
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestProjectScanCancellationGuard(Option<usize>);
 
-#[cfg(test)]
-pub(crate) fn test_cancel_project_scan_after_checks(
-    checks: usize,
-) -> TestProjectScanCancellationGuard {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_cancel_project_scan_after_checks(checks: usize) -> TestProjectScanCancellationGuard {
     let previous = TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS.with(|budget| {
         let previous = budget.get();
         budget.set(Some(checks));
@@ -1395,36 +1417,34 @@ pub(crate) fn test_cancel_project_scan_after_checks(
     TestProjectScanCancellationGuard(previous)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestProjectScanCancellationGuard {
     fn drop(&mut self) {
         TEST_PROJECT_SCAN_CANCEL_AFTER_CHECKS.with(|budget| budget.set(self.0.take()));
     }
 }
 
-#[cfg(test)]
-pub(crate) struct TestAfterProjectReadGuard(Option<ProjectReadHook>);
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestAfterProjectReadGuard(Option<ProjectReadHook>);
 
-#[cfg(test)]
-pub(crate) fn test_after_project_read(
-    hook: impl FnOnce(&Path) + 'static,
-) -> TestAfterProjectReadGuard {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_after_project_read(hook: impl FnOnce(&Path) + 'static) -> TestAfterProjectReadGuard {
     let previous = TEST_AFTER_PROJECT_READ.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
     TestAfterProjectReadGuard(previous)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestAfterProjectReadGuard {
     fn drop(&mut self) {
         TEST_AFTER_PROJECT_READ.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
 
-#[cfg(test)]
-pub(crate) struct TestAfterProjectReadAtGuard(Option<(PathBuf, ProjectReadHook)>);
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestAfterProjectReadAtGuard(Option<(PathBuf, ProjectReadHook)>);
 
-#[cfg(test)]
-pub(crate) fn test_after_project_read_at(
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_after_project_read_at(
     path: PathBuf,
     hook: impl FnOnce(&Path) + 'static,
 ) -> TestAfterProjectReadAtGuard {
@@ -1433,14 +1453,14 @@ pub(crate) fn test_after_project_read_at(
     TestAfterProjectReadAtGuard(previous)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestAfterProjectReadAtGuard {
     fn drop(&mut self) {
         TEST_AFTER_PROJECT_READ_AT.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn run_after_project_read(path: &Path) {
     let hook = TEST_AFTER_PROJECT_READ.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -1458,7 +1478,7 @@ fn run_after_project_read(path: &Path) {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn run_after_project_read(_path: &Path) {}
 
 fn normalize_workspace_roots(
@@ -2973,7 +2993,7 @@ fn add_metadata_file(
     true
 }
 
-pub(crate) fn add_metadata_observation(
+pub fn add_metadata_observation(
     observations: &mut Vec<MetadataObservation>,
     observation: MetadataObservation,
 ) {
@@ -3496,9 +3516,7 @@ fn read_payload_with_tracker(
         path: entry.path.clone(),
         read_policy: read_policy.clone(),
         path_entry: entry.clone(),
-        stamp: crate::workspace::path_stamp_result(&entry.path)
-            .ok()
-            .flatten(),
+        stamp: path_stamp_result(&entry.path).ok().flatten(),
         content_hash: project_content_hash(&bytes),
     };
     let contents =
@@ -3530,6 +3548,34 @@ fn project_content_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+pub fn content_hash_bytes(bytes: &[u8]) -> u64 {
+    project_content_hash(bytes)
+}
+
+pub fn path_stamp_result(path: &Path) -> io::Result<Option<ProjectReadStamp>> {
+    let link_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let is_symlink = link_metadata.file_type().is_symlink();
+    let metadata = if is_symlink {
+        match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => link_metadata,
+            Err(error) => return Err(error),
+        }
+    } else {
+        link_metadata
+    };
+    Ok(Some(ProjectReadStamp {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        is_dir: metadata.is_dir(),
+        is_symlink,
+    }))
+}
+
 fn is_pascal_source_path(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         extension.eq_ignore_ascii_case("pas")
@@ -3539,7 +3585,7 @@ fn is_pascal_source_path(path: &Path) -> bool {
 }
 
 #[allow(dead_code)]
-pub(crate) fn read_package_metadata(
+pub fn read_package_metadata(
     path: &Path,
     options: &ProjectOptions,
     overrides: &EffectiveOverrides,
@@ -3550,7 +3596,7 @@ pub(crate) fn read_package_metadata(
         .map(|read| read.metadata)
 }
 
-pub(crate) fn read_package_metadata_with_observations(
+pub fn read_package_metadata_with_observations(
     path: &Path,
     options: &ProjectOptions,
     overrides: &EffectiveOverrides,
@@ -5724,10 +5770,10 @@ mod tests {
         EffectiveOverrides, MAX_OWNERSHIP_CANDIDATES, MAX_OWNERSHIP_SOURCE_BYTES,
         MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES, MetadataObservation,
         ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectReadStamp,
-        ProjectReadTracker, ReadPolicy, project_candidate_membership, read_package_metadata,
-        test_cancel_project_scan_after_checks,
+        ProjectReadTracker, ReadPolicy, content_hash_bytes, path_stamp_result,
+        project_candidate_membership, read_package_metadata, test_cancel_project_scan_after_checks,
     };
-    use pascal_core::delphi_overrides::OverrideSession;
+    use crate::delphi_overrides::OverrideSession;
     use std::fs;
     use std::io::Write;
     #[cfg(unix)]
@@ -5865,13 +5911,9 @@ mod tests {
                     observed == path
                         && read_policy == &context.read_policy
                         && path_entry.path == *path
-                        && stamp
-                            == &crate::workspace::path_stamp_result(path)
-                                .expect("payload path stamp")
+                        && stamp == &path_stamp_result(path).expect("payload path stamp")
                         && *content_hash
-                            == crate::workspace::content_hash_bytes(
-                                &fs::read(path).expect("payload bytes"),
-                            )
+                            == content_hash_bytes(&fs::read(path).expect("payload bytes"))
                 }),
                 "evaluated payload {path:?} was downgraded to stat-only: {context:?}"
             );
@@ -5894,8 +5936,7 @@ mod tests {
             path: metadata.clone(),
             provenance: ProjectPathProvenance::Configured,
         };
-        let first_stamp =
-            crate::workspace::path_stamp_result(&metadata).expect("first metadata stamp");
+        let first_stamp = path_stamp_result(&metadata).expect("first metadata stamp");
         let first = MetadataObservation::Payload {
             path: metadata.clone(),
             read_policy: policy.clone(),
@@ -6027,7 +6068,7 @@ mod tests {
         )
         .expect("outside package unit");
         let overrides = EffectiveOverrides {
-            path_mappings: vec![pascal_core::delphi_overrides::PathMapping {
+            path_mappings: vec![crate::delphi_overrides::PathMapping {
                 from: "c:/sdk".to_string(),
                 to: sdk.clone(),
                 config_file: root.join(".delphi-tools.local.toml"),

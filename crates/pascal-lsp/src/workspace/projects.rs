@@ -6,11 +6,11 @@ use super::{
 };
 use crate::NavigationIndex;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
-use crate::project::{
+use lsp_types::Url;
+use pascal_project::{
     discover_with_selections, project_candidates, runtime_project_selection,
     selected_project_is_current,
 };
-use lsp_types::Url;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 

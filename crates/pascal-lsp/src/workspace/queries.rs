@@ -7,12 +7,12 @@ use super::rename::{
     source_for_input_with_owner,
 };
 use crate::navigation::SemanticTokenResolutionMode;
-use crate::project::has_invalid_project_selection;
 use crate::{NavigationIndex, NavigationTarget};
 use lsp_types::{
     CompletionList, DocumentHighlight, DocumentSymbol, Hover, Location, MarkupKind, Position,
     Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
+use pascal_project::has_invalid_project_selection;
 use std::sync::atomic::AtomicBool;
 
 pub(crate) struct NavigationResult {
@@ -998,16 +998,16 @@ mod tests {
         hover_from_input, references_from_input, semantic_tokens_from_input,
         signature_help_from_input, type_definitions_from_input,
     };
-    use crate::project::{
-        MetadataObservation, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
-    };
     use crate::workspace::rename::{
         CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input, owner_for_input,
         project_context_and_metadata_for_input, revalidate_input,
     };
     use crate::workspace::{Workspace, WorkspaceOptions, content_hash_bytes};
     use lsp_types::{MarkupKind, Position, Url};
-    use pascal_core::delphi_overrides::{EffectiveOverrides, OverrideSession};
+    use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
+    use pascal_project::{
+        MetadataObservation, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
+    };
     use std::collections::HashSet;
     #[cfg(target_os = "linux")]
     use std::ffi::CString;
@@ -1166,7 +1166,7 @@ mod tests {
     fn assistance_preflight_propagates_cancellation_during_owner_discovery() {
         let fixture = query_fixture();
         let cancel = AtomicBool::new(false);
-        let _guard = crate::project::test_cancel_project_scan_after_checks(0);
+        let _guard = pascal_project::test_cancel_project_scan_after_checks(0);
 
         let computed = hover_from_input(
             fixture.input,
@@ -1865,7 +1865,7 @@ mod tests {
         let package_project_for_hook = package_project.clone();
         let changed_for_hook = changed_package_project_source.to_owned();
         let _hook =
-            crate::project::test_after_project_read_at(package_project.clone(), move |path| {
+            pascal_project::test_after_project_read_at(package_project.clone(), move |path| {
                 assert_eq!(path, package_project_for_hook.as_path());
                 fs::write(&package_project_for_hook, changed_for_hook)
                     .expect("mutate package project after read");
@@ -1913,7 +1913,7 @@ mod tests {
             path: lower.clone(),
             provenance: ProjectPathProvenance::LegacyNative,
         };
-        let upper_read = crate::project::read_package_metadata(
+        let upper_read = pascal_project::read_package_metadata(
             &upper,
             &options,
             &overrides,
@@ -1921,7 +1921,7 @@ mod tests {
             &upper_entry,
         )
         .expect("upper package read");
-        let lower_read = crate::project::read_package_metadata(
+        let lower_read = pascal_project::read_package_metadata(
             &lower,
             &options,
             &overrides,
@@ -2234,7 +2234,7 @@ mod tests {
 
         let project_for_hook = project_path.clone();
         let changed_for_hook = changed_project.to_string();
-        let _hook = crate::project::test_after_project_read(move |path| {
+        let _hook = pascal_project::test_after_project_read(move |path| {
             if path == project_for_hook {
                 fs::write(&project_for_hook, &changed_for_hook)
                     .expect("mutate project after discovery read");
@@ -2283,7 +2283,7 @@ mod tests {
 
         let project_for_hook = project_path.clone();
         let new_project_for_hook = new_project_path.clone();
-        let _hook = crate::project::test_after_project_read(move |path| {
+        let _hook = pascal_project::test_after_project_read(move |path| {
             if path == project_for_hook {
                 fs::write(
                     &new_project_for_hook,
@@ -2570,7 +2570,7 @@ mod tests {
     fn initial_context_observations_honor_cancellation() {
         let fixture = query_fixture();
         let cancel = AtomicBool::new(false);
-        let _guard = crate::project::test_cancel_project_scan_after_checks(0);
+        let _guard = pascal_project::test_cancel_project_scan_after_checks(0);
         let computed = references_from_input(
             fixture.input,
             &source_uri(&fixture.provider),
@@ -2585,7 +2585,7 @@ mod tests {
     fn binding_preflight_honors_cancellation() {
         let fixture = query_fixture();
         let cancel = AtomicBool::new(false);
-        let _guard = crate::project::test_cancel_project_scan_after_checks(0);
+        let _guard = pascal_project::test_cancel_project_scan_after_checks(0);
         let result = binding_info_for_input(
             &fixture.input,
             &source_uri(&fixture.provider),

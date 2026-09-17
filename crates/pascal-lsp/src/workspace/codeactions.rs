@@ -10,7 +10,6 @@ use super::{
     absolute_path, canonical_file_uri, is_configuration_file, is_lint_excluded, path_stamp,
 };
 use crate::configuration::{config_directories, resolve_lint};
-use crate::project::{has_invalid_project_selection, project_candidates};
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
 use lint4d::engine::suppress::parse_suppressions;
@@ -23,6 +22,7 @@ use lsp_types::{
     CodeActionParams, Diagnostic, NumberOrString, Range, Url, WorkspaceEdit,
 };
 use pascal_core::{FileInfo, parser};
+use pascal_project::{has_invalid_project_selection, project_candidates};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
@@ -1031,7 +1031,7 @@ mod tests {
     use crate::workspace::rename::revalidate_input;
     use lsp_types::CodeActionOrCommand;
     use lsp_types::Url;
-    use pascal_core::delphi_overrides::OverrideSession;
+    use pascal_project::delphi_overrides::OverrideSession;
     use serde_json::json;
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]

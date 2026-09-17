@@ -2,7 +2,18 @@
 
 use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
-use crate::project::{
+use crate::{NavigationIndex, NavigationTarget, text};
+use globset::{GlobSet, GlobSetBuilder};
+use lsp_types::{
+    Diagnostic as LspDiagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range,
+    TextDocumentContentChangeEvent, TextEdit, Url,
+};
+use pascal_core::{FileInfo, Severity, decode_bytes, parser};
+pub(crate) use pascal_project::content_hash_bytes;
+use pascal_project::delphi_overrides::{
+    EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
+};
+use pascal_project::{
     MetadataObservation, PackageMetadata, ProjectCandidateMembership, ProjectCandidates,
     ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
     ProjectReadObservation, ProjectReadStamp, ProjectSelections, discover_with_selections,
@@ -12,21 +23,10 @@ use crate::project::{
     read_package_metadata_with_observations, runtime_project_selection,
     selected_project_is_current, selected_project_is_current_with_cancel,
 };
-use crate::{NavigationIndex, NavigationTarget, text};
-use globset::{GlobSet, GlobSetBuilder};
-use lsp_types::{
-    Diagnostic as LspDiagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range,
-    TextDocumentContentChangeEvent, TextEdit, Url,
-};
-use pascal_core::delphi_overrides::{
-    EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
-};
-use pascal_core::{FileInfo, Severity, decode_bytes, parser};
 use serde::Deserialize;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::hash::Hasher;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -203,13 +203,7 @@ pub(crate) struct DiskStamp {
     modified: Option<SystemTime>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PathStamp {
-    bytes: u64,
-    modified: Option<SystemTime>,
-    is_dir: bool,
-    is_symlink: bool,
-}
+pub(crate) type PathStamp = pascal_project::ProjectReadStamp;
 
 #[derive(Debug, Clone, Default)]
 struct DirectoryCatalogue {
@@ -268,7 +262,7 @@ struct CachedPackageMetadata {
 struct PackageMetadataKey {
     descriptor: PathBuf,
     overrides: EffectiveOverrides,
-    read_policy: crate::project::ReadPolicy,
+    read_policy: pascal_project::ReadPolicy,
     config: Option<String>,
     platform: Option<String>,
 }
@@ -2330,7 +2324,7 @@ impl Workspace {
         stamp: DiskStamp,
         content_hash: u64,
         path: &Path,
-        read_policy: &crate::project::ReadPolicy,
+        read_policy: &pascal_project::ReadPolicy,
         path_entry: &ProjectPathEntry,
     ) {
         let Some(records) = self.analysis_records.as_mut() else {
@@ -4104,7 +4098,7 @@ impl Workspace {
             return;
         };
         for observation in observations {
-            crate::project::add_metadata_observation(
+            pascal_project::add_metadata_observation(
                 &mut state.context.metadata_observations,
                 observation.clone(),
             );
@@ -5392,7 +5386,7 @@ fn path_to_glob(path: &Path) -> String {
 fn read_disk_source(
     path: &Path,
     max_bytes: usize,
-    read_policy: &crate::project::ReadPolicy,
+    read_policy: &pascal_project::ReadPolicy,
     entry: &ProjectPathEntry,
     allow_legacy_payload: bool,
 ) -> Result<DiskSource, String> {
@@ -5409,7 +5403,7 @@ fn read_disk_source(
 fn read_disk_source_with_cancel(
     path: &Path,
     max_bytes: usize,
-    read_policy: &crate::project::ReadPolicy,
+    read_policy: &pascal_project::ReadPolicy,
     entry: &ProjectPathEntry,
     allow_legacy_payload: bool,
     cancel: Option<&AtomicBool>,
@@ -5464,13 +5458,6 @@ fn read_disk_source_with_cancel(
         },
         content_hash: content_hash_bytes(&bytes),
     })
-}
-
-pub(crate) fn content_hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(bytes);
-    hasher.write_usize(bytes.len());
-    hasher.finish()
 }
 
 fn disk_stamp(path: &Path) -> Option<DiskStamp> {
@@ -5535,27 +5522,7 @@ fn mark_dependency_change(
 }
 
 pub(crate) fn path_stamp_result(path: &Path) -> io::Result<Option<PathStamp>> {
-    let link_metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let is_symlink = link_metadata.file_type().is_symlink();
-    let metadata = if is_symlink {
-        match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => link_metadata,
-            Err(error) => return Err(error),
-        }
-    } else {
-        link_metadata
-    };
-    Ok(Some(PathStamp {
-        bytes: metadata.len(),
-        modified: metadata.modified().ok(),
-        is_dir: metadata.is_dir(),
-        is_symlink,
-    }))
+    pascal_project::path_stamp_result(path)
 }
 
 fn path_stamp(path: &Path) -> Option<PathStamp> {
@@ -6013,11 +5980,11 @@ mod tests {
         context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
-    use crate::project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance};
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
-    use pascal_core::delphi_overrides::{
+    use pascal_project::delphi_overrides::{
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
     };
+    use pascal_project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance};
     use std::collections::HashSet;
     use std::fs;
     #[cfg(unix)]
@@ -7331,7 +7298,7 @@ mod tests {
         let base = super::PackageMetadataKey {
             descriptor: std::path::PathBuf::from("/packages/Shared.dproj"),
             overrides: EffectiveOverrides::default(),
-            read_policy: crate::project::ReadPolicy::default(),
+            read_policy: pascal_project::ReadPolicy::default(),
             config: Some("Debug".into()),
             platform: Some("Win32".into()),
         };

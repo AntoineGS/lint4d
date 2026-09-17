@@ -2,9 +2,9 @@ use lsp_types::{
     CompletionItemKind, CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range,
     Url,
 };
-use pascal_core::delphi_overrides::OverrideSession;
 use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
+use pascal_project::delphi_overrides::OverrideSession;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;

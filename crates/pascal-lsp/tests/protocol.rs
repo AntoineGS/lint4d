@@ -362,6 +362,11 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_selection_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_SELECTION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_barrier(environment: TempDir, variable: &str) -> (Self, TestBarrier) {
         let barrier_directory = environment.path().join("analysis-barrier");
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
@@ -1963,11 +1968,358 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     assert_eq!(capabilities["workspaceSymbolProvider"], true);
     assert_eq!(capabilities["referencesProvider"], true);
     assert_eq!(capabilities["documentHighlightProvider"], true);
+    assert_eq!(capabilities["selectionRangeProvider"], true);
     assert_eq!(capabilities["hoverProvider"], true);
     assert_eq!(capabilities["typeDefinitionProvider"], true);
     assert_eq!(capabilities["foldingRangeProvider"], true);
     assert_eq!(capabilities["documentFormattingProvider"], true);
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_return_an_inner_to_outer_structural_chain() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Selection.pas");
+    let source = "unit Selection;\ninterface\ntype\n  TWidget = class\n    Value: Integer;\n  end;\nimplementation\nprocedure TWidget.Run;\nbegin\n  Value := Other.Bar[0] + 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    assert_eq!(initialize["capabilities"]["selectionRangeProvider"], true);
+
+    let position = position_of(source, "Bar", 0);
+    let id = RequestId::from("selection-ranges".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position, position]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "selection range request failed: {response:?}"
+    );
+    let result = response.result.expect("selection range result");
+    let ranges = result.as_array().expect("selection range array");
+    assert_eq!(
+        ranges.len(),
+        2,
+        "request order and duplicates must be preserved"
+    );
+    assert_eq!(
+        ranges[0], ranges[1],
+        "duplicate positions must produce duplicate results"
+    );
+    assert_eq!(
+        ranges[0]["range"],
+        json!({
+            "start": position,
+            "end": Position::new(position.line, position.character + 3)
+        }),
+        "the innermost range must be the identifier under the cursor"
+    );
+
+    let mut chain = Vec::new();
+    let mut current = &ranges[0];
+    loop {
+        chain.push(current["range"].clone());
+        let Some(parent) = current.get("parent") else {
+            break;
+        };
+        current = parent;
+    }
+    assert!(chain.len() >= 5, "structural chain is too short: {chain:?}");
+    let point = |value: &Value| {
+        (
+            value["line"].as_u64().expect("selection line"),
+            value["character"].as_u64().expect("selection character"),
+        )
+    };
+    for pair in chain.windows(2) {
+        let outer_start = point(&pair[1]["start"]);
+        let inner_start = point(&pair[0]["start"]);
+        let inner_end = point(&pair[0]["end"]);
+        let outer_end = point(&pair[1]["end"]);
+        assert!(
+            outer_start <= inner_start && inner_end <= outer_end && pair[1] != pair[0],
+            "selection parents must strictly contain their children: {chain:?}"
+        );
+    }
+    assert_eq!(
+        chain.last().expect("document fallback range"),
+        &json!({
+            "start": Position::new(0, 0),
+            "end": pascal_lsp::text::offset_to_position(source, source.len())
+                .expect("document end position")
+        }),
+        "the outermost selection must cover the document"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn selection_range_cancellation_returns_the_standard_request_canceled_error() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionCancel.pas");
+    let source = "unit SelectionCancel;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_selection_barrier(temp);
+    server.initialize(source_path.parent().expect("workspace root"), Value::Null);
+    let id = RequestId::from("selection-cancelled".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(source, "Value", 0)]
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": "selection-cancelled"}));
+    let error = server
+        .response(&id)
+        .error
+        .expect("cancelled selection request must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_reject_invalid_positions_without_partial_results() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionInvalid.pas");
+    write_file(
+        &source_path,
+        "unit SelectionInvalid;\ninterface\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let invalid_params_id = RequestId::from("selection-invalid-params".to_string());
+    server.send_request(
+        invalid_params_id.clone(),
+        "textDocument/selectionRange",
+        json!({}),
+    );
+    assert_eq!(
+        server
+            .response(&invalid_params_id)
+            .error
+            .expect("invalid selection parameters error")
+            .code,
+        -32602
+    );
+
+    let invalid_position_id = RequestId::from("selection-invalid-position".to_string());
+    server.send_request(
+        invalid_position_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [{"line": 0, "character": 10_000}]
+        }),
+    );
+    let invalid_position_error = server
+        .response(&invalid_position_id)
+        .error
+        .expect("invalid selection position error");
+    assert_eq!(invalid_position_error.code, -32803);
+    assert!(
+        invalid_position_error
+            .message
+            .contains("valid UTF-16 source boundary")
+    );
+
+    let oversized_id = RequestId::from("selection-oversized".to_string());
+    server.send_request(
+        oversized_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": vec![json!({"line": 0, "character": 0}); 257]
+        }),
+    );
+    let oversized_error = server
+        .response(&oversized_id)
+        .error
+        .expect("oversized selection request error");
+    assert_eq!(oversized_error.code, -32803);
+    assert!(oversized_error.message.contains("more than 256 positions"));
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_return_a_valid_empty_source_range() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionEmpty.pas");
+    write_file(&source_path, "");
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("selection-empty".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [{"line": 0, "character": 0}]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "empty selection request failed: {response:?}"
+    );
+    assert_eq!(
+        response.result.expect("empty selection result"),
+        json!([{
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 0}
+            }
+        }])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_are_syntax_only_and_do_not_require_imports() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionUnresolvedImport.pas");
+    let source = "unit SelectionUnresolvedImport;\ninterface\nuses MissingSelectionProvider;\nimplementation\nprocedure Run;\nbegin\n  MissingSelectionProvider.Value := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("selection-unresolved-import".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(source, "Value", 0)]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "unresolved imports must not block syntax selection ranges: {response:?}"
+    );
+    assert_eq!(
+        response
+            .result
+            .expect("selection result")
+            .as_array()
+            .expect("selection array")
+            .len(),
+        1
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn blocked_selection_ranges_do_not_block_unrelated_lsp_requests() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("SelectionConcurrent.pas");
+    let source = "unit SelectionConcurrent;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := Other.Bar[0];\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_selection_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let selection_id = RequestId::from("blocked-selection".to_string());
+    server.send_request(
+        selection_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(source, "Bar", 0)]
+        }),
+    );
+    barrier.wait_until_entered();
+
+    let symbols_id = RequestId::from("while-selection-is-blocked".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none() && symbols.result.is_some(),
+        "unrelated request was blocked by selection ranges: {symbols:?}"
+    );
+
+    barrier.release();
+    let selection = server.response(&selection_id);
+    assert!(
+        selection.error.is_none() && selection.result.is_some(),
+        "selection range request failed after release: {selection:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn requested_open_document_change_discards_blocked_selection_ranges() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("SelectionStale.pas");
+    let first_source = "unit SelectionStale;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := 1;\nend;\nend.\n";
+    let second_source = first_source.replace("Value", "ChangedValue");
+    write_file(&source_path, first_source);
+
+    let (mut server, barrier) = TestServer::launch_with_selection_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_source
+            }
+        }),
+    );
+
+    let request_id = RequestId::from("stale-selection".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(first_source, "Value", 0)]
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("requested source change must stale selection ranges");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
     server.shutdown();
 }
 

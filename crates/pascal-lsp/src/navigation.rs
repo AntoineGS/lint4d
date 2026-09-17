@@ -17,6 +17,7 @@ mod assistance;
 mod folding;
 mod overload;
 mod rename;
+mod selection;
 mod semantic_tokens;
 mod symbols;
 pub(crate) use folding::{
@@ -181,6 +182,24 @@ impl NavigationIndex {
     /// Return source-accurate syntax folding ranges for one indexed document.
     pub fn folding_ranges(&self, uri: &Url) -> Result<Vec<lsp_types::FoldingRange>, String> {
         folding::folding_ranges(self, uri)
+    }
+
+    /// Return syntax-structural selection ranges for each requested position.
+    pub fn selection_ranges(
+        &self,
+        uri: &Url,
+        positions: &[Position],
+    ) -> Result<Vec<lsp_types::SelectionRange>, String> {
+        selection::selection_ranges(self, uri, positions)
+    }
+
+    pub(crate) fn selection_ranges_with_cancel(
+        &self,
+        uri: &Url,
+        positions: &[Position],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<lsp_types::SelectionRange>, String> {
+        selection::selection_ranges_with_cancel(self, uri, positions, cancel)
     }
 
     pub(crate) fn folding_ranges_with_cancel(

@@ -20,8 +20,9 @@ use lsp_types::{
     DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
     FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
     InitializeParams, MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams,
-    ReferenceParams, Registration, RegistrationParams, RelativePattern, ServerInfo,
-    SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
+    ReferenceParams, Registration, RegistrationParams, RelativePattern, SelectionRangeParams,
+    ServerInfo, SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit,
+    WorkspaceFolder,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -80,7 +81,8 @@ impl AnalysisPriority {
             | AnalysisRequest::Prepare { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
-            | AnalysisRequest::DocumentHighlights { .. } => Self::Interactive,
+            | AnalysisRequest::DocumentHighlights { .. }
+            | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
             AnalysisRequest::Diagnostics { .. } => Self::Diagnostics,
             AnalysisRequest::Formatting { .. }
             | AnalysisRequest::DocumentSymbols { .. }
@@ -224,6 +226,7 @@ enum TestBarrier {
     Navigation,
     Formatting,
     Diagnostics,
+    Selection,
 }
 
 #[cfg(feature = "test-support")]
@@ -232,6 +235,7 @@ pub struct TestBarrierConfig {
     navigation: Option<TestBarrierPaths>,
     formatting: Option<TestBarrierPaths>,
     diagnostics: Option<TestBarrierPaths>,
+    selection: Option<TestBarrierPaths>,
     dispatch: Option<PathBuf>,
 }
 
@@ -254,8 +258,14 @@ impl TestBarrierConfig {
             formatting: formatting.map(|(entered, release)| TestBarrierPaths { entered, release }),
             diagnostics: diagnostics
                 .map(|(entered, release)| TestBarrierPaths { entered, release }),
+            selection: None,
             dispatch: None,
         }
+    }
+
+    pub fn with_selection(mut self, selection: Option<(PathBuf, PathBuf)>) -> Self {
+        self.selection = selection.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
     }
 
     pub fn with_dispatch(mut self, path: Option<PathBuf>) -> Self {
@@ -289,6 +299,7 @@ impl TestBarrierConfig {
             TestBarrier::Navigation => self.navigation.as_ref(),
             TestBarrier::Formatting => self.formatting.as_ref(),
             TestBarrier::Diagnostics => self.diagnostics.as_ref(),
+            TestBarrier::Selection => self.selection.as_ref(),
         }
     }
 }
@@ -450,6 +461,10 @@ enum AnalysisRequest {
         uri: Url,
         position: Position,
     },
+    SelectionRanges {
+        uri: Url,
+        positions: Vec<Position>,
+    },
     SemanticTokens {
         uri: Url,
         range: Option<lsp_types::Range>,
@@ -480,6 +495,7 @@ enum AnalysisResultValue {
     WorkspaceSymbols(Result<Vec<lsp_types::SymbolInformation>, String>),
     References(Result<Vec<lsp_types::Location>, String>),
     DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
+    SelectionRanges(Result<Vec<lsp_types::SelectionRange>, String>),
     SemanticTokens(Result<lsp_types::SemanticTokens, String>),
     FoldingRanges(Result<Vec<lsp_types::FoldingRange>, String>),
 }
@@ -546,6 +562,7 @@ enum ObservationMethod {
     WorkspaceSymbols,
     References { include_declaration: bool },
     DocumentHighlights,
+    SelectionRanges,
     SemanticTokens { range: Option<ObservationRange> },
     FoldingRanges,
 }
@@ -567,6 +584,7 @@ struct ObservationKey {
     method: ObservationMethod,
     uri: Option<Url>,
     position: Option<ObservationPosition>,
+    positions: Option<Vec<ObservationPosition>>,
     query: Option<String>,
     version: Option<i32>,
     source_generation: u64,
@@ -575,7 +593,7 @@ struct ObservationKey {
 
 impl ObservationKey {
     fn for_request(request: &AnalysisRequest, workspace: &Workspace) -> Option<Self> {
-        let (method, uri, position, query) = match request {
+        let (method, uri, position, positions, query) = match request {
             AnalysisRequest::Hover {
                 uri,
                 position,
@@ -590,6 +608,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::Completion { uri, position } => (
                 ObservationMethod::Completion,
@@ -599,6 +618,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::SignatureHelp { uri, position } => (
                 ObservationMethod::SignatureHelp,
@@ -607,6 +627,7 @@ impl ObservationKey {
                     line: position.line,
                     character: position.character,
                 }),
+                None,
                 None,
             ),
             AnalysisRequest::Navigation {
@@ -625,6 +646,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::TypeDefinitions { uri, position } => (
                 ObservationMethod::TypeDefinitions,
@@ -633,6 +655,7 @@ impl ObservationKey {
                     line: position.line,
                     character: position.character,
                 }),
+                None,
                 None,
             ),
             AnalysisRequest::Prepare { uri, position } => (
@@ -643,6 +666,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::DocumentSymbols { uri, hierarchical } => (
                 ObservationMethod::DocumentSymbols {
@@ -651,9 +675,11 @@ impl ObservationKey {
                 Some(uri.clone()),
                 None,
                 None,
+                None,
             ),
             AnalysisRequest::WorkspaceSymbols { query } => (
                 ObservationMethod::WorkspaceSymbols,
+                None,
                 None,
                 None,
                 Some(query.clone()),
@@ -672,6 +698,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::DocumentHighlights { uri, position } => (
                 ObservationMethod::DocumentHighlights,
@@ -680,6 +707,7 @@ impl ObservationKey {
                     line: position.line,
                     character: position.character,
                 }),
+                None,
                 None,
             ),
             AnalysisRequest::SemanticTokens { uri, range } => (
@@ -698,11 +726,28 @@ impl ObservationKey {
                 Some(uri.clone()),
                 None,
                 None,
+                None,
             ),
             AnalysisRequest::FoldingRanges { uri } => (
                 ObservationMethod::FoldingRanges,
                 Some(uri.clone()),
                 None,
+                None,
+                None,
+            ),
+            AnalysisRequest::SelectionRanges { uri, positions } => (
+                ObservationMethod::SelectionRanges,
+                Some(uri.clone()),
+                None,
+                Some(
+                    positions
+                        .iter()
+                        .map(|position| ObservationPosition {
+                            line: position.line,
+                            character: position.character,
+                        })
+                        .collect(),
+                ),
                 None,
             ),
             AnalysisRequest::Formatting { .. }
@@ -716,6 +761,7 @@ impl ObservationKey {
             method,
             uri,
             position,
+            positions,
             query,
             version,
             source_generation: workspace.source_generation(),
@@ -727,6 +773,7 @@ impl ObservationKey {
         self.method == other.method
             && self.uri == other.uri
             && self.position == other.position
+            && self.positions == other.positions
             && self.query == other.query
     }
 
@@ -997,6 +1044,9 @@ impl AnalysisJobs {
             AnalysisRequest::DocumentHighlights { .. } => AnalysisResultValue::DocumentHighlights(
                 Err("analysis worker failed without changing workspace state".to_string()),
             ),
+            AnalysisRequest::SelectionRanges { .. } => AnalysisResultValue::SelectionRanges(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
             AnalysisRequest::SemanticTokens { .. } => AnalysisResultValue::SemanticTokens(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
@@ -1336,6 +1386,35 @@ impl AnalysisJobs {
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
                                 value: AnalysisResultValue::DocumentHighlights(computed.value),
+                            }
+                        }
+                        AnalysisRequest::SelectionRanges { uri, positions } => {
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Selection,
+                                &test_barriers,
+                                &worker_cancellation,
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::SelectionRanges(Err(error)),
+                                }
+                            } else {
+                                let computed = queries::selection_ranges_from_input(
+                                    input,
+                                    &uri,
+                                    positions,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::SelectionRanges(computed.value),
+                                }
                             }
                         }
                         AnalysisRequest::SemanticTokens { uri, range } => {
@@ -1984,6 +2063,7 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::TypeDefinitions(_)
                 | AnalysisResultValue::DocumentSymbols { .. }
                 | AnalysisResultValue::DocumentHighlights(_)
+                | AnalysisResultValue::SelectionRanges(_)
                 | AnalysisResultValue::SemanticTokens(_)
                 | AnalysisResultValue::FoldingRanges(_)
         )
@@ -2174,6 +2254,12 @@ fn deliver_analysis_result(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
+        AnalysisResultValue::SelectionRanges(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
         AnalysisResultValue::SemanticTokens(value) => match value {
             Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
             Err(error) => {
@@ -2212,6 +2298,7 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::WorkspaceSymbols(value) => *value = Err(error),
         AnalysisResultValue::References(value) => *value = Err(error),
         AnalysisResultValue::DocumentHighlights(value) => *value = Err(error),
+        AnalysisResultValue::SelectionRanges(value) => *value = Err(error),
         AnalysisResultValue::SemanticTokens(value) => *value = Err(error),
         AnalysisResultValue::FoldingRanges(value) => *value = Err(error),
     }
@@ -2889,6 +2976,27 @@ fn handle_request(
                 client_features,
             )?;
         }
+        "textDocument/selectionRange" => {
+            let id = request.id.clone();
+            let params: SelectionRangeParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::SelectionRanges {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    positions: params.positions,
+                },
+                client_features,
+            )?;
+        }
         "textDocument/semanticTokens/full" => {
             let id = request.id.clone();
             let params: lsp_types::SemanticTokensParams = match parse_params(&request) {
@@ -3435,6 +3543,7 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
         "workspaceSymbolProvider": true,
         "referencesProvider": true,
         "documentHighlightProvider": true,
+        "selectionRangeProvider": true,
         "foldingRangeProvider": true,
         "semanticTokensProvider": {
             "legend": crate::NavigationIndex::semantic_tokens_legend(),

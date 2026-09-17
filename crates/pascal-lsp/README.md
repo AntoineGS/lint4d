@@ -5,8 +5,8 @@ without Windows, Wine, RAD Studio, or `DelphiLSP.exe`. This slice provides
 declaration/definition navigation, source-based hover and type definitions,
 document and workspace symbols, semantic references, document highlights,
 semantic completion and signature help, syntax folding ranges, conservative
-symbol-aware rename, naming quick fixes, and reuses lint4d and fmt4d for
-diagnostics and formatting.
+structural selection ranges, conservative symbol-aware rename, naming quick
+fixes, and reuses lint4d and fmt4d for diagnostics and formatting.
 It is not a replacement for Delphi's compiler or its complete type system.
 
 ## Build and Run
@@ -652,6 +652,21 @@ and source/configuration generations plus the observed read set are revalidated
 before delivery. A changed input produces a stale-result error for the client
 to retry rather than returning data computed from an older snapshot.
 
+### Selection ranges
+
+`textDocument/selectionRange` returns one range per requested cursor position.
+Each result is a strict inner-to-outer chain of syntax ranges, ending at the
+document range when necessary. Request order and duplicate positions are
+preserved. The query uses the original source snapshot, including open-buffer
+overlays, and reports UTF-16 positions correctly across CRLF and non-BMP text.
+
+Selection ranges are syntax-based and do not require imported units to resolve.
+Invalid UTF-16 boundaries, batches larger than 256 positions, excessive syntax
+depth, and excessive traversal work fail the request without partial results.
+Empty documents return a valid zero-length document range. Selection requests
+also honor cancellation and the same generation/read-set stale-result checks as
+the other bounded analysis queries.
+
 Disk discovery excludes descendants named `.git`, `.worktrees`, `target`,
 `node_modules`, `build`, `dist`, and similar generated directories. An explicit
 workspace/source root may itself live under one of these names. Symlinked files
@@ -699,6 +714,8 @@ Implemented and covered by tests:
 - Syntax folding covers multiline declarations, implementations, control-flow
   blocks, unit sections, comments, and balanced regions with conservative
   conditional/recovery handling.
+- Structural selection ranges return bounded, cancellable inner-to-outer syntax
+  chains while preserving request order and duplicate positions.
 - Generic type and routine substitution/inference covers explicit and inferred
   calls, nested and inherited specializations, constructor results, consistent
   multi-parameter inference, cross-unit type identity, and method/formal

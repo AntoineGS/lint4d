@@ -10,7 +10,7 @@ use crate::navigation::{FoldingRangeOptions, SemanticTokenResolutionMode};
 use crate::{NavigationIndex, NavigationTarget};
 use lsp_types::{
     CompletionList, DocumentHighlight, DocumentSymbol, FoldingRange, Hover, Location, MarkupKind,
-    Position, Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
+    Position, Range, SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
 use pascal_project::has_invalid_project_selection;
 use std::sync::atomic::AtomicBool;
@@ -843,6 +843,61 @@ pub(crate) fn document_symbols_from_input(
         value,
         records,
     }
+}
+
+pub(crate) fn selection_ranges_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    positions: Vec<Position>,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<SelectionRange>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("document is outside configured workspace roots or source paths: {uri}"),
+        );
+    }
+    let (source, record) = match source_for_input_with_owner(&input, &uri, &owner, Some(cancel)) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let (context, metadata_records) = match project_context_and_metadata_for_owner(&owner, cancel) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let mut index = NavigationIndex::new();
+    if let Err(error) =
+        index.update_with_defines_with_cancel(uri.clone(), source, &context.defines, cancel)
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("could not index selection ranges for {uri}: {error}"),
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let value = index.selection_ranges_with_cancel(&uri, &positions, cancel);
+    let mut records = vec![record];
+    records.extend(metadata_records);
+    with_records(source_generation, configuration_generation, value, records)
 }
 
 pub(crate) fn navigation_from_input(

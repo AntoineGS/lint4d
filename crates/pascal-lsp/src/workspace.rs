@@ -599,6 +599,7 @@ pub struct Workspace {
     source_generation: u64,
     configuration_generation: u64,
     source_change_generations: HashMap<Url, u64>,
+    source_change_generations_case_insensitive: HashMap<String, u64>,
     configuration_change_generations: HashMap<Url, u64>,
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
@@ -2316,6 +2317,7 @@ impl Workspace {
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
+                missing_provider_candidate: false,
             },
         );
     }
@@ -2350,6 +2352,7 @@ impl Workspace {
                 read_policy: Some(read_policy.clone()),
                 path_entry: Some(path_entry.clone()),
                 include_payload: false,
+                missing_provider_candidate: false,
             },
         );
     }
@@ -2409,6 +2412,7 @@ impl Workspace {
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
+                    missing_provider_candidate: false,
                 },
             );
         }
@@ -4321,6 +4325,7 @@ impl Workspace {
     ) -> Vec<PathBuf> {
         let mut entries = self.directory_entries(directory);
         entries.extend(self.open_document_entries(directory, context_key));
+        self.record_missing_provider_candidates(directory, names, &entries);
         let mut candidates: Vec<PathBuf> = Vec::new();
         for name in names {
             for path in &entries {
@@ -4336,6 +4341,51 @@ impl Workspace {
             }
         }
         candidates
+    }
+
+    fn record_missing_provider_candidates(
+        &mut self,
+        directory: &Path,
+        names: &[String],
+        entries: &[PathBuf],
+    ) {
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        let directory = absolute_path(directory.to_path_buf());
+        for name in names {
+            // Retain a negative lookup only when no disk or overlay entry
+            // matched this filename. The live validator can then invalidate
+            // the result if that specific provider appears later.
+            if entries.iter().any(|path| {
+                path.file_name()
+                    .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
+            }) {
+                continue;
+            }
+            let path = directory.join(name);
+            let Some(uri) = Url::from_file_path(&path).ok() else {
+                continue;
+            };
+            records
+                .entry(uri.clone())
+                .or_insert_with(|| rename::SourceRecord {
+                    uri,
+                    text: String::new(),
+                    version: None,
+                    stamp: None,
+                    open: false,
+                    path: Some(path.clone()),
+                    path_stamp: path_stamp(&path),
+                    content_hash: None,
+                    content_bytes: None,
+                    candidate_membership: None,
+                    read_policy: None,
+                    path_entry: None,
+                    include_payload: false,
+                    missing_provider_candidate: true,
+                });
+        }
     }
 
     fn open_document_entries(&self, directory: &Path, context_key: &ContextKey) -> Vec<PathBuf> {
@@ -4752,10 +4802,17 @@ impl Workspace {
                 .as_ref()
                 .and_then(|path| Url::from_file_path(absolute_path(path.clone())).ok())
                 .unwrap_or_else(|| canonical_file_uri(&record.uri));
+            let missing_provider_candidate_changed = record.missing_provider_candidate
+                && record.path.as_deref().is_some_and(|candidate| {
+                    self.source_change_generations_case_insensitive
+                        .get(&case_insensitive_path_key(candidate))
+                        .is_some_and(|generation| *generation > source_generation)
+                });
             if self
                 .source_change_generations
                 .get(&dependency_uri)
                 .is_some_and(|generation| *generation > source_generation)
+                || missing_provider_candidate_changed
                 || self
                     .configuration_change_generations
                     .get(&dependency_uri)
@@ -4822,6 +4879,12 @@ impl Workspace {
             self.source_generation,
             include_parent,
         );
+        if let Ok(path) = uri.to_file_path() {
+            self.source_change_generations_case_insensitive.insert(
+                case_insensitive_path_key(&absolute_path(path)),
+                self.source_generation,
+            );
+        }
     }
 
     fn mark_configuration_change(&mut self, uri: &Url, include_parent: bool) {
@@ -5526,6 +5589,10 @@ fn add_configuration_watch_directories(
 fn paths_equal_ci(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+fn case_insensitive_path_key(path: &Path) -> String {
+    path.to_string_lossy().to_ascii_lowercase()
 }
 
 fn project_path_entry_for<'a>(

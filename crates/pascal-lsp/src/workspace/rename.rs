@@ -131,6 +131,10 @@ pub(crate) struct SourceRecord {
     pub(crate) read_policy: Option<ReadPolicy>,
     pub(crate) path_entry: Option<ProjectPathEntry>,
     pub(crate) include_payload: bool,
+    /// The recorded provider filename was absent during the computation.
+    /// Unlike a positive source URI, this is invalidated by a matching source
+    /// change even when the file was not part of the worker's read set.
+    pub(crate) missing_provider_candidate: bool,
 }
 
 impl SourceRecord {
@@ -1021,6 +1025,7 @@ fn path_record_at(
         read_policy,
         path_entry,
         include_payload,
+        missing_provider_candidate: false,
     })
 }
 
@@ -1061,6 +1066,7 @@ pub(crate) fn source_for_input_with_cancel(
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
+                missing_provider_candidate: false,
             },
         ));
     }
@@ -1100,6 +1106,7 @@ pub(crate) fn source_for_input_with_owner(
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
+                missing_provider_candidate: false,
             },
         ));
     }
@@ -1153,6 +1160,7 @@ pub(crate) fn source_for_input_with_owner(
         read_policy: Some(read_policy),
         path_entry: Some(entry),
         include_payload: false,
+        missing_provider_candidate: false,
     };
     Ok((disk.text, record))
 }
@@ -2661,6 +2669,7 @@ pub(crate) fn build_snapshot(
                     read_policy: Some(read_policy.clone()),
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
+                    missing_provider_candidate: false,
                 },
                 overlay.text.len(),
             )
@@ -2721,6 +2730,7 @@ pub(crate) fn build_snapshot(
                     read_policy: Some(read_policy.clone()),
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
+                    missing_provider_candidate: false,
                 },
                 scan.bytes,
             )
@@ -3011,6 +3021,7 @@ pub(crate) fn build_snapshot(
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
+                    missing_provider_candidate: false,
                 },
             )
         } else {
@@ -3041,6 +3052,7 @@ pub(crate) fn build_snapshot(
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
+                    missing_provider_candidate: false,
                 },
             )
         };
@@ -7558,6 +7570,7 @@ mod tests {
             read_policy: None,
             path_entry: None,
             include_payload: true,
+            missing_provider_candidate: false,
         };
 
         let error = read_record_content_hash(&include, &record, &AtomicBool::new(false))

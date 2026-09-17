@@ -18428,6 +18428,63 @@ fn changed_imported_provider_discards_blocked_navigation_result() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn absent_provider_overlay_invalidates_blocked_empty_navigation_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("AbsentProvider.pas");
+    let main_source = "unit Main;\ninterface\nuses AbsentProvider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    let provider_source = "unit AbsentProvider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("absent-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("fulfilled negative provider lookup must stale the old result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+
+    let fresh_request_id = RequestId::from("absent-provider-navigation-fresh".to_string());
+    server.send_request(
+        fresh_request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    let locations = result_locations(server.response(&fresh_request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn unrelated_configuration_change_does_not_discard_blocked_formatting_result() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");

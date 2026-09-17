@@ -739,6 +739,7 @@ fn lint_configuration_for_input(
                 read_policy: Some(context.read_policy.clone()),
                 path_entry: super::context_path_entry(&context, path),
                 include_payload: false,
+                missing_provider_candidate: false,
             })
         })
         .collect();

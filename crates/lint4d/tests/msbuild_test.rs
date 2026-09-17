@@ -1,39 +1,64 @@
 use lint4d::discovery::msbuild::parse_msbuild_output;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+fn native_absolute_root() -> PathBuf {
+    PathBuf::from("C:\\")
+}
+
+#[cfg(not(windows))]
+fn native_absolute_root() -> PathBuf {
+    PathBuf::from("/")
+}
+
+fn native_absolute_path(parts: &[&str]) -> PathBuf {
+    let mut path = native_absolute_root();
+    for part in parts {
+        path.push(part);
+    }
+    path
+}
+
+fn native_relative_path(parts: &[&str]) -> PathBuf {
+    let mut path = PathBuf::new();
+    for part in parts {
+        path.push(part);
+    }
+    path
+}
+
 #[test]
 fn parses_key_value_lines() {
-    let output = "\
-        DCU_OUTPUT=C:\\MyProject\\Win64\\Debug\n\
-        UNIT_SEARCH=C:\\MyProject\\lib;C:\\Shared\\units\n\
-        PLATFORM=Win64\n\
-        CONFIG=Debug\n\
-        BDS=C:\\Program Files (x86)\\Embarcadero\\Studio\\23.0\n\
-        LIBRARY_PATH=C:\\Program Files (x86)\\Embarcadero\\Studio\\23.0\\lib\\Win64\\release;C:\\Program Files (x86)\\Embarcadero\\Studio\\23.0\\lib\\Win64\\debug\n\
-        BROWSING_PATH=\n";
+    let project_dir = native_absolute_path(&["MyProject"]);
+    let output_dir = project_dir.join("Win64").join("Debug");
+    let project_lib = project_dir.join("lib");
+    let shared_units = native_absolute_path(&["Shared", "units"]);
+    let bds_root = native_absolute_path(&["Program Files (x86)", "Embarcadero", "Studio", "23.0"]);
+    let library_release = bds_root.join("lib").join("Win64").join("release");
+    let library_debug = bds_root.join("lib").join("Win64").join("debug");
+    let output = format!(
+        "DCU_OUTPUT={}\n\
+         UNIT_SEARCH={};{}\n\
+         PLATFORM=Win64\n\
+         CONFIG=Debug\n\
+         BDS={}\n\
+         LIBRARY_PATH={};{}\n\
+         BROWSING_PATH=\n",
+        output_dir.display(),
+        project_lib.display(),
+        shared_units.display(),
+        bds_root.display(),
+        library_release.display(),
+        library_debug.display(),
+    );
 
-    let base_dir = PathBuf::from("C:\\MyProject");
-    let result = parse_msbuild_output(output, &base_dir);
+    let result = parse_msbuild_output(&output, &project_dir);
 
-    assert!(
-        result
-            .paths
-            .contains(&PathBuf::from("C:\\MyProject\\Win64\\Debug"))
-    );
-    assert!(result.paths.contains(&PathBuf::from("C:\\MyProject\\lib")));
-    assert!(result.paths.contains(&PathBuf::from("C:\\Shared\\units")));
-    assert!(
-        result
-            .paths
-            .iter()
-            .any(|p| p.to_string_lossy().contains("lib\\Win64\\release"))
-    );
-    assert!(
-        result
-            .paths
-            .iter()
-            .any(|p| p.to_string_lossy().contains("lib\\Win64\\debug"))
-    );
+    assert!(result.paths.contains(&output_dir));
+    assert!(result.paths.contains(&project_lib));
+    assert!(result.paths.contains(&shared_units));
+    assert!(result.paths.contains(&library_release));
+    assert!(result.paths.contains(&library_debug));
     assert_eq!(result.platform.as_deref(), Some("Win64"));
     assert_eq!(result.config.as_deref(), Some("Debug"));
 }
@@ -47,22 +72,24 @@ fn skips_empty_values() {
 
 #[test]
 fn skips_unexpanded_variables() {
-    let output = "DCU_OUTPUT=$(DCC_DcuOutput)\nUNIT_SEARCH=C:\\valid\\path\n";
-    let result = parse_msbuild_output(output, &PathBuf::from("."));
-    // $(DCC_DcuOutput) should be skipped, C:\valid\path should remain
+    let valid_path = native_absolute_path(&["valid", "path"]);
+    let output = format!(
+        "DCU_OUTPUT=$(DCC_DcuOutput)\nUNIT_SEARCH={}\n",
+        valid_path.display()
+    );
+    let result = parse_msbuild_output(&output, &PathBuf::from("."));
+    // $(DCC_DcuOutput) should be skipped, the native absolute path should remain
     assert_eq!(result.paths.len(), 1);
-    assert_eq!(result.paths[0], PathBuf::from("C:\\valid\\path"));
+    assert_eq!(result.paths[0], valid_path);
 }
 
 #[test]
 fn resolves_relative_paths_against_base_dir() {
-    let output = "DCU_OUTPUT=Win64\\Debug\n";
-    let base_dir = PathBuf::from("C:\\MyProject");
-    let result = parse_msbuild_output(output, &base_dir);
-    assert_eq!(
-        result.paths[0],
-        PathBuf::from("C:\\MyProject\\Win64\\Debug")
-    );
+    let relative_path = native_relative_path(&["Win64", "Debug"]);
+    let output = format!("DCU_OUTPUT={}\n", relative_path.display());
+    let base_dir = native_absolute_path(&["MyProject"]);
+    let result = parse_msbuild_output(&output, &base_dir);
+    assert_eq!(result.paths[0], base_dir.join(relative_path));
 }
 
 #[cfg(not(windows))]
@@ -99,12 +126,19 @@ fn native_windows_join_preserves_rooted_and_drive_relative_paths() {
 
 #[test]
 fn deduplicates_paths() {
-    let output = "DCU_OUTPUT=C:\\path\\one\nUNIT_SEARCH=C:\\path\\one;C:\\path\\two\n";
-    let result = parse_msbuild_output(output, &PathBuf::from("."));
+    let first_path = native_absolute_path(&["path", "one"]);
+    let second_path = native_absolute_path(&["path", "two"]);
+    let output = format!(
+        "DCU_OUTPUT={}\nUNIT_SEARCH={};{}\n",
+        first_path.display(),
+        first_path.display(),
+        second_path.display(),
+    );
+    let result = parse_msbuild_output(&output, &PathBuf::from("."));
     let count = result
         .paths
         .iter()
-        .filter(|p| **p == PathBuf::from("C:\\path\\one"))
+        .filter(|path| path.as_path() == first_path.as_path())
         .count();
     assert_eq!(count, 1);
 }

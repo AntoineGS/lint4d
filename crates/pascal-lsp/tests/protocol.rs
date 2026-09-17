@@ -949,6 +949,35 @@ fn uri(path: &Path) -> Url {
     Url::from_file_path(path).expect("file URI")
 }
 
+fn decoded_semantic_tokens(
+    result: &Value,
+    token_types: &[&str],
+) -> Vec<(u32, u32, u32, String, u32)> {
+    let data = result["data"].as_array().expect("semantic token data");
+    let mut line = 0;
+    let mut character = 0;
+    let mut tokens = Vec::with_capacity(data.len() / 5);
+    for chunk in data.chunks_exact(5) {
+        let delta_line = chunk[0].as_u64().expect("delta line") as u32;
+        let delta_start = chunk[1].as_u64().expect("delta start") as u32;
+        line += delta_line;
+        character = if delta_line == 0 {
+            character + delta_start
+        } else {
+            delta_start
+        };
+        let token_type = chunk[3].as_u64().expect("token type") as usize;
+        tokens.push((
+            line,
+            character,
+            chunk[2].as_u64().expect("token length") as u32,
+            token_types[token_type].to_string(),
+            chunk[4].as_u64().expect("token modifiers") as u32,
+        ));
+    }
+    tokens
+}
+
 fn position_of(source: &str, needle: &str, occurrence: usize) -> Position {
     let mut from = 0;
     let mut offset = 0;
@@ -2260,6 +2289,252 @@ fn incremental_did_change_applies_a_cross_line_crlf_range() {
         fs::read_to_string(&source_path).expect("source after edit"),
         source
     );
+    server.shutdown();
+}
+
+#[test]
+fn semantic_tokens_advertise_the_legend_and_return_full_document_tokens() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Tokens.pas");
+    let source = "unit Tokens;\r\ninterface\r\ntype\r\n  TWidget = class\r\n    Value: Integer;\r\n  end;\r\nprocedure Run(A: Integer);\r\nimplementation\r\nprocedure Run(A: Integer);\r\nvar\r\n  Widget: TWidget;\r\nbegin\r\n  Widget.Value := 42; // 😀 value\r\n  WriteLn('hello');\r\nend;\r\nend.\r\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    let provider = &initialize["capabilities"]["semanticTokensProvider"];
+    assert_eq!(provider["range"], true);
+    assert_eq!(provider["full"], true);
+    assert_eq!(provider["full"].get("delta"), None);
+    assert_eq!(
+        provider["legend"]["tokenTypes"],
+        json!([
+            "namespace",
+            "type",
+            "class",
+            "enum",
+            "interface",
+            "struct",
+            "typeParameter",
+            "parameter",
+            "variable",
+            "property",
+            "enumMember",
+            "function",
+            "method",
+            "keyword",
+            "modifier",
+            "comment",
+            "string",
+            "number",
+            "operator"
+        ])
+    );
+    assert_eq!(
+        provider["legend"]["tokenModifiers"],
+        json!(["declaration", "definition", "readonly", "static"])
+    );
+
+    let request_id = RequestId::from("semantic-tokens-full".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/semanticTokens/full",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "semantic tokens failed: {response:?}"
+    );
+    let result = response.result.expect("semantic token result");
+    let data = result["data"].as_array().expect("semantic token data");
+    assert!(!data.is_empty());
+    assert_eq!(data.len() % 5, 0);
+    let token_types = provider["legend"]["tokenTypes"]
+        .as_array()
+        .expect("token type legend")
+        .iter()
+        .map(|token_type| token_type.as_str().expect("token type name"))
+        .collect::<Vec<_>>();
+    let tokens = decoded_semantic_tokens(&result, &token_types);
+    assert!(tokens.contains(&(0, 0, 4, "keyword".to_string(), 0)));
+    assert!(tokens.contains(&(0, 5, 6, "namespace".to_string(), 1)));
+    assert!(tokens.contains(&(12, 22, 11, "comment".to_string(), 0)));
+    assert!(tokens.contains(&(12, 15, 2, "operator".to_string(), 0)));
+    assert!(tokens.contains(&(12, 18, 2, "number".to_string(), 0)));
+    assert!(tokens.contains(&(4, 4, 5, "variable".to_string(), 1)));
+    assert!(tokens.contains(&(6, 10, 3, "function".to_string(), 1)));
+    assert!(tokens.contains(&(8, 10, 3, "function".to_string(), 2)));
+
+    server.shutdown();
+}
+
+#[test]
+fn semantic_tokens_range_clips_tokens_to_the_requested_utf16_range() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("RangeTokens.pas");
+    let source = "unit RangeTokens;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n  Value := 42;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    let token_types = initialize["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"]
+        .as_array()
+        .expect("token type legend")
+        .iter()
+        .map(|token_type| token_type.as_str().expect("token type name"))
+        .collect::<Vec<_>>();
+    let request_id = RequestId::from("semantic-tokens-range".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/semanticTokens/range",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {
+                "start": {"line": 8, "character": 3},
+                "end": {"line": 8, "character": 7}
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "semantic token range failed: {response:?}"
+    );
+    let result = response.result.expect("semantic token range result");
+    assert_eq!(
+        decoded_semantic_tokens(&result, &token_types),
+        vec![(8, 3, 4, "variable".to_string(), 0)]
+    );
+    server.shutdown();
+}
+
+#[test]
+fn semantic_tokens_full_request_uses_the_newest_open_document_overlay() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("OverlayTokens.pas");
+    let disk_source = "unit OverlayTokens;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nvar\n  DiskValue: Integer;\nbegin\n  DiskValue := 1;\nend;\nend.\n";
+    let overlay_source = disk_source.replace("DiskValue", "UpdatedValue");
+    write_file(&source_path, disk_source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    let token_types = initialize["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"]
+        .as_array()
+        .expect("token type legend")
+        .iter()
+        .map(|token_type| token_type.as_str().expect("token type name"))
+        .collect::<Vec<_>>();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": disk_source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{"text": overlay_source}]
+        }),
+    );
+    let request_id = RequestId::from("semantic-tokens-overlay".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/semanticTokens/full",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "overlay semantic tokens failed: {response:?}"
+    );
+    let result = response.result.expect("overlay semantic token result");
+    let tokens = decoded_semantic_tokens(&result, &token_types);
+    assert!(tokens.contains(&(6, 2, 12, "variable".to_string(), 1)));
+    assert!(tokens.contains(&(8, 2, 12, "variable".to_string(), 0)));
+    server.shutdown();
+}
+
+#[test]
+fn semantic_tokens_mark_class_members_with_the_static_modifier() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("StaticTokens.pas");
+    let source = "unit StaticTokens;\ninterface\ntype\n  TWidget = class\n    class var Count: Integer;\n    class procedure Reset;\n  end;\nimplementation\nclass procedure TWidget.Reset;\nbegin\n  Count := 0;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    let token_types = initialize["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"]
+        .as_array()
+        .expect("token type legend")
+        .iter()
+        .map(|token_type| token_type.as_str().expect("token type name"))
+        .collect::<Vec<_>>();
+    let request_id = RequestId::from("semantic-tokens-static".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/semanticTokens/full",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "semantic tokens failed: {response:?}"
+    );
+    let result = response.result.expect("semantic token result");
+    let tokens = decoded_semantic_tokens(&result, &token_types);
+
+    assert!(tokens.contains(&(4, 14, 5, "variable".to_string(), 1 | (1 << 3))));
+    assert!(tokens.contains(&(10, 2, 5, "variable".to_string(), 1 << 3)));
+    assert!(tokens.contains(&(8, 24, 5, "method".to_string(), 2 | (1 << 3))));
+
+    server.shutdown();
+}
+
+#[test]
+fn semantic_tokens_classify_declared_types_properties_and_enum_members() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("KindsTokens.pas");
+    let source = "unit KindsTokens;\ninterface\ntype\n  TRecord = record\n    Field: Integer;\n  end;\n  TEnum = (First, Second);\n  TIntf = interface\n    procedure Method;\n  end;\n  TClass = class\n    property Value: Integer;\n  end;\nimplementation\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    let token_types = initialize["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"]
+        .as_array()
+        .expect("token type legend")
+        .iter()
+        .map(|token_type| token_type.as_str().expect("token type name"))
+        .collect::<Vec<_>>();
+    let request_id = RequestId::from("semantic-tokens-kinds".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/semanticTokens/full",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "semantic tokens failed: {response:?}"
+    );
+    let result = response.result.expect("semantic token result");
+    let tokens = decoded_semantic_tokens(&result, &token_types);
+
+    assert!(tokens.contains(&(3, 2, 7, "struct".to_string(), 1)));
+    assert!(tokens.contains(&(4, 4, 5, "variable".to_string(), 1)));
+    assert!(tokens.contains(&(6, 2, 5, "enum".to_string(), 1)));
+    assert!(tokens.contains(&(6, 11, 5, "enumMember".to_string(), 5)));
+    assert!(tokens.contains(&(6, 18, 6, "enumMember".to_string(), 5)));
+    assert!(tokens.contains(&(7, 2, 5, "interface".to_string(), 1)));
+    assert!(tokens.contains(&(8, 14, 6, "method".to_string(), 1)));
+    assert!(tokens.contains(&(10, 2, 6, "class".to_string(), 1)));
+    assert!(tokens.contains(&(11, 13, 5, "property".to_string(), 1)));
+
     server.shutdown();
 }
 

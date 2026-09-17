@@ -1,4 +1,7 @@
 local REQUEST_TIMEOUT = 10000
+local BUSY_ERROR_CODE = -32803
+local BUSY_RETRY_DELAY = 50
+local MAX_BUSY_RETRIES = REQUEST_TIMEOUT / BUSY_RETRY_DELAY
 
 local function assert_range(actual, start_line, start_character, end_line, end_character)
 	local expected = {
@@ -9,27 +12,37 @@ local function assert_range(actual, start_line, start_character, end_line, end_c
 end
 
 local function request(client, method, params, bufnr)
-	local completed = false
-	local callback_error
-	local result
-	local accepted = client:request(method, params, function(err, response)
-		callback_error = err
-		result = response
-		completed = true
-	end, bufnr)
-	assert(accepted, method .. " request was not accepted")
-	assert(
-		vim.wait(REQUEST_TIMEOUT, function()
-			return completed
-		end),
-		method .. " request timed out"
-	)
-	assert(not callback_error, method .. " callback error: " .. vim.inspect(callback_error))
-	assert(result ~= nil, method .. " returned no result")
-	return result
+	for _ = 1, MAX_BUSY_RETRIES do
+		local completed = false
+		local callback_error
+		local result
+		local accepted = client:request(method, params, function(err, response)
+			callback_error = err
+			result = response
+			completed = true
+		end, bufnr)
+		assert(accepted, method .. " request was not accepted")
+		assert(
+			vim.wait(REQUEST_TIMEOUT, function()
+				return completed
+			end),
+			method .. " request timed out"
+		)
+		if callback_error and callback_error.code == BUSY_ERROR_CODE then
+			vim.wait(BUSY_RETRY_DELAY)
+		else
+			assert(not callback_error, method .. " callback error: " .. vim.inspect(callback_error))
+			assert(result ~= nil, method .. " returned no result")
+			return result
+		end
+	end
+	error(method .. " remained busy for " .. REQUEST_TIMEOUT .. "ms")
 end
 
-local function standard_list(label, invoke)
+local function standard_list(label, client, method, params, bufnr, invoke)
+	-- The convenience APIs do not expose their request errors. Complete a
+	-- direct request first so the following request is sent sequentially.
+	request(client, method, params, bufnr)
 	local captured
 	invoke(function(list)
 		captured = list
@@ -135,9 +148,16 @@ local function run()
 		vim.inspect(widget.children)
 	)
 
-	local outline_list = standard_list("gO/document_symbol", function(on_list)
+	local outline_list = standard_list(
+		"gO/document_symbol",
+		client,
+		"textDocument/documentSymbol",
+		{ textDocument = { uri = provider_uri } },
+		provider,
+		function(on_list)
 		vim.lsp.buf.document_symbol({ on_list = on_list })
-	end)
+		end
+	)
 	local outline_item
 	for _, item in ipairs(outline_list.items) do
 		if item.text:find("TWidget", 1, true) then
@@ -159,9 +179,16 @@ local function run()
 	assert_location(workspace_symbols[3].location, provider_uri, 12, 2, 12, 18)
 	assert(vim.fn.bufnr(consumer_path) == -1, "workspace symbol search opened the consumer")
 
-	local workspace_list = standard_list("workspace_symbol", function(on_list)
+	local workspace_list = standard_list(
+		"workspace_symbol",
+		client,
+		"workspace/symbol",
+		{ query = "Only" },
+		provider,
+		function(on_list)
 		vim.lsp.buf.workspace_symbol("Only", { on_list = on_list })
-	end)
+		end
+	)
 	assert(#workspace_list.items == 3, vim.inspect(workspace_list.items))
 	assert(vim.fn.bufnr(consumer_path) == -1, "workspace symbol picker opened the consumer")
 
@@ -192,9 +219,20 @@ local function run()
 	assert_location(references_with_declaration[4], provider_uri, 21, 6, 21, 17)
 
 	vim.api.nvim_win_set_cursor(0, { 12, 2 })
-	local references_list = standard_list("grr/references", function(on_list)
+	local references_list = standard_list(
+		"grr/references",
+		client,
+		"textDocument/references",
+		{
+			textDocument = references_params.textDocument,
+			position = references_params.position,
+			context = { includeDeclaration = false },
+		},
+		provider,
+		function(on_list)
 		vim.lsp.buf.references({ includeDeclaration = false }, { on_list = on_list })
-	end)
+		end
+	)
 	assert(#references_list.items == 3, vim.inspect(references_list.items))
 
 	local highlights = request(client, "textDocument/documentHighlight", {

@@ -535,10 +535,10 @@ or bypass the reusable model safely.
 
 ## Symbols, References and Highlights
 
-The server advertises the four standard query capabilities
+The server advertises the standard query capabilities
 `textDocument/documentSymbol`, `workspace/symbol`,
-`textDocument/references`, and `textDocument/documentHighlight`. These queries
-are read-only: the server does not write source files.
+`textDocument/references`, `textDocument/documentHighlight`, and semantic
+tokens. These queries are read-only: the server does not write source files.
 
 ### Document outlines
 
@@ -601,6 +601,28 @@ configuration does not install `CursorHold` or `CursorMoved` autocmds; clients
 request highlights explicitly, for example with
 `vim.lsp.buf.document_highlight()`.
 
+### Semantic tokens
+
+The server supports both `textDocument/semanticTokens/full` and
+`textDocument/semanticTokens/range`. Full results are complete snapshots rather
+than delta responses. The legend includes standard Pascal-oriented namespace,
+type, class, interface, record, enum, routine, parameter, variable, property,
+literal, comment, keyword, and operator token types.
+
+Keywords, strings, numbers, comments, and operators are classified lexically.
+Identifiers receive a semantic type only when the source index can prove their
+binding; declarations and definitions are marked separately, class members are
+marked static, and constants and enum members are marked read-only. Unknown,
+ambiguous, conditionally uncertain, or parser-recovery identifiers remain
+unclassified instead of being guessed. If import discovery is incomplete or an
+include audit is uncertain, the response keeps syntax-derived tokens but
+suppresses semantic identifier classifications rather than using partially
+resolved imports.
+Ranges are clipped to the requested UTF-16 range, including CRLF and non-BMP
+text, and open-buffer overlays are used in preference to disk content. Semantic
+token requests use the same bounded snapshots, cancellation, and stale-result
+checks as the other analysis queries.
+
 All analysis queries run in bounded analysis workers. `$/cancelRequest` is honored,
 and source/configuration generations plus the observed read set are revalidated
 before delivery. A changed input produces a stale-result error for the client
@@ -647,8 +669,9 @@ Implemented and covered by tests:
   classes and nested procedures inside methods.
 - In-memory replacements, Unicode UTF-16 coordinates, and CRLF source files.
 - Unknown receivers do not trigger an unrelated workspace-wide name search.
-- Document/workspace symbols, semantic references, and document-local highlights
-  use the standard LSP requests and preserve UTF-16 source ranges.
+- Document/workspace symbols, semantic references, document-local highlights,
+  and semantic tokens use the standard LSP requests and preserve UTF-16 source
+  ranges.
 - Generic type and routine substitution/inference covers explicit and inferred
   calls, nested and inherited specializations, constructor results, consistent
   multi-parameter inference, cross-unit type identity, and method/formal
@@ -676,7 +699,8 @@ Not implemented or incomplete:
   callable inference are not implemented. Completion and signature help remain
   conservative when imports, conditionals, receivers, or parser state are
   unknown.
-- Semantic tokens and a general Delphi type checker are not implemented.
+- A general Delphi type checker is not implemented; semantic-token precision is
+  limited to bindings proven by the source index.
 
 Unsupported expressions can return no location. Results should be evaluated
 against your own projects before treating navigation as compiler-equivalent.

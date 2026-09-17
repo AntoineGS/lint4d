@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
 mod assistance;
+mod documentation;
 mod folding;
 mod overload;
 mod rename;
@@ -8275,6 +8276,7 @@ pub(crate) struct ParsedDocument {
     generic_parameter_contexts: Vec<GenericParameterContext>,
     generic_parameter_intervals: SourceIntervalIndex,
     helpers: Vec<HelperDefinition>,
+    documentation: Vec<Option<Arc<documentation::Documentation>>>,
 }
 
 struct Document {
@@ -8506,6 +8508,7 @@ impl Document {
 
         collect_symbols(root, &source, &scopes, &scope_by_span, &mut symbols);
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
+        let documentation = documentation::collect(&source, &symbols, cancel)?;
         inherit_member_routine_visibility(&mut symbols);
         let conditional_unknown_symbols =
             conditional_unknown_symbols(root, &conditionals, &symbols);
@@ -8684,6 +8687,7 @@ impl Document {
             generic_parameter_contexts,
             generic_parameter_intervals,
             helpers,
+            documentation,
         });
         Ok(Self {
             parsed,

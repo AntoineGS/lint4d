@@ -4662,6 +4662,105 @@ fn hover_negotiates_markdown_when_the_client_advertises_it() {
 }
 
 #[test]
+fn documentation_formats_are_negotiated_independently_for_all_assistance_endpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DocumentationFormats.pas");
+    let source = "unit DocumentationFormats;\ninterface\n/// <summary>Returns <c>the value</c>.</summary>\n/// <param name=\"Name\">The lookup name.</param>\nfunction ValueFor(Name: string): Integer;\nprocedure Caller;\nimplementation\nfunction ValueFor(Name: string): Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nvar\n  /// <summary>Local value.</summary>\n  LocalValue: Integer;\nbegin\n  Loc\n  ValueFor('text' );\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("documentation-formats-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(temp.path()),
+            "capabilities": {
+                "general": {"positionEncodings": ["utf-16"]},
+                "textDocument": {
+                    "hover": {"contentFormat": ["plaintext"]},
+                    "completion": {
+                        "completionItem": {"documentationFormat": ["markdown"]}
+                    },
+                    "signatureHelp": {"documentationFormat": ["plaintext"]}
+                }
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let hover_id = RequestId::from("documentation-formats-hover".to_string());
+    server.send_request(
+        hover_id.clone(),
+        "textDocument/hover",
+        navigation_params(&source_path, source, "ValueFor", 0),
+    );
+    let hover = server.response(&hover_id);
+    assert!(hover.error.is_none(), "hover failed: {hover:?}");
+    let hover_contents = &hover.result.expect("hover result")["contents"];
+    assert_eq!(hover_contents["kind"], "plaintext");
+    assert!(
+        hover_contents["value"]
+            .as_str()
+            .expect("hover plaintext")
+            .contains("Returns the value.")
+    );
+
+    let completion_id = RequestId::from("documentation-formats-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Loc", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "completion failed: {completion:?}"
+    );
+    let completion_result = completion.result.expect("completion result");
+    let completion_item = completion_result["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "LocalValue")
+        .cloned()
+        .unwrap_or_else(|| panic!("documented completion item missing: {completion_result}"));
+    assert_eq!(completion_item["documentation"]["kind"], "markdown");
+    assert_eq!(completion_item["documentation"]["value"], "Local value.");
+
+    let signature_id = RequestId::from("documentation-formats-signature".to_string());
+    server.send_request(
+        signature_id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "ValueFor('text' ", 0),
+        }),
+    );
+    let signature = server.response(&signature_id);
+    assert!(signature.error.is_none(), "signature failed: {signature:?}");
+    let signature = signature.result.expect("signature result");
+    assert_eq!(
+        signature["signatures"][0]["documentation"],
+        "Returns the value."
+    );
+    assert_eq!(
+        signature["signatures"][0]["parameters"][0]["documentation"],
+        "The lookup name."
+    );
+    server.shutdown();
+}
+
+#[test]
 fn hover_markdown_escapes_backtick_fences_inside_multiline_comments() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("FenceHover.pas");
@@ -4791,6 +4890,81 @@ fn hover_uses_an_unsaved_provider_overlay_for_imported_declarations() {
         .expect("plaintext hover value");
     assert!(value.contains("OverlayValue: Integer"), "{value}");
     assert!(!value.contains("DiskValue"), "{value}");
+    server.shutdown();
+}
+
+#[test]
+fn provider_overlay_documentation_refreshes_after_did_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let disk_provider = "unit Provider;\ninterface\ntype\n  TWidget = class\n    property OverlayValue: Integer;\n  end;\nimplementation\nend.\n";
+    let overlay_v1 = "unit Provider;\ninterface\ntype\n  TWidget = class\n    /// <summary>First overlay documentation.</summary>\n    property OverlayValue: Integer;\n  end;\nimplementation\nend.\n";
+    let overlay_v2 = "unit Provider;\ninterface\ntype\n  TWidget = class\n    /// <summary>Updated overlay documentation.</summary>\n    property OverlayValue: Integer;\n  end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Widget: Provider.TWidget;\nbegin\n  Log(Widget.OverlayValue);\nend;\nend.\n";
+    write_file(&provider, disk_provider);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 3,
+                "text": overlay_v1
+            }
+        }),
+    );
+
+    let first_id = RequestId::from("overlay-documentation-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/hover",
+        navigation_params(&consumer, consumer_source, "OverlayValue", 0),
+    );
+    let first = server.response(&first_id);
+    assert!(first.error.is_none(), "first hover failed: {first:?}");
+    let first_result = first.result.expect("first hover");
+    let first_value = first_result["contents"]["value"]
+        .as_str()
+        .expect("first hover text")
+        .to_owned();
+    assert!(
+        first_value.contains("First overlay documentation."),
+        "{first_value}"
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&provider), "version": 4},
+            "contentChanges": [{"text": overlay_v2}]
+        }),
+    );
+    let second_id = RequestId::from("overlay-documentation-second".to_string());
+    server.send_request(
+        second_id.clone(),
+        "textDocument/hover",
+        navigation_params(&consumer, consumer_source, "OverlayValue", 0),
+    );
+    let second = server.response(&second_id);
+    assert!(second.error.is_none(), "second hover failed: {second:?}");
+    let second_result = second.result.expect("second hover");
+    let second_value = second_result["contents"]["value"]
+        .as_str()
+        .expect("second hover text")
+        .to_owned();
+    assert!(
+        second_value.contains("Updated overlay documentation."),
+        "{second_value}"
+    );
+    assert!(
+        !second_value.contains("First overlay documentation."),
+        "{second_value}"
+    );
     server.shutdown();
 }
 

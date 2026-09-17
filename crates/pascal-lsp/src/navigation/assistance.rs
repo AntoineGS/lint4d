@@ -1,17 +1,19 @@
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, Origin,
-    ROOT_SCOPE, Region, RoutineKind, Span, Symbol, SymbolKind, canonical_name, location_for_span,
-    node_text, symbol_is_available_at, symbol_visible_in_region,
+    ROOT_SCOPE, Region, RoutineKind, Span, Symbol, SymbolKind, canonical_name, documentation,
+    location_for_span, node_text, symbol_is_available_at, symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionList, CompletionTextEdit, Hover, HoverContents,
-    Location, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, Position, Range,
-    SignatureHelp, SignatureInformation, TextEdit, Url,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionTextEdit,
+    Documentation as LspDocumentation, Hover, HoverContents, Location, MarkupContent, MarkupKind,
+    ParameterInformation, ParameterLabel, Position, Range, SignatureHelp, SignatureInformation,
+    TextEdit, Url,
 };
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,6 +185,7 @@ pub(crate) struct DeclarationDisplay {
     pub(crate) excerpt: String,
     pub(crate) source_uri: Url,
     pub(crate) source_start: usize,
+    pub(crate) documentation: Option<Arc<documentation::Documentation>>,
 }
 
 struct SpecializedRoutineSignature {
@@ -196,13 +199,14 @@ impl NavigationIndex {
     /// member expression at `position`.
     pub fn completion(&self, uri: &Url, position: Position) -> Result<CompletionList, String> {
         let cancel = AtomicBool::new(false);
-        self.completion_with_cancel(uri, position, &cancel)
+        self.completion_with_cancel(uri, position, MarkupKind::Markdown, &cancel)
     }
 
     pub(crate) fn completion_with_cancel(
         &self,
         uri: &Url,
         position: Position,
+        format: MarkupKind,
         cancel: &AtomicBool,
     ) -> Result<CompletionList, String> {
         check_cancel(cancel)?;
@@ -309,9 +313,17 @@ impl NavigationIndex {
                 continue;
             };
             budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
+            let documentation = self
+                .documents
+                .get(&candidate.uri)
+                .and_then(|document| document.documentation.get(candidate.index))
+                .and_then(Option::as_ref);
+            let documentation = render_lsp_documentation(documentation, format.clone(), cancel)?;
+            budget.require_bytes(documentation.as_ref().map_or(0, documentation_size), cancel)?;
             items.push(CompletionItem {
                 label: symbol.name.clone(),
                 kind: Some(completion_kind(symbol.kind)),
+                documentation,
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                     range,
                     symbol.name.clone(),
@@ -338,13 +350,14 @@ impl NavigationIndex {
         position: Position,
     ) -> Result<Option<SignatureHelp>, String> {
         let cancel = AtomicBool::new(false);
-        self.signature_help_with_cancel(uri, position, &cancel)
+        self.signature_help_with_cancel(uri, position, MarkupKind::Markdown, &cancel)
     }
 
     pub(crate) fn signature_help_with_cancel(
         &self,
         uri: &Url,
         position: Position,
+        format: MarkupKind,
         cancel: &AtomicBool,
     ) -> Result<Option<SignatureHelp>, String> {
         check_cancel(cancel)?;
@@ -551,7 +564,7 @@ impl NavigationIndex {
                 ));
             }
             budget.require_bytes(signature_bytes, cancel)?;
-            let Some(parameters) = parameter_information_for_spans_with_budget(
+            let Some(mut parameters) = parameter_information_for_spans_with_budget(
                 &signature.parameter_spans,
                 &signature.label,
                 signature.label_start,
@@ -567,11 +580,50 @@ impl NavigationIndex {
                     "signature help exceeds the {MAX_SIGNATURE_PARAMETERS}-parameter limit"
                 ));
             }
+            let documentation = document
+                .documentation
+                .get(candidate.index)
+                .and_then(|documentation| documentation.as_ref());
+            let signature_documentation =
+                render_lsp_signature_documentation(documentation, format.clone(), cancel)?;
+            if let Some(documentation) = documentation {
+                for (index, parameter) in parameters.iter_mut().enumerate() {
+                    check_cancel(cancel)?;
+                    let Some(name) = symbol.routine_parameters.get(index).and_then(|parameter| {
+                        document
+                            .source
+                            .get(parameter.span.start..parameter.span.end)
+                    }) else {
+                        continue;
+                    };
+                    let Some(value) = documentation.parameter(name, format.clone(), cancel)? else {
+                        continue;
+                    };
+                    parameter.documentation = Some(lsp_documentation(value, format.clone()));
+                }
+            }
+            let documentation_bytes = signature_documentation
+                .as_ref()
+                .map_or(0, documentation_size)
+                .saturating_add(
+                    parameters
+                        .iter()
+                        .filter_map(|parameter| parameter.documentation.as_ref())
+                        .map(documentation_size)
+                        .sum::<usize>(),
+                );
+            response_bytes = response_bytes.saturating_add(documentation_bytes);
+            if response_bytes > MAX_SIGNATURE_RESPONSE_BYTES {
+                return Err(format!(
+                    "signature help exceeds the {MAX_SIGNATURE_RESPONSE_BYTES}-byte response limit"
+                ));
+            }
+            budget.require_bytes(documentation_bytes, cancel)?;
             signatures.push((
                 super::overload::key_for_candidate(self, &candidate),
                 SignatureInformation {
                     label: signature.label,
-                    documentation: None,
+                    documentation: signature_documentation,
                     parameters: Some(parameters),
                     active_parameter: None,
                 },
@@ -2343,6 +2395,11 @@ impl NavigationIndex {
             excerpt,
             source_uri: candidate.uri.clone(),
             source_start: symbol.declaration_span.start,
+            documentation: document
+                .documentation
+                .get(candidate.index)
+                .cloned()
+                .flatten(),
         }))
     }
 }
@@ -3769,6 +3826,51 @@ fn bounded_string(value: String) -> Option<String> {
     (value.len() <= MAX_HOVER_EXCERPT_BYTES).then_some(value)
 }
 
+fn render_lsp_documentation(
+    documentation: Option<&Arc<documentation::Documentation>>,
+    format: MarkupKind,
+    cancel: &AtomicBool,
+) -> Result<Option<LspDocumentation>, String> {
+    let Some(documentation) = documentation else {
+        return Ok(None);
+    };
+    let Some(value) = documentation.render(format.clone(), cancel)? else {
+        return Ok(None);
+    };
+    Ok(Some(lsp_documentation(value, format)))
+}
+
+fn render_lsp_signature_documentation(
+    documentation: Option<&Arc<documentation::Documentation>>,
+    format: MarkupKind,
+    cancel: &AtomicBool,
+) -> Result<Option<LspDocumentation>, String> {
+    let Some(documentation) = documentation else {
+        return Ok(None);
+    };
+    let Some(value) = documentation.render_signature(format.clone(), cancel)? else {
+        return Ok(None);
+    };
+    Ok(Some(lsp_documentation(value, format)))
+}
+
+fn lsp_documentation(value: String, format: MarkupKind) -> LspDocumentation {
+    match format {
+        MarkupKind::Markdown => LspDocumentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        MarkupKind::PlainText => LspDocumentation::String(value),
+    }
+}
+
+fn documentation_size(documentation: &LspDocumentation) -> usize {
+    match documentation {
+        LspDocumentation::String(value) => value.len(),
+        LspDocumentation::MarkupContent(value) => value.value.len(),
+    }
+}
+
 #[cfg(test)]
 fn render_displays(displays: &[DeclarationDisplay], format: MarkupKind) -> Result<String, String> {
     let mut value = String::new();
@@ -3834,6 +3936,14 @@ fn render_displays_with_budget(
                 rendered.push_str(&display.excerpt);
             }
         }
+        if let Some(documentation) = display.documentation.as_ref() {
+            if let Some(documentation) = documentation.render(format.clone(), cancel)? {
+                if !rendered.is_empty() {
+                    rendered.push_str("\n\n");
+                }
+                rendered.push_str(&documentation);
+            }
+        }
         budget.require_bytes(rendered.len(), cancel)?;
         value.push_str(&rendered);
         if value.len() > MAX_HOVER_VALUE_BYTES {
@@ -3897,6 +4007,7 @@ mod tests {
             excerpt,
             source_uri: Url::parse("file:///U.pas").expect("test URI"),
             source_start: 0,
+            documentation: None,
         }
     }
 

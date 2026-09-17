@@ -1,6 +1,6 @@
 use lsp_types::{
-    CompletionItemKind, CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range,
-    Url,
+    CompletionItemKind, CompletionTextEdit, Documentation as LspDocumentation, HoverContents,
+    Location, MarkedString, MarkupKind, Position, Range, Url,
 };
 use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
@@ -14069,6 +14069,229 @@ end.
             .is_none(),
         "strings must not produce hover content"
     );
+}
+
+#[test]
+fn hover_includes_adjacent_xml_documentation_for_the_resolved_declaration() {
+    let source = r#"unit DocumentationHover;
+interface
+/// <summary>Returns <c>the value</c> for <paramref name="Name"/>.</summary>
+function ValueFor(Name: string): Integer;
+implementation
+function ValueFor(Name: string): Integer;
+begin
+  Result := 1;
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationHover");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("documentation source parses");
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "ValueFor", 0))
+        .expect("documented declaration hover");
+
+    assert_eq!(
+        hover_text(&hover),
+        "`DocumentationHover`\n\n```pascal\nfunction ValueFor(Name: string): Integer;\n```\n\nReturns `the value` for `Name`."
+    );
+}
+
+#[test]
+fn completion_includes_markdown_documentation_for_the_resolved_declaration() {
+    let source = r#"unit DocumentationCompletion;
+interface
+/// <summary>Returns <c>the value</c>.</summary>
+function ValueFor(Name: string): Integer;
+procedure Caller;
+implementation
+function ValueFor(Name: string): Integer;
+begin
+  Result := 1;
+end;
+procedure Caller;
+begin
+  Val
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("completion documentation source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "  Val", 0))
+        .expect("documented completion");
+    let item = completion
+        .items
+        .iter()
+        .find(|item| item.label == "ValueFor")
+        .expect("documented function completion item");
+
+    assert_eq!(
+        item.documentation,
+        Some(LspDocumentation::MarkupContent(lsp_types::MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "Returns `the value`.".to_owned(),
+        }))
+    );
+}
+
+#[test]
+fn signature_help_includes_markdown_summary_and_parameter_documentation() {
+    let source = r#"unit DocumentationSignature;
+interface
+/// <summary>Returns <c>the value</c>.</summary>
+/// <param name="Name">The lookup name.</param>
+/// <returns>The integer result.</returns>
+function ValueFor(Name: string): Integer;
+procedure Caller;
+implementation
+function ValueFor(Name: string): Integer;
+begin
+  Result := 1;
+end;
+procedure Caller;
+begin
+  ValueFor('text' );
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationSignature");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("signature documentation source parses");
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "ValueFor('text' ", 0))
+        .expect("documented signature help")
+        .expect("documented signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].documentation,
+        Some(LspDocumentation::MarkupContent(lsp_types::MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "Returns `the value`.\n\n**Returns**\n\nThe integer result.".to_owned(),
+        }))
+    );
+    assert_eq!(
+        signature.signatures[0].parameters.as_ref().unwrap()[0].documentation,
+        Some(LspDocumentation::MarkupContent(lsp_types::MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "The lookup name.".to_owned(),
+        }))
+    );
+}
+
+#[test]
+fn documentation_pairs_declarations_and_definitions_without_crossing_overloads() {
+    let source = r#"unit DocumentationPairing;
+interface
+/// <summary>Integer declaration.</summary>
+function Pick(Value: Integer): Integer; overload;
+function Fallback(Value: Integer): Integer;
+/// <summary>String declaration.</summary>
+function Pick(Value: string): string; overload;
+implementation
+/// <summary>Integer implementation.</summary>
+function Pick(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+/// <summary>Fallback implementation.</summary>
+function Fallback(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+/// <summary>String implementation.</summary>
+function Pick(Value: string): string;
+begin
+  Result := Value;
+end;
+procedure Caller;
+begin
+  Pick(1);
+  Fallback(1);
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationPairing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("documentation pairing source parses");
+
+    let pick = index
+        .hover(&source_uri, position_of(source, "Pick(1)", 0))
+        .expect("overload documentation hover");
+    let pick_text = hover_text(&pick);
+    assert!(pick_text.contains("Integer declaration."), "{pick_text}");
+    assert!(pick_text.contains("String declaration."), "{pick_text}");
+    assert!(
+        !pick_text.contains("Integer implementation."),
+        "{pick_text}"
+    );
+    assert!(!pick_text.contains("String implementation."), "{pick_text}");
+
+    let fallback = index
+        .hover(&source_uri, position_of(source, "Fallback(1)", 0))
+        .expect("implementation fallback hover");
+    let fallback_text = hover_text(&fallback);
+    assert!(
+        fallback_text.contains("Fallback implementation."),
+        "{fallback_text}"
+    );
+}
+
+#[test]
+fn documentation_attaches_to_types_fields_and_properties() {
+    let source = r#"unit DocumentationMembers;
+interface
+type
+  /// <summary>Widget type.</summary>
+  TWidget = class
+    /// <summary>Stored field.</summary>
+    Field: Integer;
+    /// <summary>Visible property.</summary>
+    property Name: string;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Widget.Field := 1;
+  Widget.Name := 'widget';
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("documented members source parses");
+
+    let type_hover = index
+        .hover(&source_uri, position_of(source, "TWidget", 1))
+        .expect("type documentation hover");
+    assert!(hover_text(&type_hover).contains("Widget type."));
+
+    let field_hover = index
+        .hover(&source_uri, position_of(source, "Field", 1))
+        .expect("field documentation hover");
+    assert!(hover_text(&field_hover).contains("Stored field."));
+
+    let property_hover = index
+        .hover(&source_uri, position_of(source, "Name", 1))
+        .expect("property documentation hover");
+    assert!(hover_text(&property_hover).contains("Visible property."));
 }
 
 #[test]

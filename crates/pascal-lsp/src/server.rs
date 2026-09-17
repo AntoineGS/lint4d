@@ -370,10 +370,27 @@ struct ClientFeatures {
     action_disabled: bool,
     document_changes: bool,
     hierarchical_document_symbols: bool,
-    hover_markdown: bool,
+    hover_format: DocumentationFormat,
+    completion_format: DocumentationFormat,
+    signature_help_format: DocumentationFormat,
     folding_range_limit: Option<usize>,
     line_folding_only: bool,
     folding_range_kind_value_set: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentationFormat {
+    PlainText,
+    Markdown,
+}
+
+impl DocumentationFormat {
+    fn markup_kind(self) -> MarkupKind {
+        match self {
+            Self::PlainText => MarkupKind::PlainText,
+            Self::Markdown => MarkupKind::Markdown,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,10 +431,12 @@ enum AnalysisRequest {
     Completion {
         uri: Url,
         position: Position,
+        format: MarkupKind,
     },
     SignatureHelp {
         uri: Url,
         position: Position,
+        format: MarkupKind,
     },
     Navigation {
         uri: Url,
@@ -553,8 +572,8 @@ enum NavigationObservationTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ObservationMethod {
     Hover { markdown: bool },
-    Completion,
-    SignatureHelp,
+    Completion { markdown: bool },
+    SignatureHelp { markdown: bool },
     Navigation(NavigationObservationTarget),
     TypeDefinitions,
     Prepare,
@@ -610,8 +629,14 @@ impl ObservationKey {
                 None,
                 None,
             ),
-            AnalysisRequest::Completion { uri, position } => (
-                ObservationMethod::Completion,
+            AnalysisRequest::Completion {
+                uri,
+                position,
+                format,
+            } => (
+                ObservationMethod::Completion {
+                    markdown: matches!(format, MarkupKind::Markdown),
+                },
                 Some(uri.clone()),
                 Some(ObservationPosition {
                     line: position.line,
@@ -620,8 +645,14 @@ impl ObservationKey {
                 None,
                 None,
             ),
-            AnalysisRequest::SignatureHelp { uri, position } => (
-                ObservationMethod::SignatureHelp,
+            AnalysisRequest::SignatureHelp {
+                uri,
+                position,
+                format,
+            } => (
+                ObservationMethod::SignatureHelp {
+                    markdown: matches!(format, MarkupKind::Markdown),
+                },
                 Some(uri.clone()),
                 Some(ObservationPosition {
                     line: position.line,
@@ -1080,11 +1111,16 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::Hover(computed.value),
                             }
                         }
-                        AnalysisRequest::Completion { uri, position } => {
-                            let computed = queries::completion_from_input(
+                        AnalysisRequest::Completion {
+                            uri,
+                            position,
+                            format,
+                        } => {
+                            let computed = queries::completion_from_input_with_format(
                                 input,
                                 &uri,
                                 position,
+                                format,
                                 &worker_cancellation,
                             );
                             AnalysisResult {
@@ -1095,11 +1131,16 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::Completion(computed.value),
                             }
                         }
-                        AnalysisRequest::SignatureHelp { uri, position } => {
-                            let computed = queries::signature_help_from_input(
+                        AnalysisRequest::SignatureHelp {
+                            uri,
+                            position,
+                            format,
+                        } => {
+                            let computed = queries::signature_help_from_input_with_format(
                                 input,
                                 &uri,
                                 position,
+                                format,
                                 &worker_cancellation,
                             );
                             AnalysisResult {
@@ -2043,7 +2084,9 @@ fn diagnostic_features() -> ClientFeatures {
         action_disabled: false,
         document_changes: false,
         hierarchical_document_symbols: false,
-        hover_markdown: false,
+        hover_format: DocumentationFormat::PlainText,
+        completion_format: DocumentationFormat::PlainText,
+        signature_help_format: DocumentationFormat::PlainText,
         folding_range_limit: None,
         line_folding_only: false,
         folding_range_kind_value_set: None,
@@ -2814,11 +2857,7 @@ fn handle_request(
                         &params.text_document_position_params.text_document.uri,
                     ),
                     position: params.text_document_position_params.position,
-                    format: if client_features.hover_markdown {
-                        MarkupKind::Markdown
-                    } else {
-                        MarkupKind::PlainText
-                    },
+                    format: client_features.hover_format.markup_kind(),
                 },
                 client_features,
             )?;
@@ -2840,6 +2879,7 @@ fn handle_request(
                 AnalysisRequest::Completion {
                     uri: canonical_file_uri(&params.text_document_position.text_document.uri),
                     position: params.text_document_position.position,
+                    format: client_features.completion_format.markup_kind(),
                 },
                 client_features,
             )?;
@@ -2863,6 +2903,7 @@ fn handle_request(
                         &params.text_document_position_params.text_document.uri,
                     ),
                     position: params.text_document_position_params.position,
+                    format: client_features.signature_help_format.markup_kind(),
                 },
                 client_features,
             )?;
@@ -3590,13 +3631,21 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
         value["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"]
             .as_bool()
             .unwrap_or(false);
-    let hover_markdown = value["textDocument"]["hover"]["contentFormat"]
-        .as_array()
-        .is_some_and(|formats| {
-            formats
-                .iter()
-                .any(|format| format.as_str() == Some("markdown"))
-        });
+    let hover_format =
+        preferred_documentation_format(&value, &["textDocument", "hover", "contentFormat"]);
+    let completion_format = preferred_documentation_format(
+        &value,
+        &[
+            "textDocument",
+            "completion",
+            "completionItem",
+            "documentationFormat",
+        ],
+    );
+    let signature_help_format = preferred_documentation_format(
+        &value,
+        &["textDocument", "signatureHelp", "documentationFormat"],
+    );
     let folding = &value["textDocument"]["foldingRange"];
     let folding_range_limit = folding["rangeLimit"]
         .as_u64()
@@ -3620,11 +3669,31 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
         action_disabled,
         document_changes,
         hierarchical_document_symbols,
-        hover_markdown,
+        hover_format,
+        completion_format,
+        signature_help_format,
         folding_range_limit,
         line_folding_only,
         folding_range_kind_value_set,
     }
+}
+
+fn preferred_documentation_format(value: &Value, path: &[&str]) -> DocumentationFormat {
+    let mut current = value;
+    for key in path {
+        current = &current[*key];
+    }
+    let Some(formats) = current.as_array() else {
+        return DocumentationFormat::PlainText;
+    };
+    for format in formats {
+        match format.as_str() {
+            Some("plaintext") => return DocumentationFormat::PlainText,
+            Some("markdown") => return DocumentationFormat::Markdown,
+            _ => {}
+        }
+    }
+    DocumentationFormat::PlainText
 }
 
 fn supports_workspace_folders(client: &ClientCapabilities) -> bool {
@@ -3682,16 +3751,16 @@ mod tests {
     use super::{
         ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
         AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisRequest, AnalysisResult,
-        AnalysisResultValue, BoundedReader, ClientFeatures, FileWatcherRegistration,
-        MAX_ANALYSIS_QUEUE, MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES,
-        MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, PriorityQueue, deliver_analysis_result,
-        invalidate_analysis_result,
+        AnalysisResultValue, BoundedReader, ClientFeatures, DocumentationFormat,
+        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CONFIGURATION_WATCH_PATHS,
+        MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, PriorityQueue,
+        deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
     use crate::workspace::rename::install_snapshot_priority_barrier;
     use crossbeam_channel::RecvTimeoutError;
     use lsp_server::{Connection, Message, RequestId, Response};
-    use lsp_types::{MarkupKind, Position, PrepareRenameResponse, Range, Url};
+    use lsp_types::{ClientCapabilities, MarkupKind, Position, PrepareRenameResponse, Range, Url};
     use pascal_project::delphi_overrides::OverrideSession;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
@@ -3715,11 +3784,35 @@ mod tests {
             action_disabled: false,
             document_changes: false,
             hierarchical_document_symbols: false,
-            hover_markdown: false,
+            hover_format: DocumentationFormat::PlainText,
+            completion_format: DocumentationFormat::PlainText,
+            signature_help_format: DocumentationFormat::PlainText,
             folding_range_limit: None,
             line_folding_only: false,
             folding_range_kind_value_set: None,
         }
+    }
+
+    #[test]
+    fn documentation_formats_are_negotiated_independently() {
+        let capabilities: ClientCapabilities = serde_json::from_value(serde_json::json!({
+            "textDocument": {
+                "hover": {"contentFormat": ["plaintext", "markdown"]},
+                "completion": {
+                    "completionItem": {"documentationFormat": ["markdown"]}
+                },
+                "signatureHelp": {"documentationFormat": ["plaintext"]}
+            }
+        }))
+        .expect("documentation capabilities");
+
+        let features = super::client_features(&capabilities);
+        assert_eq!(features.hover_format, DocumentationFormat::PlainText);
+        assert_eq!(features.completion_format, DocumentationFormat::Markdown);
+        assert_eq!(
+            features.signature_help_format,
+            DocumentationFormat::PlainText
+        );
     }
 
     fn receive_analysis_result(jobs: &mut AnalysisJobs, id: &RequestId) -> AnalysisResult {
@@ -3938,10 +4031,12 @@ mod tests {
             AssistanceRequestKind::Completion => AnalysisRequest::Completion {
                 uri: main_uri,
                 position,
+                format: MarkupKind::Markdown,
             },
             AssistanceRequestKind::SignatureHelp => AnalysisRequest::SignatureHelp {
                 uri: main_uri,
                 position,
+                format: MarkupKind::Markdown,
             },
         }
     }
@@ -4772,6 +4867,7 @@ mod tests {
             AnalysisRequest::Completion {
                 uri: main_uri.clone(),
                 position: Position::new(7, 5),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),
@@ -4787,6 +4883,7 @@ mod tests {
             AnalysisRequest::Completion {
                 uri: main_uri.clone(),
                 position: Position::new(7, 5),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),
@@ -4836,6 +4933,7 @@ mod tests {
             AnalysisRequest::SignatureHelp {
                 uri: main_uri.clone(),
                 position: Position::new(9, 6),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),
@@ -4851,6 +4949,7 @@ mod tests {
             AnalysisRequest::SignatureHelp {
                 uri: main_uri.clone(),
                 position: Position::new(9, 6),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),
@@ -5642,6 +5741,7 @@ mod tests {
             AnalysisRequest::Completion {
                 uri: main_uri.clone(),
                 position: Position::new(5, 24),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),
@@ -5684,6 +5784,7 @@ mod tests {
             AnalysisRequest::SignatureHelp {
                 uri: main_uri,
                 position: Position::new(5, 24),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),

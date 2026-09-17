@@ -91,10 +91,21 @@ pub(crate) fn hover_from_input(
     with_records(source_generation, configuration_generation, value, records)
 }
 
+#[cfg(test)]
 pub(crate) fn completion_from_input(
     input: WorkspaceInput,
     uri: &Url,
     position: Position,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionList> {
+    completion_from_input_with_format(input, uri, position, MarkupKind::Markdown, cancel)
+}
+
+pub(crate) fn completion_from_input_with_format(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    format: MarkupKind,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionList> {
     let source_generation = input.source_generation;
@@ -133,17 +144,28 @@ pub(crate) fn completion_from_input(
     }
     let value = snapshot
         .index
-        .completion_with_cancel(&uri, position, cancel);
+        .completion_with_cancel(&uri, position, format, cancel);
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     with_records(source_generation, configuration_generation, value, records)
 }
 
+#[cfg(test)]
 pub(crate) fn signature_help_from_input(
     input: WorkspaceInput,
     uri: &Url,
     position: Position,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Option<SignatureHelp>> {
+    signature_help_from_input_with_format(input, uri, position, MarkupKind::Markdown, cancel)
+}
+
+pub(crate) fn signature_help_from_input_with_format(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    format: MarkupKind,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<Option<SignatureHelp>> {
     let source_generation = input.source_generation;
@@ -182,7 +204,7 @@ pub(crate) fn signature_help_from_input(
     }
     let value = snapshot
         .index
-        .signature_help_with_cancel(&uri, position, cancel);
+        .signature_help_with_cancel(&uri, position, format, cancel);
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }

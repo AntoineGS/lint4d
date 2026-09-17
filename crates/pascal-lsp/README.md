@@ -667,6 +667,41 @@ Empty documents return a valid zero-length document range. Selection requests
 also honor cancellation and the same generation/read-set stale-result checks as
 the other bounded analysis queries.
 
+### Source documentation comments
+
+Hover, completion items, and signature help include source documentation when a
+documented comment is attached to the resolved declaration. A standalone
+Delphi `///` comment immediately before a declaration is attached; consecutive
+`///` lines may be joined across one line break. Block comments are attached
+only when they contain a supported documentation tag and are also standalone.
+Trailing comments, blank-line-separated comments, compiler directives,
+license/file-header comments, and comments belonging to another declaration do
+not attach. For a uniquely proven routine declaration/implementation pair,
+documentation on the visible declaration is preferred and implementation
+documentation is used only when the declaration has none. Overloads, helpers,
+generic specializations, and cross-unit declarations retain their resolved
+symbol identity.
+
+The supported XML-style subset includes `summary`, `remarks`, `param` (matched
+case-insensitively by name, including grouped parameters), `returns`, `code`/`c`,
+`paramref`, and `see`/`cref`. Basic XML entities are decoded; malformed or
+unsupported markup degrades to safe text, without external entity, file, or
+network access. Markdown and plaintext are selected independently for hover,
+completion documentation, and signature documentation according to the
+client's advertised formats, with plaintext as the fallback. Signature help
+also exposes the matching parameter's documentation separately.
+
+Documentation processing is bounded and cancellable:
+
+| Documentation limit | Value |
+| --- | ---: |
+| Source scan | 2 MiB |
+| Scanned comments | 8,192 |
+| Individual comment body | 64 KiB |
+| Individual XML tag | 4 KiB |
+| XML nesting depth | 64 levels |
+| Rendered documentation | 64 KiB |
+
 Disk discovery excludes descendants named `.git`, `.worktrees`, `target`,
 `node_modules`, `build`, `dist`, and similar generated directories. An explicit
 workspace/source root may itself live under one of these names. Symlinked files

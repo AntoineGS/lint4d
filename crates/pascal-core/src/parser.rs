@@ -128,30 +128,33 @@ pub fn parse_file_incremental(
     };
     let mut parser_source = phase1_source;
 
-    // Phase 2 — opaque-{$IF} rewrite (Bucket F). Unlike the fresh path, probe
-    // this pass even when the incremental tree reports no error: an edited old
-    // tree can retain a clean shape for a newly-invalid opaque body. Applying
-    // the same offset-preserving rewrite keeps that stale-tree case correct.
-    let (phase2_source, patches_f) = rewrite_opaque_if_blocks(&parser_source);
-    if !patches_f.is_empty() {
-        let phase2_source = phase2_source.into_owned();
-        if phase2_source.len() != parser_source.len() {
-            let parsed = parse_fresh(source)?;
-            return Ok(IncrementalParseResult {
-                tree: parsed.tree,
-                diagnostics: parsed.diagnostics,
-                patches: parsed.patches,
-                parser_source: parsed.parser_source,
-                used_old_tree: false,
-            });
+    // Phase 2 — opaque-{$IF} rewrite (Bucket F). Keep the same gate as the
+    // fresh path: a valid conditional fragment must remain visible to the
+    // grammar rather than being conservatively erased just because it is not
+    // a standalone Pascal fragment. The error gate still probes an edited old
+    // tree whose stale shape might otherwise hide a newly-invalid body.
+    if has_real_error(tree.root_node()) {
+        let (phase2_source, patches_f) = rewrite_opaque_if_blocks(&parser_source);
+        if !patches_f.is_empty() {
+            let phase2_source = phase2_source.into_owned();
+            if phase2_source.len() != parser_source.len() {
+                let parsed = parse_fresh(source)?;
+                return Ok(IncrementalParseResult {
+                    tree: parsed.tree,
+                    diagnostics: parsed.diagnostics,
+                    patches: parsed.patches,
+                    parser_source: parsed.parser_source,
+                    used_old_tree: false,
+                });
+            }
+            let phase2_tree = incremental_parse_candidate(&phase2_source, &parser_source, &tree)
+                .map(|(tree, _)| tree)
+                .or_else(|| parse_bytes(&phase2_source, None).ok())
+                .ok_or_else(|| "parser returned no tree".to_string())?;
+            tree = phase2_tree;
+            parser_source = phase2_source;
+            patches.extend(patches_f);
         }
-        let phase2_tree = incremental_parse_candidate(&phase2_source, &parser_source, &tree)
-            .map(|(tree, _)| tree)
-            .or_else(|| parse_bytes(&phase2_source, None).ok())
-            .ok_or_else(|| "parser returned no tree".to_string())?;
-        tree = phase2_tree;
-        parser_source = phase2_source;
-        patches.extend(patches_f);
     }
 
     let diagnostics = collect_parse_errors(&tree, source);
@@ -498,6 +501,79 @@ mod parse_with_patches_tests {
     }
 
     #[test]
+    fn incremental_parse_matches_fresh_phase_decision_for_a_valid_enum_fragment() {
+        let old_source = b"unit X;\ninterface\ntype T = (A, {$IF VERSION > 1} B, {$IFEND} C);\nimplementation\nend.\n";
+        let new_source = b"unit X;\ninterface\ntype T = (A, {$IF VERSION > 1} B, {$IFEND} C);\nimplementation\nend.\n// edit\n";
+        let old = parse_file_with_parser_source(&info(), old_source).expect("old parse");
+        let fresh = parse_file_with_parser_source(&info(), new_source).expect("fresh parse");
+        let incremental =
+            parse_file_incremental(&info(), new_source, &old.parser_source, &old.tree)
+                .expect("incremental parse");
+
+        assert!(fresh.diagnostics.is_empty());
+        assert!(fresh.patches.is_empty());
+        let fresh_sexp = fresh.tree.root_node().to_sexp();
+        assert_eq!(fresh_sexp.matches("(declEnumValue name:").count(), 3);
+        assert!(incremental.used_old_tree);
+        assert_eq!(
+            incremental.tree.root_node().to_sexp(),
+            fresh_sexp,
+            "valid conditional enum fragments must follow the fresh rewrite gate"
+        );
+        assert_eq!(
+            format!("{:?}", incremental.diagnostics),
+            format!("{:?}", fresh.diagnostics)
+        );
+        assert_eq!(incremental.patches, fresh.patches);
+        assert_eq!(incremental.parser_source, fresh.parser_source);
+    }
+
+    #[test]
+    fn incremental_parse_fallback_matches_fresh_when_old_tree_extent_is_untrusted() {
+        let old_source = b"unit X;\ninterface\ntype T = (A, {$IF VERSION > 1} B, {$IFEND} C);\nimplementation\nend.\n";
+        let new_source = b"unit X;\ninterface\ntype T = (A, {$IF VERSION > 1} B, {$IFEND} C);\nimplementation\nend.\n// edit\n";
+        let old = parse_file_with_parser_source(&info(), old_source).expect("old parse");
+        let mut untrusted_tree = old.tree.clone();
+        let old_end = old.parser_source.len();
+        let old_end_position = untrusted_tree.root_node().end_position();
+        untrusted_tree.edit(&InputEdit {
+            start_byte: old_end,
+            old_end_byte: old_end,
+            new_end_byte: old_end + 1,
+            start_position: old_end_position,
+            old_end_position,
+            new_end_position: Point {
+                row: old_end_position.row,
+                column: old_end_position.column + 1,
+            },
+        });
+        assert_ne!(
+            untrusted_tree.root_node().end_byte(),
+            old.parser_source.len()
+        );
+
+        let fresh = parse_file_with_parser_source(&info(), new_source).expect("fresh parse");
+        assert!(fresh.diagnostics.is_empty());
+        assert!(fresh.patches.is_empty());
+        let fallback =
+            parse_file_incremental(&info(), new_source, &old.parser_source, &untrusted_tree)
+                .expect("fallback parse");
+
+        assert!(!fallback.used_old_tree);
+        assert_eq!(
+            fallback.tree.root_node().to_sexp(),
+            fresh.tree.root_node().to_sexp(),
+            "an untrusted old tree must use the complete fresh pipeline"
+        );
+        assert_eq!(
+            format!("{:?}", fallback.diagnostics),
+            format!("{:?}", fresh.diagnostics)
+        );
+        assert_eq!(fallback.patches, fresh.patches);
+        assert_eq!(fallback.parser_source, fresh.parser_source);
+    }
+
+    #[test]
     fn incremental_parse_preserves_unicode_crlf_and_directive_coordinates() {
         let old_source = b"unit X;\r\ninterface\r\n// stable \xF0\x9F\x98\x80\r\nconst Stable = 1;\r\nimplementation\r\nif Ready then\r\n{$IFDEF FEATURE}\r\n  DoThing;\r\n{$ENDIF}\r\nend.\r\n";
         let new_source = b"unit X;\r\ninterface\r\n// stable \xF0\x9F\x98\x80\r\nconst Stable = 2;\r\nimplementation\r\nif Ready then\r\n{$IFDEF FEATURE}\r\n  DoThing;\r\n{$ENDIF}\r\nend.\r\n";
@@ -533,24 +609,41 @@ mod parse_with_patches_tests {
     #[test]
     fn incremental_parse_reuses_state_across_the_opaque_directive_fallback() {
         let old_source = b"unit X;\ninterface\nimplementation\n{$IF DEFINED(X)}\nrappel: developper en 32 bits pour plus de stabilite\n{$IFEND}\nconst Stable = 1;\nend.\n";
-        let new_source = b"unit X;\ninterface\nimplementation\n{$IF DEFINED(X)}\nrappel: developper en 32 bits pour plus de stabilite\n{$IFEND}\nconst Stable = 2;\nend.\n";
-        let (old_tree, _, old_patches) =
-            parse_file_with_patches(&info(), old_source).expect("old parse");
+        let sources = [
+            b"unit X;\ninterface\nimplementation\n{$IF DEFINED(X)}\nrappel: developper en 32 bits pour plus de stabilite plus\n{$IFEND}\nconst Stable = 2;\nend.\n" as &[u8],
+            b"unit X;\ninterface\nimplementation\nconst Stable = 3;\nend.\n",
+        ];
+        let old = parse_file_with_parser_source(&info(), old_source).expect("old parse");
         assert!(
-            old_patches
+            old.patches
                 .iter()
                 .any(|patch| matches!(patch, DirectivePatch::OpaqueBlock(_)))
         );
-        let fresh = parse_file_with_patches(&info(), new_source).expect("fresh parse");
-        let incremental = parse_file_incremental(&info(), new_source, old_source, &old_tree)
-            .expect("incremental parse");
+        let mut old_tree = old.tree;
+        let mut old_parser_source = old.parser_source;
+        for (step, new_source) in sources.iter().enumerate() {
+            let fresh = parse_file_with_parser_source(&info(), new_source).expect("fresh parse");
+            let incremental =
+                parse_file_incremental(&info(), new_source, &old_parser_source, &old_tree)
+                    .expect("incremental parse");
 
-        assert!(incremental.used_old_tree);
-        assert_eq!(
-            incremental.tree.root_node().to_sexp(),
-            fresh.0.root_node().to_sexp()
-        );
-        assert_eq!(incremental.patches, fresh.2);
+            assert!(
+                incremental.used_old_tree,
+                "step {step} should use the actual prior parser state"
+            );
+            assert_eq!(
+                incremental.tree.root_node().to_sexp(),
+                fresh.tree.root_node().to_sexp()
+            );
+            assert_eq!(
+                format!("{:?}", incremental.diagnostics),
+                format!("{:?}", fresh.diagnostics)
+            );
+            assert_eq!(incremental.patches, fresh.patches);
+            assert_eq!(incremental.parser_source, fresh.parser_source);
+            old_tree = incremental.tree;
+            old_parser_source = incremental.parser_source;
+        }
     }
 
     #[test]

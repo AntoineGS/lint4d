@@ -953,6 +953,7 @@ struct CommentAttachment {
     end: usize,
     body: String,
     documented: bool,
+    mergeable_line: bool,
 }
 
 pub(crate) fn collect(
@@ -1141,6 +1142,7 @@ fn scan_comments(source: &str, cancel: &AtomicBool) -> Result<Vec<CommentAttachm
                 end: comment.end,
                 body: String::new(),
                 documented: false,
+                mergeable_line: false,
             });
             continue;
         }
@@ -1150,7 +1152,7 @@ fn scan_comments(source: &str, cancel: &AtomicBool) -> Result<Vec<CommentAttachm
             let body = body.strip_prefix([' ', '\t']).unwrap_or(body);
             let can_merge = attachments
                 .last()
-                .is_some_and(|previous| previous.documented && previous.end < comment.start)
+                .is_some_and(|previous| previous.mergeable_line && previous.end < comment.start)
                 && is_single_line_gap(
                     source,
                     attachments
@@ -1178,17 +1180,18 @@ fn scan_comments(source: &str, cancel: &AtomicBool) -> Result<Vec<CommentAttachm
                 }
                 continue;
             }
-            let documented = !is_license_comment(body);
             attachments.push(CommentAttachment {
                 end: comment.end,
                 body: body.to_owned(),
-                documented,
+                documented: true,
+                mergeable_line: true,
             });
         } else {
             attachments.push(CommentAttachment {
                 end: comment.end,
                 body: normalize_block_body(body, cancel)?,
                 documented,
+                mergeable_line: false,
             });
         }
     }

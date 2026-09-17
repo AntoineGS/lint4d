@@ -8507,6 +8507,7 @@ impl Document {
         }
 
         collect_symbols(root, &source, &scopes, &scope_by_span, &mut symbols);
+        pair_omitted_generic_constraints(&mut symbols);
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
         let documentation = documentation::collect(&source, &symbols, cancel)?;
         inherit_member_routine_visibility(&mut symbols);
@@ -9205,6 +9206,123 @@ fn collect_symbols(
         ),
         _ => {}
     });
+}
+
+/// Pair a definition that omits generic constraints with one unique declaration.
+///
+/// The exact routine key keeps constraint shape so distinct constrained overloads
+/// remain separate.  This pass only supplies the declaration's exact key when the
+/// rest of the identity and generic arity select one declaration unambiguously.
+fn pair_omitted_generic_constraints(symbols: &mut [Symbol]) {
+    let declaration_indices: Vec<usize> = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| {
+            (symbol.kind == SymbolKind::Routine && symbol.origin == Origin::Declaration)
+                .then_some(index)
+        })
+        .collect();
+    let definition_indices: Vec<usize> = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| {
+            (symbol.kind == SymbolKind::Routine && symbol.origin == Origin::Definition)
+                .then_some(index)
+        })
+        .collect();
+
+    let mut generic_parameter_key_replacements = HashMap::new();
+    for definition_index in definition_indices {
+        let definition = &symbols[definition_index];
+        if definition.generic_parameters.is_empty()
+            || definition
+                .generic_parameters
+                .iter()
+                .all(|parameter| parameter.constraint.is_some() || parameter.constraint_unsupported)
+        {
+            continue;
+        }
+        let matching_declarations: Vec<usize> = declaration_indices
+            .iter()
+            .copied()
+            .filter(|&declaration_index| {
+                let declaration = &symbols[declaration_index];
+                declaration.scope == definition.scope
+                    && declaration.owner_type == definition.owner_type
+                    && declaration.key == definition.key
+                    && declaration.routine_signature == definition.routine_signature
+                    && generic_parameters_match_with_omissions(
+                        &definition.generic_parameters,
+                        &declaration.generic_parameters,
+                    )
+            })
+            .collect();
+        let Some(&declaration_index) = matching_declarations
+            .first()
+            .filter(|_| matching_declarations.len() == 1)
+        else {
+            continue;
+        };
+
+        let Some(routine_key) = symbols[declaration_index].routine_key.clone() else {
+            continue;
+        };
+        let old_routine_key = definition.routine_key.clone();
+        symbols[definition_index].routine_key = Some(routine_key.clone());
+        symbols[definition_index].generic_parameters =
+            symbols[declaration_index].generic_parameters.clone();
+        symbols[definition_index].routine_directives =
+            symbols[declaration_index].routine_directives;
+        symbols[definition_index].result_type_name =
+            symbols[declaration_index].result_type_name.clone();
+        symbols[definition_index].result_type_ref =
+            symbols[declaration_index].result_type_ref.clone();
+        symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
+
+        if let Some(old_routine_key) = old_routine_key {
+            match generic_parameter_key_replacements.entry(old_routine_key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(routine_key));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get().as_ref() != Some(&routine_key) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+    for symbol in symbols.iter_mut() {
+        if symbol.kind != SymbolKind::Type || symbol.generic_parameter.is_none() {
+            continue;
+        }
+        let Some(routine_key) = symbol
+            .routine_key
+            .as_ref()
+            .and_then(|key| generic_parameter_key_replacements.get(key))
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        symbol.routine_key = Some(routine_key.clone());
+    }
+}
+
+fn generic_parameters_match_with_omissions(
+    definition: &[GenericParameter],
+    declaration: &[GenericParameter],
+) -> bool {
+    definition.len() == declaration.len()
+        && definition
+            .iter()
+            .zip(declaration)
+            .all(|(definition, declaration)| {
+                if definition.constraint.is_none() && !definition.constraint_unsupported {
+                    true
+                } else {
+                    generic_parameter_shape(definition) == generic_parameter_shape(declaration)
+                }
+            })
 }
 
 fn pair_abbreviated_definitions(
@@ -10387,18 +10505,20 @@ fn generic_shape(parameters: &[GenericParameter]) -> String {
     }
     parameters
         .iter()
-        .map(|parameter| {
-            if parameter.constraint_unsupported {
-                "!".to_owned()
-            } else {
-                parameter
-                    .constraint
-                    .as_ref()
-                    .map_or_else(|| "?".to_owned(), TypeRef::display)
-            }
-        })
+        .map(generic_parameter_shape)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn generic_parameter_shape(parameter: &GenericParameter) -> String {
+    if parameter.constraint_unsupported {
+        "!".to_owned()
+    } else {
+        parameter
+            .constraint
+            .as_ref()
+            .map_or_else(|| "?".to_owned(), TypeRef::display)
+    }
 }
 
 fn enclosing_type(node: Node<'_>, source: &str) -> Option<String> {

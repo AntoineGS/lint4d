@@ -14295,6 +14295,66 @@ end.
 }
 
 #[test]
+fn documentation_license_markers_reject_whole_groups_and_keep_next_group() {
+    let cases = [
+        (
+            "line-first",
+            "/// Copyright 2026\n/// <summary>Permission granted to redistribute this file.</summary>\n/// <remarks>Line group.</remarks>",
+        ),
+        (
+            "line-middle",
+            "/// <summary>Line group.</summary>\n/// Copyright 2026\n/// <remarks>Permission granted to redistribute this file.</remarks>",
+        ),
+        (
+            "line-last",
+            "/// <summary>Line group.</summary>\n/// <remarks>Permission granted to redistribute this file.</remarks>\n/// Copyright 2026",
+        ),
+        (
+            "block-first",
+            "(* Copyright 2026\n   <summary>Permission granted to redistribute this file.</summary>\n   <remarks>Block group.</remarks> *)",
+        ),
+        (
+            "block-middle",
+            "(* <summary>Block group.</summary>\n   Copyright 2026\n   <remarks>Permission granted to redistribute this file.</remarks> *)",
+        ),
+        (
+            "block-last",
+            "(* <summary>Block group.</summary>\n   <remarks>Permission granted to redistribute this file.</remarks>\n   Copyright 2026 *)",
+        ),
+    ];
+
+    for (index, (label, comment)) in cases.into_iter().enumerate() {
+        let unit = format!("LicenseGroup{index}");
+        let source = format!(
+            "unit {unit};\ninterface\n{comment}\nprocedure Run;\n/// <summary>Separate next declaration.</summary>\nprocedure Next;\nimplementation\nprocedure Run;\nbegin\nend;\nprocedure Next;\nbegin\nend;\nend.\n"
+        );
+        let source_uri = uri(&unit);
+        let mut index = NavigationIndex::new();
+        index
+            .update(source_uri.clone(), source.clone())
+            .unwrap_or_else(|error| panic!("{label} source parses: {error}"));
+
+        let run_hover = index
+            .hover(&source_uri, position_of(&source, "Run", 0))
+            .unwrap_or_else(|| panic!("{label} Run hover"));
+        let run_text = hover_text(&run_hover);
+        assert!(
+            !run_text.contains("Permission granted"),
+            "{label}: {run_text}"
+        );
+
+        let next_hover = index
+            .hover(&source_uri, position_of(&source, "Next", 0))
+            .unwrap_or_else(|| panic!("{label} Next hover"));
+        assert!(
+            hover_text(&next_hover).contains("Separate next declaration."),
+            "{label}: {}",
+            hover_text(&next_hover)
+        );
+    }
+}
+
+#[test]
 fn documentation_pairing_keeps_generic_and_nongeneric_overloads_distinct() {
     let source = r#"unit GenericDocumentationPairing;
 interface
@@ -14336,6 +14396,138 @@ end.
         !nongeneric_text.contains("Generic implementation."),
         "{nongeneric_text}"
     );
+}
+
+#[test]
+fn generic_method_constraint_pairing_supports_omitted_and_repeated_constraints() {
+    let source = r#"unit GenericMethodConstraintPairing;
+interface
+type
+  TBase = class
+  end;
+  TFoo = class
+    /// <summary>Class-constrained declaration.</summary>
+    procedure Pick<T: class>;
+    /// <summary>Named-constrained declaration.</summary>
+    procedure PickBase<T: TBase>;
+    /// <summary>Repeated class declaration.</summary>
+    procedure Keep<T: class>; overload;
+    /// <summary>Repeated named declaration.</summary>
+    procedure Keep<T: TBase>; overload;
+    /// <summary>Ambiguous class declaration.</summary>
+    procedure Ambiguous<T: class>; overload;
+    /// <summary>Ambiguous named declaration.</summary>
+    procedure Ambiguous<T: TBase>; overload;
+  end;
+implementation
+procedure TFoo.Pick<T>;
+begin
+end;
+procedure TFoo.PickBase<T>;
+begin
+end;
+procedure TFoo.Keep<T: class>;
+begin
+end;
+procedure TFoo.Keep<T: TBase>;
+begin
+end;
+procedure TFoo.Ambiguous<T>;
+begin
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodConstraintPairing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method constraint source parses");
+
+    for (declaration, implementation, documentation) in [
+        (
+            "Pick<T: class>",
+            "Pick<T>;",
+            "Class-constrained declaration.",
+        ),
+        (
+            "PickBase<T: TBase>",
+            "PickBase<T>;",
+            "Named-constrained declaration.",
+        ),
+    ] {
+        let declaration_position = position_of(source, declaration, 0);
+        let implementation_position = position_of(source, implementation, 0);
+        let hover = index
+            .hover(&source_uri, implementation_position)
+            .expect("omitted-constraint implementation hover");
+        assert!(
+            hover_text(&hover).contains(documentation),
+            "{declaration}: {}",
+            hover_text(&hover)
+        );
+        for target in [
+            NavigationTarget::Definition,
+            NavigationTarget::Implementation,
+        ] {
+            let locations = index.navigate(&source_uri, declaration_position, target);
+            assert_eq!(
+                locations.len(),
+                1,
+                "{declaration} {target:?}: {locations:?}"
+            );
+            assert_location_start(&locations[0], &source_uri, implementation_position);
+        }
+    }
+
+    for (declaration, implementation, documentation) in [
+        (
+            "Keep<T: class>",
+            "Keep<T: class>;",
+            "Repeated class declaration.",
+        ),
+        (
+            "Keep<T: TBase>",
+            "Keep<T: TBase>;",
+            "Repeated named declaration.",
+        ),
+    ] {
+        let declaration_position = position_of(source, declaration, 0);
+        let implementation_position = position_of(source, implementation, 1);
+        let hover = index
+            .hover(&source_uri, implementation_position)
+            .expect("repeated-constraint implementation hover");
+        assert!(
+            hover_text(&hover).contains(documentation),
+            "{declaration}: {}",
+            hover_text(&hover)
+        );
+        for target in [
+            NavigationTarget::Definition,
+            NavigationTarget::Implementation,
+        ] {
+            let locations = index.navigate(&source_uri, declaration_position, target);
+            assert_eq!(
+                locations.len(),
+                1,
+                "{declaration} {target:?}: {locations:?}"
+            );
+            assert_location_start(&locations[0], &source_uri, implementation_position);
+        }
+    }
+
+    for declaration in ["Ambiguous<T: class>", "Ambiguous<T: TBase>"] {
+        let locations = index.navigate(
+            &source_uri,
+            position_of(source, declaration, 0),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(locations.len(), 1, "{declaration}: {locations:?}");
+        assert!(
+            !locations.iter().any(|location| {
+                location.range.start == position_of(source, "Ambiguous<T>;", 0)
+            })
+        );
+    }
 }
 
 #[test]

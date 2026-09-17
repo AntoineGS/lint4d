@@ -28,6 +28,7 @@ pub(crate) use rename::RenameBindingInfo;
 pub(crate) use rename::test_cancel_after_checks;
 #[cfg(test)]
 pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
+pub(crate) use selection::validate_selection_position_count;
 
 #[cfg(test)]
 thread_local! {
@@ -46,6 +47,7 @@ thread_local! {
     static TEST_SEMANTIC_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_SHADOW_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static TEST_DOCUMENT_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -97,6 +99,16 @@ pub(super) fn test_semantic_token_work_counters()
 #[cfg(test)]
 pub(super) fn test_record_semantic_node_visit() {
     TEST_SEMANTIC_NODE_VISITS.with(|value| value.set(value.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub(super) fn test_reset_document_parse_count() {
+    TEST_DOCUMENT_PARSE_CALLS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn test_document_parse_count() -> usize {
+    TEST_DOCUMENT_PARSE_CALLS.with(Cell::get)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -8297,6 +8309,8 @@ impl Document {
                 });
             }
         }
+        #[cfg(test)]
+        TEST_DOCUMENT_PARSE_CALLS.with(|value| value.set(value.get().saturating_add(1)));
         let path = uri
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));

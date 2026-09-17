@@ -2061,6 +2061,54 @@ fn selection_ranges_return_an_inner_to_outer_structural_chain() {
     server.shutdown();
 }
 
+#[test]
+fn selection_ranges_accept_crlf_line_comments_in_mixed_position_batches() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionComment.pas");
+    let source = "unit U;\r\n// hello\r\ninterface\r\nimplementation\r\nend.\r\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("selection-comment-crlf".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [
+                {"line": 1, "character": 3},
+                {"line": 1, "character": 8},
+                {"line": 2, "character": 0}
+            ]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "CRLF comment selection failed: {response:?}"
+    );
+    let result = response.result.expect("selection result");
+    let ranges = result.as_array().expect("selection array");
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(
+        ranges[0]["range"],
+        json!({
+            "start": {"line": 1, "character": 0},
+            "end": {"line": 1, "character": 8}
+        })
+    );
+    assert_eq!(
+        ranges[1]["range"]["start"],
+        json!({"line": 0, "character": 0})
+    );
+    assert_eq!(
+        ranges[2]["range"]["start"],
+        json!({"line": 2, "character": 0})
+    );
+    server.shutdown();
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn selection_range_cancellation_returns_the_standard_request_canceled_error() {

@@ -1,3 +1,4 @@
+use super::KnownDocumentOwner;
 use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
     WorkspaceInput, build_snapshot, input_source_is_readable_with_owner, is_cancelled,
@@ -787,6 +788,70 @@ fn ensure_semantic_tokens_ready(
     Ok(SemanticTokenResolutionMode::Full)
 }
 
+struct SyntaxDocument {
+    source: String,
+    context: pascal_project::ProjectContext,
+    records: Vec<super::rename::SourceRecord>,
+}
+
+fn syntax_owner_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<KnownDocumentOwner, String> {
+    let owner = owner_for_input(input, uri, cancel)?;
+    if !input_source_is_readable_with_owner(input, uri, &owner) {
+        return Err(format!(
+            "document is outside configured workspace roots or source paths: {uri}"
+        ));
+    }
+    Ok(owner)
+}
+
+fn syntax_document_for_owner(
+    input: &WorkspaceInput,
+    uri: &Url,
+    owner: &KnownDocumentOwner,
+    cancel: &AtomicBool,
+) -> Result<SyntaxDocument, String> {
+    let (source, record) = source_for_input_with_owner(input, uri, owner, Some(cancel))?;
+    let (context, metadata_records) = project_context_and_metadata_for_owner(owner, cancel)?;
+    let mut records = Vec::with_capacity(metadata_records.len().saturating_add(1));
+    records.push(record);
+    records.extend(metadata_records);
+    Ok(SyntaxDocument {
+        source,
+        context,
+        records,
+    })
+}
+
+fn syntax_index_for_document(
+    input: &WorkspaceInput,
+    uri: &Url,
+    document: SyntaxDocument,
+    cancel: &AtomicBool,
+    operation: &str,
+) -> Result<(NavigationIndex, Vec<super::rename::SourceRecord>), String> {
+    let cached = input
+        .cached_documents
+        .get(uri)
+        .filter(|cached| cached.context == document.context)
+        .map(|cached| cached.parsed.clone());
+    let defines = document.context.defines;
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_defines_and_cached_with_cancel(
+            uri.clone(),
+            document.source,
+            &defines,
+            cached,
+            cancel,
+        )
+        .map_err(|error| format!("could not index {operation} for {uri}: {error}"))?;
+    Ok((index, document.records))
+}
+
 pub(crate) fn document_symbols_from_input(
     input: WorkspaceInput,
     uri: &Url,
@@ -798,45 +863,27 @@ pub(crate) fn document_symbols_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let owner = match owner_for_input(&input, &uri, cancel) {
+    let owner = match syntax_owner_for_input(&input, &uri, cancel) {
         Ok(owner) => owner,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
-        return failed(
-            source_generation,
-            configuration_generation,
-            format!("document is outside configured workspace roots or source paths: {uri}"),
-        );
-    }
-    let (source, record) = match source_for_input_with_owner(&input, &uri, &owner, Some(cancel)) {
-        Ok(result) => result,
-        Err(error) => return failed(source_generation, configuration_generation, error),
-    };
-    let (context, metadata_records) = match project_context_and_metadata_for_owner(&owner, cancel) {
-        Ok(result) => result,
+    let document = match syntax_document_for_owner(&input, &uri, &owner, cancel) {
+        Ok(document) => document,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
 
-    let mut index = NavigationIndex::new();
-    let defines = context.defines;
-    if let Err(error) = index.update_with_defines_with_cancel(uri.clone(), source, &defines, cancel)
-    {
-        return failed(
-            source_generation,
-            configuration_generation,
-            format!("could not index document symbols for {uri}: {error}"),
-        );
-    }
+    let (index, records) =
+        match syntax_index_for_document(&input, &uri, document, cancel, "document symbols") {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     let value = index.document_symbols_with_cancel(&uri, cancel);
-    let mut records = vec![record];
-    records.extend(metadata_records);
     super::rename::Computed {
         source_generation,
         configuration_generation,
@@ -858,45 +905,41 @@ pub(crate) fn selection_ranges_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    let owner = match owner_for_input(&input, &uri, cancel) {
+    let owner = match syntax_owner_for_input(&input, &uri, cancel) {
         Ok(owner) => owner,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
-        return failed(
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    if let Err(error) = crate::navigation::validate_selection_position_count(&positions) {
+        return failed(source_generation, configuration_generation, error);
+    }
+    if positions.is_empty() {
+        return with_records(
             source_generation,
             configuration_generation,
-            format!("document is outside configured workspace roots or source paths: {uri}"),
+            Ok(Vec::new()),
+            Vec::new(),
         );
     }
-    let (source, record) = match source_for_input_with_owner(&input, &uri, &owner, Some(cancel)) {
-        Ok(result) => result,
-        Err(error) => return failed(source_generation, configuration_generation, error),
-    };
-    let (context, metadata_records) = match project_context_and_metadata_for_owner(&owner, cancel) {
-        Ok(result) => result,
+    let document = match syntax_document_for_owner(&input, &uri, &owner, cancel) {
+        Ok(document) => document,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
 
-    let mut index = NavigationIndex::new();
-    if let Err(error) =
-        index.update_with_defines_with_cancel(uri.clone(), source, &context.defines, cancel)
-    {
-        return failed(
-            source_generation,
-            configuration_generation,
-            format!("could not index selection ranges for {uri}: {error}"),
-        );
-    }
+    let (index, records) =
+        match syntax_index_for_document(&input, &uri, document, cancel, "selection ranges") {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     let value = index.selection_ranges_with_cancel(&uri, &positions, cancel);
-    let mut records = vec![record];
-    records.extend(metadata_records);
     with_records(source_generation, configuration_generation, value, records)
 }
 
@@ -1104,8 +1147,8 @@ fn with_records<T>(
 mod tests {
     use super::{
         completion_from_input, document_symbols_from_input, highlights_from_input,
-        hover_from_input, references_from_input, semantic_tokens_from_input,
-        signature_help_from_input, type_definitions_from_input,
+        hover_from_input, references_from_input, selection_ranges_from_input,
+        semantic_tokens_from_input, signature_help_from_input, type_definitions_from_input,
     };
     use crate::workspace::rename::{
         CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input, owner_for_input,
@@ -1453,6 +1496,81 @@ mod tests {
             consumer_source,
             input: workspace.analysis_input(),
         }
+    }
+
+    #[test]
+    fn selection_reuses_context_valid_documents_and_skips_empty_or_oversized_parses() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("SelectionCache.pas");
+        let source = "unit SelectionCache;\ninterface\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&source_path, source).expect("source");
+        let uri = source_uri(&source_path);
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open source");
+        let input = workspace.analysis_input();
+        assert!(
+            input.cached_documents.contains_key(&uri),
+            "the fixture must provide a reusable parsed document"
+        );
+        let cancel = AtomicBool::new(false);
+
+        crate::navigation::test_reset_document_parse_count();
+        let computed =
+            selection_ranges_from_input(input.clone(), &uri, vec![Position::new(0, 0)], &cancel);
+        assert!(
+            computed.value.is_ok(),
+            "cached selection failed: {computed:?}"
+        );
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "an unchanged cached document must be reused"
+        );
+
+        let mut changed_context = input.clone();
+        changed_context
+            .cached_documents
+            .get_mut(&uri)
+            .expect("cached document")
+            .context
+            .defines
+            .push("CONTEXT_CHANGED".to_owned());
+        crate::navigation::test_reset_document_parse_count();
+        let computed =
+            selection_ranges_from_input(changed_context, &uri, vec![Position::new(0, 0)], &cancel);
+        assert!(
+            computed.value.is_ok(),
+            "changed-context selection failed: {computed:?}"
+        );
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            1,
+            "a context mismatch must not reuse the cached document"
+        );
+
+        crate::navigation::test_reset_document_parse_count();
+        let computed = selection_ranges_from_input(input.clone(), &uri, Vec::new(), &cancel);
+        assert_eq!(computed.value, Ok(Vec::new()));
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "an empty selection request must not parse the source"
+        );
+
+        crate::navigation::test_reset_document_parse_count();
+        let computed =
+            selection_ranges_from_input(input, &uri, vec![Position::new(0, 0); 257], &cancel);
+        let error = computed.value.expect_err("oversized selection request");
+        assert!(error.contains("more than 256 positions"), "{error}");
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "an oversized selection request must not parse the source"
+        );
     }
 
     struct AssistanceFixture {

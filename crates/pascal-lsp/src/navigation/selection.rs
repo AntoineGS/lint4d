@@ -38,11 +38,7 @@ pub(super) fn selection_ranges_with_cancel(
     cancel: &AtomicBool,
 ) -> Result<Vec<SelectionRange>, String> {
     check_cancel(cancel)?;
-    if positions.len() > MAX_SELECTION_POSITIONS {
-        return Err(format!(
-            "selection range request contains more than {MAX_SELECTION_POSITIONS} positions"
-        ));
-    }
+    validate_selection_position_count(positions)?;
     let document = index
         .documents
         .get(uri)
@@ -72,6 +68,15 @@ pub(super) fn selection_ranges_with_cancel(
         )?);
     }
     Ok(result)
+}
+
+pub(crate) fn validate_selection_position_count(positions: &[Position]) -> Result<(), String> {
+    if positions.len() > MAX_SELECTION_POSITIONS {
+        return Err(format!(
+            "selection range request contains more than {MAX_SELECTION_POSITIONS} positions"
+        ));
+    }
+    Ok(())
 }
 
 impl SelectionTree {
@@ -256,7 +261,7 @@ mod tests {
     use super::{MAX_SELECTION_POSITIONS, selection_ranges_with_cancel};
     use crate::NavigationIndex;
     use crate::text::offset_to_position;
-    use lsp_types::Position;
+    use lsp_types::{Position, Range, SelectionRange};
     use std::sync::atomic::AtomicBool;
 
     fn indexed(source: &str) -> (NavigationIndex, lsp_types::Url) {
@@ -362,5 +367,118 @@ mod tests {
         let error = selection_ranges_with_cancel(&index, &uri, &[position], &cancel)
             .expect_err("excessive selection depth must fail closed");
         assert!(error.contains("selection syntax hierarchy"), "{error}");
+    }
+
+    #[test]
+    fn selection_ranges_keep_line_comment_ranges_valid_for_lf_and_crlf() {
+        let expected_comment = Range::new(Position::new(1, 0), Position::new(1, 8));
+        for newline in ["\n", "\r\n"] {
+            let source = format!(
+                "unit U;{newline}// hello{newline}interface{newline}implementation{newline}end.{newline}"
+            );
+            let (index, uri) = indexed(&source);
+            let positions = [
+                Position::new(1, 3),
+                Position::new(1, 8),
+                Position::new(2, 0),
+            ];
+            let cancel = AtomicBool::new(false);
+            let ranges = selection_ranges_with_cancel(&index, &uri, &positions, &cancel)
+                .expect("LF and CRLF comment selections");
+
+            assert_eq!(ranges.len(), positions.len());
+            assert_eq!(ranges[0].range, expected_comment);
+            assert_eq!(ranges[1].range.start, Position::new(0, 0));
+            assert_eq!(ranges[2].range.start, Position::new(2, 0));
+        }
+    }
+
+    #[test]
+    fn selection_ranges_keep_non_bmp_comment_endpoints_and_mixed_positions_valid() {
+        let source = "unit U;\r\n// 😀hello\r\ninterface\r\nimplementation\r\nend.\r\n";
+        let (index, uri) = indexed(source);
+        let positions = [
+            Position::new(1, 3),
+            Position::new(1, 8),
+            Position::new(1, 10),
+            Position::new(2, 0),
+        ];
+        let cancel = AtomicBool::new(false);
+
+        let ranges = selection_ranges_with_cancel(&index, &uri, &positions, &cancel)
+            .expect("non-BMP comment selections");
+        assert_eq!(ranges.len(), positions.len());
+        assert_eq!(
+            ranges[0].range,
+            Range::new(Position::new(1, 0), Position::new(1, 10))
+        );
+        assert_eq!(ranges[1].range, ranges[0].range);
+        assert_eq!(ranges[2].range.start, Position::new(0, 0));
+        assert_eq!(ranges[3].range.start, Position::new(2, 0));
+    }
+
+    fn selection_chain(selection: &SelectionRange) -> Vec<Range> {
+        let mut ranges = Vec::new();
+        let mut current = Some(selection);
+        while let Some(selection) = current {
+            ranges.push(selection.range);
+            current = selection.parent.as_deref();
+        }
+        ranges
+    }
+
+    #[test]
+    fn selection_ranges_return_exact_class_whitespace_and_eof_chains() {
+        let source = "unit Selection;\ninterface\ntype\n  TWidget = class\n    Value: Integer;\n  end;\nimplementation\nprocedure TWidget.Run;\nbegin\n  Value := Other.Bar[0] + 1;\nend;\nend.\n";
+        let (index, uri) = indexed(source);
+        let cancel = AtomicBool::new(false);
+
+        let class_member_position =
+            offset_to_position(source, source.find("Value").expect("class member"))
+                .expect("class member position");
+        let class_member =
+            selection_ranges_with_cancel(&index, &uri, &[class_member_position], &cancel)
+                .expect("class member selection")
+                .remove(0);
+        assert_eq!(
+            selection_chain(&class_member),
+            vec![
+                Range::new(Position::new(4, 4), Position::new(4, 9)),
+                Range::new(Position::new(4, 4), Position::new(4, 19)),
+                Range::new(Position::new(3, 12), Position::new(5, 5)),
+                Range::new(Position::new(3, 2), Position::new(5, 6)),
+                Range::new(Position::new(2, 0), Position::new(5, 6)),
+                Range::new(Position::new(1, 0), Position::new(5, 6)),
+                Range::new(Position::new(0, 0), Position::new(11, 4)),
+                Range::new(Position::new(0, 0), Position::new(12, 0)),
+            ]
+        );
+
+        let whitespace =
+            selection_ranges_with_cancel(&index, &uri, &[Position::new(3, 0)], &cancel)
+                .expect("whitespace selection")
+                .remove(0);
+        assert_eq!(
+            selection_chain(&whitespace),
+            vec![
+                Range::new(Position::new(2, 0), Position::new(5, 6)),
+                Range::new(Position::new(1, 0), Position::new(5, 6)),
+                Range::new(Position::new(0, 0), Position::new(11, 4)),
+                Range::new(Position::new(0, 0), Position::new(12, 0)),
+            ]
+        );
+
+        let eof = selection_ranges_with_cancel(
+            &index,
+            &uri,
+            &[offset_to_position(source, source.len()).expect("EOF position")],
+            &cancel,
+        )
+        .expect("EOF selection")
+        .remove(0);
+        assert_eq!(
+            selection_chain(&eof),
+            vec![Range::new(Position::new(0, 0), Position::new(12, 0))]
+        );
     }
 }

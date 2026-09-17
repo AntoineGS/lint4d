@@ -649,6 +649,30 @@ impl TestServer {
         self.initialize_with_watched_registration(root, initialization_options, false)
     }
 
+    fn initialize_with_folding_capabilities(
+        &mut self,
+        root: &Path,
+        folding_capabilities: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {"foldingRange": folding_capabilities}
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
     fn initialize_with_workspace_folders(
         &mut self,
         root: &Path,
@@ -1941,8 +1965,364 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     assert_eq!(capabilities["documentHighlightProvider"], true);
     assert_eq!(capabilities["hoverProvider"], true);
     assert_eq!(capabilities["typeDefinitionProvider"], true);
+    assert_eq!(capabilities["foldingRangeProvider"], true);
     assert_eq!(capabilities["documentFormattingProvider"], true);
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_return_multiline_syntax_ranges_over_the_protocol() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Folding.pas");
+    let source = "unit Folding;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  if True then\n  begin\n    Value := 1;\n  end;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    assert_eq!(initialize["capabilities"]["foldingRangeProvider"], true);
+
+    let id = RequestId::from("folding-ranges".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 4 && range["endLine"] == 10 }),
+        "routine range missing from response: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 5 && range["endLine"] == 10 }),
+        "begin range missing from response: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 6 && range["endLine"] == 9 }),
+        "if range missing from response: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_range_client_capabilities_filter_kinds_and_characters() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingOptions.pas");
+    let source = "unit FoldingOptions;\ninterface\nimplementation\n{$REGION 'body'}\n{comment\n  continues}\nprocedure Run;\nbegin\n  Value := 1;\nend;\n{$ENDREGION}\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(
+        temp.path(),
+        json!({
+            "lineFoldingOnly": true,
+            "foldingRangeKind": {"valueSet": ["region"]}
+        }),
+    );
+    let id = RequestId::from("folding-options".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges.iter().any(|range| range["kind"] == "region"),
+        "region range missing: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .all(|range| range.get("kind") != Some(&json!("comment"))),
+        "unsupported comment range returned: {ranges:?}"
+    );
+    assert!(
+        ranges.iter().all(|range| {
+            !range.as_object().is_some_and(|range| {
+                range.contains_key("startCharacter") || range.contains_key("endCharacter")
+            })
+        }),
+        "line-only ranges must omit character fields: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_range_zero_limit_returns_an_empty_result() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingZeroLimit.pas");
+    let source =
+        "unit FoldingZeroLimit;\ninterface\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 0}));
+    let id = RequestId::from("folding-zero-limit".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("folding range result"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn folding_range_limit_prefers_outer_meaningful_ranges() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingLimit.pas");
+    let source = "unit FoldingLimit;\ninterface\nprocedure Decl;\nimplementation\nprocedure Run;\nbegin\n  if True then\n  begin\n  end;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 2}));
+    let id = RequestId::from("folding-limit".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert_eq!(ranges.len(), 2, "range limit must be honored: {ranges:?}");
+    assert_eq!(
+        ranges
+            .iter()
+            .map(|range| (range["startLine"].as_u64(), range["endLine"].as_u64()))
+            .collect::<Vec<_>>(),
+        vec![(Some(3), Some(9)), (Some(4), Some(9))]
+    );
+    server.shutdown();
+}
+
+#[test]
+fn line_only_folding_does_not_hide_code_after_a_closing_token() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingLineOnly.pas");
+    let source = "unit FoldingLineOnly;\ninterface\nimplementation\nprocedure Run;\nbegin\n  if True then begin\n    Value := 1;\n  end; Value := 2;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(temp.path(), json!({"lineFoldingOnly": true}));
+    let id = RequestId::from("folding-line-only".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 5 && range["endLine"] == 6 }),
+        "if body should stop before the line containing unrelated code: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .all(|range| { !(range["startLine"] == 5 && range["endLine"] == 7) }),
+        "line-only folding must not hide unrelated closing-line code: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_use_authoritative_open_overlay_then_restore_disk_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingOverlay.pas");
+    let disk_source =
+        "unit FoldingOverlay;\ninterface\nimplementation\nprocedure Run; begin end;\nend.\n";
+    let overlay_source = "unit FoldingOverlay;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := 1;\nend;\nend.\n";
+    write_file(&source_path, disk_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": overlay_source
+            }
+        }),
+    );
+
+    let open_id = RequestId::from("folding-overlay-open".to_string());
+    server.send_request(
+        open_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let open_response = server.response(&open_id);
+    assert!(
+        open_response.error.is_none(),
+        "open overlay request failed: {open_response:?}"
+    );
+    let open_result = open_response.result.expect("open folding result");
+    let open_ranges = open_result.as_array().expect("open folding array");
+    assert!(
+        open_ranges
+            .iter()
+            .any(|range| { range["startLine"] == 3 && range["endLine"] == 6 }),
+        "folding must use the open overlay: {open_ranges:?}"
+    );
+
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let close_id = RequestId::from("folding-overlay-close".to_string());
+    server.send_request(
+        close_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let close_response = server.response(&close_id);
+    assert!(
+        close_response.error.is_none(),
+        "closed overlay request failed: {close_response:?}"
+    );
+    let close_result = close_response.result.expect("closed folding result");
+    let close_ranges = close_result.as_array().expect("closed folding array");
+    assert!(
+        close_ranges
+            .iter()
+            .all(|range| { !(range["startLine"] == 3 && range["endLine"] == 6) }),
+        "folding must return to disk source after close: {close_ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_do_not_require_imports_to_resolve() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingMissingImport.pas");
+    let source = "unit FoldingMissingImport;\ninterface\nuses MissingProvider;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("folding-missing-import".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "missing import must not block folding: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 4 && range["endLine"] == 6 }),
+        "routine range missing when an import is unresolved: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_reject_invalid_and_non_file_documents() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingInvalid.pas");
+    write_file(
+        &source_path,
+        "unit FoldingInvalid;\ninterface\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let invalid_id = RequestId::from("folding-invalid-params".to_string());
+    server.send_request(invalid_id.clone(), "textDocument/foldingRange", json!({}));
+    assert_eq!(
+        server
+            .response(&invalid_id)
+            .error
+            .expect("invalid folding parameters error")
+            .code,
+        -32602
+    );
+
+    let non_file_id = RequestId::from("folding-non-file".to_string());
+    server.send_request(
+        non_file_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": "https://example.test/Folding.pas"}}),
+    );
+    let non_file_error = server
+        .response(&non_file_id)
+        .error
+        .expect("non-file folding error");
+    assert_eq!(non_file_error.code, -32803);
+    server.shutdown();
+}
+
+#[test]
+fn folding_range_cancellation_handles_thousands_of_nodes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingMany.pas");
+    let mut source = String::from("unit FoldingMany;\ninterface\nvar\n");
+    for index in 0..4_000 {
+        source.push_str(&format!("  Value{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("folding-cancelled".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": "folding-cancelled"}));
+    let error = server
+        .response(&id)
+        .error
+        .expect("cancelled folding request must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
     server.shutdown();
 }
 

@@ -4,8 +4,9 @@ A native, source-based Delphi/Object Pascal language server. Runs on Linux
 without Windows, Wine, RAD Studio, or `DelphiLSP.exe`. This slice provides
 declaration/definition navigation, source-based hover and type definitions,
 document and workspace symbols, semantic references, document highlights,
-semantic completion and signature help, conservative symbol-aware rename,
-naming quick fixes, and reuses lint4d and fmt4d for diagnostics and formatting.
+semantic completion and signature help, syntax folding ranges, conservative
+symbol-aware rename, naming quick fixes, and reuses lint4d and fmt4d for
+diagnostics and formatting.
 It is not a replacement for Delphi's compiler or its complete type system.
 
 ## Build and Run
@@ -627,6 +628,25 @@ text, and open-buffer overlays are used in preference to disk content. Semantic
 token requests use the same bounded snapshots, cancellation, and stale-result
 checks as the other analysis queries.
 
+### Folding ranges
+
+The server advertises `textDocument/foldingRange` and returns sorted,
+deduplicated ranges for multiline Pascal declarations and implementations,
+classes, records, interfaces, begin/end and control-flow blocks, unit sections,
+multiline comments, and balanced `REGION`/`ENDREGION` directives. Single-line
+constructs and directive-looking text inside strings or comments are ignored.
+Conditional, parser-recovery, opaque, and unmatched regions are handled
+conservatively so a range does not hide source whose extent is uncertain.
+
+Ranges use the original source offsets and UTF-16 positions, including CRLF and
+non-BMP text. Open-buffer overlays take precedence over disk content. The
+request honors the client's `rangeLimit`, `lineFoldingOnly`, and
+`foldingRangeKind.valueSet` capabilities. Structural ranges are untagged;
+comments, imports, and explicit regions use the standard `comment`, `imports`,
+and `region` kinds. A zero range limit returns an empty list, and bounded
+analysis returns an explicit request failure rather than traversing without a
+limit. Folding is syntax-based and does not require imported units to resolve.
+
 All analysis queries run in bounded analysis workers. `$/cancelRequest` is honored,
 and source/configuration generations plus the observed read set are revalidated
 before delivery. A changed input produces a stale-result error for the client
@@ -676,6 +696,9 @@ Implemented and covered by tests:
 - Document/workspace symbols, semantic references, document-local highlights,
   and semantic tokens use the standard LSP requests and preserve UTF-16 source
   ranges.
+- Syntax folding covers multiline declarations, implementations, control-flow
+  blocks, unit sections, comments, and balanced regions with conservative
+  conditional/recovery handling.
 - Generic type and routine substitution/inference covers explicit and inferred
   calls, nested and inherited specializations, constructor results, consistent
   multi-parameter inference, cross-unit type identity, and method/formal

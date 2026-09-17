@@ -14,10 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
 mod assistance;
+mod folding;
 mod overload;
 mod rename;
 mod semantic_tokens;
 mod symbols;
+pub(crate) use folding::{
+    FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
+};
 pub(crate) use rename::RenameBindingInfo;
 #[cfg(test)]
 pub(crate) use rename::test_cancel_after_checks;
@@ -172,6 +176,20 @@ impl NavigationIndex {
     /// Return the source-accurate outline for one indexed document.
     pub fn document_symbols(&self, uri: &Url) -> Result<Vec<lsp_types::DocumentSymbol>, String> {
         symbols::document_symbols(self, uri)
+    }
+
+    /// Return source-accurate syntax folding ranges for one indexed document.
+    pub fn folding_ranges(&self, uri: &Url) -> Result<Vec<lsp_types::FoldingRange>, String> {
+        folding::folding_ranges(self, uri)
+    }
+
+    pub(crate) fn folding_ranges_with_cancel(
+        &self,
+        uri: &Url,
+        options: FoldingRangeOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<lsp_types::FoldingRange>, String> {
+        folding::folding_ranges_with_cancel(self, uri, options, cancel)
     }
 
     pub(crate) fn document_symbols_with_cancel(

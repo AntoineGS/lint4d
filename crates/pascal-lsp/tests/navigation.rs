@@ -13246,6 +13246,270 @@ fn document_symbols_survive_parser_recovery_after_valid_declarations() {
     assert!(names.contains(&"VisibleThing"));
 }
 
+#[test]
+fn folding_ranges_cover_multiline_pascal_constructs_without_single_line_noise() {
+    let source_uri = uri("FoldingRanges");
+    let source = "unit FoldingRanges;\ninterface\ntype\n  TRecord = record\n    Value: Integer;\n  end;\n  TWidget = class\n  public\n    procedure Run;\n  end;\nimplementation\nprocedure TWidget.Run;\nbegin\n  if True then\n  begin\n    while True do\n    begin\n    end;\n  end;\nend;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("folding source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("folding ranges are available");
+    let spans = ranges
+        .iter()
+        .map(|range| (range.start_line, range.end_line))
+        .collect::<Vec<_>>();
+    assert!(
+        spans.contains(&(3, 5)),
+        "record declaration is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(6, 9)),
+        "class declaration is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(11, 19)),
+        "routine declaration is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(12, 19)),
+        "outer begin block is foldable: {spans:?}"
+    );
+    assert!(spans.contains(&(13, 18)), "if block is foldable: {spans:?}");
+    assert!(
+        spans.contains(&(15, 17)),
+        "while block is foldable: {spans:?}"
+    );
+    assert!(
+        !spans.contains(&(8, 8)),
+        "single-line declarations are not foldable: {spans:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_include_nested_regions_and_multiline_comments_only() {
+    let source_uri = uri("FoldingCommentsAndRegions");
+    let source = "unit FoldingCommentsAndRegions;\ninterface\nimplementation\nconst Text = '{$REGION not-a-region}';\n{comment text\n  continues}\n{$REGION Outer}\n{$REGION Inner}\nprocedure Run;\nbegin\nend;\n{$ENDREGION}\n{$ENDREGION}\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("comment and region source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("comment and region ranges are available");
+    let comments = ranges
+        .iter()
+        .filter(|range| range.kind == Some(lsp_types::FoldingRangeKind::Comment))
+        .collect::<Vec<_>>();
+    let regions = ranges
+        .iter()
+        .filter(|range| range.kind == Some(lsp_types::FoldingRangeKind::Region))
+        .collect::<Vec<_>>();
+    assert_eq!(comments.len(), 1, "only the real comment folds: {ranges:?}");
+    assert_eq!(comments[0].start_line, 4);
+    assert_eq!(comments[0].end_line, 5);
+    assert_eq!(
+        regions.len(),
+        2,
+        "nested regions must both fold: {ranges:?}"
+    );
+    assert!(
+        regions
+            .iter()
+            .any(|range| (range.start_line, range.end_line) == (6, 12)),
+        "outer region range missing: {regions:?}"
+    );
+    assert!(
+        regions
+            .iter()
+            .any(|range| (range.start_line, range.end_line) == (7, 11)),
+        "inner region range missing: {regions:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_tag_multiline_uses_as_imports() {
+    let source_uri = uri("FoldingImports");
+    let source = "unit FoldingImports;\ninterface\nuses\n  FirstUnit,\n  SecondUnit;\nimplementation\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("uses source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("import folding ranges are available");
+    assert!(
+        ranges.iter().any(|range| {
+            range.kind == Some(lsp_types::FoldingRangeKind::Imports)
+                && (range.start_line, range.end_line) == (2, 4)
+        }),
+        "multiline uses range missing: {ranges:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_preserve_crlf_and_utf16_positions() {
+    let source_uri = uri("FoldingUtf16");
+    let source =
+        "unit FoldingUtf16;\r\ninterface\r\nimplementation\r\n{\r\n  body\r\n  😀}\r\nend.\r\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("CRLF comment source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("CRLF comment ranges are available");
+    let comment = ranges
+        .iter()
+        .find(|range| range.kind == Some(lsp_types::FoldingRangeKind::Comment))
+        .expect("multiline comment range");
+    assert_eq!(
+        (
+            comment.start_line,
+            comment.start_character,
+            comment.end_line,
+            comment.end_character,
+        ),
+        (3, Some(0), 5, Some(5))
+    );
+}
+
+#[test]
+fn folding_ranges_cover_try_and_case_blocks() {
+    let source_uri = uri("FoldingTryCase");
+    let source = "unit FoldingTryCase;\ninterface\nimplementation\nprocedure Run;\nbegin\n  try\n    case Value of\n      1:\n      begin\n      end;\n    else\n      Value := 2;\n    end;\n  finally\n    Value := 3;\n  end;\nend;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("try/case source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("try/case ranges are available");
+    let spans = ranges
+        .iter()
+        .map(|range| (range.start_line, range.end_line))
+        .collect::<Vec<_>>();
+    assert!(spans.contains(&(5, 15)), "try block is foldable: {spans:?}");
+    assert!(
+        spans.contains(&(6, 12)),
+        "case block is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(8, 9)),
+        "case arm block is foldable: {spans:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_do_not_cross_inactive_or_unknown_conditional_text() {
+    let source_uri = uri("FoldingConditionals");
+    let source = "unit FoldingConditionals;\ninterface\nimplementation\n{$IFDEF HIDDEN}\nprocedure Hidden;\nbegin\nend;\n{$ENDIF}\nprocedure Visible;\nbegin\nend;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("conditional source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("conditional folding ranges are available");
+    assert!(
+        ranges.iter().all(|range| range.start_line >= 8),
+        "inactive procedure must not produce a range: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|range| (range.start_line, range.end_line) == (8, 10)),
+        "active procedure remains foldable: {ranges:?}"
+    );
+
+    let malformed_uri = uri("FoldingMalformedConditional");
+    let malformed = "unit FoldingMalformedConditional;\ninterface\nimplementation\n{$IFDEF HIDDEN}\nprocedure Hidden;\nbegin\nend;\n";
+    index
+        .update(malformed_uri.clone(), malformed.to_owned())
+        .expect("malformed conditional source parses");
+    assert!(
+        index
+            .folding_ranges(&malformed_uri)
+            .expect("malformed conditional ranges are available")
+            .is_empty(),
+        "malformed conditional text must not create speculative ranges"
+    );
+}
+
+#[test]
+fn folding_ranges_include_unit_lifecycle_sections_and_ignore_unmatched_regions() {
+    let source_uri = uri("FoldingSections");
+    let source = "unit FoldingSections;\ninterface\nimplementation\ninitialization\n  StartUp;\nfinalization\n  ShutDown;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("lifecycle source parses");
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("lifecycle ranges are available");
+    let spans = ranges
+        .iter()
+        .map(|range| (range.start_line, range.end_line))
+        .collect::<Vec<_>>();
+    assert!(
+        spans.contains(&(3, 4)),
+        "initialization section is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(5, 6)),
+        "finalization section is foldable: {spans:?}"
+    );
+
+    let malformed_uri = uri("FoldingUnmatchedRegion");
+    let malformed = "unit FoldingUnmatchedRegion;\ninterface\nimplementation\n{$REGION never-closed}\nprocedure Run;\nbegin\nend;\nend.\n";
+    index
+        .update(malformed_uri.clone(), malformed.to_owned())
+        .expect("unmatched region source parses");
+    assert!(
+        index
+            .folding_ranges(&malformed_uri)
+            .expect("unmatched region ranges are available")
+            .iter()
+            .all(|range| range.kind != Some(lsp_types::FoldingRangeKind::Region)),
+        "unmatched regions must not produce speculative ranges"
+    );
+}
+
+#[test]
+fn folding_ranges_reject_excessive_syntax_depth() {
+    let source_uri = uri("FoldingDepth");
+    let depth = 160;
+    let mut source =
+        String::from("unit FoldingDepth;\ninterface\nimplementation\nprocedure Run;\nbegin\n");
+    for _ in 0..depth {
+        source.push_str("if True then begin\n");
+    }
+    for _ in 0..depth {
+        source.push_str("end;\n");
+    }
+    source.push_str("end;\nend.\n");
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source)
+        .expect("deep folding source parses");
+    let error = index
+        .folding_ranges(&source_uri)
+        .expect_err("excessive folding depth must fail closed");
+    assert!(
+        error.contains("folding syntax hierarchy"),
+        "unexpected folding depth error: {error}"
+    );
+}
+
 fn deeply_nested_symbol_source(depth: usize) -> String {
     let mut source = String::from("unit DeepSymbols;\ninterface\nimplementation\nprocedure P0;\n");
     for index in 1..depth {

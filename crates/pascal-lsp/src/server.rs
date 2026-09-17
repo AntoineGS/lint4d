@@ -1,5 +1,8 @@
 //! Synchronous stdio LSP protocol loop for the Pascal navigation workspace.
 
+use crate::navigation::{
+    FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
+};
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
@@ -15,10 +18,10 @@ use lsp_types::{
     CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
-    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
-    MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
-    Registration, RegistrationParams, RelativePattern, ServerInfo, SignatureHelpParams,
-    TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
+    FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
+    InitializeParams, MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams,
+    ReferenceParams, Registration, RegistrationParams, RelativePattern, ServerInfo,
+    SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -84,7 +87,8 @@ impl AnalysisPriority {
             | AnalysisRequest::WorkspaceSymbols { .. }
             | AnalysisRequest::References { .. }
             | AnalysisRequest::Rename { .. }
-            | AnalysisRequest::SemanticTokens { .. } => Self::Bulk,
+            | AnalysisRequest::SemanticTokens { .. }
+            | AnalysisRequest::FoldingRanges { .. } => Self::Bulk,
         }
     }
 }
@@ -356,6 +360,9 @@ struct ClientFeatures {
     document_changes: bool,
     hierarchical_document_symbols: bool,
     hover_markdown: bool,
+    folding_range_limit: Option<usize>,
+    line_folding_only: bool,
+    folding_range_kind_value_set: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +454,9 @@ enum AnalysisRequest {
         uri: Url,
         range: Option<lsp_types::Range>,
     },
+    FoldingRanges {
+        uri: Url,
+    },
 }
 
 #[derive(Clone)]
@@ -471,6 +481,7 @@ enum AnalysisResultValue {
     References(Result<Vec<lsp_types::Location>, String>),
     DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
     SemanticTokens(Result<lsp_types::SemanticTokens, String>),
+    FoldingRanges(Result<Vec<lsp_types::FoldingRange>, String>),
 }
 
 #[derive(Clone)]
@@ -536,6 +547,7 @@ enum ObservationMethod {
     References { include_declaration: bool },
     DocumentHighlights,
     SemanticTokens { range: Option<ObservationRange> },
+    FoldingRanges,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -683,6 +695,12 @@ impl ObservationKey {
                         },
                     }),
                 },
+                Some(uri.clone()),
+                None,
+                None,
+            ),
+            AnalysisRequest::FoldingRanges { uri } => (
+                ObservationMethod::FoldingRanges,
                 Some(uri.clone()),
                 None,
                 None,
@@ -980,6 +998,9 @@ impl AnalysisJobs {
                 Err("analysis worker failed without changing workspace state".to_string()),
             ),
             AnalysisRequest::SemanticTokens { .. } => AnalysisResultValue::SemanticTokens(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::FoldingRanges { .. } => AnalysisResultValue::FoldingRanges(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
         };
@@ -1330,6 +1351,25 @@ impl AnalysisJobs {
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
                                 value: AnalysisResultValue::SemanticTokens(computed.value),
+                            }
+                        }
+                        AnalysisRequest::FoldingRanges { uri } => {
+                            let computed = queries::folding_ranges_from_input(
+                                input,
+                                &uri,
+                                FoldingRangeOptions {
+                                    range_limit: features.folding_range_limit,
+                                    line_folding_only: features.line_folding_only,
+                                    kind_value_set: features.folding_range_kind_value_set,
+                                },
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::FoldingRanges(computed.value),
                             }
                         }
                     }));
@@ -1925,6 +1965,9 @@ fn diagnostic_features() -> ClientFeatures {
         document_changes: false,
         hierarchical_document_symbols: false,
         hover_markdown: false,
+        folding_range_limit: None,
+        line_folding_only: false,
+        folding_range_kind_value_set: None,
     }
 }
 
@@ -1942,6 +1985,7 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::DocumentSymbols { .. }
                 | AnalysisResultValue::DocumentHighlights(_)
                 | AnalysisResultValue::SemanticTokens(_)
+                | AnalysisResultValue::FoldingRanges(_)
         )
 }
 
@@ -2136,6 +2180,12 @@ fn deliver_analysis_result(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
+        AnalysisResultValue::FoldingRanges(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
     }
 }
 
@@ -2163,6 +2213,7 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::References(value) => *value = Err(error),
         AnalysisResultValue::DocumentHighlights(value) => *value = Err(error),
         AnalysisResultValue::SemanticTokens(value) => *value = Err(error),
+        AnalysisResultValue::FoldingRanges(value) => *value = Err(error),
     }
 }
 
@@ -2880,6 +2931,26 @@ fn handle_request(
                 client_features,
             )?;
         }
+        "textDocument/foldingRange" => {
+            let id = request.id.clone();
+            let params: FoldingRangeParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::FoldingRanges {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                },
+                client_features,
+            )?;
+        }
         "textDocument/prepareRename" => {
             let id = request.id.clone();
             let params: PositionRequestParams = match parse_params(&request) {
@@ -3364,6 +3435,7 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
         "workspaceSymbolProvider": true,
         "referencesProvider": true,
         "documentHighlightProvider": true,
+        "foldingRangeProvider": true,
         "semanticTokensProvider": {
             "legend": crate::NavigationIndex::semantic_tokens_legend(),
             "range": true,
@@ -3416,12 +3488,33 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
                 .iter()
                 .any(|format| format.as_str() == Some("markdown"))
         });
+    let folding = &value["textDocument"]["foldingRange"];
+    let folding_range_limit = folding["rangeLimit"]
+        .as_u64()
+        .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+    let line_folding_only = folding["lineFoldingOnly"].as_bool().unwrap_or(false);
+    let folding_range_kind_value_set =
+        folding["foldingRangeKind"]["valueSet"]
+            .as_array()
+            .map(|kinds| {
+                kinds.iter().fold(0, |mask, kind| {
+                    mask | match kind.as_str() {
+                        Some("comment") => FOLDING_KIND_COMMENT,
+                        Some("imports") => FOLDING_KIND_IMPORTS,
+                        Some("region") => FOLDING_KIND_REGION,
+                        _ => 0,
+                    }
+                })
+            });
     ClientFeatures {
         action_resolve,
         action_disabled,
         document_changes,
         hierarchical_document_symbols,
         hover_markdown,
+        folding_range_limit,
+        line_folding_only,
+        folding_range_kind_value_set,
     }
 }
 
@@ -3514,6 +3607,9 @@ mod tests {
             document_changes: false,
             hierarchical_document_symbols: false,
             hover_markdown: false,
+            folding_range_limit: None,
+            line_folding_only: false,
+            folding_range_kind_value_set: None,
         }
     }
 
@@ -3649,6 +3745,25 @@ mod tests {
         assert!(
             !result.records.is_empty(),
             "the computed semantic-token result must carry its source read set"
+        );
+    }
+
+    fn assert_folding_ranges_were_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::FoldingRanges(Ok(ranges)) => {
+                assert!(
+                    !ranges.is_empty(),
+                    "the computed folding-range result must not be empty"
+                );
+            }
+            AnalysisResultValue::FoldingRanges(Err(error)) => {
+                panic!("folding-range worker failed before delivery: {error}");
+            }
+            _ => panic!("expected a folding-range result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed folding-range result must carry its source read set"
         );
     }
 
@@ -4322,6 +4437,68 @@ mod tests {
             response
                 .error
                 .expect("changed overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_folding_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nprocedure VisibleThing;\nimplementation\nprocedure VisibleThing;\nbegin\nend;\nend.\n";
+        let changed = "unit Main;\ninterface\nprocedure ChangedThing;\nimplementation\nprocedure ChangedThing;\nbegin\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = test_workspace(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("folding-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::FoldingRanges {
+                uri: main_uri.clone(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start folding control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_folding_ranges_were_computed(&control);
+        deliver_successfully(&mut workspace, control_id, control);
+
+        let stale_id = RequestId::from("folding-overlay-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::FoldingRanges {
+                uri: main_uri.clone(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale folding request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_folding_ranges_were_computed(&stale);
+
+        workspace
+            .change_document(main_uri, changed.to_string(), 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &mut workspace, stale, Some(stale_id.clone()))
+            .expect("deliver stale folding result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed overlay must reject folding result")
                 .code,
             -32803
         );

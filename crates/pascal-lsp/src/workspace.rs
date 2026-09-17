@@ -567,6 +567,7 @@ pub struct Workspace {
     overrides: OverrideSession,
     roots: Vec<WorkspaceRoot>,
     index: NavigationIndex,
+    cached_documents: HashMap<Url, rename::CachedDocument>,
     open_documents: HashMap<Url, OpenDocument>,
     indexed_files: HashSet<Url>,
     indexed_sizes: HashMap<Url, usize>,
@@ -692,6 +693,7 @@ impl Workspace {
             open_documents,
             deleted_overrides: input.deleted_overrides.clone(),
             document_owners: input.document_owners.clone(),
+            cached_documents: input.cached_documents.clone(),
             project_selections: input.project_selections.clone(),
             analysis_records: Some(HashMap::new()),
             source_generation: input.source_generation,
@@ -2145,14 +2147,33 @@ impl Workspace {
             .get(context_key)
             .map(|state| state.context.defines.clone())
             .unwrap_or_default();
+        let cached = self
+            .cached_documents
+            .get(uri)
+            .filter(|cached| {
+                self.contexts
+                    .get(context_key)
+                    .is_some_and(|state| state.context == cached.context)
+            })
+            .map(|cached| cached.parsed.clone());
         let update = match cancel {
-            Some(cancel) => {
-                self.index
-                    .update_with_defines_with_cancel(uri.clone(), source, &defines, cancel)
+            Some(cancel) => self.index.update_with_defines_and_cached_with_cancel(
+                uri.clone(),
+                source,
+                &defines,
+                cached,
+                cancel,
+            ),
+            None => {
+                let cancel = AtomicBool::new(false);
+                self.index.update_with_defines_and_cached_with_cancel(
+                    uri.clone(),
+                    source,
+                    &defines,
+                    cached,
+                    &cancel,
+                )
             }
-            None => self
-                .index
-                .update_with_defines(uri.clone(), source, &defines),
         };
         if let Err(error) = update {
             if error == CANCELLATION_MESSAGE {

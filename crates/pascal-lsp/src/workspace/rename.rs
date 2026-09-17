@@ -14,6 +14,7 @@ use super::{
 };
 use crate::NavigationIndex;
 use crate::conditional::{self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind};
+use crate::navigation::ParsedDocument;
 use crate::project::{
     MetadataObservation, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
     ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
@@ -32,6 +33,7 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
 
@@ -89,6 +91,12 @@ pub(crate) struct OverlayInput {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct CachedDocument {
+    pub(crate) context: ProjectContext,
+    pub(crate) parsed: Arc<ParsedDocument>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct WorkspaceInput {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) options: WorkspaceOptions,
@@ -96,6 +104,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) project_selections: ProjectSelections,
     pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
+    pub(crate) cached_documents: HashMap<Url, CachedDocument>,
     pub(crate) rejected_documents: HashSet<Url>,
     pub(crate) rejection_reasons: HashMap<Url, String>,
     pub(crate) document_versions: HashMap<Url, i32>,
@@ -592,6 +601,16 @@ impl Workspace {
             .iter()
             .map(|(uri, document)| (canonical_file_uri(uri), document.version))
             .collect();
+        let cached_documents = self
+            .index
+            .reusable_documents()
+            .into_iter()
+            .filter_map(|(uri, parsed)| {
+                let context_key = self.document_contexts.get(&uri)?;
+                let context = self.contexts.get(context_key)?.context.clone();
+                Some((canonical_file_uri(&uri), CachedDocument { context, parsed }))
+            })
+            .collect();
         WorkspaceInput {
             roots: self.roots.iter().map(|root| root.path.clone()).collect(),
             options: self.options.clone(),
@@ -599,6 +618,7 @@ impl Workspace {
             project_selections: self.project_selections.clone(),
             document_owners: self.document_owners.clone(),
             overlays,
+            cached_documents,
             rejected_documents,
             rejection_reasons,
             document_versions,
@@ -2363,6 +2383,7 @@ pub(crate) fn build_snapshot(
         loader_options,
         input.overrides.clone(),
     );
+    loader.cached_documents = input.cached_documents.clone();
     loader.project_selections = input.project_selections.clone();
     loader.document_owners = input.document_owners.clone();
     for (uri, overlay) in &input.overlays {
@@ -2869,8 +2890,24 @@ pub(crate) fn build_snapshot(
                 }
             })
             .unwrap_or_default();
+        let cached = input
+            .cached_documents
+            .get(&uri)
+            .filter(|cached| {
+                loader
+                    .contexts
+                    .get(&source_context_key)
+                    .is_some_and(|state| state.context == cached.context)
+            })
+            .map(|cached| cached.parsed.clone());
         index
-            .update_with_defines_with_cancel(uri.clone(), source.clone(), &defines, cancel)
+            .update_with_defines_and_cached_with_cancel(
+                uri.clone(),
+                source.clone(),
+                &defines,
+                cached,
+                cancel,
+            )
             .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
         retained_files = retained_files.saturating_add(1);
         retained_bytes = retained_bytes.saturating_add(source_bytes);
@@ -5396,6 +5433,7 @@ mod tests {
     use std::path::PathBuf;
     #[cfg(target_os = "linux")]
     use std::process::Command;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::thread;
@@ -5404,6 +5442,136 @@ mod tests {
 
     fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn local_snapshot_reuses_an_unchanged_document_model() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let uri = Url::from_file_path(root.path().join("Snapshot.pas")).expect("fixture URI");
+        let source = "unit Snapshot;\ninterface\nimplementation\nend.\n";
+        let mut workspace = test_workspace(vec![root.path().to_path_buf()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        let input = workspace.analysis_input();
+        let cached = input
+            .cached_documents
+            .get(&uri)
+            .expect("indexed document should be available to snapshots")
+            .parsed
+            .clone();
+        let cancel = AtomicBool::new(false);
+
+        let snapshot = build_snapshot(
+            &input,
+            std::slice::from_ref(&uri),
+            &[],
+            SnapshotMode::Local,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("local snapshot");
+        let snapshot_document = snapshot
+            .index
+            .reusable_documents()
+            .into_iter()
+            .find(|(document_uri, _)| document_uri == &uri)
+            .map(|(_, parsed)| parsed)
+            .expect("snapshot document");
+
+        assert!(
+            Arc::ptr_eq(&cached, &snapshot_document),
+            "unchanged snapshot input should reuse the immutable parsed model"
+        );
+    }
+
+    #[test]
+    fn local_snapshot_rejects_a_cached_model_from_a_different_context() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let uri =
+            Url::from_file_path(root.path().join("ContextSnapshot.pas")).expect("fixture URI");
+        let source = "unit ContextSnapshot;\ninterface\nimplementation\nend.\n";
+        let mut workspace = test_workspace(vec![root.path().to_path_buf()], Default::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open document");
+        let mut input = workspace.analysis_input();
+        let cached = input
+            .cached_documents
+            .get(&uri)
+            .expect("indexed document should be available to snapshots")
+            .parsed
+            .clone();
+        input
+            .cached_documents
+            .get_mut(&uri)
+            .expect("cached context")
+            .context
+            .defines
+            .push("FEATURE".to_owned());
+        let cancel = AtomicBool::new(false);
+
+        let snapshot = build_snapshot(
+            &input,
+            std::slice::from_ref(&uri),
+            &[],
+            SnapshotMode::Local,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("local snapshot");
+        let snapshot_document = snapshot
+            .index
+            .reusable_documents()
+            .into_iter()
+            .find(|(document_uri, _)| document_uri == &uri)
+            .map(|(_, parsed)| parsed)
+            .expect("snapshot document");
+
+        assert!(
+            !Arc::ptr_eq(&cached, &snapshot_document),
+            "a cache from a different project context must not be reused"
+        );
+    }
+
+    #[test]
+    fn analysis_cache_follows_the_bounded_retained_file_set() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let first_path = root.path().join("First.pas");
+        let second_path = root.path().join("Second.pas");
+        let first_uri = Url::from_file_path(&first_path).expect("first URI");
+        let second_uri = Url::from_file_path(&second_path).expect("second URI");
+        let first_source = "unit First;\ninterface\nimplementation\nend.\n";
+        let second_source = "unit Second;\ninterface\nimplementation\nend.\n";
+        fs::write(&first_path, first_source).expect("first source");
+        fs::write(&second_path, second_source).expect("second source");
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_files = 1;
+        let mut workspace = test_workspace(vec![root.path().to_path_buf()], options);
+
+        workspace
+            .open_document(first_uri.clone(), first_source.to_owned(), 1)
+            .expect("open first document");
+        assert!(workspace.close_document(&first_uri));
+        assert!(
+            workspace
+                .analysis_input()
+                .cached_documents
+                .contains_key(&first_uri),
+            "the first document should be cached before eviction"
+        );
+
+        workspace
+            .open_document(second_uri.clone(), second_source.to_owned(), 1)
+            .expect("open second document");
+        let input = workspace.analysis_input();
+        assert!(input.cached_documents.contains_key(&second_uri));
+        assert!(
+            !input.cached_documents.contains_key(&first_uri),
+            "evicted documents must not remain in the reusable cache"
+        );
     }
 
     #[test]

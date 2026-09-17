@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
@@ -182,7 +184,26 @@ impl NavigationIndex {
         defines: &[String],
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        let document = Document::parse_with_cancel(uri.clone(), source, defines, cancel)?;
+        self.update_with_defines_and_cached_with_cancel(uri, source, defines, None, cancel)
+    }
+
+    pub(crate) fn update_with_defines_and_cached_with_cancel(
+        &mut self,
+        uri: Url,
+        source: String,
+        defines: &[String],
+        cached: Option<Arc<ParsedDocument>>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let previous = self
+            .documents
+            .get(&uri)
+            .map(|document| document.parsed.clone());
+        let document =
+            Document::parse_with_cancel(uri.clone(), source, defines, cancel, previous.or(cached))?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
         let old_unit = self
             .documents
             .get(&uri)
@@ -197,6 +218,13 @@ impl NavigationIndex {
         urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         urls.dedup();
         Ok(())
+    }
+
+    pub(crate) fn reusable_documents(&self) -> Vec<(Url, Arc<ParsedDocument>)> {
+        self.documents
+            .iter()
+            .map(|(uri, document)| (uri.clone(), document.parsed.clone()))
+            .collect()
     }
 
     /// Remove a document and all symbols contributed by it.
@@ -217,7 +245,7 @@ impl NavigationIndex {
     pub(crate) fn source_text(&self, uri: &Url) -> Option<&str> {
         self.documents
             .get(uri)
-            .map(|document| document.source.as_str())
+            .map(|document| document.source.as_ref())
     }
 
     /// Bind a document's imports to the workspace-selected unit documents.
@@ -7914,8 +7942,11 @@ impl ResolutionState {
     }
 }
 
-struct Document {
-    source: String,
+#[derive(Debug)]
+pub(crate) struct ParsedDocument {
+    source: Arc<str>,
+    parser_source: Arc<[u8]>,
+    defines: Arc<[String]>,
     tree: Tree,
     parser_recovery_spans: Vec<Span>,
     unit_name: String,
@@ -7926,7 +7957,6 @@ struct Document {
     implementation_uses: Vec<String>,
     imports: Vec<ImportMetadata>,
     unknown_imports: HashSet<String>,
-    import_bindings: Option<HashMap<String, Url>>,
     interface_routine_keys: HashSet<String>,
     scopes: Vec<Scope>,
     with_contexts: Vec<WithContext>,
@@ -7951,13 +7981,38 @@ struct Document {
     helpers: Vec<HelperDefinition>,
 }
 
+struct Document {
+    parsed: Arc<ParsedDocument>,
+    import_bindings: Option<HashMap<String, Url>>,
+}
+
+impl Deref for Document {
+    type Target = ParsedDocument;
+
+    fn deref(&self) -> &Self::Target {
+        &self.parsed
+    }
+}
+
 impl Document {
     fn parse_with_cancel(
         uri: Url,
         source: String,
         defines: &[String],
         cancel: &AtomicBool,
+        previous: Option<Arc<ParsedDocument>>,
     ) -> Result<Self, String> {
+        if let Some(previous) = previous.as_ref() {
+            if previous.source.as_ref() == source.as_str() && previous.defines.as_ref() == defines {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("request cancelled".to_string());
+                }
+                return Ok(Self {
+                    parsed: previous.clone(),
+                    import_bindings: None,
+                });
+            }
+        }
         let path = uri
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));
@@ -7966,8 +8021,32 @@ impl Document {
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
         }
-        let (tree, _diagnostics, patches) =
-            parser::parse_file_with_patches(&info, conditionals.projected_source.as_bytes())?;
+        let (tree, _diagnostics, patches, parser_source) = if let Some(previous) = previous.as_ref()
+        {
+            let parsed = parser::parse_file_incremental(
+                &info,
+                conditionals.projected_source.as_bytes(),
+                previous.parser_source.as_ref(),
+                &previous.tree,
+            )?;
+            (
+                parsed.tree,
+                parsed.diagnostics,
+                parsed.patches,
+                parsed.parser_source,
+            )
+        } else {
+            let parsed = parser::parse_file_with_parser_source(
+                &info,
+                conditionals.projected_source.as_bytes(),
+            )?;
+            (
+                parsed.tree,
+                parsed.diagnostics,
+                parsed.patches,
+                parsed.parser_source,
+            )
+        };
         let root = tree.root_node();
         let parser_recovery_spans = collect_parser_recovery_spans(root);
         let opaque_ranges = patches
@@ -8233,8 +8312,14 @@ impl Document {
             }
         }
 
-        Ok(Self {
-            source,
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
+
+        let parsed = Arc::new(ParsedDocument {
+            source: Arc::from(source),
+            parser_source: Arc::from(parser_source.into_boxed_slice()),
+            defines: Arc::from(defines.to_vec().into_boxed_slice()),
             tree,
             parser_recovery_spans,
             unit_name,
@@ -8245,7 +8330,6 @@ impl Document {
             implementation_uses,
             imports,
             unknown_imports,
-            import_bindings: None,
             interface_routine_keys,
             scopes,
             with_contexts,
@@ -8268,6 +8352,10 @@ impl Document {
             exported_symbol_indices,
             interface_member_routine_keys,
             helpers,
+        });
+        Ok(Self {
+            parsed,
+            import_bindings: None,
         })
     }
 
@@ -10894,12 +10982,219 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_document_update_reuses_the_immutable_parsed_model() {
+        let uri = Url::parse("file:///tmp/unchanged-model.pas").expect("fixture URI");
+        let source = "unit UnchangedModel;\ninterface\nimplementation\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("initial document parses");
+        let first = index
+            .documents
+            .get(&uri)
+            .expect("initial document retained")
+            .parsed
+            .clone();
+        index.bind_imports(&uri, std::iter::once(("Provider".to_owned(), uri.clone())));
+
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("unchanged document parses");
+        let second = index
+            .documents
+            .get(&uri)
+            .expect("unchanged document retained");
+
+        assert!(
+            Arc::ptr_eq(&first, &second.parsed),
+            "unchanged source and defines must reuse the parsed model"
+        );
+        assert!(
+            second.import_bindings.is_none(),
+            "reused models must receive fresh per-index import bindings"
+        );
+    }
+
+    #[test]
+    fn changed_document_update_preserves_incremental_tree_reuse_and_fresh_results() {
+        let uri = Url::parse("file:///tmp/incremental-model.pas").expect("fixture URI");
+        let old_source = "unit IncrementalModel;\ninterface\nconst Stable = 1;\nimplementation\nprocedure Use;\nbegin\n  Stable := 2;\nend;\nend.\n";
+        let new_source = "unit IncrementalModel;\ninterface\nconst Stable = 1;\nimplementation\nprocedure Use;\nbegin\n  Stable := 3;\nend;\nend.\n";
+        let mut incremental = NavigationIndex::new();
+        incremental
+            .update(uri.clone(), old_source.to_owned())
+            .expect("old document parses");
+        let stable_id = incremental
+            .documents
+            .get(&uri)
+            .expect("old document retained")
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(5, 6)
+            .expect("stable unit node")
+            .id();
+        incremental
+            .update(uri.clone(), new_source.to_owned())
+            .expect("changed document parses");
+
+        let mut fresh = NavigationIndex::new();
+        fresh
+            .update(uri.clone(), new_source.to_owned())
+            .expect("fresh document parses");
+        let updated = incremental
+            .documents
+            .get(&uri)
+            .expect("updated document retained");
+        let updated_stable_id = updated
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(5, 6)
+            .expect("stable unit node after edit")
+            .id();
+
+        assert_eq!(
+            stable_id, updated_stable_id,
+            "unchanged syntax must be reused"
+        );
+        assert_eq!(
+            incremental
+                .document_symbols(&uri)
+                .expect("incremental symbols"),
+            fresh.document_symbols(&uri).expect("fresh symbols")
+        );
+        let use_offset = new_source.find("Stable := 3").expect("updated use") + 1;
+        let use_position = text::offset_to_position(new_source, use_offset).expect("use position");
+        assert_eq!(
+            incremental.navigate(&uri, use_position, NavigationTarget::Declaration),
+            fresh.navigate(&uri, use_position, NavigationTarget::Declaration),
+            "navigation must match a fresh parse after the edit"
+        );
+    }
+
+    #[test]
+    fn changed_document_update_preserves_assistance_results() {
+        let uri = Url::parse("file:///tmp/incremental-assistance.pas").expect("fixture URI");
+        let old_source = "unit IncrementalAssistance;\ninterface\ntype\n  TThing = class\n    Value: Integer;\n    procedure SetValue(AValue: Integer);\n  end;\nimplementation\nprocedure TThing.SetValue(AValue: Integer);\nbegin\n  Value := AValue;\nend;\nprocedure Use;\nvar\n  Thing: TThing;\nbegin\n  Thing.Val;\n  Thing.SetValue(1);\nend;\nend.\n";
+        let new_source = "unit IncrementalAssistance;\ninterface\ntype\n  TThing = class\n    Value: Integer;\n    procedure SetValue(AValue: Integer);\n  end;\nimplementation\nconst Added = 1;\nprocedure TThing.SetValue(AValue: Integer);\nbegin\n  Value := AValue + 1;\nend;\nprocedure Use;\nvar\n  Thing: TThing;\nbegin\n  Thing.Val;\n  Thing.SetValue(2);\nend;\nend.\n";
+        let mut incremental = NavigationIndex::new();
+        incremental
+            .update(uri.clone(), old_source.to_owned())
+            .expect("old assistance source parses");
+        incremental
+            .update(uri.clone(), new_source.to_owned())
+            .expect("changed assistance source parses");
+
+        let mut fresh = NavigationIndex::new();
+        fresh
+            .update(uri.clone(), new_source.to_owned())
+            .expect("fresh assistance source parses");
+
+        let completion_position = text::offset_to_position(
+            new_source,
+            new_source.find("Thing.Val").expect("completion expression") + "Thing.Val".len(),
+        )
+        .expect("completion position");
+        assert_eq!(
+            incremental.completion(&uri, completion_position),
+            fresh.completion(&uri, completion_position),
+            "completion must match a fresh parse after the edit"
+        );
+
+        let value_position = text::offset_to_position(
+            new_source,
+            new_source.find("Thing.Val").expect("hover expression") + "Thing.".len() + 1,
+        )
+        .expect("hover position");
+        assert_eq!(
+            incremental.hover(&uri, value_position),
+            fresh.hover(&uri, value_position),
+            "hover must match a fresh parse after the edit"
+        );
+
+        let signature_position = text::offset_to_position(
+            new_source,
+            new_source.find("Thing.SetValue(2").expect("signature call") + "Thing.SetValue(2".len(),
+        )
+        .expect("signature position");
+        assert_eq!(
+            incremental.signature_help(&uri, signature_position),
+            fresh.signature_help(&uri, signature_position),
+            "signature help must match a fresh parse after the edit"
+        );
+    }
+
+    #[test]
+    fn changed_effective_defines_rebuild_the_parsed_model() {
+        let uri = Url::parse("file:///tmp/define-model.pas").expect("fixture URI");
+        let source = "unit DefineModel;\ninterface\n{$IFDEF FEATURE}\nconst Enabled = 1;\n{$ENDIF}\nimplementation\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_defines(uri.clone(), source.to_owned(), &[])
+            .expect("document without feature parses");
+        let without_feature = index
+            .documents
+            .get(&uri)
+            .expect("document without feature retained")
+            .parsed
+            .clone();
+        let hidden_index = without_feature
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name.eq_ignore_ascii_case("Enabled"))
+            .expect("conditional symbol is retained for unknown-state handling");
+        assert!(without_feature.conditional_unknown_symbols[hidden_index]);
+
+        index
+            .update_with_defines(uri.clone(), source.to_owned(), &["FEATURE".to_owned()])
+            .expect("document with feature parses");
+        let with_feature = index
+            .documents
+            .get(&uri)
+            .expect("document with feature retained")
+            .parsed
+            .clone();
+
+        assert!(
+            !Arc::ptr_eq(&without_feature, &with_feature),
+            "a define change must invalidate the semantic model"
+        );
+        let enabled_index = with_feature
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name.eq_ignore_ascii_case("Enabled"))
+            .expect("conditional symbol with feature");
+        assert!(!with_feature.conditional_unknown_symbols[enabled_index]);
+    }
+
+    #[test]
+    fn cancelled_update_does_not_publish_a_parsed_cache_entry() {
+        let uri = Url::parse("file:///tmp/cancelled-model.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        let cancel = AtomicBool::new(true);
+
+        let error = index
+            .update_with_defines_with_cancel(
+                uri.clone(),
+                "unit CancelledModel;\ninterface\nimplementation\nend.\n".to_owned(),
+                &[],
+                &cancel,
+            )
+            .expect_err("cancelled parse must fail");
+
+        assert_eq!(error, "request cancelled");
+        assert!(
+            !index.contains(&uri),
+            "cancelled work must not publish a document"
+        );
+    }
+
+    #[test]
     fn budgeted_uses_lookup_charges_ast_traversal_before_identifier_materialization() {
         let source =
             "unit UsesBudgetConsumer;\ninterface\nuses BudgetProvider;\nimplementation\nend.\n";
         let uri = Url::parse("file:///tmp/uses-budget-consumer.pas").expect("fixture URI");
         let cancel = AtomicBool::new(false);
-        let document = Document::parse_with_cancel(uri, source.to_owned(), &[], &cancel)
+        let document = Document::parse_with_cancel(uri, source.to_owned(), &[], &cancel, None)
             .expect("uses-budget fixture parses");
         let module_name = collect_nodes_matching(document.tree.root_node(), "moduleName")
             .into_iter()
@@ -10932,7 +11227,7 @@ mod tests {
         );
         let uri = Url::parse("file:///tmp/wide-uses-budget.pas").expect("fixture URI");
         let cancel = AtomicBool::new(false);
-        let document = Document::parse_with_cancel(uri, source, &[], &cancel)
+        let document = Document::parse_with_cancel(uri, source, &[], &cancel, None)
             .expect("wide uses fixture parses");
         let module_name = collect_nodes_matching(document.tree.root_node(), "moduleName")
             .into_iter()

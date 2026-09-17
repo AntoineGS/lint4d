@@ -500,6 +500,27 @@ revalidated on demand for the requested source and dependencies it traverses,
 and watcher events are supported but not required. Navigation does not
 globally rescan a large workspace on each request.
 
+### Incremental parsing and cached documents
+
+After the first parse, a changed document computes one conservative byte and
+`Point` edit and gives tree-sitter an edited copy of the previous tree. The
+parser input is the exact offset-preserving result of conditional and compiler
+directive preprocessing, so parser diagnostics and directive patches retain
+source coordinates. If the previous tree extent is not trusted, or a rewrite
+cannot preserve byte offsets, the document is parsed from scratch. Opaque
+`{$IF ...}{$IFEND}` bodies are checked again after an edit even when the
+incremental tree itself reports no syntax error.
+
+Semantic extraction is still rebuilt for changed source or effective project
+defines; this is not a fine-grained incremental compiler. When source,
+effective defines, and the complete project context are unchanged, the
+immutable parsed document is reused. Import bindings remain per-index state
+and are rebuilt rather than shared. Background snapshots receive only the
+bounded set of documents retained by the workspace's `maxFiles` and source-byte
+limits, and reuse a cached model only after exact source/context checks. Open
+overlay text, disk reloads, project changes, and evictions therefore invalidate
+or bypass the reusable model safely.
+
 ## Symbols, References and Highlights
 
 The server advertises the four standard query capabilities

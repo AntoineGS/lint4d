@@ -2,9 +2,8 @@ use crate::directive_fragment_rewrite::{
     DirectivePatch, rewrite_opaque_if_blocks, rewrite_partial_control_flow,
 };
 use crate::types::{Diagnostic, FileInfo, Severity};
-use std::borrow::Cow;
 use std::cell::RefCell;
-use tree_sitter::Parser;
+use tree_sitter::{InputEdit, Parser, Point, Tree};
 
 thread_local! {
     pub(crate) static PARSER: RefCell<Parser> = RefCell::new({
@@ -37,31 +36,155 @@ pub fn parse_file(
 ///
 /// Callers that don't need patches should use [`parse_file`] instead.
 pub fn parse_file_with_patches(
-    _info: &FileInfo,
+    info: &FileInfo,
     source: &[u8],
 ) -> Result<(tree_sitter::Tree, Vec<Diagnostic>, Vec<DirectivePatch>), String> {
+    let parsed = parse_file_with_parser_source(info, source)?;
+    Ok((parsed.tree, parsed.diagnostics, parsed.patches))
+}
+
+/// Parse Delphi source and also return the exact rewritten bytes consumed by
+/// tree-sitter.
+///
+/// Most callers should use [`parse_file_with_patches`]. This variant is for a
+/// caller retaining parse state for a later [`parse_file_incremental`] call.
+pub fn parse_file_with_parser_source(
+    _info: &FileInfo,
+    source: &[u8],
+) -> Result<ParseWithParserSourceResult, String> {
+    let parsed = parse_fresh(source)?;
+    Ok(ParseWithParserSourceResult {
+        tree: parsed.tree,
+        diagnostics: parsed.diagnostics,
+        patches: parsed.patches,
+        parser_source: parsed.parser_source,
+    })
+}
+
+/// A fresh parse together with the rewritten bytes consumed by tree-sitter.
+#[derive(Debug)]
+pub struct ParseWithParserSourceResult {
+    pub tree: Tree,
+    pub diagnostics: Vec<Diagnostic>,
+    pub patches: Vec<DirectivePatch>,
+    pub parser_source: Vec<u8>,
+}
+
+/// The result of an incremental parse.
+///
+/// `parser_source` is the exact byte sequence consumed by tree-sitter after
+/// the offset-preserving directive rewrites. Keeping it beside the tree lets a
+/// caller describe the next edit in the same coordinate space without sharing
+/// a mutable parser or mutating the published tree.
+#[derive(Debug)]
+pub struct IncrementalParseResult {
+    pub tree: Tree,
+    pub diagnostics: Vec<Diagnostic>,
+    pub patches: Vec<DirectivePatch>,
+    pub parser_source: Vec<u8>,
+    /// Whether the caller-provided old tree was passed to tree-sitter. This is
+    /// useful to instrument callers and tests; it does not claim that every
+    /// node was reused by the parser.
+    pub used_old_tree: bool,
+}
+
+/// Incrementally parse `source` using an old tree and the exact parser bytes
+/// that produced that tree.
+///
+/// The source passed here is the same source accepted by
+/// [`parse_file_with_patches`]. The old parser source may differ from it: the
+/// function computes one conservative [`InputEdit`] after applying the same
+/// directive rewrites to the new source. That keeps byte and `Point`
+/// coordinates correct even when a changed edit crosses a rewritten region.
+/// If the old tree's extent or a rewrite length invariant is not trustworthy,
+/// this function falls back to a fresh parse rather than publishing an unsafe
+/// incremental result.
+pub fn parse_file_incremental(
+    _info: &FileInfo,
+    source: &[u8],
+    old_parser_source: &[u8],
+    old_tree: &Tree,
+) -> Result<IncrementalParseResult, String> {
+    let (phase1_source, mut patches) = rewrite_partial_control_flow(source);
+    let phase1_source = phase1_source.into_owned();
+    if phase1_source.len() != source.len() {
+        let parsed = parse_fresh(source)?;
+        return Ok(IncrementalParseResult {
+            tree: parsed.tree,
+            diagnostics: parsed.diagnostics,
+            patches: parsed.patches,
+            parser_source: parsed.parser_source,
+            used_old_tree: false,
+        });
+    }
+    let mut used_old_tree = false;
+
+    let mut tree = match incremental_parse_candidate(&phase1_source, old_parser_source, old_tree) {
+        Some((tree, reused)) => {
+            used_old_tree = reused;
+            tree
+        }
+        None => parse_bytes(&phase1_source, None)?,
+    };
+    let mut parser_source = phase1_source;
+
+    // Phase 2 — opaque-{$IF} rewrite (Bucket F). Unlike the fresh path, probe
+    // this pass even when the incremental tree reports no error: an edited old
+    // tree can retain a clean shape for a newly-invalid opaque body. Applying
+    // the same offset-preserving rewrite keeps that stale-tree case correct.
+    let (phase2_source, patches_f) = rewrite_opaque_if_blocks(&parser_source);
+    if !patches_f.is_empty() {
+        let phase2_source = phase2_source.into_owned();
+        if phase2_source.len() != parser_source.len() {
+            let parsed = parse_fresh(source)?;
+            return Ok(IncrementalParseResult {
+                tree: parsed.tree,
+                diagnostics: parsed.diagnostics,
+                patches: parsed.patches,
+                parser_source: parsed.parser_source,
+                used_old_tree: false,
+            });
+        }
+        let phase2_tree = incremental_parse_candidate(&phase2_source, &parser_source, &tree)
+            .map(|(tree, _)| tree)
+            .or_else(|| parse_bytes(&phase2_source, None).ok())
+            .ok_or_else(|| "parser returned no tree".to_string())?;
+        tree = phase2_tree;
+        parser_source = phase2_source;
+        patches.extend(patches_f);
+    }
+
+    let diagnostics = collect_parse_errors(&tree, source);
+    Ok(IncrementalParseResult {
+        tree,
+        diagnostics,
+        patches,
+        parser_source,
+        used_old_tree,
+    })
+}
+
+#[derive(Debug)]
+struct FreshParseResult {
+    tree: Tree,
+    diagnostics: Vec<Diagnostic>,
+    patches: Vec<DirectivePatch>,
+    parser_source: Vec<u8>,
+}
+
+fn parse_fresh(source: &[u8]) -> Result<FreshParseResult, String> {
     // Phase 1 — always-on partial-control-flow rewrite (Bucket C).
     let (phase1_source, mut patches) = rewrite_partial_control_flow(source);
-
-    let mut tree = PARSER
-        .with(|parser| {
-            let mut parser = parser.borrow_mut();
-            parser.parse(&*phase1_source, None)
-        })
-        .ok_or_else(|| "parser returned no tree".to_string())?;
+    let mut parser_source = phase1_source.clone().into_owned();
+    let mut tree = parse_bytes(&phase1_source, None)?;
 
     // Phase 2 — lazy opaque-{$IF} rewrite (Bucket F). Runs only when the
     // Phase 1 tree still has real errors.
     if has_real_error(tree.root_node()) {
         let (phase2_source, patches_f) = rewrite_opaque_if_blocks(&phase1_source);
         if !patches_f.is_empty() {
-            let phase2_owned: Cow<[u8]> = Cow::Owned(phase2_source.into_owned());
-            tree = PARSER
-                .with(|parser| {
-                    let mut parser = parser.borrow_mut();
-                    parser.parse(&*phase2_owned, None)
-                })
-                .ok_or_else(|| "parser returned no tree".to_string())?;
+            parser_source = phase2_source.clone().into_owned();
+            tree = parse_bytes(&phase2_source, None)?;
             patches.extend(patches_f);
         }
     }
@@ -70,7 +193,78 @@ pub fn parse_file_with_patches(
     // messages show the original bytes, not the whitespaced rewrites.
     // Both rewriters preserve byte offsets, so positions stay valid.
     let diagnostics = collect_parse_errors(&tree, source);
-    Ok((tree, diagnostics, patches))
+    Ok(FreshParseResult {
+        tree,
+        diagnostics,
+        patches,
+        parser_source,
+    })
+}
+
+fn parse_bytes(source: &[u8], old_tree: Option<&Tree>) -> Result<Tree, String> {
+    PARSER
+        .with(|parser| parser.borrow_mut().parse(source, old_tree))
+        .ok_or_else(|| "parser returned no tree".to_string())
+}
+
+fn incremental_parse_candidate(
+    new_source: &[u8],
+    old_source: &[u8],
+    old_tree: &Tree,
+) -> Option<(Tree, bool)> {
+    if old_tree.root_node().end_byte() != old_source.len() {
+        return None;
+    }
+    let mut edited_tree = old_tree.clone();
+    if let Some(edit) = input_edit(old_source, new_source) {
+        edited_tree.edit(&edit);
+    }
+    parse_bytes(new_source, Some(&edited_tree))
+        .ok()
+        .map(|tree| (tree, true))
+}
+
+fn input_edit(old_source: &[u8], new_source: &[u8]) -> Option<InputEdit> {
+    if old_source == new_source {
+        return None;
+    }
+
+    let mut start = 0;
+    let common_prefix = old_source.len().min(new_source.len());
+    while start < common_prefix && old_source[start] == new_source[start] {
+        start += 1;
+    }
+
+    let mut old_end = old_source.len();
+    let mut new_end = new_source.len();
+    while old_end > start && new_end > start && old_source[old_end - 1] == new_source[new_end - 1] {
+        old_end -= 1;
+        new_end -= 1;
+    }
+
+    Some(InputEdit {
+        start_byte: start,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_position: point_at(old_source, start),
+        old_end_position: point_at(old_source, old_end),
+        new_end_position: point_at(new_source, new_end),
+    })
+}
+
+fn point_at(source: &[u8], byte: usize) -> Point {
+    let mut row = 0;
+    let mut line_start = 0;
+    for (index, value) in source[..byte].iter().enumerate() {
+        if *value == b'\n' {
+            row += 1;
+            line_start = index + 1;
+        }
+    }
+    Point {
+        row,
+        column: byte - line_start,
+    }
 }
 
 /// Walk the tree and emit a `Diagnostic` for every ERROR or MISSING node.
@@ -260,5 +454,168 @@ mod parse_with_patches_tests {
         let (_tree, diags, patches) = parse_file_with_patches(&info(), src).expect("parse ok");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
         assert!(patches.is_empty(), "expected no patches, got {patches:?}");
+    }
+
+    #[test]
+    fn incremental_parse_reuses_old_tree_for_an_unchanged_prefix() {
+        let old_source = b"unit X;\ninterface\nconst Stable = 1;\nimplementation\nprocedure Changed;\nbegin\n  Stable := 2;\nend;\nend.\n";
+        let new_source = b"unit X;\ninterface\nconst Stable = 1;\nimplementation\nprocedure Changed;\nbegin\n  Stable := 3;\nend;\nend.\n";
+        let (old_tree, _, _) = parse_file_with_patches(&info(), old_source).expect("old parse");
+        let fresh = parse_file_with_patches(&info(), new_source).expect("fresh parse");
+        let incremental = parse_file_incremental(&info(), new_source, old_source, &old_tree)
+            .expect("incremental parse");
+
+        assert!(
+            incremental.used_old_tree,
+            "the old tree must reach tree-sitter"
+        );
+        assert_eq!(
+            incremental.tree.root_node().to_sexp(),
+            fresh.0.root_node().to_sexp(),
+            "incremental and fresh trees must be structurally equivalent"
+        );
+        assert_eq!(
+            format!("{:?}", incremental.diagnostics),
+            format!("{:?}", fresh.1),
+            "incremental and fresh diagnostics must match"
+        );
+        assert_eq!(incremental.patches, fresh.2);
+
+        let old_stable = old_tree
+            .root_node()
+            .named_descendant_for_byte_range(5, 6)
+            .expect("stable prefix node in old tree");
+        let incremental_stable = incremental
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(5, 6)
+            .expect("stable prefix node in incremental tree");
+        assert_eq!(
+            old_stable.id(),
+            incremental_stable.id(),
+            "an unchanged prefix node should be reused rather than rebuilt"
+        );
+    }
+
+    #[test]
+    fn incremental_parse_preserves_unicode_crlf_and_directive_coordinates() {
+        let old_source = b"unit X;\r\ninterface\r\n// stable \xF0\x9F\x98\x80\r\nconst Stable = 1;\r\nimplementation\r\nif Ready then\r\n{$IFDEF FEATURE}\r\n  DoThing;\r\n{$ENDIF}\r\nend.\r\n";
+        let new_source = b"unit X;\r\ninterface\r\n// stable \xF0\x9F\x98\x80\r\nconst Stable = 2;\r\nimplementation\r\nif Ready then\r\n{$IFDEF FEATURE}\r\n  DoThing;\r\n{$ENDIF}\r\nend.\r\n";
+        let (old_tree, _, old_patches) =
+            parse_file_with_patches(&info(), old_source).expect("old parse");
+        let fresh = parse_file_with_patches(&info(), new_source).expect("fresh parse");
+        let incremental = parse_file_incremental(&info(), new_source, old_source, &old_tree)
+            .expect("incremental parse");
+
+        assert!(incremental.used_old_tree);
+        assert_eq!(
+            incremental.tree.root_node().to_sexp(),
+            fresh.0.root_node().to_sexp()
+        );
+        assert_eq!(
+            format!("{:?}", incremental.diagnostics),
+            format!("{:?}", fresh.1)
+        );
+        assert_eq!(incremental.patches, fresh.2);
+        assert_eq!(old_patches, incremental.patches);
+        let old_stable = old_tree
+            .root_node()
+            .named_descendant_for_byte_range(5, 6)
+            .expect("stable unit node in old tree");
+        let new_stable = incremental
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(5, 6)
+            .expect("stable unit node in new tree");
+        assert_eq!(old_stable.id(), new_stable.id());
+    }
+
+    #[test]
+    fn incremental_parse_reuses_state_across_the_opaque_directive_fallback() {
+        let old_source = b"unit X;\ninterface\nimplementation\n{$IF DEFINED(X)}\nrappel: developper en 32 bits pour plus de stabilite\n{$IFEND}\nconst Stable = 1;\nend.\n";
+        let new_source = b"unit X;\ninterface\nimplementation\n{$IF DEFINED(X)}\nrappel: developper en 32 bits pour plus de stabilite\n{$IFEND}\nconst Stable = 2;\nend.\n";
+        let (old_tree, _, old_patches) =
+            parse_file_with_patches(&info(), old_source).expect("old parse");
+        assert!(
+            old_patches
+                .iter()
+                .any(|patch| matches!(patch, DirectivePatch::OpaqueBlock(_)))
+        );
+        let fresh = parse_file_with_patches(&info(), new_source).expect("fresh parse");
+        let incremental = parse_file_incremental(&info(), new_source, old_source, &old_tree)
+            .expect("incremental parse");
+
+        assert!(incremental.used_old_tree);
+        assert_eq!(
+            incremental.tree.root_node().to_sexp(),
+            fresh.0.root_node().to_sexp()
+        );
+        assert_eq!(incremental.patches, fresh.2);
+    }
+
+    #[test]
+    fn incremental_parse_falls_back_when_old_tree_extent_is_untrusted() {
+        let old_source = b"unit X;\ninterface\nimplementation\nend.\n";
+        let new_source = b"unit X;\ninterface\nimplementation\nconst Added = 1;\nend.\n";
+        let (old_tree, _, _) = parse_file_with_patches(&info(), old_source).expect("old parse");
+        let fresh = parse_file_with_patches(&info(), new_source).expect("fresh parse");
+        let incremental =
+            parse_file_incremental(&info(), new_source, b"not-the-old-parser-source", &old_tree)
+                .expect("fallback parse");
+
+        assert!(!incremental.used_old_tree);
+        assert_eq!(
+            incremental.tree.root_node().to_sexp(),
+            fresh.0.root_node().to_sexp()
+        );
+        assert_eq!(incremental.patches, fresh.2);
+    }
+
+    #[test]
+    fn incremental_parse_matches_fresh_across_insert_delete_and_repair_sequences() {
+        let sources: &[&[u8]] = &[
+            b"unit X;\ninterface\nconst Stable = 1;\nimplementation\nprocedure Changed;\nbegin\n  Stable := 2;\nend;\nend.\n",
+            b"unit X;\ninterface\nconst Stable = 1;\nconst Inserted = 8;\nimplementation\nprocedure Changed;\nbegin\n  Stable := 2;\nend;\nend.\n",
+            b"unit X;\ninterface\nconst Stable = 1;\nimplementation\nprocedure Changed;\nbegin\n  Stable := 20;\nend;\nend.\n",
+            b"unit X;\ninterface\nconst Stable = 1;\nimplementation\nprocedure Changed;\nvar\n  Local: Integer;\nbegin\n  Local := 3;\n  Stable :=\n    Local + 1;\nend;\nend.\n",
+            b"unit X;\ninterface\nconst Stable = ;\nimplementation\nprocedure Changed;\nbegin\n  Stable :=\n    Local + 1;\nend;\nend.\n",
+            b"unit X;\ninterface\nconst Stable = 4;\nimplementation\nprocedure Changed;\nvar\n  Local: Integer;\nbegin\n  Local := 3;\n  Stable :=\n    Local + 1;\nend;\nend.\n",
+        ];
+        let initial = parse_file_with_parser_source(&info(), sources[0]).expect("initial parse");
+        let mut old_tree = initial.tree;
+        let mut old_parser_source = initial.parser_source;
+
+        for (step, source) in sources.iter().enumerate().skip(1) {
+            let fresh = parse_file_with_parser_source(&info(), source).expect("fresh parse");
+            let incremental =
+                parse_file_incremental(&info(), source, &old_parser_source, &old_tree)
+                    .expect("incremental parse");
+
+            assert!(
+                incremental.used_old_tree,
+                "step {step} should use the old tree"
+            );
+            assert_eq!(
+                incremental.tree.root_node().to_sexp(),
+                fresh.tree.root_node().to_sexp(),
+                "step {step} tree differs from a fresh parse"
+            );
+            assert_eq!(
+                format!("{:?}", incremental.diagnostics),
+                format!("{:?}", fresh.diagnostics),
+                "step {step} diagnostics differ from a fresh parse"
+            );
+            assert_eq!(
+                incremental.patches, fresh.patches,
+                "step {step} patches differ"
+            );
+            assert_eq!(
+                incremental.parser_source, fresh.parser_source,
+                "step {step} parser input differs"
+            );
+
+            old_tree = incremental.tree;
+            old_parser_source = incremental.parser_source;
+        }
     }
 }

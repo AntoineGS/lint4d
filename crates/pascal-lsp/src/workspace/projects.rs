@@ -244,6 +244,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.index = NavigationIndex::new();
+        self.cached_documents.clear();
         self.indexed_files.clear();
         self.indexed_sizes.clear();
         self.indexed_bytes = 0;

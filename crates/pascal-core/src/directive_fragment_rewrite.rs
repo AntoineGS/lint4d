@@ -663,17 +663,19 @@ mod tests {
         // where the directive markers were.
         assert_eq!(rewritten.len(), src.len());
         let rewritten_bytes = rewritten.into_owned();
-        for i in p.opening_start..p.opening_end {
-            assert_eq!(
-                rewritten_bytes[i], b' ',
-                "opening marker byte at {i} must be space"
-            );
+        for (offset, byte) in rewritten_bytes[p.opening_start..p.opening_end]
+            .iter()
+            .enumerate()
+        {
+            let i = p.opening_start + offset;
+            assert_eq!(*byte, b' ', "opening marker byte at {i} must be space");
         }
-        for i in p.closing_start..p.closing_end {
-            assert_eq!(
-                rewritten_bytes[i], b' ',
-                "closing marker byte at {i} must be space"
-            );
+        for (offset, byte) in rewritten_bytes[p.closing_start..p.closing_end]
+            .iter()
+            .enumerate()
+        {
+            let i = p.closing_start + offset;
+            assert_eq!(*byte, b' ', "closing marker byte at {i} must be space");
         }
         // Content between markers (` if cond then `) is preserved.
         let inner_start = p.opening_end;
@@ -986,10 +988,10 @@ mod tests {
         // in the opaque span.
         let rewritten = opaque_rewritten_of(src);
         assert_eq!(rewritten.len(), src.len());
-        for i in o.start..o.end {
-            let b = rewritten[i];
+        for (offset, b) in rewritten[o.start..o.end].iter().enumerate() {
+            let i = o.start + offset;
             assert!(
-                b == b' ' || b == b'\n' || b == b'\r',
+                *b == b' ' || *b == b'\n' || *b == b'\r',
                 "rewritten byte at {i} must be space or newline, got {b:?}"
             );
         }

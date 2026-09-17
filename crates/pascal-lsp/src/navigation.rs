@@ -21,6 +21,9 @@ mod rename;
 mod selection;
 mod semantic_tokens;
 mod symbols;
+#[cfg(test)]
+pub(crate) use assistance::CompletionResolutionSeed;
+pub(crate) use assistance::{CompletionMetadata, CompletionOptions, CompletionResult};
 pub(crate) use folding::{
     FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
 };

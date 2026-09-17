@@ -53,7 +53,7 @@ fn record_assistance_helper_entry(counter: &'static std::thread::LocalKey<Cell<u
 struct CompletionAccumulator<'a> {
     prefix: String,
     completion_is_declaration: bool,
-    candidates: HashMap<String, (Candidate, usize)>,
+    candidates: HashMap<String, (CompletionCandidate, usize)>,
     inaccessible: HashMap<String, usize>,
     uncertain: HashMap<String, usize>,
     scanned: usize,
@@ -111,7 +111,13 @@ impl<'a> CompletionAccumulator<'a> {
         Ok(true)
     }
 
-    fn insert(&mut self, candidate: Candidate, symbol: &Symbol, precedence: usize) {
+    fn insert(
+        &mut self,
+        candidate: Candidate,
+        substitution: Option<&GenericSubstitution>,
+        symbol: &Symbol,
+        precedence: usize,
+    ) {
         if let Some(inaccessible_precedence) = self.inaccessible.get(&symbol.key).copied() {
             if inaccessible_precedence < precedence {
                 return;
@@ -129,8 +135,16 @@ impl<'a> CompletionAccumulator<'a> {
             .get(&symbol.key)
             .is_none_or(|(_, current_precedence)| precedence < *current_precedence);
         if replace {
-            self.candidates
-                .insert(symbol.key.clone(), (candidate, precedence));
+            self.candidates.insert(
+                symbol.key.clone(),
+                (
+                    CompletionCandidate {
+                        candidate,
+                        substitution: substitution.cloned(),
+                    },
+                    precedence,
+                ),
+            );
         }
     }
 
@@ -188,10 +202,71 @@ pub(crate) struct DeclarationDisplay {
     pub(crate) documentation: Option<Arc<documentation::Documentation>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionOptions {
+    pub(crate) format: MarkupKind,
+    pub(crate) defer_documentation: bool,
+    pub(crate) defer_detail: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionResult {
+    pub(crate) list: CompletionList,
+    pub(crate) seeds: Vec<CompletionResolutionSeed>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionResolutionSeed {
+    candidate: Candidate,
+    substitution: Option<GenericSubstitution>,
+}
+
+impl CompletionResolutionSeed {
+    #[cfg(test)]
+    pub(crate) fn test_new(uri: Url, index: usize) -> Self {
+        Self {
+            candidate: Candidate { uri, index },
+            substitution: None,
+        }
+    }
+
+    pub(crate) fn candidate_uri(&self) -> &Url {
+        &self.candidate.uri
+    }
+
+    pub(crate) fn candidate_index(&self) -> usize {
+        self.candidate.index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_substitution(&self) -> bool {
+        self.substitution.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionMetadata {
+    pub(crate) detail: Option<String>,
+    pub(crate) documentation: Option<LspDocumentation>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionCandidate {
+    candidate: Candidate,
+    substitution: Option<GenericSubstitution>,
+}
+
 struct SpecializedRoutineSignature {
     label: String,
     label_start: usize,
     parameter_spans: Vec<Span>,
+}
+
+fn empty_completion_result() -> CompletionResult {
+    CompletionResult {
+        list: CompletionList::default(),
+        seeds: Vec::new(),
+    }
 }
 
 impl NavigationIndex {
@@ -209,6 +284,27 @@ impl NavigationIndex {
         format: MarkupKind,
         cancel: &AtomicBool,
     ) -> Result<CompletionList, String> {
+        Ok(self
+            .completion_with_cancel_and_options(
+                uri,
+                position,
+                CompletionOptions {
+                    format,
+                    defer_documentation: false,
+                    defer_detail: false,
+                },
+                cancel,
+            )?
+            .list)
+    }
+
+    pub(crate) fn completion_with_cancel_and_options(
+        &self,
+        uri: &Url,
+        position: Position,
+        options: CompletionOptions,
+        cancel: &AtomicBool,
+    ) -> Result<CompletionResult, String> {
         check_cancel(cancel)?;
         let mut budget = AssistanceBudget::new(
             MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
@@ -216,16 +312,19 @@ impl NavigationIndex {
             "completion",
         );
         let Some(document) = self.documents.get(uri) else {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         };
         let Some(offset) = text::position_to_offset(&document.source, position) else {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         };
         let anchor = offset.saturating_sub(1);
         if completion_position_is_conditionally_unknown(document, offset, anchor) {
-            return Ok(CompletionList {
-                is_incomplete: true,
-                items: Vec::new(),
+            return Ok(CompletionResult {
+                list: CompletionList {
+                    is_incomplete: true,
+                    items: Vec::new(),
+                },
+                seeds: Vec::new(),
             });
         }
         if completion_position_is_ignored_with_budget(
@@ -235,7 +334,7 @@ impl NavigationIndex {
             cancel,
             &mut budget,
         )? {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         }
         if unsupported_context_at(
             document,
@@ -245,7 +344,7 @@ impl NavigationIndex {
             MAX_COMPLETION_CONTEXT_NODES,
             "completion",
         )? {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         }
 
         let prefix_start =
@@ -275,7 +374,7 @@ impl NavigationIndex {
             .map_or(offset, |identifier| identifier.end_byte());
         if let Some(identifier) = identifier {
             if unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)? {
-                return Ok(CompletionList::default());
+                return Ok(empty_completion_result());
             }
         }
         let member = member_expression_for_completion(
@@ -287,7 +386,7 @@ impl NavigationIndex {
             &mut budget,
         )?;
         if matches!(member, CompletionMember::Unsupported) {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         }
         let (candidates, mut is_incomplete) = self.completion_candidates(
             uri,
@@ -307,22 +406,43 @@ impl NavigationIndex {
         };
         let response_truncated = candidates.len() > MAX_COMPLETION_ITEMS;
         let mut items = Vec::with_capacity(candidates.len().min(MAX_COMPLETION_ITEMS));
-        for candidate in candidates.into_iter().take(MAX_COMPLETION_ITEMS) {
+        let mut seeds = Vec::with_capacity(candidates.len().min(MAX_COMPLETION_ITEMS));
+        for completion_candidate in candidates.into_iter().take(MAX_COMPLETION_ITEMS) {
             check_cancel(cancel)?;
-            let Some(symbol) = self.symbol(&candidate) else {
+            let candidate = &completion_candidate.candidate;
+            let Some(symbol) = self.symbol(candidate) else {
                 continue;
             };
             budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
-            let documentation = self
-                .documents
-                .get(&candidate.uri)
-                .and_then(|document| document.documentation.get(candidate.index))
-                .and_then(Option::as_ref);
-            let documentation = render_lsp_documentation(documentation, format.clone(), cancel)?;
+            let display = if !options.defer_detail {
+                self.declaration_display(
+                    candidate,
+                    completion_candidate.substitution.as_ref(),
+                    cancel,
+                    &mut budget,
+                )?
+            } else {
+                None
+            };
+            let documentation = if options.defer_documentation {
+                None
+            } else {
+                let documentation = self
+                    .documents
+                    .get(&candidate.uri)
+                    .and_then(|document| document.documentation.get(candidate.index))
+                    .and_then(Option::as_ref);
+                render_lsp_documentation(documentation, options.format.clone(), cancel)?
+            };
             budget.require_bytes(documentation.as_ref().map_or(0, documentation_size), cancel)?;
+            budget.require_bytes(
+                display.as_ref().map_or(0, |display| display.excerpt.len()),
+                cancel,
+            )?;
             items.push(CompletionItem {
                 label: symbol.name.clone(),
                 kind: Some(completion_kind(symbol.kind)),
+                detail: display.map(|display| display.excerpt),
                 documentation,
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                     range,
@@ -330,13 +450,69 @@ impl NavigationIndex {
                 ))),
                 ..CompletionItem::default()
             });
+            seeds.push(CompletionResolutionSeed {
+                candidate: candidate.clone(),
+                substitution: completion_candidate.substitution,
+            });
         }
         if response_truncated {
             is_incomplete = true;
         }
-        Ok(CompletionList {
-            is_incomplete,
-            items,
+        Ok(CompletionResult {
+            list: CompletionList {
+                is_incomplete,
+                items,
+            },
+            seeds,
+        })
+    }
+
+    pub(crate) fn completion_metadata_for_seed(
+        &self,
+        seed: &CompletionResolutionSeed,
+        format: MarkupKind,
+        resolve_documentation: bool,
+        resolve_detail: bool,
+        cancel: &AtomicBool,
+    ) -> Result<CompletionMetadata, String> {
+        check_cancel(cancel)?;
+        let mut budget = AssistanceBudget::new(
+            MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
+            MAX_HOVER_VALUE_BYTES,
+            "completion resolve",
+        );
+        let Some(symbol) = self.symbol(&seed.candidate) else {
+            return Err(
+                "completion declaration disappeared while resolving; retry the request".to_string(),
+            );
+        };
+        budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
+        let detail = if resolve_detail {
+            self.declaration_display(
+                &seed.candidate,
+                seed.substitution.as_ref(),
+                cancel,
+                &mut budget,
+            )?
+            .map(|display| display.excerpt)
+        } else {
+            None
+        };
+        let documentation = if resolve_documentation {
+            let documentation = self
+                .documents
+                .get(&seed.candidate.uri)
+                .and_then(|document| document.documentation.get(seed.candidate.index))
+                .and_then(Option::as_ref);
+            render_lsp_documentation(documentation, format, cancel)?
+        } else {
+            None
+        };
+        budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
+        budget.require_bytes(documentation.as_ref().map_or(0, documentation_size), cancel)?;
+        Ok(CompletionMetadata {
+            detail,
+            documentation,
         })
     }
 
@@ -660,7 +836,7 @@ impl NavigationIndex {
         lookup_identifier: Option<Node<'_>>,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<(Vec<Candidate>, bool), String> {
+    ) -> Result<(Vec<CompletionCandidate>, bool), String> {
         let completion_is_declaration = current_document.symbols.iter().any(|current| {
             current.declaration_ordered
                 && current.span.start <= offset
@@ -978,10 +1154,10 @@ impl NavigationIndex {
         let mut candidates = std::mem::take(&mut accumulator.candidates)
             .into_values()
             .map(|(candidate, _)| candidate)
-            .collect::<Vec<_>>();
+            .collect::<Vec<CompletionCandidate>>();
         candidates.sort_by(|left, right| {
-            let left_symbol = self.symbol(left);
-            let right_symbol = self.symbol(right);
+            let left_symbol = self.symbol(&left.candidate);
+            let right_symbol = self.symbol(&right.candidate);
             left_symbol
                 .map(|symbol| canonical_name(&symbol.name))
                 .cmp(&right_symbol.map(|symbol| canonical_name(&symbol.name)))
@@ -990,8 +1166,13 @@ impl NavigationIndex {
                         .map(|symbol| symbol.name.as_str())
                         .cmp(&right_symbol.map(|symbol| symbol.name.as_str()))
                 })
-                .then_with(|| left.uri.as_str().cmp(right.uri.as_str()))
-                .then_with(|| left.index.cmp(&right.index))
+                .then_with(|| {
+                    left.candidate
+                        .uri
+                        .as_str()
+                        .cmp(right.candidate.uri.as_str())
+                })
+                .then_with(|| left.candidate.index.cmp(&right.candidate.index))
         });
         Ok((candidates, accumulator.is_incomplete))
     }
@@ -1356,12 +1537,13 @@ impl NavigationIndex {
                     routine_keys.insert(key.clone());
                 }
             }
-            self.add_completion_candidate(
+            self.add_completion_candidate_with_substitution(
                 accumulator,
                 Candidate {
                     uri: candidate.uri.clone(),
                     index: candidate.index,
                 },
+                Some(substitution),
                 current_uri,
                 candidate.uri != *current_uri,
                 private_spans,
@@ -1381,6 +1563,32 @@ impl NavigationIndex {
         current_uri: &Url,
         _member_access: bool,
         _private_spans: &mut HashMap<Url, HashSet<Span>>,
+        precedence: usize,
+        offset: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.add_completion_candidate_with_substitution(
+            accumulator,
+            candidate,
+            None,
+            current_uri,
+            _member_access,
+            _private_spans,
+            precedence,
+            offset,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_completion_candidate_with_substitution(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        candidate: Candidate,
+        substitution: Option<&GenericSubstitution>,
+        current_uri: &Url,
+        _member_access: bool,
+        _private_spans: &mut HashMap<Url, HashSet<super::Span>>,
         precedence: usize,
         offset: usize,
         cancel: &AtomicBool,
@@ -1441,7 +1649,7 @@ impl NavigationIndex {
                 return Ok(());
             }
         }
-        accumulator.insert(candidate, symbol, precedence);
+        accumulator.insert(candidate, substitution, symbol, precedence);
         Ok(())
     }
 
@@ -3984,11 +4192,12 @@ fn display_unit_name(document: &Document) -> String {
 mod tests {
     use super::{
         AssistanceBudget, COMPLETION_SYMBOL_VISITS, Candidate, CompletionAccumulator,
-        DeclarationDisplay, MAX_COMPLETION_SCANNED_SYMBOLS, MAX_HOVER_VALUE_BYTES, MarkupKind,
-        NavigationIndex, Origin, PARAMETER_INFORMATION_HELPER_ENTRIES, PARAMETER_UTF16_SCAN_PASSES,
-        ParameterLabel, Region, SOURCE_SCAN_HELPER_ENTRIES, Span, Symbol, SymbolKind,
-        identifier_at_with_budget, named_type_path_for_symbol, parameter_information_with_budget,
-        render_displays, routine_signature_label,
+        CompletionOptions, DeclarationDisplay, MAX_COMPLETION_SCANNED_SYMBOLS,
+        MAX_HOVER_VALUE_BYTES, MarkupKind, NavigationIndex, Origin,
+        PARAMETER_INFORMATION_HELPER_ENTRIES, PARAMETER_UTF16_SCAN_PASSES, ParameterLabel, Region,
+        SOURCE_SCAN_HELPER_ENTRIES, Span, Symbol, SymbolKind, identifier_at_with_budget,
+        named_type_path_for_symbol, parameter_information_with_budget, render_displays,
+        routine_signature_label,
     };
     use crate::navigation::{
         ROOT_SCOPE, RoutineKind, TEST_EXPORTED_INDEX_VECTOR_MATERIALIZATIONS,
@@ -4009,6 +4218,48 @@ mod tests {
             source_start: 0,
             documentation: None,
         }
+    }
+
+    #[test]
+    fn deferred_completion_omits_requested_metadata_before_resolution() {
+        let source = "unit DeferredCompletion;\ninterface\n/// <summary>Returns the value.</summary>\n/// <param name=\"Name\">Lookup name.</param>\nfunction Documented(Name: string): Integer;\nimplementation\nfunction Documented(Name: string): Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  Doc\nend;\nend.\n";
+        let uri = Url::parse("file:///DeferredCompletion.pas").expect("source URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("completion source parses");
+        let position = text::offset_to_position(
+            source,
+            source.find("  Doc").expect("completion prefix") + "  Doc".len(),
+        )
+        .expect("completion position");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let result = index
+            .completion_with_cancel_and_options(
+                &uri,
+                position,
+                CompletionOptions {
+                    format: MarkupKind::Markdown,
+                    defer_documentation: true,
+                    defer_detail: true,
+                },
+                &cancel,
+            )
+            .expect("deferred completion");
+        let item = result
+            .list
+            .items
+            .iter()
+            .find(|item| item.label == "Documented")
+            .expect("documented completion item");
+        assert!(item.documentation.is_none());
+        assert!(item.detail.is_none());
+        assert!(item.text_edit.is_some());
+        assert_eq!(result.seeds.len(), result.list.items.len());
+        let seed = &result.seeds[0];
+        assert_eq!(seed.candidate_uri(), &uri);
+        assert!(seed.candidate_index() < index.documents[&uri].symbols.len());
+        assert!(!seed.has_substitution());
     }
 
     #[test]
@@ -4556,13 +4807,13 @@ mod tests {
         let mut same_scope_budget = AssistanceBudget::new(16, 16, "test");
         let mut same_scope = CompletionAccumulator::new("same", false, &mut same_scope_budget);
         same_scope.mark_uncertain(&symbol.key, 2);
-        same_scope.insert(candidate.clone(), &symbol, 2);
+        same_scope.insert(candidate.clone(), None, &symbol, 2);
         assert!(same_scope.candidates.is_empty());
         assert_eq!(same_scope.uncertain.get(&symbol.key), Some(&2));
 
         let mut shadowed_budget = AssistanceBudget::new(16, 16, "test");
         let mut shadowed = CompletionAccumulator::new("same", false, &mut shadowed_budget);
-        shadowed.insert(candidate, &symbol, 0);
+        shadowed.insert(candidate, None, &symbol, 0);
         shadowed.mark_uncertain(&symbol.key, 1);
         assert!(shadowed.candidates.contains_key(&symbol.key));
         assert!(shadowed.uncertain.is_empty());

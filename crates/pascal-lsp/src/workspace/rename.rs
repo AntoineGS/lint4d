@@ -774,11 +774,11 @@ impl Workspace {
                     record.uri
                 )
             })?;
-            if current.text != record.text
-                || record
-                    .content_hash
-                    .is_some_and(|expected| expected != current.content_hash)
-            {
+            let content_changed = record.content_hash.map_or_else(
+                || current.text != record.text,
+                |expected| expected != current.content_hash,
+            );
+            if content_changed {
                 return Err(format!(
                     "closed source changed while resolving {}; retry the request",
                     record.uri
@@ -848,12 +848,15 @@ pub(crate) fn revalidate_input(
                 record.uri
             )
         })?;
-        if disk_stamp(&path) != record.stamp
-            || current.text != record.text
-            || record
-                .content_hash
-                .is_some_and(|expected| expected != current.content_hash)
-        {
+        let content_changed = record.content_hash.map_or_else(
+            || current.text != record.text,
+            |expected| expected != current.content_hash,
+        );
+        let overlay_changed = input
+            .overlays
+            .get(&record.uri)
+            .is_some_and(|overlay| overlay.text != current.text);
+        if disk_stamp(&path) != record.stamp || content_changed || overlay_changed {
             return Err(format!(
                 "closed source changed while resolving {}; retry the request",
                 record.uri
@@ -981,7 +984,7 @@ fn file_content_hash(
     Ok(super::content_hash_bytes(&bytes))
 }
 
-fn text_content_hash(source: &str) -> u64 {
+pub(crate) fn text_content_hash(source: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
     hasher.finish()
@@ -3115,6 +3118,7 @@ pub(crate) fn build_snapshot(
                 cancel,
                 true,
             )?;
+            record.content_hash = baseline_content_hashes.get(&path_key(&path)).copied();
             record.read_policy = Some(read_policy);
             record.path_entry = Some(path_entry);
         }

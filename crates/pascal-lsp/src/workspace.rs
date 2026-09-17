@@ -4978,7 +4978,7 @@ impl Workspace {
                 if document.version != record.version.unwrap_or_default()
                     || record
                         .content_hash
-                        .is_some_and(|expected| content_hash_bytes(text.as_bytes()) != expected)
+                        .is_some_and(|expected| rename::text_content_hash(text) != expected)
                     || record.content_hash.is_none() && text != record.text
                 {
                     return Err(format!(

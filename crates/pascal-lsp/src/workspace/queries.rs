@@ -4,14 +4,19 @@ use super::rename::{
     WorkspaceInput, build_snapshot, input_source_is_readable_with_owner, is_cancelled,
     owner_for_input, project_context_and_metadata_for_input,
     project_context_and_metadata_for_owner, query_binding_info_for_input,
-    reference_binding_info_for_input, snapshot_records, source_for_input_with_cancel,
-    source_for_input_with_owner,
+    reference_binding_info_for_input, revalidate_input, snapshot_records,
+    source_for_input_with_cancel, source_for_input_with_owner,
 };
-use crate::navigation::{FoldingRangeOptions, SemanticTokenResolutionMode};
+use crate::navigation::{
+    CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions,
+    SemanticTokenResolutionMode,
+};
 use crate::{NavigationIndex, NavigationTarget};
+#[cfg(test)]
+use lsp_types::CompletionList;
 use lsp_types::{
-    CompletionList, DocumentHighlight, DocumentSymbol, FoldingRange, Hover, Location, MarkupKind,
-    Position, Range, SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
+    DocumentHighlight, DocumentSymbol, FoldingRange, Hover, Location, MarkupKind, Position, Range,
+    SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
 use pascal_project::has_invalid_project_selection;
 use std::sync::atomic::AtomicBool;
@@ -101,6 +106,7 @@ pub(crate) fn completion_from_input(
     completion_from_input_with_format(input, uri, position, MarkupKind::Markdown, cancel)
 }
 
+#[cfg(test)]
 pub(crate) fn completion_from_input_with_format(
     input: WorkspaceInput,
     uri: &Url,
@@ -108,6 +114,32 @@ pub(crate) fn completion_from_input_with_format(
     format: MarkupKind,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionList> {
+    let computed = completion_from_input_with_options(
+        input,
+        uri,
+        position,
+        CompletionOptions {
+            format,
+            defer_documentation: false,
+            defer_detail: false,
+        },
+        cancel,
+    );
+    super::rename::Computed {
+        source_generation: computed.source_generation,
+        configuration_generation: computed.configuration_generation,
+        value: computed.value.map(|result| result.list),
+        records: computed.records,
+    }
+}
+
+pub(crate) fn completion_from_input_with_options(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    options: CompletionOptions,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionResult> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = super::canonical_file_uri(uri);
@@ -144,7 +176,113 @@ pub(crate) fn completion_from_input_with_format(
     }
     let value = snapshot
         .index
-        .completion_with_cancel(&uri, position, format, cancel);
+        .completion_with_cancel_and_options(&uri, position, options, cancel);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    with_records(source_generation, configuration_generation, value, records)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn completion_metadata_from_input(
+    input: WorkspaceInput,
+    source_uri: &Url,
+    position: Position,
+    expected_source_generation: u64,
+    expected_configuration_generation: u64,
+    candidate_uri: &Url,
+    candidate_index: usize,
+    format: MarkupKind,
+    resolve_documentation: bool,
+    resolve_detail: bool,
+    original_records: &[super::rename::SourceRecord],
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionMetadata> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    if source_generation < expected_source_generation
+        || configuration_generation < expected_configuration_generation
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "completion resolution snapshot predates the retained completion identity; retry the request"
+                .to_string(),
+        );
+    }
+    if let Err(error) = revalidate_input(&input, original_records, cancel) {
+        return failed(source_generation, configuration_generation, error);
+    }
+    let source_uri = super::canonical_file_uri(source_uri);
+    let candidate_uri = super::canonical_file_uri(candidate_uri);
+    let snapshot = match assistance_snapshot(&input, &source_uri, cancel) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let records = snapshot_records(&snapshot);
+    if let Err(error) = ensure_assistance_ready(&snapshot, &source_uri) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            records,
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let completion = match snapshot.index.completion_with_cancel_and_options(
+        &source_uri,
+        position,
+        CompletionOptions {
+            format: format.clone(),
+            defer_documentation: true,
+            defer_detail: true,
+        },
+        cancel,
+    ) {
+        Ok(completion) => completion,
+        Err(error) => {
+            return with_records(
+                source_generation,
+                configuration_generation,
+                Err(error),
+                records,
+            );
+        }
+    };
+    let mut matching = completion.seeds.iter().filter(|seed| {
+        seed.candidate_uri() == &candidate_uri && seed.candidate_index() == candidate_index
+    });
+    let Some(seed) = matching.next() else {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(
+                "completion declaration is no longer an exact candidate; request completion again"
+                    .to_string(),
+            ),
+            records,
+        );
+    };
+    if matching.next().is_some() {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err("completion declaration became ambiguous; request completion again".to_string()),
+            records,
+        );
+    }
+    let value = snapshot.index.completion_metadata_for_seed(
+        seed,
+        format,
+        resolve_documentation,
+        resolve_detail,
+        cancel,
+    );
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }

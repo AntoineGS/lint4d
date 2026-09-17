@@ -244,6 +244,54 @@ impl ReadPolicy {
         }
     }
 
+    /// Return a conservative estimate of the heap-backed state retained by
+    /// this authorization policy.
+    ///
+    /// Callers that retain policies in bounded request state can use this
+    /// value without exposing the policy's internal authorization roots. The
+    /// estimate intentionally overcounts compiled glob data so a bound may
+    /// reject a large policy early rather than relying on an optimistic
+    /// accounting approximation.
+    pub fn retained_size_hint(&self) -> usize {
+        fn path_bytes(path: &PathBuf) -> usize {
+            std::mem::size_of::<PathBuf>().saturating_add(path.capacity())
+        }
+
+        fn root_bytes(root: &AuthorizedReadRoot) -> usize {
+            std::mem::size_of::<AuthorizedReadRoot>()
+                .saturating_add(path_bytes(&root.path))
+                .saturating_add(
+                    root.pattern_exclusion_bases
+                        .iter()
+                        .map(path_bytes)
+                        .sum::<usize>(),
+                )
+        }
+
+        let configured = self.configured_roots.iter().map(root_bytes).sum::<usize>();
+        let mapped = self.mapped_roots.iter().map(root_bytes).sum::<usize>();
+        let exclusions = self
+            .exclusions
+            .iter()
+            .map(|value| std::mem::size_of::<String>() + value.capacity())
+            .sum::<usize>();
+        let exclusion_bases = self.exclusion_bases.iter().map(path_bytes).sum::<usize>();
+        let compiled_patterns = self
+            .exclusions
+            .iter()
+            .map(String::capacity)
+            .sum::<usize>()
+            .saturating_add(self.exclusions.len().saturating_mul(128))
+            .saturating_mul(4);
+
+        std::mem::size_of::<Self>()
+            .saturating_add(configured)
+            .saturating_add(mapped)
+            .saturating_add(exclusions)
+            .saturating_add(exclusion_bases)
+            .saturating_add(compiled_patterns)
+    }
+
     pub fn allows_location(&self, entry: &ProjectPathEntry) -> bool {
         match &entry.provenance {
             ProjectPathProvenance::LegacyNative => {

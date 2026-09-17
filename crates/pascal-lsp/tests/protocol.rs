@@ -367,6 +367,11 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_completion_resolution_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_COMPLETION_RESOLUTION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_barrier(environment: TempDir, variable: &str) -> (Self, TestBarrier) {
         let barrier_directory = environment.path().join("analysis-barrier");
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
@@ -813,6 +818,42 @@ impl TestServer {
                         "workspaceFolders": true,
                         "workspaceEdit": {"documentChanges": true}
                     }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    fn initialize_with_completion_resolve_properties(
+        &mut self,
+        root: &Path,
+        properties: Value,
+        documentation_formats: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": null,
+                "capabilities": {
+                    "general": {"positionEncodings": ["utf-16"]},
+                    "textDocument": {
+                        "synchronization": {"dynamicRegistration": false, "didSave": true},
+                        "completion": {
+                            "completionItem": {
+                                "documentationFormat": documentation_formats,
+                                "resolveSupport": {"properties": properties}
+                            }
+                        }
+                    },
+                    "workspace": {"workspaceFolders": true}
                 }
             }),
         );
@@ -3520,10 +3561,548 @@ fn initialize_advertises_standard_completion_and_signature_help() {
         capabilities["completionProvider"]["triggerCharacters"],
         json!(["."])
     );
+    assert_eq!(capabilities["completionProvider"]["resolveProvider"], true);
     assert_eq!(
         capabilities["signatureHelpProvider"]["triggerCharacters"],
         json!(["(", ","])
     );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_defers_negotiated_fields_and_restores_stable_item() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeferredCompletion.pas");
+    let source = "unit DeferredCompletion;\ninterface\n/// <summary>Returns the value.</summary>\n/// <param name=\"Name\">Lookup name.</param>\nfunction Documented(Name: string): Integer;\nimplementation\nfunction Documented(Name: string): Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  Doc\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut eager_server = TestServer::launch();
+    let eager_initialize = eager_server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    assert_eq!(
+        eager_initialize["capabilities"]["completionProvider"]["resolveProvider"],
+        true
+    );
+    let eager_id = RequestId::from("completion-eager".to_string());
+    eager_server.send_request(
+        eager_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Doc", 0)
+        }),
+    );
+    let eager = eager_server.response(&eager_id);
+    assert!(eager.error.is_none(), "eager completion failed: {eager:?}");
+    let eager_item = eager.result.expect("eager completion result")["items"]
+        .as_array()
+        .expect("eager completion items")
+        .iter()
+        .find(|item| item["label"] == "Documented")
+        .cloned()
+        .expect("eager documented item");
+    assert!(eager_item["documentation"].is_string());
+    assert!(
+        eager_item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Documented"))
+    );
+    assert!(eager_item["data"].is_null());
+    eager_server.shutdown();
+
+    let mut deferred_server = TestServer::launch();
+    let initialize = deferred_server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown", "plaintext"]),
+    );
+    assert_eq!(
+        initialize["capabilities"]["completionProvider"]["resolveProvider"],
+        true
+    );
+    let request_id = RequestId::from("completion-deferred".to_string());
+    deferred_server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Doc", 0)
+        }),
+    );
+    let response = deferred_server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "deferred completion failed: {response:?}"
+    );
+    let initial = response.result.expect("deferred completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("deferred completion items")
+        .iter()
+        .find(|item| item["label"] == "Documented")
+        .cloned()
+        .expect("deferred documented item");
+    assert!(item["documentation"].is_null());
+    assert!(item["detail"].is_null());
+    assert!(item["data"].is_object());
+    let original_edit = item["textEdit"].clone();
+    let original_kind = item["kind"].clone();
+    let original_insert_text = item["insertText"].clone();
+    let original_filter_text = item["filterText"].clone();
+    let original_additional_edits = item["additionalTextEdits"].clone();
+    let mut resolve_item = item.clone();
+    resolve_item["label"] = json!("ForgedLabel");
+    resolve_item["detail"] = json!("Forged detail");
+    resolve_item["textEdit"]["newText"] = json!("FORGED_EDIT");
+    resolve_item["sortText"] = json!("forged-sort");
+    resolve_item["kind"] = json!(1);
+    resolve_item["insertText"] = json!("FORGED_INSERT");
+    resolve_item["filterText"] = json!("forged-filter");
+    resolve_item["additionalTextEdits"] = json!([]);
+
+    let resolve_id = RequestId::from("completion-resolve".to_string());
+    deferred_server.send_request(resolve_id.clone(), "completionItem/resolve", resolve_item);
+    let resolved = deferred_server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "completion resolve failed: {resolved:?}"
+    );
+    let resolved = resolved.result.expect("resolved completion item");
+    assert_eq!(resolved["label"], "Documented");
+    assert_eq!(resolved["textEdit"], original_edit);
+    assert_eq!(resolved["kind"], original_kind);
+    assert_eq!(resolved["insertText"], original_insert_text);
+    assert_eq!(resolved["filterText"], original_filter_text);
+    assert_eq!(resolved["additionalTextEdits"], original_additional_edits);
+    assert_eq!(resolved["documentation"]["kind"], "markdown");
+    assert!(
+        resolved["documentation"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("Returns the value."))
+    );
+    assert!(
+        resolved["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Documented"))
+    );
+    deferred_server.shutdown();
+}
+
+#[test]
+fn completion_resolution_accepts_unchanged_open_source_after_unrelated_overlay_edit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("OpenDeferredCompletion.pas");
+    let unrelated_path = temp.path().join("Unrelated.pas");
+    let source = "unit OpenDeferredCompletion;\ninterface\n/// <summary>Returns the open value.</summary>\nfunction OpenDocumented: Integer;\nimplementation\nfunction OpenDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  OpenDoc\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(
+        &unrelated_path,
+        "unit Unrelated; interface implementation end.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let completion_id = RequestId::from("open-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  OpenDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("open completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("open completion items")
+        .iter()
+        .find(|item| item["label"] == "OpenDocumented")
+        .cloned()
+        .expect("open documented item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit Unrelated; interface implementation end.\n"
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("open-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "open resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("open resolved item");
+    assert_eq!(resolved["label"], "OpenDocumented");
+    assert!(
+        resolved["documentation"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("open value"))
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_rejects_a_project_context_switch() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main_path = temp.path().join("ContextCompletion.pas");
+    let project_a = temp.path().join("A.dproj");
+    let project_b = temp.path().join("B.dproj");
+    let source = "unit ContextCompletion;\ninterface\n/// <summary>Context-bound value.</summary>\nfunction ContextDocumented: Integer;\nimplementation\nfunction ContextDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  ContextDoc\nend;\nend.\n";
+    write_file(&main_path, source);
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>ContextCompletion.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let select_a_id = RequestId::from("context-select-a".to_string());
+    server.send_request(
+        select_a_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "projectUri": uri(&project_a)
+        }),
+    );
+    assert!(server.response(&select_a_id).error.is_none());
+
+    let completion_id = RequestId::from("context-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(source, "  ContextDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("context completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("context completion items")
+        .iter()
+        .find(|item| item["label"] == "ContextDocumented")
+        .cloned()
+        .expect("context documented item");
+
+    let select_b_id = RequestId::from("context-select-b".to_string());
+    server.send_request(
+        select_b_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "projectUri": uri(&project_b)
+        }),
+    );
+    assert!(server.response(&select_b_id).error.is_none());
+
+    let resolve_id = RequestId::from("context-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("context switch must invalidate completion resolution");
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_rejects_a_provider_disk_change_without_watcher_notification() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main_path = temp.path().join("Main.pas");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nbegin\n  ProviderDoc\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\n/// <summary>Provider documentation.</summary>\nfunction ProviderDocumented: Integer;\nimplementation\nfunction ProviderDocumented: Integer;\nbegin\n  Result := 1;\nend;\nend.\n";
+    write_file(&main_path, main_source);
+    write_file(&provider_path, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["plaintext"]),
+    );
+    let completion_id = RequestId::from("provider-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  ProviderDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("provider completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("provider completion items")
+        .iter()
+        .find(|item| item["label"] == "ProviderDocumented")
+        .cloned()
+        .expect("provider documented item");
+
+    write_file(
+        &provider_path,
+        "unit Provider;\ninterface\n/// <summary>Changed provider documentation.</summary>\nfunction ProviderDocumented: Integer;\nimplementation\nfunction ProviderDocumented: Integer;\nbegin\n  Result := 2;\nend;\nend.\n",
+    );
+    let resolve_id = RequestId::from("provider-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("provider disk change must invalidate resolution");
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_defers_only_the_negotiated_field_in_plaintext() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("PlainCompletion.pas");
+    let source = "unit PlainCompletion;\ninterface\n/// <summary>Plain documentation.</summary>\nfunction PlainDocumented: Integer;\nimplementation\nfunction PlainDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  PlainDoc\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation"]),
+        json!(["plaintext"]),
+    );
+    let completion_id = RequestId::from("plain-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  PlainDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("plain completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("plain completion items")
+        .iter()
+        .find(|item| item["label"] == "PlainDocumented")
+        .cloned()
+        .expect("plain documented item");
+    assert!(item["documentation"].is_null());
+    let eager_detail = item["detail"]
+        .as_str()
+        .expect("eager plain detail")
+        .to_owned();
+
+    let resolve_id = RequestId::from("plain-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "plain resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("plain resolved item");
+    assert!(resolved["documentation"].is_string());
+    assert_eq!(resolved["detail"].as_str(), Some(eager_detail.as_str()));
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_preserves_generic_member_specialization() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("GenericProvider.pas");
+    let main_path = temp.path().join("GenericMain.pas");
+    let provider_source = "unit GenericProvider;\ninterface\ntype\n  TBox<T> = class\n    Value: T;\n  end;\nimplementation\nend.\n";
+    let main_source = "unit GenericMain;\ninterface\nuses GenericProvider;\nimplementation\nprocedure Caller;\nvar\n  Box: TBox<Integer>;\nbegin\n  Box.Va\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("generic-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Box.Va", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("generic completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("generic completion items")
+        .iter()
+        .find(|item| item["label"] == "Value")
+        .cloned()
+        .expect("generic Value item");
+    assert!(item["detail"].is_null());
+
+    let resolve_id = RequestId::from("generic-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "generic resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("generic resolved item");
+    assert!(
+        resolved["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Value: Integer"))
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_rejects_a_requester_overlay_changed_after_completion() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("RequesterCompletion.pas");
+    let source = "unit RequesterCompletion;\ninterface\n/// <summary>Requester documentation.</summary>\nfunction RequesterDocumented: Integer;\nimplementation\nfunction RequesterDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  RequesterDoc\nend;\nend.\n";
+    let changed_source = source.replace("RequesterDoc\n", "RequesterChanged\n");
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("requester-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  RequesterDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("requester completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("requester completion items")
+        .iter()
+        .find(|item| item["label"] == "RequesterDocumented")
+        .cloned()
+        .expect("requester documented item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": changed_source
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("requester-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "requester overlay change must invalidate resolution: {response:?}"
+    );
+    assert_eq!(response.error.expect("requester stale error").code, -32803);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_resolution_cancellation_returns_once_while_worker_is_in_flight() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("CancelledCompletion.pas");
+    let source = "unit CancelledCompletion;\ninterface\n/// <summary>Cancellation documentation.</summary>\nfunction CancelledDocumented: Integer;\nimplementation\nfunction CancelledDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  CancelledDoc\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_completion_resolution_barrier(environment);
+    server.initialize_with_completion_resolve_properties(
+        &root,
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("cancelled-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  CancelledDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("cancelled completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("cancelled completion items")
+        .iter()
+        .find(|item| item["label"] == "CancelledDocumented")
+        .cloned()
+        .expect("cancelled documented item");
+
+    let resolve_id = RequestId::from("cancelled-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": resolve_id.clone()}));
+    let response = server.response(&resolve_id);
+    let error = response.error.expect("cancelled resolve error");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    barrier.release();
+    server.assert_no_response(&resolve_id);
     server.shutdown();
 }
 

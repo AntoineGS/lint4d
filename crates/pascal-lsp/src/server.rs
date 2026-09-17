@@ -1,7 +1,10 @@
 //! Synchronous stdio LSP protocol loop for the Pascal navigation workspace.
 
+#[cfg(test)]
+use crate::navigation::CompletionResolutionSeed;
 use crate::navigation::{
-    FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
+    CompletionMetadata, CompletionOptions, CompletionResult, FOLDING_KIND_COMMENT,
+    FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
 };
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
@@ -14,24 +17,27 @@ use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionParams,
-    CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
-    FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
-    InitializeParams, MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams,
-    ReferenceParams, Registration, RegistrationParams, RelativePattern, SelectionRangeParams,
-    ServerInfo, SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit,
-    WorkspaceFolder,
+    ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionItem,
+    CompletionList, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlightParams, FileChangeType,
+    FileSystemWatcher, FoldingRangeParams, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, InitializeParams, MarkupKind, OneOf, Position,
+    PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams, Registration,
+    RegistrationParams, RelativePattern, SelectionRangeParams, ServerInfo, SignatureHelpParams,
+    TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
 };
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::hash::{BuildHasher, Hash, Hasher};
 #[cfg(feature = "test-support")]
 use std::io::Write;
 use std::io::{self, BufRead, Read};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -62,6 +68,13 @@ const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
+const MAX_COMPLETION_RESOLUTION_ENTRIES: usize = 2_048;
+const MAX_COMPLETION_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COMPLETION_RESOLUTION_DATA_BYTES: usize = 512;
+const MAX_COMPLETION_RESOLUTION_RECORDS: usize = 1_024;
+const MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COMPLETION_RESOLUTION_ITEM_BYTES: usize = 64 * 1024;
+const COMPLETION_RESOLUTION_DATA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalysisPriority {
@@ -81,6 +94,7 @@ impl AnalysisPriority {
             | AnalysisRequest::Prepare { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
+            | AnalysisRequest::ResolveCompletion(_)
             | AnalysisRequest::DocumentHighlights { .. }
             | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
             AnalysisRequest::Diagnostics { .. } => Self::Diagnostics,
@@ -227,6 +241,7 @@ enum TestBarrier {
     Formatting,
     Diagnostics,
     Selection,
+    CompletionResolution,
 }
 
 #[cfg(feature = "test-support")]
@@ -236,6 +251,7 @@ pub struct TestBarrierConfig {
     formatting: Option<TestBarrierPaths>,
     diagnostics: Option<TestBarrierPaths>,
     selection: Option<TestBarrierPaths>,
+    completion_resolution: Option<TestBarrierPaths>,
     dispatch: Option<PathBuf>,
 }
 
@@ -259,12 +275,22 @@ impl TestBarrierConfig {
             diagnostics: diagnostics
                 .map(|(entered, release)| TestBarrierPaths { entered, release }),
             selection: None,
+            completion_resolution: None,
             dispatch: None,
         }
     }
 
     pub fn with_selection(mut self, selection: Option<(PathBuf, PathBuf)>) -> Self {
         self.selection = selection.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_completion_resolution(
+        mut self,
+        completion_resolution: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.completion_resolution =
+            completion_resolution.map(|(entered, release)| TestBarrierPaths { entered, release });
         self
     }
 
@@ -300,6 +326,7 @@ impl TestBarrierConfig {
             TestBarrier::Formatting => self.formatting.as_ref(),
             TestBarrier::Diagnostics => self.diagnostics.as_ref(),
             TestBarrier::Selection => self.selection.as_ref(),
+            TestBarrier::CompletionResolution => self.completion_resolution.as_ref(),
         }
     }
 }
@@ -372,10 +399,474 @@ struct ClientFeatures {
     hierarchical_document_symbols: bool,
     hover_format: DocumentationFormat,
     completion_format: DocumentationFormat,
+    completion_resolve_documentation: bool,
+    completion_resolve_detail: bool,
     signature_help_format: DocumentationFormat,
     folding_range_limit: Option<usize>,
     line_folding_only: bool,
     folding_range_kind_value_set: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionResolutionContext {
+    source_uri: Url,
+    position: Position,
+    source_generation: u64,
+    configuration_generation: u64,
+    format: MarkupKind,
+    resolve_documentation: bool,
+    resolve_detail: bool,
+    records: Vec<SourceRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionResolutionRequest {
+    token: String,
+    context: Arc<CompletionResolutionContext>,
+    candidate_uri: Url,
+    candidate_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionAnalysis {
+    uri: Url,
+    position: Position,
+    format: MarkupKind,
+    resolve_documentation: bool,
+    resolve_detail: bool,
+    value: Result<CompletionResult, String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionResolutionAnalysis {
+    token: String,
+    value: Result<CompletionMetadata, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct CompletionResolveData {
+    version: u8,
+    token: String,
+    proof: String,
+}
+
+#[derive(Debug)]
+struct CompletionResolutionEntry {
+    context_id: u64,
+    candidate_uri: Url,
+    candidate_index: usize,
+    proof: String,
+    item: CompletionItem,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct StoredCompletionResolutionContext {
+    context: Arc<CompletionResolutionContext>,
+    references: usize,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct CompletionResolutionStore {
+    hasher: RandomState,
+    next_context_id: u64,
+    entries: HashMap<String, CompletionResolutionEntry>,
+    order: VecDeque<String>,
+    contexts: HashMap<u64, StoredCompletionResolutionContext>,
+    retained_bytes: usize,
+}
+
+impl CompletionResolutionStore {
+    fn new() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            next_context_id: 0,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            contexts: HashMap::new(),
+            retained_bytes: 0,
+        }
+    }
+
+    fn issue_digest(&self, context_id: u64, item_index: usize, discriminator: u8) -> u64 {
+        let mut hasher = self.hasher.build_hasher();
+        discriminator.hash(&mut hasher);
+        context_id.hash(&mut hasher);
+        item_index.hash(&mut hasher);
+        self.entries.len().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn token_and_proof(&self, context_id: u64, item_index: usize) -> (String, String) {
+        let token = format!(
+            "{:016x}{:016x}",
+            self.issue_digest(context_id, item_index, 1),
+            self.issue_digest(context_id, item_index, 2)
+        );
+        let mut hasher = self.hasher.build_hasher();
+        token.hash(&mut hasher);
+        context_id.hash(&mut hasher);
+        item_index.hash(&mut hasher);
+        let proof = format!("{:016x}", hasher.finish());
+        (token, proof)
+    }
+
+    fn register(
+        &mut self,
+        analysis: CompletionAnalysis,
+        source_generation: u64,
+        configuration_generation: u64,
+        records: &[SourceRecord],
+    ) -> Result<CompletionList, String> {
+        let CompletionAnalysis {
+            uri,
+            position,
+            format,
+            resolve_documentation,
+            resolve_detail,
+            value,
+        } = analysis;
+        let result = value?;
+        if !resolve_documentation && !resolve_detail {
+            return Ok(result.list);
+        }
+        if result.list.items.is_empty() {
+            return Ok(result.list);
+        }
+        if result.list.items.len() != result.seeds.len() {
+            return Err("completion result lost its exact resolution identities".to_string());
+        }
+        if result.list.items.len() > MAX_COMPLETION_RESOLUTION_ENTRIES {
+            return Err("completion result exceeds the bounded resolution entry limit".to_string());
+        }
+
+        let (compact_records, context_bytes) = compact_completion_records(records)?;
+        if compact_records.len() > MAX_COMPLETION_RESOLUTION_RECORDS {
+            return Err("completion dependency observations exceed the bounded limit".to_string());
+        }
+        if context_bytes > MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES {
+            return Err(
+                "completion dependency observations exceed the bounded byte limit".to_string(),
+            );
+        }
+        let context_id = self
+            .next_context_id
+            .checked_add(1)
+            .ok_or_else(|| "completion resolution context ID space exhausted".to_string())?;
+        let context = Arc::new(CompletionResolutionContext {
+            source_uri: canonical_file_uri(&uri),
+            position,
+            source_generation,
+            configuration_generation,
+            format,
+            resolve_documentation,
+            resolve_detail,
+            records: compact_records,
+        });
+
+        let mut pending = Vec::with_capacity(result.list.items.len());
+        let mut output = result.list;
+        let mut new_bytes = context_bytes.saturating_add(size_of::<CompletionResolutionContext>());
+        for (index, (item, seed)) in output.items.iter_mut().zip(result.seeds).enumerate() {
+            let mut stored_item = item.clone();
+            stored_item.data = None;
+            let item_bytes = serde_json::to_vec(&stored_item)
+                .map_err(|error| format!("could not size completion resolve item: {error}"))?
+                .len();
+            if item_bytes > MAX_COMPLETION_RESOLUTION_ITEM_BYTES {
+                return Err("completion resolve item exceeds its bounded size".to_string());
+            }
+            let (token, proof) = self.token_and_proof(context_id, index);
+            let data = CompletionResolveData {
+                version: COMPLETION_RESOLUTION_DATA_VERSION,
+                token: token.clone(),
+                proof: proof.clone(),
+            };
+            let data_value = serde_json::to_value(&data)
+                .map_err(|error| format!("could not encode completion resolve data: {error}"))?;
+            let data_bytes = serde_json::to_vec(&data_value)
+                .map_err(|error| format!("could not size completion resolve data: {error}"))?
+                .len();
+            if data_bytes > MAX_COMPLETION_RESOLUTION_DATA_BYTES {
+                return Err("completion resolve data exceeds its bounded size".to_string());
+            }
+            let candidate_uri = canonical_file_uri(seed.candidate_uri());
+            if self.entries.contains_key(&token)
+                || pending.iter().any(|(existing, _)| existing == &token)
+            {
+                return Err("completion resolution token collision".to_string());
+            }
+            let token_storage = size_of::<String>().saturating_add(token.capacity());
+            let entry_bytes = size_of::<CompletionResolutionEntry>()
+                .saturating_add(item_bytes)
+                .saturating_add(data_bytes)
+                .saturating_add(token_storage.saturating_mul(2))
+                .saturating_add(proof.capacity())
+                .saturating_add(candidate_uri.as_str().len());
+            new_bytes = new_bytes.saturating_add(entry_bytes);
+            stored_item.data = Some(data_value);
+            *item = stored_item.clone();
+            pending.push((
+                token,
+                CompletionResolutionEntry {
+                    context_id,
+                    candidate_uri,
+                    candidate_index: seed.candidate_index(),
+                    proof,
+                    item: stored_item,
+                    bytes: entry_bytes,
+                },
+            ));
+        }
+        if new_bytes > MAX_COMPLETION_RESOLUTION_BYTES {
+            return Err("completion resolution state exceeds its bounded byte limit".to_string());
+        }
+        while self.entries.len().saturating_add(pending.len()) > MAX_COMPLETION_RESOLUTION_ENTRIES
+            || self.retained_bytes.saturating_add(new_bytes) > MAX_COMPLETION_RESOLUTION_BYTES
+        {
+            let Some(victim) = self.order.pop_front() else {
+                return Err("completion resolution state could not make room".to_string());
+            };
+            self.remove(&victim);
+        }
+        self.next_context_id = context_id;
+        self.retained_bytes = self.retained_bytes.saturating_add(new_bytes);
+        self.contexts.insert(
+            context_id,
+            StoredCompletionResolutionContext {
+                context,
+                references: pending.len(),
+                bytes: context_bytes.saturating_add(size_of::<CompletionResolutionContext>()),
+            },
+        );
+        for (token, entry) in pending {
+            self.order.push_back(token.clone());
+            self.entries.insert(token, entry);
+        }
+        Ok(output)
+    }
+
+    fn remove(&mut self, token: &str) {
+        let Some(entry) = self.entries.remove(token) else {
+            return;
+        };
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.bytes);
+        if let Some(context) = self.contexts.get_mut(&entry.context_id) {
+            context.references = context.references.saturating_sub(1);
+            if context.references == 0 {
+                let context = self
+                    .contexts
+                    .remove(&entry.context_id)
+                    .expect("completion context exists while removing its final entry");
+                self.retained_bytes = self.retained_bytes.saturating_sub(context.bytes);
+            }
+        }
+    }
+
+    fn request(&self, item: &CompletionItem) -> Result<CompletionResolutionRequest, String> {
+        let value = item
+            .data
+            .as_ref()
+            .ok_or_else(|| "completion item has no resolve data".to_string())?;
+        let data_bytes = serde_json::to_vec(value)
+            .map_err(|error| format!("invalid completion resolve data: {error}"))?
+            .len();
+        if data_bytes > MAX_COMPLETION_RESOLUTION_DATA_BYTES {
+            return Err("completion resolve data exceeds its bounded size".to_string());
+        }
+        let data: CompletionResolveData = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid completion resolve data: {error}"))?;
+        if data.version != COMPLETION_RESOLUTION_DATA_VERSION
+            || data.token.len() > 64
+            || data.proof.len() > 32
+        {
+            return Err("completion resolve data is stale or tampered".to_string());
+        }
+        let entry = self
+            .entries
+            .get(&data.token)
+            .ok_or_else(|| "completion resolve data is stale, foreign, or evicted".to_string())?;
+        if entry.proof != data.proof {
+            return Err("completion resolve data is stale or tampered".to_string());
+        }
+        let context = self
+            .contexts
+            .get(&entry.context_id)
+            .ok_or_else(|| "completion resolve context was evicted".to_string())?;
+        Ok(CompletionResolutionRequest {
+            token: data.token,
+            context: Arc::clone(&context.context),
+            candidate_uri: entry.candidate_uri.clone(),
+            candidate_index: entry.candidate_index,
+        })
+    }
+
+    fn finish(&self, token: &str, metadata: CompletionMetadata) -> Result<CompletionItem, String> {
+        let entry = self
+            .entries
+            .get(token)
+            .ok_or_else(|| "completion resolve data was evicted while resolving".to_string())?;
+        let mut item = entry.item.clone();
+        let context = self
+            .contexts
+            .get(&entry.context_id)
+            .ok_or_else(|| "completion resolve context was evicted while resolving".to_string())?;
+        if context.context.resolve_documentation {
+            item.documentation = metadata.documentation;
+        }
+        if context.context.resolve_detail {
+            item.detail = metadata.detail;
+        }
+        Ok(item)
+    }
+}
+
+impl Default for CompletionResolutionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn compact_completion_records(
+    records: &[SourceRecord],
+) -> Result<(Vec<SourceRecord>, usize), String> {
+    let mut compact = Vec::with_capacity(records.len());
+    let mut bytes = 0usize;
+    for record in records {
+        let content_hash = record.content_hash.or_else(|| {
+            if record.open {
+                Some(crate::workspace::rename::text_content_hash(&record.text))
+            } else {
+                record
+                    .content_bytes
+                    .as_deref()
+                    .map(crate::workspace::content_hash_bytes)
+                    .or_else(|| {
+                        (!record.text.is_empty())
+                            .then(|| crate::workspace::content_hash_bytes(record.text.as_bytes()))
+                    })
+            }
+        });
+        if !record.open && record.path.is_none() && content_hash.is_none() {
+            return Err(format!(
+                "completion dependency {} has no bounded content observation",
+                record.uri
+            ));
+        }
+        let observation = SourceRecord {
+            uri: record.uri.clone(),
+            text: String::new(),
+            version: record.version,
+            stamp: record.stamp.clone(),
+            open: record.open,
+            path: record.path.clone(),
+            path_stamp: record.path_stamp.clone(),
+            content_hash,
+            content_bytes: None,
+            candidate_membership: record.candidate_membership.clone(),
+            read_policy: record.read_policy.clone(),
+            path_entry: record.path_entry.clone(),
+            include_payload: record.include_payload,
+            missing_provider_candidate: record.missing_provider_candidate,
+            missing_provider_scope: record.missing_provider_scope.clone(),
+        };
+        let observation_bytes = compact_completion_record_bytes(&observation);
+        bytes = bytes.saturating_add(observation_bytes);
+        compact.push(observation);
+        if compact.len() > MAX_COMPLETION_RESOLUTION_RECORDS
+            || bytes > MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES
+        {
+            return Err("completion dependency observations exceed the bounded limit".to_string());
+        }
+    }
+    Ok((compact, bytes))
+}
+
+fn path_storage_bytes(path: &PathBuf) -> usize {
+    size_of::<PathBuf>().saturating_add(path.capacity())
+}
+
+fn path_entry_storage_bytes(entry: &pascal_project::ProjectPathEntry) -> usize {
+    size_of::<pascal_project::ProjectPathEntry>()
+        .saturating_add(path_storage_bytes(&entry.path))
+        .saturating_add(match &entry.provenance {
+            pascal_project::ProjectPathProvenance::Mapped { root } => path_storage_bytes(root),
+            pascal_project::ProjectPathProvenance::LegacyNative
+            | pascal_project::ProjectPathProvenance::Configured => 0,
+        })
+}
+
+fn candidate_membership_storage_bytes(
+    membership: &pascal_project::ProjectCandidateMembership,
+) -> usize {
+    size_of::<pascal_project::ProjectCandidateMembership>().saturating_add(
+        membership
+            .paths
+            .iter()
+            .map(path_storage_bytes)
+            .sum::<usize>(),
+    )
+}
+
+fn missing_provider_scope_storage_bytes(
+    scope: &crate::workspace::rename::MissingProviderScope,
+) -> usize {
+    size_of::<crate::workspace::rename::MissingProviderScope>()
+        .saturating_add(path_storage_bytes(&scope.root))
+        .saturating_add(
+            scope
+                .names
+                .iter()
+                .map(|name| size_of::<String>().saturating_add(name.capacity()))
+                .sum::<usize>(),
+        )
+        .saturating_add(scope.read_policy.retained_size_hint())
+        .saturating_add(path_entry_storage_bytes(&scope.path_entry))
+}
+
+fn compact_completion_record_bytes(record: &SourceRecord) -> usize {
+    size_of::<SourceRecord>()
+        .saturating_add(record.uri.as_str().len())
+        .saturating_add(
+            record
+                .text
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u8>()),
+        )
+        .saturating_add(record.path.as_ref().map_or(0, path_storage_bytes))
+        .saturating_add(
+            record
+                .content_bytes
+                .as_ref()
+                .map_or(0, |bytes| bytes.capacity()),
+        )
+        .saturating_add(
+            record
+                .candidate_membership
+                .as_ref()
+                .map_or(0, candidate_membership_storage_bytes),
+        )
+        .saturating_add(
+            record
+                .read_policy
+                .as_ref()
+                .map_or(0, pascal_project::ReadPolicy::retained_size_hint),
+        )
+        .saturating_add(
+            record
+                .path_entry
+                .as_ref()
+                .map_or(0, path_entry_storage_bytes),
+        )
+        .saturating_add(
+            record
+                .missing_provider_scope
+                .as_ref()
+                .map_or(0, missing_provider_scope_storage_bytes),
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,6 +923,8 @@ enum AnalysisRequest {
         uri: Url,
         position: Position,
         format: MarkupKind,
+        resolve_documentation: bool,
+        resolve_detail: bool,
     },
     SignatureHelp {
         uri: Url,
@@ -464,6 +957,7 @@ enum AnalysisRequest {
     },
     CodeActions(CodeActionParams),
     Resolve(CodeAction),
+    ResolveCompletion(CompletionResolutionRequest),
     DocumentSymbols {
         uri: Url,
         hierarchical: bool,
@@ -496,7 +990,8 @@ enum AnalysisRequest {
 #[derive(Clone)]
 enum AnalysisResultValue {
     Hover(Result<Option<lsp_types::Hover>, String>),
-    Completion(Result<lsp_types::CompletionList, String>),
+    Completion(CompletionAnalysis),
+    ResolveCompletion(CompletionResolutionAnalysis),
     SignatureHelp(Result<Option<lsp_types::SignatureHelp>, String>),
     Navigation(NavigationAnalysis),
     Formatting(Result<Option<lsp_types::TextEdit>, String>),
@@ -571,18 +1066,32 @@ enum NavigationObservationTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ObservationMethod {
-    Hover { markdown: bool },
-    Completion { markdown: bool },
-    SignatureHelp { markdown: bool },
+    Hover {
+        markdown: bool,
+    },
+    Completion {
+        markdown: bool,
+        resolve_documentation: bool,
+        resolve_detail: bool,
+    },
+    SignatureHelp {
+        markdown: bool,
+    },
     Navigation(NavigationObservationTarget),
     TypeDefinitions,
     Prepare,
-    DocumentSymbols { hierarchical: bool },
+    DocumentSymbols {
+        hierarchical: bool,
+    },
     WorkspaceSymbols,
-    References { include_declaration: bool },
+    References {
+        include_declaration: bool,
+    },
     DocumentHighlights,
     SelectionRanges,
-    SemanticTokens { range: Option<ObservationRange> },
+    SemanticTokens {
+        range: Option<ObservationRange>,
+    },
     FoldingRanges,
 }
 
@@ -633,9 +1142,13 @@ impl ObservationKey {
                 uri,
                 position,
                 format,
+                resolve_documentation,
+                resolve_detail,
             } => (
                 ObservationMethod::Completion {
                     markdown: matches!(format, MarkupKind::Markdown),
+                    resolve_documentation: *resolve_documentation,
+                    resolve_detail: *resolve_detail,
                 },
                 Some(uri.clone()),
                 Some(ObservationPosition {
@@ -785,7 +1298,8 @@ impl ObservationKey {
             | AnalysisRequest::Diagnostics { .. }
             | AnalysisRequest::Rename { .. }
             | AnalysisRequest::CodeActions(_)
-            | AnalysisRequest::Resolve(_) => return None,
+            | AnalysisRequest::Resolve(_)
+            | AnalysisRequest::ResolveCompletion(_) => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
         Some(Self {
@@ -967,6 +1481,7 @@ struct AnalysisJobs {
     request_to_job: HashMap<RequestId, AnalysisComputationId>,
     observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
     diagnostic_jobs: HashMap<Url, AnalysisComputationId>,
+    completion_resolutions: CompletionResolutionStore,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
     shutting_down: bool,
@@ -989,6 +1504,7 @@ impl AnalysisJobs {
             request_to_job: HashMap::new(),
             observation_jobs: HashMap::new(),
             diagnostic_jobs: HashMap::new(),
+            completion_resolutions: CompletionResolutionStore::new(),
             test_barriers,
             next_computation_id: 0,
             shutting_down: false,
@@ -1015,9 +1531,20 @@ impl AnalysisJobs {
             AnalysisRequest::Hover { .. } => AnalysisResultValue::Hover(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
-            AnalysisRequest::Completion { .. } => AnalysisResultValue::Completion(Err(
-                "analysis worker failed without changing workspace state".to_string(),
-            )),
+            AnalysisRequest::Completion {
+                uri,
+                position,
+                format,
+                resolve_documentation,
+                resolve_detail,
+            } => AnalysisResultValue::Completion(CompletionAnalysis {
+                uri: uri.clone(),
+                position: *position,
+                format: format.clone(),
+                resolve_documentation: *resolve_documentation,
+                resolve_detail: *resolve_detail,
+                value: Err("analysis worker failed without changing workspace state".to_string()),
+            }),
             AnalysisRequest::SignatureHelp { .. } => AnalysisResultValue::SignatureHelp(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
@@ -1057,6 +1584,14 @@ impl AnalysisJobs {
             AnalysisRequest::Resolve(_) => AnalysisResultValue::Resolve(Box::new(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             ))),
+            AnalysisRequest::ResolveCompletion(request) => {
+                AnalysisResultValue::ResolveCompletion(CompletionResolutionAnalysis {
+                    token: request.token.clone(),
+                    value: Err(
+                        "analysis worker failed without changing workspace state".to_string()
+                    ),
+                })
+            }
             AnalysisRequest::DocumentSymbols { uri, hierarchical } => {
                 AnalysisResultValue::DocumentSymbols {
                     uri: uri.clone(),
@@ -1115,12 +1650,18 @@ impl AnalysisJobs {
                             uri,
                             position,
                             format,
+                            resolve_documentation,
+                            resolve_detail,
                         } => {
-                            let computed = queries::completion_from_input_with_format(
+                            let computed = queries::completion_from_input_with_options(
                                 input,
                                 &uri,
                                 position,
-                                format,
+                                CompletionOptions {
+                                    format: format.clone(),
+                                    defer_documentation: resolve_documentation,
+                                    defer_detail: resolve_detail,
+                                },
                                 &worker_cancellation,
                             );
                             AnalysisResult {
@@ -1128,7 +1669,14 @@ impl AnalysisJobs {
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
-                                value: AnalysisResultValue::Completion(computed.value),
+                                value: AnalysisResultValue::Completion(CompletionAnalysis {
+                                    uri,
+                                    position,
+                                    format,
+                                    resolve_documentation,
+                                    resolve_detail,
+                                    value: computed.value,
+                                }),
                             }
                         }
                         AnalysisRequest::SignatureHelp {
@@ -1360,6 +1908,67 @@ impl AnalysisJobs {
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
                                 value: AnalysisResultValue::Resolve(Box::new(computed.value)),
+                            }
+                        }
+                        AnalysisRequest::ResolveCompletion(request) => {
+                            let CompletionResolutionRequest {
+                                token,
+                                context,
+                                candidate_uri,
+                                candidate_index,
+                            } = request;
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::CompletionResolution,
+                                &test_barriers,
+                                &worker_cancellation,
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: context.source_generation,
+                                    configuration_generation: context.configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::ResolveCompletion(
+                                        CompletionResolutionAnalysis {
+                                            token,
+                                            value: Err(error),
+                                        },
+                                    ),
+                                }
+                            } else {
+                                let mut computed = queries::completion_metadata_from_input(
+                                    input,
+                                    &context.source_uri,
+                                    context.position,
+                                    context.source_generation,
+                                    context.configuration_generation,
+                                    &candidate_uri,
+                                    candidate_index,
+                                    context.format.clone(),
+                                    context.resolve_documentation,
+                                    context.resolve_detail,
+                                    &context.records,
+                                    &worker_cancellation,
+                                );
+                                // Keep the identity's original generation as the
+                                // delivery baseline.  Dependency validation can
+                                // still admit unrelated overlay changes, while
+                                // a project/context switch remains stale even if
+                                // this worker starts after that switch.
+                                computed.source_generation = context.source_generation;
+                                computed.configuration_generation =
+                                    context.configuration_generation;
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::ResolveCompletion(
+                                        CompletionResolutionAnalysis {
+                                            token,
+                                            value: computed.value,
+                                        },
+                                    ),
+                                }
                             }
                         }
                         AnalysisRequest::DocumentSymbols { uri, hierarchical } => {
@@ -1633,6 +2242,13 @@ impl AnalysisJobs {
         );
         let failures = self.pump(workspace);
         self.handle_dispatch_failures(failures, connection)
+    }
+
+    fn completion_resolution_request(
+        &self,
+        item: &CompletionItem,
+    ) -> Result<CompletionResolutionRequest, String> {
+        self.completion_resolutions.request(item)
     }
 
     fn attach_client(&mut self, primary_id: &AnalysisComputationId, id: RequestId) -> bool {
@@ -1956,7 +2572,13 @@ impl AnalysisJobs {
                     if cancelled {
                         workspace.reschedule_diagnostics(job.uri);
                     } else {
-                        deliver_analysis_result(connection, workspace, result, None)?;
+                        deliver_analysis_result_with_store(
+                            connection,
+                            workspace,
+                            &mut self.completion_resolutions,
+                            result,
+                            None,
+                        )?;
                     }
                 }
                 AnalysisJobId::Client(primary_id) => {
@@ -1981,9 +2603,10 @@ impl AnalysisJobs {
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     } else if !client_ids.is_empty() {
                         for id in client_ids {
-                            deliver_analysis_result(
+                            deliver_analysis_result_with_store(
                                 connection,
                                 workspace,
+                                &mut self.completion_resolutions,
                                 result.clone(),
                                 Some(id),
                             )?;
@@ -2086,6 +2709,8 @@ fn diagnostic_features() -> ClientFeatures {
         hierarchical_document_symbols: false,
         hover_format: DocumentationFormat::PlainText,
         completion_format: DocumentationFormat::PlainText,
+        completion_resolve_documentation: false,
+        completion_resolve_detail: false,
         signature_help_format: DocumentationFormat::PlainText,
         folding_range_limit: None,
         line_folding_only: false,
@@ -2099,6 +2724,7 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
             value,
             AnalysisResultValue::Hover(_)
                 | AnalysisResultValue::Completion(_)
+                | AnalysisResultValue::ResolveCompletion(_)
                 | AnalysisResultValue::SignatureHelp(_)
                 | AnalysisResultValue::Navigation(_)
                 | AnalysisResultValue::Formatting(_)
@@ -2112,9 +2738,27 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
         )
 }
 
+#[cfg(test)]
 fn deliver_analysis_result(
     connection: &Connection,
     workspace: &mut Workspace,
+    result: AnalysisResult,
+    client_id: Option<RequestId>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut completion_resolutions = CompletionResolutionStore::new();
+    deliver_analysis_result_with_store(
+        connection,
+        workspace,
+        &mut completion_resolutions,
+        result,
+        client_id,
+    )
+}
+
+fn deliver_analysis_result_with_store(
+    connection: &Connection,
+    workspace: &mut Workspace,
+    completion_resolutions: &mut CompletionResolutionStore,
     result: AnalysisResult,
     client_id: Option<RequestId>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -2165,12 +2809,35 @@ fn deliver_analysis_result(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-        AnalysisResultValue::Completion(value) => match value {
-            Ok(value) => send_ok(
-                connection,
-                client_id.clone().expect("client result"),
-                CompletionResponse::List(value),
-            ),
+        AnalysisResultValue::Completion(analysis) => {
+            let value = completion_resolutions.register(
+                analysis,
+                result.source_generation,
+                result.configuration_generation,
+                &result.records,
+            );
+            match value {
+                Ok(value) => send_ok(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    CompletionResponse::List(value),
+                ),
+                Err(error) => send_analysis_error(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    error,
+                ),
+            }
+        }
+        AnalysisResultValue::ResolveCompletion(analysis) => match analysis.value {
+            Ok(metadata) => match completion_resolutions.finish(&analysis.token, metadata) {
+                Ok(item) => send_ok(connection, client_id.clone().expect("client result"), item),
+                Err(error) => send_analysis_error(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    error,
+                ),
+            },
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
@@ -2321,7 +2988,8 @@ fn deliver_analysis_result(
 fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
     match &mut result.value {
         AnalysisResultValue::Hover(value) => *value = Err(error),
-        AnalysisResultValue::Completion(value) => *value = Err(error),
+        AnalysisResultValue::Completion(analysis) => analysis.value = Err(error),
+        AnalysisResultValue::ResolveCompletion(analysis) => analysis.value = Err(error),
         AnalysisResultValue::SignatureHelp(value) => *value = Err(error),
         AnalysisResultValue::Navigation(navigation) => {
             navigation.state = None;
@@ -2880,7 +3548,34 @@ fn handle_request(
                     uri: canonical_file_uri(&params.text_document_position.text_document.uri),
                     position: params.text_document_position.position,
                     format: client_features.completion_format.markup_kind(),
+                    resolve_documentation: client_features.completion_resolve_documentation,
+                    resolve_detail: client_features.completion_resolve_detail,
                 },
+                client_features,
+            )?;
+        }
+        "completionItem/resolve" => {
+            let id = request.id.clone();
+            let item: CompletionItem = match parse_params(&request) {
+                Ok(item) => item,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            let resolve_request = match jobs.completion_resolution_request(&item) {
+                Ok(resolve_request) => resolve_request,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::RequestFailed, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::ResolveCompletion(resolve_request),
                 client_features,
             )?;
         }
@@ -3574,7 +4269,7 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
             "save": true
         },
         "hoverProvider": true,
-        "completionProvider": {"triggerCharacters": ["."]},
+        "completionProvider": {"triggerCharacters": ["."], "resolveProvider": true},
         "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
         "typeDefinitionProvider": true,
         "declarationProvider": true,
@@ -3642,6 +4337,24 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
             "documentationFormat",
         ],
     );
+    let completion_resolve_properties =
+        &value["textDocument"]["completion"]["completionItem"]["resolveSupport"]["properties"];
+    let completion_resolve_documentation =
+        completion_resolve_properties
+            .as_array()
+            .is_some_and(|properties| {
+                properties
+                    .iter()
+                    .any(|property| property.as_str() == Some("documentation"))
+            });
+    let completion_resolve_detail =
+        completion_resolve_properties
+            .as_array()
+            .is_some_and(|properties| {
+                properties
+                    .iter()
+                    .any(|property| property.as_str() == Some("detail"))
+            });
     let signature_help_format = preferred_documentation_format(
         &value,
         &[
@@ -3676,6 +4389,8 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
         hierarchical_document_symbols,
         hover_format,
         completion_format,
+        completion_resolve_documentation,
+        completion_resolve_detail,
         signature_help_format,
         folding_range_limit,
         line_folding_only,
@@ -3756,16 +4471,20 @@ mod tests {
     use super::{
         ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
         AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisRequest, AnalysisResult,
-        AnalysisResultValue, BoundedReader, ClientFeatures, DocumentationFormat,
-        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CONFIGURATION_WATCH_PATHS,
-        MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, PriorityQueue,
-        deliver_analysis_result, invalidate_analysis_result,
+        AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
+        CompletionResolutionSeed, CompletionResolutionStore, CompletionResult, DocumentationFormat,
+        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
+        MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES,
+        PendingAnalysis, PriorityQueue, deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
     use crate::workspace::rename::install_snapshot_priority_barrier;
     use crossbeam_channel::RecvTimeoutError;
     use lsp_server::{Connection, Message, RequestId, Response};
-    use lsp_types::{ClientCapabilities, MarkupKind, Position, PrepareRenameResponse, Range, Url};
+    use lsp_types::{
+        ClientCapabilities, CompletionItem, CompletionList, MarkupKind, Position,
+        PrepareRenameResponse, Range, Url,
+    };
     use pascal_project::delphi_overrides::OverrideSession;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
@@ -3791,6 +4510,8 @@ mod tests {
             hierarchical_document_symbols: false,
             hover_format: DocumentationFormat::PlainText,
             completion_format: DocumentationFormat::PlainText,
+            completion_resolve_documentation: false,
+            completion_resolve_detail: false,
             signature_help_format: DocumentationFormat::PlainText,
             folding_range_limit: None,
             line_folding_only: false,
@@ -3821,6 +4542,96 @@ mod tests {
         assert_eq!(
             features.signature_help_format,
             DocumentationFormat::Markdown
+        );
+    }
+
+    fn test_completion_analysis(uri: &Url, index: usize) -> CompletionAnalysis {
+        CompletionAnalysis {
+            uri: uri.clone(),
+            position: Position::new(0, 0),
+            format: MarkupKind::PlainText,
+            resolve_documentation: true,
+            resolve_detail: true,
+            value: Ok(CompletionResult {
+                list: CompletionList {
+                    is_incomplete: false,
+                    items: vec![CompletionItem {
+                        label: format!("Candidate{index}"),
+                        ..CompletionItem::default()
+                    }],
+                },
+                seeds: vec![CompletionResolutionSeed::test_new(uri.clone(), index)],
+            }),
+        }
+    }
+
+    #[test]
+    fn completion_resolution_store_rejects_tampering_and_foreign_entries() {
+        let uri = Url::parse("file:///completion-store.pas").expect("completion URI");
+        let mut owner = CompletionResolutionStore::new();
+        let item = owner
+            .register(test_completion_analysis(&uri, 0), 1, 1, &[])
+            .expect("store registration")
+            .items
+            .into_iter()
+            .next()
+            .expect("stored item");
+
+        let mut tampered = item.clone();
+        tampered.data = Some(serde_json::json!({
+            "version": 1,
+            "token": "not-the-issued-token",
+            "proof": "not-the-issued-proof"
+        }));
+        let error = owner
+            .request(&tampered)
+            .expect_err("tampered resolve data must be rejected");
+        assert!(error.contains("stale") || error.contains("tampered"));
+
+        let foreign = CompletionResolutionStore::new();
+        let error = foreign
+            .request(&item)
+            .expect_err("foreign resolve data must be rejected");
+        assert!(error.contains("foreign") || error.contains("evicted"));
+
+        let oversized = CompletionItem {
+            data: Some(serde_json::json!({
+                "version": 1,
+                "token": "x".repeat(MAX_COMPLETION_RESOLUTION_DATA_BYTES),
+                "proof": "x"
+            })),
+            ..CompletionItem::default()
+        };
+        let error = owner
+            .request(&oversized)
+            .expect_err("oversized resolve data must be rejected");
+        assert!(error.contains("bounded size"));
+    }
+
+    #[test]
+    fn completion_resolution_store_evicts_the_oldest_entry() {
+        let uri = Url::parse("file:///completion-store-eviction.pas").expect("completion URI");
+        let mut store = CompletionResolutionStore::new();
+        let mut first = None;
+        let mut last = None;
+        for index in 0..=super::MAX_COMPLETION_RESOLUTION_ENTRIES {
+            let output = store
+                .register(test_completion_analysis(&uri, index), 1, 1, &[])
+                .expect("bounded store registration");
+            if index == 0 {
+                first = output.items.first().cloned();
+            }
+            last = output.items.first().cloned();
+        }
+        let first = first.expect("first stored item");
+        let last = last.expect("last stored item");
+        assert!(
+            store.request(&first).is_err(),
+            "oldest completion entry must be evicted"
+        );
+        assert!(
+            store.request(&last).is_ok(),
+            "newest entry must remain usable"
         );
     }
 
@@ -3901,13 +4712,18 @@ mod tests {
 
     fn assert_completion_was_computed(result: &AnalysisResult) {
         match &result.value {
-            AnalysisResultValue::Completion(Ok(completion)) => {
+            AnalysisResultValue::Completion(CompletionAnalysis {
+                value: Ok(completion),
+                ..
+            }) => {
                 assert!(
-                    !completion.items.is_empty(),
+                    !completion.list.items.is_empty(),
                     "the computed completion result must not be empty"
                 );
             }
-            AnalysisResultValue::Completion(Err(error)) => {
+            AnalysisResultValue::Completion(CompletionAnalysis {
+                value: Err(error), ..
+            }) => {
                 panic!("completion worker failed before delivery: {error}");
             }
             _ => panic!("expected a completion result"),
@@ -4041,6 +4857,8 @@ mod tests {
                 uri: main_uri,
                 position,
                 format: MarkupKind::Markdown,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             AssistanceRequestKind::SignatureHelp => AnalysisRequest::SignatureHelp {
                 uri: main_uri,
@@ -4877,6 +5695,8 @@ mod tests {
                 uri: main_uri.clone(),
                 position: Position::new(7, 5),
                 format: MarkupKind::Markdown,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             &workspace,
             symbol_client_features(),
@@ -4893,6 +5713,8 @@ mod tests {
                 uri: main_uri.clone(),
                 position: Position::new(7, 5),
                 format: MarkupKind::Markdown,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             &workspace,
             symbol_client_features(),
@@ -5751,6 +6573,8 @@ mod tests {
                 uri: main_uri.clone(),
                 position: Position::new(5, 24),
                 format: MarkupKind::Markdown,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             &workspace,
             symbol_client_features(),
@@ -5759,7 +6583,10 @@ mod tests {
         let completion = jobs.receiver.recv().expect("computed completion result");
         assert!(matches!(
             &completion.value,
-            AnalysisResultValue::Completion(Ok(value)) if value.items.is_empty()
+            AnalysisResultValue::Completion(CompletionAnalysis {
+                value: Ok(CompletionResult { list, .. }),
+                ..
+            }) if list.items.is_empty()
         ));
         jobs.sender
             .send(completion)

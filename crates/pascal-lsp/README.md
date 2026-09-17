@@ -204,6 +204,19 @@ from an unrelated type or global declaration. Rename remains conservative and
 rejects inherited class-member references until the complete override model is
 available.
 
+The server advertises `completionProvider.resolveProvider`. Completion metadata
+is negotiated independently: `documentation` and `detail` are deferred only
+when the client lists the corresponding property in
+`completionItem.resolveSupport.properties`; unsupported properties are computed
+eagerly for compatibility. Deferred `completionItem/resolve` runs in the
+analysis worker and returns the negotiated documentation format. The server
+issues bounded opaque, session-local data and resolves the exact declaration
+URI/index captured for the item. It restores the original label, kind, edits,
+`insertText`, filtering, and sorting fields instead of trusting presentation
+changes made by the client; resolution never adds or changes edits. Missing,
+tampered, foreign, evicted, stale, or ambiguous identities fail conservatively
+so the client can request completion again.
+
 Signature help reports every supported source declaration, including overloads.
 When source-resolved argument types identify one exact, safe widening, or safe
 class upcast match, `active_signature` identifies that overload while retaining
@@ -867,7 +880,11 @@ parameters, and 256 KiB of aggregate signature metadata. Completion reports
 item truncation as `isIncomplete` and fails closed when context traversal cannot
 finish; typed `with` context traversal is capped at 64 nested contexts and also
 reports incomplete rather than guessing. Signature help fails closed when its
-bounded parser or output limit is exceeded.
+bounded parser or output limit is exceeded. Deferred completion state retains
+at most 2,048 items and 8 MiB in one server session, with compact dependency
+observations capped at 1,024 records and 2 MiB. Resolve data is capped at 512
+bytes per item and retained completion items at 64 KiB; oldest entries are
+evicted to stay within the bounds.
 
 Linting and formatting reject syntax trees deeper than 256 levels to protect
 their recursive analysis pipelines. Navigation uses iterative tree walks. LSP

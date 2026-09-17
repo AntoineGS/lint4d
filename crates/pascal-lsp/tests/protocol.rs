@@ -18281,6 +18281,193 @@ fn blocked_navigation_does_not_block_unrelated_lsp_requests() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn unrelated_open_document_change_does_not_discard_blocked_navigation_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let unrelated = root.join("Unrelated.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    let unrelated_source = "unit Unrelated;\ninterface\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+    write_file(&unrelated, unrelated_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("unrelated-open-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated),
+                "languageId": "pascal",
+                "version": 1,
+                "text": unrelated_source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&unrelated), "version": 2},
+            "contentChanges": [{"text": format!("{unrelated_source}{{$IFDEF UNRELATED}}\n") }]
+        }),
+    );
+
+    barrier.release();
+    let locations = result_locations(server.response(&request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn requested_open_document_change_discards_blocked_navigation_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let first_source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    let second_source =
+        first_source.replace("procedure Run;", "procedure Changed;\nprocedure Run;");
+    write_file(&main, first_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_source
+            }
+        }),
+    );
+
+    let request_id = RequestId::from("requested-open-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, first_source, "Run", 0),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("requested source change must stale the result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn changed_imported_provider_discards_blocked_navigation_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let changed_provider_source = provider_source.replace("PublicRoutine", "ChangedRoutine");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("changed-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "PublicRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    write_file(&provider, &changed_provider_source);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&provider), "type": 2}]}),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("changed provider must stale the result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_configuration_change_does_not_discard_blocked_formatting_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let unrelated = root.join("unrelated");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    let unrelated_config = unrelated.join(".lint4d.toml");
+    write_file(&main, source);
+
+    let (mut server, barrier) = TestServer::launch_with_formatting_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("unrelated-configuration-formatting".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    barrier.wait_until_entered();
+
+    write_file(&unrelated_config, "[rules]\nconstant-naming = \"off\"\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&unrelated_config), "type": 1}]}),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "unrelated configuration must not stale formatting: {response:?}"
+    );
+    assert!(response.result.is_some());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn blocked_formatting_does_not_block_unrelated_lsp_requests() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");

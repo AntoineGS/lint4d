@@ -114,12 +114,24 @@ distinct-position references and edits are never silently merged. Explicit
 cancellation removes queued work immediately, and shutdown drains queued
 client requests with cancellation responses before stopping workers.
 
-Results are checked against the captured source/configuration generations and
-filesystem/configuration read set; diagnostics also verify the open-document
-version. A stale navigation or formatting result is rejected for retry, while
-a stale or cancelled diagnostic is silently discarded. Cancelling a navigation
-or formatting request returns the standard LSP `RequestCanceled` error
-(`-32800`) exactly once.
+Results are checked against the worker's captured source/configuration read set
+and the live workspace's cheap dependency change stamps; diagnostics also
+verify the open-document version. Hover, completion, signature help,
+declaration/definition/implementation/type-definition navigation, document
+symbols, document highlights, formatting, and diagnostics can survive an
+unrelated open-file or configuration change when their recorded source,
+provider, project metadata, lint/fmt configuration, and negative membership
+observations are unchanged. Empty results retain the same dependency and
+absence checks. Requested sources, imported providers, consumed configuration,
+project selection, and workspace-folder changes invalidate the result.
+
+Workspace symbols, references, prepare/rename, code actions, and code-action
+resolution remain conservative: any source/configuration generation change
+rejects them because their completeness or mutation target may depend on
+workspace-wide membership. A stale navigation or formatting result is rejected
+for retry, while a stale or cancelled diagnostic is silently discarded.
+Cancelling a navigation or formatting request returns the standard LSP
+`RequestCanceled` error (`-32800`) exactly once.
 
 ### Open-document synchronization
 

@@ -598,6 +598,10 @@ pub struct Workspace {
     analysis_records: Option<HashMap<Url, rename::SourceRecord>>,
     source_generation: u64,
     configuration_generation: u64,
+    source_change_generations: HashMap<Url, u64>,
+    configuration_change_generations: HashMap<Url, u64>,
+    global_source_change_generation: u64,
+    global_configuration_change_generation: u64,
 }
 
 impl Workspace {
@@ -1196,6 +1200,7 @@ impl Workspace {
         self.pending_diagnostics.remove(uri);
         if was_open {
             self.bump_source_generation();
+            self.mark_source_change(uri, false);
             self.open_document_contexts.remove(uri);
             self.disk_stamps.remove(uri);
             self.refresh_loaded_disk(uri);
@@ -1211,6 +1216,7 @@ impl Workspace {
         context_key: ContextKey,
     ) -> Result<(), String> {
         self.bump_source_generation();
+        self.mark_source_change(&uri, false);
         let text_len = text.len();
         let source_for_index = text.clone();
         if let Some(previous) = self.open_documents.get(&uri) {
@@ -1238,6 +1244,7 @@ impl Workspace {
 
     fn reject_open_document(&mut self, uri: Url, version: i32, reason: String) {
         self.bump_source_generation();
+        self.mark_source_change(&uri, false);
         if let Some(previous) = self.open_documents.get(&uri) {
             if let Some(previous_text) = &previous.text {
                 self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
@@ -1298,6 +1305,7 @@ impl Workspace {
 
     fn advance_document_version(&mut self, uri: &Url, version: i32) {
         self.bump_source_generation();
+        self.mark_source_change(uri, false);
         if let Some(document) = self.open_documents.get_mut(uri) {
             document.version = version;
         }
@@ -1336,10 +1344,12 @@ impl Workspace {
             .is_ok_and(|path| is_immutable_override_file(&path));
         if !override_changed {
             self.bump_source_generation();
+            self.mark_source_change(uri, true);
         }
         let configuration_changed = is_configuration_path(uri);
         if configuration_changed && !override_changed {
             self.bump_configuration_generation();
+            self.mark_configuration_change(uri, true);
         }
         self.invalidate_metadata_for_uri(uri);
         self.invalidate_directory_for_uri(uri);
@@ -1380,6 +1390,7 @@ impl Workspace {
     ) {
         self.bump_source_generation();
         self.bump_configuration_generation();
+        self.mark_global_change();
         self.clear_legacy_route_proofs();
         for removed in removed {
             let removed = absolute_path(removed);
@@ -4712,12 +4723,119 @@ impl Workspace {
             .map(|document| document.version)
     }
 
+    /// Check a completed dependency-scoped read-only computation against the
+    /// live protocol state without touching the filesystem. Worker-side
+    /// revalidation still checks the captured payload; this second pass only
+    /// uses changes observed by the protocol loop and immutable in-memory
+    /// overlay/index state.
+    pub(crate) fn dependency_scoped_result_is_fresh(
+        &self,
+        source_generation: u64,
+        configuration_generation: u64,
+        records: &[rename::SourceRecord],
+    ) -> Result<(), String> {
+        if records.is_empty()
+            && (source_generation != self.source_generation
+                || configuration_generation != self.configuration_generation)
+        {
+            return Err("analysis read set was empty after workspace state changed".to_string());
+        }
+        if self.global_source_change_generation > source_generation
+            || self.global_configuration_change_generation > configuration_generation
+        {
+            return Err("workspace structure changed while resolving the request".to_string());
+        }
+
+        for record in records {
+            let dependency_uri = record
+                .path
+                .as_ref()
+                .and_then(|path| Url::from_file_path(absolute_path(path.clone())).ok())
+                .unwrap_or_else(|| canonical_file_uri(&record.uri));
+            if self
+                .source_change_generations
+                .get(&dependency_uri)
+                .is_some_and(|generation| *generation > source_generation)
+                || self
+                    .configuration_change_generations
+                    .get(&dependency_uri)
+                    .is_some_and(|generation| *generation > configuration_generation)
+            {
+                return Err(format!(
+                    "analysis dependency changed while resolving {}; retry the request",
+                    record.uri
+                ));
+            }
+
+            if record.open {
+                let Some(document) = self.open_documents.get(&record.uri) else {
+                    return Err(format!(
+                        "open document disappeared while resolving {}; retry the request",
+                        record.uri
+                    ));
+                };
+                let Some(text) = document.text.as_deref() else {
+                    return Err(format!(
+                        "open document became unreadable while resolving {}; retry the request",
+                        record.uri
+                    ));
+                };
+                if document.version != record.version.unwrap_or_default()
+                    || record
+                        .content_hash
+                        .is_some_and(|expected| content_hash_bytes(text.as_bytes()) != expected)
+                    || record.content_hash.is_none() && text != record.text
+                {
+                    return Err(format!(
+                        "source changed while resolving {}; retry the request",
+                        record.uri
+                    ));
+                }
+            } else if record.path.is_none()
+                && record
+                    .stamp
+                    .as_ref()
+                    .zip(self.disk_stamps.get(&dependency_uri))
+                    .is_some_and(|(expected, current)| expected != current)
+            {
+                return Err(format!(
+                    "closed source changed while resolving {}; retry the request",
+                    record.uri
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn bump_source_generation(&mut self) {
         self.source_generation = self.source_generation.wrapping_add(1);
     }
 
     fn bump_configuration_generation(&mut self) {
         self.configuration_generation = self.configuration_generation.wrapping_add(1);
+    }
+
+    fn mark_source_change(&mut self, uri: &Url, include_parent: bool) {
+        mark_dependency_change(
+            &mut self.source_change_generations,
+            uri,
+            self.source_generation,
+            include_parent,
+        );
+    }
+
+    fn mark_configuration_change(&mut self, uri: &Url, include_parent: bool) {
+        mark_dependency_change(
+            &mut self.configuration_change_generations,
+            uri,
+            self.configuration_generation,
+            include_parent,
+        );
+    }
+
+    fn mark_global_change(&mut self) {
+        self.global_source_change_generation = self.source_generation;
+        self.global_configuration_change_generation = self.configuration_generation;
     }
 
     fn warn(&mut self, message: String) {
@@ -5327,6 +5445,30 @@ pub(crate) fn canonical_file_uri(uri: &Url) -> Url {
         .ok()
         .and_then(|path| Url::from_file_path(absolute_path(path)).ok())
         .unwrap_or_else(|| uri.clone())
+}
+
+fn mark_dependency_change(
+    changes: &mut HashMap<Url, u64>,
+    uri: &Url,
+    generation: u64,
+    include_parent: bool,
+) {
+    let uri = canonical_file_uri(uri);
+    changes.insert(uri.clone(), generation);
+    if !include_parent {
+        return;
+    }
+    let Ok(path) = uri.to_file_path() else {
+        return;
+    };
+    let path = absolute_path(path);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(parent_uri) = Url::from_file_path(parent) else {
+        return;
+    };
+    changes.insert(canonical_file_uri(&parent_uri), generation);
 }
 
 pub(crate) fn path_stamp_result(path: &Path) -> io::Result<Option<PathStamp>> {

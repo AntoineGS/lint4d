@@ -243,6 +243,7 @@ impl Workspace {
     fn invalidate_project_selection(&mut self) {
         self.bump_source_generation();
         self.bump_configuration_generation();
+        self.mark_global_change();
         self.index = NavigationIndex::new();
         self.cached_documents.clear();
         self.indexed_files.clear();

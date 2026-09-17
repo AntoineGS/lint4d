@@ -1880,15 +1880,41 @@ fn diagnostic_features() -> ClientFeatures {
     }
 }
 
+fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRecord]) -> bool {
+    !records.is_empty()
+        && matches!(
+            value,
+            AnalysisResultValue::Hover(_)
+                | AnalysisResultValue::Completion(_)
+                | AnalysisResultValue::SignatureHelp(_)
+                | AnalysisResultValue::Navigation(_)
+                | AnalysisResultValue::Formatting(_)
+                | AnalysisResultValue::Diagnostics(_)
+                | AnalysisResultValue::TypeDefinitions(_)
+                | AnalysisResultValue::DocumentSymbols { .. }
+                | AnalysisResultValue::DocumentHighlights(_)
+        )
+}
+
 fn deliver_analysis_result(
     connection: &Connection,
     workspace: &mut Workspace,
     result: AnalysisResult,
     client_id: Option<RequestId>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if result.source_generation != workspace.source_generation()
-        || result.configuration_generation != workspace.configuration_generation()
-    {
+    let stale = if is_dependency_scoped_result(&result.value, &result.records) {
+        workspace
+            .dependency_scoped_result_is_fresh(
+                result.source_generation,
+                result.configuration_generation,
+                &result.records,
+            )
+            .is_err()
+    } else {
+        result.source_generation != workspace.source_generation()
+            || result.configuration_generation != workspace.configuration_generation()
+    };
+    if stale {
         if let AnalysisResultValue::Diagnostics(diagnostics) = &result.value {
             workspace.reschedule_diagnostics(diagnostics.uri.clone());
             return Ok(());

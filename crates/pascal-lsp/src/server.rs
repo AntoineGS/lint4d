@@ -15,7 +15,9 @@ use crate::workspace::{
     parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, unbounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded, unbounded,
+};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionItem,
@@ -33,6 +35,7 @@ use lsp_types::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -68,6 +71,7 @@ const MAX_INTERACTIVE_BURST: usize = 3;
 const MAX_DIAGNOSTIC_BURST: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+const OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
@@ -101,6 +105,251 @@ const MAX_PARTIAL_RESULT_BYTES_PER_CHUNK: usize = 64 * 1024;
 const MAX_PARTIAL_RESULT_ITEM_BYTES: usize = MAX_PARTIAL_RESULT_BYTES_PER_CHUNK;
 const MAX_PARTIAL_RESULT_CHUNKS_PER_TURN: usize = 1;
 const MAX_OUTBOUND_MESSAGES: usize = 32;
+/// Messages accepted by the protocol loop but not yet accepted by the
+/// transport writer are retained here.  Partial-result data is deliberately
+/// limited to a small prefix of this queue so terminal responses and
+/// cancellation/progress control messages always have reserved capacity.
+const MAX_PENDING_OUTBOUND_MESSAGES: usize = 128;
+const MAX_PENDING_OUTBOUND_DATA_MESSAGES: usize = 16;
+const MAX_PENDING_OUTBOUND_CONTROL_MESSAGES: usize =
+    MAX_PENDING_OUTBOUND_MESSAGES - MAX_PENDING_OUTBOUND_DATA_MESSAGES;
+const MAX_PENDING_OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_OUTBOUND_CONTROL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PARTIAL_DELIVERY_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+enum OutputError {
+    Disconnected,
+    Backpressure,
+    Encoding(String),
+}
+
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => formatter.write_str("LSP writer disconnected"),
+            Self::Backpressure => formatter
+                .write_str("LSP output queue is full; the client did not drain the connection"),
+            Self::Encoding(error) => {
+                write!(formatter, "could not encode outbound LSP message: {error}")
+            }
+        }
+    }
+}
+
+impl Error for OutputError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundClass {
+    Data,
+    Control,
+}
+
+#[derive(Debug)]
+struct PendingOutboundMessage {
+    message: Message,
+    bytes: usize,
+    class: OutboundClass,
+}
+
+#[derive(Debug, Default)]
+struct OutboundQueue {
+    pending: VecDeque<PendingOutboundMessage>,
+    pending_bytes: usize,
+    pending_data_messages: usize,
+    pending_control_messages: usize,
+    pending_control_bytes: usize,
+}
+
+impl OutboundQueue {
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn flush(&mut self, sender: &Sender<Message>) -> Result<(), OutputError> {
+        while let Some(pending) = self.pending.front() {
+            match sender.try_send(pending.message.clone()) {
+                Ok(()) => {
+                    let pending = self.pending.pop_front().expect("pending message exists");
+                    self.pending_bytes = self.pending_bytes.saturating_sub(pending.bytes);
+                    match pending.class {
+                        OutboundClass::Data => {
+                            self.pending_data_messages =
+                                self.pending_data_messages.saturating_sub(1);
+                        }
+                        OutboundClass::Control => {
+                            self.pending_control_messages =
+                                self.pending_control_messages.saturating_sub(1);
+                            self.pending_control_bytes =
+                                self.pending_control_bytes.saturating_sub(pending.bytes);
+                        }
+                    }
+                }
+                Err(TrySendError::Full(_)) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => return Err(OutputError::Disconnected),
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue(
+        &mut self,
+        sender: &Sender<Message>,
+        message: Message,
+        class: OutboundClass,
+    ) -> Result<bool, OutputError> {
+        self.flush(sender)?;
+        let bytes = serde_json::to_vec(&message)
+            .map_err(|error| OutputError::Encoding(error.to_string()))?
+            .len();
+        let total_messages = self
+            .pending_data_messages
+            .saturating_add(self.pending_control_messages);
+        let total_bytes = self.pending_bytes.saturating_add(bytes);
+        if total_messages >= MAX_PENDING_OUTBOUND_MESSAGES
+            || total_bytes > MAX_PENDING_OUTBOUND_BYTES
+        {
+            return match class {
+                OutboundClass::Data => Ok(false),
+                OutboundClass::Control => Err(OutputError::Backpressure),
+            };
+        }
+        if class == OutboundClass::Data
+            && self.pending_data_messages >= MAX_PENDING_OUTBOUND_DATA_MESSAGES
+        {
+            return Ok(false);
+        }
+        if class == OutboundClass::Control
+            && (self.pending_control_messages >= MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
+                || self.pending_control_bytes.saturating_add(bytes)
+                    > MAX_PENDING_OUTBOUND_CONTROL_BYTES)
+        {
+            return Err(OutputError::Backpressure);
+        }
+
+        self.pending.push_back(PendingOutboundMessage {
+            message,
+            bytes,
+            class,
+        });
+        self.pending_bytes = total_bytes;
+        match class {
+            OutboundClass::Data => self.pending_data_messages += 1,
+            OutboundClass::Control => {
+                self.pending_control_messages += 1;
+                self.pending_control_bytes = self.pending_control_bytes.saturating_add(bytes);
+            }
+        }
+        self.flush(sender)?;
+        Ok(true)
+    }
+}
+
+/// Protocol output is accepted without blocking the event loop.  The
+/// production wrapper retains a bounded, ordered queue in front of the
+/// transport channel; the plain `Connection` implementation keeps the
+/// memory-connection unit tests lightweight.
+trait ProtocolSender {
+    fn send_control(&self, message: Message) -> Result<(), OutputError>;
+    fn send_data(&self, message: Message) -> Result<bool, OutputError>;
+}
+
+impl ProtocolSender for Connection {
+    fn send_control(&self, message: Message) -> Result<(), OutputError> {
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(OutputError::Backpressure),
+            Err(TrySendError::Disconnected(_)) => Err(OutputError::Disconnected),
+        }
+    }
+
+    fn send_data(&self, message: Message) -> Result<bool, OutputError> {
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(OutputError::Disconnected),
+        }
+    }
+}
+
+struct ProtocolConnection {
+    connection: Connection,
+    outbound: RefCell<OutboundQueue>,
+}
+
+impl ProtocolConnection {
+    fn new(connection: Connection) -> Self {
+        Self {
+            connection,
+            outbound: RefCell::new(OutboundQueue::default()),
+        }
+    }
+
+    fn initialize_start(&self) -> Result<(RequestId, Value), lsp_server::ProtocolError> {
+        self.connection.initialize_start()
+    }
+
+    fn initialize_finish(
+        &self,
+        initialize_id: RequestId,
+        initialize_result: Value,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_control(Message::Response(Response::new_ok(
+            initialize_id,
+            initialize_result,
+        )))
+        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        match self.receiver().recv() {
+            Ok(Message::Notification(notification)) if notification.method == "initialized" => {
+                Ok(())
+            }
+            Ok(message) => {
+                Err(format!("expected initialized notification, got: {message:?}").into())
+            }
+            Err(_) => Err("LSP client disconnected during initialization".into()),
+        }
+    }
+
+    fn receiver(&self) -> &Receiver<Message> {
+        &self.connection.receiver
+    }
+
+    fn flush(&self) -> Result<(), OutputError> {
+        self.outbound.borrow_mut().flush(&self.connection.sender)
+    }
+
+    fn has_pending_output(&self) -> bool {
+        self.outbound.borrow().has_pending()
+    }
+
+    fn drain_until(&self, deadline: Instant) -> Result<(), OutputError> {
+        while self.has_pending_output() {
+            self.flush()?;
+            if !self.has_pending_output() || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
+        }
+        self.flush()
+    }
+}
+
+impl ProtocolSender for ProtocolConnection {
+    fn send_control(&self, message: Message) -> Result<(), OutputError> {
+        self.outbound.borrow_mut().enqueue(
+            &self.connection.sender,
+            message,
+            OutboundClass::Control,
+        )?;
+        Ok(())
+    }
+
+    fn send_data(&self, message: Message) -> Result<bool, OutputError> {
+        self.outbound
+            .borrow_mut()
+            .enqueue(&self.connection.sender, message, OutboundClass::Data)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalysisPriority {
@@ -1402,7 +1651,7 @@ impl ConfigurationCoordinator {
 
     fn on_initialized(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if self.initialized {
             return Ok(());
@@ -1413,7 +1662,7 @@ impl ConfigurationCoordinator {
 
     fn handle_notification(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
         notification: &Notification,
     ) -> Result<DiagnosticNotificationEffect, Box<dyn Error + Send + Sync>> {
@@ -1436,7 +1685,7 @@ impl ConfigurationCoordinator {
 
     fn request_refresh(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if !self.pull_supported || !self.initialized {
             return Ok(());
@@ -1451,7 +1700,7 @@ impl ConfigurationCoordinator {
 
     fn send_pending(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if !self.pull_supported
             || !self.initialized
@@ -1472,7 +1721,7 @@ impl ConfigurationCoordinator {
                 section: Some(RUNTIME_CONFIGURATION_SECTION.to_string()),
             }],
         };
-        connection.sender.send(Message::Request(Request::new(
+        connection.send_control(Message::Request(Request::new(
             id.clone(),
             "workspace/configuration".to_string(),
             serde_json::to_value(params)?,
@@ -1488,7 +1737,7 @@ impl ConfigurationCoordinator {
 
     fn handle_response(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
         response: &Response,
     ) -> Result<Option<DiagnosticNotificationEffect>, Box<dyn Error + Send + Sync>> {
@@ -1764,6 +2013,14 @@ impl PartialResultPayload {
         Ok(bytes)
     }
 
+    fn retained_bytes(&self) -> Result<usize, String> {
+        let mut bytes = size_of::<Self>();
+        for index in 0..self.len() {
+            bytes = bytes.saturating_add(self.item_json_len(index)?);
+        }
+        Ok(bytes)
+    }
+
     fn chunk(&self, start: usize) -> Result<Option<(usize, Value)>, String> {
         if start >= self.len() {
             return Ok(None);
@@ -1811,6 +2068,83 @@ struct PartialDeliveryRecipient {
 }
 
 #[derive(Debug)]
+struct PartialDeliveryValidation {
+    input: Arc<rename::RevalidationInput>,
+    records: Arc<Vec<SourceRecord>>,
+    cancellation: Arc<AtomicBool>,
+    receiver: Option<Receiver<Result<(), String>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PartialDeliveryValidation {
+    fn new(
+        input: Arc<rename::RevalidationInput>,
+        records: Arc<Vec<SourceRecord>>,
+    ) -> Result<Self, String> {
+        let mut validation = Self {
+            input,
+            records,
+            cancellation: Arc::new(AtomicBool::new(false)),
+            receiver: None,
+            handle: None,
+        };
+        validation.request()?;
+        Ok(validation)
+    }
+
+    fn request(&mut self) -> Result<(), String> {
+        if self.receiver.is_some() || self.handle.is_some() {
+            return Err("partial result freshness validation is already running".to_string());
+        }
+        let (sender, receiver) = bounded(1);
+        let input = Arc::clone(&self.input);
+        let records = Arc::clone(&self.records);
+        let cancellation = Arc::clone(&self.cancellation);
+        let handle = thread::Builder::new()
+            .name("PascalLspPartialValidation".to_string())
+            .spawn(move || {
+                let result = rename::revalidate_revalidation_input(
+                    &input,
+                    records.as_slice(),
+                    &cancellation,
+                );
+                let _ = sender.send(result);
+            })
+            .map_err(|error| format!("could not start partial result validation: {error}"))?;
+        self.receiver = Some(receiver);
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<Result<(), String>> {
+        let receiver = self.receiver.as_ref()?;
+        let result = match receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(
+                "partial result freshness validation worker disconnected".to_string(),
+            )),
+        }?;
+        self.receiver = None;
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                return Some(Err(
+                    "partial result freshness validation worker panicked".to_string()
+                ));
+            }
+        }
+        Some(result)
+    }
+}
+
+impl Drop for PartialDeliveryValidation {
+    fn drop(&mut self) {
+        self.cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
 struct PartialDelivery {
     job_id: AnalysisComputationId,
     source_generation: u64,
@@ -1818,6 +2152,8 @@ struct PartialDelivery {
     payload: PartialResultPayload,
     recipients: Vec<PartialDeliveryRecipient>,
     next_recipient: usize,
+    retained_bytes: usize,
+    validation: PartialDeliveryValidation,
 }
 
 fn partial_payload_from_result(
@@ -1839,6 +2175,38 @@ fn is_partial_result_value(value: &AnalysisResultValue) -> bool {
         value,
         AnalysisResultValue::WorkspaceSymbols(_) | AnalysisResultValue::References(_)
     )
+}
+
+fn source_records_retained_bytes(records: &[SourceRecord]) -> usize {
+    records
+        .iter()
+        .fold(size_of::<SourceRecord>(), |total, record| {
+            total
+                .saturating_add(record.uri.as_str().len())
+                .saturating_add(record.text.len())
+                .saturating_add(
+                    record
+                        .path
+                        .as_ref()
+                        .map_or(0, |path| path.as_os_str().len()),
+                )
+                .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::len))
+                .saturating_add(
+                    record
+                        .auto_import_scopes
+                        .iter()
+                        .map(|scope| {
+                            scope.root.as_os_str().len()
+                                + scope.provider_units.iter().map(String::len).sum::<usize>()
+                                + scope
+                                    .candidate_prefixes
+                                    .iter()
+                                    .map(String::len)
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>(),
+                )
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -1897,7 +2265,7 @@ impl ProgressTracker {
 
     fn begin_client(
         &mut self,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
         job_id: AnalysisJobId,
         recipient: &ClientRecipient,
         title: &str,
@@ -1933,9 +2301,10 @@ impl ProgressTracker {
 
     fn start_server(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         job_id: AnalysisJobId,
         title: &str,
+        partial_tokens: &HashMap<ProgressToken, (AnalysisComputationId, RequestId)>,
     ) -> Result<(), String> {
         if !self.server_supported
             || self
@@ -1947,15 +2316,21 @@ impl ProgressTracker {
         {
             return Ok(());
         }
-        let token_number = self
-            .next_token
-            .checked_add(1)
-            .ok_or_else(|| "progress token space exhausted".to_string())?;
-        self.next_token = token_number;
-        let token = ProgressToken::String(format!("{PROGRESS_TOKEN_PREFIX}{token_number}"));
-        if self.tokens.contains_key(&token) {
-            return Ok(());
-        }
+        let token = loop {
+            let token_number = self
+                .next_token
+                .checked_add(1)
+                .ok_or_else(|| "progress token space exhausted".to_string())?;
+            self.next_token = token_number;
+            let token = ProgressToken::String(format!("{PROGRESS_TOKEN_PREFIX}{token_number}"));
+            if partial_tokens.contains_key(&token) {
+                continue;
+            }
+            if self.tokens.contains_key(&token) {
+                return Ok(());
+            }
+            break token;
+        };
         let request_number = self
             .next_create_id
             .checked_add(1)
@@ -1979,7 +2354,7 @@ impl ProgressTracker {
             "window/workDoneProgress/create".to_string(),
             serde_json::json!({"token": token}),
         );
-        if let Err(error) = connection.sender.send(Message::Request(request)) {
+        if let Err(error) = connection.send_control(Message::Request(request)) {
             self.creates.remove(&create_id);
             self.remove_token(&token);
             return Err(error.to_string());
@@ -1987,7 +2362,11 @@ impl ProgressTracker {
         Ok(())
     }
 
-    fn report_started(&self, connection: &Connection, job_id: AnalysisJobId) -> Result<(), String> {
+    fn report_started(
+        &self,
+        connection: &dyn ProtocolSender,
+        job_id: AnalysisJobId,
+    ) -> Result<(), String> {
         let tokens = self
             .entries
             .get(&job_id)
@@ -2004,7 +2383,7 @@ impl ProgressTracker {
 
     fn report_started_recipient(
         &self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         job_id: AnalysisJobId,
         request_id: &RequestId,
     ) -> Result<(), String> {
@@ -2035,7 +2414,7 @@ impl ProgressTracker {
 
     fn handle_create_response(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         response: &Response,
     ) -> Result<bool, String> {
         let Some((job_id, token)) = self.creates.remove(&response.id) else {
@@ -2066,7 +2445,7 @@ impl ProgressTracker {
 
     fn finish_recipient(
         &mut self,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
         job_id: AnalysisJobId,
         request_id: &RequestId,
         message: Option<&str>,
@@ -2092,7 +2471,7 @@ impl ProgressTracker {
 
     fn finish_job(
         &mut self,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
         job_id: AnalysisJobId,
         message: Option<&str>,
     ) -> Result<(), String> {
@@ -2119,7 +2498,7 @@ impl ProgressTracker {
 
     fn finish_target(
         &mut self,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
         job_id: AnalysisJobId,
         token: &ProgressToken,
         message: Option<&str>,
@@ -2167,7 +2546,7 @@ impl ProgressTracker {
         }
     }
 
-    fn shutdown(&mut self, connection: Option<&Connection>) -> Result<(), String> {
+    fn shutdown(&mut self, connection: Option<&dyn ProtocolSender>) -> Result<(), String> {
         let jobs = self.entries.keys().copied().collect::<Vec<_>>();
         for job_id in jobs {
             self.finish_job(connection, job_id, Some("Cancelled"))?;
@@ -2183,14 +2562,13 @@ impl ProgressTracker {
 }
 
 fn send_progress_begin(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     token: &ProgressToken,
     title: &str,
     message: &str,
 ) -> Result<(), String> {
     connection
-        .sender
-        .send(Message::Notification(Notification::new(
+        .send_control(Message::Notification(Notification::new(
             "$/progress".to_string(),
             serde_json::json!({
                 "token": token,
@@ -2206,13 +2584,12 @@ fn send_progress_begin(
 }
 
 fn send_progress_report(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     token: &ProgressToken,
     message: &str,
 ) -> Result<(), String> {
     connection
-        .sender
-        .send(Message::Notification(Notification::new(
+        .send_control(Message::Notification(Notification::new(
             "$/progress".to_string(),
             serde_json::json!({
                 "token": token,
@@ -2227,7 +2604,7 @@ fn send_progress_report(
 }
 
 fn send_progress_end(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     token: &ProgressToken,
     message: Option<&str>,
 ) -> Result<(), String> {
@@ -2236,8 +2613,7 @@ fn send_progress_end(
         None => serde_json::json!({"kind": "end"}),
     };
     connection
-        .sender
-        .send(Message::Notification(Notification::new(
+        .send_control(Message::Notification(Notification::new(
             "$/progress".to_string(),
             serde_json::json!({"token": token, "value": value}),
         )))
@@ -3429,7 +3805,19 @@ impl AnalysisJobs {
                 QueuedAnalysis::Diagnostic(_) => 0,
             })
             .sum::<usize>();
-        running.saturating_add(queued)
+        let delivering = self
+            .partial_deliveries
+            .iter()
+            .map(|delivery| delivery.recipients.len())
+            .sum::<usize>();
+        running.saturating_add(queued).saturating_add(delivering)
+    }
+
+    fn partial_delivery_bytes(&self) -> usize {
+        self.partial_deliveries
+            .iter()
+            .map(|delivery| delivery.retained_bytes)
+            .sum()
     }
 
     fn start_diagnostics(&mut self, uri: Url, _workspace: &Workspace) -> Result<(), String> {
@@ -3456,7 +3844,7 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
         work_done_token: Option<ProgressToken>,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
         self.enqueue_client_with_partial(
             id,
@@ -3478,7 +3866,7 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
         tokens: AnalysisProgressTokens,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
         if self.shutting_down {
             return Err("analysis server is shutting down".to_string());
@@ -3529,7 +3917,9 @@ impl AnalysisJobs {
             }
 
             if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
-                if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS {
+                if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+                    || self.partial_tokens.len() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+                {
                     return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
                 }
                 let recipient = ClientRecipient {
@@ -3562,6 +3952,7 @@ impl AnalysisJobs {
         }
 
         if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+            || self.partial_tokens.len() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
             || self.queue.len() >= MAX_CLIENT_ANALYSIS_QUEUE
         {
             return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
@@ -3681,7 +4072,7 @@ impl AnalysisJobs {
     }
 
     fn send_client_error(
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
         ids: impl IntoIterator<Item = RequestId>,
         code: ErrorCode,
         message: &str,
@@ -3699,7 +4090,7 @@ impl AnalysisJobs {
     fn supersede_client(
         &mut self,
         primary_id: &AnalysisComputationId,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
         if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
@@ -3764,7 +4155,7 @@ impl AnalysisJobs {
         Ok(())
     }
 
-    fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<(), String> {
+    fn cancel(&mut self, connection: &dyn ProtocolSender, id: &RequestId) -> Result<(), String> {
         let Some(primary_id) = self.request_to_job.get(id).cloned() else {
             return Ok(());
         };
@@ -3895,7 +4286,7 @@ impl AnalysisJobs {
 
     fn cancel_progress(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         token: &ProgressToken,
     ) -> Result<(), String> {
         let Some(target) = self.progress.target(token) else {
@@ -3934,7 +4325,7 @@ impl AnalysisJobs {
 
     fn handle_progress_response(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         response: &Response,
     ) -> Result<bool, String> {
         self.progress.handle_create_response(connection, response)
@@ -3942,7 +4333,7 @@ impl AnalysisJobs {
 
     fn cancel_diagnostics_for_with_connection(
         &mut self,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
         uris: &[Url],
     ) -> Result<(), String> {
         loop {
@@ -3983,7 +4374,7 @@ impl AnalysisJobs {
 
     fn refresh_diagnostics_with_connection(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
         uris: &[Url],
     ) -> Result<(), String> {
@@ -3997,7 +4388,7 @@ impl AnalysisJobs {
     fn pump(
         &mut self,
         workspace: &Workspace,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Vec<DispatchFailure> {
         if self.shutting_down {
             return Vec::new();
@@ -4067,6 +4458,7 @@ impl AnalysisJobs {
                                     connection,
                                     AnalysisJobId::Diagnostic(id),
                                     "Indexing workspace",
+                                    &self.partial_tokens,
                                 ) {
                                     failures.push(DispatchFailure {
                                         recipients: Vec::new(),
@@ -4098,7 +4490,7 @@ impl AnalysisJobs {
     fn handle_dispatch_failures(
         &mut self,
         failures: Vec<DispatchFailure>,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
         let mut first_error = None;
         for failure in failures {
@@ -4144,7 +4536,7 @@ impl AnalysisJobs {
 
     fn finish_partial_recipient(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         job_id: AnalysisComputationId,
         recipient: &PartialDeliveryRecipient,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -4166,7 +4558,7 @@ impl AnalysisJobs {
 
     fn fail_client_recipients(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         job_id: AnalysisComputationId,
         recipients: Vec<ClientRecipient>,
         code: ErrorCode,
@@ -4190,7 +4582,7 @@ impl AnalysisJobs {
 
     fn fail_partial_delivery(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         delivery: PartialDelivery,
         code: ErrorCode,
         message: &str,
@@ -4208,7 +4600,7 @@ impl AnalysisJobs {
     }
 
     fn send_bulk_result(
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         id: RequestId,
         payload: &PartialResultPayload,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -4220,7 +4612,7 @@ impl AnalysisJobs {
 
     fn start_partial_delivery(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         workspace: &Workspace,
         result: AnalysisResult,
         recipients: Vec<ClientRecipient>,
@@ -4239,11 +4631,18 @@ impl AnalysisJobs {
         let AnalysisResult {
             source_generation,
             configuration_generation,
+            records,
             value,
             ..
         } = result;
         let Some(payload) = partial_payload_from_result(value) else {
-            return Err("partial result was attached to an unsupported analysis".into());
+            return self.fail_client_recipients(
+                connection,
+                primary_id,
+                recipients,
+                ErrorCode::RequestFailed,
+                "partial result was attached to an unsupported analysis",
+            );
         };
         let payload = match payload {
             Ok(payload) => payload,
@@ -4266,6 +4665,7 @@ impl AnalysisJobs {
         };
 
         let mut partial_recipients = Vec::new();
+        let mut ordinary_recipients = Vec::new();
         for recipient in recipients {
             if let Some(token) = recipient.partial_result_token.clone() {
                 if payload.len() == 0 {
@@ -4288,21 +4688,91 @@ impl AnalysisJobs {
                     });
                 }
             } else {
-                Self::send_bulk_result(connection, recipient.id.clone(), &payload)?;
-                self.remove_client_mapping(&recipient.id, &primary_id);
-                self.release_partial_token(&recipient);
-                self.progress
-                    .finish_recipient(
-                        Some(connection),
-                        AnalysisJobId::Client(primary_id),
-                        &recipient.id,
-                        None,
-                    )
-                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                ordinary_recipients.push(recipient);
             }
         }
 
+        for recipient in ordinary_recipients {
+            Self::send_bulk_result(connection, recipient.id.clone(), &payload)?;
+            self.remove_client_mapping(&recipient.id, &primary_id);
+            self.release_partial_token(&recipient);
+            self.progress
+                .finish_recipient(
+                    Some(connection),
+                    AnalysisJobId::Client(primary_id),
+                    &recipient.id,
+                    None,
+                )
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        }
+
         if !partial_recipients.is_empty() {
+            let revalidation_input = Arc::new(workspace.revalidation_input());
+            let partial_failure = payload.retained_bytes().map(|payload_bytes| {
+                payload_bytes
+                    .saturating_add(source_records_retained_bytes(&records))
+                    .saturating_add(revalidation_input.retained_bytes())
+            });
+            let retained_bytes = match partial_failure {
+                Ok(retained_bytes) => retained_bytes,
+                Err(error) => {
+                    let recipients = partial_recipients
+                        .into_iter()
+                        .map(|recipient| ClientRecipient {
+                            id: recipient.id,
+                            work_done_token: None,
+                            partial_result_token: Some(recipient.token),
+                        })
+                        .collect();
+                    return self.fail_client_recipients(
+                        connection,
+                        primary_id,
+                        recipients,
+                        ErrorCode::RequestFailed,
+                        &error,
+                    );
+                }
+            };
+            if self.partial_delivery_bytes().saturating_add(retained_bytes)
+                > MAX_PARTIAL_DELIVERY_BYTES
+            {
+                let recipients = partial_recipients
+                    .into_iter()
+                    .map(|recipient| ClientRecipient {
+                        id: recipient.id,
+                        work_done_token: None,
+                        partial_result_token: Some(recipient.token),
+                    })
+                    .collect();
+                return self.fail_client_recipients(
+                    connection,
+                    primary_id,
+                    recipients,
+                    ErrorCode::RequestFailed,
+                    "partial result delivery capacity is full; retry the request",
+                );
+            }
+            let records = Arc::new(records);
+            let validation = match PartialDeliveryValidation::new(revalidation_input, records) {
+                Ok(validation) => validation,
+                Err(error) => {
+                    let recipients = partial_recipients
+                        .into_iter()
+                        .map(|recipient| ClientRecipient {
+                            id: recipient.id,
+                            work_done_token: None,
+                            partial_result_token: Some(recipient.token),
+                        })
+                        .collect();
+                    return self.fail_client_recipients(
+                        connection,
+                        primary_id,
+                        recipients,
+                        ErrorCode::RequestFailed,
+                        &error,
+                    );
+                }
+            };
             self.partial_deliveries.push_back(PartialDelivery {
                 job_id: primary_id,
                 source_generation,
@@ -4310,6 +4780,8 @@ impl AnalysisJobs {
                 payload,
                 recipients: partial_recipients,
                 next_recipient: 0,
+                retained_bytes,
+                validation,
             });
         }
         Ok(())
@@ -4317,7 +4789,7 @@ impl AnalysisJobs {
 
     fn pump_partial_deliveries(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         workspace: &Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         for _ in 0..MAX_PARTIAL_RESULT_CHUNKS_PER_TURN {
@@ -4338,9 +4810,25 @@ impl AnalysisJobs {
             if delivery.recipients.is_empty() {
                 continue;
             }
+            match delivery.validation.poll() {
+                None => {
+                    self.partial_deliveries.push_front(delivery);
+                    return Ok(());
+                }
+                Some(Err(error)) => {
+                    self.fail_partial_delivery(
+                        connection,
+                        delivery,
+                        ErrorCode::RequestFailed,
+                        &format!("analysis result became stale during partial delivery: {error}"),
+                    )?;
+                    continue;
+                }
+                Some(Ok(())) => {}
+            }
             let recipient_index = delivery.next_recipient % delivery.recipients.len();
-            let recipient = &delivery.recipients[recipient_index];
-            let Some((end, value)) = delivery.payload.chunk(recipient.next_item)? else {
+            let next_item = delivery.recipients[recipient_index].next_item;
+            if next_item >= delivery.payload.len() {
                 let recipient = delivery.recipients.remove(recipient_index);
                 send_ok(
                     connection,
@@ -4350,26 +4838,34 @@ impl AnalysisJobs {
                 self.finish_partial_recipient(connection, delivery.job_id, &recipient)?;
                 if !delivery.recipients.is_empty() {
                     delivery.next_recipient %= delivery.recipients.len();
+                    delivery.validation.request()?;
                     self.partial_deliveries.push_back(delivery);
                 }
                 continue;
+            }
+            let (end, value) = match delivery.payload.chunk(next_item) {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => unreachable!("partial result cursor checked above"),
+                Err(error) => {
+                    self.fail_partial_delivery(
+                        connection,
+                        delivery,
+                        ErrorCode::RequestFailed,
+                        &error,
+                    )?;
+                    continue;
+                }
             };
-            if !send_partial_result_chunk(connection, &recipient.token, value)? {
+            let token = delivery.recipients[recipient_index].token.clone();
+            if !send_partial_result_chunk(connection, &token, value)? {
+                delivery.validation.request()?;
                 self.partial_deliveries.push_front(delivery);
                 return Ok(());
             }
             delivery.recipients[recipient_index].next_item = end;
-            if end >= delivery.payload.len() {
-                let recipient = delivery.recipients.remove(recipient_index);
-                send_ok(
-                    connection,
-                    recipient.id.clone(),
-                    delivery.payload.empty_result(),
-                )?;
-                self.finish_partial_recipient(connection, delivery.job_id, &recipient)?;
-            }
             if !delivery.recipients.is_empty() {
                 delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
+                delivery.validation.request()?;
                 self.partial_deliveries.push_back(delivery);
             }
         }
@@ -4378,7 +4874,7 @@ impl AnalysisJobs {
 
     fn poll(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Ok(result) = self.receiver.try_recv() {
@@ -4509,13 +5005,13 @@ impl AnalysisJobs {
 
     fn shutdown_with_connection(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.shutdown_inner(Some(connection))
             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })
     }
 
-    fn shutdown_inner(&mut self, connection: Option<&Connection>) -> Result<(), String> {
+    fn shutdown_inner(&mut self, connection: Option<&dyn ProtocolSender>) -> Result<(), String> {
         if self.shutting_down {
             return Ok(());
         }
@@ -4685,7 +5181,7 @@ fn analysis_result_is_stale(workspace: &Workspace, result: &AnalysisResult) -> b
 }
 
 fn send_partial_result_chunk(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     token: &ProgressToken,
     value: Value,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -4693,16 +5189,14 @@ fn send_partial_result_chunk(
         "$/progress".to_string(),
         serde_json::json!({"token": token, "value": value}),
     ));
-    match connection.sender.try_send(message) {
-        Ok(()) => Ok(true),
-        Err(TrySendError::Full(_)) => Ok(false),
-        Err(TrySendError::Disconnected(_)) => Err("LSP writer disconnected".into()),
-    }
+    connection
+        .send_data(message)
+        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })
 }
 
 #[cfg(test)]
 fn deliver_analysis_result(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     result: AnalysisResult,
     client_id: Option<RequestId>,
@@ -4718,7 +5212,7 @@ fn deliver_analysis_result(
 }
 
 fn deliver_analysis_result_with_store(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     completion_resolutions: &mut CompletionResolutionStore,
     result: AnalysisResult,
@@ -4967,7 +5461,7 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
 }
 
 fn send_analysis_error(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     id: RequestId,
     error: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -4996,11 +5490,24 @@ fn run_stdio_with_config(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let (connection, io_threads) = bounded_stdio();
+    let connection = ProtocolConnection::new(connection);
     let outcome = run_connection(&connection, test_barriers);
+    let shutdown_deadline = Instant::now() + OUTPUT_SHUTDOWN_TIMEOUT;
+    let drain_result = connection.drain_until(shutdown_deadline);
     drop(connection);
-    let success = outcome?;
-    io_threads.join()?;
-    Ok(success)
+    let join_result = io_threads.join_until(shutdown_deadline);
+    match outcome {
+        Ok(success) => {
+            drain_result?;
+            join_result?;
+            Ok(success)
+        }
+        Err(error) => {
+            let _ = join_result;
+            let _ = drain_result;
+            Err(error)
+        }
+    }
 }
 
 struct StdioThreads {
@@ -5009,15 +5516,43 @@ struct StdioThreads {
 }
 
 impl StdioThreads {
-    fn join(self) -> io::Result<()> {
-        match self.reader.join() {
-            Ok(result) => result?,
-            Err(error) => std::panic::panic_any(error),
+    fn join_until(self, deadline: Instant) -> io::Result<()> {
+        let mut reader = Some(self.reader);
+        let mut writer = Some(self.writer);
+        while reader.is_some() || writer.is_some() {
+            if reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                let handle = reader.take().expect("reader handle");
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(error) => std::panic::panic_any(error),
+                }
+            }
+            if writer
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                let handle = writer.take().expect("writer handle");
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(error) => std::panic::panic_any(error),
+                }
+            }
+            if reader.is_none() && writer.is_none() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                // A peer that does not drain stdout must not keep the process
+                // alive indefinitely. Dropping an unfinished JoinHandle
+                // detaches the blocked transport thread; process teardown
+                // then closes the descriptors and bounds shutdown time.
+                return Ok(());
+            }
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
-        match self.writer.join() {
-            Ok(result) => result,
-            Err(error) => std::panic::panic_any(error),
-        }
+        Ok(())
     }
 }
 
@@ -5200,7 +5735,7 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
 }
 
 fn run_connection(
-    connection: &Connection,
+    connection: &ProtocolConnection,
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let (initialize_id, initialize, options) = loop {
@@ -5277,7 +5812,7 @@ fn run_connection(
 }
 
 fn event_loop(
-    connection: &Connection,
+    connection: &ProtocolConnection,
     workspace: &mut Workspace,
     workspace_folders_supported: bool,
     client_features: ClientFeatures,
@@ -5288,6 +5823,7 @@ fn event_loop(
     let mut shutdown_received = false;
     let mut deferred_configuration_messages = VecDeque::new();
     loop {
+        connection.flush()?;
         if let Some(effect) = configuration.poll(workspace)? {
             if let Some(registration) = watcher_registration.as_mut() {
                 sync_file_watcher(connection, workspace, registration)?;
@@ -5301,10 +5837,11 @@ fn event_loop(
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
         }
         jobs.poll(connection, workspace)?;
+        let output_pending = connection.has_pending_output();
         let timeout = workspace
             .next_diagnostic_timeout()
             .unwrap_or(Duration::from_secs(86_400))
-            .min(if jobs.is_empty() {
+            .min(if jobs.is_empty() && !output_pending {
                 Duration::from_secs(86_400)
             } else {
                 ANALYSIS_POLL_INTERVAL
@@ -5332,7 +5869,7 @@ fn event_loop(
                 Some(DeferredConfigurationMessage::Notification(notification)) => {
                     Message::Notification(notification)
                 }
-                None => match connection.receiver.recv_timeout(timeout) {
+                None => match connection.receiver().recv_timeout(timeout) {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
                         if !shutdown_received {
@@ -5349,7 +5886,7 @@ fn event_loop(
                 },
             }
         } else {
-            match connection.receiver.recv_timeout(timeout) {
+            match connection.receiver().recv_timeout(timeout) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
                     if !shutdown_received {
@@ -5654,7 +6191,7 @@ fn event_loop(
 }
 
 fn start_analysis(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     jobs: &mut AnalysisJobs,
     id: RequestId,
@@ -5677,7 +6214,7 @@ fn start_analysis(
 }
 
 fn start_analysis_with_partial(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     jobs: &mut AnalysisJobs,
     id: RequestId,
@@ -5784,7 +6321,7 @@ fn notification_may_change_configuration(method: &str) -> bool {
 }
 
 fn reject_deferred_configuration_request(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     messages: &mut VecDeque<DeferredConfigurationMessage>,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let Some(index) = messages
@@ -5855,7 +6392,7 @@ fn deferred_request_is_current(
 }
 
 fn handle_request(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     request: Request,
     client_features: ClientFeatures,
@@ -6392,7 +6929,7 @@ fn handle_request(
 }
 
 fn handle_notification(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     notification: Notification,
     workspace_folders_supported: bool,
@@ -6522,7 +7059,7 @@ fn handle_notification(
 }
 
 fn publish_due_diagnostics(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -6547,26 +7084,24 @@ fn publish_due_diagnostics(
 }
 
 fn send_diagnostics(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     uri: &Url,
     version: Option<i32>,
     diagnostics: Vec<lsp_types::Diagnostic>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection
-        .sender
-        .send(Message::Notification(Notification::new(
-            "textDocument/publishDiagnostics".to_string(),
-            PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics,
-                version,
-            },
-        )))?;
+    connection.send_control(Message::Notification(Notification::new(
+        "textDocument/publishDiagnostics".to_string(),
+        PublishDiagnosticsParams {
+            uri: uri.clone(),
+            diagnostics,
+            version,
+        },
+    )))?;
     Ok(())
 }
 
 fn register_file_watcher(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     relative_pattern_support: bool,
 ) -> Result<FileWatcherRegistration, Box<dyn Error + Send + Sync>> {
@@ -6595,7 +7130,7 @@ fn register_file_watcher(
 }
 
 fn sync_file_watcher(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     registration: &mut FileWatcherRegistration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -6640,7 +7175,7 @@ fn configuration_watcher(path: &Path) -> FileSystemWatcher {
 }
 
 fn send_file_watcher_registration(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     registration_id: &str,
     request_id: &str,
     watchers: Vec<FileSystemWatcher>,
@@ -6659,7 +7194,7 @@ fn send_file_watcher_registration(
             registrations: vec![registration],
         },
     );
-    connection.sender.send(Message::Request(request))?;
+    connection.send_control(Message::Request(request))?;
     Ok(())
 }
 
@@ -6693,23 +7228,21 @@ fn malformed_did_change_attribution(notification: &Notification) -> Option<(Url,
 }
 
 fn send_ok<T: serde::Serialize>(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     id: RequestId,
     value: T,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection
-        .sender
-        .send(Message::Response(Response::new_ok(id, value)))?;
+    connection.send_control(Message::Response(Response::new_ok(id, value)))?;
     Ok(())
 }
 
 fn send_error(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     id: RequestId,
     code: ErrorCode,
     message: impl Into<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection.sender.send(Message::Response(Response::new_err(
+    connection.send_control(Message::Response(Response::new_err(
         id,
         code as i32,
         message.into(),
@@ -6943,21 +7476,24 @@ fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
 mod tests {
     use super::{
         ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
-        AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisRequest, AnalysisResult,
-        AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
+        AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisProgressTokens, AnalysisRequest,
+        AnalysisResult, AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
         CompletionResolutionSeed, CompletionResolutionStore, CompletionResult, DocumentationFormat,
-        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
-        MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
-        MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES,
-        PendingAnalysis, PriorityQueue, deliver_analysis_result, invalidate_analysis_result,
+        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
+        MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
+        MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
+        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, PartialDelivery,
+        PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload, PendingAnalysis,
+        PriorityQueue, deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
-    use crossbeam_channel::RecvTimeoutError;
-    use lsp_server::{Connection, Message, RequestId, Response};
+    use crossbeam_channel::{RecvTimeoutError, bounded};
+    use lsp_server::{Connection, Message, Notification, RequestId, Response};
     use lsp_types::{
-        ClientCapabilities, CompletionItem, CompletionList, MarkupKind, Position,
-        PrepareRenameResponse, Range, Url,
+        ClientCapabilities, CompletionItem, CompletionList, Location, MarkupKind, Position,
+        PrepareRenameResponse, Range, SymbolInformation, SymbolKind, Url,
     };
     use pascal_project::delphi_overrides::OverrideSession;
     use std::fs;
@@ -7524,6 +8060,138 @@ mod tests {
             ANALYSIS_SUPERSEDED_MESSAGE,
             "request superseded by a newer document version"
         );
+    }
+
+    #[allow(deprecated)]
+    fn boundary_symbol(name_length: usize) -> SymbolInformation {
+        SymbolInformation {
+            name: "x".repeat(name_length),
+            kind: SymbolKind::VARIABLE,
+            tags: None,
+            deprecated: None,
+            location: Location {
+                uri: Url::parse("file:///boundary.pas").expect("boundary URI"),
+                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            },
+            container_name: None,
+        }
+    }
+
+    #[test]
+    fn partial_chunk_accepts_the_exact_encoded_limit_and_rejects_one_byte_over() {
+        let mut name_length = 0;
+        while serde_json::to_vec(&boundary_symbol(name_length))
+            .expect("symbol encoding")
+            .len()
+            + 2
+            <= MAX_PARTIAL_RESULT_BYTES_PER_CHUNK
+        {
+            name_length += 1;
+        }
+        let at_limit = PartialResultPayload::WorkspaceSymbols(Arc::new(vec![boundary_symbol(
+            name_length.saturating_sub(1),
+        )]));
+        let (_, value) = at_limit
+            .chunk(0)
+            .expect("boundary chunk encoding")
+            .expect("boundary chunk");
+        assert_eq!(
+            serde_json::to_vec(&value)
+                .expect("boundary array encoding")
+                .len(),
+            MAX_PARTIAL_RESULT_BYTES_PER_CHUNK
+        );
+
+        let over_limit =
+            PartialResultPayload::WorkspaceSymbols(Arc::new(vec![boundary_symbol(name_length)]));
+        let error = over_limit
+            .chunk(0)
+            .expect_err("one byte over the encoded chunk limit must fail");
+        assert!(error.contains("chunk limit"));
+    }
+
+    #[test]
+    fn bounded_outbound_queue_reserves_control_capacity_when_data_is_full() {
+        let (sender, receiver) = bounded(1);
+        let mut queue = OutboundQueue::default();
+        let data = || {
+            Message::Notification(Notification::new(
+                "$/progress".to_string(),
+                serde_json::json!({"token": "data", "value": [1]}),
+            ))
+        };
+        for _ in 0..=MAX_PENDING_OUTBOUND_DATA_MESSAGES {
+            assert!(
+                queue
+                    .enqueue(&sender, data(), OutboundClass::Data)
+                    .expect("data enqueue")
+            );
+        }
+        assert_eq!(
+            queue.pending_data_messages,
+            MAX_PENDING_OUTBOUND_DATA_MESSAGES
+        );
+        let control = Message::Response(Response::new_ok(
+            RequestId::from("cancel".to_string()),
+            serde_json::Value::Null,
+        ));
+        assert!(
+            queue
+                .enqueue(&sender, control, OutboundClass::Control)
+                .expect("reserved control enqueue")
+        );
+        assert_eq!(queue.pending_control_messages, 1);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn delivering_recipients_consume_the_global_admission_bound() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let source = root.join("Main.pas");
+        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
+        let workspace = test_workspace(vec![root], Default::default());
+        let records = Arc::new(Vec::new());
+        let validation = PartialDeliveryValidation::new(
+            Arc::new(workspace.revalidation_input()),
+            Arc::clone(&records),
+        )
+        .expect("validation worker");
+        let recipients = (0..MAX_CLIENT_ANALYSIS_RECIPIENTS)
+            .map(|index| PartialDeliveryRecipient {
+                id: RequestId::from(format!("delivering-{index}")),
+                token: lsp_types::ProgressToken::String(format!("partial-{index}")),
+                next_item: 0,
+            })
+            .collect();
+        let mut jobs = AnalysisJobs::new();
+        jobs.partial_deliveries.push_back(PartialDelivery {
+            job_id: AnalysisComputationId(0),
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            payload: PartialResultPayload::References(Arc::new(Vec::new())),
+            recipients,
+            next_recipient: 0,
+            retained_bytes: 1,
+            validation,
+        });
+        assert_eq!(
+            jobs.client_recipient_count(),
+            MAX_CLIENT_ANALYSIS_RECIPIENTS
+        );
+        let error = jobs
+            .enqueue_client_with_partial(
+                RequestId::from("after-delivery-bound".to_string()),
+                AnalysisRequest::WorkspaceSymbols {
+                    query: "Main".to_string(),
+                },
+                &workspace,
+                symbol_client_features(),
+                AnalysisProgressTokens::default(),
+                None,
+            )
+            .expect_err("delivering recipients must count toward admission");
+        assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
     }
 
     #[test]

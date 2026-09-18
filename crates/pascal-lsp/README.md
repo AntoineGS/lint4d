@@ -757,6 +757,18 @@ complete safe result. A source or configuration change during delivery stops
 the stream and returns a stale-result error; cancellation likewise stops future
 chunks and returns the request-cancelled error.
 
+Partial delivery is also subject to the global 33-recipient client-analysis
+admission bound: queued, running, coalesced, and already-delivering recipients
+all count, so a request beyond the bound receives a retryable queue-capacity
+error rather than creating unbounded retained work. Retained staged payloads
+are bounded to 64 MiB as well.
+An individual item larger than 64 KiB fails only its own partial request with a
+request-failed error; it does not terminate the LSP session or affect ordinary
+requests. Partial-result data uses nonblocking bounded output with reserved
+capacity for responses, cancellation, and progress control messages. Session
+shutdown performs a bounded output drain instead of waiting indefinitely for a
+client that stopped reading.
+
 After all chunks, the successful final response is an empty array so items are
 not duplicated. Empty results use only that final empty response. Without a
 `partialResultToken`, the ordinary complete array response is unchanged. Partial

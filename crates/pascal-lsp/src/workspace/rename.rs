@@ -116,6 +116,47 @@ pub(crate) struct WorkspaceInput {
     pub(crate) configuration_generation: u64,
 }
 
+/// The small portion of a workspace snapshot needed to revalidate a retained
+/// result after its worker has completed.  Full analysis inputs also retain
+/// parsed documents, ownership maps, and project metadata; keeping those
+/// structures alive for every backpressured partial delivery would defeat the
+/// delivery memory bound.
+#[derive(Debug, Clone)]
+pub(crate) struct RevalidationInput {
+    pub(crate) options: WorkspaceOptions,
+    pub(crate) overlays: HashMap<Url, OverlayInput>,
+}
+
+impl RevalidationInput {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let option_bytes = self
+            .options
+            .source_paths
+            .iter()
+            .map(String::len)
+            .chain(self.options.exclude.iter().map(String::len))
+            .sum::<usize>()
+            .saturating_add(
+                self.options
+                    .project_file
+                    .as_ref()
+                    .map_or(0, |path| path.to_string_lossy().len()),
+            )
+            .saturating_add(self.options.build_config.as_ref().map_or(0, String::len))
+            .saturating_add(self.options.platform.as_ref().map_or(0, String::len));
+        let overlay_bytes = self.overlays.iter().fold(0usize, |total, (uri, overlay)| {
+            total
+                .saturating_add(uri.as_str().len())
+                .saturating_add(overlay.text.len())
+                .saturating_add(std::mem::size_of::<OverlayInput>())
+        });
+        std::mem::size_of::<Self>()
+            .saturating_add(std::mem::size_of::<WorkspaceOptions>())
+            .saturating_add(option_bytes)
+            .saturating_add(overlay_bytes)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SourceRecord {
     pub(crate) uri: Url,
@@ -667,6 +708,27 @@ impl BaselineAccumulator {
 }
 
 impl Workspace {
+    pub(crate) fn revalidation_input(&self) -> RevalidationInput {
+        let overlays = self
+            .open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                let text = document.text.as_ref()?.clone();
+                Some((
+                    canonical_file_uri(uri),
+                    OverlayInput {
+                        text,
+                        version: document.version,
+                    },
+                ))
+            })
+            .collect();
+        RevalidationInput {
+            options: self.options.clone(),
+            overlays,
+        }
+    }
+
     pub(crate) fn analysis_input(&self) -> WorkspaceInput {
         let overlays = self
             .open_documents
@@ -860,6 +922,23 @@ pub(crate) fn revalidate_input(
     records: &[SourceRecord],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    revalidate_records(&input.options, &input.overlays, records, cancel)
+}
+
+pub(crate) fn revalidate_revalidation_input(
+    input: &RevalidationInput,
+    records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    revalidate_records(&input.options, &input.overlays, records, cancel)
+}
+
+fn revalidate_records(
+    options: &WorkspaceOptions,
+    overlays: &HashMap<Url, OverlayInput>,
+    records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     for record in records {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -869,7 +948,7 @@ pub(crate) fn revalidate_input(
             continue;
         }
         if record.open {
-            let Some(overlay) = input.overlays.get(&record.uri) else {
+            let Some(overlay) = overlays.get(&record.uri) else {
                 return Err(format!(
                     "open document disappeared while resolving {}; retry the request",
                     record.uri
@@ -903,7 +982,7 @@ pub(crate) fn revalidate_input(
             matches!(&path_entry.provenance, ProjectPathProvenance::LegacyNative);
         let current = read_disk_source(
             &path,
-            input.options.limits.max_file_bytes,
+            options.limits.max_file_bytes,
             read_policy,
             path_entry,
             allow_legacy_payload,
@@ -918,8 +997,7 @@ pub(crate) fn revalidate_input(
             || current.text != record.text,
             |expected| expected != current.content_hash,
         ) || parsed_source_changed(record, &current.text);
-        let overlay_changed = input
-            .overlays
+        let overlay_changed = overlays
             .get(&record.uri)
             .is_some_and(|overlay| overlay.text != current.text);
         if disk_stamp(&path) != record.stamp || content_changed || overlay_changed {

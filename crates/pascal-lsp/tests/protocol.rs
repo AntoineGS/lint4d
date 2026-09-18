@@ -468,6 +468,49 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_workspace_symbols_and_diagnostics_barriers(
+        environment: TempDir,
+    ) -> (Self, TestBarrier, TestBarrier) {
+        let workspace_directory = environment.path().join("workspace-symbols-barrier");
+        let diagnostics_directory = environment.path().join("diagnostics-barrier");
+        fs::create_dir_all(&workspace_directory).expect("workspace-symbols barrier directory");
+        fs::create_dir_all(&diagnostics_directory).expect("diagnostics barrier directory");
+        let workspace_symbols = TestBarrier {
+            entered: workspace_directory.join("entered"),
+            release: workspace_directory.join("release"),
+        };
+        let diagnostics = TestBarrier {
+            entered: diagnostics_directory.join("entered"),
+            release: diagnostics_directory.join("release"),
+        };
+        let workspace_symbols_value = format!(
+            "{}|{}",
+            workspace_symbols.entered.display(),
+            workspace_symbols.release.display()
+        );
+        let diagnostics_value = format!(
+            "{}|{}",
+            diagnostics.entered.display(),
+            diagnostics.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                (
+                    "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER",
+                    workspace_symbols_value.as_str(),
+                ),
+                (
+                    "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER",
+                    diagnostics_value.as_str(),
+                ),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, workspace_symbols, diagnostics)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_barrier(environment: TempDir, variable: &str) -> (Self, TestBarrier) {
         let barrier_directory = environment.path().join("analysis-barrier");
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
@@ -2635,6 +2678,17 @@ fn workspace_symbol_partial_result_string_token_chunks_without_final_duplicates(
                     !value.is_empty(),
                     "non-empty output must use non-empty chunks"
                 );
+                assert!(
+                    value.len() <= 128,
+                    "partial result chunk exceeds the item bound"
+                );
+                assert!(
+                    serde_json::to_vec(value)
+                        .expect("partial result chunk must encode")
+                        .len()
+                        <= 64 * 1024,
+                    "partial result chunk exceeds the encoded byte bound"
+                );
                 partial_items.extend(value.iter().cloned());
             }
             Message::Response(response) if response.id == partial_id => {
@@ -2663,6 +2717,90 @@ fn workspace_symbol_partial_result_string_token_chunks_without_final_duplicates(
         .expect("ordinary array")
         .clone();
     assert_eq!(partial_items, ordinary);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn oversized_partial_item_fails_only_its_request_and_keeps_the_session_alive() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(
+        &source,
+        &format!(
+            "unit Main; interface var Symbol{}: Integer; implementation end.\n",
+            "x".repeat(70_000)
+        ),
+    );
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let partial_id = RequestId::from("oversized-partial".to_string());
+    server.send_request(
+        partial_id.clone(),
+        "workspace/symbol",
+        json!({
+            "query": "Symbol",
+            "partialResultToken": "oversized-partial-token",
+            "workDoneToken": "oversized-work-done"
+        }),
+    );
+
+    let mut progress_kinds = Vec::new();
+    let response = loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                if notification.params["token"] == "oversized-work-done" {
+                    progress_kinds.push(
+                        notification.params["value"]["kind"]
+                            .as_str()
+                            .expect("work-done progress kind")
+                            .to_owned(),
+                    );
+                }
+            }
+            Message::Response(response) if response.id == partial_id => break response,
+            other => server.pending.push_back(other),
+        }
+    };
+    assert_eq!(
+        response
+            .error
+            .expect("oversized partial request must fail")
+            .code,
+        -32803
+    );
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "oversized-work-done");
+    assert_eq!(end["value"]["kind"], "end");
+    progress_kinds.push(
+        end["value"]["kind"]
+            .as_str()
+            .expect("work-done end kind")
+            .to_owned(),
+    );
+    assert_eq!(progress_kinds, ["begin", "report", "end"]);
+
+    let healthy_id = RequestId::from("healthy-after-oversized".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "the oversized partial request must not terminate the session: {healthy:?}"
+    );
+    assert_eq!(
+        healthy
+            .result
+            .expect("healthy symbol result")
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     server.shutdown();
 }
 
@@ -2954,6 +3092,136 @@ fn source_change_between_partial_chunks_fails_without_a_successful_final_respons
     assert_eq!(error.code, -32803);
     assert!(error.message.contains("stale"));
     server.assert_no_response(&id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unnotified_disk_change_between_workspace_symbol_chunks_fails_closed() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 3_000));
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("unnotified-disk-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "disk-symbols"}),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "disk-symbols");
+    write_file(&source, "unit Main; interface implementation end.\n");
+
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("unnotified disk change must fail the partial request");
+    assert_eq!(error.code, -32803);
+    assert!(
+        response.result.is_none(),
+        "stale delivery must not claim success"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unnotified_disk_change_between_reference_chunks_fails_closed() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = format!(
+        "unit Main;\ninterface\nvar Target: Integer;\nimplementation\nprocedure Run;\nbegin\n{}end;\nend.\n",
+        "Target := Target + 1;\n".repeat(1_000)
+    );
+    write_file(&source, &text);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("unnotified-disk-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "position": {"line": 2, "character": 5},
+            "context": {"includeDeclaration": true},
+            "partialResultToken": "disk-references"
+        }),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "disk-references");
+    write_file(&source, "unit Main; interface implementation end.\n");
+
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("unnotified disk change must fail the partial request");
+    assert_eq!(error.code, -32803);
+    assert!(
+        response.result.is_none(),
+        "stale delivery must not claim success"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn generated_work_done_tokens_avoid_active_partial_tokens() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = workspace_symbol_source("Main", 1_000);
+    write_file(&source, &text);
+    let (mut server, workspace_symbols, diagnostics) =
+        TestServer::launch_with_workspace_symbols_and_diagnostics_barriers(environment);
+    server.initialize_with_progress(&root);
+
+    let request_id = RequestId::from("generated-token-collision".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/symbol",
+        json!({
+            "query": "Symbol",
+            "partialResultToken": "pascal-lsp-progress-1"
+        }),
+    );
+    workspace_symbols.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let create = server.request("window/workDoneProgress/create");
+    let generated_token = create.params["token"].clone();
+    assert_ne!(
+        generated_token,
+        json!("pascal-lsp-progress-1"),
+        "server progress allocation must reserve the partial-token namespace"
+    );
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], generated_token);
+    assert_eq!(begin["value"]["kind"], "begin");
+
+    workspace_symbols.release();
+    diagnostics.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none()
+            || response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == -32803),
+        "partial request must terminate after the controlled state change: {response:?}"
+    );
     server.shutdown();
 }
 

@@ -1577,6 +1577,10 @@ impl ConfigurationCoordinator {
         self.preparation.is_busy()
     }
 
+    fn can_coalesce_configuration_notifications(&self) -> bool {
+        self.pull_supported
+    }
+
     fn deferred_request_revision(&self) -> u64 {
         self.apply_revision
     }
@@ -4138,7 +4142,8 @@ fn event_loop(
                 if configuration.is_preparing()
                     && notification_requires_configuration_ordering(&notification.method) =>
             {
-                let coalesce = notification.method == "workspace/didChangeConfiguration"
+                let coalesce = configuration.can_coalesce_configuration_notifications()
+                    && notification.method == "workspace/didChangeConfiguration"
                     && matches!(
                         deferred_configuration_messages.back(),
                         Some(DeferredConfigurationMessage::Notification(previous))

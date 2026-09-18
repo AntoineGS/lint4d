@@ -1,3 +1,4 @@
+pub mod conditional;
 pub mod config_discovery;
 pub mod directive_fragment_rewrite;
 pub mod directives;
@@ -9,6 +10,10 @@ pub mod node_kind;
 pub mod parser;
 pub mod text;
 pub mod types;
+
+pub mod resolver;
+
+pub use resolver::*;
 
 pub use pascal_project::delphi_overrides;
 

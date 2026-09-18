@@ -156,11 +156,20 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cfg-pascal"
 version = "0.1.0"
-source = "git+https://github.com/AntoineGS/cfg-pascal.git#110ee97d136a25c67aa2603d8ee7e7f51ec5e79d"
+source = "git+https://github.com/AntoineGS/cfg-pascal.git?rev=208d6743c61e0b391195958270a5e04e3a4328d4#208d6743c61e0b391195958270a5e04e3a4328d4"
 dependencies = [
  "cfg-core",
+ "cfg-tree-sitter-pascal",
  "tree-sitter",
- "tree-sitter-pascal 0.10.2",
+]
+
+[[package]]
+name = "cfg-tree-sitter-pascal"
+version = "0.11.0"
+source = "git+https://github.com/AntoineGS/cfg-pascal.git?rev=208d6743c61e0b391195958270a5e04e3a4328d4#208d6743c61e0b391195958270a5e04e3a4328d4"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]
@@ -728,7 +737,6 @@ name = "lint4d"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
- "cfg-core",
  "cfg-pascal",
  "clap",
  "criterion",
@@ -736,6 +744,7 @@ dependencies = [
  "insta",
  "owo-colors",
  "pascal-core",
+ "pascal-project",
  "petgraph",
  "predicates",
  "quick-xml",
@@ -746,7 +755,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-language",
- "tree-sitter-pascal 0.11.0",
+ "tree-sitter-pascal",
  "walkdir",
  "winreg",
  "xxhash-rust",
@@ -857,7 +866,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-language",
- "tree-sitter-pascal 0.11.0",
+ "tree-sitter-pascal",
  "walkdir",
  "winreg",
 ]
@@ -1361,16 +1370,6 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
-
-[[package]]
-name = "tree-sitter-pascal"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb51e9a57493fd237e4517566749f7f7453349261a72a427e5f11d3b34b72a8"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
 
 [[package]]
 name = "tree-sitter-pascal"

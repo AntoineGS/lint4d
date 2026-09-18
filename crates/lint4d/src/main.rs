@@ -3,15 +3,23 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{CommandFactory, Parser};
+use lint4d::cfg::{CfgSnapshotOptions, CfgSnapshotStatus, to_cfg_project_snapshot};
 use lint4d::config::Config;
 use lint4d::config::baseline::Baseline;
 use lint4d::discovery::discover_files;
 use lint4d::discovery::dproj::parse_dproj;
-use lint4d::engine::{FileInfo, Severity, run_lint_with_context};
+use lint4d::engine::{FileInfo, Severity, run_lint_with_cfg_project};
 use lint4d::fix::fix_file;
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;
 use lint4d::rules::RuleRegistry;
+use lint4d::rules::helpers::extract_unit_name;
+use pascal_core::node_kind as K;
+use pascal_core::parser::{node_text, parse_file};
+use pascal_core::resolver::{
+    FilesystemSourceStore, ImportSection, ImportSite, NoCancellation, ResolverLimits, UnitResolver,
+};
+use pascal_project::{ProjectContext, ProjectOptions};
 use rayon::prelude::*;
 
 /// Exit codes
@@ -268,8 +276,9 @@ fn real_main() {
         Err(e) => exit_err(&format!("config error: {}", e), EXIT_ERROR),
     };
 
-    let project_context = resolve_dcu_context(&cli, &config);
     let files = discover_source_files(&cli, &config);
+    let dcu_project = resolve_dcu_context(&cli, &config);
+    let source_project = resolve_source_project(&cli, &config, &files);
 
     // --fix-fmt: run fix pipeline instead of lint pipeline
     if cli.fix_fmt {
@@ -277,7 +286,15 @@ fn real_main() {
         return;
     }
 
-    run_lint_pipeline(&cli, &config, &cwd, files, project_context, threshold);
+    run_lint_pipeline(
+        &cli,
+        &config,
+        &cwd,
+        files,
+        dcu_project,
+        source_project,
+        threshold,
+    );
 }
 
 /// Validates CLI arguments and returns the parsed severity threshold.
@@ -393,13 +410,195 @@ fn discover_source_files(cli: &Cli, config: &Config) -> Vec<FileInfo> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SourceProject {
+    context: ProjectContext,
+    roots: Vec<PathBuf>,
+    configuration_id: String,
+}
+
+fn lint_project_file(
+    file: &FileInfo,
+    source: &[u8],
+    config: &Config,
+    dcu_project: Option<&lint4d::dcu::ProjectContext>,
+    source_project: &SourceProject,
+    registry: &RuleRegistry,
+) -> Option<Vec<lint4d::engine::Diagnostic>> {
+    let (tree, _) = parse_file(file, source).ok()?;
+    let unit_name = extract_unit_name(tree.root_node(), source)?;
+    let sites = resolver_import_sites(tree.root_node(), source);
+    let path = lexical_absolute(&file.path);
+    let mut resolver = UnitResolver::new(
+        source_project.context.clone(),
+        source_project.roots.clone(),
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let project = match resolver.resolve_project_from_source(
+        &path,
+        &unit_name,
+        &sites,
+        None,
+        &NoCancellation,
+    ) {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!(
+                "lint4d: warning: could not resolve source project for {}: {}; using file-local CFG",
+                file.path.display(),
+                error
+            );
+            return None;
+        }
+    };
+    let options = CfgSnapshotOptions {
+        prepare_configured_sources: true,
+        configuration_id: Some(source_project.configuration_id.clone()),
+        preparation_environment: cfg_pascal::PreparationEnvironment::Complete,
+        initial_defined_symbols: source_project.context.defines.clone(),
+        initial_undefined_symbols: Vec::new(),
+        preparation_limits: cfg_pascal::PreparationLimits::default(),
+    };
+    let snapshot = match to_cfg_project_snapshot(project, options) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!(
+                "lint4d: warning: could not build project CFG for {}: {}; using file-local CFG",
+                file.path.display(),
+                error
+            );
+            return None;
+        }
+    };
+    for warning in &snapshot.resolution.warnings {
+        eprintln!(
+            "lint4d: warning: source-project resolution for {}: {warning}",
+            file.path.display()
+        );
+    }
+    if let CfgSnapshotStatus::Incomplete { reason } = &snapshot.status {
+        eprintln!(
+            "lint4d: warning: source-project CFG for {} is incomplete: {reason}",
+            file.path.display()
+        );
+    }
+    Some(run_lint_with_cfg_project(
+        file,
+        source,
+        config,
+        dcu_project,
+        Some(&snapshot),
+        registry,
+    ))
+}
+
+fn resolver_import_sites(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportSite> {
+    fn visit(
+        node: tree_sitter::Node<'_>,
+        in_uses: bool,
+        source: &[u8],
+        sites: &mut Vec<ImportSite>,
+    ) {
+        let in_uses = in_uses || node.kind() == K::DECL_USES;
+        if in_uses && node.kind() == K::MODULE_NAME {
+            sites.push(ImportSite {
+                byte_range: node.byte_range(),
+                requested_name: node_text(node, source),
+                section: ImportSection::Module,
+            });
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(child, in_uses, source, sites);
+        }
+    }
+
+    let mut sites = Vec::new();
+    visit(root, false, source, &mut sites);
+    sites
+}
+
+/// Discover source-project metadata once. Each worker still creates its own
+/// resolver/store session, so no mutable resolver state crosses Rayon tasks.
+fn resolve_source_project(cli: &Cli, config: &Config, files: &[FileInfo]) -> Option<SourceProject> {
+    let project_file = cli.project.as_ref()?;
+    let project_file = lexical_absolute(project_file);
+    let root = project_file.parent()?.to_path_buf();
+    let options = ProjectOptions {
+        project_file: Some(project_file.clone()),
+        build_config: cli
+            .build_config
+            .clone()
+            .or_else(|| config.build_config().map(str::to_string)),
+        platform: cli
+            .platform
+            .clone()
+            .or_else(|| config.platform().map(str::to_string)),
+        source_paths: Vec::new(),
+    };
+    let probe = files
+        .first()
+        .map(|file| lexical_absolute(&file.path))
+        .unwrap_or_else(|| root.join("__lint4d_project_probe__.pas"));
+    let context = match ProjectContext::discover(&probe, std::slice::from_ref(&root), &options) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!(
+                "lint4d: warning: source project discovery failed for {}: {}; using file-local CFG",
+                project_file.display(),
+                error
+            );
+            return None;
+        }
+    };
+    for warning in &context.warnings {
+        eprintln!("lint4d: warning: {warning}");
+    }
+    let configuration_id = format!(
+        "config={};platform={}",
+        context.config.as_deref().unwrap_or_default(),
+        context.platform.as_deref().unwrap_or_default()
+    );
+    Some(SourceProject {
+        context,
+        roots: vec![root],
+        configuration_id,
+    })
+}
+
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                result.push(component.as_os_str())
+            }
+            std::path::Component::Normal(value) => result.push(value),
+        }
+    }
+    result
+}
+
 /// Runs the parallel lint pipeline: lints files, applies baseline, formats output, exits.
 fn run_lint_pipeline(
     cli: &Cli,
     config: &Config,
     cwd: &Path,
     files: Vec<FileInfo>,
-    project_context: Option<lint4d::dcu::ProjectContext>,
+    dcu_project: Option<lint4d::dcu::ProjectContext>,
+    source_project: Option<SourceProject>,
     threshold: Severity,
 ) {
     if files.is_empty() {
@@ -413,7 +612,7 @@ fn run_lint_pipeline(
     // Build the rule registry once and share across all files.
     let registry = RuleRegistry::new();
 
-    if project_context.is_none() {
+    if dcu_project.is_none() {
         for rule in registry.all_rules() {
             if rule.requires_context() {
                 eprintln!(
@@ -429,9 +628,37 @@ fn run_lint_pipeline(
     let mut file_results: Vec<_> = files
         .par_iter()
         .filter_map(|file| {
-            let source = fs::read(&file.path).ok()?;
-            let diagnostics =
-                run_lint_with_context(file, &source, config, project_context.as_ref(), &registry);
+            let raw_source = fs::read(&file.path).ok()?;
+            let source = analysis_source_bytes(&raw_source);
+            let diagnostics = if let Some(source_project) = source_project.as_ref() {
+                match lint_project_file(
+                    file,
+                    &source,
+                    config,
+                    dcu_project.as_ref(),
+                    source_project,
+                    &registry,
+                ) {
+                    Some(diagnostics) => diagnostics,
+                    None => run_lint_with_cfg_project(
+                        file,
+                        &source,
+                        config,
+                        dcu_project.as_ref(),
+                        None,
+                        &registry,
+                    ),
+                }
+            } else {
+                run_lint_with_cfg_project(
+                    file,
+                    &source,
+                    config,
+                    dcu_project.as_ref(),
+                    None,
+                    &registry,
+                )
+            };
             Some((file.path.to_string_lossy().to_string(), source, diagnostics))
         })
         .collect();
@@ -529,6 +756,15 @@ fn run_fix_fmt(files: &[FileInfo], config: &Config) {
         }
         eprintln!("Fixed {} identifier(s) in {}", count, path.display());
     }
+}
+
+/// Keep parser, resolver ranges, CFG snapshots, and CLI output in one UTF-8
+/// coordinate space while the request-scoped resolver retains raw disk bytes
+/// for payload hashes and revision validation.
+fn analysis_source_bytes(raw_source: &[u8]) -> Vec<u8> {
+    pascal_core::decode_bytes(raw_source)
+        .into_owned()
+        .into_bytes()
 }
 
 fn run_generate_baseline(

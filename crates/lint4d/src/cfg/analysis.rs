@@ -1,6 +1,7 @@
 use cfg_core::call_graph::CallGraph;
 use cfg_core::summary::ProcId;
 use cfg_core::types::Cfg;
+use cfg_pascal::cfg_core;
 use std::collections::HashMap;
 
 use crate::dcu::ProjectContext;

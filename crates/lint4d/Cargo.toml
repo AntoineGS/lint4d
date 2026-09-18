@@ -18,8 +18,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 rayon = "1"
-cfg-core = { git = "https://github.com/AntoineGS/cfg-core.git" }
-cfg-pascal = { git = "https://github.com/AntoineGS/cfg-pascal.git" }
+cfg-pascal = { git = "https://github.com/AntoineGS/cfg-pascal.git", rev = "208d6743c61e0b391195958270a5e04e3a4328d4" }
+# cfg-core is intentionally not a direct dependency: lint4d uses the
+# cfg-pascal public re-export for all cfg-core types, preserving one crate
+# identity. Cargo.lock pins the transitive git revision.
 petgraph = "0.7"
 owo-colors = { version = "4", features = ["supports-colors"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -28,6 +30,7 @@ walkdir = "2"
 quick-xml = "0.37"
 tempfile = "3"
 pascal-core = { path = "../pascal-core" }
+pascal-project = { path = "../pascal-project" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

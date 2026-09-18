@@ -5,6 +5,7 @@ use tree_sitter::Tree;
 use crate::cfg::analysis::AnalysisContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
+use cfg_pascal::cfg_core;
 
 pub struct UseAfterFreeRule {
     meta: RuleMeta,

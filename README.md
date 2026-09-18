@@ -53,6 +53,13 @@ Lint from a Delphi project file:
 lint4d --project MyApp.dproj
 ```
 
+With `--project`, lint4d reads the `.dproj` source references and also enables
+bounded project-aware source resolution for CFG analysis. If project metadata,
+imports, or includes are incomplete, lint4d reports a warning and keeps the
+file-local CFG path instead of inventing cross-unit facts. The resolver and
+CFG/LSP ownership boundaries are described in the [shared resolver integration
+guide](docs/shared-resolver-architecture.md).
+
 List all available rules:
 
 ```sh
@@ -223,7 +230,13 @@ For rules that require type information (`field-not-freed`, `field-reassign-leak
 lint4d --dcu-path build/dcu/Win64/Release src/
 ```
 
-The `--dcu-path` flag can be repeated to specify multiple directories. When using `--project`, DCU paths are read from the `.dproj` file automatically. You can also override the target platform and build configuration:
+The `--dcu-path` flag can be repeated to specify multiple directories. DCU
+directories use the priority `--dcu-path` values, then `.lint4d.toml` `dcu_paths`,
+then project/BDS auto-discovery. With `--project`, `--platform` and
+`--build-config` select the source-project configuration as well as the DCU
+auto-discovery context; without `--project` those three project-context flags
+have no effect (and lint4d warns). `--bds-path` only overrides the RAD Studio
+root used by DCU auto-discovery.
 
 ```sh
 lint4d --project MyApp.dproj --platform Win64 --build-config Release

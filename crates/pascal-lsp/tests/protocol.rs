@@ -13,7 +13,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-#[cfg(feature = "test-support")]
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -376,7 +375,7 @@ impl TestServer {
             .env("XDG_CONFIG_HOME", environment.join("config"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .envs(variables)
             .spawn()
             .expect("launch pascal-lsp test server");
@@ -395,7 +394,7 @@ impl TestServer {
             .env("XDG_CONFIG_HOME", environment.join("config"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .envs(variable.into_iter().zip(value))
             .spawn()
             .expect("launch pascal-lsp");
@@ -551,7 +550,6 @@ impl TestServer {
         }
     }
 
-    #[cfg(feature = "test-support")]
     fn diagnostic_with_timeout(&mut self, expected: &Url, timeout: Duration) -> Option<Value> {
         let expected = expected.to_string();
         if let Some(index) = self.pending.iter().position(|message| {
@@ -1088,6 +1086,37 @@ fn write_file(path: &Path, source: &str) {
         fs::create_dir_all(parent).expect("create source directory");
     }
     fs::write(path, source).expect("write Pascal source");
+}
+
+fn write_bytes(path: &Path, source: &[u8]) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create source directory");
+    }
+    fs::write(path, source).expect("write Pascal source bytes");
+}
+
+fn latin1(source: &str) -> Vec<u8> {
+    source
+        .chars()
+        .map(|character| {
+            let codepoint = character as u32;
+            assert!(codepoint <= 0xff, "test source is not Latin-1");
+            codepoint as u8
+        })
+        .collect()
+}
+
+fn case_distinct_paths_supported(directory: &Path) -> bool {
+    fs::create_dir_all(directory).expect("create case-sensitivity probe directory");
+    let lower = directory.join("case-sensitivity-probe");
+    let upper = directory.join("CASE-SENSITIVITY-PROBE");
+    let _ = fs::remove_file(&lower);
+    let _ = fs::remove_file(&upper);
+    fs::write(&lower, b"lower").expect("write case-sensitivity probe");
+    let distinct = !upper.exists();
+    let _ = fs::remove_file(&lower);
+    let _ = fs::remove_file(&upper);
+    distinct
 }
 
 fn workspace_symbol_source(unit_name: &str, variable_count: usize) -> String {
@@ -5989,6 +6018,50 @@ fn rename_allows_a_legacy_relative_include_outside_the_workspace() {
     assert!(
         response.error.is_none(),
         "legacy include rejected: {response:?}"
+    );
+    assert!(response.result.is_some());
+    server.shutdown();
+}
+
+#[test]
+fn rename_include_resolution_prefers_an_open_overlay_over_disk() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.pas");
+    let main_source =
+        "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I Shared.pas}\nend.\n";
+    let disk_include = "const BadConst = 2;\n";
+    let overlay_include = "{$DEFINE SAFE}\n";
+    write_file(&main, main_source);
+    write_file(&include, disk_include);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&include),
+                "languageId": "pascal",
+                "version": 2,
+                "text": overlay_include
+            }
+        }),
+    );
+    let id = RequestId::from("overlay-include-rename".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "BadConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "overlay include should shadow disk include: {response:?}"
     );
     assert!(response.result.is_some());
     server.shutdown();
@@ -11200,6 +11273,377 @@ fn standalone_naming_actions_match_workspace_configuration_precedence() {
         response.result.unwrap()[0]["title"],
         "Rename 'BadConst' to 'BAD_CONST'"
     );
+    server.shutdown();
+}
+
+#[test]
+fn project_diagnostics_resolve_disk_dependencies_and_refresh_changed_overlays() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let provider = app.join("Provider.pas");
+    let project = app.join("App.dproj");
+    let source = "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n";
+    let changed = source.replace("Provider", "MissingUnit");
+    write_file(&main, source);
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let initial = server.notification("textDocument/publishDiagnostics");
+    assert_eq!(initial["version"], 1);
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-lsp")
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": changed}]
+        }),
+    );
+    let refreshed =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert_eq!(refreshed["version"], 2);
+    assert!(
+        refreshed["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-lsp")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_diagnostics_preserve_crlf_include_cfg_and_positions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    let main = app.join("Main.pas");
+    let include = app.join("body.inc");
+    let project = app.join("App.dproj");
+    let lf_source = "unit Main;\ninterface\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  {$I body.inc}\n  X.Foo;\nend;\nend.\n";
+    let crlf_source = lf_source.replace('\n', "\r\n");
+    write_file(&main, lf_source);
+    write_file(&include, "X.Free;\n");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": lf_source
+            }
+        }),
+    );
+    let lf_diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(lf_diagnostics["diagnostics"][0]["code"], "use-after-free");
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": crlf_source}]
+        }),
+    );
+    let crlf_diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(crlf_diagnostics["version"], 2);
+    assert_eq!(
+        range_signature(&crlf_diagnostics["diagnostics"][0]),
+        range_signature(&lf_diagnostics["diagnostics"][0])
+    );
+    assert_eq!(crlf_diagnostics["diagnostics"][0]["code"], "use-after-free");
+    server.shutdown();
+}
+
+#[test]
+fn project_diagnostics_refresh_when_only_a_dependency_overlay_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("app");
+    let main = root.join("Main.pas");
+    let body = root.join("body.pas");
+    let project = root.join("App.dproj");
+    let main_source = "unit Main;\ninterface\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  {$I body.pas}\n  X.Foo;\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&body, "X.Free;\n");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(initial["diagnostics"][0]["code"], "use-after-free");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&body),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "X.Free;\n"
+            }
+        }),
+    );
+    if let Some(open_refresh) = server.diagnostic_with_timeout(&uri(&main), Duration::from_secs(2))
+    {
+        assert_eq!(open_refresh["diagnostics"][0]["code"], "use-after-free");
+    }
+    let _ = server.diagnostic_with_timeout(&uri(&body), Duration::from_secs(2));
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&body), "version": 2},
+            "contentChanges": [{"text": "X := TObject.Create;\n"}]
+        }),
+    );
+    let refreshed = server
+        .diagnostic_with_timeout(&uri(&main), Duration::from_secs(2))
+        .expect("dependency didChange must publish consumer diagnostics");
+    assert_eq!(refreshed["version"], 1);
+    assert!(
+        refreshed["diagnostics"].as_array().unwrap().is_empty(),
+        "dependency overlay must refresh the consumer: {refreshed}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_diagnostics_keep_the_selected_root_when_an_alias_matches_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("app");
+    let main = root.join("Main.pas");
+    let other = root.join("Other.pas");
+    let project = root.join("App.dproj");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  X.Foo;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(&other, "unit Other;\ninterface\nimplementation\nend.\n");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>Main=Other</DCC_UnitAlias></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(diagnostics["version"], 1);
+    assert_eq!(diagnostics["diagnostics"][0]["code"], "use-after-free");
+    assert_eq!(diagnostics["diagnostics"][0]["range"]["start"]["line"], 7);
+    assert_eq!(
+        diagnostics["diagnostics"][0]["range"]["start"]["character"],
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_diagnostics_load_a_selected_dpr_root_by_full_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("app");
+    let main = root.join("App.dpr");
+    let other = root.join("Other.pas");
+    let project = root.join("App.dproj");
+    let source = "program App;\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  X.Foo;\nend;\nbegin\n  Test;\nend.\n";
+    write_file(&main, source);
+    write_file(&other, "unit Other;\ninterface\nimplementation\nend.\n");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitAlias>App=Other</DCC_UnitAlias></PropertyGroup><ItemGroup><DCCReference Include=\"App.dpr\"/></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(diagnostics["version"], 1);
+    assert_eq!(diagnostics["diagnostics"][0]["code"], "use-after-free");
+    assert_eq!(diagnostics["diagnostics"][0]["range"]["start"]["line"], 5);
+    assert_eq!(
+        diagnostics["diagnostics"][0]["range"]["start"]["character"],
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_diagnostics_match_a_latin1_disk_graph_and_overlay_positions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("app");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let include = root.join("body.inc");
+    let project = root.join("App.dproj");
+    let source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  // café\n  {$I body.inc}\n  X.Foo;\nend;\nend.\n";
+    write_bytes(&main, &latin1(source));
+    write_bytes(
+        &provider,
+        &latin1(
+            "unit Provider;\ninterface\n// café\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n",
+        ),
+    );
+    write_bytes(&include, &latin1("// café\nX.Free;\n"));
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(diagnostics["diagnostics"][0]["code"], "use-after-free");
+    assert_eq!(diagnostics["diagnostics"][0]["range"]["start"]["line"], 9);
+    assert_eq!(
+        diagnostics["diagnostics"][0]["range"]["start"]["character"],
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
+fn project_diagnostics_refresh_when_candidate_directory_membership_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("app");
+    if !case_distinct_paths_supported(&root) {
+        return;
+    }
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let competing_provider = root.join("PROVIDER.pas");
+    let body = root.join("body.inc");
+    let project = root.join("App.dproj");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  {$I body.inc}\n  X.Foo;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(&body, "X.Free;\n");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(initial["diagnostics"][0]["code"], "use-after-free");
+
+    write_file(&competing_provider, provider_source);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({
+            "changes": [{"uri": uri(&competing_provider), "type": 1}]
+        }),
+    );
+    let ambiguous = server
+        .diagnostic_with_timeout(&uri(&main), Duration::from_secs(2))
+        .expect("candidate membership change must republish the consumer");
+    assert_eq!(ambiguous["version"], 1);
+    assert!(
+        ambiguous["diagnostics"].as_array().unwrap().is_empty(),
+        "ambiguous project resolution must use conservative analysis: {ambiguous}"
+    );
+
+    fs::remove_file(&competing_provider).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({
+            "changes": [{"uri": uri(&competing_provider), "type": 3}]
+        }),
+    );
+    let restored = server
+        .diagnostic_with_timeout(&uri(&main), Duration::from_secs(2))
+        .expect("candidate membership removal must republish the consumer");
+    assert_eq!(restored["version"], 1);
+    assert_eq!(restored["diagnostics"][0]["code"], "use-after-free");
     server.shutdown();
 }
 

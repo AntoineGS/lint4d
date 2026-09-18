@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;
 
@@ -203,6 +204,205 @@ fn project_flag_lints_dproj_files() {
         .current_dir(dir.path())
         .assert()
         .success();
+}
+
+#[test]
+fn project_resolution_reports_incomplete_imports_but_keeps_linting() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Main.pas"),
+        "unit Main;\ninterface\nuses MissingUnit;\nimplementation\nend.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("MyProject.dproj"),
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ItemGroup>
+    <DCCReference Include="Main.pas"/>
+  </ItemGroup>
+</Project>"#,
+    )
+    .unwrap();
+
+    lint4d()
+        .arg("--project")
+        .arg(dir.path().join("MyProject.dproj"))
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("source-project CFG")
+                .and(predicate::str::contains("incomplete")),
+        );
+}
+
+#[test]
+fn project_cfg_preserves_crlf_diagnostics_and_original_scope() {
+    let dir = TempDir::new().unwrap();
+    let main = dir.path().join("Main.pas");
+    let pad = dir.path().join("pad.inc");
+    let project = dir.path().join("App.dproj");
+    let lf_source = "unit Main;\ninterface\nimplementation\n{$I pad.inc}\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  X.Foo;\nend;\nend.\n";
+    let crlf_source = lf_source.replace('\n', "\r\n");
+    fs::write(&pad, "\n\n\n\n\n\n\n\n\n\n").unwrap();
+    fs::write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    )
+    .unwrap();
+
+    fs::write(&main, lf_source).unwrap();
+    let lint = |expected_source: &str| -> Value {
+        fs::write(&main, expected_source).unwrap();
+        let output = lint4d()
+            .arg("--project")
+            .arg(&project)
+            .arg("--format")
+            .arg("json")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "lint4d failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let lf = lint(lf_source);
+    let crlf = lint(&crlf_source);
+    let lf_diagnostics = &lf["files"][0]["diagnostics"];
+    let crlf_diagnostics = &crlf["files"][0]["diagnostics"];
+    assert_eq!(lf_diagnostics, crlf_diagnostics);
+    assert_eq!(crlf_diagnostics[0]["rule_id"], "use-after-free");
+    assert_eq!(crlf_diagnostics[0]["line"], 9);
+    assert_eq!(crlf_diagnostics[0]["column"], 3);
+    assert_eq!(crlf_diagnostics[0]["scope"], "Test");
+}
+
+#[test]
+fn project_root_alias_does_not_replace_the_selected_main_source() {
+    let dir = TempDir::new().unwrap();
+    let main = dir.path().join("Main.pas");
+    let other = dir.path().join("Other.pas");
+    let project = dir.path().join("App.dproj");
+    fs::write(
+        &main,
+        "unit Main;\ninterface\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  X.Foo;\nend;\nend.\n",
+    )
+    .unwrap();
+    fs::write(&other, "unit Other;\ninterface\nimplementation\nend.\n").unwrap();
+    fs::write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>Main=Other</DCC_UnitAlias></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    )
+    .unwrap();
+
+    let output = lint4d()
+        .arg("--project")
+        .arg(&project)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() || output.status.code() == Some(1),
+        "lint4d failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = &json["files"][0]["diagnostics"];
+    assert_eq!(diagnostics[0]["rule_id"], "use-after-free");
+    assert_eq!(diagnostics[0]["line"], 8);
+    assert_eq!(diagnostics[0]["column"], 3);
+}
+
+#[test]
+fn project_dpr_root_is_loaded_by_selected_full_path() {
+    let dir = TempDir::new().unwrap();
+    let main = dir.path().join("App.dpr");
+    let other = dir.path().join("Other.pas");
+    let project = dir.path().join("App.dproj");
+    fs::write(
+        &main,
+        "program App;\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  X.Foo;\nend;\nbegin\n  Test;\nend.\n",
+    )
+    .unwrap();
+    fs::write(&other, "unit Other;\ninterface\nimplementation\nend.\n").unwrap();
+    fs::write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitAlias>App=Other</DCC_UnitAlias></PropertyGroup><ItemGroup><DCCReference Include=\"App.dpr\"/></ItemGroup></Project>",
+    )
+    .unwrap();
+
+    let output = lint4d()
+        .arg("--project")
+        .arg(&project)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() || output.status.code() == Some(1),
+        "lint4d failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = &json["files"][0]["diagnostics"];
+    assert_eq!(diagnostics[0]["rule_id"], "use-after-free");
+    assert_eq!(diagnostics[0]["line"], 6);
+    assert_eq!(diagnostics[0]["column"], 3);
+}
+
+#[test]
+fn project_latin1_root_include_and_dependency_match_decoded_positions() {
+    let dir = TempDir::new().unwrap();
+    let main = dir.path().join("Main.pas");
+    let provider = dir.path().join("Provider.pas");
+    let include = dir.path().join("body.inc");
+    let project = dir.path().join("App.dproj");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  // café\n  {$I body.inc}\n  X.Foo;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\n// café\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    let include_source = "// café\nX.Free;\n";
+    fs::write(&main, latin1(main_source)).unwrap();
+    fs::write(&provider, latin1(provider_source)).unwrap();
+    fs::write(&include, latin1(include_source)).unwrap();
+    fs::write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    )
+    .unwrap();
+
+    let output = lint4d()
+        .arg("--project")
+        .arg(&project)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "lint4d failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = &json["files"][0]["diagnostics"];
+    assert_eq!(diagnostics[0]["rule_id"], "use-after-free");
+    assert_eq!(diagnostics[0]["line"], 10);
+    assert_eq!(diagnostics[0]["column"], 3);
+}
+
+fn latin1(source: &str) -> Vec<u8> {
+    source
+        .chars()
+        .map(|character| {
+            let codepoint = character as u32;
+            assert!(codepoint <= 0xff, "test source is not Latin-1");
+            codepoint as u8
+        })
+        .collect()
 }
 
 #[test]

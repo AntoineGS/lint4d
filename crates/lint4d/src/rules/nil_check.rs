@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use cfg_core::BlockId;
 use cfg_core::summary::ProcId;
 use cfg_core::types::Cfg;
+use cfg_pascal::cfg_core;
 use pascal_core::node_kind as K;
 use petgraph::Direction;
 use petgraph::visit::EdgeRef;
@@ -649,8 +650,13 @@ struct NilComparison {
 fn parse_nil_comparison(text: &str) -> Option<NilComparison> {
     let trimmed = text.trim();
     let lower = trimmed.to_lowercase();
+    let lower = lower
+        .strip_prefix("if ")
+        .map_or(lower.as_str(), str::trim)
+        .trim_end_matches(" then")
+        .trim();
 
-    if let Some(inner) = extract_assigned_arg(&lower) {
+    if let Some(inner) = extract_assigned_arg(lower) {
         if is_identifier(&inner) {
             let is_negated = lower.trim_start().starts_with("not ");
             return Some(NilComparison {
@@ -660,14 +666,14 @@ fn parse_nil_comparison(text: &str) -> Option<NilComparison> {
         }
     }
 
-    if let Some(var) = extract_nil_compare(&lower, "<>") {
+    if let Some(var) = extract_nil_compare(lower, "<>") {
         return Some(NilComparison {
             var_name: var,
             is_not_nil: true,
         });
     }
 
-    if let Some(var) = extract_nil_compare(&lower, "=") {
+    if let Some(var) = extract_nil_compare(lower, "=") {
         return Some(NilComparison {
             var_name: var,
             is_not_nil: false,

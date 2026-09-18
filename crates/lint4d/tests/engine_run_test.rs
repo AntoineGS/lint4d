@@ -1,6 +1,13 @@
+use lint4d::cfg::project_snapshot::{CfgSnapshotOptions, to_cfg_project_snapshot};
 use lint4d::config::Config;
-use lint4d::engine::{FileInfo, run_lint};
+use lint4d::engine::{FileInfo, run_lint, run_lint_with_cfg_project};
+use lint4d::rules::RuleRegistry;
+use pascal_core::resolver::{
+    LoadedSource, ResolutionReport, ResolutionTarget, ResolvedInclude, ResolvedProject,
+    ResolvedUnit, SourceId, SourceRevision,
+};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[test]
 fn identifier_casing_flags_mismatched_casing() {
@@ -127,6 +134,177 @@ fn engine_keeps_parse_errors_in_pas_files() {
         diagnostics.iter().any(|d| d.rule_id == "parse-error"),
         "Parse errors should still be reported for .pas files"
     );
+}
+
+#[test]
+fn shared_runner_without_project_matches_file_local_wrapper() {
+    let source = std::fs::read("tests/fixtures/naming/bad_identifier_casing.pas").unwrap();
+    let file = FileInfo::new(PathBuf::from("Test.pas"));
+    let config = "version = 1".parse::<Config>().unwrap();
+    let expected = run_lint(&file, &source, &config);
+    let actual =
+        run_lint_with_cfg_project(&file, &source, &config, None, None, &RuleRegistry::new());
+    assert_eq!(
+        serde_json::to_value(&actual).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+}
+
+#[test]
+fn prepared_include_diagnostic_falls_back_without_publishing_a_fake_location() {
+    let source = b"unit App;\ninterface\n{$I decls.inc}\nimplementation\nend.\n";
+    let include = b"const badConst = 1;\n";
+    let root_id = SourceId::new("source:/workspace/App.pas");
+    let include_id = SourceId::new("source:/workspace/decls.inc");
+    let directive = b"{$I decls.inc}";
+    let directive_start = source
+        .windows(directive.len())
+        .position(|window| window == directive)
+        .expect("include directive");
+    let project = ResolvedProject {
+        root: ResolvedUnit {
+            requested_name: "App".to_string(),
+            declared_name: "App".to_string(),
+            source: LoadedSource {
+                id: root_id.clone(),
+                path: PathBuf::from("/workspace/App.pas"),
+                bytes: Arc::from(source.to_vec()),
+                decoded_text: None,
+                revision: SourceRevision::Overlay {
+                    version: 1,
+                    content_hash: 1,
+                },
+            },
+        },
+        units: Vec::new(),
+        imports: Vec::new(),
+        includes: vec![ResolvedInclude {
+            including_source_id: root_id.clone(),
+            byte_range: directive_start..directive_start + directive.len(),
+            requested_name: "decls.inc".to_string(),
+            target: ResolutionTarget::Found(include_id.clone()),
+        }],
+        include_sources: vec![LoadedSource {
+            id: include_id,
+            path: PathBuf::from("/workspace/decls.inc"),
+            bytes: Arc::from(include.to_vec()),
+            decoded_text: None,
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+        }],
+        complete: true,
+        report: ResolutionReport {
+            observations: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+            incomplete_reasons: Vec::new(),
+        },
+    };
+    let snapshot = to_cfg_project_snapshot(
+        project,
+        CfgSnapshotOptions {
+            prepare_configured_sources: true,
+            configuration_id: Some("debug".to_string()),
+            ..CfgSnapshotOptions::default()
+        },
+    )
+    .expect("prepared snapshot");
+    let config = "version = 1\n[rules.naming]\nconstant_style = \"PascalCase\""
+        .parse::<Config>()
+        .unwrap();
+    let diagnostics = run_lint_with_cfg_project(
+        &FileInfo::new(PathBuf::from("/workspace/App.pas")),
+        source,
+        &config,
+        None,
+        Some(&snapshot),
+        &RuleRegistry::new(),
+    );
+
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic.rule_id != "constant-naming" && diagnostic.rule_id != "lint4d-error"
+    }));
+}
+
+#[test]
+fn prepared_include_diagnostic_scope_uses_original_coordinates() {
+    let source = b"unit Main;\ninterface\nimplementation\n{$I pad.inc}\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  X.Foo;\nend;\nend.\n";
+    let pad = b"\n\n\n\n\n\n\n\n\n\n";
+    let root_id = SourceId::new("source:/workspace/Main.pas");
+    let pad_id = SourceId::new("source:/workspace/pad.inc");
+    let directive = b"{$I pad.inc}";
+    let directive_start = source
+        .windows(directive.len())
+        .position(|window| window == directive)
+        .expect("include directive");
+    let project = ResolvedProject {
+        root: ResolvedUnit {
+            requested_name: "Main".to_string(),
+            declared_name: "Main".to_string(),
+            source: LoadedSource {
+                id: root_id.clone(),
+                path: PathBuf::from("/workspace/Main.pas"),
+                bytes: Arc::from(source.to_vec()),
+                decoded_text: None,
+                revision: SourceRevision::Overlay {
+                    version: 1,
+                    content_hash: 1,
+                },
+            },
+        },
+        units: Vec::new(),
+        imports: Vec::new(),
+        includes: vec![ResolvedInclude {
+            including_source_id: root_id.clone(),
+            byte_range: directive_start..directive_start + directive.len(),
+            requested_name: "pad.inc".to_string(),
+            target: ResolutionTarget::Found(pad_id.clone()),
+        }],
+        include_sources: vec![LoadedSource {
+            id: pad_id,
+            path: PathBuf::from("/workspace/pad.inc"),
+            bytes: Arc::from(pad.to_vec()),
+            decoded_text: None,
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 2,
+            },
+        }],
+        complete: true,
+        report: ResolutionReport {
+            observations: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+            incomplete_reasons: Vec::new(),
+        },
+    };
+    let snapshot = to_cfg_project_snapshot(
+        project,
+        CfgSnapshotOptions {
+            prepare_configured_sources: true,
+            configuration_id: Some("debug".to_string()),
+            ..CfgSnapshotOptions::default()
+        },
+    )
+    .expect("prepared snapshot");
+    let config = "version = 1".parse::<Config>().unwrap();
+    let diagnostics = run_lint_with_cfg_project(
+        &FileInfo::new(PathBuf::from("/workspace/Main.pas")),
+        source,
+        &config,
+        None,
+        Some(&snapshot),
+        &RuleRegistry::new(),
+    );
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.rule_id == "use-after-free")
+        .expect("prepared use-after-free diagnostic");
+    assert_eq!(diagnostic.line, 9);
+    assert_eq!(diagnostic.column, 3);
+    assert_eq!(diagnostic.scope.as_deref(), Some("Test"));
 }
 
 #[test]

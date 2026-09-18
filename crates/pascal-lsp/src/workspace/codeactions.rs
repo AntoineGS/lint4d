@@ -546,6 +546,7 @@ fn same_record_observation(left: &SourceRecord, right: &SourceRecord) -> bool {
         && left.path_stamp == right.path_stamp
         && left.content_hash == right.content_hash
         && left.content_bytes == right.content_bytes
+        && left.directory_observation == right.directory_observation
 }
 
 fn set_disabled_or_skip(action: &mut CodeAction, supported: bool, reason: String) -> bool {
@@ -740,6 +741,7 @@ fn lint_configuration_for_input(
                 path_entry: super::context_path_entry(&context, path),
                 include_payload: false,
                 missing_provider_candidate: false,
+                directory_observation: false,
             })
         })
         .collect();

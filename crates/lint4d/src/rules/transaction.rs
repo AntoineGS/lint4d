@@ -6,6 +6,7 @@ use tree_sitter::{Node, Tree};
 
 use cfg_core::types::Cfg;
 use cfg_pascal::calls::{TransactionCallKind, TransactionOp, lookup_transaction_method};
+use cfg_pascal::cfg_core;
 
 use crate::cfg::analysis::AnalysisContext;
 use crate::dcu::ProjectContext;

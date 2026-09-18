@@ -1,6 +1,6 @@
-use crate::conditional::{self, ConditionalAnalysis};
 use crate::text;
 use lsp_types::{Location, Position, Range, Url};
+use pascal_core::conditional::{self, ConditionalAnalysis};
 use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::{FileInfo, parser};
 use serde::{Deserialize, Serialize};

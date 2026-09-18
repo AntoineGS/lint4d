@@ -1,9 +1,11 @@
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
-    MetadataObservation, ProjectContext, ProjectOptions, ProjectPathProvenance, ProjectSelections,
+    MetadataObservation, ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
+    ProjectSelections, ReadPolicy,
     discover_with_selections_and_observations_with_cancel_and_overrides,
 };
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use tempfile::tempdir;
 
@@ -146,4 +148,98 @@ fn public_api_rejects_a_precancelled_discovery() {
     .expect_err("pre-cancelled discovery must fail before filesystem work");
 
     assert_eq!(error, "request cancelled");
+}
+
+#[test]
+fn public_api_prefers_exact_mapped_provenance_for_a_source() {
+    let root = PathBuf::from("/workspace");
+    let source = root.join("src/Main.pas");
+    let mut context = ProjectContext {
+        main_source: Some(source.clone()),
+        main_source_entry: Some(ProjectPathEntry {
+            path: source.clone(),
+            provenance: ProjectPathProvenance::Mapped {
+                root: root.join("mapped"),
+            },
+        }),
+        search_path_entries: vec![ProjectPathEntry {
+            path: root.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        }],
+        ..ProjectContext::default()
+    };
+    context.read_policy = ReadPolicy::default();
+
+    assert_eq!(
+        context.path_entry_for(&source),
+        context.main_source_entry.clone()
+    );
+}
+
+#[test]
+fn public_api_uses_the_most_specific_search_root_before_policy_fallback() {
+    let path = PathBuf::from("/workspace/src/vendor/Errors.pas");
+    let broad = ProjectPathEntry {
+        path: PathBuf::from("/workspace/src"),
+        provenance: ProjectPathProvenance::Configured,
+    };
+    let specific = ProjectPathEntry {
+        path: PathBuf::from("/workspace/src/vendor"),
+        provenance: ProjectPathProvenance::Mapped {
+            root: PathBuf::from("/mapped/vendor"),
+        },
+    };
+    let context = ProjectContext {
+        search_path_entries: vec![broad, specific.clone()],
+        ..ProjectContext::default()
+    };
+
+    assert_eq!(
+        context.path_entry_for(&path),
+        Some(ProjectPathEntry {
+            path,
+            provenance: specific.provenance,
+        })
+    );
+}
+
+#[test]
+fn public_api_orders_include_owner_then_include_then_unit_paths_without_duplicates() {
+    let owner = PathBuf::from("/workspace/src");
+    let include = PathBuf::from("/workspace/include");
+    let duplicate = PathBuf::from("/workspace/src/../include");
+    let unit = PathBuf::from("/workspace/units");
+    let context = ProjectContext {
+        include_path_entries: vec![
+            ProjectPathEntry::legacy(include.clone()),
+            ProjectPathEntry::legacy(duplicate),
+        ],
+        search_path_entries: vec![
+            ProjectPathEntry::legacy(owner.clone()),
+            ProjectPathEntry::legacy(unit.clone()),
+        ],
+        ..ProjectContext::default()
+    };
+
+    let paths = context
+        .include_search_entries(&owner.join("Main.pas"))
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec![owner, include, unit]);
+}
+
+#[test]
+fn public_api_does_not_turn_a_stat_observation_into_payload_authorization() {
+    let path = PathBuf::from("/workspace/generated/Unit.pas");
+    let context = ProjectContext {
+        metadata_observations: vec![MetadataObservation::Stat { path: path.clone() }],
+        ..ProjectContext::default()
+    };
+
+    assert!(context.path_entry_for(&path).is_none());
+    assert!(matches!(
+        context.metadata_observations.as_slice(),
+        [MetadataObservation::Stat { path: observed }] if observed == &path
+    ));
 }

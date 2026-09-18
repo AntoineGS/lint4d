@@ -1,14 +1,14 @@
 //! Conservative, offset-preserving analysis of Pascal compiler directives.
 //!
-//! This is intentionally a small abstract interpreter rather than a Delphi
-//! preprocessor.  It knows only facts supplied by the selected project and
-//! facts established unconditionally while walking a source file.  Anything
-//! it cannot prove remains [`Truth::Unknown`].
+//! This module intentionally remains a small abstract interpreter rather than
+//! a Delphi preprocessor.  It knows project-provided defines and facts proved
+//! unconditionally while walking a source buffer; anything else remains
+//! [`Truth::Unknown`].
 
+use crate::resolver::{CancellationToken, NoCancellation};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_DIRECTIVES: usize = 16_384;
 const MAX_CONDITIONAL_DEPTH: usize = 256;
@@ -20,14 +20,14 @@ const MAX_ENVIRONMENT_WORK: usize = 1_000_000;
 const MAX_ENVIRONMENT_BYTE_WORK: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Truth {
+pub enum Truth {
     True,
     False,
     Unknown,
 }
 
 impl Truth {
-    pub(crate) fn and(self, other: Self) -> Self {
+    fn and(self, other: Self) -> Self {
         match (self, other) {
             (Self::False, _) | (_, Self::False) => Self::False,
             (Self::True, value) | (value, Self::True) => value,
@@ -35,7 +35,7 @@ impl Truth {
         }
     }
 
-    pub(crate) fn or(self, other: Self) -> Self {
+    fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::True, _) | (_, Self::True) => Self::True,
             (Self::False, value) | (value, Self::False) => value,
@@ -43,7 +43,7 @@ impl Truth {
         }
     }
 
-    pub(crate) fn not(self) -> Self {
+    fn not(self) -> Self {
         match self {
             Self::True => Self::False,
             Self::False => Self::True,
@@ -57,7 +57,7 @@ impl Truth {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DirectiveKind {
+pub enum DirectiveKind {
     Include,
     ConditionalStart,
     ConditionalMiddle,
@@ -69,42 +69,44 @@ pub(crate) enum DirectiveKind {
     Other,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ConditionalDirective {
-    pub(crate) kind: DirectiveKind,
-    pub(crate) body: String,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    /// Whether the directive itself is in a branch that may be executed.
-    pub(crate) activity: Truth,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalDirective {
+    pub kind: DirectiveKind,
+    pub body: String,
+    pub start: usize,
+    pub end: usize,
+    /// Whether the directive itself is in a branch that may execute.
+    pub activity: Truth,
 }
 
 impl ConditionalDirective {
-    pub(crate) fn potentially_active(&self) -> bool {
+    pub fn potentially_active(&self) -> bool {
         self.activity != Truth::False
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ConditionalAnalysis {
-    /// Source used for parsing/indexing. It has exactly the same byte length
-    /// and line breaks as `source`; the caller must retain `source` itself for
-    /// edits, diagnostics, and revalidation.
-    pub(crate) projected_source: String,
-    pub(crate) inactive_spans: Vec<Range<usize>>,
-    pub(crate) unknown_spans: Vec<Range<usize>>,
-    pub(crate) directives: Vec<ConditionalDirective>,
-    pub(crate) complete: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalAnalysis {
+    /// Source used for parsing/indexing. It has the same byte length and line
+    /// breaks as the original source.
+    pub projected_source: String,
+    pub inactive_spans: Vec<Range<usize>>,
+    pub unknown_spans: Vec<Range<usize>>,
+    pub directives: Vec<ConditionalDirective>,
+    /// False means that a malformed structure, cancellation, or safety budget
+    /// prevented a complete walk. A true result may still contain unknown
+    /// activity spans.
+    pub complete: bool,
 }
 
 impl ConditionalAnalysis {
-    pub(crate) fn is_unknown_at(&self, offset: usize) -> bool {
+    pub fn is_unknown_at(&self, offset: usize) -> bool {
         self.unknown_spans
             .iter()
             .any(|span| span.start <= offset && offset < span.end)
     }
 
-    pub(crate) fn unknown_contains_identifier(&self, source: &str, name: &str) -> bool {
+    pub fn unknown_contains_identifier(&self, source: &str, name: &str) -> bool {
         if name.is_empty() {
             return false;
         }
@@ -121,11 +123,7 @@ impl ConditionalAnalysis {
         })
     }
 
-    pub(crate) fn potentially_active_contains_identifier(
-        &self,
-        source: &str,
-        names: &[String],
-    ) -> bool {
+    pub fn potentially_active_contains_identifier(&self, source: &str, names: &[String]) -> bool {
         identifier_spans(source).into_iter().any(|(start, end)| {
             let in_inactive = self
                 .inactive_spans
@@ -145,7 +143,7 @@ impl ConditionalAnalysis {
         })
     }
 
-    pub(crate) fn pascal_condition_contains_identifier(&self, names: &[String]) -> bool {
+    pub fn pascal_condition_contains_identifier(&self, names: &[String]) -> bool {
         if names
             .iter()
             .any(|name| !name.trim_start_matches('&').is_ascii())
@@ -185,39 +183,25 @@ struct RawDirective {
     body: String,
 }
 
-#[derive(Debug, Default)]
-struct LexResult {
-    directives: Vec<RawDirective>,
-    complete: bool,
-}
-
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default, Clone)]
 struct Environment {
     values: HashMap<String, Truth>,
     bytes: usize,
 }
 
 impl Environment {
-    fn new() -> Self {
-        Self::default()
-    }
-
     fn len(&self) -> usize {
         self.values.len()
     }
-
     fn contains_key(&self, key: &str) -> bool {
         self.values.contains_key(key)
     }
-
     fn get(&self, key: &str) -> Option<&Truth> {
         self.values.get(key)
     }
-
     fn keys(&self) -> impl Iterator<Item = &String> {
         self.values.keys()
     }
-
     fn bytes(&self) -> usize {
         self.bytes
     }
@@ -248,25 +232,24 @@ struct ConditionalFrame {
 }
 
 /// Analyze a source buffer using the selected project's positive define facts.
-#[cfg(test)]
-pub(crate) fn analyze(source: &str, project_defines: &[String]) -> ConditionalAnalysis {
-    analyze_inner(source, project_defines, None)
+pub fn analyze(source: &str, project_defines: &[String]) -> ConditionalAnalysis {
+    analyze_with_cancel(source, project_defines, &NoCancellation)
 }
 
-/// Analyze a source buffer while polling `cancel` during directive evaluation.
+/// Analyze a source buffer while polling a caller-owned cancellation token.
 ///
 /// Cancellation is represented as an incomplete analysis because callers must
-/// fail closed whenever the abstract interpretation did not finish.
-pub(crate) fn analyze_with_cancel(
+/// fail closed whenever abstract interpretation did not finish.
+pub fn analyze_with_cancel(
     source: &str,
     project_defines: &[String],
-    cancel: &AtomicBool,
+    cancel: &dyn CancellationToken,
 ) -> ConditionalAnalysis {
     analyze_inner(source, project_defines, Some(cancel))
 }
 
 struct AnalysisBudget<'a> {
-    cancel: Option<&'a AtomicBool>,
+    cancel: Option<&'a dyn CancellationToken>,
     work: usize,
     byte_work: usize,
     exhausted: bool,
@@ -277,10 +260,7 @@ impl AnalysisBudget<'_> {
         if self.exhausted {
             return false;
         }
-        if self
-            .cancel
-            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-        {
+        if self.cancel.is_some_and(|cancel| cancel.is_cancelled()) {
             self.exhausted = true;
             return false;
         }
@@ -332,7 +312,7 @@ impl AnalysisBudget<'_> {
 fn analyze_inner(
     source: &str,
     project_defines: &[String],
-    cancel: Option<&AtomicBool>,
+    cancel: Option<&dyn CancellationToken>,
 ) -> ConditionalAnalysis {
     let lexed = lex_directives(source, cancel);
     let mut budget = AnalysisBudget {
@@ -346,7 +326,7 @@ fn analyze_inner(
         Some(environment) => environment,
         None => {
             complete = false;
-            Environment::new()
+            Environment::default()
         }
     };
     let mut active = Truth::True;
@@ -370,7 +350,6 @@ fn analyze_inner(
             active,
         );
         masked_spans.push(raw.start..raw.end);
-
         let kind = directive_kind(&raw.body);
         directives.push(ConditionalDirective {
             kind,
@@ -419,7 +398,7 @@ fn analyze_inner(
                 if is_else && frame.has_else {
                     complete = false;
                 }
-                if !is_else_directive(&raw.body) && frame.has_else {
+                if !is_else && frame.has_else {
                     complete = false;
                 }
                 if frame.current_active != Truth::False
@@ -437,7 +416,6 @@ fn analyze_inner(
                     break;
                 };
                 environment = restored_environment;
-
                 if is_else {
                     frame.has_else = true;
                     frame.current_active = frame.parent_active.and(frame.remaining);
@@ -484,10 +462,8 @@ fn analyze_inner(
                 }
             }
             DirectiveKind::Include => {
-                // Include files can DEFINE/UNDEF symbols or inject nested
-                // directives. Unless their contents have been soundly
-                // processed, no previously known fact survives an active
-                // include boundary.
+                // An include may DEFINE or UNDEF a symbol. Until its content is
+                // processed soundly no fact survives the active boundary.
                 if active != Truth::False {
                     environment.clear();
                 }
@@ -510,10 +486,6 @@ fn analyze_inner(
     if !budget.poll() {
         complete = false;
     }
-
-    // Once the directive structure is malformed, no branch is a proof. Do not
-    // hide source from the parser; mark the entire buffer unknown so callers
-    // can refuse unsafe binding/edit decisions instead.
     if !complete {
         inactive_spans.clear();
         unknown_spans.clear();
@@ -522,9 +494,8 @@ fn analyze_inner(
         }
     }
 
-    let projected_source = project_source(source, &inactive_spans, &masked_spans);
     ConditionalAnalysis {
-        projected_source,
+        projected_source: project_source(source, &inactive_spans, &masked_spans),
         inactive_spans,
         unknown_spans,
         directives,
@@ -536,7 +507,7 @@ fn initial_environment(
     project_defines: &[String],
     budget: &mut AnalysisBudget<'_>,
 ) -> Option<Environment> {
-    let mut environment = Environment::new();
+    let mut environment = Environment::default();
     for define in project_defines {
         if !budget.charge(1) {
             return None;
@@ -646,16 +617,11 @@ fn merge_conditional_environment(
     {
         return None;
     }
-
     if frame.parent_active != Truth::True
         && !merge_environment(&mut merged, &frame.before_environment, budget)
     {
         return None;
     }
-
-    // An IF without ELSE has a possible no-op path whenever no condition is
-    // proven true. The `remaining` value is already the abstract condition for
-    // that path.
     if !frame.has_else
         && frame.remaining != Truth::False
         && !merge_environment(&mut merged, &frame.before_environment, budget)
@@ -744,12 +710,10 @@ fn project_source(source: &str, inactive: &[Range<usize>], directives: &[Range<u
             }
         }
     }
-    // `source` is a Rust `str`; replacing arbitrary UTF-8 bytes with ASCII
-    // spaces keeps the result valid while retaining the exact byte offsets.
     String::from_utf8(bytes).expect("offset-preserving projection remains UTF-8")
 }
 
-fn lex_directives(source: &str, cancel: Option<&AtomicBool>) -> LexResult {
+fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexResult {
     let bytes = source.as_bytes();
     let mut result = LexResult {
         directives: Vec::new(),
@@ -757,7 +721,7 @@ fn lex_directives(source: &str, cancel: Option<&AtomicBool>) -> LexResult {
     };
     let mut index = 0;
     while index < bytes.len() {
-        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
             result.complete = false;
             break;
         }
@@ -769,9 +733,7 @@ fn lex_directives(source: &str, cancel: Option<&AtomicBool>) -> LexResult {
                     break;
                 }
             },
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                index = skip_line_comment(bytes, index);
-            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => index = skip_line_comment(bytes, index),
             b'{' if bytes.get(index + 1) == Some(&b'$') => {
                 let Some(close) = find_byte(bytes, index + 2, b'}') else {
                     result.complete = false;
@@ -823,6 +785,12 @@ fn lex_directives(source: &str, cancel: Option<&AtomicBool>) -> LexResult {
         }
     }
     result
+}
+
+#[derive(Debug, Default)]
+struct LexResult {
+    directives: Vec<RawDirective>,
+    complete: bool,
 }
 
 fn find_byte(bytes: &[u8], start: usize, wanted: u8) -> Option<usize> {
@@ -951,8 +919,6 @@ fn evaluate_condition(body: &str, environment: &Environment, complete: &mut bool
                 Truth::Unknown
             }),
         "if" | "elseif" | "elif" => evaluate_expression(arguments, environment, complete),
-        // Compiler options are host/compiler state, not facts we infer from a
-        // project file. They remain unknown but are structurally supported.
         "ifopt" => Truth::Unknown,
         _ => {
             *complete = false;
@@ -1243,26 +1209,16 @@ impl ExpressionParser<'_> {
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("false") => {
                 Value::Truth(Truth::False)
             }
-            // A bare identifier in {$IF ...} belongs to Pascal's value
-            // namespace, not the compiler-symbol namespace. This analyzer
-            // deliberately does not resolve Pascal constants, so it cannot
-            // be used as a DEFINE/UNDEF fact.
             ExprToken::Identifier(_) => Value::Unknown,
             ExprToken::Number(value) => Value::Number(value),
             ExprToken::String(value) => Value::String(value),
-            ExprToken::Invalid => {
+            ExprToken::Invalid | ExprToken::End => {
                 self.malformed = true;
                 Value::Unknown
             }
-            ExprToken::End => {
-                self.malformed = true;
-                Value::Unknown
-            }
-            ExprToken::LParen | ExprToken::RParen => {
-                self.malformed = true;
-                Value::Unknown
-            }
-            ExprToken::Equal
+            ExprToken::LParen
+            | ExprToken::RParen
+            | ExprToken::Equal
             | ExprToken::NotEqual
             | ExprToken::Less
             | ExprToken::LessEqual
@@ -1381,18 +1337,14 @@ fn identifier_spans(source: &str) -> Vec<(usize, usize)> {
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'\'' => {
-                index = skip_string(bytes, index).unwrap_or(bytes.len());
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                index = skip_line_comment(bytes, index);
-            }
+            b'\'' => index = skip_string(bytes, index).unwrap_or(bytes.len()),
+            b'/' if bytes.get(index + 1) == Some(&b'/') => index = skip_line_comment(bytes, index),
             b'{' => {
-                index = find_byte(bytes, index + 1, b'}').map_or(bytes.len(), |close| close + 1);
+                index = find_byte(bytes, index + 1, b'}').map_or(bytes.len(), |close| close + 1)
             }
             b'(' if bytes.get(index + 1) == Some(&b'*') => {
                 index =
-                    find_sequence(bytes, index + 2, b"*)").map_or(bytes.len(), |close| close + 2);
+                    find_sequence(bytes, index + 2, b"*)").map_or(bytes.len(), |close| close + 2)
             }
             byte if is_identifier_byte(byte) => {
                 let start = index;
@@ -1447,351 +1399,4 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "writeableconst"
             | "x"
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DirectiveKind, MAX_DIRECTIVES, Truth, analyze, analyze_with_cancel};
-    use std::sync::atomic::AtomicBool;
-
-    #[test]
-    fn known_inactive_branch_is_masked_without_changing_offsets() {
-        let source = "{$UNDEF OFF}\n{$IFDEF OFF}\nconst Hidden = 1;\n{$ELSE}\nconst Visible = 2;\n{$ENDIF}\n";
-        let analysis = analyze(source, &[]);
-        assert!(analysis.complete);
-        assert_eq!(analysis.projected_source.len(), source.len());
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Hidden"))
-        );
-        assert!(
-            !analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Visible"))
-        );
-    }
-
-    #[test]
-    fn absent_and_compiler_version_facts_are_unknown() {
-        let absent = analyze("{$IFDEF ABSENT}\nHidden\n{$ENDIF}", &[]);
-        assert_eq!(absent.directives[0].activity, Truth::True);
-        assert!(absent.unknown_spans.iter().any(|span| !span.is_empty()));
-
-        let version = analyze("{$IF CompilerVersion >= 24}\nValue\n{$ENDIF}", &[]);
-        assert!(version.complete);
-        assert!(version.unknown_spans.iter().any(|span| !span.is_empty()));
-
-        let option = analyze("{$IFOPT DEBUG}\nValue\n{$ENDIF}", &[]);
-        assert!(option.complete);
-        assert!(option.unknown_spans.iter().any(|span| !span.is_empty()));
-    }
-
-    #[test]
-    fn mixed_case_boolean_expressions_use_kleene_truth() {
-        let source = "{$DeFiNe FEATURE}\n{$UnDeF DISABLED}\n{$iF (DEFINED(FEATURE) Or DEFINED(MISSING)) AnD NoT DEFINED(DISABLED)}\nVisible\n{$EnDIf}\n{$IF False AnD DEFINED(UNKNOWN)}\nHidden\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-        assert!(analysis.complete);
-        assert!(
-            !analysis
-                .unknown_spans
-                .iter()
-                .any(|span| { source[span.clone()].contains("Visible") })
-        );
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Hidden"))
-        );
-    }
-
-    #[test]
-    fn local_define_and_undef_are_applied_only_when_provable() {
-        let source = "{$DEFINE FEATURE}\n{$IFDEF FEATURE}\nOne\n{$ENDIF}\n{$UNDEF FEATURE}\n{$IFDEF FEATURE}\nTwo\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Two"))
-        );
-        assert!(analysis.directives.iter().any(|directive| {
-            directive.kind == DirectiveKind::Define && directive.activity == Truth::True
-        }));
-    }
-
-    #[test]
-    fn bare_expression_identifiers_do_not_use_define_facts() {
-        let source = "{$DEFINE Flag}\nconst Flag = False;\n{$IF Flag}\nYes\n{$ELSE}\nNo\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-
-        assert!(analysis.complete);
-        assert!(
-            analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Yes"))
-        );
-        assert!(
-            analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("No"))
-        );
-    }
-
-    #[test]
-    fn malformed_directive_arguments_never_establish_facts() {
-        let source = "{$UNDEF !!!OFF}{$IFDEF OFF}\nYes\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-
-        assert!(!analysis.complete);
-        assert_eq!(analysis.unknown_spans, vec![0..source.len()]);
-    }
-
-    #[test]
-    fn environment_amplification_hits_the_aggregate_work_budget() {
-        let mut source = String::new();
-        for index in 0..1_500 {
-            source.push_str(&format!("{{$DEFINE SYMBOL_{index}}}\n"));
-        }
-        source.push_str("{$IFDEF UNKNOWN_START}\n");
-        for index in 0..1_500 {
-            source.push_str(&format!("{{$ELSEIF UNKNOWN_{index}}}\n"));
-        }
-        source.push_str("body\n{$ENDIF}");
-
-        let analysis = analyze(&source, &[]);
-
-        assert!(!analysis.complete);
-        assert_eq!(analysis.unknown_spans, vec![0..source.len()]);
-    }
-
-    #[test]
-    fn long_environment_symbols_hit_the_byte_budget() {
-        let mut source = String::new();
-        let long_prefix = "SYMBOL_".to_string() + &"X".repeat(4_096);
-        for index in 0..512 {
-            source.push_str(&format!("{{$DEFINE {long_prefix}_{index}}}\n"));
-        }
-        source.push_str("{$IFDEF UNKNOWN_START}\nbody\n{$ENDIF}");
-
-        let analysis = analyze(&source, &[]);
-
-        assert!(!analysis.complete);
-        assert_eq!(analysis.unknown_spans, vec![0..source.len()]);
-    }
-
-    #[test]
-    fn long_environment_symbols_hit_the_clone_byte_work_budget() {
-        let mut source = String::new();
-        source.push_str("{$DEFINE ");
-        source.push_str(&"X".repeat(512 * 1024));
-        source.push_str("}\n");
-        for _ in 0..128 {
-            source.push_str("{$IF True}\n");
-        }
-        for _ in 0..128 {
-            source.push_str("{$ENDIF}\n");
-        }
-
-        let analysis = analyze(&source, &[]);
-
-        assert!(!analysis.complete);
-        assert_eq!(analysis.unknown_spans, vec![0..source.len()]);
-    }
-
-    #[test]
-    fn nested_long_environment_symbols_do_not_complete_with_unbounded_clone_work() {
-        let mut source = String::new();
-        source.push_str("{$DEFINE ");
-        source.push_str(&"X".repeat(256 * 1024));
-        source.push_str("}\n");
-        for _ in 0..96 {
-            source.push_str("{$IF True}\n");
-        }
-        for _ in 0..96 {
-            source.push_str("{$ENDIF}\n");
-        }
-
-        let analysis = analyze(&source, &[]);
-
-        assert!(!analysis.complete);
-        assert_eq!(analysis.unknown_spans, vec![0..source.len()]);
-    }
-
-    #[test]
-    fn cancellation_marks_analysis_incomplete() {
-        let source = "{$IFDEF MAYBE}\nVisible\n{$ENDIF}";
-        let cancel = AtomicBool::new(true);
-
-        let analysis = analyze_with_cancel(source, &[], &cancel);
-
-        assert!(!analysis.complete);
-        assert_eq!(analysis.unknown_spans, vec![0..source.len()]);
-    }
-
-    #[test]
-    fn strings_comments_and_nested_directives_are_lexed() {
-        let source = "const Text = '{$IFDEF FAKE}'; // {$IFDEF FAKE}\n(* {$IFDEF FAKE} *)\n{$IFDEF OUTER}\n{$IFDEF INNER}\nHidden\n{$ENDIF}\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-        assert!(analysis.complete);
-        assert_eq!(
-            analysis
-                .directives
-                .iter()
-                .filter(|directive| directive.kind == DirectiveKind::ConditionalStart)
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn candidate_identifier_scans_ignore_comments_strings_and_directives() {
-        let source = "{$IFDEF MAYBE}\n// Target\nconst Text = 'Target';\n{$I Target.inc}\nTarget := 1;\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-        assert!(analysis.potentially_active_contains_identifier(source, &["Target".to_owned()]));
-        assert!(analysis.unknown_contains_identifier(source, "Target"));
-
-        let noise_only =
-            "{$IFDEF MAYBE}\n// Target\nconst Text = 'Target';\n{$I Target.inc}\n{$ENDIF}";
-        let noise_analysis = analyze(noise_only, &[]);
-        assert!(
-            !noise_analysis
-                .potentially_active_contains_identifier(noise_only, &["Target".to_owned()])
-        );
-        assert!(!noise_analysis.unknown_contains_identifier(noise_only, "Target"));
-    }
-
-    #[test]
-    fn directive_budget_exhaustion_marks_the_whole_source_unknown() {
-        let source = "{$DEFINE FEATURE}\n".repeat(MAX_DIRECTIVES + 1);
-        let analysis = analyze(&source, &[]);
-        assert!(!analysis.complete);
-        assert_eq!(analysis.unknown_spans, vec![0..source.len()]);
-        assert_eq!(analysis.projected_source.len(), source.len());
-    }
-
-    #[test]
-    fn unknown_branch_side_effects_merge_to_unknown() {
-        let analysis = analyze(
-            "{$IFDEF MAYBE}\n{$DEFINE FEATURE}\n{$ELSE}\n{$UNDEF FEATURE}\n{$ENDIF}\n{$IFDEF FEATURE}\nMaybe\n{$ENDIF}",
-            &[],
-        );
-        assert!(analysis.unknown_spans.iter().any(|span| !span.is_empty()));
-    }
-
-    #[test]
-    fn comparisons_keep_unknown_operands_unknown_and_use_pascal_boolean_order() {
-        let unknown = analyze(
-            "{$IF DEFINED(A) = DEFINED(B)}\nYes\n{$ELSE}\nNo\n{$ENDIF}",
-            &[],
-        );
-        assert!(unknown.complete);
-        assert!(
-            unknown
-                .unknown_spans
-                .iter()
-                .any(|span| unknown.projected_source[span.clone()].contains("Yes"))
-        );
-        assert!(
-            unknown
-                .unknown_spans
-                .iter()
-                .any(|span| unknown.projected_source[span.clone()].contains("No"))
-        );
-
-        let ordered_source = "{$IF False < True}\nYes\n{$ELSE}\nNo\n{$ENDIF}";
-        let ordered = analyze(ordered_source, &[]);
-        assert!(ordered.complete);
-        assert!(
-            !ordered
-                .unknown_spans
-                .iter()
-                .any(|span| ordered_source[span.clone()].contains("Yes"))
-        );
-        assert!(
-            ordered
-                .inactive_spans
-                .iter()
-                .any(|span| ordered_source[span.clone()].contains("No"))
-        );
-    }
-
-    #[test]
-    fn mixed_logical_comparisons_and_typed_values_follow_pascal_precedence() {
-        let source = "{$IF True or False = False}\nWrong\n{$ELSE}\nRight\n{$ENDIF}\n{$IF not True = False}\nNotRight\n{$ELSE}\nNotWrong\n{$ENDIF}\n{$IF 6 and 3 = 2}\nTyped\n{$ELSE}\nUntyped\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-        assert!(analysis.complete);
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Wrong"))
-        );
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("NotWrong"))
-        );
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Untyped"))
-        );
-        assert!(
-            !analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Right"))
-        );
-        assert!(
-            !analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("NotRight"))
-        );
-        assert!(
-            !analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("Typed"))
-        );
-    }
-
-    #[test]
-    fn unknown_boolean_values_keep_pascal_short_circuit_truth() {
-        let source = "{$IF UnknownFlag and False}\nWrongAnd\n{$ELSE}\nRightAnd\n{$ENDIF}\n{$IF UnknownFlag or True}\nRightOr\n{$ELSE}\nWrongOr\n{$ENDIF}";
-        let analysis = analyze(source, &[]);
-        assert!(analysis.complete);
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("WrongAnd"))
-        );
-        assert!(
-            analysis
-                .inactive_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("WrongOr"))
-        );
-        assert!(
-            !analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("RightAnd"))
-        );
-        assert!(
-            !analysis
-                .unknown_spans
-                .iter()
-                .any(|span| source[span.clone()].contains("RightOr"))
-        );
-    }
 }

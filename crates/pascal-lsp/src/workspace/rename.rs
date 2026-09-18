@@ -6,6 +6,7 @@
 //! index for each expensive request and never mutates the live navigation
 //! cache or the filesystem.
 
+use super::resolver as shared_resolver;
 use super::{
     ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
     WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_configuration_file,
@@ -13,15 +14,18 @@ use super::{
     paths_equal_ci, read_disk_source,
 };
 use crate::NavigationIndex;
-use crate::conditional::{self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind};
 use crate::navigation::ParsedDocument;
 use crate::text;
 use lsp_types::{
     DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
     PrepareRenameResponse, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
-use pascal_core::decode_bytes;
-use pascal_project::delphi_overrides::EffectiveOverrides;
+use pascal_core::conditional::{
+    self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind,
+};
+use pascal_core::resolver::{
+    IncludeResolveRequest, LegacyRoute, LoadedSource, Resolution, ResolverLimits,
+};
 use pascal_project::{
     MetadataObservation, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
     ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
@@ -32,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
@@ -58,9 +62,6 @@ const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
 const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
-const INCLUDE_BYTE_BUDGET_ERROR: &str =
-    "include byte limit would be exceeded before reading the file";
-
 #[cfg(test)]
 thread_local! {
     static TEST_CANCEL_INCLUDE_ANALYSIS: Cell<bool> = const { Cell::new(false) };
@@ -137,6 +138,10 @@ pub(crate) struct SourceRecord {
     /// Unlike a positive source URI, this is invalidated by a matching source
     /// change even when the file was not part of the worker's read set.
     pub(crate) missing_provider_candidate: bool,
+    /// The resolver observed the directory contents while resolving a source.
+    /// A child create/delete/rename invalidates this record, but unrelated
+    /// source records remain exact-path dependencies.
+    pub(crate) directory_observation: bool,
 }
 
 impl SourceRecord {
@@ -696,10 +701,13 @@ impl Workspace {
                 let text_changed = record.content_hash.map_or_else(
                     || document.text.as_deref() != Some(record.text.as_str()),
                     |expected| {
-                        document
-                            .text
-                            .as_deref()
-                            .is_none_or(|text| text_content_hash(text) != expected)
+                        document.text.as_deref().is_none_or(|text| {
+                            if record.text.is_empty() {
+                                super::content_hash_bytes(text.as_bytes()) != expected
+                            } else {
+                                text_content_hash(text) != expected
+                            }
+                        })
                     },
                 );
                 if document.version != record.version.unwrap_or_default() || text_changed {
@@ -780,7 +788,13 @@ pub(crate) fn revalidate_input(
             };
             let text_changed = record.content_hash.map_or_else(
                 || overlay.text != record.text,
-                |expected| text_content_hash(&overlay.text) != expected,
+                |expected| {
+                    if record.text.is_empty() {
+                        super::content_hash_bytes(overlay.text.as_bytes()) != expected
+                    } else {
+                        text_content_hash(&overlay.text) != expected
+                    }
+                },
             );
             if overlay.version != record.version.unwrap_or_default() || text_changed {
                 return Err(format!(
@@ -839,6 +853,13 @@ fn revalidate_path_record(
 ) -> Result<(), String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    // A resolver candidate can be rejected for authorization even while the
+    // filesystem path exists (for example, a configured symlink). Its
+    // presence is not proof that the candidate became readable; the live
+    // generation check handles an observed candidate change instead.
+    if record.missing_provider_candidate {
+        return Ok(());
     }
     if let Some(expected) = &record.candidate_membership {
         let actual =
@@ -1031,6 +1052,7 @@ fn path_record_at(
         path_entry,
         include_payload,
         missing_provider_candidate: false,
+        directory_observation: false,
     })
 }
 
@@ -1072,6 +1094,7 @@ pub(crate) fn source_for_input_with_cancel(
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                directory_observation: false,
             },
         ));
     }
@@ -1112,6 +1135,7 @@ pub(crate) fn source_for_input_with_owner(
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                directory_observation: false,
             },
         ));
     }
@@ -1166,6 +1190,7 @@ pub(crate) fn source_for_input_with_owner(
         path_entry: Some(entry),
         include_payload: false,
         missing_provider_candidate: false,
+        directory_observation: false,
     };
     Ok((disk.text, record))
 }
@@ -1415,7 +1440,8 @@ pub(crate) fn consumed_context_records(
             }) => (Some(read_policy.clone()), Some(path_entry.clone())),
             Some(MetadataObservation::Stat { .. }) | None => (None, None),
         };
-        if let Some(record) = path_record_at(
+        let missing_provider_candidate = stamp.is_none() && !is_configuration_file(&path);
+        if let Some(mut record) = path_record_at(
             path,
             stamp,
             content_hash,
@@ -1425,6 +1451,7 @@ pub(crate) fn consumed_context_records(
             path_entry,
             false,
         ) {
+            record.missing_provider_candidate = missing_provider_candidate;
             records.push(record);
         }
     }
@@ -2675,6 +2702,7 @@ pub(crate) fn build_snapshot(
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
                     missing_provider_candidate: false,
+                    directory_observation: false,
                 },
                 overlay.text.len(),
             )
@@ -2716,7 +2744,7 @@ pub(crate) fn build_snapshot(
             if !is_priority && !direct_candidate && !may_contain_include_directive(&scan.data) {
                 continue;
             }
-            let source = decode_bytes(&scan.data).into_owned();
+            let source = shared_resolver::decode_source_bytes(&scan.data);
             let stamp = disk_stamp(&path)
                 .ok_or_else(|| format!("rename workspace scan could not stat source {path:?}"))?;
             (
@@ -2736,6 +2764,7 @@ pub(crate) fn build_snapshot(
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
                     missing_provider_candidate: false,
+                    directory_observation: false,
                 },
                 scan.bytes,
             )
@@ -3027,6 +3056,7 @@ pub(crate) fn build_snapshot(
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    directory_observation: false,
                 },
             )
         } else {
@@ -3058,6 +3088,7 @@ pub(crate) fn build_snapshot(
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    directory_observation: false,
                 },
             )
         };
@@ -3094,6 +3125,7 @@ pub(crate) fn build_snapshot(
 
     if mode != SnapshotMode::WorkspaceSymbols {
         let include_audit = audit_includes(IncludeAuditor {
+            input,
             sources: &sources,
             loader: &mut loader,
             contexts: &mut contexts,
@@ -3105,6 +3137,8 @@ pub(crate) fn build_snapshot(
             allow_incomplete_context_for,
             cancel,
             cache: HashMap::new(),
+            resolution_cache: HashMap::new(),
+            resolvers: HashMap::new(),
             active: HashSet::new(),
             name_free_assistance: mode == SnapshotMode::Assistance,
             baseline_contents: &mut baseline_contents,
@@ -3118,6 +3152,18 @@ pub(crate) fn build_snapshot(
         if let Some(reason) = include_audit.incomplete_reason {
             complete = false;
             incomplete_reason.get_or_insert(reason);
+        }
+    }
+    if let Some(analysis_records) = loader.analysis_records.take() {
+        for (uri, record) in analysis_records {
+            if record.include_payload
+                || record.open && record.version.is_some()
+                || record.content_hash.is_some()
+                    && record.read_policy.is_some()
+                    && record.path_entry.is_some()
+            {
+                super::resolver::merge_source_record(&mut records, SourceRecord { uri, ..record });
+            }
         }
     }
 
@@ -3747,27 +3793,6 @@ struct IncludeAuditResult {
     incomplete_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum IncludeRoute {
-    Legacy,
-    Mapped { root: PathBuf },
-}
-
-#[derive(Debug)]
-struct IncludeLookup {
-    observations: Vec<IncludeObservation>,
-    selected: Option<PathBuf>,
-    selected_directory: Option<PathBuf>,
-    selected_route: IncludeRoute,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct IncludeObservation {
-    path: PathBuf,
-    stamp: Option<PathStamp>,
-}
-
 #[derive(Debug, Clone)]
 struct IncludeAnalysis {
     safe: bool,
@@ -3794,6 +3819,7 @@ impl IncludeAnalysis {
 }
 
 struct IncludeAuditor<'a> {
+    input: &'a WorkspaceInput,
     sources: &'a HashMap<Url, String>,
     loader: &'a mut Workspace,
     contexts: &'a mut HashMap<Url, ContextKey>,
@@ -3806,6 +3832,9 @@ struct IncludeAuditor<'a> {
     allow_incomplete_context_for: &'a [Url],
     cancel: &'a AtomicBool,
     cache: HashMap<String, IncludeAnalysis>,
+    resolution_cache: HashMap<String, Resolution<LoadedSource>>,
+    resolvers:
+        HashMap<ContextKey, pascal_core::resolver::UnitResolver<shared_resolver::LspSourceStore>>,
     active: HashSet<String>,
     name_free_assistance: bool,
     files_read: usize,
@@ -3819,10 +3848,7 @@ struct IncludeInspection<'a> {
     context_key: &'a ContextKey,
     context: &'a ProjectContext,
     owner_path: &'a Path,
-    selected_directory: Option<&'a Path>,
-    relative: bool,
-    route: IncludeRoute,
-    legacy_authorized: bool,
+    legacy_route: Option<LegacyRoute>,
 }
 
 fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult, String> {
@@ -3988,6 +4014,195 @@ impl IncludeAuditor<'_> {
         true
     }
 
+    fn top_level_legacy_route(
+        &self,
+        owner_path: &Path,
+        context_key: &ContextKey,
+        context: &ProjectContext,
+    ) -> Option<LegacyRoute> {
+        let uri = Url::from_file_path(owner_path).ok()?;
+        self.loader
+            .legacy_route_for_resolver(&uri, owner_path, context_key, context)
+            .or_else(|| {
+                owner_has_legacy_or_workspace_authority(self.loader, owner_path, context).then(
+                    || LegacyRoute {
+                        source_path: owner_path.to_path_buf(),
+                        sibling_directory: owner_path.parent().unwrap_or(owner_path).to_path_buf(),
+                    },
+                )
+            })
+    }
+
+    fn legacy_route_for_loaded_source(
+        &self,
+        context: &ProjectContext,
+        source: &LoadedSource,
+        inherited: Option<&LegacyRoute>,
+    ) -> Option<LegacyRoute> {
+        let legacy = match &source.revision {
+            pascal_core::resolver::SourceRevision::Disk { path_entry, .. } => {
+                matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative)
+            }
+            pascal_core::resolver::SourceRevision::Overlay { .. } => {
+                context.path_entry_for(&source.path).is_some_and(|entry| {
+                    matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                }) || inherited.is_some_and(|route| {
+                    source.path.parent().is_some_and(|parent| {
+                        path_key(parent) == path_key(&route.sibling_directory)
+                    })
+                })
+            }
+        };
+        legacy.then(|| LegacyRoute {
+            source_path: source.path.clone(),
+            sibling_directory: source.path.parent().unwrap_or(&source.path).to_path_buf(),
+        })
+    }
+
+    fn resolve_include(
+        &mut self,
+        context_key: &ContextKey,
+        context: &ProjectContext,
+        including_path: &Path,
+        directive: &Directive,
+        legacy_route: Option<&LegacyRoute>,
+    ) -> Result<Resolution<LoadedSource>, String> {
+        let Some(requested_name) = include_name(directive) else {
+            return Ok(Resolution::Unavailable {
+                reason: "include directive has no statically known file name".to_string(),
+            });
+        };
+        let cache_key = include_resolution_cache_key(
+            context_key,
+            including_path,
+            &requested_name,
+            legacy_route,
+        );
+        if let Some(result) = self.resolution_cache.get(&cache_key) {
+            return Ok(result.clone());
+        }
+
+        let limits = ResolverLimits {
+            max_source_bytes: self.max_file_bytes,
+            max_include_files: MAX_RENAME_INCLUDE_FILES,
+            max_include_bytes: MAX_RENAME_INCLUDE_BYTES,
+            max_include_directives: MAX_RENAME_INCLUDE_DIRECTIVES,
+            max_include_depth: MAX_RENAME_INCLUDE_DEPTH,
+            ..ResolverLimits::default()
+        };
+        let (outcome, report) = {
+            let resolver = self
+                .resolvers
+                .entry(context_key.clone())
+                .or_insert_with(|| {
+                    shared_resolver::resolver_for_context_with_limits(
+                        context.clone(),
+                        self.input.roots.clone(),
+                        self.input,
+                        limits,
+                    )
+                });
+            let (used_files, used_bytes, used_directives) = resolver.include_usage();
+            resolver.set_include_limits(
+                used_files.saturating_add(MAX_RENAME_INCLUDE_FILES.saturating_sub(self.files_read)),
+                used_bytes.saturating_add(MAX_RENAME_INCLUDE_BYTES.saturating_sub(self.bytes_read)),
+                used_directives.saturating_add(
+                    MAX_RENAME_INCLUDE_DIRECTIVES.saturating_sub(self.directives_seen),
+                ),
+            );
+            let outcome = resolver.try_resolve_include(
+                IncludeResolveRequest {
+                    including_path,
+                    byte_range: directive.start..directive.end,
+                    requested_name: &requested_name,
+                    legacy_route,
+                },
+                self.cancel,
+            );
+            let report = resolver.report();
+            (outcome, report)
+        };
+        self.observe_resolver_report(context_key, &report);
+        let result = match outcome {
+            Ok(outcome) => match outcome.result {
+                Resolution::Incomplete { reason, candidates } => {
+                    let reason = if report.warnings.iter().any(|warning| {
+                        let warning = warning.to_ascii_lowercase();
+                        warning.contains("unauthorized")
+                            || warning.contains("outside the requester-scoped")
+                            || warning.contains("outside the owning project")
+                    }) {
+                        "include source is outside the owning project's readable roots".to_string()
+                    } else {
+                        reason
+                    };
+                    Resolution::Incomplete { reason, candidates }
+                }
+                result => result,
+            },
+            Err(pascal_core::ResolverError::Cancelled) => {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            Err(error) => Resolution::Incomplete {
+                reason: error.to_string(),
+                candidates: Vec::new(),
+            },
+        };
+        self.resolution_cache.insert(cache_key, result.clone());
+        Ok(result)
+    }
+
+    fn observe_resolver_report(
+        &mut self,
+        context_key: &ContextKey,
+        report: &pascal_core::resolver::ResolutionReport,
+    ) {
+        self.loader.merge_resolution_report(context_key, report);
+        for observation in &report.observations {
+            match observation {
+                pascal_core::resolver::ResolutionObservation::Directory { path, stamp, .. } => {
+                    add_baseline_path_with_stamp(self.baseline, path.clone(), stamp.clone())
+                }
+                pascal_core::resolver::ResolutionObservation::Candidate {
+                    path,
+                    stamp,
+                    present,
+                    ..
+                } => {
+                    // A denied candidate may still exist on disk (for
+                    // example, a configured symlink outside the requester
+                    // roots). Its presence must not stale the request, while
+                    // an actually missing candidate remains an observed
+                    // precedence input and must stale if it appears.
+                    if *present || stamp.is_some() || !path.exists() {
+                        add_baseline_path_with_stamp(self.baseline, path.clone(), stamp.clone());
+                    }
+                }
+                pascal_core::resolver::ResolutionObservation::Payload {
+                    path,
+                    revision: pascal_core::resolver::SourceRevision::Disk { stamp, .. },
+                    ..
+                } => add_baseline_path_with_stamp(self.baseline, path.clone(), Some(stamp.clone())),
+                _ => {}
+            }
+        }
+    }
+
+    fn record_loaded_include(
+        &mut self,
+        context: &ProjectContext,
+        source: &LoadedSource,
+    ) -> Result<(), String> {
+        let uri = Url::from_file_path(&source.path).map_err(|_| {
+            format!(
+                "include source is not a file URI: {}",
+                source.path.display()
+            )
+        })?;
+        self.loader
+            .record_resolved_source(context, source, uri, true)
+    }
+
     fn inspect_top_level(
         &mut self,
         uri: &Url,
@@ -4002,49 +4217,52 @@ impl IncludeAuditor<'_> {
             self.stopped = true;
             return Ok(());
         };
-
-        let directories = include_search_directories(&owner_path, Some(context));
-        let lookup =
-            resolve_include_path_with_overrides(directive, &directories, &context.overrides);
-        self.observe_lookup(&lookup);
-        if let Some(error) = lookup.error {
-            self.record_error(format!(
-                "rename cannot prove completeness because include in {uri} could not be read: {error}"
-            ));
-            self.stopped = true;
-            return Ok(());
-        }
-        let Some(path) = lookup.selected else {
-            self.record_error(format!(
-                "rename cannot prove completeness because an include path in {uri} is unresolved"
-            ));
-            self.stopped = true;
-            return Ok(());
+        let legacy_route = self.top_level_legacy_route(&owner_path, context_key, context);
+        let resolution = self.resolve_include(
+            context_key,
+            context,
+            &owner_path,
+            directive,
+            legacy_route.as_ref(),
+        )?;
+        let source = match resolution {
+            Resolution::Found(source) => source,
+            Resolution::Unavailable { .. } => {
+                self.record_error(format!(
+                    "rename cannot prove completeness because an include path in {uri} is unresolved"
+                ));
+                self.stopped = true;
+                return Ok(());
+            }
+            Resolution::Ambiguous { candidates } => {
+                self.record_error(format!(
+                    "rename cannot prove completeness because include in {uri} is ambiguous ({})",
+                    candidates.len()
+                ));
+                self.stopped = true;
+                return Ok(());
+            }
+            Resolution::Incomplete { reason, .. } => {
+                self.record_error(format!(
+                    "rename cannot prove completeness because include in {uri} could not be read: {reason}"
+                ));
+                self.stopped = true;
+                return Ok(());
+            }
         };
-
-        let route = lookup.selected_route.clone();
-        let legacy_authorized = matches!(&route, IncludeRoute::Legacy)
-            && legacy_include_is_authorized(
-                self.loader,
-                context,
-                &owner_path,
-                lookup.selected_directory.as_deref(),
-                include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()),
-            );
+        let legacy_route =
+            self.legacy_route_for_loaded_source(context, &source, legacy_route.as_ref());
         let inspection = IncludeInspection {
             context_key,
             context,
             owner_path: &owner_path,
-            selected_directory: lookup.selected_directory.as_deref(),
-            relative: include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()),
-            route,
-            legacy_authorized,
+            legacy_route,
         };
-        let analysis = self.inspect_include_file(&path, inspection, 0)?;
+        let analysis = self.inspect_include_file(&source, inspection, 0)?;
         if !analysis.safe || analysis.relevant {
             let reason = analysis
                 .reason
-                .unwrap_or_else(|| format!("include {path:?} contains source content"));
+                .unwrap_or_else(|| format!("include {:?} contains source content", source.path));
             self.record_error(format!("rename cannot prove completeness because {reason}"));
             self.stopped = true;
         }
@@ -4058,8 +4276,7 @@ impl IncludeAuditor<'_> {
         directive: &Directive,
         context_key: &ContextKey,
         context: &ProjectContext,
-        inherited_route: IncludeRoute,
-        legacy_authorized: bool,
+        inherited_route: Option<LegacyRoute>,
         depth: usize,
     ) -> Result<IncludeAnalysis, String> {
         if depth >= MAX_RENAME_INCLUDE_DEPTH {
@@ -4071,49 +4288,48 @@ impl IncludeAuditor<'_> {
                 false,
             ));
         }
-        let directories = include_search_directories(owner_path, Some(context));
-        let lookup =
-            resolve_include_path_with_overrides(directive, &directories, &context.overrides);
-        self.observe_lookup(&lookup);
-        if let Some(error) = lookup.error {
-            return Ok(IncludeAnalysis::unsafe_with_reason(
-                format!("include in {owner_path:?} could not be read: {error}"),
-                false,
-            ));
-        }
-        let Some(path) = lookup.selected else {
-            return Ok(IncludeAnalysis::unsafe_with_reason(
-                format!("include in {owner_path:?} has an unresolved path"),
-                false,
-            ));
+        let resolution = self.resolve_include(
+            context_key,
+            context,
+            owner_path,
+            directive,
+            inherited_route.as_ref(),
+        )?;
+        let source = match resolution {
+            Resolution::Found(source) => source,
+            Resolution::Unavailable { .. } => {
+                return Ok(IncludeAnalysis::unsafe_with_reason(
+                    format!("include in {owner_path:?} has an unresolved path"),
+                    false,
+                ));
+            }
+            Resolution::Ambiguous { .. } => {
+                return Ok(IncludeAnalysis::unsafe_with_reason(
+                    format!("include in {owner_path:?} has an ambiguous path"),
+                    false,
+                ));
+            }
+            Resolution::Incomplete { reason, .. } => {
+                return Ok(IncludeAnalysis::unsafe_with_reason(
+                    format!("include in {owner_path:?} could not be read: {reason}"),
+                    false,
+                ));
+            }
         };
-        let route = match lookup.selected_route {
-            IncludeRoute::Mapped { root } => IncludeRoute::Mapped { root },
-            IncludeRoute::Legacy => inherited_route,
-        };
-        let legacy_authorized = matches!(&route, IncludeRoute::Legacy)
-            && inherited_legacy_authorization(
-                legacy_authorized,
-                owner_path,
-                directive,
-                lookup.selected_directory.as_deref(),
-                context,
-            );
+        let legacy_route =
+            self.legacy_route_for_loaded_source(context, &source, inherited_route.as_ref());
         let inspection = IncludeInspection {
             context_key,
             context,
             owner_path,
-            selected_directory: lookup.selected_directory.as_deref(),
-            relative: include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()),
-            route,
-            legacy_authorized,
+            legacy_route,
         };
-        self.inspect_include_file(&path, inspection, depth + 1)
+        self.inspect_include_file(&source, inspection, depth + 1)
     }
 
     fn inspect_include_file(
         &mut self,
-        path: &Path,
+        source: &LoadedSource,
         inspection: IncludeInspection<'_>,
         depth: usize,
     ) -> Result<IncludeAnalysis, String> {
@@ -4125,21 +4341,18 @@ impl IncludeAuditor<'_> {
             self.stopped = true;
             return Ok(IncludeAnalysis::unsafe_with_reason(
                 format!(
-                    "include {path:?} exceeds the maximum include nesting depth ({MAX_RENAME_INCLUDE_DEPTH})"
+                    "include {:?} exceeds the maximum include nesting depth ({MAX_RENAME_INCLUDE_DEPTH})",
+                    source.path
                 ),
                 false,
             ));
         }
-        let directories = include_search_directories(path, Some(inspection.context));
+        let path = &source.path;
         let cache_key = include_cache_key(
             path,
-            &directories,
             inspection.context_key,
             inspection.owner_path,
-            inspection.selected_directory,
-            inspection.relative,
-            &inspection.route,
-            inspection.legacy_authorized,
+            inspection.legacy_route.as_ref(),
         );
         let active_key = canonical_include_key(path);
         if self.active.contains(&active_key) {
@@ -4150,53 +4363,6 @@ impl IncludeAuditor<'_> {
         }
         if let Some(analysis) = self.cache.get(&cache_key) {
             return Ok(analysis.clone());
-        }
-        if !is_readable_include_for_context(
-            self.loader,
-            path,
-            inspection.context_key,
-            inspection.context,
-            &inspection.route,
-            inspection.legacy_authorized,
-        ) {
-            let analysis = IncludeAnalysis::unsafe_with_reason(
-                format!("include {path:?} is outside the owning project's readable roots"),
-                false,
-            );
-            self.cache.insert(cache_key, analysis.clone());
-            return Ok(analysis);
-        }
-        let path_entry = match &inspection.route {
-            IncludeRoute::Mapped { root } => Some(ProjectPathEntry {
-                path: path.to_path_buf(),
-                provenance: ProjectPathProvenance::Mapped { root: root.clone() },
-            }),
-            IncludeRoute::Legacy => {
-                super::context_path_entry(inspection.context, path).or_else(|| {
-                    inspection.legacy_authorized.then(|| ProjectPathEntry {
-                        path: path.to_path_buf(),
-                        provenance: ProjectPathProvenance::LegacyNative,
-                    })
-                })
-            }
-        };
-        let Some(path_entry) = path_entry else {
-            let analysis = IncludeAnalysis::unsafe_with_reason(
-                format!("include {path:?} has no requester-scoped read authorization"),
-                false,
-            );
-            self.cache.insert(cache_key, analysis.clone());
-            return Ok(analysis);
-        };
-        if matches!(&inspection.route, IncludeRoute::Mapped { .. })
-            && !matches!(&path_entry.provenance, ProjectPathProvenance::Mapped { .. })
-        {
-            let analysis = IncludeAnalysis::unsafe_with_reason(
-                format!("mapped include {path:?} has no mapped provenance"),
-                false,
-            );
-            self.cache.insert(cache_key, analysis.clone());
-            return Ok(analysis);
         }
         if self.files_read >= MAX_RENAME_INCLUDE_FILES {
             self.stopped = true;
@@ -4223,62 +4389,50 @@ impl IncludeAuditor<'_> {
         }
 
         self.files_read += 1;
-        let include_source = match if matches!(&inspection.route, IncludeRoute::Mapped { .. }) {
-            read_mapped_include(
-                &inspection.context.read_policy,
-                &path_entry,
-                self.max_file_bytes,
-                remaining_bytes,
-                self.cancel,
-            )
-        } else {
-            read_include(
-                path,
-                &inspection.context.read_policy,
-                &path_entry,
-                self.max_file_bytes,
-                Some(remaining_bytes),
-                Some(self.cancel),
-            )
-        } {
-            Ok(source) => source,
-            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-            Err(error) => {
-                if error == INCLUDE_BYTE_BUDGET_ERROR {
-                    self.stopped = true;
-                }
-                let analysis = IncludeAnalysis::unsafe_with_reason(
-                    format!("include {path:?} could not be read: {error}"),
-                    false,
-                );
-                self.cache.insert(cache_key, analysis.clone());
-                return Ok(analysis);
-            }
-        };
-        self.bytes_read = self.bytes_read.saturating_add(include_source.bytes);
-        self.baseline_content_hashes
-            .entry(path_key(path))
-            .or_insert(include_source.content_hash);
-        self.baseline.set_include_payload_dependency(
-            path,
-            inspection.context.read_policy.clone(),
+        if source.bytes.len() > remaining_bytes {
+            self.stopped = true;
+            let analysis = IncludeAnalysis::unsafe_with_reason(
+                format!(
+                    "include {path:?} could not be audited because include byte limit ({MAX_RENAME_INCLUDE_BYTES}) was reached"
+                ),
+                false,
+            );
+            self.cache.insert(cache_key, analysis.clone());
+            return Ok(analysis);
+        }
+        self.bytes_read = self.bytes_read.saturating_add(source.bytes.len());
+        self.record_loaded_include(inspection.context, source)?;
+        if let pascal_core::resolver::SourceRevision::Disk {
+            content_hash,
+            read_policy,
             path_entry,
-        );
+            ..
+        } = &source.revision
+        {
+            self.baseline_content_hashes
+                .entry(path_key(path))
+                .or_insert(*content_hash);
+            self.baseline.set_include_payload_dependency(
+                path,
+                read_policy.clone(),
+                path_entry.clone(),
+            );
+        }
 
         // The caller's project defines are not necessarily the state at this
         // include boundary: the owner may have DEFINE/UNDEF directives, and
         // preceding includes may have changed the environment. Until the
         // auditor carries that state soundly, start include analysis with
         // unknown facts rather than resurrecting stale project facts.
-        let conditional = conditional::analyze_with_cancel(&include_source.text, &[], self.cancel);
+        let include_text = shared_resolver::decode_source_bytes(&source.bytes);
+        let conditional = conditional::analyze_with_cancel(&include_text, &[], self.cancel);
         if is_cancelled(self.cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         let relevant = if self.name_free_assistance {
             projected_source_contains_pascal_tokens(&conditional.projected_source)
         } else {
-            conditional
-                .potentially_active_contains_identifier(&include_source.text, self.candidate_names)
+            conditional.potentially_active_contains_identifier(&include_text, self.candidate_names)
                 || conditional.pascal_condition_contains_identifier(self.candidate_names)
         };
         let include_directives = conditional
@@ -4336,8 +4490,7 @@ impl IncludeAuditor<'_> {
                     &directive,
                     inspection.context_key,
                     inspection.context,
-                    inspection.route.clone(),
-                    inspection.legacy_authorized,
+                    inspection.legacy_route.clone(),
                     depth,
                 )?;
                 if !child.safe || child.relevant {
@@ -4365,16 +4518,6 @@ impl IncludeAuditor<'_> {
         };
         self.cache.insert(cache_key, analysis.clone());
         Ok(analysis)
-    }
-
-    fn observe_lookup(&mut self, lookup: &IncludeLookup) {
-        for observation in &lookup.observations {
-            add_baseline_path_with_stamp(
-                self.baseline,
-                observation.path.clone(),
-                observation.stamp.clone(),
-            );
-        }
     }
 
     fn record_error(&mut self, error: String) {
@@ -4466,165 +4609,32 @@ fn projected_source_contains_pascal_tokens(source: &str) -> bool {
     false
 }
 
-fn include_search_directories(owner_path: &Path, context: Option<&ProjectContext>) -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    if let Some(parent) = absolute_path(owner_path.to_path_buf())
-        .parent()
-        .map(Path::to_path_buf)
-    {
-        add_include_directory(&mut directories, parent);
-    }
-    if let Some(context) = context {
-        for path in &context.include_paths {
-            add_include_directory(&mut directories, path.clone());
-        }
-        for path in &context.search_paths {
-            add_include_directory(&mut directories, path.clone());
-        }
-    }
-    directories
-}
-
-fn add_include_directory(directories: &mut Vec<PathBuf>, path: PathBuf) {
-    let path = absolute_path(path);
-    if !directories
-        .iter()
-        .any(|existing| path_key(existing) == path_key(&path))
-    {
-        directories.push(path);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn include_cache_key(
     path: &Path,
-    directories: &[PathBuf],
     context_key: &ContextKey,
     owner_path: &Path,
-    selected_directory: Option<&Path>,
-    relative: bool,
-    route: &IncludeRoute,
-    legacy_authorized: bool,
+    legacy_route: Option<&LegacyRoute>,
 ) -> String {
     let mut hasher = DefaultHasher::new();
     path_key(path).hash(&mut hasher);
-    for directory in directories {
-        path_key(directory).hash(&mut hasher);
-    }
     context_key.hash(&mut hasher);
     path_key(owner_path).hash(&mut hasher);
-    selected_directory.map(path_key).hash(&mut hasher);
-    relative.hash(&mut hasher);
-    route.hash(&mut hasher);
-    legacy_authorized.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    legacy_route.hash(&mut hasher);
+    format!("include:{:016x}", hasher.finish())
 }
 
-fn is_readable_include_for_context(
-    workspace: &Workspace,
-    path: &Path,
+fn include_resolution_cache_key(
     context_key: &ContextKey,
-    context: &ProjectContext,
-    route: &IncludeRoute,
-    legacy_authorized: bool,
-) -> bool {
-    let path = absolute_path(path.to_path_buf());
-    if let IncludeRoute::Mapped { root } = route {
-        return workspace.mapped_path_is_readable_under_root(&path, root, context_key);
-    }
-    let mapped_roots = context_key
-        .overrides
-        .read_roots()
-        .into_iter()
-        .map(|root| super::native_mapping_root(&root))
-        .collect::<Vec<_>>();
-    if mapped_roots
-        .iter()
-        .any(|root| path_starts_with_native(&path, root))
-    {
-        return workspace.mapped_path_is_readable(&path, context_key);
-    }
-
-    workspace.accepts_path(&path)
-        || context.search_path_entries.iter().any(|entry| {
-            if !path_starts_with_native(&path, &entry.path) {
-                return false;
-            }
-            match &entry.provenance {
-                ProjectPathProvenance::Mapped { root } => {
-                    workspace.mapped_path_is_readable_under_root(&path, root, context_key)
-                }
-                ProjectPathProvenance::Configured => false,
-                ProjectPathProvenance::LegacyNative => true,
-            }
-        })
-        || context.include_path_entries.iter().any(|entry| {
-            if !path_starts_with_native(&path, &entry.path) {
-                return false;
-            }
-            match &entry.provenance {
-                ProjectPathProvenance::Mapped { root } => {
-                    workspace.mapped_path_is_readable_under_root(&path, root, context_key)
-                }
-                ProjectPathProvenance::Configured => false,
-                ProjectPathProvenance::LegacyNative => true,
-            }
-        })
-        || legacy_authorized
-}
-
-fn legacy_include_is_authorized(
-    workspace: &Workspace,
-    context: &ProjectContext,
-    owner_path: &Path,
-    selected_directory: Option<&Path>,
-    relative: bool,
-) -> bool {
-    owner_has_legacy_or_workspace_authority(workspace, owner_path, context)
-        && (!relative
-            || selected_directory.is_some_and(|directory| {
-                owner_path
-                    .parent()
-                    .is_some_and(|parent| path_key(parent) == path_key(directory))
-                    || legacy_search_entry_selected(context, Some(directory))
-            }))
-}
-
-fn inherited_legacy_authorization(
-    inherited: bool,
-    owner_path: &Path,
-    directive: &Directive,
-    selected_directory: Option<&Path>,
-    context: &ProjectContext,
-) -> bool {
-    if !inherited {
-        return legacy_search_entry_selected(context, selected_directory);
-    }
-    if !include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()) {
-        return true;
-    }
-    selected_directory.is_some_and(|directory| {
-        owner_path
-            .parent()
-            .is_some_and(|parent| path_key(parent) == path_key(directory))
-            || legacy_search_entry_selected(context, Some(directory))
-    })
-}
-
-fn legacy_search_entry_selected(
-    context: &ProjectContext,
-    selected_directory: Option<&Path>,
-) -> bool {
-    selected_directory.is_some_and(|directory| {
-        context
-            .search_path_entries
-            .iter()
-            .chain(context.include_path_entries.iter())
-            .any(|entry| {
-                path_key(&entry.path) == path_key(directory)
-                    && matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-            })
-    })
+    including_path: &Path,
+    requested_name: &str,
+    legacy_route: Option<&LegacyRoute>,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    context_key.hash(&mut hasher);
+    path_key(including_path).hash(&mut hasher);
+    requested_name.hash(&mut hasher);
+    legacy_route.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn owner_has_legacy_or_workspace_authority(
@@ -4653,226 +4663,6 @@ fn canonical_include_key(path: &Path) -> String {
     fs::canonicalize(path)
         .map(|canonical| path_key(&canonical))
         .unwrap_or_else(|_| path_key(path))
-}
-
-#[cfg(test)]
-fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> IncludeLookup {
-    resolve_include_path_with_overrides(directive, directories, &EffectiveOverrides::default())
-}
-
-fn resolve_include_path_with_overrides(
-    directive: &Directive,
-    directories: &[PathBuf],
-    overrides: &EffectiveOverrides,
-) -> IncludeLookup {
-    let Some(raw) = include_name(directive) else {
-        return IncludeLookup {
-            observations: Vec::new(),
-            selected: None,
-            selected_directory: None,
-            selected_route: IncludeRoute::Legacy,
-            error: None,
-        };
-    };
-
-    let mut observations = Vec::new();
-    let mut selected = None;
-    let mut selected_directory = None;
-    let mut selected_route = IncludeRoute::Legacy;
-    let mut error = None;
-    for directory in directories {
-        observations.push(IncludeObservation {
-            path: directory.clone(),
-            stamp: path_stamp(directory),
-        });
-        let (candidate, route) = match overrides.resolve_path(&raw, directory) {
-            Ok(resolved) => {
-                let route = resolved
-                    .mapping
-                    .as_ref()
-                    .map_or(IncludeRoute::Legacy, |mapping| IncludeRoute::Mapped {
-                        root: super::native_mapping_root(&mapping.to),
-                    });
-                (absolute_path(resolved.path), route)
-            }
-            Err(resolve_error) => {
-                error = Some(resolve_error);
-                break;
-            }
-        };
-        if observations
-            .iter()
-            .any(|observation| path_key(&observation.path) == path_key(&candidate))
-        {
-            continue;
-        }
-        let metadata = fs::metadata(&candidate);
-        let stamp = path_stamp(&candidate);
-        observations.push(IncludeObservation {
-            path: candidate.clone(),
-            stamp,
-        });
-        match metadata {
-            Ok(metadata) if metadata.is_file() => {
-                selected = Some(candidate);
-                selected_directory = Some(directory.clone());
-                selected_route = route;
-                break;
-            }
-            Ok(_) => {}
-            Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
-                let case_lookup = resolve_case_insensitive_include_path(&candidate);
-                observations.extend(case_lookup.observations);
-                if let Some(case_error) = case_lookup.error {
-                    error = Some(case_error);
-                    break;
-                }
-                if let Some(actual) = case_lookup.selected {
-                    let actual_metadata = fs::metadata(&actual);
-                    observations.push(IncludeObservation {
-                        path: actual.clone(),
-                        stamp: path_stamp(&actual),
-                    });
-                    match actual_metadata {
-                        Ok(metadata) if metadata.is_file() => {
-                            selected = Some(actual);
-                            selected_directory = Some(directory.clone());
-                            selected_route = route;
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(io_error) => {
-                            error = Some(format!("{}: {io_error}", actual.display()));
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(io_error) => {
-                error = Some(format!("{}: {io_error}", candidate.display()));
-                break;
-            }
-        }
-    }
-    IncludeLookup {
-        observations,
-        selected,
-        selected_directory,
-        selected_route,
-        error,
-    }
-}
-
-#[derive(Debug)]
-struct CaseInsensitiveIncludeLookup {
-    observations: Vec<IncludeObservation>,
-    selected: Option<PathBuf>,
-    error: Option<String>,
-}
-
-fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeLookup {
-    let absolute = absolute_path(path.to_path_buf());
-    let mut base = absolute.clone();
-    while !base.exists() {
-        if !base.pop() {
-            base = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
-            break;
-        }
-    }
-    let relative = absolute
-        .strip_prefix(&base)
-        .unwrap_or_else(|_| Path::new(""));
-    let mut current = base.clone();
-    let mut observations = Vec::new();
-    observations.push(IncludeObservation {
-        path: current.clone(),
-        stamp: path_stamp(&current),
-    });
-    for component in relative.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = current.pop();
-            }
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(std::path::MAIN_SEPARATOR.to_string()),
-            Component::Normal(component) => {
-                let wanted = component.to_string_lossy();
-                let entries = match fs::read_dir(&current) {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        return CaseInsensitiveIncludeLookup {
-                            observations,
-                            selected: None,
-                            error: Some(format!(
-                                "could not inspect {} while resolving case-insensitive include: {error}",
-                                current.display()
-                            )),
-                        };
-                    }
-                };
-                let mut matches = entries
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .eq_ignore_ascii_case(&wanted)
-                            .then_some(entry.path())
-                    })
-                    .collect::<Vec<_>>();
-                if matches.len() > 1 {
-                    return CaseInsensitiveIncludeLookup {
-                        observations,
-                        selected: None,
-                        error: Some(format!(
-                            "ambiguous case-insensitive include path component {wanted:?} under {}",
-                            current.display()
-                        )),
-                    };
-                }
-                let Some(next) = matches.pop() else {
-                    observations.push(IncludeObservation {
-                        path: current.join(component),
-                        stamp: None,
-                    });
-                    return CaseInsensitiveIncludeLookup {
-                        observations,
-                        selected: None,
-                        error: None,
-                    };
-                };
-                let stamp = match next.metadata() {
-                    Ok(_) => path_stamp(&next),
-                    Err(error) => {
-                        observations.push(IncludeObservation {
-                            path: next.clone(),
-                            stamp: None,
-                        });
-                        return CaseInsensitiveIncludeLookup {
-                            observations,
-                            selected: None,
-                            error: Some(format!(
-                                "could not inspect {} while resolving case-insensitive include: {error}",
-                                next.display()
-                            )),
-                        };
-                    }
-                };
-                observations.push(IncludeObservation {
-                    path: next.clone(),
-                    stamp,
-                });
-                current = next;
-            }
-        }
-    }
-    CaseInsensitiveIncludeLookup {
-        observations,
-        selected: Some(current),
-        error: None,
-    }
 }
 
 fn include_name(directive: &Directive) -> Option<String> {
@@ -4926,93 +4716,6 @@ fn directive_keyword(body: &str) -> Option<&str> {
         .split(|character: char| character.is_ascii_whitespace() || character == ':')
         .next()
         .filter(|keyword| !keyword.is_empty())
-}
-
-#[derive(Debug, Clone)]
-struct IncludeSource {
-    text: String,
-    content_hash: u64,
-    bytes: usize,
-}
-
-fn read_include(
-    path: &Path,
-    read_policy: &ReadPolicy,
-    path_entry: &ProjectPathEntry,
-    max_file_bytes: usize,
-    max_total_bytes: Option<usize>,
-    cancel: Option<&AtomicBool>,
-) -> Result<IncludeSource, String> {
-    if cancel.is_some_and(is_cancelled) {
-        return Err(CANCELLATION_MESSAGE.to_string());
-    }
-    let legacy_payload = matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
-    if if legacy_payload {
-        !read_policy.allows_legacy_payload_entry(path_entry)
-    } else {
-        !read_policy.allows_entry(path_entry)
-    } {
-        return Err("payload path is not authorized".to_string());
-    }
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.is_file() {
-        return Err("path is not a regular file".to_string());
-    }
-    if metadata.len() > max_file_bytes as u64 {
-        return Err(format!(
-            "file exceeds the configured per-file limit {max_file_bytes}"
-        ));
-    }
-    if max_total_bytes.is_some_and(|limit| metadata.len() > limit as u64) {
-        return Err(INCLUDE_BYTE_BUDGET_ERROR.to_string());
-    }
-    if cancel.is_some_and(is_cancelled) {
-        return Err(CANCELLATION_MESSAGE.to_string());
-    }
-    let limit = max_total_bytes.map_or(max_file_bytes, |total| max_file_bytes.min(total));
-    let bytes = if legacy_payload {
-        read_policy.read_legacy_payload_bytes(path_entry, limit as u64)
-    } else {
-        read_policy.read_payload_bytes(path_entry, limit as u64)
-    }
-    .map_err(|error| error.to_string())?;
-    let byte_count = bytes.len();
-    if cancel.is_some_and(is_cancelled) {
-        return Err(CANCELLATION_MESSAGE.to_string());
-    }
-    if let Some(encoding) = unsupported_source_encoding(&bytes) {
-        return Err(format!("unsupported {encoding} source encoding"));
-    }
-    Ok(IncludeSource {
-        text: decode_bytes(&bytes).into_owned(),
-        content_hash: super::content_hash_bytes(&bytes),
-        bytes: byte_count,
-    })
-}
-
-fn read_mapped_include(
-    read_policy: &ReadPolicy,
-    path_entry: &ProjectPathEntry,
-    max_file_bytes: usize,
-    max_total_bytes: usize,
-    cancel: &AtomicBool,
-) -> Result<IncludeSource, String> {
-    if is_cancelled(cancel) {
-        return Err(CANCELLATION_MESSAGE.to_string());
-    }
-    let limit = max_file_bytes.min(max_total_bytes);
-    let bytes = read_policy.read_payload_bytes(path_entry, limit as u64)?;
-    if is_cancelled(cancel) {
-        return Err(CANCELLATION_MESSAGE.to_string());
-    }
-    if let Some(encoding) = unsupported_source_encoding(&bytes) {
-        return Err(format!("unsupported {encoding} source encoding"));
-    }
-    Ok(IncludeSource {
-        text: decode_bytes(&bytes).into_owned(),
-        content_hash: super::content_hash_bytes(&bytes),
-        bytes: bytes.len(),
-    })
 }
 
 fn read_record_content_bytes(
@@ -5430,19 +5133,20 @@ mod tests {
     use super::super::FileChange;
     use super::super::MetadataObservation;
     use super::{
-        BaselineAccumulator, ContextKey, ContextState, Directive, DirectiveKind, Enumeration,
-        IncludeAuditResult, IncludeAuditor, IncludeInspection, IncludeRoute, PathStamp,
+        BaselineAccumulator, ContextKey, ContextState, DirectiveKind, Enumeration, PathStamp,
         ProjectCandidateMembership, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
         ReadPolicy, SnapshotMode, Workspace, WorkspaceOptions, build_snapshot,
         capture_consumed_configuration_baseline, capture_context_baseline, contains_any_identifier,
         directive_kind, enumerate_external_overlays, file_content_hash,
         install_snapshot_priority_barrier, path_key, path_record_at, read_exact_file_bytes,
-        read_include, read_record_content_hash, rename_from_input, resolve_include_path,
-        resolve_include_path_with_overrides, revalidate_input, snapshot_records,
+        read_record_content_hash, rename_from_input, revalidate_input, snapshot_records,
         test_cancel_in_include_analysis,
     };
     use lsp_types::{Position, Url};
-    use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession, PathMapping};
+    use pascal_core::resolver::{
+        ResolutionObservation, ResolutionReport, SourceId, SourceRevision,
+    };
+    use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
     use std::collections::{HashMap, HashSet};
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]
@@ -5500,6 +5204,134 @@ mod tests {
         assert!(
             Arc::ptr_eq(&cached, &snapshot_document),
             "unchanged snapshot input should reuse the immutable parsed model"
+        );
+    }
+
+    #[test]
+    fn repeated_include_occurrences_share_one_payload_load() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let main = root.join("Main.pas");
+        let include = root.join("body.inc");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nconst BadConst = 1;\nimplementation\n{$I body.inc}\n{$I body.inc}\n{$I body.inc}\nend.\n",
+        )
+        .expect("main source");
+        fs::write(&include, "{ whitespace only }\n").expect("include source");
+
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let uri = Url::from_file_path(&main).expect("main URI");
+        let cancel = AtomicBool::new(false);
+        super::super::resolver::reset_test_source_loads();
+        let computed = rename_from_input(
+            input,
+            &uri,
+            Position::new(2, 6),
+            "GoodConst",
+            false,
+            &cancel,
+        );
+
+        assert!(
+            computed.value.is_ok(),
+            "rename result: {:?}",
+            computed.value
+        );
+        assert_eq!(
+            super::super::resolver::test_source_load_count(&include),
+            1,
+            "repeated include occurrences must reuse one resolver payload"
+        );
+    }
+
+    #[test]
+    fn discarded_payload_observation_revalidates_equal_stamp_mutation() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let candidate = root.join("Provider.pas");
+        let original = b"unit Wrong; interface implementation end.\n";
+        let changed = b"unit Right; interface implementation end.\n";
+        assert_eq!(original.len(), changed.len());
+        fs::write(&candidate, original).expect("candidate");
+        let root_entry = ProjectPathEntry {
+            path: root.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let candidate_entry = ProjectPathEntry {
+            path: candidate.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths: vec![root.clone()],
+            search_path_entries: vec![root_entry],
+            read_policy: ReadPolicy::new(
+                std::slice::from_ref(&root),
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        let stamp = super::path_stamp_result(&candidate)
+            .expect("candidate stamp")
+            .expect("candidate exists");
+        let report = ResolutionReport {
+            observations: vec![
+                ResolutionObservation::Candidate {
+                    path: candidate.clone(),
+                    entry: Some(candidate_entry.clone()),
+                    stamp: Some(stamp.clone()),
+                    present: true,
+                },
+                ResolutionObservation::Payload {
+                    source_id: SourceId::new(format!("source:{}", candidate.display())),
+                    path: candidate.clone(),
+                    revision: SourceRevision::Disk {
+                        stamp: stamp.clone(),
+                        content_hash: pascal_project::content_hash_bytes(original),
+                        read_policy: context.read_policy.clone(),
+                        path_entry: candidate_entry,
+                    },
+                },
+            ],
+            warnings: Vec::new(),
+            complete: true,
+            incomplete_reasons: Vec::new(),
+        };
+        let record = super::super::resolver::report_records(&context, &report)
+            .into_iter()
+            .find(|record| record.path.as_deref() == Some(candidate.as_path()))
+            .expect("discarded candidate payload record");
+        assert_eq!(
+            record.content_hash,
+            Some(pascal_project::content_hash_bytes(original))
+        );
+        assert!(record.read_policy.is_some());
+        assert!(record.path_entry.is_some());
+        let cancel = AtomicBool::new(false);
+        super::revalidate_path_record(&candidate, &record, &cancel)
+            .expect("unchanged discarded candidate must revalidate");
+
+        let original_mtime = fs::metadata(&candidate)
+            .expect("candidate metadata")
+            .modified()
+            .expect("candidate mtime");
+        fs::write(&candidate, changed).expect("mutated candidate");
+        File::options()
+            .write(true)
+            .open(&candidate)
+            .expect("open candidate for timestamp restore")
+            .set_times(FileTimes::new().set_modified(original_mtime))
+            .expect("restore candidate mtime");
+
+        let error = super::revalidate_path_record(&candidate, &record, &cancel)
+            .expect_err("same-stamp discarded candidate mutation must stale");
+        assert!(
+            error.contains("changed") || error.contains("metadata"),
+            "unexpected discarded candidate revalidation error: {error}"
         );
     }
 
@@ -7186,7 +7018,8 @@ mod tests {
                 .records
                 .iter()
                 .any(|record| { record.path.as_deref() == Some(linked_directory.as_path()) }),
-            "the symlinked include-search directory must be in the revalidation read-set"
+            "the symlinked include-search directory must be in the revalidation read-set: {:#?}",
+            computed.records
         );
         assert!(
             revalidate_input(&input, &computed.records, &cancel).is_ok(),
@@ -7231,14 +7064,6 @@ mod tests {
                 let _ = read_exact_file_bytes(&target, &read_policy, &path_entry, &cancel);
                 let _ = file_content_hash(&target, &read_policy, &path_entry, &cancel);
                 let _ = super::read_scan_source(&target, &read_policy, &path_entry, &cancel);
-                let _ = read_include(
-                    &target,
-                    &read_policy,
-                    &path_entry,
-                    16 * 1024 * 1024,
-                    None,
-                    None,
-                );
             }
             return;
         }
@@ -7322,241 +7147,6 @@ mod tests {
     }
 
     #[test]
-    fn include_cache_does_not_share_authorized_and_unauthorized_routes() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let root = temp.path().join("project");
-        let main = root.join("Main.pas");
-        let outside = temp.path().join("outside/Shared.inc");
-        fs::create_dir_all(&root).expect("project directory");
-        fs::create_dir_all(outside.parent().expect("include parent")).expect("include directory");
-        fs::write(&main, "unit Main; interface implementation end.\n").expect("main source");
-        fs::write(&outside, "{$DEFINE SAFE}\n").expect("include source");
-
-        let main_uri = Url::from_file_path(&main).expect("main URI");
-        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
-        let context_key = workspace.context_for_uri(&main_uri).expect("main context");
-        let context = workspace
-            .contexts
-            .get(&context_key)
-            .expect("retained main context")
-            .context
-            .clone();
-        let sources = HashMap::new();
-        let mut contexts = HashMap::new();
-        let mut baseline = BaselineAccumulator::default();
-        let mut baseline_content_hashes = HashMap::new();
-        let mut baseline_contents = HashMap::new();
-        let candidate_names = Vec::new();
-        let cancel = AtomicBool::new(false);
-        let mut auditor = IncludeAuditor {
-            sources: &sources,
-            loader: &mut workspace,
-            contexts: &mut contexts,
-            baseline: &mut baseline,
-            baseline_content_hashes: &mut baseline_content_hashes,
-            baseline_contents: &mut baseline_contents,
-            candidate_names: &candidate_names,
-            max_file_bytes: 1024,
-            observe_directory_stamps: false,
-            allow_incomplete_context_for: &[],
-            cancel: &cancel,
-            cache: HashMap::new(),
-            active: HashSet::new(),
-            files_read: 0,
-            bytes_read: 0,
-            directives_seen: 0,
-            stopped: false,
-            result: IncludeAuditResult::default(),
-            name_free_assistance: false,
-        };
-
-        let allowed = auditor
-            .inspect_include_file(
-                &outside,
-                IncludeInspection {
-                    context_key: &context_key,
-                    context: &context,
-                    owner_path: &main,
-                    selected_directory: Some(root.as_path()),
-                    relative: true,
-                    route: IncludeRoute::Legacy,
-                    legacy_authorized: true,
-                },
-                0,
-            )
-            .expect("authorized route");
-        assert!(allowed.safe, "the authorized route must be accepted");
-
-        let denied = auditor
-            .inspect_include_file(
-                &outside,
-                IncludeInspection {
-                    context_key: &context_key,
-                    context: &context,
-                    owner_path: &main,
-                    selected_directory: Some(root.as_path()),
-                    relative: true,
-                    route: IncludeRoute::Legacy,
-                    legacy_authorized: false,
-                },
-                0,
-            )
-            .expect("unauthorized route");
-        assert!(
-            !denied.safe,
-            "the unauthorized route must not reuse the allow result"
-        );
-    }
-
-    #[test]
-    fn include_lookup_keeps_the_missing_precedence_observation() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let root = temp.path().join("root");
-        let fallback = temp.path().join("fallback");
-        let earlier = root.join("subdir/Shared.inc");
-        let selected = fallback.join("subdir/Shared.inc");
-        fs::create_dir_all(earlier.parent().expect("earlier parent")).expect("earlier directory");
-        fs::create_dir_all(selected.parent().expect("selected parent"))
-            .expect("selected directory");
-        fs::write(&selected, "{$DEFINE SAFE}\n").expect("selected include");
-
-        let directive = Directive {
-            kind: DirectiveKind::Include,
-            body: "I subdir/Shared.inc".to_string(),
-            start: 0,
-            end: 0,
-        };
-        let lookup = resolve_include_path(&directive, &[root, fallback]);
-        assert_eq!(lookup.selected.as_deref(), Some(selected.as_path()));
-        let observation = lookup
-            .observations
-            .iter()
-            .find(|observation| observation.path == earlier)
-            .expect("earlier candidate observation");
-        assert!(observation.stamp.is_none());
-
-        fs::write(&earlier, "procedure Hidden; begin end;\n").expect("create earlier include");
-        assert!(observation.stamp.is_none());
-    }
-
-    #[test]
-    fn include_lookup_matches_pascal_file_names_case_insensitively() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let include = temp.path().join("MDCompilers.inc");
-        fs::write(&include, "{$DEFINE SAFE}\n").expect("include");
-
-        let directive = Directive {
-            kind: DirectiveKind::Include,
-            body: "I MDCompilers.Inc".to_string(),
-            start: 0,
-            end: 0,
-        };
-        let lookup = resolve_include_path(&directive, &[temp.path().to_path_buf()]);
-
-        assert_eq!(lookup.selected.as_deref(), Some(include.as_path()));
-    }
-
-    #[test]
-    fn include_lookup_maps_absolute_windows_paths_with_nested_suffixes() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let mapped_root = temp.path().join("sdk");
-        let include = mapped_root.join("Nested/Shared.inc");
-        fs::create_dir_all(include.parent().expect("nested include directory"))
-            .expect("nested include directory");
-        fs::write(&include, "{$DEFINE SAFE}\n").expect("mapped include");
-
-        let overrides = EffectiveOverrides {
-            path_mappings: vec![PathMapping {
-                from: "c:/sdk".to_string(),
-                to: mapped_root.clone(),
-                config_file: temp.path().join(".delphi-tools.local.toml"),
-            }],
-            ..EffectiveOverrides::default()
-        };
-        let directive = Directive {
-            kind: DirectiveKind::Include,
-            body: "I C:/SDK/Nested/Shared.inc".to_string(),
-            start: 0,
-            end: 0,
-        };
-        let lookup = resolve_include_path_with_overrides(
-            &directive,
-            &[temp.path().to_path_buf()],
-            &overrides,
-        );
-
-        assert_eq!(lookup.selected.as_deref(), Some(include.as_path()));
-        assert_eq!(
-            lookup.selected_route,
-            IncludeRoute::Mapped {
-                root: mapped_root.clone()
-            }
-        );
-        assert!(lookup.error.is_none());
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn include_lookup_snapshots_case_insensitive_directories_and_absence() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let actual_directory = temp.path().join("ActualDir");
-        let actual_include = actual_directory.join("Shared.inc");
-        let missing_directory = temp.path().join("MissingRoot");
-        fs::create_dir_all(&actual_directory).expect("actual directory");
-        fs::write(&actual_include, "{$DEFINE SAFE}\n").expect("include");
-
-        let directive = Directive {
-            kind: DirectiveKind::Include,
-            body: "I actualdir/Shared.Inc".to_string(),
-            start: 0,
-            end: 0,
-        };
-        let lookup = resolve_include_path(
-            &directive,
-            &[missing_directory.clone(), temp.path().to_path_buf()],
-        );
-
-        assert_eq!(lookup.selected.as_deref(), Some(actual_include.as_path()));
-        assert!(
-            lookup
-                .observations
-                .iter()
-                .any(|observation| observation.path == actual_directory
-                    && observation.stamp.is_some()),
-            "the actual case-insensitive directory must be in the read-set"
-        );
-        assert!(
-            lookup
-                .observations
-                .iter()
-                .any(|observation| observation.path == missing_directory
-                    && observation.stamp.is_none()),
-            "the absent higher-precedence directory must be in the read-set"
-        );
-    }
-
-    #[test]
-    fn include_byte_budget_is_checked_before_opening_content() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let include = temp.path().join("Large.inc");
-        fs::write(&include, "{$DEFINE SAFE}\n").expect("include");
-
-        let read_policy = ReadPolicy::new(
-            std::slice::from_ref(&temp.path().to_path_buf()),
-            &[],
-            &[],
-            &EffectiveOverrides::default(),
-        );
-        let path_entry = ProjectPathEntry {
-            path: include.clone(),
-            provenance: ProjectPathProvenance::Configured,
-        };
-        let error = read_include(&include, &read_policy, &path_entry, 1024, Some(1), None)
-            .expect_err("remaining include budget is too small");
-        assert_eq!(error, super::INCLUDE_BYTE_BUDGET_ERROR);
-    }
-
-    #[test]
     fn include_revalidation_requires_recorded_payload_authorization() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let include = temp.path().join("Shared.inc");
@@ -7576,6 +7166,7 @@ mod tests {
             path_entry: None,
             include_payload: true,
             missing_provider_candidate: false,
+            directory_observation: false,
         };
 
         let error = read_record_content_hash(&include, &record, &AtomicBool::new(false))

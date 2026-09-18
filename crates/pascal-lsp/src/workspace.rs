@@ -8,24 +8,24 @@ use lsp_types::{
     Diagnostic as LspDiagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range,
     TextDocumentContentChangeEvent, TextEdit, Url,
 };
-use pascal_core::{FileInfo, Severity, decode_bytes, parser};
+use pascal_core::{FileInfo, Severity, parser};
 pub(crate) use pascal_project::content_hash_bytes;
 use pascal_project::delphi_overrides::{
     EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
 };
 use pascal_project::{
-    MetadataObservation, PackageMetadata, ProjectCandidateMembership, ProjectCandidates,
-    ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
+    MetadataObservation, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
+    ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
     ProjectReadObservation, ProjectReadStamp, ProjectSelections, discover_with_selections,
     discover_with_selections_and_observations_with_cancel_and_overrides,
     discover_with_selections_and_observations_with_overrides, has_invalid_project_selection,
     project_candidate_membership, project_candidates, project_candidates_with_cancel,
-    read_package_metadata_with_observations, runtime_project_selection,
-    selected_project_is_current, selected_project_is_current_with_cancel,
+    runtime_project_selection, selected_project_is_current,
+    selected_project_is_current_with_cancel,
 };
 use serde::Deserialize;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -33,10 +33,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
+use pascal_core::resolver::{ImportSection, ImportSite, LegacyRoute, ResolutionTarget, SourceKind};
+
 pub(crate) mod codeactions;
 pub(crate) mod projects;
 pub(crate) mod queries;
 pub(crate) mod rename;
+#[allow(dead_code)]
+pub(crate) mod resolver;
 
 /// Maximum syntax-tree depth used before invoking the recursive lint/format pipelines.
 pub const MAX_TREE_DEPTH: usize = 256;
@@ -45,18 +49,6 @@ const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
-const MAX_DIRECTORY_CATALOGUES: usize = 1024;
-const MAX_FILENAME_CATALOGUE_ENTRIES: usize = 10_000;
-const MAX_FILENAME_CATALOGUES: usize = 256;
-// The multidev workspace currently contains 436,705 filesystem entries when
-// counted without following links. Keep a fixed margin for normal growth, but
-// retain a hard stop so a pathological workspace cannot turn package lookup
-// into an unbounded traversal.
-const MAX_PACKAGE_CATALOGUE_ENTRIES: usize = 524_288;
-const MAX_PACKAGE_CATALOGUES: usize = 64;
-const MAX_PACKAGE_LOOKUPS: usize = 256;
-const MAX_PACKAGE_METADATA_CACHE: usize = 512;
-const MAX_PACKAGE_UNIT_CANDIDATES: usize = 1_024;
 const MAX_WORKSPACE_WARNINGS: usize = 256;
 const MAX_DELETED_OVERRIDES: usize = 256;
 const MAX_DOCUMENT_OWNERS: usize = 4_096;
@@ -205,78 +197,6 @@ pub(crate) struct DiskStamp {
 
 pub(crate) type PathStamp = pascal_project::ProjectReadStamp;
 
-#[derive(Debug, Clone, Default)]
-struct DirectoryCatalogue {
-    stamp: Option<PathStamp>,
-    entries: Vec<PathBuf>,
-    last_used: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct FilenameCatalogue {
-    entries: HashMap<String, Vec<PathBuf>>,
-    complete: bool,
-    directories: Vec<(PathBuf, Option<PathStamp>)>,
-    last_used: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct PackageCatalogue {
-    entries: HashMap<String, Vec<PathBuf>>,
-    requested_names: HashSet<String>,
-    complete: bool,
-    directories: Vec<(PathBuf, Option<PathStamp>)>,
-    validated_epoch: u64,
-    last_used: u64,
-}
-
-#[derive(Debug)]
-struct PackageDescriptorMatch {
-    path: PathBuf,
-    names: Vec<String>,
-}
-
-#[derive(Debug, Default)]
-struct PackageDescriptorFiles {
-    has_dpk: bool,
-    dpk: Vec<PackageDescriptorMatch>,
-    dproj: Vec<PackageDescriptorMatch>,
-}
-
-#[derive(Debug, Default)]
-struct PackageCatalogueScan {
-    entries: HashMap<String, Vec<PathBuf>>,
-    directories: Vec<(PathBuf, Option<PathStamp>)>,
-    complete: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CachedPackageMetadata {
-    metadata_stamps: Vec<(PathBuf, Option<PathStamp>)>,
-    result: Result<PackageMetadata, String>,
-    observations: Vec<ProjectReadObservation>,
-    last_used: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PackageMetadataKey {
-    descriptor: PathBuf,
-    overrides: EffectiveOverrides,
-    read_policy: pascal_project::ReadPolicy,
-    config: Option<String>,
-    platform: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct PackageLookup {
-    candidates: Vec<PathBuf>,
-    metadata_paths: Vec<PathBuf>,
-    observations: Vec<ProjectReadObservation>,
-    metadata_observations: Vec<MetadataObservation>,
-    warnings: Vec<String>,
-    complete: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ContextKey {
     project_file: Option<PathBuf>,
@@ -296,12 +216,6 @@ struct ContextKey {
 pub(crate) struct LegacyRouteProof {
     source: PathBuf,
     context: ContextKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PackageCatalogueKey {
-    context: ContextKey,
-    root: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -583,13 +497,9 @@ pub struct Workspace {
     document_owners: HashMap<Url, KnownDocumentOwner>,
     owner_last_used: HashMap<Url, u64>,
     project_selections: ProjectSelections,
-    directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
-    filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
-    package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
-    package_catalogue_epoch: u64,
-    package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
     warnings: Vec<String>,
     analysis_records: Option<HashMap<Url, rename::SourceRecord>>,
+    diagnostic_dependencies: HashMap<Url, Vec<rename::SourceRecord>>,
     source_generation: u64,
     configuration_generation: u64,
     source_change_generations: HashMap<Url, u64>,
@@ -597,6 +507,17 @@ pub struct Workspace {
     configuration_change_generations: HashMap<Url, u64>,
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
+}
+
+struct SharedLintRequest<'a> {
+    uri: &'a Url,
+    path: &'a Path,
+    source: &'a [u8],
+    lint_source: &'a [u8],
+    config: &'a lint4d::config::Config,
+    context_key: &'a ContextKey,
+    context: &'a ProjectContext,
+    cancel: &'a AtomicBool,
 }
 
 impl Workspace {
@@ -871,7 +792,6 @@ impl Workspace {
         cancel: &AtomicBool,
     ) -> Result<Vec<Location>, String> {
         check_workspace_cancel(Some(cancel))?;
-        self.package_catalogue_epoch = self.package_catalogue_epoch.wrapping_add(1);
         let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
         if self.context_has_invalid_project_selection(&context_key) {
             return Err(format!(
@@ -883,7 +803,8 @@ impl Workspace {
                 "project override configuration is invalid; navigation is unavailable for {uri}"
             ));
         }
-        if !self.ensure_supported_with_context(uri, &context_key) {
+        let supported = self.ensure_supported_with_context(uri, &context_key);
+        if !supported {
             return Ok(Vec::new());
         }
         let empty_pins = HashSet::new();
@@ -1193,9 +1114,10 @@ impl Workspace {
             false
         };
         self.pending_diagnostics.remove(uri);
+        self.forget_diagnostic_dependencies(uri);
         if was_open {
             self.bump_source_generation();
-            self.mark_source_change(uri, false);
+            self.mark_source_change(uri, true);
             self.open_document_contexts.remove(uri);
             self.disk_stamps.remove(uri);
             self.refresh_loaded_disk(uri);
@@ -1211,7 +1133,7 @@ impl Workspace {
         context_key: ContextKey,
     ) -> Result<(), String> {
         self.bump_source_generation();
-        self.mark_source_change(&uri, false);
+        self.mark_source_change(&uri, true);
         let text_len = text.len();
         let source_for_index = text.clone();
         if let Some(previous) = self.open_documents.get(&uri) {
@@ -1239,7 +1161,7 @@ impl Workspace {
 
     fn reject_open_document(&mut self, uri: Url, version: i32, reason: String) {
         self.bump_source_generation();
-        self.mark_source_change(&uri, false);
+        self.mark_source_change(&uri, true);
         if let Some(previous) = self.open_documents.get(&uri) {
             if let Some(previous_text) = &previous.text {
                 self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
@@ -1300,7 +1222,7 @@ impl Workspace {
 
     fn advance_document_version(&mut self, uri: &Url, version: i32) {
         self.bump_source_generation();
-        self.mark_source_change(uri, false);
+        self.mark_source_change(uri, true);
         if let Some(document) = self.open_documents.get_mut(uri) {
             document.version = version;
         }
@@ -1425,10 +1347,6 @@ impl Workspace {
         self.contexts.clear();
         self.document_contexts.clear();
         self.open_document_contexts.clear();
-        self.directory_catalogues.clear();
-        self.filename_catalogues.clear();
-        self.package_catalogues.clear();
-        self.package_metadata_cache.clear();
         self.deleted_overrides.clear();
     }
 
@@ -1471,6 +1389,33 @@ impl Workspace {
                 .entry(uri)
                 .or_insert_with(|| Instant::now() + DIAGNOSTIC_RETRY);
         }
+    }
+
+    pub(crate) fn record_diagnostic_dependencies(
+        &mut self,
+        uri: Url,
+        records: Vec<rename::SourceRecord>,
+    ) {
+        if self.open_documents.contains_key(&uri) {
+            self.diagnostic_dependencies.insert(uri, records);
+        }
+    }
+
+    pub(crate) fn forget_diagnostic_dependencies(&mut self, uri: &Url) {
+        self.diagnostic_dependencies.remove(uri);
+    }
+
+    pub(crate) fn diagnostic_dependents_for_change(&self, changed_uri: &Url) -> Vec<Url> {
+        self.diagnostic_dependencies
+            .iter()
+            .filter(|(consumer, _)| self.open_documents.contains_key(*consumer))
+            .filter(|(_, records)| {
+                records
+                    .iter()
+                    .any(|record| source_record_matches_change(record, changed_uri))
+            })
+            .map(|(consumer, _)| consumer.clone())
+            .collect()
     }
 
     pub(crate) fn open_document_uris(&self) -> Vec<Url> {
@@ -1848,36 +1793,176 @@ impl Workspace {
             return Ok(Vec::new());
         };
         let mut bindings = HashMap::new();
+        if imports.is_empty() {
+            self.index.bind_imports(uri, bindings);
+            return Ok(Vec::new());
+        }
+        let path = uri
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("unit imports require a file URI: {uri}"))?;
+        let unit_name = self
+            .index
+            .unit_name(uri)
+            .ok_or_else(|| format!("indexed source {uri} has no declared unit name"))?;
+        let indexed_text = self
+            .index
+            .source_text(uri)
+            .ok_or_else(|| format!("indexed source {uri} has no decoded source text"))?
+            .to_owned();
+        let input = self.analysis_input();
+        let no_cancel = AtomicBool::new(false);
+        let resolver_cancel = cancel.unwrap_or(&no_cancel);
+        let legacy_route =
+            self.legacy_route_for_resolver(uri, &path, &effective_context_key, &context);
+        let mut resolver = resolver::resolver_for_context(
+            context.clone(),
+            input.roots.clone(),
+            &input,
+            resolver_cancel,
+        );
+        let root = match resolver.load_source(
+            &path,
+            legacy_route.as_ref(),
+            SourceKind::Unit,
+            resolver_cancel,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                let report = resolver.finish();
+                self.merge_resolution_report(&effective_context_key, &report);
+                if matches!(error, pascal_core::ResolverError::Cancelled) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                self.warn(format!("could not load indexed source {uri}: {error}"));
+                self.index.bind_imports(uri, bindings);
+                return Ok(Vec::new());
+            }
+        };
+        let root = pascal_core::ResolvedUnit {
+            requested_name: unit_name,
+            declared_name: self
+                .index
+                .unit_name(uri)
+                .expect("indexed source unit name remains available"),
+            source: root,
+        };
+        let sites = imports
+            .into_iter()
+            .map(|import| ImportSite {
+                byte_range: import.span.start..import.span.end,
+                requested_name: import.name,
+                section: ImportSection::Module,
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolver
+            .resolve_imports_with_text(&root, &sites, &indexed_text, resolver_cancel)
+            .map_err(|error| {
+                if matches!(error, pascal_core::ResolverError::Cancelled) {
+                    CANCELLATION_MESSAGE.to_string()
+                } else {
+                    error.to_string()
+                }
+            })?;
+        let mut resolved_urls = HashMap::new();
         let mut dependencies = Vec::new();
-        for import in imports {
+        for dependency in resolved.dependencies {
             check_workspace_cancel(cancel)?;
-            if self.index.conditional_unknown_at(uri, import.span.start) {
+            let dependency_uri = Url::from_file_path(&dependency.source.path).map_err(|_| {
+                format!(
+                    "resolved unit is not a file URI: {}",
+                    dependency.source.path.display()
+                )
+            })?;
+            if dependency_uri == *uri {
                 continue;
             }
-            let lookup_name = aliased_unit_name(&context, &import.name);
-            let Some(dependency) = self.resolve_unit_with_cancel(
-                uri,
-                &import.name,
-                &lookup_name,
-                &context,
-                &effective_context_key,
-                pinned,
-                cancel,
-            )?
-            else {
-                self.warn(format!(
-                    "could not resolve unit {} imported by {} (searched project context)",
-                    import.name, uri
-                ));
+            let dependency_text = dependency.source.decoded_text.as_deref().map_or_else(
+                || resolver::decode_source_bytes(&dependency.source.bytes),
+                ToOwned::to_owned,
+            );
+            let disk_size = matches!(
+                &dependency.source.revision,
+                pascal_core::SourceRevision::Disk { .. }
+            )
+            .then_some(dependency.source.bytes.len());
+            let already_indexed = self.index.contains(&dependency_uri)
+                && self
+                    .document_contexts
+                    .get(&dependency_uri)
+                    .is_some_and(|key| key == &effective_context_key)
+                && self
+                    .index
+                    .source_text(&dependency_uri)
+                    .is_some_and(|source| source == dependency_text);
+            if !already_indexed
+                && !self.index_source_with_cancel(
+                    &dependency_uri,
+                    dependency_text,
+                    disk_size,
+                    &effective_context_key,
+                    pinned,
+                    cancel,
+                )?
+            {
                 continue;
+            }
+            if let pascal_core::SourceRevision::Disk { stamp, .. } = &dependency.source.revision {
+                self.disk_stamps.insert(
+                    dependency_uri.clone(),
+                    DiskStamp {
+                        bytes: stamp.bytes,
+                        modified: stamp.modified,
+                    },
+                );
+            }
+            pinned.insert(dependency_uri.clone());
+            resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
+            let dependency_is_legacy = match &dependency.source.revision {
+                pascal_core::SourceRevision::Disk { path_entry, .. } => {
+                    matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative)
+                }
+                pascal_core::SourceRevision::Overlay { .. } => context
+                    .path_entry_for(&dependency.source.path)
+                    .is_some_and(|entry| {
+                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    }),
             };
-            bindings.insert(import.name, dependency.clone());
-            pinned.insert(dependency.clone());
-            if !dependencies.contains(&dependency) {
-                dependencies.push(dependency);
+            if legacy_route.is_some() && dependency_is_legacy {
+                self.remember_legacy_route(
+                    &dependency_uri,
+                    &effective_context_key,
+                    &dependency.source.path,
+                );
+            }
+            self.record_resolved_source(
+                &context,
+                &dependency.source,
+                dependency_uri.clone(),
+                false,
+            )?;
+            if !dependencies.contains(&dependency_uri) {
+                dependencies.push(dependency_uri);
+            }
+        }
+        for import in resolved.bindings {
+            if let ResolutionTarget::Found(source_id) = import.target {
+                if let Some(dependency_uri) = resolved_urls.get(&source_id) {
+                    bindings.insert(import.site.requested_name, dependency_uri.clone());
+                }
             }
         }
         check_workspace_cancel(cancel)?;
+        let report = resolver.finish();
+        let rejected_dependency = report
+            .warnings
+            .iter()
+            .find(|warning| warning.to_ascii_lowercase().contains("rejected"))
+            .cloned();
+        self.merge_resolution_report(&effective_context_key, &report);
+        if let Some(reason) = rejected_dependency {
+            return Err(format!("required dependency was rejected: {reason}"));
+        }
         self.index.bind_imports(uri, bindings);
         Ok(dependencies)
     }
@@ -2312,6 +2397,7 @@ impl Workspace {
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                directory_observation: false,
             },
         );
     }
@@ -2347,8 +2433,105 @@ impl Workspace {
                 path_entry: Some(path_entry.clone()),
                 include_payload: false,
                 missing_provider_candidate: false,
+                directory_observation: false,
             },
         );
+    }
+
+    fn record_resolved_source(
+        &mut self,
+        context: &ProjectContext,
+        source: &pascal_core::LoadedSource,
+        uri: Url,
+        include_payload: bool,
+    ) -> Result<(), String> {
+        let Some(records) = self.analysis_records.as_mut() else {
+            return Ok(());
+        };
+        let record = resolver::source_record_for_loaded(context, source, uri, include_payload)?;
+        resolver::merge_source_record(records, record);
+        Ok(())
+    }
+
+    fn merge_resolution_report(
+        &mut self,
+        context_key: &ContextKey,
+        report: &pascal_core::ResolutionReport,
+    ) {
+        let context_for_records = self
+            .contexts
+            .get(context_key)
+            .map(|state| state.context.clone());
+        let report_records = context_for_records
+            .as_ref()
+            .map(|context| resolver::report_records(context, report))
+            .unwrap_or_default();
+        if let Some(state) = self.contexts.get_mut(context_key) {
+            resolver::merge_report_into_context(&mut state.context, report);
+            merge_project_read_observations(
+                &mut state.project_read_observations,
+                report
+                    .observations
+                    .iter()
+                    .filter_map(|observation| match observation {
+                        pascal_core::ResolutionObservation::ProjectRead(observation) => {
+                            Some(observation.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            for observation in &report.observations {
+                let (path, stamp) = match observation {
+                    pascal_core::ResolutionObservation::Metadata(observation) => {
+                        let stamp = match observation {
+                            MetadataObservation::Stat { path } => path_stamp(path),
+                            MetadataObservation::Payload { stamp, .. } => stamp.clone(),
+                        };
+                        (observation.path(), stamp)
+                    }
+                    pascal_core::ResolutionObservation::ProjectRead(observation) => (
+                        observation.path.as_path(),
+                        Some(path_stamp_from_project_read(&observation.stamp)),
+                    ),
+                    pascal_core::ResolutionObservation::Directory { .. }
+                    | pascal_core::ResolutionObservation::Candidate { .. }
+                    | pascal_core::ResolutionObservation::Payload { .. } => continue,
+                };
+                let existing = state
+                    .watched_paths
+                    .keys()
+                    .find(|existing| package_paths_equal(existing, path))
+                    .cloned();
+                if let Some(existing) = existing {
+                    if let Some(current) = state.watched_paths.get_mut(&existing) {
+                        if current.is_none() {
+                            *current = stamp.clone();
+                        }
+                    }
+                } else {
+                    state.watched_paths.insert(path.to_path_buf(), stamp);
+                }
+            }
+        }
+        if let Some(records) = self.analysis_records.as_mut() {
+            for record in report_records {
+                resolver::merge_source_record(records, record);
+            }
+            for observation in &report.observations {
+                let Some(record) = resolver::observation_record(observation) else {
+                    continue;
+                };
+                records.entry(record.uri.clone()).or_insert(record);
+            }
+        }
+        for warning in &report.warnings {
+            self.warn(warning.clone());
+        }
+        for reason in &report.incomplete_reasons {
+            self.warn(reason.clone());
+        }
+        self.refresh_known_owners_for_context(context_key);
     }
 
     pub(crate) fn analysis_records(
@@ -2407,6 +2590,7 @@ impl Workspace {
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    directory_observation: false,
                 },
             );
         }
@@ -2484,6 +2668,18 @@ impl Workspace {
                             format!("could not rediscover known project owner for {uri}: {error}")
                         }
                     });
+            }
+            if owner.origin == OwnerOrigin::Automatic
+                && self.context_has_open_legacy_overlay(&owner.state)
+                && self.context_state_is_fresh_with_open_documents(&owner.state, cancel)?
+            {
+                // An automatic project owner remains authoritative while an
+                // explicitly opened legacy source has lost its backing file.
+                // Once project candidates change, freshness fails and normal
+                // automatic discovery is allowed to reconsider the owner.
+                self.contexts.insert(owner.key.clone(), owner.state.clone());
+                self.select_document_context(uri, &owner.key, owner.origin);
+                return Ok(owner.key);
             }
         }
         let discovered = match cancel {
@@ -2863,6 +3059,23 @@ impl Workspace {
         self.document_owners
             .get(uri)
             .is_some_and(|owner| owner.key == *key && owner.has_legacy_route(path))
+    }
+
+    fn legacy_route_for_resolver(
+        &self,
+        uri: &Url,
+        path: &Path,
+        context_key: &ContextKey,
+        context: &ProjectContext,
+    ) -> Option<LegacyRoute> {
+        let legacy = context
+            .path_entry_for(path)
+            .is_some_and(|entry| matches!(entry.provenance, ProjectPathProvenance::LegacyNative))
+            || self.legacy_route_is_current(uri, path, context_key);
+        legacy.then(|| LegacyRoute {
+            source_path: path.to_path_buf(),
+            sibling_directory: path.parent().unwrap_or(path).to_path_buf(),
+        })
     }
 
     fn remember_document_owner(&mut self, uri: &Url, key: &ContextKey) {
@@ -3337,25 +3550,7 @@ impl Workspace {
         }
     }
 
-    fn invalidate_directory_for_uri(&mut self, uri: &Url) {
-        if let Ok(path) = uri.to_file_path() {
-            let path = absolute_path(path);
-            if let Some(parent) = path.parent() {
-                self.directory_catalogues.remove(parent);
-            }
-            self.package_metadata_cache.retain(|_, cached| {
-                !cached
-                    .metadata_stamps
-                    .iter()
-                    .any(|(metadata_path, _)| paths_equal_ci(metadata_path, &path))
-            });
-        }
-        // A filename-only catalogue has no source-content dependency and is
-        // cheap to rebuild, while clearing it ensures watcher-less creates and
-        // renames are visible without a periodic repository scan.
-        self.filename_catalogues.clear();
-        self.package_catalogues.clear();
-    }
+    fn invalidate_directory_for_uri(&mut self, _uri: &Url) {}
 
     fn ensure_supported_with_context(&self, uri: &Url, key: &ContextKey) -> bool {
         let Ok(path) = uri.to_file_path() else {
@@ -3470,1119 +3665,6 @@ impl Workspace {
                     .find(|root| native_paths_equal(&root.path, workspace_root))
             })
             .is_some_and(|workspace_root| workspace_root.excludes.is_excluded(path, mapped_root))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_unit_with_cancel(
-        &mut self,
-        current_uri: &Url,
-        requested_name: &str,
-        lookup_name: &str,
-        context: &ProjectContext,
-        context_key: &ContextKey,
-        pinned: &HashSet<Url>,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Option<Url>, String> {
-        check_workspace_cancel(cancel)?;
-        let mut groups: Vec<(Vec<PathBuf>, bool)> = Vec::new();
-        if let Some(explicit) = context.explicit_units.get(lookup_name) {
-            groups.push((explicit.clone(), false));
-        }
-
-        let current_path = current_uri.to_file_path().ok().map(absolute_path);
-        let current_directory = current_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        let legacy_current_source = current_path.as_deref().is_some_and(|path| {
-            context.main_source_entry.as_ref().is_some_and(|entry| {
-                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-                    && native_paths_equal(&entry.path, path)
-            }) || context
-                .explicit_unit_entries
-                .values()
-                .flatten()
-                .any(|entry| {
-                    matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-                        && native_paths_equal(&entry.path, path)
-                })
-                || self.legacy_route_is_current(current_uri, path, context_key)
-        });
-        let legacy_sibling_directory = legacy_current_source
-            .then_some(current_directory.clone())
-            .flatten();
-        if let Some(directory) = current_directory {
-            check_workspace_cancel(cancel)?;
-            groups.extend(
-                self.directory_unit_candidate_groups(
-                    &directory,
-                    lookup_name,
-                    &context.unit_namespaces,
-                    context_key,
-                )
-                .into_iter()
-                .map(|paths| (paths, false)),
-            );
-        }
-        for directory in &context.search_paths {
-            check_workspace_cancel(cancel)?;
-            let legacy_search_path = context.search_path_entries.iter().any(|entry| {
-                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-                    && native_paths_equal(&entry.path, directory)
-            });
-            groups.extend(
-                self.directory_unit_candidate_groups(
-                    directory,
-                    lookup_name,
-                    &context.unit_namespaces,
-                    context_key,
-                )
-                .into_iter()
-                .map(|paths| (paths, legacy_search_path)),
-            );
-        }
-        if context.project_file.is_none() {
-            check_workspace_cancel(cancel)?;
-            groups.push((
-                self.filename_unit_candidates(lookup_name, context, context_key),
-                false,
-            ));
-        }
-
-        for (candidates, legacy_search_path) in groups {
-            check_workspace_cancel(cancel)?;
-            let mut paths = candidates;
-            let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
-            for path in paths.drain(..) {
-                if !unique_paths
-                    .iter()
-                    .any(|existing| paths_equal_ci(existing, &path))
-                {
-                    unique_paths.push(path);
-                }
-            }
-            let mut valid = Vec::new();
-            for path in unique_paths {
-                check_workspace_cancel(cancel)?;
-                let Ok(candidate_uri) = Url::from_file_path(&path) else {
-                    continue;
-                };
-                if candidate_uri == *current_uri {
-                    continue;
-                }
-                let legacy_search_path_route = legacy_search_path
-                    && context.search_path_entries.iter().any(|entry| {
-                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-                            && path_starts_with_native(&path, &entry.path)
-                    });
-                if !self.load_source_with_legacy_sibling_with_cancel(
-                    &candidate_uri,
-                    context_key,
-                    pinned,
-                    legacy_sibling_directory.as_deref(),
-                    legacy_search_path_route,
-                    cancel,
-                )? {
-                    continue;
-                }
-                let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
-                    continue;
-                };
-                if unit_name_matches(&unit_name, requested_name, lookup_name, context) {
-                    valid.push(candidate_uri);
-                }
-            }
-            valid.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-            valid.dedup();
-            match valid.len() {
-                0 => {}
-                1 => return Ok(valid.pop()),
-                _ => {
-                    self.warn(format!(
-                        "ambiguous unit {requested_name} in the current project context: {}",
-                        valid
-                            .iter()
-                            .map(Url::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                    return Ok(None);
-                }
-            }
-        }
-        check_workspace_cancel(cancel)?;
-        let package_lookup = self.package_unit_candidates(
-            requested_name,
-            lookup_name,
-            context,
-            context_key,
-            cancel,
-        )?;
-        self.retain_package_observations(context_key, package_lookup.observations.clone());
-        self.merge_metadata_observations(context_key, &package_lookup.metadata_observations);
-        for path in &package_lookup.metadata_paths {
-            self.watch_package_path(context_key, path);
-        }
-        if !package_lookup.complete {
-            for warning in package_lookup.warnings {
-                self.warn(warning);
-            }
-            return Ok(None);
-        }
-        let mut valid = Vec::new();
-        for path in package_lookup.candidates {
-            check_workspace_cancel(cancel)?;
-            let Ok(candidate_uri) = Url::from_file_path(&path) else {
-                continue;
-            };
-            if candidate_uri == *current_uri {
-                continue;
-            }
-            if !self.load_source_with_cancel(&candidate_uri, context_key, pinned, cancel)? {
-                continue;
-            }
-            let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
-                continue;
-            };
-            if unit_name_matches(&unit_name, requested_name, lookup_name, context) {
-                valid.push(candidate_uri);
-            }
-        }
-        valid.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        valid.dedup();
-        match valid.len() {
-            0 => {
-                for warning in package_lookup.warnings {
-                    self.warn(warning);
-                }
-            }
-            1 => return Ok(valid.pop()),
-            _ => {
-                self.warn(format!(
-                    "ambiguous unit {requested_name} in the named source packages: {}",
-                    valid
-                        .iter()
-                        .map(Url::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                return Ok(None);
-            }
-        }
-        if context.project_file.is_some()
-            && !context.explicit_units.is_empty()
-            && !context.explicit_units.contains_key(lookup_name)
-        {
-            self.warn(format!(
-                "unsupported unit filename mapping for {requested_name}: no explicit project filename mapping; declaration filename mismatch cannot be inferred safely"
-            ));
-        }
-        Ok(None)
-    }
-
-    fn directory_unit_candidate_groups(
-        &mut self,
-        directory: &Path,
-        unit_name: &str,
-        namespaces: &[String],
-        context_key: &ContextKey,
-    ) -> Vec<Vec<PathBuf>> {
-        let directory = absolute_path(directory.to_path_buf());
-        let mut groups = unit_filename_candidate_tiers(unit_name, namespaces)
-            .into_iter()
-            .map(|names| self.filename_candidates_for_names(&directory, &names, context_key))
-            .collect::<Vec<_>>();
-        let parts: Vec<&str> = unit_name
-            .split('.')
-            .filter(|part| !part.is_empty())
-            .collect();
-        if parts.len() > 1 {
-            let nested = parts[..parts.len() - 1]
-                .iter()
-                .fold(directory.clone(), |path, part| path.join(part));
-            if let Some(nested) = resolve_case_insensitive_path(&nested) {
-                groups.extend(
-                    unit_filename_candidate_tiers(parts.last().copied().unwrap_or_default(), &[])
-                        .into_iter()
-                        .map(|names| {
-                            self.filename_candidates_for_names(&nested, &names, context_key)
-                        }),
-                );
-            }
-        }
-        groups
-    }
-
-    fn package_unit_candidates(
-        &mut self,
-        requested_name: &str,
-        lookup_name: &str,
-        context: &ProjectContext,
-        context_key: &ContextKey,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<PackageLookup, String> {
-        check_workspace_cancel(cancel)?;
-        let mut lookup = PackageLookup {
-            complete: true,
-            ..PackageLookup::default()
-        };
-        if context.packages.is_empty() {
-            return Ok(lookup);
-        }
-        if context.packages.len() > MAX_PACKAGE_LOOKUPS {
-            lookup.complete = false;
-            lookup.warnings.push(format!(
-                "named package lookup limit ({MAX_PACKAGE_LOOKUPS}) reached while resolving {requested_name}"
-            ));
-            return Ok(lookup);
-        }
-
-        let package_names = context.packages.to_vec();
-        for package_name in &package_names {
-            check_workspace_cancel(cancel)?;
-            let (descriptors, catalogue_complete) = self.package_descriptors(
-                &package_names,
-                package_name,
-                context,
-                context_key,
-                cancel,
-            )?;
-            if !catalogue_complete {
-                lookup.complete = false;
-                lookup.warnings.push(format!(
-                    "source for package {package_name} was not found because its bounded source catalogue was incomplete; compiled-only package skipped"
-                ));
-                lookup.candidates.clear();
-                return Ok(lookup);
-            }
-            if descriptors.is_empty() {
-                lookup.warnings.push(format!(
-                    "source for package {package_name} was not found under the configured workspace/source roots; compiled-only package skipped"
-                ));
-                continue;
-            }
-            if descriptors.len() > 1 {
-                lookup.warnings.push(format!(
-                    "ambiguous package {package_name}; matching source descriptors were found: {}",
-                    descriptors
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                continue;
-            }
-
-            let descriptor = &descriptors[0];
-            let (metadata, observations) =
-                match self.cached_package_metadata(descriptor, context, cancel) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                    Err(error) => {
-                        lookup.warnings.push(format!(
-                            "source package {package_name} was skipped: {error}"
-                        ));
-                        continue;
-                    }
-                };
-            merge_project_read_observations(&mut lookup.observations, observations);
-            lookup.metadata_paths.push(descriptor.clone());
-            lookup
-                .metadata_paths
-                .extend(metadata.metadata_files.iter().cloned());
-            lookup
-                .metadata_observations
-                .extend(metadata.metadata_observations.iter().cloned());
-            let mut matched_mapping = false;
-            for (unit_name, entries) in &metadata.unit_entries {
-                if !package_unit_name_matches(unit_name, requested_name, lookup_name, context) {
-                    continue;
-                }
-                matched_mapping = true;
-                for entry in entries {
-                    if !context.read_policy.allows_location(entry) {
-                        lookup.warnings.push(format!(
-                            "source package {package_name} maps {requested_name} outside configured workspace/source roots; skipped: {}",
-                            entry.path.display()
-                        ));
-                        continue;
-                    }
-                    let path = &entry.path;
-                    if !lookup
-                        .metadata_paths
-                        .iter()
-                        .any(|existing| package_paths_equal(existing, path))
-                    {
-                        lookup.metadata_paths.push(path.clone());
-                    }
-                    if lookup
-                        .candidates
-                        .iter()
-                        .any(|existing| package_paths_equal(existing, path))
-                    {
-                        continue;
-                    }
-                    if lookup.candidates.len() >= MAX_PACKAGE_UNIT_CANDIDATES {
-                        lookup.complete = false;
-                        lookup.warnings.push(format!(
-                            "package unit candidate limit ({MAX_PACKAGE_UNIT_CANDIDATES}) reached while resolving {requested_name}"
-                        ));
-                        lookup.candidates.clear();
-                        return Ok(lookup);
-                    }
-                    lookup.candidates.push(path.clone());
-                }
-            }
-            if !matched_mapping {
-                lookup.warnings.push(format!(
-                    "source package {package_name} has no contains mapping for {requested_name}"
-                ));
-            }
-            lookup.warnings.extend(metadata.warnings.iter().cloned());
-        }
-        Ok(lookup)
-    }
-
-    fn package_descriptors(
-        &mut self,
-        requested_names: &[String],
-        package_name: &str,
-        context: &ProjectContext,
-        context_key: &ContextKey,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<(Vec<PathBuf>, bool), String> {
-        check_workspace_cancel(cancel)?;
-        let requested_names: HashSet<String> = requested_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
-        let key = package_name.to_ascii_lowercase();
-        let roots = self.package_catalogue_roots(context, context_key);
-
-        for root in &roots {
-            self.package_catalogue(context_key, root, &requested_names, cancel)?;
-        }
-        check_workspace_cancel(cancel)?;
-        let (mut descriptors, complete) =
-            self.catalogued_package_descriptors(context_key, &roots, &key);
-
-        descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        descriptors.dedup_by(|left, right| package_paths_equal(left, right));
-        Ok((descriptors, complete))
-    }
-
-    fn catalogued_package_descriptors(
-        &self,
-        context_key: &ContextKey,
-        roots: &[PathBuf],
-        package_name: &str,
-    ) -> (Vec<PathBuf>, bool) {
-        let mut descriptors: Vec<PathBuf> = Vec::new();
-        let mut complete = true;
-        for root in roots {
-            let root = absolute_path(root.clone());
-            let key = PackageCatalogueKey {
-                context: context_key.clone(),
-                root,
-            };
-            let Some(catalogue) = self.package_catalogues.get(&key) else {
-                complete = false;
-                continue;
-            };
-            complete &= catalogue.complete;
-            if let Some(paths) = catalogue.entries.get(package_name) {
-                for path in paths {
-                    if !descriptors
-                        .iter()
-                        .any(|existing| package_paths_equal(existing, path))
-                    {
-                        descriptors.push(path.clone());
-                    }
-                }
-            }
-        }
-        (descriptors, complete)
-    }
-
-    fn package_catalogue_roots(
-        &self,
-        context: &ProjectContext,
-        context_key: &ContextKey,
-    ) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        for workspace_root in &self.roots {
-            for root in &workspace_root.source_roots {
-                if !roots.iter().any(|existing| existing == root) {
-                    roots.push(root.clone());
-                }
-            }
-        }
-        for configured_root in context_key.overrides.read_roots() {
-            let configured_root = absolute_path(configured_root);
-            let root = native_mapping_root(&configured_root);
-            if fs::symlink_metadata(&root).is_err()
-                && !context_uses_mapped_root(context, &configured_root, &root)
-            {
-                continue;
-            }
-            if !roots
-                .iter()
-                .any(|existing| package_paths_equal(existing, &root))
-            {
-                roots.push(root);
-            }
-        }
-        roots
-    }
-
-    #[allow(dead_code)]
-    fn package_source_is_configured(&self, path: &Path) -> bool {
-        self.roots.iter().any(|workspace_root| {
-            workspace_root
-                .source_roots
-                .iter()
-                .any(|root| path_starts_with_ci(path, root))
-        })
-    }
-
-    fn cached_package_metadata(
-        &mut self,
-        path: &Path,
-        context: &ProjectContext,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<(PackageMetadata, Vec<ProjectReadObservation>), String> {
-        check_workspace_cancel(cancel)?;
-        let key = PackageMetadataKey {
-            descriptor: path.to_path_buf(),
-            overrides: context.overrides.clone(),
-            read_policy: context.read_policy.clone(),
-            config: context.config.clone(),
-            platform: context.platform.clone(),
-        };
-        let stamp = path_stamp(path);
-        if let Some(cached) = self.package_metadata_cache.get(&key) {
-            if cached
-                .metadata_stamps
-                .iter()
-                .all(|(metadata_path, metadata_stamp)| path_stamp(metadata_path) == *metadata_stamp)
-            {
-                let result = cached.result.clone();
-                let observations = cached.observations.clone();
-                self.use_clock = self.use_clock.saturating_add(1);
-                if let Some(cached) = self.package_metadata_cache.get_mut(&key) {
-                    cached.last_used = self.use_clock;
-                }
-                check_workspace_cancel(cancel)?;
-                return result.map(|metadata| (metadata, observations));
-            }
-        }
-        let previous_metadata_paths = self
-            .package_metadata_cache
-            .get(&key)
-            .map(|cached| {
-                cached
-                    .metadata_stamps
-                    .iter()
-                    .map(|(metadata_path, _)| metadata_path.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![path.to_path_buf()]);
-        let options = ProjectOptions {
-            build_config: key.config.clone(),
-            platform: key.platform.clone(),
-            ..ProjectOptions::default()
-        };
-        let entry = match context_path_entry(context, path) {
-            Some(entry) => entry,
-            None => {
-                return Err(format!(
-                    "package metadata {} is outside the effective project read roots",
-                    path.display()
-                ));
-            }
-        };
-        let package_read = read_package_metadata_with_observations(
-            path,
-            &options,
-            &key.overrides,
-            &key.read_policy,
-            &entry,
-        );
-        let (result, observations) = match package_read {
-            Ok(read) => (Ok(read.metadata), read.observations),
-            Err(error) => (Err(error), Vec::new()),
-        };
-        check_workspace_cancel(cancel)?;
-        let metadata_paths = result
-            .as_ref()
-            .map(|metadata| metadata.metadata_files.clone())
-            .unwrap_or(previous_metadata_paths);
-        let metadata_stamps = metadata_paths
-            .into_iter()
-            .map(|metadata_path| {
-                let metadata_stamp = if package_paths_equal(&metadata_path, path) {
-                    stamp.clone()
-                } else if let Some(observation) = observations
-                    .iter()
-                    .find(|observation| package_paths_equal(&observation.path, &metadata_path))
-                {
-                    Some(path_stamp_from_project_read(&observation.stamp))
-                } else {
-                    path_stamp(&metadata_path)
-                };
-                (metadata_path, metadata_stamp)
-            })
-            .collect();
-        self.use_clock = self.use_clock.saturating_add(1);
-        self.package_metadata_cache.insert(
-            key,
-            CachedPackageMetadata {
-                metadata_stamps,
-                result: result.clone(),
-                observations: observations.clone(),
-                last_used: self.use_clock,
-            },
-        );
-        self.trim_package_metadata_cache();
-        result.map(|metadata| (metadata, observations))
-    }
-
-    fn trim_package_metadata_cache(&mut self) {
-        while self.package_metadata_cache.len() > MAX_PACKAGE_METADATA_CACHE {
-            let Some(victim) = self
-                .package_metadata_cache
-                .iter()
-                .min_by_key(|(_, metadata)| metadata.last_used)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.package_metadata_cache.remove(&victim);
-        }
-    }
-
-    fn watch_package_path(&mut self, context_key: &ContextKey, path: &Path) {
-        if let Some(state) = self.contexts.get_mut(context_key) {
-            if (extension_is(path, "dpk") || extension_is(path, "dproj"))
-                && !state
-                    .context
-                    .metadata_files
-                    .iter()
-                    .any(|existing| paths_equal_ci(existing, path))
-            {
-                state.context.metadata_files.push(path.to_path_buf());
-            }
-            state
-                .watched_paths
-                .entry(path.to_path_buf())
-                .or_insert_with(|| path_stamp(path));
-        }
-    }
-
-    fn retain_package_observations(
-        &mut self,
-        context_key: &ContextKey,
-        observations: Vec<ProjectReadObservation>,
-    ) {
-        if let Some(state) = self.contexts.get_mut(context_key) {
-            merge_project_read_observations(&mut state.project_read_observations, observations);
-        }
-    }
-
-    fn merge_metadata_observations(
-        &mut self,
-        context_key: &ContextKey,
-        observations: &[MetadataObservation],
-    ) {
-        let Some(state) = self.contexts.get_mut(context_key) else {
-            return;
-        };
-        for observation in observations {
-            pascal_project::add_metadata_observation(
-                &mut state.context.metadata_observations,
-                observation.clone(),
-            );
-        }
-    }
-
-    fn package_catalogue(
-        &mut self,
-        context_key: &ContextKey,
-        root: &Path,
-        requested_names: &HashSet<String>,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<PackageCatalogue, String> {
-        check_workspace_cancel(cancel)?;
-        let root = absolute_path(root.to_path_buf());
-        let key = PackageCatalogueKey {
-            context: context_key.clone(),
-            root: root.clone(),
-        };
-        let requested_names: HashSet<String> = requested_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
-        let fresh = self.package_catalogues.get(&key).is_some_and(|catalogue| {
-            catalogue.complete
-                && package_catalogue_directories_are_readable(&catalogue.directories)
-                && (catalogue.validated_epoch == self.package_catalogue_epoch
-                    || catalogue
-                        .directories
-                        .iter()
-                        .all(|(path, stamp)| path_stamp(path) == *stamp))
-                && requested_names.is_subset(&catalogue.requested_names)
-        });
-        if fresh {
-            self.use_clock = self.use_clock.saturating_add(1);
-            if let Some(catalogue) = self.package_catalogues.get_mut(&key) {
-                catalogue.validated_epoch = self.package_catalogue_epoch;
-                catalogue.last_used = self.use_clock;
-                return Ok(catalogue.clone());
-            }
-        }
-
-        let mut scan_names = requested_names.clone();
-        if let Some(catalogue) = self.package_catalogues.get(&key) {
-            scan_names.extend(catalogue.requested_names.iter().cloned());
-        }
-        let scan = self.scan_package_catalogue(context_key, &root, &scan_names, cancel)?;
-
-        self.use_clock = self.use_clock.saturating_add(1);
-        let catalogue = PackageCatalogue {
-            entries: scan.entries,
-            requested_names: scan_names,
-            complete: scan.complete,
-            directories: scan.directories,
-            validated_epoch: self.package_catalogue_epoch,
-            last_used: self.use_clock,
-        };
-        self.package_catalogues.insert(key, catalogue.clone());
-        self.trim_package_catalogues();
-        Ok(catalogue)
-    }
-
-    fn scan_package_catalogue(
-        &mut self,
-        context_key: &ContextKey,
-        root: &Path,
-        requested_names: &HashSet<String>,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<PackageCatalogueScan, String> {
-        check_workspace_cancel(cancel)?;
-        let root = absolute_path(root.to_path_buf());
-        let excludes = self
-            .roots
-            .iter()
-            .find(|workspace_root| {
-                context_key
-                    .workspace_root
-                    .as_deref()
-                    .is_some_and(|selected| native_paths_equal(selected, &workspace_root.path))
-            })
-            .map(|workspace_root| workspace_root.excludes.clone())
-            .unwrap_or_else(|| ExcludeMatcher::new(&root, &root, &[]));
-        let mut scan = PackageCatalogueScan {
-            complete: true,
-            directories: vec![(root.clone(), path_stamp(&root))],
-            ..PackageCatalogueScan::default()
-        };
-        if fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-            scan.complete = false;
-            return Ok(scan);
-        }
-        let mut pending = VecDeque::from([root.clone()]);
-        let mut visited = 1usize;
-
-        'directories: while let Some(directory) = pending.pop_front() {
-            check_workspace_cancel(cancel)?;
-            let read_dir = match fs::read_dir(&directory) {
-                Ok(read_dir) => read_dir,
-                Err(_) => {
-                    scan.complete = false;
-                    break;
-                }
-            };
-            let mut children = Vec::new();
-            for result in read_dir {
-                check_workspace_cancel(cancel)?;
-                if visited >= MAX_PACKAGE_CATALOGUE_ENTRIES {
-                    scan.complete = false;
-                    break 'directories;
-                }
-                let Ok(entry) = result else {
-                    scan.complete = false;
-                    break 'directories;
-                };
-                visited += 1;
-                children.push(entry);
-            }
-            children.sort_by(|left, right| {
-                left.path()
-                    .to_string_lossy()
-                    .cmp(&right.path().to_string_lossy())
-            });
-
-            let mut descriptors_by_stem: HashMap<String, PackageDescriptorFiles> = HashMap::new();
-            for entry in children {
-                check_workspace_cancel(cancel)?;
-                let path = entry.path();
-                let Ok(file_type) = entry.file_type() else {
-                    scan.complete = false;
-                    continue;
-                };
-                let excluded = excludes.is_excluded(&path, &root);
-                if file_type.is_dir() {
-                    scan.directories.push((path.clone(), path_stamp(&path)));
-                    if !file_type.is_symlink() && !excluded {
-                        pending.push_back(path);
-                    }
-                    continue;
-                }
-                if file_type.is_symlink()
-                    || excluded
-                    || !file_type.is_file()
-                    || !(extension_is(&path, "dpk") || extension_is(&path, "dproj"))
-                {
-                    continue;
-                }
-                let Some(stem) = path.file_stem() else {
-                    continue;
-                };
-                let stem = stem.to_string_lossy().to_ascii_lowercase();
-                let mut matched_names = Vec::new();
-                if requested_names.contains(&stem) {
-                    matched_names.push(stem.clone());
-                }
-
-                let files = descriptors_by_stem.entry(stem).or_default();
-                if extension_is(&path, "dpk") {
-                    files.has_dpk = true;
-                    if !matched_names.is_empty() {
-                        files.dpk.push(PackageDescriptorMatch {
-                            path,
-                            names: matched_names,
-                        });
-                    }
-                } else if !matched_names.is_empty() {
-                    files.dproj.push(PackageDescriptorMatch {
-                        path,
-                        names: matched_names,
-                    });
-                }
-            }
-
-            for files in descriptors_by_stem.into_values() {
-                check_workspace_cancel(cancel)?;
-                let selected = if files.has_dpk {
-                    files.dpk
-                } else {
-                    files.dproj
-                };
-                for descriptor in selected {
-                    for name in descriptor.names {
-                        scan.entries
-                            .entry(name)
-                            .or_default()
-                            .push(descriptor.path.clone());
-                    }
-                }
-            }
-        }
-
-        for paths in scan.entries.values_mut() {
-            check_workspace_cancel(cancel)?;
-            paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-            paths.dedup_by(|left, right| package_paths_equal(left, right));
-        }
-        Ok(scan)
-    }
-
-    fn trim_package_catalogues(&mut self) {
-        while self.package_catalogues.len() > MAX_PACKAGE_CATALOGUES {
-            let Some(victim) = self
-                .package_catalogues
-                .iter()
-                .min_by_key(|(_, catalogue)| catalogue.last_used)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.package_catalogues.remove(&victim);
-        }
-    }
-
-    fn filename_candidates_for_names(
-        &mut self,
-        directory: &Path,
-        names: &[String],
-        context_key: &ContextKey,
-    ) -> Vec<PathBuf> {
-        let mut entries = self.directory_entries(directory);
-        entries.extend(self.open_document_entries(directory, context_key));
-        self.record_missing_provider_candidates(directory, names, &entries);
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for name in names {
-            for path in &entries {
-                if path
-                    .file_name()
-                    .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
-                    && !candidates
-                        .iter()
-                        .any(|existing| paths_equal_ci(existing, path))
-                {
-                    candidates.push(path.clone());
-                }
-            }
-        }
-        candidates
-    }
-
-    fn record_missing_provider_candidates(
-        &mut self,
-        directory: &Path,
-        names: &[String],
-        entries: &[PathBuf],
-    ) {
-        let Some(records) = self.analysis_records.as_mut() else {
-            return;
-        };
-        let directory = absolute_path(directory.to_path_buf());
-        for name in names {
-            // Retain a negative lookup only when no disk or overlay entry
-            // matched this filename. The live validator can then invalidate
-            // the result if that specific provider appears later.
-            if entries.iter().any(|path| {
-                path.file_name()
-                    .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
-            }) {
-                continue;
-            }
-            let path = directory.join(name);
-            let Some(uri) = Url::from_file_path(&path).ok() else {
-                continue;
-            };
-            records
-                .entry(uri.clone())
-                .or_insert_with(|| rename::SourceRecord {
-                    uri,
-                    text: String::new(),
-                    version: None,
-                    stamp: None,
-                    open: false,
-                    path: Some(path.clone()),
-                    path_stamp: path_stamp(&path),
-                    content_hash: None,
-                    content_bytes: None,
-                    candidate_membership: None,
-                    read_policy: None,
-                    path_entry: None,
-                    include_payload: false,
-                    missing_provider_candidate: true,
-                });
-        }
-    }
-
-    fn open_document_entries(&self, directory: &Path, context_key: &ContextKey) -> Vec<PathBuf> {
-        self.open_documents
-            .iter()
-            .filter_map(|(uri, document)| {
-                document.text.as_ref()?;
-                let path = absolute_path(uri.to_file_path().ok()?);
-                let parent = path.parent()?;
-                (paths_equal_ci(parent, directory)
-                    && self.ensure_supported_with_context(uri, context_key))
-                .then_some(path)
-            })
-            .collect()
-    }
-
-    fn directory_entries(&mut self, directory: &Path) -> Vec<PathBuf> {
-        let directory = absolute_path(directory.to_path_buf());
-        let stamp = path_stamp(&directory);
-        if self
-            .directory_catalogues
-            .get(&directory)
-            .is_some_and(|catalogue| catalogue.stamp == stamp)
-        {
-            if let Some(catalogue) = self.directory_catalogues.get_mut(&directory) {
-                self.use_clock = self.use_clock.saturating_add(1);
-                catalogue.last_used = self.use_clock;
-                return catalogue.entries.clone();
-            }
-        }
-
-        let entries = fs::read_dir(&directory)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let file_type = entry.file_type().ok()?;
-                (file_type.is_file() && !file_type.is_symlink()).then_some(entry.path())
-            })
-            .collect::<Vec<_>>();
-        self.use_clock = self.use_clock.saturating_add(1);
-        self.directory_catalogues.insert(
-            directory.clone(),
-            DirectoryCatalogue {
-                stamp,
-                entries: entries.clone(),
-                last_used: self.use_clock,
-            },
-        );
-        self.trim_directory_catalogues();
-        entries
-    }
-
-    fn trim_directory_catalogues(&mut self) {
-        while self.directory_catalogues.len() > MAX_DIRECTORY_CATALOGUES {
-            let Some(victim) = self
-                .directory_catalogues
-                .iter()
-                .min_by_key(|(_, catalogue)| catalogue.last_used)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            self.directory_catalogues.remove(&victim);
-        }
-    }
-
-    fn filename_unit_candidates(
-        &mut self,
-        unit_name: &str,
-        context: &ProjectContext,
-        context_key: &ContextKey,
-    ) -> Vec<PathBuf> {
-        let names = unit_filename_candidates(unit_name, &context.unit_namespaces)
-            .into_iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        let roots = if context.search_paths.is_empty() {
-            self.roots
-                .iter()
-                .map(|root| root.path.clone())
-                .collect::<Vec<_>>()
-        } else {
-            context.search_paths.clone()
-        };
-        let mut result = Vec::new();
-        for root in &roots {
-            let catalogue = self.filename_catalogue(root);
-            if !catalogue.complete {
-                self.warn(format!(
-                    "projectless filename catalogue reached its bounded entry limit under {}",
-                    root.display()
-                ));
-            }
-            for name in &names {
-                if let Some(paths) = catalogue.entries.get(name) {
-                    result.extend(paths.iter().cloned());
-                }
-            }
-        }
-        for (uri, document) in &self.open_documents {
-            if document.text.is_none() || !self.ensure_supported_with_context(uri, context_key) {
-                continue;
-            }
-            let Ok(path) = uri.to_file_path() else {
-                continue;
-            };
-            let path = absolute_path(path);
-            let Some(file_name) = path.file_name() else {
-                continue;
-            };
-            if names
-                .iter()
-                .any(|name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
-                && roots.iter().any(|root| path_starts_with_ci(&path, root))
-            {
-                result.push(path);
-            }
-        }
-        result
-    }
-
-    fn filename_catalogue(&mut self, root: &Path) -> FilenameCatalogue {
-        let root = absolute_path(root.to_path_buf());
-        let fresh = self
-            .filename_catalogues
-            .get(&root)
-            .is_some_and(|catalogue| {
-                catalogue
-                    .directories
-                    .iter()
-                    .all(|(path, stamp)| path_stamp(path) == *stamp)
-            });
-        if fresh {
-            self.use_clock = self.use_clock.saturating_add(1);
-            if let Some(catalogue) = self.filename_catalogues.get_mut(&root) {
-                catalogue.last_used = self.use_clock;
-                return catalogue.clone();
-            }
-        }
-        let mut entries: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        let mut directories = vec![(root.clone(), path_stamp(&root))];
-        let mut visited = 0;
-        let mut complete = true;
-        let excludes = self
-            .roots
-            .iter()
-            .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
-            .map(|workspace_root| workspace_root.excludes.clone());
-        for entry in WalkDir::new(&root).follow_links(false).into_iter() {
-            if visited >= MAX_FILENAME_CATALOGUE_ENTRIES {
-                complete = false;
-                break;
-            }
-            let Ok(entry) = entry else {
-                continue;
-            };
-            visited += 1;
-            if entry.file_type().is_dir() && directories.len() < MAX_FILENAME_CATALOGUE_ENTRIES {
-                directories.push((entry.path().to_path_buf(), path_stamp(entry.path())));
-            }
-            if entry.file_type().is_symlink()
-                || excludes
-                    .as_ref()
-                    .is_some_and(|matcher| matcher.is_excluded(entry.path(), &root))
-            {
-                continue;
-            }
-            if !entry.file_type().is_file() || !extension_is(entry.path(), "pas") {
-                continue;
-            }
-            if let Some(name) = entry.path().file_name() {
-                entries
-                    .entry(name.to_string_lossy().to_ascii_lowercase())
-                    .or_default()
-                    .push(entry.path().to_path_buf());
-            }
-        }
-        self.use_clock = self.use_clock.saturating_add(1);
-        let catalogue = FilenameCatalogue {
-            entries,
-            complete,
-            directories,
-            last_used: self.use_clock,
-        };
-        self.filename_catalogues.insert(root, catalogue.clone());
-        self.trim_filename_catalogues();
-        catalogue
-    }
-
-    fn trim_filename_catalogues(&mut self) {
-        while self.filename_catalogues.len() > MAX_FILENAME_CATALOGUES {
-            let Some(victim) = self
-                .filename_catalogues
-                .iter()
-                .min_by_key(|(_, catalogue)| catalogue.last_used)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            self.filename_catalogues.remove(&victim);
-        }
     }
 
     fn remove_indexed(&mut self, uri: &Url) {
@@ -4791,11 +3873,7 @@ impl Workspace {
         }
 
         for record in records {
-            let dependency_uri = record
-                .path
-                .as_ref()
-                .and_then(|path| Url::from_file_path(absolute_path(path.clone())).ok())
-                .unwrap_or_else(|| canonical_file_uri(&record.uri));
+            let dependency_uri = source_record_dependency_uri(record);
             let missing_provider_candidate_changed = record.missing_provider_candidate
                 && record.path.as_deref().is_some_and(|candidate| {
                     self.source_change_generations_case_insensitive
@@ -4955,8 +4033,9 @@ impl Workspace {
         let source = document
             .text
             .as_deref()
-            .expect("accepted open documents retain their text");
-        let lint_source = normalize_line_endings(source);
+            .expect("accepted open documents retain their text")
+            .to_owned();
+        let lint_source = normalize_line_endings(&source);
         check_workspace_cancel(Some(cancel))?;
         let path = match uri.to_file_path() {
             Ok(path) => absolute_path(path),
@@ -5003,7 +4082,16 @@ impl Workspace {
         }
         let config = resolved_config.value;
         check_workspace_cancel(Some(cancel))?;
-        let raw = lint4d::engine::run_lint(&FileInfo::new(path), lint_source.as_bytes(), &config);
+        let raw = self.run_shared_lint_with_cancel(SharedLintRequest {
+            uri,
+            path: &path,
+            source: source.as_bytes(),
+            lint_source: lint_source.as_bytes(),
+            config: &config,
+            context_key: &context_key,
+            context: &context,
+            cancel,
+        })?;
         check_workspace_cancel(Some(cancel))?;
         let line_index = DiagnosticLineIndex::new(&lint_source);
         let mut diagnostics = Vec::with_capacity(raw.len());
@@ -5031,6 +4119,128 @@ impl Workspace {
             ));
         }
         Ok(diagnostics)
+    }
+
+    fn run_shared_lint_with_cancel(
+        &mut self,
+        request: SharedLintRequest<'_>,
+    ) -> Result<Vec<pascal_core::Diagnostic>, String> {
+        let SharedLintRequest {
+            uri,
+            path,
+            source,
+            lint_source,
+            config,
+            context_key,
+            context,
+            cancel,
+        } = request;
+        check_workspace_cancel(Some(cancel))?;
+        let input = self.analysis_input();
+        let run_file_local = || {
+            lint4d::engine::run_lint_with_cfg_project(
+                &FileInfo::new(path.to_path_buf()),
+                lint_source,
+                config,
+                None,
+                None,
+                &lint4d::rules::RuleRegistry::new(),
+            )
+        };
+        let source_text = match std::str::from_utf8(source) {
+            Ok(source_text) => source_text,
+            Err(_) => return Ok(run_file_local()),
+        };
+        let mut source_index = NavigationIndex::new();
+        match source_index.update_with_defines_with_cancel(
+            uri.clone(),
+            source_text.to_owned(),
+            &context.defines,
+            cancel,
+        ) {
+            Ok(()) => {}
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(_) => return Ok(run_file_local()),
+        }
+        let (source_tree, _) = match parser::parse_file(&FileInfo::new(path.to_path_buf()), source)
+        {
+            Ok(parsed) => parsed,
+            Err(_) => return Ok(run_file_local()),
+        };
+        let Some(unit_name) =
+            lint4d::rules::helpers::extract_unit_name(source_tree.root_node(), source)
+        else {
+            return Ok(run_file_local());
+        };
+        let mut resolver =
+            resolver::resolver_for_context(context.clone(), input.roots.clone(), &input, cancel);
+        let sites = source_index
+            .imports(uri)
+            .into_iter()
+            .map(|import| ImportSite {
+                byte_range: import.span.start..import.span.end,
+                requested_name: import.name,
+                section: ImportSection::Module,
+            })
+            .collect::<Vec<_>>();
+        let legacy_route = self.legacy_route_for_resolver(uri, path, context_key, context);
+        let project = match resolver.resolve_project_from_source(
+            path,
+            &unit_name,
+            &sites,
+            legacy_route.as_ref(),
+            cancel,
+        ) {
+            Ok(project) => project,
+            Err(error) => {
+                let report = resolver.finish();
+                self.merge_resolution_report(context_key, &report);
+                if matches!(error, pascal_core::ResolverError::Cancelled) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                self.warn(format!(
+                    "could not resolve project CFG for {uri}: {error}; using file-local CFG"
+                ));
+                return Ok(run_file_local());
+            }
+        };
+        check_workspace_cancel(Some(cancel))?;
+        self.merge_resolution_report(context_key, &project.report);
+        let configuration_id = format!(
+            "config={};platform={}",
+            context.config.as_deref().unwrap_or_default(),
+            context.platform.as_deref().unwrap_or_default()
+        );
+        let options = lint4d::cfg::CfgSnapshotOptions {
+            prepare_configured_sources: context.project_file.is_some(),
+            configuration_id: Some(configuration_id),
+            initial_defined_symbols: context.defines.clone(),
+            ..Default::default()
+        };
+        let snapshot = match lint4d::cfg::to_cfg_project_snapshot(project, options) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.warn(format!(
+                    "could not build project CFG for {uri}: {error}; using file-local CFG"
+                ));
+                return Ok(run_file_local());
+            }
+        };
+        check_workspace_cancel(Some(cancel))?;
+        if source != lint_source {
+            // Keep resolver coordinates and snapshot bytes identical. The
+            // normalized representation is still used for the conservative
+            // file-local fallback so published positions follow line endings.
+            return Ok(run_file_local());
+        }
+        Ok(lint4d::engine::run_lint_with_cfg_project(
+            &FileInfo::new(path.to_path_buf()),
+            source,
+            config,
+            None,
+            Some(&snapshot),
+            &lint4d::rules::RuleRegistry::new(),
+        ))
     }
 }
 
@@ -5338,24 +4548,25 @@ impl<'a> DiagnosticLineIndex<'a> {
 }
 
 fn normalize_line_endings(source: &str) -> String {
-    if !source.as_bytes().contains(&b'\r') {
+    let bytes = source.as_bytes();
+    let has_bare_carriage_return = bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'));
+    if !has_bare_carriage_return {
         return source.to_owned();
     }
-    let bytes = source.as_bytes();
     let mut normalized = String::with_capacity(source.len());
     let mut start = 0;
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] != b'\r' {
+        if bytes[index] != b'\r' || bytes.get(index + 1) == Some(&b'\n') {
             index += 1;
             continue;
         }
         normalized.push_str(&source[start..index]);
         normalized.push('\n');
         index += 1;
-        if bytes.get(index) == Some(&b'\n') {
-            index += 1;
-        }
         start = index;
     }
     normalized.push_str(&source[start..]);
@@ -5441,7 +4652,7 @@ fn read_disk_source_with_cancel(
     }
     .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     check_workspace_cancel(cancel)?;
-    let text = decode_bytes(&bytes).into_owned();
+    let text = resolver::decode_source_bytes(&bytes);
     if text.len() > max_bytes {
         return Err(format!(
             "decoded contents of {} exceed the configured per-file limit {max_bytes}",
@@ -5495,6 +4706,46 @@ pub(crate) fn canonical_file_uri(uri: &Url) -> Url {
         .ok()
         .and_then(|path| Url::from_file_path(absolute_path(path)).ok())
         .unwrap_or_else(|| uri.clone())
+}
+
+fn source_record_dependency_uri(record: &rename::SourceRecord) -> Url {
+    record
+        .path
+        .as_ref()
+        .and_then(|path| Url::from_file_path(absolute_path(path.clone())).ok())
+        .map(|uri| canonical_file_uri(&uri))
+        .unwrap_or_else(|| canonical_file_uri(&record.uri))
+}
+
+fn source_record_matches_change(record: &rename::SourceRecord, changed_uri: &Url) -> bool {
+    let changed_uri = canonical_file_uri(changed_uri);
+    if source_record_dependency_uri(record) == changed_uri {
+        return true;
+    }
+
+    let observed_directory = record.directory_observation || record.candidate_membership.is_some();
+    if observed_directory
+        && record
+            .path
+            .as_deref()
+            .zip(changed_uri.to_file_path().ok())
+            .is_some_and(|(directory, changed_path)| {
+                absolute_path(changed_path)
+                    .parent()
+                    .is_some_and(|parent| paths_equal_ci(directory, parent))
+            })
+    {
+        return true;
+    }
+
+    record.missing_provider_candidate
+        && record
+            .path
+            .as_deref()
+            .zip(changed_uri.to_file_path().ok())
+            .is_some_and(|(candidate, changed_path)| {
+                paths_equal_ci(candidate, &absolute_path(changed_path))
+            })
 }
 
 fn mark_dependency_change(
@@ -5600,44 +4851,6 @@ fn context_path_entry(context: &ProjectContext, path: &Path) -> Option<ProjectPa
 
 fn native_mapping_root(root: &Path) -> PathBuf {
     resolve_case_insensitive_path(root).unwrap_or_else(|| absolute_path(root.to_path_buf()))
-}
-
-fn context_uses_mapped_root(
-    context: &ProjectContext,
-    configured_root: &Path,
-    resolved_root: &Path,
-) -> bool {
-    context
-        .main_source_entry
-        .as_ref()
-        .into_iter()
-        .chain(context.search_path_entries.iter())
-        .chain(context.include_path_entries.iter())
-        .chain(context.explicit_unit_entries.values().flatten())
-        .any(|entry| match &entry.provenance {
-            ProjectPathProvenance::Mapped { root: mapped_root } => {
-                package_paths_equal(mapped_root, resolved_root)
-                    || paths_equal_ci(mapped_root, configured_root)
-            }
-            ProjectPathProvenance::Configured => {
-                path_starts_with_native(&entry.path, resolved_root)
-                    || path_starts_with_native(&entry.path, configured_root)
-                    || (!resolved_root.exists()
-                        && path_starts_with_ci(&entry.path, configured_root))
-            }
-            ProjectPathProvenance::LegacyNative => false,
-        })
-}
-
-fn package_catalogue_directories_are_readable(
-    directories: &[(PathBuf, Option<PathStamp>)],
-) -> bool {
-    directories.iter().all(|(path, stamp)| {
-        !stamp
-            .as_ref()
-            .is_some_and(|stamp| stamp.is_dir && !stamp.is_symlink)
-            || fs::read_dir(path).is_ok()
-    })
 }
 
 fn relative_path(base: &Path, path: &Path) -> Option<PathBuf> {
@@ -5821,79 +5034,6 @@ fn resolve_case_insensitive_path(path: &Path) -> Option<PathBuf> {
     Some(current)
 }
 
-fn aliased_unit_name(context: &ProjectContext, name: &str) -> String {
-    context
-        .unit_aliases
-        .iter()
-        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
-        .map_or_else(
-            || name.to_ascii_lowercase(),
-            |(_, target)| target.to_ascii_lowercase(),
-        )
-}
-
-fn unit_filename_candidates(unit_name: &str, namespaces: &[String]) -> Vec<String> {
-    unit_filename_candidate_tiers(unit_name, namespaces)
-        .into_iter()
-        .flatten()
-        .collect()
-}
-
-fn unit_filename_candidate_tiers(unit_name: &str, namespaces: &[String]) -> Vec<Vec<String>> {
-    let mut tiers = Vec::new();
-    let short_name = unit_name.rsplit('.').next().unwrap_or(unit_name);
-    let mut exact = vec![format!("{unit_name}.pas")];
-    if !short_name.eq_ignore_ascii_case(unit_name) {
-        exact.push(format!("{short_name}.pas"));
-    }
-    tiers.push(exact);
-    if !unit_name.contains('.') {
-        for namespace in namespaces {
-            let namespace = namespace.trim().trim_matches('.');
-            if !namespace.is_empty() {
-                tiers.push(vec![format!("{namespace}.{unit_name}.pas")]);
-            }
-        }
-    }
-    for tier in &mut tiers {
-        tier.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    }
-    tiers
-}
-
-fn unit_name_matches(
-    actual: &str,
-    requested: &str,
-    lookup: &str,
-    context: &ProjectContext,
-) -> bool {
-    if actual.eq_ignore_ascii_case(lookup) || actual.eq_ignore_ascii_case(requested) {
-        return true;
-    }
-    if lookup.contains('.') {
-        return false;
-    }
-    context
-        .unit_namespaces
-        .iter()
-        .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual))
-}
-
-fn package_unit_name_matches(
-    actual: &str,
-    requested: &str,
-    lookup: &str,
-    context: &ProjectContext,
-) -> bool {
-    actual.eq_ignore_ascii_case(requested)
-        || actual.eq_ignore_ascii_case(lookup)
-        || (!lookup.contains('.')
-            && context
-                .unit_namespaces
-                .iter()
-                .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual)))
-}
-
 fn is_default_excluded_component(component: Component<'_>) -> bool {
     let Component::Normal(name) = component else {
         return false;
@@ -5984,11 +5124,9 @@ mod tests {
     use pascal_project::delphi_overrides::{
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
     };
-    use pascal_project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance};
-    use std::collections::HashSet;
+    use pascal_project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance, ReadPolicy};
+    use std::collections::{HashMap, HashSet};
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::Path;
     use std::path::PathBuf;
@@ -5996,6 +5134,483 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[cfg(unix)]
+    fn configured_native_package_fixture(
+        temp_root: &Path,
+        configured_root: &Path,
+        mapped_root: &Path,
+    ) -> (Workspace, Url) {
+        let workspace_root = temp_root.join("workspace");
+        let main = workspace_root.join("Main.pas");
+        let package = workspace_root.join("packages/Shared.dpk");
+        let provider = workspace_root.join("packages/src/SharedUnit.pas");
+        fs::create_dir_all(provider.parent().expect("package source directory"))
+            .expect("package source directory");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
+        )
+        .expect("package provider");
+        fs::write(
+            &package,
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("package descriptor");
+        fs::write(
+            workspace_root.join("App.dproj"),
+            r#"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>$(SDK)</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>"#,
+        )
+        .expect("project descriptor");
+        fs::write(
+            workspace_root.join(".delphi-tools.local.toml"),
+            format!(
+                "[properties]\nSDK = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                configured_root.display(),
+                mapped_root.display()
+            ),
+        )
+        .expect("override configuration");
+
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        (
+            test_workspace(vec![workspace_root], WorkspaceOptions::default()),
+            main_uri,
+        )
+    }
+
+    #[test]
+    fn shared_resolver_prefers_lsp_overlay_over_disk() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().to_owned();
+        let path = root.join("Errors.pas");
+        let importer = root.join("Main.pas");
+        let disk_source = "unit Errors; interface const Disk = 1; implementation end.\n";
+        let overlay_source = "unit Errors; interface const Overlay = 2; implementation end.\n";
+        fs::write(&path, disk_source).expect("disk source");
+        let uri = Url::from_file_path(&path).expect("source URI");
+
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            uri.clone(),
+            super::rename::OverlayInput {
+                text: overlay_source.to_owned(),
+                version: 7,
+            },
+        );
+        let input = super::rename::WorkspaceInput {
+            roots: vec![root.clone()],
+            options: WorkspaceOptions::default(),
+            overrides: OverrideSession::new(None),
+            project_selections: HashMap::new(),
+            document_owners: HashMap::new(),
+            overlays,
+            cached_documents: HashMap::new(),
+            rejected_documents: HashSet::new(),
+            rejection_reasons: HashMap::new(),
+            document_versions: HashMap::new(),
+            deleted_overrides: HashMap::new(),
+            source_generation: 0,
+            configuration_generation: 0,
+        };
+        let entry = ProjectPathEntry {
+            path: root.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths: vec![root.clone()],
+            search_path_entries: vec![entry],
+            read_policy: ReadPolicy::new(
+                std::slice::from_ref(&root),
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let mut resolver =
+            super::resolver::resolver_for_context(context, vec![root], &input, &cancel);
+        let outcome = resolver.resolve_unit(
+            pascal_core::UnitResolveRequest {
+                requested_name: "Errors",
+                importer_path: &importer,
+                legacy_route: None,
+            },
+            &cancel,
+        );
+        let found = match outcome.result {
+            pascal_core::Resolution::Found(unit) => unit,
+            other => panic!("expected overlay unit, got {other:?}"),
+        };
+
+        assert_eq!(&*found.source.bytes, overlay_source.as_bytes());
+        assert_eq!(
+            found.source.revision,
+            pascal_core::SourceRevision::Overlay {
+                version: 7,
+                content_hash: pascal_project::content_hash_bytes(overlay_source.as_bytes()),
+            }
+        );
+    }
+
+    #[test]
+    fn closed_utf16_importer_resolves_a_provider_definition() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let provider = root.join("Provider.pas");
+        let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Test;\nbegin\n  Hello;\nend;\nend.\n";
+        let provider_source = "unit Provider;\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n";
+        let mut utf16_main = vec![0xff, 0xfe];
+        utf16_main.extend(main_source.encode_utf16().flat_map(u16::to_le_bytes));
+        fs::write(&main, utf16_main).expect("UTF-16 importer");
+        fs::write(&provider, provider_source).expect("UTF-8 provider");
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let locations =
+            workspace.navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+
+        assert_eq!(
+            locations.len(),
+            1,
+            "UTF-16 provider navigation: {locations:?}"
+        );
+        assert_eq!(
+            locations[0].uri,
+            Url::from_file_path(&provider).expect("provider URI")
+        );
+    }
+
+    #[test]
+    fn transitive_closed_utf16_dependency_resolves_its_provider() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let middle = root.join("Middle.pas");
+        let provider = root.join("Provider.pas");
+        let main_source = "unit Main;\ninterface\nuses Middle;\nimplementation\nprocedure Run;\nbegin\n  MiddleRoutine;\nend;\nend.\n";
+        let middle_source = "unit Middle;\ninterface\nuses Provider;\nprocedure MiddleRoutine;\nimplementation\nprocedure MiddleRoutine;\nbegin\n  Hello;\nend;\nend.\n";
+        let provider_source = "unit Provider;\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n";
+        fs::write(&main, main_source).expect("main source");
+        let mut utf16_middle = vec![0xff, 0xfe];
+        utf16_middle.extend(middle_source.encode_utf16().flat_map(u16::to_le_bytes));
+        fs::write(&middle, utf16_middle).expect("UTF-16 middle source");
+        fs::write(&provider, provider_source).expect("provider source");
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let middle_uri = Url::from_file_path(&middle).expect("middle URI");
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let middle_locations =
+            workspace.navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+        assert_eq!(
+            middle_locations.len(),
+            1,
+            "Main -> Middle: {middle_locations:?}"
+        );
+        assert_eq!(middle_locations[0].uri, middle_uri);
+
+        let provider_locations = workspace.navigate(
+            &middle_uri,
+            Position::new(7, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(
+            provider_locations.len(),
+            1,
+            "UTF-16 transitive provider navigation: {provider_locations:?}"
+        );
+        assert_eq!(provider_locations[0].uri, provider_uri);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_mapped_package_root_keeps_package_lookup_incomplete() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let workspace_root = temp.path().join("workspace");
+        let main = workspace_root.join("Main.pas");
+        let package = workspace_root.join("packages/Shared.dpk");
+        let provider = workspace_root.join("packages/src/SharedUnit.pas");
+        let missing_root = temp.path().join("missing-sdk");
+        fs::create_dir_all(provider.parent().expect("package source directory"))
+            .expect("package source directory");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
+        )
+        .expect("package provider");
+        fs::write(
+            &package,
+            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+        )
+        .expect("package descriptor");
+        fs::write(
+            workspace_root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\MissingSdk</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>",
+        )
+        .expect("project descriptor");
+        fs::write(
+            workspace_root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\MissingSdk'\nto = '{}'\n",
+                missing_root.display()
+            ),
+        )
+        .expect("override configuration");
+
+        let mut workspace =
+            test_workspace(vec![workspace_root.clone()], WorkspaceOptions::default());
+        let locations = workspace.navigate(
+            &Url::from_file_path(&main).expect("main URI"),
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert!(
+            locations.is_empty(),
+            "missing mapped package root must not permit a unique package result: {locations:?}"
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .any(|warning| { warning.contains("directory scan limit") }),
+            "missing mapped package root did not produce a directory observation warning: {:?}",
+            workspace.warnings()
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("unit resolution was incomplete")),
+            "missing mapped package root did not make resolution incomplete: {:?}",
+            workspace.warnings()
+        );
+
+        fs::create_dir(&missing_root).expect("empty mapped package root");
+        let mut empty_root_workspace =
+            test_workspace(vec![workspace_root.clone()], WorkspaceOptions::default());
+        let locations = empty_root_workspace.navigate(
+            &Url::from_file_path(&main).expect("main URI"),
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            locations.len(),
+            1,
+            "an existing empty mapped package root must not make a valid package incomplete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_configured_native_package_root_keeps_package_lookup_incomplete() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let missing_root = temp.path().join("missing-sdk");
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &missing_root, &missing_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert!(
+            locations.is_empty(),
+            "missing configured native package root must not permit a unique package result: {locations:?}"
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| {
+                let warning = warning.to_ascii_lowercase();
+                warning.contains("directory scan") || warning.contains("package catalogue")
+            }),
+            "missing configured native package root did not produce an incomplete warning: {:?}",
+            workspace.warnings()
+        );
+        assert!(
+            workspace.warnings().iter().any(|warning| warning
+                .to_ascii_lowercase()
+                .contains("unit resolution was incomplete")),
+            "missing configured native package root did not make resolution incomplete: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_configured_native_package_root_preserves_a_unique_package_result() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let configured_root = temp.path().join("empty-sdk");
+        fs::create_dir(&configured_root).expect("empty configured native root");
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
+        let locations = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+
+        assert_eq!(locations.len(), 1, "empty configured root: {locations:?}");
+        assert_eq!(
+            locations[0].uri,
+            Url::from_file_path(temp.path().join("workspace/packages/src/SharedUnit.pas"))
+                .expect("provider URI")
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .all(|warning| { !warning.to_ascii_lowercase().contains("package catalogue") }),
+            "empty configured native root made the catalogue incomplete: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_configured_native_package_root_revalidates_after_create_delete_and_restore() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let configured_root = temp.path().join("restored-sdk");
+        let (mut workspace, main_uri) =
+            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
+
+        assert!(
+            workspace
+                .navigate(
+                    &main_uri,
+                    Position::new(6, 2),
+                    NavigationTarget::Declaration
+                )
+                .is_empty()
+        );
+
+        fs::create_dir(&configured_root).expect("create configured native root");
+        assert_eq!(
+            workspace
+                .navigate(
+                    &main_uri,
+                    Position::new(6, 2),
+                    NavigationTarget::Declaration
+                )
+                .len(),
+            1
+        );
+
+        fs::remove_dir(&configured_root).expect("remove configured native root");
+        let deleted = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            deleted.is_empty(),
+            "deleted configured native root reused a stale complete catalogue: {deleted:?}"
+        );
+
+        fs::create_dir(&configured_root).expect("restore configured native root");
+        let restored = workspace.navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "restored empty configured native root should preserve the unique package: {restored:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_adjusted_mapped_package_root_preserves_duplicate_descriptor_incompleteness() {
+        fn navigate_with_mapped_root(
+            configured_name: &str,
+            actual_name: &str,
+        ) -> Vec<lsp_types::Location> {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let workspace_root = temp.path().join("workspace");
+            let sdk_root = temp.path().join(actual_name);
+            let main = workspace_root.join("Main.pas");
+            let workspace_package = workspace_root.join("packages/Shared.dpk");
+            let workspace_provider = workspace_root.join("packages/src/SharedUnit.pas");
+            let sdk_package = sdk_root.join("Shared.dpk");
+            let sdk_provider = sdk_root.join("src/SharedUnit.pas");
+            fs::create_dir_all(
+                workspace_provider
+                    .parent()
+                    .expect("workspace source directory"),
+            )
+            .expect("workspace source directory");
+            fs::create_dir_all(sdk_provider.parent().expect("SDK source directory"))
+                .expect("SDK source directory");
+            fs::write(
+                &main,
+                "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
+            )
+            .expect("main source");
+            fs::write(
+                &workspace_provider,
+                "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
+            )
+            .expect("workspace provider");
+            fs::write(&sdk_provider, "unit SharedUnit; interface end.\n").expect("SDK provider");
+            fs::write(
+                &workspace_package,
+                "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+            )
+            .expect("workspace package descriptor");
+            fs::write(
+                &sdk_package,
+                "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
+            )
+            .expect("SDK package descriptor");
+            fs::write(
+                workspace_root.join("App.dproj"),
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\MappedSdk</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>",
+            )
+            .expect("project descriptor");
+            fs::write(
+                workspace_root.join(".delphi-tools.local.toml"),
+                format!(
+                    "[[path_mappings]]\nfrom = 'C:\\MappedSdk'\nto = '{}'\n",
+                    temp.path().join(configured_name).display()
+                ),
+            )
+            .expect("override configuration");
+
+            let mut workspace = test_workspace(vec![workspace_root], WorkspaceOptions::default());
+            workspace.navigate(
+                &Url::from_file_path(&main).expect("main URI"),
+                Position::new(6, 2),
+                NavigationTarget::Declaration,
+            )
+        }
+
+        let exact_case = navigate_with_mapped_root("SDK", "SDK");
+        assert!(
+            exact_case.is_empty(),
+            "exact-case mapped root must retain duplicate package ambiguity: {exact_case:?}"
+        );
+
+        let case_adjusted = navigate_with_mapped_root("sdk", "SDK");
+        assert!(
+            case_adjusted.is_empty(),
+            "case-adjusted mapped root must retain duplicate package ambiguity: {case_adjusted:?}"
+        );
     }
 
     fn text_change(
@@ -6626,123 +6241,12 @@ mod tests {
         assert!(!owner.has_legacy_route(Path::new("/external/helper.pas")));
     }
 
-    #[cfg(unix)]
-    fn mapped_package_fixture(temp_root: &Path, mapped_root: &Path) -> (Workspace, Url) {
-        let workspace_root = temp_root.join("workspace");
-        let main = workspace_root.join("Main.pas");
-        let package = workspace_root.join("packages/Shared.dpk");
-        let provider = workspace_root.join("packages/src/SharedUnit.pas");
-        fs::create_dir_all(provider.parent().expect("package source directory"))
-            .expect("package source directory");
-        fs::write(
-            &main,
-            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
-        )
-        .expect("main source");
-        fs::write(
-            &provider,
-            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
-        )
-        .expect("package provider");
-        fs::write(
-            &package,
-            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
-        )
-        .expect("package descriptor");
-        fs::write(
-            workspace_root.join("App.dproj"),
-            r#"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\MappedSdk</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>"#,
-        )
-        .expect("project descriptor");
-        fs::write(
-            workspace_root.join(".delphi-tools.local.toml"),
-            format!(
-                "[[path_mappings]]\nfrom = 'C:\\MappedSdk'\nto = '{}'\n",
-                mapped_root.display()
-            ),
-        )
-        .expect("override configuration");
-
-        let main_uri = Url::from_file_path(&main).expect("main URI");
-        (
-            test_workspace(vec![workspace_root], WorkspaceOptions::default()),
-            main_uri,
-        )
-    }
-
-    #[cfg(unix)]
-    fn configured_native_package_fixture(
-        temp_root: &Path,
-        configured_root: &Path,
-        mapped_root: &Path,
-    ) -> (Workspace, Url) {
-        let workspace_root = temp_root.join("workspace");
-        let main = workspace_root.join("Main.pas");
-        let package = workspace_root.join("packages/Shared.dpk");
-        let provider = workspace_root.join("packages/src/SharedUnit.pas");
-        fs::create_dir_all(provider.parent().expect("package source directory"))
-            .expect("package source directory");
-        fs::write(
-            &main,
-            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
-        )
-        .expect("main source");
-        fs::write(
-            &provider,
-            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
-        )
-        .expect("package provider");
-        fs::write(
-            &package,
-            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
-        )
-        .expect("package descriptor");
-        fs::write(
-            workspace_root.join("App.dproj"),
-            r#"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>$(SDK)</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>"#,
-        )
-        .expect("project descriptor");
-        fs::write(
-            workspace_root.join(".delphi-tools.local.toml"),
-            format!(
-                "[properties]\nSDK = '{}'\n[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
-                configured_root.display(),
-                mapped_root.display()
-            ),
-        )
-        .expect("override configuration");
-
-        let main_uri = Url::from_file_path(&main).expect("main URI");
-        (
-            test_workspace(vec![workspace_root], WorkspaceOptions::default()),
-            main_uri,
-        )
-    }
-
-    #[cfg(unix)]
-    struct PermissionsRestore {
-        path: PathBuf,
-        mode: u32,
-    }
-
-    #[cfg(unix)]
-    impl Drop for PermissionsRestore {
-        fn drop(&mut self) {
-            if let Ok(mut permissions) =
-                fs::metadata(&self.path).map(|metadata| metadata.permissions())
-            {
-                permissions.set_mode(self.mode);
-                let _ = fs::set_permissions(&self.path, permissions);
-            }
-        }
-    }
-
     #[test]
     fn diagnostic_line_index_reuses_utf16_prefixes_for_unicode_and_bare_cr() {
         let source = normalize_line_endings("😀abc\rdef\r\nghi");
         let index = DiagnosticLineIndex::new(&source);
 
-        assert_eq!(source, "😀abc\ndef\nghi");
+        assert_eq!(source, "😀abc\ndef\r\nghi");
         assert_eq!(index.position(1, 5).expect("after emoji").character, 2);
         assert_eq!(index.position(2, 4).expect("second line end").character, 3);
         assert_eq!(index.position(3, 4).expect("third line end").character, 3);
@@ -7291,815 +6795,6 @@ mod tests {
             .watched_paths;
         assert!(watched_paths.contains_key(&upper));
         assert!(watched_paths.contains_key(&lower));
-    }
-
-    #[test]
-    fn delphi_overrides_package_keys_include_effective_inputs() {
-        let base = super::PackageMetadataKey {
-            descriptor: std::path::PathBuf::from("/packages/Shared.dproj"),
-            overrides: EffectiveOverrides::default(),
-            read_policy: pascal_project::ReadPolicy::default(),
-            config: Some("Debug".into()),
-            platform: Some("Win32".into()),
-        };
-        let mut other = base.clone();
-        other
-            .overrides
-            .properties
-            .insert("bds".into(), r"D:\SDK".into());
-        assert_ne!(base, other);
-        other = base.clone();
-        other.platform = Some("Win64".into());
-        assert_ne!(base, other);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mapped_package_catalogue_rejects_a_symlinked_destination_root() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let target = temp.path().join("sdk");
-        let mapped_root = temp.path().join("mapped-sdk");
-        fs::create_dir(&target).expect("target directory");
-        fs::write(target.join("Shared.dpk"), "package Shared; end.\n").expect("package descriptor");
-        symlink(&target, &mapped_root).expect("mapped symlink");
-
-        let mut workspace = test_workspace(Vec::new(), WorkspaceOptions::default());
-        let key = super::ContextKey {
-            project_file: None,
-            workspace_root: None,
-            project_scope: None,
-            selection_scope: None,
-            selection_project: None,
-            config: None,
-            platform: None,
-            overrides: EffectiveOverrides {
-                path_mappings: vec![PathMapping {
-                    from: "c:/sdk".to_owned(),
-                    to: mapped_root.clone(),
-                    config_file: temp.path().join("overrides.toml"),
-                }],
-                ..EffectiveOverrides::default()
-            },
-        };
-        let requested_names = HashSet::from(["shared".to_owned()]);
-        let catalogue = workspace
-            .package_catalogue(&key, &mapped_root, &requested_names, None)
-            .expect("package catalogue");
-
-        assert!(!catalogue.complete, "symlinked roots must be incomplete");
-        assert!(
-            catalogue.entries.is_empty(),
-            "symlinked roots must not be scanned"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn relevant_missing_mapped_package_root_keeps_package_lookup_incomplete() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let workspace_root = temp.path().join("workspace");
-        let main = workspace_root.join("Main.pas");
-        let package = workspace_root.join("packages/Shared.dpk");
-        let provider = workspace_root.join("packages/src/SharedUnit.pas");
-        let missing_root = temp.path().join("missing-sdk");
-        fs::create_dir_all(provider.parent().expect("package source directory"))
-            .expect("package source directory");
-        fs::write(
-            &main,
-            "unit Main;\ninterface\nuses SharedUnit;\nimplementation\nprocedure Run;\nbegin\n  SharedRoutine;\nend;\nend.\n",
-        )
-        .expect("main source");
-        fs::write(
-            &provider,
-            "unit SharedUnit;\ninterface\nprocedure SharedRoutine;\nimplementation\nprocedure SharedRoutine; begin end;\nend.\n",
-        )
-        .expect("package provider");
-        fs::write(
-            &package,
-            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
-        )
-        .expect("package descriptor");
-        fs::write(
-            workspace_root.join("App.dproj"),
-            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\MissingSdk</DCC_UnitSearchPath><DCC_UsePackage>Shared</DCC_UsePackage></PropertyGroup></Project>",
-        )
-        .expect("project descriptor");
-        fs::write(
-            workspace_root.join(".delphi-tools.local.toml"),
-            format!(
-                "[[path_mappings]]\nfrom = 'C:\\MissingSdk'\nto = '{}'\n",
-                missing_root.display()
-            ),
-        )
-        .expect("override configuration");
-
-        let mut workspace = test_workspace(vec![workspace_root], WorkspaceOptions::default());
-        let locations = workspace.navigate(
-            &Url::from_file_path(&main).expect("main URI"),
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-
-        assert!(
-            locations.is_empty(),
-            "missing mapped package root must not permit a unique package result: {locations:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "missing mapped package root did not produce an actionable incomplete warning: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn relevant_missing_configured_native_package_root_keeps_package_lookup_incomplete() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let missing_root = temp.path().join("missing-sdk");
-        let (mut workspace, main_uri) =
-            configured_native_package_fixture(temp.path(), &missing_root, &missing_root);
-        let locations = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-
-        assert!(
-            locations.is_empty(),
-            "missing configured native package root must not permit a unique package result: {locations:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "missing configured native package root did not produce an actionable incomplete warning: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn empty_readable_configured_native_package_root_preserves_a_unique_package_result() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let configured_root = temp.path().join("empty-sdk");
-        fs::create_dir(&configured_root).expect("empty configured native root");
-
-        let (mut workspace, main_uri) =
-            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
-        let locations = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-
-        assert_eq!(locations.len(), 1);
-        assert_eq!(
-            locations[0].uri,
-            Url::from_file_path(temp.path().join("workspace/packages/src/SharedUnit.pas"))
-                .expect("provider URI")
-        );
-        assert!(
-            workspace
-                .warnings()
-                .iter()
-                .all(|warning| !warning.contains("bounded source catalogue")),
-            "empty readable configured native root made the catalogue incomplete: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn missing_configured_native_package_root_revalidates_after_create_delete_and_restore() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let configured_root = temp.path().join("restored-sdk");
-        let (mut workspace, main_uri) =
-            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
-
-        let initially_missing = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(initially_missing.is_empty());
-
-        fs::create_dir(&configured_root).expect("create configured native root");
-        let created = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(created.len(), 1);
-
-        fs::remove_dir(&configured_root).expect("remove configured native root");
-        let deleted = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(
-            deleted.is_empty(),
-            "deleted configured native root reused a stale complete catalogue: {deleted:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "deleted configured native root did not remain incomplete: {:?}",
-            workspace.warnings()
-        );
-
-        fs::create_dir(&configured_root).expect("restore configured native root");
-        let restored = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(
-            restored.len(),
-            1,
-            "restored empty configured native root should resolve only the unique workspace package: {restored:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn case_adjusted_configured_native_package_root_stays_incomplete_after_deletion() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let actual_root = temp.path().join("SDK");
-        let configured_root = temp.path().join("sdk");
-        fs::create_dir(&actual_root).expect("case-adjusted configured native root");
-
-        let (mut workspace, main_uri) =
-            configured_native_package_fixture(temp.path(), &configured_root, &configured_root);
-        let initial = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(
-            initial.len(),
-            1,
-            "case-adjusted readable root should preserve the unique package: {initial:?}"
-        );
-
-        fs::remove_dir(&actual_root).expect("delete case-adjusted configured native root");
-        let missing = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(
-            missing.is_empty(),
-            "deleted case-adjusted root must not reveal a unique workspace package: {missing:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "deleted case-adjusted configured root did not remain incomplete: {:?}",
-            workspace.warnings()
-        );
-
-        fs::create_dir(&actual_root).expect("restore case-adjusted configured native root");
-        workspace.warnings.clear();
-        let restored = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(
-            restored.len(),
-            1,
-            "restored case-adjusted root should resolve the unique workspace package: {restored:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unrelated_prefix_similar_mapping_does_not_grant_a_configured_native_root() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let mapped_root = temp.path().join("missing-sdk");
-        let configured_root = temp.path().join("missing-sdk-extra");
-        let (mut workspace, main_uri) =
-            configured_native_package_fixture(temp.path(), &configured_root, &mapped_root);
-        let locations = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-
-        assert_eq!(
-            locations.len(),
-            1,
-            "prefix-similar unrelated mapping must not make the package catalogue incomplete: {locations:?}"
-        );
-        assert!(
-            workspace
-                .warnings()
-                .iter()
-                .all(|warning| !warning.contains("bounded source catalogue")),
-            "unrelated missing mapping incorrectly granted the configured root: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn configured_native_entries_use_component_containment_for_nested_files() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let configured_root = temp.path().join("missing-sdk");
-        let nested_file = configured_root.join("nested/Provider.pas");
-        let sibling = temp.path().join("missing-sdk-extra/Provider.pas");
-        let context = ProjectContext {
-            search_path_entries: vec![ProjectPathEntry {
-                path: nested_file,
-                provenance: ProjectPathProvenance::Configured,
-            }],
-            ..ProjectContext::default()
-        };
-
-        assert!(super::context_uses_mapped_root(
-            &context,
-            &configured_root,
-            &configured_root
-        ));
-        let unrelated = ProjectContext {
-            search_path_entries: vec![ProjectPathEntry {
-                path: sibling,
-                provenance: ProjectPathProvenance::Configured,
-            }],
-            ..ProjectContext::default()
-        };
-        assert!(!super::context_uses_mapped_root(
-            &unrelated,
-            &configured_root,
-            &configured_root
-        ));
-
-        let existing_root = temp.path().join("mapped-sdk");
-        let case_distinct_root = temp.path().join("MAPPED-SDK");
-        fs::create_dir(&existing_root).expect("existing mapped destination");
-        let case_distinct = ProjectContext {
-            search_path_entries: vec![ProjectPathEntry {
-                path: case_distinct_root.join("Provider.pas"),
-                provenance: ProjectPathProvenance::Configured,
-            }],
-            ..ProjectContext::default()
-        };
-        assert!(!super::context_uses_mapped_root(
-            &case_distinct,
-            &existing_root,
-            &existing_root
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_directory_and_inaccessible_mapped_package_roots_keep_lookup_incomplete() {
-        for kind in ["non-directory", "inaccessible"] {
-            let temp = tempfile::tempdir().expect("temporary workspace");
-            let mapped_root = temp.path().join(kind);
-            let inaccessible = kind == "inaccessible";
-            if inaccessible {
-                fs::create_dir(&mapped_root).expect("inaccessible mapped root");
-                let original_mode = fs::metadata(&mapped_root)
-                    .expect("inaccessible mapped root metadata")
-                    .permissions()
-                    .mode();
-                let _restore = PermissionsRestore {
-                    path: mapped_root.clone(),
-                    mode: original_mode,
-                };
-                let mut permissions = fs::metadata(&mapped_root)
-                    .expect("inaccessible mapped root metadata")
-                    .permissions();
-                permissions.set_mode(0o0);
-                fs::set_permissions(&mapped_root, permissions)
-                    .expect("remove mapped root permissions");
-                if fs::read_dir(&mapped_root).is_ok() {
-                    eprintln!(
-                        "skipping inaccessible mapped-root case: runner can read mode-000 directory"
-                    );
-                    continue;
-                }
-                assert!(
-                    fs::read_dir(&mapped_root).is_err(),
-                    "permission-revocation fixture must fail read_dir before testing the case"
-                );
-
-                let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
-                let locations = workspace.navigate(
-                    &main_uri,
-                    Position::new(6, 2),
-                    NavigationTarget::Declaration,
-                );
-                let warnings = workspace.warnings().to_vec();
-
-                assert!(
-                    locations.is_empty(),
-                    "{kind} mapped package root must not permit a unique result: {locations:?}"
-                );
-                assert!(
-                    warnings.iter().any(|warning| {
-                        warning.contains("package shared")
-                            && warning.contains("bounded source catalogue")
-                            && warning.contains("incomplete")
-                    }),
-                    "{kind} mapped package root did not produce an actionable incomplete warning: {warnings:?}"
-                );
-            } else {
-                fs::write(&mapped_root, "not a directory").expect("non-directory mapped root");
-                let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
-                let locations = workspace.navigate(
-                    &main_uri,
-                    Position::new(6, 2),
-                    NavigationTarget::Declaration,
-                );
-                let warnings = workspace.warnings().to_vec();
-
-                assert!(
-                    locations.is_empty(),
-                    "{kind} mapped package root must not permit a unique result: {locations:?}"
-                );
-                assert!(
-                    warnings.iter().any(|warning| {
-                        warning.contains("package shared")
-                            && warning.contains("bounded source catalogue")
-                            && warning.contains("incomplete")
-                    }),
-                    "{kind} mapped package root did not produce an actionable incomplete warning: {warnings:?}"
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn empty_readable_mapped_package_root_preserves_a_unique_package_result() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let mapped_root = temp.path().join("empty-sdk");
-        fs::create_dir(&mapped_root).expect("empty mapped root");
-
-        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
-        let locations = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-
-        assert_eq!(locations.len(), 1);
-        assert_eq!(
-            locations[0].uri,
-            Url::from_file_path(temp.path().join("workspace/packages/src/SharedUnit.pas"))
-                .expect("provider URI")
-        );
-        assert!(
-            workspace
-                .warnings()
-                .iter()
-                .all(|warning| !warning.contains("bounded source catalogue")),
-            "empty readable mapped root made the catalogue incomplete: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn case_adjusted_mapped_package_root_contributes_duplicate_descriptors() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let actual_root = temp.path().join("SDK");
-        fs::create_dir_all(actual_root.join("src")).expect("case-adjusted mapped root");
-        fs::write(
-            actual_root.join("Shared.dpk"),
-            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
-        )
-        .expect("duplicate package descriptor");
-        fs::write(
-            actual_root.join("src/SharedUnit.pas"),
-            "unit SharedUnit; interface implementation end.\n",
-        )
-        .expect("duplicate package source");
-
-        let configured_root = temp.path().join("sdk");
-        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &configured_root);
-        let locations = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-
-        assert!(
-            locations.is_empty(),
-            "case-adjusted duplicate descriptor must not produce a unique result: {locations:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("ambiguous package shared")
-                    && warning.contains(&actual_root.join("Shared.dpk").display().to_string())
-            }),
-            "case-adjusted duplicate descriptor did not produce an ambiguity warning: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn case_adjusted_mapped_package_root_stays_incomplete_after_deletion() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let actual_root = temp.path().join("SDK");
-        fs::create_dir_all(actual_root.join("src")).expect("case-adjusted mapped root");
-        fs::write(
-            actual_root.join("Shared.dpk"),
-            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
-        )
-        .expect("duplicate package descriptor");
-        fs::write(
-            actual_root.join("src/SharedUnit.pas"),
-            "unit SharedUnit; interface implementation end.\n",
-        )
-        .expect("duplicate package source");
-
-        let configured_root = temp.path().join("sdk");
-        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &configured_root);
-        let initial = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(
-            initial.is_empty(),
-            "the existing case-adjusted duplicate must be ambiguous: {initial:?}"
-        );
-
-        fs::remove_dir_all(&actual_root).expect("delete case-adjusted mapped root");
-        let missing = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(
-            missing.is_empty(),
-            "deleted case-adjusted root must not reveal a unique workspace package: {missing:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "deleted case-adjusted root did not remain incomplete: {:?}",
-            workspace.warnings()
-        );
-
-        fs::create_dir_all(actual_root.join("src")).expect("restore case-adjusted mapped root");
-        fs::write(
-            actual_root.join("Shared.dpk"),
-            "package Shared;\ncontains\n  SharedUnit in 'src/SharedUnit.pas';\nend.\n",
-        )
-        .expect("restored duplicate package descriptor");
-        fs::write(
-            actual_root.join("src/SharedUnit.pas"),
-            "unit SharedUnit; interface implementation end.\n",
-        )
-        .expect("restored duplicate package source");
-        workspace.warnings.clear();
-        let restored = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(
-            restored.is_empty(),
-            "restored case-adjusted root must participate in the duplicate: {restored:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("ambiguous package shared")
-                    && warning.contains(&actual_root.join("Shared.dpk").display().to_string())
-            }),
-            "restored case-adjusted root did not participate in ambiguity: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mapped_package_navigation_rejects_a_symlinked_destination_root() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let target = temp.path().join("sdk-target");
-        let mapped_root = temp.path().join("mapped-sdk");
-        fs::create_dir(&target).expect("symlink target directory");
-        symlink(&target, &mapped_root).expect("mapped symlink");
-
-        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
-        let locations = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-
-        assert!(
-            locations.is_empty(),
-            "symlinked mapped root must not permit a unique package result: {locations:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "symlinked mapped root did not produce an actionable incomplete warning: {:?}",
-            workspace.warnings()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn package_catalogue_revalidates_directory_permissions_on_revoke_and_restore() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let mapped_root = temp.path().join("mapped-sdk");
-        fs::create_dir(&mapped_root).expect("mapped root");
-        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
-
-        let initial = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(
-            initial.len(),
-            1,
-            "readable empty root should be cached complete"
-        );
-
-        let original_mode = fs::metadata(&mapped_root)
-            .expect("mapped root metadata")
-            .permissions()
-            .mode();
-        let _restore = PermissionsRestore {
-            path: mapped_root.clone(),
-            mode: original_mode,
-        };
-        let mut inaccessible = fs::metadata(&mapped_root)
-            .expect("mapped root metadata")
-            .permissions();
-        inaccessible.set_mode(0o0);
-        fs::set_permissions(&mapped_root, inaccessible).expect("revoke mapped root permissions");
-
-        if fs::read_dir(&mapped_root).is_ok() {
-            eprintln!(
-                "skipping permission-revocation assertion: runner can read mode-000 directory"
-            );
-            return;
-        }
-        assert!(
-            fs::read_dir(&mapped_root).is_err(),
-            "permission-revocation fixture must fail read_dir before testing the cache"
-        );
-
-        let revoked = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(
-            revoked.is_empty(),
-            "revoked mapped root must not reuse a complete catalogue: {revoked:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "revoked mapped root did not produce an actionable incomplete warning: {:?}",
-            workspace.warnings()
-        );
-
-        let mut restored_permissions = fs::metadata(&mapped_root)
-            .expect("mapped root metadata after revoke")
-            .permissions();
-        restored_permissions.set_mode(original_mode);
-        fs::set_permissions(&mapped_root, restored_permissions)
-            .expect("restore mapped root permissions");
-        let restored = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(
-            restored.len(),
-            1,
-            "restored mapped root must rebuild a complete catalogue"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn missing_mapped_package_root_cache_revalidates_on_create_delete_and_restore() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let mapped_root = temp.path().join("restored-sdk");
-        let (mut workspace, main_uri) = mapped_package_fixture(temp.path(), &mapped_root);
-
-        let initially_missing = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(initially_missing.is_empty());
-
-        fs::create_dir(&mapped_root).expect("create mapped root");
-        let created = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(created.len(), 1);
-
-        fs::remove_dir(&mapped_root).expect("remove mapped root");
-        let deleted = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert!(
-            deleted.is_empty(),
-            "deleted mapped root reused a stale complete catalogue: {deleted:?}"
-        );
-        assert!(
-            workspace.warnings().iter().any(|warning| {
-                warning.contains("package shared")
-                    && warning.contains("bounded source catalogue")
-                    && warning.contains("incomplete")
-            }),
-            "deleted mapped root did not remain incomplete: {:?}",
-            workspace.warnings()
-        );
-
-        fs::create_dir(&mapped_root).expect("restore mapped root");
-        let restored = workspace.navigate(
-            &main_uri,
-            Position::new(6, 2),
-            NavigationTarget::Declaration,
-        );
-        assert_eq!(
-            restored.len(),
-            1,
-            "restored empty mapped root should resolve only the unique workspace package: {restored:?}"
-        );
-    }
-
-    #[test]
-    fn mapped_package_catalogue_applies_default_exclusions() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let mapped_root = temp.path().join("mapped-sdk");
-        let excluded = mapped_root.join(".git");
-        fs::create_dir_all(&excluded).expect("excluded directory");
-        fs::write(excluded.join("Shared.dpk"), "package Shared; end.\n")
-            .expect("excluded package descriptor");
-
-        let mut workspace = test_workspace(Vec::new(), WorkspaceOptions::default());
-        let key = super::ContextKey {
-            project_file: None,
-            workspace_root: None,
-            project_scope: None,
-            selection_scope: None,
-            selection_project: None,
-            config: None,
-            platform: None,
-            overrides: EffectiveOverrides {
-                path_mappings: vec![PathMapping {
-                    from: "c:/sdk".to_owned(),
-                    to: mapped_root.clone(),
-                    config_file: temp.path().join("overrides.toml"),
-                }],
-                ..EffectiveOverrides::default()
-            },
-        };
-        let requested_names = HashSet::from(["shared".to_owned()]);
-        let catalogue = workspace
-            .package_catalogue(&key, &mapped_root, &requested_names, None)
-            .expect("package catalogue");
-
-        assert!(
-            !catalogue.entries.contains_key("shared"),
-            "default-excluded directories must not contribute package descriptors"
-        );
     }
 
     #[cfg(unix)]

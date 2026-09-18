@@ -715,6 +715,10 @@ pub struct PackageMetadata {
     pub units: HashMap<String, Vec<PathBuf>>,
     pub unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
     pub warnings: Vec<String>,
+    /// Whether metadata evaluation omitted a path or otherwise could not prove
+    /// the package's source catalogue complete.  Warnings are retained for
+    /// diagnostics, but callers must use this flag for fail-closed lookup.
+    pub incomplete: bool,
     pub metadata_files: Vec<PathBuf>,
     pub metadata_observations: Vec<MetadataObservation>,
 }
@@ -727,6 +731,93 @@ pub struct PackageMetadataRead {
 }
 
 impl ProjectContext {
+    /// Return the requester-scoped provenance for a source path.
+    ///
+    /// Explicit source references are checked before search roots because a
+    /// mapped or configured reference must not be downgraded to the
+    /// provenance of a broader native root.  The returned entry always carries
+    /// the requested path while retaining the original provenance.
+    pub fn path_entry_for(&self, path: &Path) -> Option<ProjectPathEntry> {
+        let path = lexical_normalize(path);
+        let exact = self
+            .main_source_entry
+            .iter()
+            .chain(self.explicit_unit_entries.values().flatten())
+            .find(|entry| project_paths_equal(&entry.path, &path));
+        if let Some(entry) = exact {
+            return Some(ProjectPathEntry {
+                path,
+                provenance: entry.provenance.clone(),
+            });
+        }
+
+        self.search_path_entries
+            .iter()
+            .filter(|entry| project_path_starts_with(&path, &lexical_normalize(&entry.path)))
+            .max_by_key(|entry| entry.path.components().count())
+            .map(|entry| ProjectPathEntry {
+                path: path.clone(),
+                provenance: entry.provenance.clone(),
+            })
+            .or_else(|| self.read_policy.entry_for_path(&path))
+    }
+
+    /// Return include lookup entries in the same precedence order used by the
+    /// source resolver: owner directory, include paths, then unit paths.
+    pub fn include_search_entries(&self, owner: &Path) -> Vec<ProjectPathEntry> {
+        let owner_directory = owner.parent().unwrap_or(owner);
+        let owner_directory = lexical_normalize(owner_directory);
+        let include_paths = if self.include_path_entries.is_empty() {
+            self.include_paths
+                .iter()
+                .filter_map(|path| self.path_entry_for(path))
+                .collect::<Vec<_>>()
+        } else {
+            self.include_path_entries.clone()
+        };
+        let search_paths = if self.search_path_entries.is_empty() {
+            self.search_paths
+                .iter()
+                .filter_map(|path| self.path_entry_for(path))
+                .collect::<Vec<_>>()
+        } else {
+            self.search_path_entries.clone()
+        };
+        let mut entries = Vec::new();
+        for entry in self
+            .path_entry_for(&owner_directory)
+            .into_iter()
+            .chain(include_paths)
+            .chain(search_paths)
+        {
+            let normalized = lexical_normalize(&entry.path);
+            if entries
+                .iter()
+                .any(|existing: &ProjectPathEntry| project_paths_equal(&existing.path, &normalized))
+            {
+                continue;
+            }
+            entries.push(ProjectPathEntry {
+                path: normalized,
+                provenance: entry.provenance,
+            });
+        }
+        entries
+    }
+
+    /// Project options carrying the selected configuration and platform.
+    ///
+    /// This is deliberately a pure projection: package metadata parsing owns
+    /// all reads and receives the context's immutable overrides and policy
+    /// separately.
+    pub fn selected_project_options(&self) -> ProjectOptions {
+        ProjectOptions {
+            build_config: self.config.clone(),
+            platform: self.platform.clone(),
+            ..ProjectOptions::default()
+        }
+    }
+
     /// Discover the nearest safe project context for `file`.
     ///
     /// Discovery only examines directory entries in ancestor directories; it
@@ -3519,9 +3610,18 @@ fn read_payload_with_tracker(
         stamp: path_stamp_result(&entry.path).ok().flatten(),
         content_hash: project_content_hash(&bytes),
     };
-    let contents =
-        String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))?;
+    // Source payloads use the same lossless UTF-8/Latin-1 boundary as the
+    // resolver.  Project discovery still records the original bytes and hash
+    // above; this decoded string is only the parser coordinate representation.
+    let contents = decode_source_payload(&bytes);
     Ok((contents, observation))
+}
+
+fn decode_source_payload(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => bytes.iter().map(|&byte| byte as char).collect(),
+    }
 }
 
 fn project_read_stamp(path: &Path) -> Result<ProjectReadStamp, String> {
@@ -3603,7 +3703,7 @@ pub fn read_package_metadata_with_observations(
     read_policy: &ReadPolicy,
     entry: &ProjectPathEntry,
 ) -> Result<PackageMetadataRead, String> {
-    if entry.path != path {
+    if !project_paths_equal(&entry.path, path) {
         return Err(format!(
             "package metadata entry does not match descriptor {}",
             path.display()
@@ -3636,6 +3736,10 @@ pub fn read_package_metadata_with_observations(
             path.display()
         ))
     }?;
+    metadata.incomplete |= metadata
+        .warnings
+        .iter()
+        .any(|warning| package_metadata_warning_is_incomplete(warning));
     add_metadata_observation(&mut metadata.metadata_observations, descriptor_observation);
     metadata.metadata_observations =
         complete_metadata_observations(&metadata.metadata_files, metadata.metadata_observations);
@@ -3643,6 +3747,10 @@ pub fn read_package_metadata_with_observations(
         metadata,
         observations: tracker.observations,
     })
+}
+
+fn package_metadata_warning_is_incomplete(warning: &str) -> bool {
+    warning.contains("ignored package path outside authorized read roots")
 }
 
 fn parse_dpk_metadata(
@@ -3662,10 +3770,18 @@ fn parse_dpk_metadata(
     // The bounded filename catalogue selected this descriptor by the package
     // name requested by the project. Its header is validated as package
     // syntax, but a legacy header spelling does not replace that identity.
+    let membership = parse_unit_membership(contents);
     let mut metadata = PackageMetadata::default();
     metadata.metadata_files.push(path.to_path_buf());
+    if !membership.exhaustive {
+        metadata.incomplete = true;
+        metadata.warnings.push(format!(
+            "package {} contains membership is incomplete",
+            path.display()
+        ));
+    }
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    for (unit_name, raw_path) in parse_explicit_unit_paths(contents) {
+    for (unit_name, raw_path) in membership.explicit_paths {
         let Some(unit_entry) = package_unit_entry(
             &raw_path,
             base,
@@ -3674,6 +3790,7 @@ fn parse_dpk_metadata(
             "package contains path",
             &entry.provenance,
             read_policy,
+            &mut metadata.incomplete,
         ) else {
             continue;
         };
@@ -3719,6 +3836,7 @@ fn parse_dproj_package_metadata(
 
     let mut metadata = PackageMetadata {
         warnings: builder.warnings,
+        incomplete: builder.incomplete,
         metadata_files: vec![path.to_path_buf()],
         ..PackageMetadata::default()
     };
@@ -3730,6 +3848,7 @@ fn parse_dproj_package_metadata(
         "package main source",
         &entry.provenance,
         read_policy,
+        &mut metadata.incomplete,
     ) {
         metadata.metadata_files.push(main_source.path);
     }
@@ -3755,6 +3874,7 @@ fn parse_dproj_package_metadata(
             &reference.source_provenance,
         );
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
+            metadata.incomplete = true;
             continue;
         }
         if is_compiled_reference(&expanded.value) {
@@ -3769,10 +3889,12 @@ fn parse_dproj_package_metadata(
             "package project reference",
             &provenance,
             read_policy,
+            &mut metadata.incomplete,
         ) else {
             continue;
         };
         let Some(stem) = unit_entry.path.file_stem() else {
+            metadata.incomplete = true;
             continue;
         };
         add_package_unit_candidate(
@@ -3784,6 +3906,7 @@ fn parse_dproj_package_metadata(
     Ok(metadata)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn package_unit_entry(
     raw: &str,
     base: &Path,
@@ -3792,24 +3915,34 @@ fn package_unit_entry(
     kind: &str,
     parent_provenance: &ProjectPathProvenance,
     read_policy: &ReadPolicy,
+    incomplete: &mut bool,
 ) -> Option<ProjectPathEntry> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains(UNRESOLVED_MARKER) {
+        *incomplete = true;
         return None;
     }
-    let resolved = project_path_candidate(raw, base, overrides, warnings, kind)?;
+    let Some(resolved) = project_path_candidate(raw, base, overrides, warnings, kind) else {
+        *incomplete = true;
+        return None;
+    };
     let candidate = lexical_normalize(&resolved.path);
     let path = match resolve_existing_path_status_with_provenance(
         &candidate, &resolved, raw, warnings, kind,
     ) {
         ExistingPathStatus::Found(path) => path,
-        ExistingPathStatus::Missing | ExistingPathStatus::Unresolvable => candidate,
+        ExistingPathStatus::Missing => candidate,
+        ExistingPathStatus::Unresolvable => {
+            *incomplete = true;
+            candidate
+        }
     };
     let entry = inherit_path_provenance(
         ProjectPathEntry::resolved(path, &resolved, false),
         parent_provenance,
     );
     if !read_policy.allows_location(&entry) {
+        *incomplete = true;
         warnings.push(format!(
             "ignored package path outside authorized read roots: {}",
             entry.path.display()
@@ -3839,6 +3972,10 @@ fn declared_package_name(source: &str) -> Option<String> {
             .then(|| canonical_package_name(name))
             .filter(|name| !name.is_empty())
     })
+}
+
+fn parse_explicit_unit_paths(source: &str) -> Vec<(String, String)> {
+    parse_unit_membership(source).explicit_paths
 }
 
 #[derive(Debug)]
@@ -5551,10 +5688,6 @@ enum PascalToken {
     Semicolon,
     Dot,
     Other,
-}
-
-fn parse_explicit_unit_paths(source: &str) -> Vec<(String, String)> {
-    parse_unit_membership(source).explicit_paths
 }
 
 #[derive(Debug, Default)]

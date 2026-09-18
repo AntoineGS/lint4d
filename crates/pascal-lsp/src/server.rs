@@ -505,6 +505,12 @@ impl DiagnosticNotificationEffect {
             self.cancel.push(uri);
         }
     }
+
+    fn refresh_dependents(&mut self, workspace: &Workspace, changed_uri: &Url) {
+        for uri in workspace.diagnostic_dependents_for_change(changed_uri) {
+            self.refresh_uri(uri);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1985,6 +1991,7 @@ fn deliver_analysis_result(
             workspace.reschedule_diagnostics(diagnostics.uri.clone());
             return Ok(());
         }
+        workspace.record_diagnostic_dependencies(diagnostics.uri.clone(), result.records.clone());
     }
     if let AnalysisResultValue::Navigation(navigation) = &mut result.value {
         if let Some(state) = navigation.state.take() {
@@ -3041,7 +3048,8 @@ fn handle_notification(
                     error
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.refresh_uri(uri);
+            effect.refresh_uri(uri.clone());
+            effect.refresh_dependents(workspace, &uri);
             Ok(effect)
         }
         "textDocument/didChange" => {
@@ -3056,7 +3064,8 @@ fn handle_notification(
                         ) {
                             let mut effect = DiagnosticNotificationEffect::default();
                             effect.cancel_uri(uri.clone());
-                            effect.refresh_uri(uri);
+                            effect.refresh_uri(uri.clone());
+                            effect.refresh_dependents(workspace, &uri);
                             return Ok(effect);
                         }
                     }
@@ -3075,7 +3084,8 @@ fn handle_notification(
                     error
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.refresh_uri(uri);
+            effect.refresh_uri(uri.clone());
+            effect.refresh_dependents(workspace, &uri);
             Ok(effect)
         }
         "textDocument/didSave" => {
@@ -3088,18 +3098,23 @@ fn handle_notification(
                     error
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.refresh_uri(uri);
+            effect.refresh_uri(uri.clone());
+            effect.refresh_dependents(workspace, &uri);
             Ok(effect)
         }
         "textDocument/didClose" => {
             let params: DidCloseTextDocumentParams = parse_notification(&notification)?;
             let uri = params.text_document.uri;
-            if workspace.close_document(&uri) {
+            let closed = workspace.close_document(&uri);
+            if closed {
                 send_diagnostics(connection, &uri, None, Vec::new())
                     .map_err(|error| error.to_string())?;
             }
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.cancel_uri(uri);
+            effect.cancel_uri(uri.clone());
+            if closed {
+                effect.refresh_dependents(workspace, &uri);
+            }
             Ok(effect)
         }
         "workspace/didChangeWatchedFiles" => {
@@ -3116,6 +3131,7 @@ fn handle_notification(
                 for uri in workspace.file_event(&change.uri, kind) {
                     effect.refresh_uri(uri);
                 }
+                effect.refresh_dependents(workspace, &change.uri);
             }
             Ok(effect)
         }

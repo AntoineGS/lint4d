@@ -265,9 +265,11 @@ sources you are entitled to access.
 
 When a Delphi project records Windows installation paths but the corresponding
 source is installed locally on Linux, `pascal-lsp` can translate those paths
-only when you explicitly configure a mapping. In this release, **only the LSP
-consumes these files**. `lint4d` and `fmt4d` CLI project discovery do not read
-them; CLI integration is separate follow-up work.
+only when you explicitly configure a mapping. The LSP and lint4d's
+`--project` source-CFG path consume these files through `pascal-project`.
+`fmt4d` and lint4d runs without `--project` do not use them for source
+discovery. lint4d's `--bds-path` remains a DCU auto-discovery override, not a
+source-path mapping option.
 
 The layers below are merged in order. A missing file is an empty layer.
 

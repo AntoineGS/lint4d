@@ -255,10 +255,6 @@ impl Workspace {
         self.document_contexts.clear();
         self.open_document_contexts.clear();
         self.clear_legacy_route_proofs();
-        self.directory_catalogues.clear();
-        self.filename_catalogues.clear();
-        self.package_catalogues.clear();
-        self.package_metadata_cache.clear();
         self.file_cap_warning_sent = false;
         self.total_cap_warning_sent = false;
         self.pending_diagnostics.clear();

@@ -486,6 +486,92 @@ impl NavigationIndex {
         })
     }
 
+    /// Determine whether the completion context can produce an unqualified
+    /// auto-import candidate.
+    ///
+    /// This deliberately reuses the same syntax-aware context checks as the
+    /// completion path. The workspace snapshot uses the result only to
+    /// decide whether bounded provider observations must be retained for
+    /// deferred-resolution freshness; it must never use a less accurate raw
+    /// source-text approximation for that decision.
+    pub(crate) fn completion_context_may_auto_import(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        check_cancel(cancel)?;
+        let mut budget = AssistanceBudget::new(
+            MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
+            MAX_HOVER_VALUE_BYTES,
+            "completion context",
+        );
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(true);
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(true);
+        };
+        let anchor = offset.saturating_sub(1);
+        if completion_position_is_conditionally_unknown(document, offset, anchor)
+            || completion_position_is_ignored_with_budget(
+                document,
+                offset,
+                anchor,
+                cancel,
+                &mut budget,
+            )?
+            || unsupported_context_at(
+                document,
+                offset,
+                cancel,
+                &mut budget,
+                MAX_COMPLETION_CONTEXT_NODES,
+                "completion context",
+            )?
+        {
+            return Ok(false);
+        }
+
+        let prefix_start =
+            identifier_prefix_start_with_budget(&document.source, offset, cancel, &mut budget)?;
+        if document
+            .source
+            .get(prefix_start..offset)
+            .is_none_or(|prefix| prefix.is_empty())
+        {
+            return Ok(false);
+        }
+        let identifier = identifier_at_with_budget(
+            document.tree.root_node(),
+            anchor,
+            cancel,
+            &mut budget,
+            "completion context",
+        )?
+        .or(identifier_at_with_budget(
+            document.tree.root_node(),
+            offset,
+            cancel,
+            &mut budget,
+            "completion context",
+        )?);
+        if let Some(identifier) = identifier {
+            if unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)? {
+                return Ok(false);
+            }
+        }
+        let member = member_expression_for_completion(
+            document,
+            offset,
+            prefix_start,
+            identifier,
+            cancel,
+            &mut budget,
+        )?;
+        Ok(matches!(member, CompletionMember::Unqualified))
+    }
+
     pub(crate) fn completion_metadata_for_seed(
         &self,
         seed: &CompletionResolutionSeed,

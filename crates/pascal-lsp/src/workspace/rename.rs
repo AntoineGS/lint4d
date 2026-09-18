@@ -237,7 +237,7 @@ impl SourceRecord {
 pub(crate) struct SnapshotSeed {
     pub(crate) record: SourceRecord,
     pub(crate) consumed_configuration: Vec<SourceRecord>,
-    pub(crate) auto_import_candidate: bool,
+    pub(crate) completion_position: Option<Position>,
 }
 
 impl SnapshotSeed {
@@ -245,7 +245,7 @@ impl SnapshotSeed {
         Self {
             record,
             consumed_configuration: Vec::new(),
-            auto_import_candidate: false,
+            completion_position: None,
         }
     }
 
@@ -254,8 +254,8 @@ impl SnapshotSeed {
         self
     }
 
-    pub(crate) fn with_auto_import_candidate(mut self, enabled: bool) -> Self {
-        self.auto_import_candidate = enabled;
+    pub(crate) fn with_completion_position(mut self, position: Option<Position>) -> Self {
+        self.completion_position = position;
         self
     }
 }
@@ -3404,10 +3404,22 @@ pub(crate) fn build_snapshot(
             }
         }
     }
-    let retain_auto_import_observations = mode == SnapshotMode::Assistance
-        && priority_seed
-            .as_ref()
-            .is_some_and(|seed| seed.auto_import_candidate)
+    let auto_import_context = if mode == SnapshotMode::Assistance {
+        match (
+            priority.first(),
+            priority_seed
+                .as_ref()
+                .and_then(|seed| seed.completion_position),
+        ) {
+            (Some(current_uri), Some(position)) => loader
+                .index
+                .completion_context_may_auto_import(current_uri, position, cancel)?,
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let retain_auto_import_observations = auto_import_context
         && priority.first().is_some_and(|current_uri| {
             records
                 .get(current_uri)

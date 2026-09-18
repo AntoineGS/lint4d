@@ -5264,112 +5264,171 @@ fn completion_auto_import_resolution_rejects_notification_free_negative_disk_cha
         writeln!(provider_source, "  Field{index}: Integer;").expect("provider source formatting");
     }
     provider_source.push_str("end;\nimplementation\nend.\n");
-    let consumer_source = concat!(
-        "unit Consumer;\n",
-        "interface\n",
-        "implementation\n",
-        "procedure Run;\n",
-        "var Value: TTarget;\n",
-        "begin Value := nil; end;\n",
-        "end.\n",
-    );
+    let consumer_sources = [
+        (
+            "ordinary",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value: TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+        (
+            "line-comment-dot",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value:\n",
+                "// .\n",
+                "  TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+        (
+            "brace-comment-dot",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value:\n",
+                "{ .\n",
+                "}\n",
+                "  TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+        (
+            "paren-comment-dot",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value:\n",
+                "(* .\n",
+                "*)\n",
+                "  TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+    ];
     let negative_source = "unit AOther;\ninterface\nimplementation\nend.\n";
 
-    for (case_name, changed_source) in [
-        (
-            "duplicate-unit",
-            negative_source.replace("unit AOther;", "unit Provider;"),
-        ),
-        (
-            "competing-symbol",
-            "unit AOther;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n"
-                .to_string(),
-        ),
-    ] {
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let provider_path = temp.path().join("Provider.pas");
-        let consumer_path = temp.path().join("Consumer.pas");
-        let negative_path = temp.path().join("AOther.pas");
-        write_file(&provider_path, &provider_source);
-        write_file(&consumer_path, consumer_source);
-        write_file(&negative_path, negative_source);
+    for (source_case, consumer_source) in consumer_sources {
+        for (case_name, changed_source) in [
+            (
+                "duplicate-unit",
+                negative_source.replace("unit AOther;", "unit Provider;"),
+            ),
+            (
+                "competing-symbol",
+                "unit AOther;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n"
+                    .to_string(),
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let provider_path = temp.path().join("Provider.pas");
+            let consumer_path = temp.path().join("Consumer.pas");
+            let negative_path = temp.path().join("AOther.pas");
+            write_file(&provider_path, &provider_source);
+            write_file(&consumer_path, consumer_source);
+            write_file(&negative_path, negative_source);
 
-        let mut server = TestServer::launch();
-        server.initialize_with_completion_resolve_properties(
-            temp.path(),
-            json!(["documentation", "detail"]),
-            json!(["markdown"]),
-        );
-        let completion_id = RequestId::from(format!("disk-negative-{case_name}-completion"));
-        server.send_request(
-            completion_id.clone(),
-            "textDocument/completion",
-            json!({
-                "textDocument": {"uri": uri(&consumer_path)},
-                "position": position_after(consumer_source, "TTarget", 0),
-            }),
-        );
-        let initial = server
-            .response(&completion_id)
-            .result
-            .expect("disk-negative completion result");
-        let item = initial["items"]
-            .as_array()
-            .expect("disk-negative completion items")
-            .iter()
-            .find(|item| item["label"] == "TTargetType")
-            .cloned()
-            .expect("disk-negative provider completion item");
-
-        let watch_path = CString::new(negative_path.to_string_lossy().as_bytes())
-            .expect("negative provider watch path");
-        let fd = unsafe { inotify_init1(0) };
-        assert!(fd >= 0, "inotify_init1 failed");
-        let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
-        assert!(watch >= 0, "inotify_add_watch failed");
-        let changed_path = negative_path.clone();
-        let (mutated_sender, mutated_receiver) = mpsc::channel();
-        let watcher = thread::spawn(move || {
-            wait_for_close_events(fd, 1);
-            write_file(&changed_path, &changed_source);
-            mutated_sender.send(()).expect("notify disk mutation");
-        });
-
-        let resolve_id = RequestId::from(format!("disk-negative-{case_name}-resolve"));
-        server.send_request(resolve_id.clone(), "completionItem/resolve", item);
-        mutated_receiver
-            .recv_timeout(IO_TIMEOUT)
-            .expect("resolve must read the negative provider before the mutation");
-        let resolved = server.response(&resolve_id);
-        watcher.join().expect("disk mutation watcher");
-        assert_eq!(
-            resolved.error.as_ref().map(|error| error.code),
-            Some(-32803),
-            "notification-free {case_name} disk mutation was accepted: {resolved:?}"
-        );
-
-        let fresh_id = RequestId::from(format!("disk-negative-{case_name}-fresh"));
-        server.send_request(
-            fresh_id.clone(),
-            "textDocument/completion",
-            json!({
-                "textDocument": {"uri": uri(&consumer_path)},
-                "position": position_after(consumer_source, "TTarget", 0),
-            }),
-        );
-        let fresh = server
-            .response(&fresh_id)
-            .result
-            .expect("fresh disk-negative completion result");
-        assert!(
-            fresh["items"]
+            let mut server = TestServer::launch();
+            server.initialize_with_completion_resolve_properties(
+                temp.path(),
+                json!(["documentation", "detail"]),
+                json!(["markdown"]),
+            );
+            let completion_id = RequestId::from(format!(
+                "disk-negative-{source_case}-{case_name}-completion"
+            ));
+            server.send_request(
+                completion_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&consumer_path)},
+                    "position": position_after(consumer_source, "TTarget", 0),
+                }),
+            );
+            let initial = server
+                .response(&completion_id)
+                .result
+                .expect("disk-negative completion result");
+            let item = initial["items"]
                 .as_array()
-                .expect("fresh disk-negative completion items")
+                .expect("disk-negative completion items")
                 .iter()
-                .all(|item| item["label"] != "TTargetType"),
-            "fresh {case_name} completion retained the ambiguous candidate: {fresh}"
-        );
-        server.shutdown();
+                .find(|item| item["label"] == "TTargetType")
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "disk-negative provider completion item missing for {source_case}/{case_name}: {initial}"
+                    )
+                });
+
+            let watch_path = CString::new(negative_path.to_string_lossy().as_bytes())
+                .expect("negative provider watch path");
+            let fd = unsafe { inotify_init1(0) };
+            assert!(fd >= 0, "inotify_init1 failed");
+            let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
+            assert!(watch >= 0, "inotify_add_watch failed");
+            let changed_path = negative_path.clone();
+            let (mutated_sender, mutated_receiver) = mpsc::channel();
+            let watcher = thread::spawn(move || {
+                wait_for_close_events(fd, 1);
+                write_file(&changed_path, &changed_source);
+                mutated_sender.send(()).expect("notify disk mutation");
+            });
+
+            let resolve_id =
+                RequestId::from(format!("disk-negative-{source_case}-{case_name}-resolve"));
+            server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+            mutated_receiver
+                .recv_timeout(IO_TIMEOUT)
+                .expect("resolve must read the negative provider before the mutation");
+            let resolved = server.response(&resolve_id);
+            watcher.join().expect("disk mutation watcher");
+            assert_eq!(
+                resolved.error.as_ref().map(|error| error.code),
+                Some(-32803),
+                "notification-free {source_case}/{case_name} disk mutation was accepted: {resolved:?}"
+            );
+
+            let fresh_id =
+                RequestId::from(format!("disk-negative-{source_case}-{case_name}-fresh"));
+            server.send_request(
+                fresh_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&consumer_path)},
+                    "position": position_after(consumer_source, "TTarget", 0),
+                }),
+            );
+            let fresh = server
+                .response(&fresh_id)
+                .result
+                .expect("fresh disk-negative completion result");
+            assert!(
+                fresh["items"]
+                    .as_array()
+                    .expect("fresh disk-negative completion items")
+                    .iter()
+                    .all(|item| item["label"] != "TTargetType"),
+                "fresh {source_case}/{case_name} completion retained the ambiguous candidate: {fresh}"
+            );
+            server.shutdown();
+        }
     }
 }
 

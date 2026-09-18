@@ -797,9 +797,6 @@ fn assistance_snapshot(
         .and_then(|position| completion_prefix_at_position(&source, position))
         .into_iter()
         .collect::<Vec<_>>();
-    let auto_import_candidate = completion_position.is_some_and(|position| {
-        !candidate_names.is_empty() && completion_position_is_unqualified(&source, position)
-    });
     let (_context, consumed_configuration) =
         project_context_and_metadata_for_input(input, uri, cancel)?;
     build_snapshot(
@@ -810,36 +807,11 @@ fn assistance_snapshot(
         Some(
             SnapshotSeed::new(record)
                 .with_consumed_configuration(&consumed_configuration)
-                .with_auto_import_candidate(auto_import_candidate),
+                .with_completion_position(completion_position),
         ),
         &[],
         cancel,
     )
-}
-
-fn completion_position_is_unqualified(source: &str, position: Position) -> bool {
-    let Some(offset) = super::text::position_to_offset(source, position) else {
-        return false;
-    };
-    let mut start = offset;
-    while start > 0 {
-        let Some((candidate, character)) = source[..start].char_indices().next_back() else {
-            break;
-        };
-        if character.is_ascii_alphanumeric() || matches!(character, '_' | '$') {
-            start = candidate;
-        } else {
-            break;
-        }
-    }
-    if start > 0 && source.as_bytes().get(start - 1) == Some(&b'&') {
-        start -= 1;
-    }
-    source[..start]
-        .chars()
-        .rev()
-        .find(|character| !character.is_whitespace())
-        != Some('.')
 }
 
 fn type_definition_snapshot(

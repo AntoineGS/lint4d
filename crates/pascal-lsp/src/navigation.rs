@@ -11827,6 +11827,75 @@ mod tests {
     }
 
     #[test]
+    fn auto_import_context_uses_syntax_not_raw_text_qualification() {
+        let cases = [
+            (
+                "ordinary",
+                "unit Context;\ninterface\nimplementation\nvar Value: TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "line-comment-dot",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n// .\n  TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "brace-comment-dot",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n{ .\n}\n  TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "paren-comment-dot",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n(* .\n*)\n  TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "active-directive",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n{$IFDEF ENABLED}\n  TTarget;\n{$ENDIF}\nend.\n",
+                &["ENABLED".to_owned()][..],
+                true,
+            ),
+            (
+                "string-dot",
+                "unit Context;\ninterface\nimplementation\nconst Text = 'Provider.Target';\nend.\n",
+                &[][..],
+                false,
+            ),
+            (
+                "qualified-receiver",
+                "unit Context;\ninterface\ntype TBox = class\nend;\nimplementation\nprocedure Run;\nvar Value: TBox;\nbegin\n  Value.Target\nend;\nend.\n",
+                &[][..],
+                false,
+            ),
+        ];
+
+        for (name, source, defines, expected) in cases {
+            let uri = Url::parse(&format!("file:///tmp/auto-import-{name}.pas"))
+                .expect("context fixture URI");
+            let position = text::offset_to_position(
+                source,
+                source.rfind("Target").expect("context fixture target") + "Target".len(),
+            )
+            .expect("context fixture position");
+            let mut index = NavigationIndex::new();
+            index
+                .update_with_defines(uri.clone(), source.to_owned(), defines)
+                .expect("context fixture parses");
+            let actual = index
+                .completion_context_may_auto_import(&uri, position, &AtomicBool::new(false))
+                .expect("context classification");
+            assert_eq!(
+                actual, expected,
+                "unexpected auto-import context for {name}"
+            );
+        }
+    }
+
+    #[test]
     fn budgeted_uses_lookup_charges_ast_traversal_before_identifier_materialization() {
         let source =
             "unit UsesBudgetConsumer;\ninterface\nuses BudgetProvider;\nimplementation\nend.\n";

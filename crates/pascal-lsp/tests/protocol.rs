@@ -2340,19 +2340,340 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     let capabilities = &result["capabilities"];
     assert_eq!(capabilities["positionEncoding"], "utf-16");
     assert_eq!(capabilities["textDocumentSync"]["change"], 2);
-    assert_eq!(capabilities["declarationProvider"], true);
-    assert_eq!(capabilities["definitionProvider"], true);
-    assert_eq!(capabilities["implementationProvider"], true);
-    assert_eq!(capabilities["documentSymbolProvider"], true);
-    assert_eq!(capabilities["workspaceSymbolProvider"], true);
-    assert_eq!(capabilities["referencesProvider"], true);
-    assert_eq!(capabilities["documentHighlightProvider"], true);
-    assert_eq!(capabilities["selectionRangeProvider"], true);
-    assert_eq!(capabilities["hoverProvider"], true);
-    assert_eq!(capabilities["typeDefinitionProvider"], true);
-    assert_eq!(capabilities["foldingRangeProvider"], true);
-    assert_eq!(capabilities["documentFormattingProvider"], true);
+    assert_eq!(
+        capabilities["declarationProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(capabilities["definitionProvider"]["workDoneProgress"], true);
+    assert_eq!(
+        capabilities["implementationProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["documentSymbolProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["workspaceSymbolProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(capabilities["referencesProvider"]["workDoneProgress"], true);
+    assert_eq!(
+        capabilities["documentHighlightProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["selectionRangeProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(capabilities["hoverProvider"]["workDoneProgress"], true);
+    assert_eq!(
+        capabilities["typeDefinitionProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["foldingRangeProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["documentFormattingProvider"]["workDoneProgress"],
+        true
+    );
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn workspace_symbol_request_reports_string_work_done_progress_in_order() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(
+        &source,
+        "unit Main;\ninterface\ntype\n  TMain = class\n  end;\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(root.path()),
+            "capabilities": {
+                "window": {"workDoneProgress": true}
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    let initialize_result = initialize.result.expect("initialize result");
+    assert_eq!(
+        initialize_result["capabilities"]["workspaceSymbolProvider"]["workDoneProgress"],
+        true
+    );
+    server.send_notification("initialized", json!({}));
+
+    let request_id = RequestId::from("workspace-symbol-progress".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/symbol",
+        json!({"query": "TMain", "workDoneToken": "symbols-progress"}),
+    );
+
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], "symbols-progress");
+    assert_eq!(begin["value"]["kind"], "begin");
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], "symbols-progress");
+    assert_eq!(report["value"]["kind"], "report");
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "workspace symbol failed: {response:?}"
+    );
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "symbols-progress");
+    assert_eq!(end["value"]["kind"], "end");
+
+    let integer_request_id = RequestId::from("workspace-symbol-integer-progress".to_string());
+    server.send_request(
+        integer_request_id.clone(),
+        "workspace/symbol",
+        json!({"query": "TMain", "workDoneToken": 37}),
+    );
+    let integer_begin = server.notification("$/progress");
+    assert_eq!(integer_begin["token"], 37);
+    assert_eq!(integer_begin["value"]["kind"], "begin");
+    let integer_report = server.notification("$/progress");
+    assert_eq!(integer_report["token"], 37);
+    assert_eq!(integer_report["value"]["kind"], "report");
+    let integer_response = server.response(&integer_request_id);
+    assert!(integer_response.error.is_none());
+    let integer_end = server.notification("$/progress");
+    assert_eq!(integer_end["token"], 37);
+    assert_eq!(integer_end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn server_indexing_progress_requires_create_ack_and_closes_after_diagnostics() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("server-progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(root.path()),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let create = server.request("window/workDoneProgress/create");
+    let token = create.params["token"].clone();
+    assert!(token.is_string(), "server progress token must be opaque");
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], token);
+    assert_eq!(begin["value"]["kind"], "begin");
+    assert_eq!(begin["value"]["title"], "Indexing workspace");
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], token);
+    assert_eq!(report["value"]["kind"], "report");
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], token);
+    assert_eq!(end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn client_without_server_progress_support_gets_no_indexing_progress_creation() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = server.diagnostic_with_timeout(&uri(&source), IO_TIMEOUT);
+    assert!(!server.pending.iter().any(|message| {
+        matches!(
+            message,
+            Message::Request(request) if request.method == "window/workDoneProgress/create"
+        )
+    }));
+    assert!(!server.pending.iter().any(|message| {
+        matches!(
+            message,
+            Message::Notification(notification) if notification.method == "$/progress"
+        )
+    }));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_request_progress_closes_only_that_recipient() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    let initialize_id = RequestId::from("cancel-progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let request_id = RequestId::from("cancel-progress-request".to_string());
+    let mut params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    params["workDoneToken"] = json!("cancel-me");
+    server.send_request(request_id.clone(), "textDocument/definition", params);
+    barrier.wait_until_entered();
+
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], "cancel-me");
+    assert_eq!(begin["value"]["kind"], "begin");
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], "cancel-me");
+    assert_eq!(report["value"]["kind"], "report");
+
+    server.send_notification(
+        "window/workDoneProgress/cancel",
+        json!({"token": "cancel-me"}),
+    );
+    let response = server.response(&request_id);
+    assert_eq!(response.error.expect("cancel response").code, -32800);
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "cancel-me");
+    assert_eq!(end["value"]["kind"], "end");
+
+    barrier.release();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn coalesced_progress_tokens_remain_isolated_when_one_request_cancels() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    let initialize_id = RequestId::from("coalesced-progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let first_id = RequestId::from("coalesced-progress-first".to_string());
+    let mut first_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    first_params["workDoneToken"] = json!("first-progress");
+    server.send_request(first_id.clone(), "textDocument/definition", first_params);
+    barrier.wait_until_entered();
+    let first_begin = server.notification("$/progress");
+    assert_eq!(first_begin["token"], "first-progress");
+    let _ = server.notification("$/progress");
+
+    let second_id = RequestId::from("coalesced-progress-second".to_string());
+    let mut second_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    second_params["workDoneToken"] = json!("second-progress");
+    server.send_request(second_id.clone(), "textDocument/definition", second_params);
+    let second_begin = server.notification("$/progress");
+    assert_eq!(second_begin["token"], "second-progress");
+
+    server.send_notification("$/cancelRequest", json!({"id": second_id}));
+    let second_response = server.response(&second_id);
+    assert_eq!(
+        second_response.error.expect("second cancellation").code,
+        -32800
+    );
+    let second_end = server.notification("$/progress");
+    assert_eq!(second_end["token"], "second-progress");
+    assert_eq!(second_end["value"]["kind"], "end");
+
+    barrier.release();
+    let first_response = server.response(&first_id);
+    assert!(
+        first_response.error.is_none(),
+        "first request failed: {first_response:?}"
+    );
+    let first_end = server.notification("$/progress");
+    assert_eq!(first_end["token"], "first-progress");
+    assert_eq!(first_end["value"]["kind"], "end");
     server.shutdown();
 }
 
@@ -2365,7 +2686,10 @@ fn selection_ranges_return_an_inner_to_outer_structural_chain() {
 
     let mut server = TestServer::launch();
     let initialize = server.initialize(temp.path(), Value::Null);
-    assert_eq!(initialize["capabilities"]["selectionRangeProvider"], true);
+    assert_eq!(
+        initialize["capabilities"]["selectionRangeProvider"]["workDoneProgress"],
+        true
+    );
 
     let position = position_of(source, "Bar", 0);
     let id = RequestId::from("selection-ranges".to_string());
@@ -2815,7 +3139,10 @@ fn folding_ranges_return_multiline_syntax_ranges_over_the_protocol() {
 
     let mut server = TestServer::launch();
     let initialize = server.initialize(temp.path(), Value::Null);
-    assert_eq!(initialize["capabilities"]["foldingRangeProvider"], true);
+    assert_eq!(
+        initialize["capabilities"]["foldingRangeProvider"]["workDoneProgress"],
+        true
+    );
 
     let id = RequestId::from("folding-ranges".to_string());
     server.send_request(

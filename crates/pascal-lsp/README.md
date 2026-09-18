@@ -105,6 +105,34 @@ clients. Cancelling a client request releases its recipient slot immediately,
 while the shared computation may remain queued or running for its other
 recipients.
 
+### Work-done progress and cancellation
+
+The server advertises work-done progress for supported long-running providers,
+including document/workspace symbols, references, semantic tokens, navigation,
+formatting, rename, and code actions. A request may supply the standard
+`workDoneToken` as a string or integer; this is separate from
+`partialResultToken` and the JSON-RPC request ID. Accepted request work begins
+with one `$/progress` `begin`, reports bounded queued/started stages without
+invented percentages, and ends exactly once after success, an error, a stale
+result, or cancellation. Reports are operation-level rather than one per
+scanned file.
+
+Server-initiated indexing/diagnostic progress is used only when the client
+advertises `window.workDoneProgress: true`. The server first sends
+`window/workDoneProgress/create` and withholds progress notifications until a
+successful response. Failed, duplicate, unknown, or late create responses are
+ignored without delaying analysis. At most 32 create requests and 128 progress
+tokens are retained; create IDs use a separate `pascal-lsp-progress-create-`
+namespace from configuration request IDs.
+
+`$/cancelRequest` cancels the exact request recipient. The server also accepts
+`window/workDoneProgress/cancel` for an active progress token; unknown or
+finished tokens are harmless. Coalesced requests retain independent progress
+tokens, so cancelling one recipient does not cancel the shared computation
+while another recipient remains. Cancelling server-initiated indexing cancels
+the diagnostic snapshot and permits a later fresh retry; worker snapshots are
+never published as a partially built complete index.
+
 Diagnostics stay debounced and coalesced per document; if both worker slots are
 occupied, the diagnostic request is retried rather than spawning an unbounded
 worker. Identical observational requests share a computation only when their

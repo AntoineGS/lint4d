@@ -24,10 +24,10 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
     FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
-    InitializeParams, MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams,
-    ReferenceParams, Registration, RegistrationParams, RelativePattern, SelectionRangeParams,
-    ServerInfo, SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit,
-    WorkspaceFolder,
+    InitializeParams, MarkupKind, OneOf, Position, PrepareRenameResponse, ProgressToken,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
+    SelectionRangeParams, ServerInfo, SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind,
+    WorkDoneProgressCancelParams, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,13 @@ const MAX_COMPLETION_RESOLUTION_RECORDS: usize = 1_024;
 const MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_COMPLETION_RESOLUTION_ITEM_BYTES: usize = 64 * 1024;
 const COMPLETION_RESOLUTION_DATA_VERSION: u8 = 1;
+/// Progress is deliberately smaller than the analysis recipient bound.  A
+/// client can attach many request recipients to one computation, but progress
+/// state must not become an alternate unbounded queue.
+const MAX_PROGRESS_ENTRIES: usize = 128;
+const MAX_PROGRESS_CREATES: usize = 32;
+const PROGRESS_CREATE_REQUEST_PREFIX: &str = "pascal-lsp-progress-create-";
+const PROGRESS_TOKEN_PREFIX: &str = "pascal-lsp-progress-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalysisPriority {
@@ -1032,6 +1039,29 @@ enum AnalysisRequest {
     },
 }
 
+fn progress_title(request: &AnalysisRequest) -> &'static str {
+    match request {
+        AnalysisRequest::Diagnostics { .. } => "Indexing workspace",
+        AnalysisRequest::WorkspaceSymbols { .. } => "Searching workspace symbols",
+        AnalysisRequest::References { .. } => "Searching workspace references",
+        AnalysisRequest::Rename { .. } => "Preparing rename",
+        AnalysisRequest::CodeActions(_) | AnalysisRequest::Resolve(_) => "Preparing code actions",
+        AnalysisRequest::Formatting { .. } => "Formatting document",
+        AnalysisRequest::DocumentSymbols { .. } => "Indexing document symbols",
+        AnalysisRequest::SemanticTokens { .. } => "Computing semantic tokens",
+        AnalysisRequest::FoldingRanges { .. } => "Computing folding ranges",
+        AnalysisRequest::Hover { .. }
+        | AnalysisRequest::Completion { .. }
+        | AnalysisRequest::SignatureHelp { .. }
+        | AnalysisRequest::Navigation { .. }
+        | AnalysisRequest::TypeDefinitions { .. }
+        | AnalysisRequest::Prepare { .. }
+        | AnalysisRequest::ResolveCompletion(_)
+        | AnalysisRequest::DocumentHighlights { .. }
+        | AnalysisRequest::SelectionRanges { .. } => "Analyzing document",
+    }
+}
+
 #[derive(Clone)]
 enum AnalysisResultValue {
     Hover(Result<Option<lsp_types::Hover>, String>),
@@ -1662,6 +1692,390 @@ enum AnalysisJobId {
     Diagnostic(AnalysisComputationId),
 }
 
+#[derive(Debug, Clone)]
+struct ClientRecipient {
+    id: RequestId,
+    work_done_token: Option<ProgressToken>,
+}
+
+#[derive(Debug, Clone)]
+enum ProgressTarget {
+    Client {
+        job_id: AnalysisJobId,
+        request_id: RequestId,
+    },
+    Diagnostic {
+        job_id: AnalysisJobId,
+    },
+}
+
+#[derive(Debug)]
+struct ProgressEntry {
+    token: ProgressToken,
+    target: ProgressTarget,
+    title: String,
+    create_id: Option<RequestId>,
+    begun: bool,
+    finished: bool,
+    finish_message: Option<String>,
+}
+
+/// Tracks work-done progress independently from request/response routing.
+///
+/// Request-associated tokens begin as soon as their bounded recipient is
+/// admitted, including while the computation is queued.  Server-initiated
+/// tokens are not visible to the client until the client acknowledges the
+/// corresponding `window/workDoneProgress/create` request.  Keeping those two
+/// lifecycles separate prevents a late create response from being mistaken
+/// for a configuration response or from reviving a finished operation.
+#[derive(Debug)]
+struct ProgressTracker {
+    server_supported: bool,
+    next_create_id: u64,
+    next_token: u64,
+    entries: HashMap<AnalysisJobId, Vec<ProgressEntry>>,
+    tokens: HashMap<ProgressToken, ProgressTarget>,
+    creates: HashMap<RequestId, (AnalysisJobId, ProgressToken)>,
+}
+
+impl ProgressTracker {
+    fn new(server_supported: bool) -> Self {
+        Self {
+            server_supported,
+            next_create_id: 0,
+            next_token: 0,
+            entries: HashMap::new(),
+            tokens: HashMap::new(),
+            creates: HashMap::new(),
+        }
+    }
+
+    fn begin_client(
+        &mut self,
+        connection: Option<&Connection>,
+        job_id: AnalysisJobId,
+        recipient: &ClientRecipient,
+        title: &str,
+    ) -> Result<(), String> {
+        let (Some(connection), Some(token)) = (connection, recipient.work_done_token.as_ref())
+        else {
+            return Ok(());
+        };
+        if self.tokens.len() >= MAX_PROGRESS_ENTRIES || self.tokens.contains_key(token) {
+            // A reused token cannot safely identify two concurrent operations.
+            // The request itself remains valid; only its optional progress is
+            // omitted until the earlier owner finishes.
+            return Ok(());
+        }
+        let target = ProgressTarget::Client {
+            job_id,
+            request_id: recipient.id.clone(),
+        };
+        self.tokens.insert(token.clone(), target.clone());
+        self.entries.entry(job_id).or_default().push(ProgressEntry {
+            token: token.clone(),
+            target,
+            title: title.to_string(),
+            create_id: None,
+            begun: true,
+            finished: false,
+            finish_message: None,
+        });
+        if let Err(error) = send_progress_begin(connection, token, title, "Queued for analysis") {
+            self.remove_token(token);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn start_server(
+        &mut self,
+        connection: &Connection,
+        job_id: AnalysisJobId,
+        title: &str,
+    ) -> Result<(), String> {
+        if !self.server_supported
+            || self.creates.len() >= MAX_PROGRESS_CREATES
+            || self.tokens.len() >= MAX_PROGRESS_ENTRIES
+        {
+            return Ok(());
+        }
+        let token_number = self
+            .next_token
+            .checked_add(1)
+            .ok_or_else(|| "progress token space exhausted".to_string())?;
+        self.next_token = token_number;
+        let token = ProgressToken::String(format!("{PROGRESS_TOKEN_PREFIX}{token_number}"));
+        if self.tokens.contains_key(&token) {
+            return Ok(());
+        }
+        let request_number = self
+            .next_create_id
+            .checked_add(1)
+            .ok_or_else(|| "progress create request ID space exhausted".to_string())?;
+        self.next_create_id = request_number;
+        let create_id =
+            RequestId::from(format!("{PROGRESS_CREATE_REQUEST_PREFIX}{request_number}"));
+        let target = ProgressTarget::Diagnostic { job_id };
+        self.tokens.insert(token.clone(), target.clone());
+        self.creates
+            .insert(create_id.clone(), (job_id, token.clone()));
+        self.entries.entry(job_id).or_default().push(ProgressEntry {
+            token: token.clone(),
+            target,
+            title: title.to_string(),
+            create_id: Some(create_id.clone()),
+            begun: false,
+            finished: false,
+            finish_message: None,
+        });
+        let request = Request::new(
+            create_id.clone(),
+            "window/workDoneProgress/create".to_string(),
+            serde_json::json!({"token": token}),
+        );
+        if let Err(error) = connection.sender.send(Message::Request(request)) {
+            self.creates.remove(&create_id);
+            self.remove_token(&token);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn report_started(&self, connection: &Connection, job_id: AnalysisJobId) -> Result<(), String> {
+        let tokens = self
+            .entries
+            .get(&job_id)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.begun)
+            .map(|entry| entry.token.clone())
+            .collect::<Vec<_>>();
+        for token in tokens {
+            send_progress_report(connection, &token, "Analysis started")?;
+        }
+        Ok(())
+    }
+
+    fn target(&self, token: &ProgressToken) -> Option<ProgressTarget> {
+        self.tokens.get(token).cloned()
+    }
+
+    fn handle_create_response(
+        &mut self,
+        connection: &Connection,
+        response: &Response,
+    ) -> Result<bool, String> {
+        let Some((job_id, token)) = self.creates.remove(&response.id) else {
+            return Ok(false);
+        };
+        let Some(entries) = self.entries.get_mut(&job_id) else {
+            self.tokens.remove(&token);
+            return Ok(true);
+        };
+        let Some(entry) = entries.iter_mut().find(|entry| entry.token == token) else {
+            self.tokens.remove(&token);
+            return Ok(true);
+        };
+        if response.error.is_some() {
+            self.remove_token(&token);
+            return Ok(true);
+        }
+        entry.begun = true;
+        let title = entry.title.clone();
+        let finished = entry.finished;
+        let finish_message = entry.finish_message.clone();
+        send_progress_begin(connection, &token, &title, "Indexing workspace")?;
+        send_progress_report(connection, &token, "Indexing workspace")?;
+        if finished {
+            send_progress_end(connection, &token, finish_message.as_deref())?;
+            self.remove_token(&token);
+        }
+        Ok(true)
+    }
+
+    fn finish_recipient(
+        &mut self,
+        connection: Option<&Connection>,
+        job_id: AnalysisJobId,
+        request_id: &RequestId,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(entries) = self.entries.get_mut(&job_id) else {
+            return Ok(());
+        };
+        let Some(index) = entries.iter().position(|entry| {
+            matches!(&entry.target, ProgressTarget::Client { request_id: id, .. } if id == request_id)
+        }) else {
+            return Ok(());
+        };
+        let entry = entries.remove(index);
+        if let (Some(connection), true) = (connection, entry.begun) {
+            send_progress_end(connection, &entry.token, message)?;
+        }
+        self.tokens.remove(&entry.token);
+        if entries.is_empty() {
+            self.entries.remove(&job_id);
+        }
+        Ok(())
+    }
+
+    fn finish_job(
+        &mut self,
+        connection: Option<&Connection>,
+        job_id: AnalysisJobId,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(entries) = self.entries.remove(&job_id) else {
+            return Ok(());
+        };
+        let mut awaiting_create = Vec::new();
+        for mut entry in entries {
+            if entry.begun {
+                if let Some(connection) = connection {
+                    send_progress_end(connection, &entry.token, message)?;
+                }
+                self.tokens.remove(&entry.token);
+            } else if entry.create_id.is_some() {
+                entry.finished = true;
+                entry.finish_message = message.map(str::to_string);
+                awaiting_create.push(entry);
+            } else {
+                self.tokens.remove(&entry.token);
+            }
+        }
+        if awaiting_create.is_empty() {
+            return Ok(());
+        }
+        self.entries.insert(job_id, awaiting_create);
+        Ok(())
+    }
+
+    fn finish_target(
+        &mut self,
+        connection: Option<&Connection>,
+        job_id: AnalysisJobId,
+        token: &ProgressToken,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(entries) = self.entries.get_mut(&job_id) else {
+            self.tokens.remove(token);
+            return Ok(());
+        };
+        let Some(index) = entries.iter().position(|entry| &entry.token == token) else {
+            self.tokens.remove(token);
+            return Ok(());
+        };
+        let entry = entries.remove(index);
+        if let (Some(connection), true) = (connection, entry.begun) {
+            send_progress_end(connection, &entry.token, message)?;
+        }
+        if let Some(create_id) = entry.create_id {
+            self.creates.remove(&create_id);
+        }
+        self.tokens.remove(token);
+        if entries.is_empty() {
+            self.entries.remove(&job_id);
+        }
+        Ok(())
+    }
+
+    fn remove_token(&mut self, token: &ProgressToken) {
+        let Some(target) = self.tokens.remove(token) else {
+            return;
+        };
+        let job_id = match target {
+            ProgressTarget::Client { job_id, .. } | ProgressTarget::Diagnostic { job_id } => job_id,
+        };
+        if let Some(entries) = self.entries.get_mut(&job_id) {
+            if let Some(index) = entries.iter().position(|entry| &entry.token == token) {
+                if let Some(create_id) = entries[index].create_id.clone() {
+                    self.creates.remove(&create_id);
+                }
+                entries.remove(index);
+            }
+            if entries.is_empty() {
+                self.entries.remove(&job_id);
+            }
+        }
+    }
+
+    fn shutdown(&mut self, connection: Option<&Connection>) -> Result<(), String> {
+        let jobs = self.entries.keys().copied().collect::<Vec<_>>();
+        for job_id in jobs {
+            self.finish_job(connection, job_id, Some("Cancelled"))?;
+        }
+        // An unacknowledged create has no begun progress to close.  Drop its
+        // registry entry so a late response is harmless after shutdown.
+        self.entries.clear();
+        self.tokens.clear();
+        self.creates.clear();
+        Ok(())
+    }
+}
+
+fn send_progress_begin(
+    connection: &Connection,
+    token: &ProgressToken,
+    title: &str,
+    message: &str,
+) -> Result<(), String> {
+    connection
+        .sender
+        .send(Message::Notification(Notification::new(
+            "$/progress".to_string(),
+            serde_json::json!({
+                "token": token,
+                "value": {
+                    "kind": "begin",
+                    "title": title,
+                    "cancellable": true,
+                    "message": message
+                }
+            }),
+        )))
+        .map_err(|error| error.to_string())
+}
+
+fn send_progress_report(
+    connection: &Connection,
+    token: &ProgressToken,
+    message: &str,
+) -> Result<(), String> {
+    connection
+        .sender
+        .send(Message::Notification(Notification::new(
+            "$/progress".to_string(),
+            serde_json::json!({
+                "token": token,
+                "value": {
+                    "kind": "report",
+                    "cancellable": true,
+                    "message": message
+                }
+            }),
+        )))
+        .map_err(|error| error.to_string())
+}
+
+fn send_progress_end(
+    connection: &Connection,
+    token: &ProgressToken,
+    message: Option<&str>,
+) -> Result<(), String> {
+    let value = match message {
+        Some(message) => serde_json::json!({"kind": "end", "message": message}),
+        None => serde_json::json!({"kind": "end"}),
+    };
+    connection
+        .sender
+        .send(Message::Notification(Notification::new(
+            "$/progress".to_string(),
+            serde_json::json!({"token": token, "value": value}),
+        )))
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum NavigationObservationTarget {
     Declaration,
@@ -1941,7 +2355,7 @@ struct QueuedClientAnalysis {
     id: AnalysisComputationId,
     request: AnalysisRequest,
     features: ClientFeatures,
-    client_ids: Vec<RequestId>,
+    recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
 }
 
@@ -1969,7 +2383,7 @@ struct AnalysisResult {
 struct PendingAnalysis {
     cancellation: Arc<AtomicBool>,
     handle: JoinHandle<()>,
-    client_ids: Vec<RequestId>,
+    recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
 }
 
@@ -1979,7 +2393,8 @@ struct PendingDiagnostic {
 }
 
 struct DispatchFailure {
-    client_ids: Vec<RequestId>,
+    recipients: Vec<ClientRecipient>,
+    client_job: Option<AnalysisComputationId>,
     diagnostic: Option<QueuedDiagnostic>,
     message: String,
 }
@@ -2090,6 +2505,7 @@ struct AnalysisJobs {
     observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
     diagnostic_jobs: HashMap<Url, AnalysisComputationId>,
     completion_resolutions: CompletionResolutionStore,
+    progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
     shutting_down: bool,
@@ -2098,10 +2514,13 @@ struct AnalysisJobs {
 impl AnalysisJobs {
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_test_barriers(TestBarrierConfig::disabled())
+        Self::with_test_barriers_and_progress(TestBarrierConfig::disabled(), false)
     }
 
-    fn with_test_barriers(test_barriers: TestBarrierConfig) -> Self {
+    fn with_test_barriers_and_progress(
+        test_barriers: TestBarrierConfig,
+        server_progress_supported: bool,
+    ) -> Self {
         let (sender, receiver) = unbounded();
         Self {
             sender,
@@ -2113,6 +2532,7 @@ impl AnalysisJobs {
             observation_jobs: HashMap::new(),
             diagnostic_jobs: HashMap::new(),
             completion_resolutions: CompletionResolutionStore::new(),
+            progress: ProgressTracker::new(server_progress_supported),
             test_barriers,
             next_computation_id: 0,
             shutting_down: false,
@@ -2764,7 +3184,7 @@ impl AnalysisJobs {
         Ok(PendingAnalysis {
             cancellation,
             handle,
-            client_ids: Vec::new(),
+            recipients: Vec::new(),
             key: None,
         })
     }
@@ -2777,7 +3197,7 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
     ) -> Result<(), String> {
-        self.enqueue_client(id, request, workspace, features, None)
+        self.enqueue_client(id, request, workspace, features, None, None)
     }
 
     fn next_computation_id(&mut self) -> Result<AnalysisComputationId, String> {
@@ -2793,13 +3213,13 @@ impl AnalysisJobs {
         let running = self
             .pending
             .values()
-            .map(|job| job.client_ids.len())
+            .map(|job| job.recipients.len())
             .sum::<usize>();
         let queued = self
             .queue
             .iter()
             .map(|job| match job {
-                QueuedAnalysis::Client(job) => job.client_ids.len(),
+                QueuedAnalysis::Client(job) => job.recipients.len(),
                 QueuedAnalysis::Diagnostic(_) => 0,
             })
             .sum::<usize>();
@@ -2828,6 +3248,7 @@ impl AnalysisJobs {
         request: AnalysisRequest,
         workspace: &Workspace,
         features: ClientFeatures,
+        work_done_token: Option<ProgressToken>,
         connection: Option<&Connection>,
     ) -> Result<(), String> {
         if self.shutting_down {
@@ -2837,6 +3258,7 @@ impl AnalysisJobs {
             return Err("analysis request ID is already in use".to_string());
         }
 
+        let title = progress_title(&request).to_string();
         let key = ObservationKey::for_request(&request, workspace);
         if let Some(key) = key.as_ref() {
             let superseded = self
@@ -2853,8 +3275,18 @@ impl AnalysisJobs {
                 if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS {
                     return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
                 }
-                if self.attach_client(&primary_id, id.clone()) {
+                let recipient = ClientRecipient {
+                    id: id.clone(),
+                    work_done_token: work_done_token.clone(),
+                };
+                if self.attach_client(&primary_id, recipient.clone()) {
                     self.request_to_job.insert(id, primary_id);
+                    self.progress.begin_client(
+                        connection,
+                        AnalysisJobId::Client(primary_id),
+                        &recipient,
+                        &title,
+                    )?;
                     return Ok(());
                 }
                 self.observation_jobs.remove(key);
@@ -2869,6 +3301,10 @@ impl AnalysisJobs {
 
         let primary_id = self.next_computation_id()?;
         self.request_to_job.insert(id.clone(), primary_id);
+        let recipient = ClientRecipient {
+            id,
+            work_done_token,
+        };
         if let Some(key) = key.clone() {
             self.observation_jobs.insert(key, primary_id);
         }
@@ -2878,11 +3314,17 @@ impl AnalysisJobs {
                 id: primary_id,
                 request,
                 features,
-                client_ids: vec![id],
+                recipients: vec![recipient.clone()],
                 key,
             }),
         );
-        let failures = self.pump(workspace);
+        self.progress.begin_client(
+            connection,
+            AnalysisJobId::Client(primary_id),
+            &recipient,
+            &title,
+        )?;
+        let failures = self.pump(workspace, connection);
         self.handle_dispatch_failures(failures, connection)
     }
 
@@ -2893,17 +3335,21 @@ impl AnalysisJobs {
         self.completion_resolutions.request(item)
     }
 
-    fn attach_client(&mut self, primary_id: &AnalysisComputationId, id: RequestId) -> bool {
+    fn attach_client(
+        &mut self,
+        primary_id: &AnalysisComputationId,
+        recipient: ClientRecipient,
+    ) -> bool {
         if let Some(job) = self.pending.get_mut(primary_id) {
             if !job.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                job.client_ids.push(id);
+                job.recipients.push(recipient);
                 return true;
             }
         }
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
         ) {
-            job.client_ids.push(id);
+            job.recipients.push(recipient);
             return true;
         }
         false
@@ -2960,15 +3406,29 @@ impl AnalysisJobs {
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
         ) {
             self.remove_observation(job.key.as_ref(), primary_id);
-            for id in &job.client_ids {
+            let request_ids = job
+                .recipients
+                .iter()
+                .map(|recipient| recipient.id.clone())
+                .collect::<Vec<_>>();
+            for id in &request_ids {
                 self.remove_client_mapping(id, primary_id);
             }
-            return Self::send_client_error(
+            Self::send_client_error(
                 connection,
-                job.client_ids,
+                request_ids,
                 ErrorCode::RequestCanceled,
                 ANALYSIS_SUPERSEDED_MESSAGE,
-            );
+            )?;
+            for recipient in job.recipients {
+                self.progress.finish_recipient(
+                    connection,
+                    AnalysisJobId::Client(*primary_id),
+                    &recipient.id,
+                    Some("Superseded"),
+                )?;
+            }
+            return Ok(());
         }
 
         let Some(job) = self.pending.get_mut(primary_id) else {
@@ -2977,17 +3437,30 @@ impl AnalysisJobs {
         job.cancellation
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let key = job.key.clone();
-        let client_ids = std::mem::take(&mut job.client_ids);
+        let recipients = std::mem::take(&mut job.recipients);
         self.remove_observation(key.as_ref(), primary_id);
-        for id in &client_ids {
+        let request_ids = recipients
+            .iter()
+            .map(|recipient| recipient.id.clone())
+            .collect::<Vec<_>>();
+        for id in &request_ids {
             self.remove_client_mapping(id, primary_id);
         }
         Self::send_client_error(
             connection,
-            client_ids,
+            request_ids,
             ErrorCode::RequestCanceled,
             ANALYSIS_SUPERSEDED_MESSAGE,
-        )
+        )?;
+        for recipient in recipients {
+            self.progress.finish_recipient(
+                connection,
+                AnalysisJobId::Client(*primary_id),
+                &recipient.id,
+                Some("Superseded"),
+            )?;
+        }
+        Ok(())
     }
 
     fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<(), String> {
@@ -3000,9 +3473,13 @@ impl AnalysisJobs {
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
         ) {
-            if let Some(position) = job.client_ids.iter().position(|client_id| client_id == id) {
-                job.client_ids.remove(position);
-                queued_empty = job.client_ids.is_empty();
+            if let Some(position) = job
+                .recipients
+                .iter()
+                .position(|recipient| &recipient.id == id)
+            {
+                job.recipients.remove(position);
+                queued_empty = job.recipients.is_empty();
                 found_queued = true;
             }
         }
@@ -3013,6 +3490,12 @@ impl AnalysisJobs {
                 [id.clone()],
                 ErrorCode::RequestCanceled,
                 rename::CANCELLATION_MESSAGE,
+            )?;
+            self.progress.finish_recipient(
+                Some(connection),
+                AnalysisJobId::Client(primary_id),
+                id,
+                Some("Cancelled"),
             )?;
             if queued_empty {
                 if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
@@ -3028,9 +3511,13 @@ impl AnalysisJobs {
         let mut cancel_worker = false;
         let mut key = None;
         if let Some(job) = self.pending.get_mut(&primary_id) {
-            if let Some(position) = job.client_ids.iter().position(|client_id| client_id == id) {
-                job.client_ids.remove(position);
-                cancel_worker = job.client_ids.is_empty();
+            if let Some(position) = job
+                .recipients
+                .iter()
+                .position(|recipient| &recipient.id == id)
+            {
+                job.recipients.remove(position);
+                cancel_worker = job.recipients.is_empty();
                 key = job.key.clone();
                 found_running = true;
                 if cancel_worker {
@@ -3050,13 +3537,70 @@ impl AnalysisJobs {
                 ErrorCode::RequestCanceled,
                 rename::CANCELLATION_MESSAGE,
             )?;
+            self.progress.finish_recipient(
+                Some(connection),
+                AnalysisJobId::Client(primary_id),
+                id,
+                Some("Cancelled"),
+            )?;
         } else {
             self.request_to_job.remove(id);
         }
         Ok(())
     }
 
-    fn cancel_diagnostics_for(&mut self, uris: &[Url]) {
+    fn cancel_progress(
+        &mut self,
+        connection: &Connection,
+        token: &ProgressToken,
+    ) -> Result<(), String> {
+        let Some(target) = self.progress.target(token) else {
+            return Ok(());
+        };
+        match target {
+            ProgressTarget::Client { request_id, .. } => self.cancel(connection, &request_id),
+            ProgressTarget::Diagnostic { job_id } => {
+                if let AnalysisJobId::Diagnostic(id) = job_id {
+                    if let Some(QueuedAnalysis::Diagnostic(job)) = self.queue.remove_first(
+                        |queued| matches!(queued, QueuedAnalysis::Diagnostic(job) if job.id == id),
+                    ) {
+                        if self
+                            .diagnostic_jobs
+                            .get(&job.uri)
+                            .is_some_and(|job_id| *job_id == id)
+                        {
+                            self.diagnostic_jobs.remove(&job.uri);
+                        }
+                    } else if let Some(job) = self.diagnostics.get(&id) {
+                        job.analysis
+                            .cancellation
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.progress.finish_target(
+                        Some(connection),
+                        job_id,
+                        token,
+                        Some("Cancelled"),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_progress_response(
+        &mut self,
+        connection: &Connection,
+        response: &Response,
+    ) -> Result<bool, String> {
+        self.progress.handle_create_response(connection, response)
+    }
+
+    fn cancel_diagnostics_for_with_connection(
+        &mut self,
+        connection: Option<&Connection>,
+        uris: &[Url],
+    ) -> Result<(), String> {
         loop {
             let Some(QueuedAnalysis::Diagnostic(job)) = self.queue.remove_first(|queued| {
                 matches!(queued, QueuedAnalysis::Diagnostic(job) if uris.contains(&job.uri))
@@ -3071,24 +3615,46 @@ impl AnalysisJobs {
                 self.diagnostic_jobs.remove(&job.uri);
             }
         }
-        for diagnostic in self.diagnostics.values() {
-            if uris.contains(&diagnostic.uri) {
+        let running = self
+            .diagnostics
+            .iter()
+            .filter(|(_, diagnostic)| uris.contains(&diagnostic.uri))
+            .map(|(id, diagnostic)| {
                 diagnostic
                     .analysis
                     .cancellation
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+                *id
+            })
+            .collect::<Vec<_>>();
+        for id in running {
+            self.progress.finish_job(
+                connection,
+                AnalysisJobId::Diagnostic(id),
+                Some("Invalidated"),
+            )?;
         }
+        Ok(())
     }
 
-    fn refresh_diagnostics(&mut self, workspace: &mut Workspace, uris: &[Url]) {
-        self.cancel_diagnostics_for(uris);
+    fn refresh_diagnostics_with_connection(
+        &mut self,
+        connection: &Connection,
+        workspace: &mut Workspace,
+        uris: &[Url],
+    ) -> Result<(), String> {
+        self.cancel_diagnostics_for_with_connection(Some(connection), uris)?;
         for uri in uris {
             workspace.reschedule_diagnostics(uri.clone());
         }
+        Ok(())
     }
 
-    fn pump(&mut self, workspace: &Workspace) -> Vec<DispatchFailure> {
+    fn pump(
+        &mut self,
+        workspace: &Workspace,
+        connection: Option<&Connection>,
+    ) -> Vec<DispatchFailure> {
         if self.shutting_down {
             return Vec::new();
         }
@@ -3109,17 +3675,31 @@ impl AnalysisJobs {
                         job.features,
                     ) {
                         Ok(mut analysis) => {
-                            analysis.client_ids = job.client_ids;
+                            analysis.recipients = job.recipients;
                             analysis.key = job.key;
                             self.pending.insert(primary_id, analysis);
+                            if let Some(connection) = connection {
+                                if let Err(error) = self
+                                    .progress
+                                    .report_started(connection, AnalysisJobId::Client(primary_id))
+                                {
+                                    failures.push(DispatchFailure {
+                                        recipients: Vec::new(),
+                                        client_job: Some(primary_id),
+                                        diagnostic: None,
+                                        message: error,
+                                    });
+                                }
+                            }
                         }
                         Err(message) => {
                             self.remove_observation(job.key.as_ref(), &primary_id);
-                            for id in &job.client_ids {
-                                self.remove_client_mapping(id, &primary_id);
+                            for recipient in &job.recipients {
+                                self.remove_client_mapping(&recipient.id, &primary_id);
                             }
                             failures.push(DispatchFailure {
-                                client_ids: job.client_ids,
+                                recipients: job.recipients,
+                                client_job: Some(primary_id),
                                 diagnostic: None,
                                 message,
                             });
@@ -3138,13 +3718,28 @@ impl AnalysisJobs {
                         diagnostic_features(),
                     ) {
                         Ok(analysis) => {
+                            if let Some(connection) = connection {
+                                if let Err(error) = self.progress.start_server(
+                                    connection,
+                                    AnalysisJobId::Diagnostic(id),
+                                    "Indexing workspace",
+                                ) {
+                                    failures.push(DispatchFailure {
+                                        recipients: Vec::new(),
+                                        client_job: None,
+                                        diagnostic: None,
+                                        message: error,
+                                    });
+                                }
+                            }
                             self.diagnostics
                                 .insert(id, PendingDiagnostic { uri, analysis });
                         }
                         Err(message) => {
                             self.diagnostic_jobs.remove(&uri);
                             failures.push(DispatchFailure {
-                                client_ids: Vec::new(),
+                                recipients: Vec::new(),
+                                client_job: None,
                                 diagnostic: Some(QueuedDiagnostic { id, uri }),
                                 message,
                             });
@@ -3174,14 +3769,27 @@ impl AnalysisJobs {
                 }
             }
             if let Some(connection) = connection {
-                for id in failure.client_ids {
-                    if let Err(error) =
-                        send_error(connection, id, ErrorCode::RequestFailed, &failure.message)
-                    {
+                for recipient in &failure.recipients {
+                    if let Err(error) = send_error(
+                        connection,
+                        recipient.id.clone(),
+                        ErrorCode::RequestFailed,
+                        &failure.message,
+                    ) {
                         first_error.get_or_insert_with(|| error.to_string());
                     }
+                    if let Some(client_job) = failure.client_job {
+                        if let Err(error) = self.progress.finish_recipient(
+                            Some(connection),
+                            AnalysisJobId::Client(client_job),
+                            &recipient.id,
+                            Some("Failed"),
+                        ) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
                 }
-            } else if first_error.is_none() && !failure.client_ids.is_empty() {
+            } else if first_error.is_none() && !failure.recipients.is_empty() {
                 first_error = Some(failure.message);
             }
         }
@@ -3212,6 +3820,13 @@ impl AnalysisJobs {
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let _ = job.analysis.handle.join();
                     if cancelled {
+                        self.progress
+                            .finish_job(
+                                Some(connection),
+                                AnalysisJobId::Diagnostic(id),
+                                Some("Cancelled"),
+                            )
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         workspace.reschedule_diagnostics(job.uri);
                     } else {
                         deliver_analysis_result_with_store(
@@ -3221,6 +3836,9 @@ impl AnalysisJobs {
                             result,
                             None,
                         )?;
+                        self.progress
+                            .finish_job(Some(connection), AnalysisJobId::Diagnostic(id), None)
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
                 }
                 AnalysisJobId::Client(primary_id) => {
@@ -3228,36 +3846,58 @@ impl AnalysisJobs {
                         continue;
                     };
                     let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
-                    let client_ids = job.client_ids;
+                    let recipients = job.recipients;
                     let key = job.key;
                     let _ = job.handle.join();
                     self.remove_observation(key.as_ref(), &primary_id);
-                    for id in &client_ids {
-                        self.remove_client_mapping(id, &primary_id);
+                    for recipient in &recipients {
+                        self.remove_client_mapping(&recipient.id, &primary_id);
                     }
                     if cancelled {
                         Self::send_client_error(
                             Some(connection),
-                            client_ids,
+                            recipients.iter().map(|recipient| recipient.id.clone()),
                             ErrorCode::RequestCanceled,
                             rename::CANCELLATION_MESSAGE,
                         )
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                    } else if !client_ids.is_empty() {
-                        for id in client_ids {
+                        for recipient in &recipients {
+                            self.progress
+                                .finish_recipient(
+                                    Some(connection),
+                                    AnalysisJobId::Client(primary_id),
+                                    &recipient.id,
+                                    Some("Cancelled"),
+                                )
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
+                        }
+                    } else if !recipients.is_empty() {
+                        for recipient in &recipients {
                             deliver_analysis_result_with_store(
                                 connection,
                                 workspace,
                                 &mut self.completion_resolutions,
                                 result.clone(),
-                                Some(id),
+                                Some(recipient.id.clone()),
                             )?;
+                            self.progress
+                                .finish_recipient(
+                                    Some(connection),
+                                    AnalysisJobId::Client(primary_id),
+                                    &recipient.id,
+                                    None,
+                                )
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
                         }
                     }
                 }
             }
         }
-        let failures = self.pump(workspace);
+        let failures = self.pump(workspace, Some(connection));
         self.handle_dispatch_failures(failures, Some(connection))
             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
         Ok(())
@@ -3287,12 +3927,25 @@ impl AnalysisJobs {
         let mut queued = std::mem::take(&mut self.queue);
         while let Some(job) = queued.pop() {
             if let QueuedAnalysis::Client(job) = job {
+                let request_ids = job
+                    .recipients
+                    .iter()
+                    .map(|recipient| recipient.id.clone())
+                    .collect::<Vec<_>>();
                 Self::send_client_error(
                     connection,
-                    job.client_ids.clone(),
+                    request_ids,
                     ErrorCode::RequestCanceled,
                     rename::CANCELLATION_MESSAGE,
                 )?;
+                for recipient in job.recipients {
+                    self.progress.finish_recipient(
+                        connection,
+                        AnalysisJobId::Client(job.id),
+                        &recipient.id,
+                        Some("Cancelled"),
+                    )?;
+                }
             }
         }
         self.observation_jobs.clear();
@@ -3310,13 +3963,20 @@ impl AnalysisJobs {
         for job in &pending {
             job.cancellation
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            let request_ids = job
+                .recipients
+                .iter()
+                .map(|recipient| recipient.id.clone())
+                .collect::<Vec<_>>();
             Self::send_client_error(
                 connection,
-                job.client_ids.clone(),
+                request_ids,
                 ErrorCode::RequestCanceled,
                 rename::CANCELLATION_MESSAGE,
             )?;
         }
+
+        self.progress.shutdown(connection)?;
 
         let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
         while !pending.is_empty() {
@@ -3925,6 +4585,12 @@ fn run_connection(
         supports_watched_file_registration(&initialize.capabilities);
     let relative_pattern_support = supports_relative_pattern(&initialize.capabilities);
     let client_features = client_features(&initialize.capabilities);
+    let work_done_progress_supported = initialize
+        .capabilities
+        .window
+        .as_ref()
+        .and_then(|window| window.work_done_progress)
+        .unwrap_or(false);
     let capabilities = server_capabilities(&initialize.capabilities);
 
     connection.initialize_finish(
@@ -3948,6 +4614,8 @@ fn run_connection(
     let watcher_registration = watcher_registration_supported
         .then(|| register_file_watcher(connection, &workspace, relative_pattern_support))
         .transpose()?;
+    let jobs =
+        AnalysisJobs::with_test_barriers_and_progress(test_barriers, work_done_progress_supported);
 
     event_loop(
         connection,
@@ -3956,7 +4624,7 @@ fn run_connection(
         client_features,
         &mut configuration,
         watcher_registration,
-        test_barriers,
+        jobs,
     )
 }
 
@@ -3967,18 +4635,19 @@ fn event_loop(
     client_features: ClientFeatures,
     configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
-    test_barriers: TestBarrierConfig,
+    mut jobs: AnalysisJobs,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
     let mut deferred_configuration_messages = VecDeque::new();
-    let mut jobs = AnalysisJobs::with_test_barriers(test_barriers);
     loop {
         if let Some(effect) = configuration.poll(workspace)? {
             if let Some(registration) = watcher_registration.as_mut() {
                 sync_file_watcher(connection, workspace, registration)?;
             }
-            jobs.cancel_diagnostics_for(&effect.cancel);
-            jobs.refresh_diagnostics(workspace, &effect.refresh);
+            jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+            jobs.refresh_diagnostics_with_connection(connection, workspace, &effect.refresh)
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
         }
         if !shutdown_received {
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
@@ -4139,7 +4808,12 @@ fn event_loop(
                         || configuration_generation != workspace.configuration_generation()
                     {
                         let open_documents = workspace.open_document_uris();
-                        jobs.refresh_diagnostics(workspace, &open_documents);
+                        jobs.refresh_diagnostics_with_connection(
+                            connection,
+                            workspace,
+                            &open_documents,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
@@ -4147,7 +4821,7 @@ fn event_loop(
                 }
             }
             Message::Notification(notification) if notification.method == "exit" => {
-                jobs.shutdown();
+                jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
                 return Ok(shutdown_received);
             }
@@ -4180,6 +4854,15 @@ fn event_loop(
                     .push_back(DeferredConfigurationMessage::Notification(notification));
             }
             Message::Notification(notification) => {
+                if notification.method == "window/workDoneProgress/cancel" {
+                    if let Ok(params) =
+                        serde_json::from_value::<WorkDoneProgressCancelParams>(notification.params)
+                    {
+                        jobs.cancel_progress(connection, &params.token)
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                    }
+                    continue;
+                }
                 if notification.method == "$/cancelRequest" {
                     if let Ok(id) = serde_json::from_value::<RequestId>(
                         notification
@@ -4249,8 +4932,17 @@ fn event_loop(
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
                         }
-                        jobs.cancel_diagnostics_for(&effect.cancel);
-                        jobs.refresh_diagnostics(workspace, &effect.refresh);
+                        jobs.cancel_diagnostics_for_with_connection(
+                            Some(connection),
+                            &effect.cancel,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                        jobs.refresh_diagnostics_with_connection(
+                            connection,
+                            workspace,
+                            &effect.refresh,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
                     Err(error) => {
                         eprintln!("pascal-lsp: notification handling failed: {error}");
@@ -4264,8 +4956,21 @@ fn event_loop(
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
                     }
-                    jobs.cancel_diagnostics_for(&effect.cancel);
-                    jobs.refresh_diagnostics(workspace, &effect.refresh);
+                    jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                    jobs.refresh_diagnostics_with_connection(
+                        connection,
+                        workspace,
+                        &effect.refresh,
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                } else if jobs
+                    .handle_progress_response(connection, &response)
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?
+                {
+                    // Progress-create responses are intentionally handled
+                    // before watcher/error logging.  Their IDs use a
+                    // disjoint prefix from Task20 configuration IDs.
                 } else {
                     let watcher_response = watcher_registration
                         .as_mut()
@@ -4301,13 +5006,31 @@ fn start_analysis(
     id: RequestId,
     request: AnalysisRequest,
     features: ClientFeatures,
+    work_done_token: Option<ProgressToken>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if let Err(error) =
-        jobs.enqueue_client(id.clone(), request, workspace, features, Some(connection))
-    {
+    if let Err(error) = jobs.enqueue_client(
+        id.clone(),
+        request,
+        workspace,
+        features,
+        work_done_token,
+        Some(connection),
+    ) {
         send_error(connection, id, ErrorCode::RequestFailed, error)?;
     }
     Ok(())
+}
+
+fn request_work_done_token(request: &Request) -> Result<Option<ProgressToken>, String> {
+    let Some(value) = request.params.get("workDoneToken") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| format!("workDoneToken must be a string or integer: {error}"))
 }
 
 fn request_requires_configuration(method: &str) -> bool {
@@ -4449,6 +5172,18 @@ fn handle_request(
     client_features: ClientFeatures,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let work_done_token = match request_work_done_token(&request) {
+        Ok(token) => token,
+        Err(error) => {
+            send_error(
+                connection,
+                request.id.clone(),
+                ErrorCode::InvalidParams,
+                error,
+            )?;
+            return Ok(());
+        }
+    };
     match request.method.as_str() {
         "pascal/projectContext" => {
             let id = request.id.clone();
@@ -4516,6 +5251,7 @@ fn handle_request(
                     format: client_features.hover_format.markup_kind(),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/completion" => {
@@ -4541,6 +5277,7 @@ fn handle_request(
                     resolve_detail: client_features.completion_resolve_detail,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "completionItem/resolve" => {
@@ -4566,6 +5303,7 @@ fn handle_request(
                 request.id,
                 AnalysisRequest::ResolveCompletion(resolve_request),
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/signatureHelp" => {
@@ -4590,6 +5328,7 @@ fn handle_request(
                     format: client_features.signature_help_format.markup_kind(),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/typeDefinition" => {
@@ -4613,6 +5352,7 @@ fn handle_request(
                     position: params.text_document_position_params.position,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/documentSymbol" => {
@@ -4634,6 +5374,7 @@ fn handle_request(
                     hierarchical: client_features.hierarchical_document_symbols,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "workspace/symbol" => {
@@ -4654,6 +5395,7 @@ fn handle_request(
                     query: params.query,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/references" => {
@@ -4676,6 +5418,7 @@ fn handle_request(
                     include_declaration: params.context.include_declaration,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/documentHighlight" => {
@@ -4699,6 +5442,7 @@ fn handle_request(
                     position: params.text_document_position_params.position,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/selectionRange" => {
@@ -4720,6 +5464,7 @@ fn handle_request(
                     positions: params.positions,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/semanticTokens/full" => {
@@ -4741,6 +5486,7 @@ fn handle_request(
                     range: None,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/semanticTokens/range" => {
@@ -4762,6 +5508,7 @@ fn handle_request(
                     range: Some(params.range),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/foldingRange" => {
@@ -4782,6 +5529,7 @@ fn handle_request(
                     uri: canonical_file_uri(&params.text_document.uri),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/prepareRename" => {
@@ -4803,6 +5551,7 @@ fn handle_request(
                     position: params.position,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/rename" => {
@@ -4825,6 +5574,7 @@ fn handle_request(
                     new_name: params.new_name,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/codeAction" => {
@@ -4844,6 +5594,7 @@ fn handle_request(
                 request.id,
                 AnalysisRequest::CodeActions(params),
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "codeAction/resolve" => {
@@ -4862,6 +5613,7 @@ fn handle_request(
                 request.id,
                 AnalysisRequest::Resolve(action),
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/declaration" | "textDocument/definition" | "textDocument/implementation" => {
@@ -4891,6 +5643,7 @@ fn handle_request(
                     target,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/formatting" => {
@@ -4911,6 +5664,7 @@ fn handle_request(
                     uri: canonical_file_uri(&params.text_document.uri),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         _ => send_error(
@@ -5257,29 +6011,31 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
             "change": 2,
             "save": true
         },
-        "hoverProvider": true,
-        "completionProvider": {"triggerCharacters": ["."], "resolveProvider": true},
-        "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
-        "typeDefinitionProvider": true,
-        "declarationProvider": true,
-        "definitionProvider": true,
-        "implementationProvider": true,
-        "documentSymbolProvider": true,
-        "workspaceSymbolProvider": true,
-        "referencesProvider": true,
-        "documentHighlightProvider": true,
-        "selectionRangeProvider": true,
-        "foldingRangeProvider": true,
+        "hoverProvider": {"workDoneProgress": true},
+        "completionProvider": {"triggerCharacters": ["."], "resolveProvider": true, "workDoneProgress": true},
+        "signatureHelpProvider": {"triggerCharacters": ["(", ","], "workDoneProgress": true},
+        "typeDefinitionProvider": {"workDoneProgress": true},
+        "declarationProvider": {"workDoneProgress": true},
+        "definitionProvider": {"workDoneProgress": true},
+        "implementationProvider": {"workDoneProgress": true},
+        "documentSymbolProvider": {"workDoneProgress": true},
+        "workspaceSymbolProvider": {"workDoneProgress": true},
+        "referencesProvider": {"workDoneProgress": true},
+        "documentHighlightProvider": {"workDoneProgress": true},
+        "selectionRangeProvider": {"workDoneProgress": true},
+        "foldingRangeProvider": {"workDoneProgress": true},
         "semanticTokensProvider": {
             "legend": crate::NavigationIndex::semantic_tokens_legend(),
             "range": true,
-            "full": true
+            "full": true,
+            "workDoneProgress": true
         },
-        "documentFormattingProvider": true,
-        "renameProvider": {"prepareProvider": true},
+        "documentFormattingProvider": {"workDoneProgress": true},
+        "renameProvider": {"prepareProvider": true, "workDoneProgress": true},
         "codeActionProvider": {
             "codeActionKinds": ["quickfix"],
-            "resolveProvider": true
+            "resolveProvider": true,
+            "workDoneProgress": true
         },
         "experimental": {
             "projectSelection": true
@@ -6408,7 +7164,10 @@ mod tests {
             jobs.pending
                 .get(&computation_id)
                 .expect("shared pending computation")
-                .client_ids,
+                .recipients
+                .iter()
+                .map(|recipient| recipient.id.clone())
+                .collect::<Vec<_>>(),
             vec![first_id.clone(), second_id]
         );
 
@@ -7464,7 +8223,7 @@ mod tests {
             PendingAnalysis {
                 cancellation: Arc::clone(&cancellation),
                 handle,
-                client_ids: Vec::new(),
+                recipients: Vec::new(),
                 key: None,
             },
         );

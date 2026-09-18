@@ -1,11 +1,11 @@
 use super::KnownDocumentOwner;
 use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
-    WorkspaceInput, build_snapshot, input_source_is_readable_with_owner, is_cancelled,
-    owner_for_input, project_context_and_metadata_for_input,
-    project_context_and_metadata_for_owner, query_binding_info_for_input,
-    reference_binding_info_for_input, revalidate_input, snapshot_records,
-    source_for_input_with_cancel, source_for_input_with_owner,
+    WorkspaceInput, auto_import_source_is_relevant, build_snapshot,
+    input_source_is_readable_with_owner, is_cancelled, owner_for_input,
+    project_context_and_metadata_for_input, project_context_and_metadata_for_owner,
+    query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
+    snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions,
@@ -231,7 +231,7 @@ pub(crate) fn completion_metadata_from_input(
             snapshot_records,
         );
     }
-    if let Err(error) = completion_observations_match(original_records, &snapshot_records) {
+    if let Err(error) = completion_observations_match(&input, original_records, &snapshot_records) {
         return with_records(
             source_generation,
             configuration_generation,
@@ -797,6 +797,9 @@ fn assistance_snapshot(
         .and_then(|position| completion_prefix_at_position(&source, position))
         .into_iter()
         .collect::<Vec<_>>();
+    let auto_import_candidate = completion_position.is_some_and(|position| {
+        !candidate_names.is_empty() && completion_position_is_unqualified(&source, position)
+    });
     let (_context, consumed_configuration) =
         project_context_and_metadata_for_input(input, uri, cancel)?;
     build_snapshot(
@@ -804,10 +807,39 @@ fn assistance_snapshot(
         std::slice::from_ref(uri),
         &candidate_names,
         SnapshotMode::Assistance,
-        Some(SnapshotSeed::new(record).with_consumed_configuration(&consumed_configuration)),
+        Some(
+            SnapshotSeed::new(record)
+                .with_consumed_configuration(&consumed_configuration)
+                .with_auto_import_candidate(auto_import_candidate),
+        ),
         &[],
         cancel,
     )
+}
+
+fn completion_position_is_unqualified(source: &str, position: Position) -> bool {
+    let Some(offset) = super::text::position_to_offset(source, position) else {
+        return false;
+    };
+    let mut start = offset;
+    while start > 0 {
+        let Some((candidate, character)) = source[..start].char_indices().next_back() else {
+            break;
+        };
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '$') {
+            start = candidate;
+        } else {
+            break;
+        }
+    }
+    if start > 0 && source.as_bytes().get(start - 1) == Some(&b'&') {
+        start -= 1;
+    }
+    source[..start]
+        .chars()
+        .rev()
+        .find(|character| !character.is_whitespace())
+        != Some('.')
 }
 
 fn type_definition_snapshot(
@@ -1327,6 +1359,7 @@ fn with_records<T>(
 }
 
 fn completion_observations_match(
+    input: &super::rename::WorkspaceInput,
     original: &[super::rename::SourceRecord],
     rebuilt: &[super::rename::SourceRecord],
 ) -> Result<(), String> {
@@ -1339,6 +1372,13 @@ fn completion_observations_match(
                 !matched[index] && completion_observations_equal(original_record, rebuilt_record)
             })
         else {
+            if completion_observation_is_superseded_by_irrelevant_overlay(
+                input,
+                original_record,
+                original,
+            ) {
+                continue;
+            }
             return Err(
                 "completion dependency observations changed while resolving; retry the request"
                     .to_string(),
@@ -1347,6 +1387,30 @@ fn completion_observations_match(
         matched[index] = true;
     }
     Ok(())
+}
+
+fn completion_observation_is_superseded_by_irrelevant_overlay(
+    input: &super::rename::WorkspaceInput,
+    record: &super::rename::SourceRecord,
+    original: &[super::rename::SourceRecord],
+) -> bool {
+    if !record.auto_import_provider_observation {
+        return false;
+    }
+    let Some(path) = record.path.as_deref() else {
+        return false;
+    };
+    let Some(overlay) = input.overlays.get(&super::canonical_file_uri(&record.uri)) else {
+        return false;
+    };
+    let scopes = original
+        .iter()
+        .flat_map(|record| record.auto_import_scopes.iter())
+        .collect::<Vec<_>>();
+    scopes.is_empty()
+        || scopes.iter().all(|scope| {
+            !scope.matches_path(path) || !auto_import_source_is_relevant(&overlay.text, scope)
+        })
 }
 
 fn completion_observations_equal(
@@ -1368,6 +1432,7 @@ fn completion_observations_equal(
         && left.include_payload == right.include_payload
         && left.missing_provider_candidate == right.missing_provider_candidate
         && left.missing_provider_scope == right.missing_provider_scope
+        && left.auto_import_provider_observation == right.auto_import_provider_observation
         && left.auto_import_scopes == right.auto_import_scopes
         && match (&left.content_bytes, &right.content_bytes) {
             (Some(left), Some(right)) => left == right,

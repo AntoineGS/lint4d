@@ -2335,6 +2335,7 @@ impl Workspace {
                 include_payload: false,
                 missing_provider_candidate: false,
                 missing_provider_scope: None,
+                auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
             },
         );
@@ -2373,6 +2374,7 @@ impl Workspace {
                 include_payload: false,
                 missing_provider_candidate: false,
                 missing_provider_scope: None,
+                auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
             },
         );
@@ -2436,6 +2438,7 @@ impl Workspace {
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
                 },
             );
@@ -4407,6 +4410,7 @@ impl Workspace {
                         include_payload: false,
                         missing_provider_candidate: true,
                         missing_provider_scope: None,
+                        auto_import_provider_observation: false,
                         auto_import_scopes: Vec::new(),
                     });
                 }
@@ -4460,6 +4464,7 @@ impl Workspace {
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: Some(scope),
+                    auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
                 });
             }
@@ -4941,6 +4946,11 @@ impl Workspace {
             return Err("workspace structure changed while resolving the request".to_string());
         }
 
+        let auto_import_scopes = records
+            .iter()
+            .flat_map(|record| record.auto_import_scopes.iter())
+            .collect::<Vec<_>>();
+
         for record in records {
             let dependency_uri = record
                 .path
@@ -4986,13 +4996,15 @@ impl Workspace {
                         // filesystem rescan.  Reject conservatively.
                         return true;
                     };
-                    auto_import_source_is_relevant(text, scope)
+                    rename::auto_import_source_is_relevant(text, scope)
                 })
             });
             let dependency_changed = self
                 .source_change_generations
                 .get(&dependency_uri)
-                .is_some_and(|generation| *generation > source_generation);
+                .is_some_and(|generation| *generation > source_generation)
+                && !self
+                    .path_record_is_superseded_by_irrelevant_overlay(record, &auto_import_scopes);
             let configuration_changed = self
                 .configuration_change_generations
                 .get(&dependency_uri)
@@ -5047,6 +5059,33 @@ impl Workspace {
             }
         }
         Ok(())
+    }
+
+    fn path_record_is_superseded_by_irrelevant_overlay(
+        &self,
+        record: &rename::SourceRecord,
+        scopes: &[&rename::AutoImportProviderScope],
+    ) -> bool {
+        if !record.auto_import_provider_observation {
+            return false;
+        }
+        let Some(path) = record.path.as_deref() else {
+            return false;
+        };
+        let Some(uri) = Url::from_file_path(absolute_path(path.to_path_buf())).ok() else {
+            return false;
+        };
+        let Some(text) = self
+            .open_documents
+            .get(&canonical_file_uri(&uri))
+            .and_then(|document| document.text.as_deref())
+        else {
+            return false;
+        };
+        scopes.is_empty()
+            || scopes.iter().all(|scope| {
+                !scope.matches_path(path) || !rename::auto_import_source_is_relevant(text, scope)
+            })
     }
 
     fn scope_path_is_accepted(&self, path: &Path, scope: &rename::MissingProviderScope) -> bool {
@@ -5623,22 +5662,6 @@ fn ensure_safe_tree_depth(path: &Path, source: &[u8]) -> Result<(), String> {
 
 fn path_to_glob(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-fn auto_import_source_is_relevant(source: &str, scope: &rename::AutoImportProviderScope) -> bool {
-    let cancel = AtomicBool::new(false);
-    match rename::source_unit_name(source, &cancel) {
-        Ok(Some(unit_name))
-            if scope
-                .provider_units
-                .iter()
-                .any(|provider| provider.eq_ignore_ascii_case(&unit_name)) =>
-        {
-            true
-        }
-        Err(_) => true,
-        _ => rename::contains_any_identifier_prefix(source, &scope.candidate_prefixes),
-    }
 }
 
 fn read_disk_source(

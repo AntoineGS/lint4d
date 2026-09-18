@@ -776,6 +776,7 @@ fn compact_completion_records(
             include_payload: record.include_payload,
             missing_provider_candidate: record.missing_provider_candidate,
             missing_provider_scope: record.missing_provider_scope.clone(),
+            auto_import_provider_observation: record.auto_import_provider_observation,
             auto_import_scopes: record.auto_import_scopes.clone(),
         };
         let observation_bytes = compact_completion_record_bytes(&observation);
@@ -4683,6 +4684,7 @@ mod tests {
             include_payload: false,
             missing_provider_candidate: false,
             missing_provider_scope: None,
+            auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
         }
     }

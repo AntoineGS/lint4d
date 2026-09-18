@@ -148,6 +148,10 @@ pub(crate) struct SourceRecord {
     /// from the synthetic direct candidate so live validation can notice a
     /// provider overlay in an existing nested directory without rescanning.
     pub(crate) missing_provider_scope: Option<MissingProviderScope>,
+    /// This path was read as part of bounded auto-import provider discovery.
+    /// It distinguishes provider-source evidence from unrelated configuration
+    /// and directory observations when an overlay supersedes the disk path.
+    pub(crate) auto_import_provider_observation: bool,
     /// Bounded semantic observations used to prove that auto-import provider
     /// uniqueness remains fresh without invalidating on unrelated comments.
     pub(crate) auto_import_scopes: Vec<AutoImportProviderScope>,
@@ -201,6 +205,25 @@ impl AutoImportProviderScope {
     }
 }
 
+pub(crate) fn auto_import_source_is_relevant(
+    source: &str,
+    scope: &AutoImportProviderScope,
+) -> bool {
+    let cancel = AtomicBool::new(false);
+    match source_unit_name(source, &cancel) {
+        Ok(Some(unit_name))
+            if scope
+                .provider_units
+                .iter()
+                .any(|provider| provider.eq_ignore_ascii_case(&unit_name)) =>
+        {
+            true
+        }
+        Err(_) => true,
+        _ => contains_any_identifier_prefix(source, &scope.candidate_prefixes),
+    }
+}
+
 impl SourceRecord {
     fn payload_dependency(&self) -> Result<(&ReadPolicy, &ProjectPathEntry), String> {
         match (self.read_policy.as_ref(), self.path_entry.as_ref()) {
@@ -214,6 +237,7 @@ impl SourceRecord {
 pub(crate) struct SnapshotSeed {
     pub(crate) record: SourceRecord,
     pub(crate) consumed_configuration: Vec<SourceRecord>,
+    pub(crate) auto_import_candidate: bool,
 }
 
 impl SnapshotSeed {
@@ -221,11 +245,17 @@ impl SnapshotSeed {
         Self {
             record,
             consumed_configuration: Vec::new(),
+            auto_import_candidate: false,
         }
     }
 
     pub(crate) fn with_consumed_configuration(mut self, records: &[SourceRecord]) -> Self {
         self.consumed_configuration = records.to_vec();
+        self
+    }
+
+    pub(crate) fn with_auto_import_candidate(mut self, enabled: bool) -> Self {
+        self.auto_import_candidate = enabled;
         self
     }
 }
@@ -1042,6 +1072,14 @@ struct ScannedSource {
     content_hash: u64,
 }
 
+#[derive(Debug)]
+struct AutoImportProviderObservation {
+    path: PathBuf,
+    content_hash: u64,
+    read_policy: ReadPolicy,
+    path_entry: ProjectPathEntry,
+}
+
 fn read_scan_source(
     path: &Path,
     read_policy: &ReadPolicy,
@@ -1112,6 +1150,7 @@ fn path_record_at(
         include_payload,
         missing_provider_candidate: false,
         missing_provider_scope: None,
+        auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
     })
 }
@@ -1156,6 +1195,7 @@ pub(crate) fn source_for_input_with_cancel(
                 include_payload: false,
                 missing_provider_candidate: false,
                 missing_provider_scope: None,
+                auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
             },
         ));
@@ -1199,6 +1239,7 @@ pub(crate) fn source_for_input_with_owner(
                 include_payload: false,
                 missing_provider_candidate: false,
                 missing_provider_scope: None,
+                auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
             },
         ));
@@ -1256,6 +1297,7 @@ pub(crate) fn source_for_input_with_owner(
         include_payload: false,
         missing_provider_candidate: false,
         missing_provider_scope: None,
+        auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
     };
     Ok((disk.text, record))
@@ -2849,6 +2891,8 @@ pub(crate) fn build_snapshot(
     let mut retained_files = 0usize;
     let mut retained_bytes = 0usize;
     let mut scanned_bytes = 0usize;
+    let mut auto_import_provider_observations = Vec::new();
+    let mut auto_import_observation_paths = HashSet::new();
     let allow_incomplete_context_for: &[Url] = if mode == SnapshotMode::Local {
         skip_imports_for
     } else {
@@ -2957,6 +3001,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
                 },
                 overlay.text.len(),
@@ -2979,7 +3024,14 @@ pub(crate) fn build_snapshot(
                 }
             };
             scanned_bytes = scanned_bytes.saturating_add(scan.bytes);
-            if mode != SnapshotMode::Assistance {
+            if mode == SnapshotMode::Assistance {
+                auto_import_provider_observations.push(AutoImportProviderObservation {
+                    path: path.clone(),
+                    content_hash: scan.content_hash,
+                    read_policy: read_policy.clone(),
+                    path_entry: path_entry.clone(),
+                });
+            } else {
                 baseline_content_hashes
                     .entry(path_key(&path))
                     .or_insert(scan.content_hash);
@@ -3014,12 +3066,6 @@ pub(crate) fn build_snapshot(
             if !is_priority && !direct_candidate && !may_contain_include {
                 continue;
             }
-            if mode == SnapshotMode::Assistance {
-                baseline_content_hashes
-                    .entry(path_key(&path))
-                    .or_insert(scan.content_hash);
-                baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
-            }
             let stamp = disk_stamp(&path)
                 .ok_or_else(|| format!("rename workspace scan could not stat source {path:?}"))?;
             (
@@ -3041,6 +3087,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
                 },
                 scan.bytes,
@@ -3357,6 +3404,29 @@ pub(crate) fn build_snapshot(
             }
         }
     }
+    let retain_auto_import_observations = mode == SnapshotMode::Assistance
+        && priority_seed
+            .as_ref()
+            .is_some_and(|seed| seed.auto_import_candidate)
+        && priority.first().is_some_and(|current_uri| {
+            records
+                .get(current_uri)
+                .is_some_and(|record| !record.auto_import_scopes.is_empty())
+        });
+    if retain_auto_import_observations {
+        for observation in auto_import_provider_observations {
+            let key = path_key(&observation.path);
+            baseline_content_hashes
+                .entry(key.clone())
+                .or_insert(observation.content_hash);
+            baseline.set_payload_dependency(
+                &observation.path,
+                observation.read_policy,
+                observation.path_entry,
+            );
+            auto_import_observation_paths.insert(key);
+        }
+    }
     if mode == SnapshotMode::Assistance && !complete {
         loader.index.set_auto_import_discovery_complete(false);
     }
@@ -3390,6 +3460,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
                 },
             )
@@ -3424,6 +3495,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
                 },
             )
@@ -3507,7 +3579,7 @@ pub(crate) fn build_snapshot(
             cancel,
         )?;
     }
-    let baseline_records = baseline
+    let mut baseline_records = baseline
         .paths
         .into_iter()
         .filter_map(|baseline| {
@@ -3526,7 +3598,12 @@ pub(crate) fn build_snapshot(
             )
         })
         .collect::<Vec<_>>();
-
+    for record in &mut baseline_records {
+        record.auto_import_provider_observation = record
+            .path
+            .as_ref()
+            .is_some_and(|path| auto_import_observation_paths.contains(&path_key(path)));
+    }
     Ok(RenameSnapshot {
         index: loader.index,
         sources,
@@ -8227,6 +8304,7 @@ mod tests {
             include_payload: true,
             missing_provider_candidate: false,
             missing_provider_scope: None,
+            auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
         };
 

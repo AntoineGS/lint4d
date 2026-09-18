@@ -34,6 +34,7 @@ const MAX_SIGNATURE_LABEL_BYTES: usize = 128 * 1024;
 const MAX_SIGNATURE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_SIGNATURE_PARAMETERS: usize = 4096;
 const MAX_TRAILING_MEMBER_DOT_GAP_BYTES: usize = 256;
+const MAX_INDEXED_TERMINAL_ALIAS_DEPTH: usize = 32;
 
 #[cfg(test)]
 static COMPLETION_SYMBOL_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -4245,7 +4246,7 @@ fn expected_value_for_indexed_type_ref_in_document(
     let receivers = type_ref_receivers_in_document(
         index, uri, document, type_ref, identifier, scope, cancel, budget,
     )?;
-    expected_value_from_receivers(receivers, true)
+    expected_value_from_indexed_receivers(index, receivers, cancel, budget)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4305,6 +4306,127 @@ fn expected_value_from_receivers(
     } else {
         ExpectedCompletionValue::NonCallable
     })
+}
+
+fn expected_value_from_indexed_receivers(
+    index: &NavigationIndex,
+    receivers: Vec<Receiver>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let mut values = Vec::with_capacity(receivers.len());
+    for receiver in receivers {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        values.push(expected_value_from_indexed_receiver(
+            index,
+            receiver,
+            &mut HashSet::new(),
+            0,
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(values)
+}
+
+fn expected_value_from_indexed_receiver(
+    index: &NavigationIndex,
+    receiver: Receiver,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    match receiver {
+        Receiver::Type(instance) => match instance.kind {
+            TypeKind::Callable => Ok(ExpectedCompletionValue::Callable),
+            // A fully indexed destination must not retain an array, and a
+            // residual array is not evidence of a scalar call target.
+            TypeKind::Array => Ok(ExpectedCompletionValue::Unknown),
+            // Type aliases are indexed as their declaration kind (Other), so
+            // resolve only this terminal alias before classifying it.  An
+            // absent/ambiguous target remains Unknown rather than becoming a
+            // proved scalar through the catch-all Type receiver branch.
+            TypeKind::Other => expected_value_from_indexed_terminal_alias(
+                index, &instance, visited, depth, cancel, budget,
+            ),
+            TypeKind::Class
+            | TypeKind::Record
+            | TypeKind::Interface
+            | TypeKind::Enum
+            | TypeKind::String
+            | TypeKind::File => Ok(ExpectedCompletionValue::NonCallable),
+        },
+        Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
+            Ok(ExpectedCompletionValue::NonCallable)
+        }
+        Receiver::Unit(_) => Ok(ExpectedCompletionValue::Unknown),
+    }
+}
+
+fn expected_value_from_indexed_terminal_alias(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    if depth >= MAX_INDEXED_TERMINAL_ALIAS_DEPTH
+        || !visited.insert((instance.uri.clone(), instance.key.clone()))
+    {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    check_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+
+    let Some(candidate) = index.type_symbol_candidate(instance) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(symbol) = index.symbol(&candidate) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(type_ref) = symbol.type_ref.as_ref() else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index,
+        &candidate.uri,
+        document,
+        type_ref,
+        identifier,
+        Some(symbol.scope),
+        cancel,
+        budget,
+    )?;
+    let mut values = Vec::with_capacity(receivers.len());
+    for receiver in receivers {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        values.push(expected_value_from_indexed_receiver(
+            index,
+            receiver,
+            visited,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(values)
 }
 
 fn assignment_target_identifier<'a>(

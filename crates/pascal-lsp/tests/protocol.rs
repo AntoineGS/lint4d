@@ -4313,6 +4313,153 @@ end.
 }
 
 #[test]
+fn completion_snippets_fail_closed_for_terminal_type_aliases() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("TerminalAliasCompletion.pas");
+    let source = r#"unit TerminalAliasCompletion;
+interface
+type
+  TProc = procedure(Value: Integer);
+  TProcAlias = TProc;
+  TProcAliasChain = TProcAlias;
+  TProcRow = array[0..1] of TProcAliasChain;
+  TProcMatrix = array[0..1] of TProcRow;
+  TScalarLeaf = Integer;
+  TScalarLeafAlias = TScalarLeaf;
+  TScalarRow = array[0..1] of TScalarLeafAlias;
+  TScalarMatrix = array[0..1] of TScalarRow;
+  TResidualBase = array[0..1] of Integer;
+  TResidualAlias = TResidualBase;
+  TResidualOuter = array[0..1] of TResidualAlias;
+  TUnknownAlias = TMissingType;
+  TUnknownRow = array[0..1] of TUnknownAlias;
+  TCycleA = array[0..1] of TCycleB;
+  TCycleB = TCycleA;
+function Make(Value: Integer): Integer;
+procedure Run(Value: Integer);
+implementation
+function Make(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+procedure Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  ProcMatrix: TProcMatrix;
+  ScalarMatrix: TScalarMatrix;
+  Residual: TResidualOuter;
+  Unknown: TUnknownRow;
+  Cycle: TCycleA;
+  Index: Integer;
+begin
+  ProcMatrix[Index,0] := Ru;
+  ScalarMatrix[Index,0] := Ma;
+  Residual[Index] := Ma;
+  Unknown[Index] := Ru;
+  Cycle[Index] := Ru;
+end;
+end.
+"#;
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request = |server: &mut TestServer, id: &str, needle: &str, label: &str| {
+        let request_id = RequestId::from(id.to_owned());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == label)
+            .cloned()
+            .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+    };
+
+    let mut failures = Vec::new();
+    for (id, needle, replacement, label) in [
+        (
+            "procedural-terminal-alias-chain",
+            "ProcMatrix[Index,0] := Ru",
+            "ProcMatrix[Index,0] := Run",
+            "Run",
+        ),
+        (
+            "residual-array-terminal-alias",
+            "Residual[Index] := Ma",
+            "Residual[Index] := Make",
+            "Make",
+        ),
+        (
+            "unknown-terminal-alias",
+            "Unknown[Index] := Ru",
+            "Unknown[Index] := Run",
+            "Run",
+        ),
+        (
+            "cyclic-terminal-alias",
+            "Cycle[Index] := Ru",
+            "Cycle[Index] := Run",
+            "Run",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, label);
+        if item["textEdit"]["newText"] != label || !item["insertTextFormat"].is_null() {
+            failures.push(format!("{id}: expected plain {label}, got {item}"));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replacen(needle, replacement, 1);
+        if expanded != expected {
+            failures.push(format!("{id}: expanded source was {expanded:?}"));
+        }
+    }
+
+    let scalar = request(
+        &mut server,
+        "scalar-terminal-alias-chain",
+        "ScalarMatrix[Index,0] := Ma",
+        "Make",
+    );
+    if scalar["textEdit"]["newText"] != "Make(${1:Value})$0" || scalar["insertTextFormat"] != 2 {
+        failures.push(format!(
+            "scalar-terminal-alias-chain: expected Make snippet, got {scalar}"
+        ));
+    }
+    let expanded = apply_expanded_completion_item(source, &scalar);
+    let expected = source.replacen(
+        "ScalarMatrix[Index,0] := Ma",
+        "ScalarMatrix[Index,0] := Make(Value)",
+        1,
+    );
+    if expanded != expected {
+        failures.push(format!(
+            "scalar-terminal-alias-chain: expanded source was {expanded:?}"
+        ));
+    }
+
+    assert!(failures.is_empty(), "completion regressions: {failures:#?}");
+
+    server.shutdown();
+}
+
+#[test]
 fn completion_snippets_stay_plain_for_non_expression_syntax_roles() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let cases = [

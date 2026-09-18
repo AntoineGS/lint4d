@@ -3658,7 +3658,8 @@ fn expected_value_for_indexed_assignment(
     // Resolve the container expression itself.  In particular, do not use
     // the last identifier in `Container[Index]`: that is the index expression
     // and says nothing about the destination element type.
-    let Some(entity) = lhs.child_by_field_name("entity") else {
+    let Some((entity, dimensions)) = indexed_entity_and_dimensions(lhs, document, cancel, budget)?
+    else {
         return Ok(ExpectedCompletionValue::Unknown);
     };
     let lookup_identifier = super::callable_lookup_identifier(entity);
@@ -3684,16 +3685,86 @@ fn expected_value_for_indexed_assignment(
             continue;
         };
         expected.push(expected_value_for_indexed_symbol(
-            index, &candidate, symbol, cancel, budget,
+            index, &candidate, symbol, dimensions, cancel, budget,
         )?);
     }
     combine_expected_values(expected)
+}
+
+fn indexed_entity_and_dimensions<'a>(
+    mut expression: Node<'a>,
+    document: &Document,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Node<'a>, usize)>, String> {
+    // Count every subscript argument, whether it is comma-separated or a
+    // chained bracket.  The count is consumed against the declared array
+    // ranks below; one AST subscript node is not necessarily one dimension.
+    let mut dimensions = 0usize;
+    loop {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if expression.kind() != "exprSubscript" {
+            break;
+        }
+        let Some(args) = expression.child_by_field_name("args") else {
+            return Ok(None);
+        };
+        let Some(count) = indexed_argument_count(args, &document.source, cancel, budget)? else {
+            return Ok(None);
+        };
+        dimensions = dimensions.checked_add(count).ok_or_else(|| {
+            "completion indexed destination dimension count overflowed".to_string()
+        })?;
+        let Some(entity) = expression.child_by_field_name("entity") else {
+            return Ok(None);
+        };
+        expression = entity;
+    }
+    if dimensions == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((expression, dimensions)))
+    }
+}
+
+fn indexed_argument_count(
+    args: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<usize>, String> {
+    let mut count = 0usize;
+    let mut cursor = args.walk();
+    for argument in args.named_children(&mut cursor) {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if argument.is_extra()
+            || argument.is_missing()
+            || argument.kind() == "ERROR"
+            || argument.start_byte() == argument.end_byte()
+            || source
+                .get(argument.start_byte()..argument.end_byte())
+                .is_none_or(str::is_empty)
+        {
+            return Ok(None);
+        }
+        count = count.checked_add(1).ok_or_else(|| {
+            "completion indexed destination dimension count overflowed".to_string()
+        })?;
+    }
+    if count == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(count))
+    }
 }
 
 fn expected_value_for_indexed_symbol(
     index: &NavigationIndex,
     candidate: &super::Candidate,
     symbol: &Symbol,
+    dimensions: usize,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<ExpectedCompletionValue, String> {
@@ -3732,12 +3803,8 @@ fn expected_value_for_indexed_symbol(
             expected.push(ExpectedCompletionValue::Unknown);
             continue;
         };
-        if instance.kind != TypeKind::Array {
-            expected.push(ExpectedCompletionValue::Unknown);
-            continue;
-        }
         let Some((element_uri, element_type_ref, element_scope)) =
-            array_element_type_ref(index, &instance, cancel, budget)?
+            array_element_type_ref(index, &instance, dimensions, cancel, budget)?
         else {
             expected.push(ExpectedCompletionValue::Unknown);
             continue;
@@ -3746,7 +3813,7 @@ fn expected_value_for_indexed_symbol(
             expected.push(ExpectedCompletionValue::Unknown);
             continue;
         };
-        expected.push(expected_value_for_type_ref_in_document(
+        expected.push(expected_value_for_indexed_type_ref_in_document(
             index,
             &element_uri,
             element_document,
@@ -3762,25 +3829,100 @@ fn expected_value_for_indexed_symbol(
 fn array_element_type_ref(
     index: &NavigationIndex,
     instance: &super::TypeInstance,
+    dimensions: usize,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<(Url, super::TypeRef, usize)>, String> {
+    if dimensions == 0 {
+        return Ok(None);
+    }
     let mut visited = HashSet::new();
-    array_element_type_ref_at_depth(index, instance, &mut visited, 0, cancel, budget)
+    array_element_type_ref_at_depth(index, instance, dimensions, &mut visited, 0, cancel, budget)
 }
 
 fn array_element_type_ref_at_depth(
     index: &NavigationIndex,
     instance: &super::TypeInstance,
+    dimensions: usize,
     visited: &mut HashSet<(Url, String)>,
     depth: usize,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<(Url, super::TypeRef, usize)>, String> {
     const MAX_ARRAY_TYPE_DEPTH: usize = 32;
-    if depth >= MAX_ARRAY_TYPE_DEPTH
+    if dimensions == 0
+        || depth >= MAX_ARRAY_TYPE_DEPTH
         || !visited.insert((instance.uri.clone(), instance.key.clone()))
     {
+        return Ok(None);
+    }
+    let Some((rank, element_uri, element_type_ref, element_scope)) =
+        array_type_metadata(index, instance, visited, depth, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    if dimensions < rank {
+        return Ok(None);
+    }
+    if dimensions == rank {
+        return Ok(Some((element_uri, element_type_ref, element_scope)));
+    }
+    let Some(element_document) = index.documents.get(&element_uri) else {
+        return Ok(None);
+    };
+    let Some(lookup_identifier) = identifier_at_with_budget(
+        element_document.tree.root_node(),
+        element_type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(None);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index,
+        &element_uri,
+        element_document,
+        &element_type_ref,
+        lookup_identifier,
+        Some(element_scope),
+        cancel,
+        budget,
+    )?;
+    let mut next_instance = None;
+    for receiver in receivers {
+        let Receiver::Type(receiver) = receiver else {
+            return Ok(None);
+        };
+        if next_instance.replace(receiver).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(next_instance) = next_instance else {
+        return Ok(None);
+    };
+    array_element_type_ref_at_depth(
+        index,
+        &next_instance,
+        dimensions.saturating_sub(rank),
+        visited,
+        depth.saturating_add(1),
+        cancel,
+        budget,
+    )
+}
+
+fn array_type_metadata(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(usize, Url, super::TypeRef, usize)>, String> {
+    const MAX_ARRAY_TYPE_DEPTH: usize = 32;
+    if depth >= MAX_ARRAY_TYPE_DEPTH {
         return Ok(None);
     }
     let candidates = index.type_candidates_in_unit_with_budget(
@@ -3816,7 +3958,9 @@ fn array_element_type_ref_at_depth(
             else {
                 return Ok(None);
             };
+            let dimensions = array_dimensions(declaration_type, element_node);
             return Ok(Some((
+                dimensions,
                 candidate.uri.clone(),
                 element_type_ref,
                 symbol.scope,
@@ -3837,16 +3981,13 @@ fn array_element_type_ref_at_depth(
     else {
         return Ok(None);
     };
-    let mut state = super::ResolutionState::new();
-    let receivers = index.type_receivers_for_type_ref_with_budget(
+    let receivers = type_ref_receivers_in_document(
+        index,
         &candidate.uri,
         document,
-        alias_type_ref.span.start,
         alias_type_ref,
         lookup_identifier,
         Some(symbol.scope),
-        &GenericSubstitution::empty(),
-        &mut state,
         cancel,
         budget,
     )?;
@@ -3855,9 +3996,6 @@ fn array_element_type_ref_at_depth(
         let Receiver::Type(receiver) = receiver else {
             return Ok(None);
         };
-        if receiver.kind != TypeKind::Array {
-            return Ok(None);
-        }
         if array_instance.replace(receiver).is_some() {
             return Ok(None);
         }
@@ -3865,7 +4003,10 @@ fn array_element_type_ref_at_depth(
     let Some(array_instance) = array_instance else {
         return Ok(None);
     };
-    array_element_type_ref_at_depth(
+    if !visited.insert((array_instance.uri.clone(), array_instance.key.clone())) {
+        return Ok(None);
+    }
+    array_type_metadata(
         index,
         &array_instance,
         visited,
@@ -3873,6 +4014,23 @@ fn array_element_type_ref_at_depth(
         cancel,
         budget,
     )
+}
+
+fn array_dimensions(declaration_type: Node<'_>, element_node: Node<'_>) -> usize {
+    // A Pascal `array[a, b] of T` has rank two even though it is one
+    // declaration node.  Dynamic `array of T` still has one index dimension.
+    let element_index = (0..declaration_type.named_child_count())
+        .find(|index| {
+            declaration_type
+                .named_child(*index)
+                .is_some_and(|child| Span::from_node(child) == Span::from_node(element_node))
+        })
+        .unwrap_or(declaration_type.named_child_count());
+    let dimensions = (0..element_index)
+        .filter_map(|index| declaration_type.named_child(index))
+        .filter(|child| !matches!(child.kind(), "kArray" | "kPacked" | "kOf"))
+        .count();
+    dimensions.max(1)
 }
 
 fn type_declaration_type_node<'a>(
@@ -4058,19 +4216,68 @@ fn expected_value_for_type_ref_in_document(
     else {
         return Ok(ExpectedCompletionValue::Unknown);
     };
+    let receivers = type_ref_receivers_in_document(
+        index, uri, document, type_ref, identifier, scope, cancel, budget,
+    )?;
+    expected_value_from_receivers(receivers, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_indexed_type_ref_in_document(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    type_ref: &super::TypeRef,
+    scope: Option<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index, uri, document, type_ref, identifier, scope, cancel, budget,
+    )?;
+    expected_value_from_receivers(receivers, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_ref_receivers_in_document(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    type_ref: &super::TypeRef,
+    lookup_identifier: Node<'_>,
+    scope: Option<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<Receiver>, String> {
     let mut state = super::ResolutionState::new();
-    let receivers = index.type_receivers_for_type_ref_with_budget(
+    index.type_receivers_for_type_ref_with_budget(
         uri,
         document,
         type_ref.span.start,
         type_ref,
-        identifier,
+        lookup_identifier,
         scope,
         &GenericSubstitution::empty(),
         &mut state,
         cancel,
         budget,
-    )?;
+    )
+}
+
+fn expected_value_from_receivers(
+    receivers: Vec<Receiver>,
+    arrays_unknown: bool,
+) -> Result<ExpectedCompletionValue, String> {
     if receivers.is_empty() {
         return Ok(ExpectedCompletionValue::Unknown);
     }
@@ -4080,6 +4287,11 @@ fn expected_value_for_type_ref_in_document(
     for receiver in receivers {
         match receiver {
             Receiver::Type(instance) if instance.kind == TypeKind::Callable => callable = true,
+            // A residual array is an intermediate/unsupported destination,
+            // not proof that a scalar call is valid.
+            Receiver::Type(instance) if arrays_unknown && instance.kind == TypeKind::Array => {
+                unknown = true;
+            }
             Receiver::Type(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
                 non_callable = true;
             }

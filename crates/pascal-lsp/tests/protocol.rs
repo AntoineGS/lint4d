@@ -4171,6 +4171,148 @@ end.
 }
 
 #[test]
+fn completion_snippets_project_full_indexed_destination_types() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("MultiIndexCompletion.pas");
+    let source = r#"unit MultiIndexCompletion;
+interface
+type
+  TProc = procedure(Value: Integer);
+  TProcArray = array[0..1] of TProc;
+  TMatrix = array[0..1] of TProcArray;
+  TDeclaredMatrix = array[0..1, 0..1] of TProc;
+  TScalarMatrix = array[0..1, 0..1] of Integer;
+  TCycleA = array[0..1] of TCycleB;
+  TCycleB = array[0..1] of TCycleA;
+function Make(Value: Integer): Integer;
+procedure Run(Value: Integer);
+implementation
+function Make(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+procedure Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  Matrix: TMatrix;
+  DeclaredMatrix: TDeclaredMatrix;
+  ScalarMatrix: TScalarMatrix;
+  Cycle: TCycleA;
+  Index: Integer;
+begin
+  Matrix[Index,0] := Ru;
+  Matrix[Index][0] := Ru;
+  DeclaredMatrix[Index,0] := Ru;
+  ScalarMatrix[Index,0] := Ma;
+  Matrix[Index,0,1] := Ru;
+  Matrix[Index,] := Ru;
+  Cycle[Index,0] := Ru;
+end;
+end.
+"#;
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize, label: &str| {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&source_path)},
+                    "position": position_after(source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            let result = response.result.expect("completion result");
+            result["items"]
+                .as_array()
+                .expect("completion items")
+                .iter()
+                .find(|item| item["label"] == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+        };
+    let mut failures = Vec::new();
+
+    for (id, needle, replacement) in [
+        (
+            "named-comma-indices",
+            "Matrix[Index,0] := Ru",
+            "Matrix[Index,0] := Run",
+        ),
+        (
+            "chained-indices",
+            "Matrix[Index][0] := Ru",
+            "Matrix[Index][0] := Run",
+        ),
+        (
+            "declared-multidimensional",
+            "DeclaredMatrix[Index,0] := Ru",
+            "DeclaredMatrix[Index,0] := Run",
+        ),
+        (
+            "excess-indices",
+            "Matrix[Index,0,1] := Ru",
+            "Matrix[Index,0,1] := Run",
+        ),
+        (
+            "malformed-indices",
+            "Matrix[Index,] := Ru",
+            "Matrix[Index,] := Run",
+        ),
+        (
+            "cyclic-array-indices",
+            "Cycle[Index,0] := Ru",
+            "Cycle[Index,0] := Run",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, 0, "Run");
+        if item["textEdit"]["newText"] != "Run" || !item["insertTextFormat"].is_null() {
+            failures.push(format!(
+                "{id}: expected plain Run, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replacen(needle, replacement, 1);
+        if expanded != expected {
+            failures.push(format!(
+                "{id}: expanded source was {expanded:?}, expected {expected:?}"
+            ));
+        }
+    }
+
+    let scalar = request(
+        &mut server,
+        "scalar-element",
+        "ScalarMatrix[Index,0] := Ma",
+        0,
+        "Make",
+    );
+    if scalar["textEdit"]["newText"] != "Make(${1:Value})$0" || scalar["insertTextFormat"] != 2 {
+        failures.push(format!(
+            "scalar-element: expected Make snippet, got {}",
+            scalar["textEdit"]["newText"]
+        ));
+    }
+
+    assert!(failures.is_empty(), "completion regressions: {failures:#?}");
+    server.shutdown();
+}
+
+#[test]
 fn completion_snippets_stay_plain_for_non_expression_syntax_roles() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let cases = [

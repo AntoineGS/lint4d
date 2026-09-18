@@ -6,9 +6,9 @@ use super::{
 use crate::text;
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionTextEdit,
-    Documentation as LspDocumentation, Hover, HoverContents, Location, MarkupContent, MarkupKind,
-    ParameterInformation, ParameterLabel, Position, Range, SignatureHelp, SignatureInformation,
-    TextEdit, Url,
+    Documentation as LspDocumentation, Hover, HoverContents, InsertTextFormat, Location,
+    MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, Position, Range,
+    SignatureHelp, SignatureInformation, TextEdit, Url,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -56,6 +56,7 @@ struct CompletionAccumulator<'a> {
     candidates: HashMap<String, (CompletionCandidate, usize)>,
     inaccessible: HashMap<String, usize>,
     uncertain: HashMap<String, usize>,
+    ambiguous_signatures: HashSet<String>,
     scanned: usize,
     exhausted: bool,
     is_incomplete: bool,
@@ -88,6 +89,7 @@ impl<'a> CompletionAccumulator<'a> {
             candidates: HashMap::new(),
             inaccessible: HashMap::new(),
             uncertain: HashMap::new(),
+            ambiguous_signatures: HashSet::new(),
             scanned: 0,
             exhausted: false,
             is_incomplete: false,
@@ -119,6 +121,16 @@ impl<'a> CompletionAccumulator<'a> {
         precedence: usize,
         auto_import: Option<AutoImportCandidate>,
     ) {
+        if let Some((current, _)) = self.candidates.get(&symbol.key) {
+            if current
+                .routine_key
+                .as_ref()
+                .zip(symbol.routine_key.as_ref())
+                .is_some_and(|(current, incoming)| current != incoming)
+            {
+                self.ambiguous_signatures.insert(symbol.key.clone());
+            }
+        }
         if let Some(inaccessible_precedence) = self.inaccessible.get(&symbol.key).copied() {
             if inaccessible_precedence < precedence {
                 return;
@@ -143,6 +155,8 @@ impl<'a> CompletionAccumulator<'a> {
                         candidate,
                         substitution: substitution.cloned(),
                         auto_import,
+                        routine_key: symbol.routine_key.clone(),
+                        signature_ambiguous: false,
                     },
                     precedence,
                 ),
@@ -209,6 +223,7 @@ pub(crate) struct CompletionOptions {
     pub(crate) format: MarkupKind,
     pub(crate) defer_documentation: bool,
     pub(crate) defer_detail: bool,
+    pub(crate) snippet_support: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +274,8 @@ struct CompletionCandidate {
     candidate: Candidate,
     substitution: Option<GenericSubstitution>,
     auto_import: Option<AutoImportCandidate>,
+    routine_key: Option<String>,
+    signature_ambiguous: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +288,13 @@ struct SpecializedRoutineSignature {
     label: String,
     label_start: usize,
     parameter_spans: Vec<Span>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionCallContext {
+    Callable,
+    ExistingCall,
+    Conservative,
 }
 
 fn empty_completion_result() -> CompletionResult {
@@ -303,6 +327,7 @@ impl NavigationIndex {
                     format,
                     defer_documentation: false,
                     defer_detail: false,
+                    snippet_support: false,
                 },
                 cancel,
             )?
@@ -399,6 +424,20 @@ impl NavigationIndex {
         if matches!(member, CompletionMember::Unsupported) {
             return Ok(empty_completion_result());
         }
+        let call_context = if options.snippet_support {
+            completion_call_context(
+                document,
+                offset,
+                prefix_start,
+                replacement_end,
+                identifier,
+                &member,
+                cancel,
+                &mut budget,
+            )?
+        } else {
+            CompletionCallContext::Conservative
+        };
         let (candidates, mut is_incomplete) = self.completion_candidates(
             uri,
             document,
@@ -454,6 +493,23 @@ impl NavigationIndex {
             let detail =
                 completion_detail(display.map(|display| display.excerpt), auto_import.as_ref());
             budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
+            let snippet = if matches!(call_context, CompletionCallContext::Callable)
+                && symbol.kind == SymbolKind::Routine
+                && !completion_candidate.signature_ambiguous
+            {
+                routine_call_snippet(
+                    self,
+                    candidate,
+                    symbol,
+                    completion_candidate.substitution.as_ref(),
+                    cancel,
+                    &mut budget,
+                )?
+            } else {
+                None
+            };
+            budget.require_bytes(snippet.as_ref().map_or(0, String::len), cancel)?;
+            let insertion_text = snippet.as_deref().unwrap_or(&symbol.name);
             items.push(CompletionItem {
                 label: symbol.name.clone(),
                 kind: Some(completion_kind(symbol.kind)),
@@ -461,11 +517,12 @@ impl NavigationIndex {
                 documentation,
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                     range,
-                    symbol.name.clone(),
+                    insertion_text.to_owned(),
                 ))),
                 additional_text_edits: auto_import
                     .as_ref()
                     .map(|auto_import| auto_import.additional_text_edits.clone()),
+                insert_text_format: snippet.map(|_| InsertTextFormat::SNIPPET),
                 ..CompletionItem::default()
             });
             seeds.push(CompletionResolutionSeed {
@@ -1277,9 +1334,13 @@ impl NavigationIndex {
         if !accumulator.uncertain.is_empty() {
             accumulator.is_incomplete = true;
         }
+        let ambiguous_signatures = accumulator.ambiguous_signatures;
         let mut candidates = std::mem::take(&mut accumulator.candidates)
-            .into_values()
-            .map(|(candidate, _)| candidate)
+            .into_iter()
+            .map(|(key, (mut candidate, _))| {
+                candidate.signature_ambiguous = ambiguous_signatures.contains(&key);
+                candidate
+            })
             .collect::<Vec<CompletionCandidate>>();
         candidates.sort_by(|left, right| {
             let left_symbol = self.symbol(&left.candidate);
@@ -3183,6 +3244,168 @@ fn member_expression_for_completion<'a>(
     Ok(result.unwrap_or(CompletionMember::Unsupported))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn completion_call_context(
+    document: &Document,
+    offset: usize,
+    prefix_start: usize,
+    replacement_end: usize,
+    identifier: Option<Node<'_>>,
+    member: &CompletionMember<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<CompletionCallContext, String> {
+    let target = identifier.or(match member {
+        CompletionMember::Node(node) | CompletionMember::Expression(node) => Some(*node),
+        CompletionMember::Unqualified
+        | CompletionMember::Bare { .. }
+        | CompletionMember::Unsupported => None,
+    });
+    let target = if let Some(target) = target {
+        target
+    } else {
+        let Some(target) = node_at_offset(
+            document.tree.root_node(),
+            offset,
+            cancel,
+            budget,
+            MAX_COMPLETION_CONTEXT_NODES,
+            "completion",
+        )?
+        else {
+            return Ok(CompletionCallContext::Conservative);
+        };
+        target
+    };
+    let target_span = Span::from_node(target);
+
+    for ancestor in std::iter::once(target).chain(Ancestors::new(target)) {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if ancestor.kind() == "exprCall"
+            && ancestor
+                .child_by_field_name("entity")
+                .is_some_and(|entity| {
+                    Span::from_node(entity).contains(target_span)
+                        || Span::from_node(entity).contains_offset(target_span.start)
+                })
+        {
+            if let Some(entity) = ancestor.child_by_field_name("entity") {
+                if source_open_paren(document, entity, ancestor, cancel, budget)?
+                    .is_some_and(|open| open >= replacement_end)
+                {
+                    return Ok(CompletionCallContext::ExistingCall);
+                }
+            }
+        }
+        if ancestor.kind() == "exprUnary" {
+            let mut cursor = ancestor.walk();
+            if ancestor
+                .children(&mut cursor)
+                .any(|child| child.kind() == "kAt" && child.end_byte() <= target_span.start)
+            {
+                return Ok(CompletionCallContext::Conservative);
+            }
+        }
+        if ancestor.kind().starts_with("decl")
+            || matches!(
+                ancestor.kind(),
+                "type" | "typeref" | "typerefDot" | "genericArgs"
+            )
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if ancestor.kind() == "defProc"
+            && ancestor
+                .child_by_field_name("header")
+                .is_some_and(|header| Span::from_node(header).contains(target_span))
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
+    }
+
+    // A completion token is only a call site when the parser has kept it in an
+    // expression.  The explicit prefix/range checks keep a cursor in a
+    // declaration or a member's left-hand qualification conservative even
+    // when error recovery attaches it to a broad ancestor.
+    if prefix_start > replacement_end || target_span.start > offset {
+        return Ok(CompletionCallContext::Conservative);
+    }
+    Ok(CompletionCallContext::Callable)
+}
+
+fn routine_call_snippet(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    symbol: &Symbol,
+    substitution: Option<&GenericSubstitution>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    if symbol.kind != SymbolKind::Routine {
+        return Ok(None);
+    }
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(None);
+    };
+    let Some(signature) =
+        specialized_routine_signature_label(index, document, symbol, substitution, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    // The declaration projection is the shared exact-signature proof.  If a
+    // malformed/recovered header cannot provide one parameter span per
+    // indexed parameter, do not invent a call shape.
+    if signature.parameter_spans.len() != symbol.routine_parameters.len() {
+        return Ok(None);
+    }
+
+    let mut snippet = String::new();
+    append_snippet_literal(&mut snippet, &symbol.name, budget, cancel)?;
+    snippet.push('(');
+    for (index, parameter) in symbol.routine_parameters.iter().enumerate() {
+        if index > 0 {
+            snippet.push_str(", ");
+        }
+        let Some(name) = document
+            .source
+            .get(parameter.span.start..parameter.span.end)
+        else {
+            return Ok(None);
+        };
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let tabstop = index.saturating_add(1);
+        snippet.push_str("${");
+        snippet.push_str(&tabstop.to_string());
+        snippet.push(':');
+        append_snippet_literal(&mut snippet, name, budget, cancel)?;
+        snippet.push('}');
+    }
+    snippet.push(')');
+    // `$0` is always the final cursor, including for zero-argument routines.
+    snippet.push_str("$0");
+    budget.require_bytes(snippet.len(), cancel)?;
+    Ok(Some(snippet))
+}
+
+fn append_snippet_literal(
+    output: &mut String,
+    value: &str,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    budget.require_bytes(value.len(), cancel)?;
+    for character in value.chars() {
+        if matches!(character, '\\' | '$' | '}') {
+            output.push('\\');
+        }
+        output.push(character);
+    }
+    Ok(())
+}
+
 fn trailing_member_dot_with_budget(
     source: &str,
     offset: usize,
@@ -5014,6 +5237,7 @@ mod tests {
                     format: MarkupKind::Markdown,
                     defer_documentation: true,
                     defer_detail: true,
+                    snippet_support: false,
                 },
                 &cancel,
             )

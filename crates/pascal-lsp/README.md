@@ -184,12 +184,22 @@ with the same spelling.
 
 Completion is case-insensitive and uses the nearest lexical locals and
 parameters, visible class members, current-unit declarations, and resolved
-imported declarations. It preserves declaration casing and returns plain
-identifier `TextEdit`s. For an unqualified identifier, it can also offer a
-unique exported declaration from an authorized project source unit that is not
-already imported. These auto-import items identify their unit and carry one
-safe `additionalTextEdit` for the interface or implementation `uses` clause;
-the edit preserves CRLF/LF style, existing comments, dotted names, and explicit
+imported declarations. It preserves declaration casing and normally returns
+plain identifier `TextEdit`s. Clients that advertise
+`textDocument.completion.completionItem.snippetSupport` also receive
+source-derived routine-call snippets at an unambiguous callable expression
+site, such as `Run(${1:Value})$0`; zero-argument routines use `Run()$0`.
+Grouped, default, and optional parameters become ordinary placeholders in
+declaration order, while escaped Pascal identifier text and LSP snippet
+metacharacters are preserved safely. Snippets remain plain in existing calls,
+address-of/procedure-reference expressions, declarations, type contexts,
+ambiguous or unknown signatures, and uncertain syntax; the server does not
+invent parameters or statement terminators. For an unqualified identifier, it
+can also offer a unique exported declaration from an authorized project source
+unit that is not already imported. Routine auto-import items retain their safe
+`additionalTextEdit` for the interface or implementation `uses` clause; the
+import edit remains separate from the primary snippet replacement. The edit
+preserves CRLF/LF style, existing comments, dotted names, and explicit
 `in 'path'` entries. The proposed import spelling is checked through the
 requesting project's actual unit resolver, including namespaces, search paths,
 and aliases; candidates are omitted when it cannot bind uniquely to the
@@ -803,10 +813,11 @@ Not implemented or incomplete:
   content can therefore produce no navigation result or block rename.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
-- Compiler-equivalent overload selection, auto-imports, snippets, and anonymous
-  callable inference are not implemented. Completion and signature help remain
-  conservative when imports, conditionals, receivers, or parser state are
-  unknown.
+- Compiler-equivalent overload selection and anonymous callable inference are
+  not implemented. Completion and signature help remain conservative when
+  imports, conditionals, receivers, or parser state are unknown; snippets are
+  limited to source-proven named routines and do not model anonymous or
+  compiler-only variadic callables.
 - A general Delphi type checker is not implemented; semantic-token precision is
   limited to bindings proven by the source index.
 

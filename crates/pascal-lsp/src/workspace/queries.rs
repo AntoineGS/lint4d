@@ -122,6 +122,7 @@ pub(crate) fn completion_from_input_with_format(
             format,
             defer_documentation: false,
             defer_detail: false,
+            snippet_support: false,
         },
         cancel,
     );
@@ -195,6 +196,7 @@ pub(crate) fn completion_metadata_from_input(
     format: MarkupKind,
     resolve_documentation: bool,
     resolve_detail: bool,
+    snippet_support: bool,
     original_records: &[super::rename::SourceRecord],
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionMetadata> {
@@ -257,6 +259,7 @@ pub(crate) fn completion_metadata_from_input(
             format: format.clone(),
             defer_documentation: true,
             defer_detail: true,
+            snippet_support,
         },
         cancel,
     ) {
@@ -2147,6 +2150,7 @@ mod tests {
                 format: MarkupKind::Markdown,
                 defer_documentation: true,
                 defer_detail: true,
+                snippet_support: false,
             },
             &cancel,
         );
@@ -2178,6 +2182,7 @@ mod tests {
                 MarkupKind::Markdown,
                 true,
                 true,
+                false,
                 &original_records,
                 &cancel,
             )

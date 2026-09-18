@@ -3,10 +3,11 @@
 `cfg-pascal` builds a control-flow graph from a parsed Pascal syntax tree. The
 legacy `build_file_cfgs` API is file-local; the additive
 `build_file_cfgs_in_project` API consumes an immutable caller-built project
-snapshot. This crate still does not provide project indexing,
-conditional-build evaluation, receiver resolution, or an LSP server. Syntax
-recognition and CFG semantic precision are therefore documented separately
-below.
+snapshot. This crate still does not provide project indexing or discovery,
+filesystem include lookup, full compiler-equivalent conditional evaluation,
+receiver resolution, or an LSP server. It does provide bounded, caller-supplied
+conditional/include preparation; that contract is documented below. Syntax
+recognition and CFG semantic precision are therefore documented separately.
 
 ## Current syntax and CFG semantics
 
@@ -172,15 +173,43 @@ identities are caller-supplied; type identity is qualified by the stable unit
 identity and does not depend on input order. Cyclic ancestry and alias graphs
 remain unknown.
 
-## Remaining LSP integration work
+## Downstream integration boundary
 
-These items belong to the existing LSP/lint integration rather than this
-single-file CFG crate:
+`cfg-pascal` remains caller-driven. It validates the immutable
+`ProjectSnapshot` and prepared-source contracts, but it does not own project
+selection, filesystem reads, include lookup, workspace indexing, LSP state, or
+MSBuild evaluation. Callers must provide parsed trees and bytes, explicit import
+bindings, and (for configured preparation) explicit include bindings and a
+validated source map.
 
-- a shared-tree lint entrypoint and context adapter;
-- project-index/configuration adapters that construct `ProjectSnapshot` values;
-- receiver resolution for method and property references;
-- project conditional and MSBuild configuration fidelity; and
-- semantic-token integration.
+### Conditional/include propagation boundary
 
-No duplicate language server or project index is introduced here.
+The lower-level `prepare_source` API propagates `DEFINE`/`UNDEF` state through
+include expansion when the caller supplies a complete, occurrence-aware
+snapshot. The shared resolver walk used by the current CLI/LSP integration is
+deliberately more conservative: it resolves imports before walking includes,
+and nested include walks do not feed newly discovered definitions back into the
+parent's initial conditional environment. Consequently, a symbol defined by an
+include and consumed by a later `IFDEF` may leave the resolver project
+incomplete. The adapter then retains the raw snapshot and uses the file-local
+CFG fallback rather than claiming configured precision. This is an intentional
+fail-closed integration limitation, not a promise that every preparation-time
+propagation case is reachable through CLI/LSP project analysis.
+
+The shared integration now lives in the sibling `lint4d` worktree rather than
+in this library. Its `pascal-core::resolver::UnitResolver<S>` consumes the
+bounded `pascal-project::ProjectContext` and a caller-supplied source store; the
+lint4d CFG adapter at
+`crates/lint4d/src/cfg/project_snapshot.rs` converts its
+`ResolvedProject` into `CfgProjectSnapshot` values for the existing
+`build_file_cfgs_in_project` API. Incomplete resolution is retained as an
+incomplete/raw snapshot and the lint runner falls back to file-local CFG rather
+than claiming precise cross-unit facts. `pascal-lsp` supplies its own overlay
+source store and retains workspace snapshots, generations, invalidation, and
+diagnostic policy.
+
+The current lint4d dependency is pinned to the upstream cfg-pascal Git revision
+`208d6743c61e0b391195958270a5e04e3a4328d4`; this documentation is not a claim
+that the downstream adapter is part of a released cfg-pascal package. Receiver
+resolution, semantic-token integration, and compiler/MSBuild fidelity remain
+owned by downstream callers.

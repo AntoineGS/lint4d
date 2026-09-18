@@ -1161,6 +1161,83 @@ fn apply_completion_item(source: &str, item: &Value) -> String {
     result
 }
 
+fn expand_lsp_snippet(snippet: &str) -> String {
+    let mut expanded = String::with_capacity(snippet.len());
+    let bytes = snippet.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                if let Some(next) = snippet[index + 1..].chars().next() {
+                    expanded.push(next);
+                    index += 1 + next.len_utf8();
+                } else {
+                    expanded.push('\\');
+                    index += 1;
+                }
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'0') => index += 2,
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                let mut end = index + 2;
+                let mut escaped = false;
+                while end < bytes.len() {
+                    if escaped {
+                        escaped = false;
+                    } else if bytes[end] == b'\\' {
+                        escaped = true;
+                    } else if bytes[end] == b'}' {
+                        break;
+                    }
+                    end += 1;
+                }
+                if end >= bytes.len() {
+                    expanded.push('$');
+                    index += 1;
+                    continue;
+                }
+                let body = &snippet[index + 2..end];
+                let default = body.split_once(':').map_or(body, |(_, default)| default);
+                expanded.push_str(&unescape_lsp_snippet_literal(default));
+                index = end + 1;
+            }
+            _ => {
+                let character = snippet[index..].chars().next().expect("snippet character");
+                expanded.push(character);
+                index += character.len_utf8();
+            }
+        }
+    }
+    expanded
+}
+
+fn unescape_lsp_snippet_literal(value: &str) -> String {
+    let mut unescaped = String::with_capacity(value.len());
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            unescaped.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            unescaped.push(character);
+        }
+    }
+    if escaped {
+        unescaped.push('\\');
+    }
+    unescaped
+}
+
+fn apply_expanded_completion_item(source: &str, item: &Value) -> String {
+    let mut expanded = item.clone();
+    let snippet = expanded["textEdit"]["newText"]
+        .as_str()
+        .expect("snippet text");
+    expanded["textEdit"]["newText"] = json!(expand_lsp_snippet(snippet));
+    apply_completion_item(source, &expanded)
+}
+
 fn final_qualified_type_position(source: &str, qualified_name: &str) -> Position {
     let start = position_of(source, qualified_name, 0);
     let prefix = qualified_name
@@ -3738,6 +3815,230 @@ fn completion_snippets_remain_conservative_for_existing_calls_and_address_of() {
 }
 
 #[test]
+fn completion_snippets_stay_plain_for_procedure_value_contexts() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("ProcedureValueContexts.pas");
+    let source = "unit ProcedureValueContexts;\ninterface\ntype\n  TProc = procedure(Value: Integer);\n  TWidget = class\n    procedure Method(Value: Integer);\n  end;\nprocedure Run(Value: Integer);\nprocedure Take(Callback: TProc);\nimplementation\nprocedure TWidget.Method(Value: Integer);\nbegin\nend;\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Take(Callback: TProc);\nbegin\nend;\nprocedure Caller;\nvar\n  Callback: TProc;\n  Widget: TWidget;\nbegin\n  Ru;\n  Callback := Ru;\n  Take(Ru);\n  @Ru;\n  Callback := Widget.Me;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request = |server: &mut TestServer, id: &str, needle: &str, label: &str| {
+        let request_id = RequestId::from(id.to_owned());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == label)
+            .cloned()
+            .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+    };
+
+    let statement = request(&mut server, "procedure-value-statement", "  Ru", "Run");
+    assert_eq!(statement["textEdit"]["newText"], "Run(${1:Value})$0");
+    assert_eq!(statement["insertTextFormat"], 2);
+
+    for (id, needle, label, replacement) in [
+        (
+            "procedure-assignment",
+            "Callback := Ru",
+            "Run",
+            "Callback := Run",
+        ),
+        ("procedure-argument", "Take(Ru", "Run", "Take(Run"),
+        ("procedure-address-of", "  @Ru", "Run", "  @Run"),
+        (
+            "method-pointer-assignment",
+            "Callback := Widget.Me",
+            "Method",
+            "Callback := Widget.Method",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, label);
+        assert_eq!(item["textEdit"]["newText"], label);
+        assert!(item["insertTextFormat"].is_null());
+        assert_eq!(
+            apply_completion_item(source, &item),
+            source.replace(needle, replacement)
+        );
+    }
+
+    assert_eq!(
+        apply_expanded_completion_item(source, &statement),
+        source.replace("  Ru;\n", "  Run(Value);\n")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_require_a_proven_expression_call_role() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("CallEligibility.pas");
+    let source = "unit CallEligibility;\ninterface\nfunction Make(Value: Integer): Integer;\nfunction Other(Value: Integer): Integer;\nfunction UseResult(Value: Integer): Integer;\nprocedure Run(Value: Integer);\nimplementation\nfunction Make(Value: Integer): Integer;\nbegin\n  Result := Value;\nend;\nfunction Other(Value: Integer): Integer;\nbegin\n  Result := Value;\nend;\nfunction UseResult(Value: Integer): Integer;\nbegin\n  Result := Ma;\nend;\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nvar\n  Value, Index: Integer;\nbegin\n  Ru;\n  Value := Make(1) + Ma;\n  if Ma > 0 then\n    Value := Value;\n  for Index := 1 to Ma do\n    Value := Value;\n  Ma := Value;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize, label: &str| {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&source_path)},
+                    "position": position_after(source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            let result = response.result.expect("completion result");
+            result["items"]
+                .as_array()
+                .expect("completion items")
+                .iter()
+                .find(|item| item["label"] == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+        };
+
+    let statement = request(&mut server, "eligibility-statement", "  Ru", 0, "Run");
+    assert_eq!(statement["textEdit"]["newText"], "Run(${1:Value})$0");
+    assert_eq!(statement["insertTextFormat"], 2);
+
+    let nested = request(
+        &mut server,
+        "eligibility-nested-expression",
+        " + Ma",
+        0,
+        "Make",
+    );
+    assert_eq!(nested["textEdit"]["newText"], "Make(${1:Value})$0");
+    assert_eq!(
+        apply_expanded_completion_item(source, &nested),
+        source.replace(" + Ma;\n", " + Make(Value);\n")
+    );
+
+    for (id, needle) in [
+        ("eligibility-condition", "if Ma"),
+        ("eligibility-loop-end", "to Ma"),
+    ] {
+        let item = request(&mut server, id, needle, 0, "Make");
+        assert_eq!(item["textEdit"]["newText"], "Make(${1:Value})$0");
+        assert_eq!(item["insertTextFormat"], 2);
+    }
+
+    let result_rhs = request(
+        &mut server,
+        "eligibility-function-result-rhs",
+        "Result := Ma",
+        0,
+        "Make",
+    );
+    assert_eq!(result_rhs["textEdit"]["newText"], "Make(${1:Value})$0");
+    assert_eq!(result_rhs["insertTextFormat"], 2);
+
+    let result_assignment = request(
+        &mut server,
+        "eligibility-result-assignment",
+        "  Ma",
+        0,
+        "Make",
+    );
+    assert_eq!(result_assignment["textEdit"]["newText"], "Make");
+    assert!(result_assignment["insertTextFormat"].is_null());
+    assert_eq!(
+        apply_completion_item(source, &result_assignment),
+        source.replace("  Ma := Value;\n", "  Make := Value;\n")
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_for_non_expression_syntax_roles() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let cases = [
+        (
+            "label",
+            "unit LabelRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  goto Ru;\nend;\nend.\n",
+            "goto Ru",
+        ),
+        (
+            "loop-target",
+            "unit LoopTargetRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nvar\n  Value: Integer;\nbegin\n  for Ru := 1 to 2 do\n    Value := Value;\nend;\nend.\n",
+            "for Ru",
+        ),
+        (
+            "left-qualification",
+            "unit LeftQualificationRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  Ru.Member;\nend;\nend.\n",
+            "  Ru",
+        ),
+        (
+            "uncertain",
+            "unit UncertainRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  Ru ???;\nend;\nend.\n",
+            "  Ru",
+        ),
+    ];
+
+    for (id, source, needle) in cases {
+        let source_path = temp.path().join(format!("{id}.pas"));
+        write_file(&source_path, source);
+        let mut server = TestServer::launch();
+        server.initialize_with_completion_capabilities(
+            temp.path(),
+            Some(true),
+            json!([]),
+            json!(["plaintext"]),
+        );
+        let request_id = RequestId::from(format!("non-expression-{id}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let item = response.result.expect("completion result")["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == "Run")
+            .cloned()
+            .unwrap_or_else(|| panic!("Run completion item missing for {id}"));
+        assert_eq!(item["textEdit"]["newText"], "Run");
+        assert!(item["insertTextFormat"].is_null());
+        server.shutdown();
+    }
+}
+
+#[test]
 fn completion_snippets_keep_utf16_mid_token_ranges_and_crlf_source() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("CrLfSnippets.pas");
@@ -3827,6 +4128,50 @@ fn completion_snippets_stay_plain_for_ambiguous_overloads() {
         .expect("Pick completion item");
     assert_eq!(item["textEdit"]["newText"], "Pick");
     assert!(item["insertTextFormat"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_for_cross_unit_overloads() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("CrossUnitOverloadProvider.pas");
+    let main_path = temp.path().join("CrossUnitOverloadConsumer.pas");
+    let provider_source = "unit CrossUnitOverloadProvider;\ninterface\nprocedure Pick(NumberValue: Integer); overload;\nprocedure Pick(TextValue: string); overload;\nimplementation\nprocedure Pick(NumberValue: Integer);\nbegin\nend;\nprocedure Pick(TextValue: string);\nbegin\nend;\nend.\n";
+    let main_source = "unit CrossUnitOverloadConsumer;\ninterface\nuses CrossUnitOverloadProvider;\nimplementation\nprocedure Caller;\nbegin\n  Pi\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("cross-unit-overload-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Pi", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Pick")
+        .cloned()
+        .expect("cross-unit Pick completion item");
+    assert_eq!(item["textEdit"]["newText"], "Pick");
+    assert!(item["insertTextFormat"].is_null());
+    assert_eq!(
+        apply_completion_item(main_source, &item),
+        main_source.replace("  Pi\n", "  Pick\n")
+    );
     server.shutdown();
 }
 
@@ -4385,6 +4730,99 @@ fn completion_snippets_use_generic_member_signatures() {
 }
 
 #[test]
+fn completion_snippets_stay_plain_when_generic_suffix_is_already_typed() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("GenericSuffixSnippet.pas");
+    let source = "unit GenericSuffixSnippet;\ninterface\ntype\n  TFactory = class\n    function Make<T>: T;\n  end;\nimplementation\nfunction TFactory.Make<T>: T;\nbegin\nend;\nprocedure Caller;\nvar\n  Factory: TFactory;\nbegin\n  Factory.Ma<Integer>;\n  Factory.Ma;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request = |server: &mut TestServer, id: &str, occurrence: usize| {
+        let request_id = RequestId::from(id.to_owned());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, "Factory.Ma", occurrence),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == "Make")
+            .cloned()
+            .unwrap_or_else(|| panic!("Make completion item missing: {result:?}"))
+    };
+
+    for (id, occurrence) in [("generic-suffix", 1), ("generic-unresolved", 2)] {
+        let item = request(&mut server, id, occurrence);
+        assert_eq!(item["textEdit"]["newText"], "Make");
+        assert!(item["insertTextFormat"].is_null());
+    }
+
+    let suffix_item = request(&mut server, "generic-suffix-expanded", 1);
+    assert_eq!(
+        apply_expanded_completion_item(source, &suffix_item),
+        source.replace("Factory.Ma<Integer>", "Factory.Make<Integer>")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_follow_the_nearest_visible_shadowed_routine() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("ShadowedRoutineSnippet.pas");
+    let source = "unit ShadowedRoutineSnippet;\ninterface\nprocedure Run(Text: string);\nimplementation\nprocedure Run(Text: string);\nbegin\nend;\nprocedure Caller;\n  procedure Run(Number: Integer);\n  begin\n  end;\nbegin\n  Ru;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("shadowed-routine-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Ru", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Run")
+        .cloned()
+        .expect("Run completion item");
+    assert!(
+        item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Number: Integer")),
+        "nearest routine detail missing: {item}"
+    );
+    assert_eq!(item["textEdit"]["newText"], "Run(${1:Number})$0");
+    assert_eq!(item["insertTextFormat"], 2);
+    server.shutdown();
+}
+
+#[test]
 fn completion_resolution_preserves_the_exact_overloaded_declaration() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let provider_path = temp.path().join("OverloadedProvider.pas");
@@ -4909,7 +5347,7 @@ fn completion_auto_import_routine_snippet_keeps_its_uses_edit_on_resolve() {
     let provider_path = temp.path().join("AutoImportRoutineProvider.pas");
     let main_path = temp.path().join("AutoImportRoutineConsumer.pas");
     let provider_source = "unit AutoImportRoutineProvider;\ninterface\nprocedure Execute(Value: Integer);\nimplementation\nprocedure Execute(Value: Integer);\nbegin\nend;\nend.\n";
-    let main_source = "unit AutoImportRoutineConsumer;\ninterface\nimplementation\nprocedure Caller;\nbegin\n  Exe\nend;\nend.\n";
+    let main_source = "unit AutoImportRoutineConsumer;\ninterface\nimplementation\nprocedure Caller;\nvar\n  Value: Integer;\nbegin\n  Exe\nend;\nend.\n";
     write_file(&provider_path, provider_source);
     write_file(&main_path, main_source);
 
@@ -4960,9 +5398,10 @@ fn completion_auto_import_routine_snippet_keeps_its_uses_edit_on_resolve() {
     assert_eq!(resolved["insertTextFormat"], 2);
     assert_eq!(resolved["additionalTextEdits"], original_additional);
 
-    let applied = apply_completion_item(main_source, &item);
+    let applied = apply_expanded_completion_item(main_source, &item);
     assert!(applied.contains("implementation\nuses AutoImportRoutineProvider;\n"));
-    assert!(applied.contains("  Execute(${1:Value})$0\n"));
+    assert!(applied.contains("  Execute(Value)\n"));
+    assert!(!applied.contains("${1:Value}"));
     server.shutdown();
 }
 

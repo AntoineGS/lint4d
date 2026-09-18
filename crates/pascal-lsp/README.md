@@ -192,9 +192,12 @@ site, such as `Run(${1:Value})$0`; zero-argument routines use `Run()$0`.
 Grouped, default, and optional parameters become ordinary placeholders in
 declaration order, while escaped Pascal identifier text and LSP snippet
 metacharacters are preserved safely. Snippets remain plain in existing calls,
-address-of/procedure-reference expressions, declarations, type contexts,
-ambiguous or unknown signatures, and uncertain syntax; the server does not
-invent parameters or statement terminators. For an unqualified identifier, it
+address-of/procedure-reference expressions, expected procedural-value
+assignments or arguments, declarations, type contexts, ambiguous or unknown
+signatures, non-expression/qualification positions, and uncertain syntax. A
+typed generic suffix and an unresolved routine generic also remain plain; the
+server does not invent parameters or statement terminators. For an unqualified
+identifier, it
 can also offer a unique exported declaration from an authorized project source
 unit that is not already imported. Routine auto-import items retain their safe
 `additionalTextEdit` for the interface or implementation `uses` clause; the

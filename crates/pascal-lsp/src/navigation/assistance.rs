@@ -1,7 +1,7 @@
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, Origin,
-    ROOT_SCOPE, Region, RoutineKind, Span, Symbol, SymbolKind, canonical_name, documentation,
-    location_for_span, node_text, symbol_is_available_at, symbol_visible_in_region,
+    ROOT_SCOPE, Receiver, Region, RoutineKind, Span, Symbol, SymbolKind, TypeKind, canonical_name,
+    documentation, location_for_span, node_text, symbol_is_available_at, symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
@@ -121,16 +121,6 @@ impl<'a> CompletionAccumulator<'a> {
         precedence: usize,
         auto_import: Option<AutoImportCandidate>,
     ) {
-        if let Some((current, _)) = self.candidates.get(&symbol.key) {
-            if current
-                .routine_key
-                .as_ref()
-                .zip(symbol.routine_key.as_ref())
-                .is_some_and(|(current, incoming)| current != incoming)
-            {
-                self.ambiguous_signatures.insert(symbol.key.clone());
-            }
-        }
         if let Some(inaccessible_precedence) = self.inaccessible.get(&symbol.key).copied() {
             if inaccessible_precedence < precedence {
                 return;
@@ -143,11 +133,38 @@ impl<'a> CompletionAccumulator<'a> {
             }
             self.uncertain.remove(&symbol.key);
         }
-        let replace = self
-            .candidates
-            .get(&symbol.key)
-            .is_none_or(|(_, current_precedence)| precedence < *current_precedence);
+        let Some((current, current_precedence)) = self.candidates.get(&symbol.key) else {
+            self.candidates.insert(
+                symbol.key.clone(),
+                (
+                    CompletionCandidate {
+                        candidate,
+                        substitution: substitution.cloned(),
+                        auto_import,
+                        routine_key: symbol.routine_key.clone(),
+                        signature_ambiguous: false,
+                    },
+                    precedence,
+                ),
+            );
+            return;
+        };
+        if precedence > *current_precedence {
+            return;
+        }
+        if precedence == *current_precedence
+            && current
+                .routine_key
+                .as_ref()
+                .zip(symbol.routine_key.as_ref())
+                .is_some_and(|(current, incoming)| current != incoming)
+        {
+            self.ambiguous_signatures.insert(symbol.key.clone());
+            return;
+        }
+        let replace = precedence < *current_precedence;
         if replace {
+            self.ambiguous_signatures.remove(&symbol.key);
             self.candidates.insert(
                 symbol.key.clone(),
                 (
@@ -297,6 +314,13 @@ enum CompletionCallContext {
     Conservative,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedCompletionValue {
+    Callable,
+    NonCallable,
+    Unknown,
+}
+
 fn empty_completion_result() -> CompletionResult {
     CompletionResult {
         list: CompletionList::default(),
@@ -426,6 +450,8 @@ impl NavigationIndex {
         }
         let call_context = if options.snippet_support {
             completion_call_context(
+                self,
+                uri,
                 document,
                 offset,
                 prefix_start,
@@ -3246,6 +3272,8 @@ fn member_expression_for_completion<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn completion_call_context(
+    index: &NavigationIndex,
+    current_uri: &Url,
     document: &Document,
     offset: usize,
     prefix_start: usize,
@@ -3257,9 +3285,15 @@ fn completion_call_context(
 ) -> Result<CompletionCallContext, String> {
     let target = identifier.or(match member {
         CompletionMember::Node(node) | CompletionMember::Expression(node) => Some(*node),
-        CompletionMember::Unqualified
-        | CompletionMember::Bare { .. }
-        | CompletionMember::Unsupported => None,
+        CompletionMember::Bare { end, .. } => node_at_offset(
+            document.tree.root_node(),
+            end.saturating_sub(1),
+            cancel,
+            budget,
+            MAX_COMPLETION_CONTEXT_NODES,
+            "completion",
+        )?,
+        CompletionMember::Unqualified | CompletionMember::Unsupported => None,
     });
     let target = if let Some(target) = target {
         target
@@ -3278,10 +3312,43 @@ fn completion_call_context(
         target
     };
     let target_span = Span::from_node(target);
+    let mut expression_role = false;
+    let mut expected_value = None;
+
+    budget.require_work(document.parser_recovery_spans.len(), cancel)?;
 
     for ancestor in std::iter::once(target).chain(Ancestors::new(target)) {
         check_cancel(cancel)?;
         budget.require_work(1, cancel)?;
+        let ancestor_span = Span::from_node(ancestor);
+        if matches!(
+            ancestor.kind(),
+            "statement"
+                | "assignment"
+                | "exprCall"
+                | "exprArgs"
+                | "exprDot"
+                | "exprTpl"
+                | "exprBinary"
+                | "exprUnary"
+                | "exprParens"
+                | "exprSubscript"
+                | "exprBrackets"
+                | "exprAs"
+                | "exprConditional"
+                | "caseLabel"
+        ) && !matches!(member, CompletionMember::Bare { .. })
+            && document.parser_recovery_spans.iter().any(|recovery| {
+                recovery.start <= ancestor_span.end && recovery.end >= ancestor_span.start
+            })
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if (ancestor.is_error() || ancestor.is_missing())
+            && !matches!(member, CompletionMember::Bare { .. })
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
         if ancestor.kind() == "exprCall"
             && ancestor
                 .child_by_field_name("entity")
@@ -3298,6 +3365,52 @@ fn completion_call_context(
                 }
             }
         }
+        if ancestor.kind() == "assignment" {
+            let Some(lhs) = ancestor.child_by_field_name("lhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            let Some(rhs) = ancestor.child_by_field_name("rhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(lhs).contains(target_span) {
+                return Ok(CompletionCallContext::Conservative);
+            }
+            if !Span::from_node(rhs).contains(target_span) {
+                return Ok(CompletionCallContext::Conservative);
+            }
+            expression_role = true;
+            expected_value = Some(expected_value_for_assignment(
+                index,
+                current_uri,
+                document,
+                lhs,
+                offset,
+                cancel,
+                budget,
+            )?);
+        }
+        if ancestor.kind() == "exprCall" {
+            let Some(args) = ancestor.child_by_field_name("args") else {
+                continue;
+            };
+            if !Span::from_node(args).contains(target_span) {
+                continue;
+            }
+            expression_role = true;
+            let Some(argument_index) = argument_index_containing(args, target_span) else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            expected_value = Some(expected_value_for_argument(
+                index,
+                current_uri,
+                document,
+                ancestor,
+                argument_index,
+                offset,
+                cancel,
+                budget,
+            )?);
+        }
         if ancestor.kind() == "exprUnary" {
             let mut cursor = ancestor.walk();
             if ancestor
@@ -3306,6 +3419,35 @@ fn completion_call_context(
             {
                 return Ok(CompletionCallContext::Conservative);
             }
+        }
+        if ancestor.kind() == "exprDot" {
+            let Some(lhs) = ancestor.child_by_field_name("lhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(lhs).contains(target_span) {
+                if prefix_start <= lhs.end_byte() {
+                    return Ok(CompletionCallContext::Conservative);
+                }
+                expression_role = true;
+                continue;
+            }
+            let Some(rhs) = ancestor.child_by_field_name("rhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(rhs).contains(target_span) {
+                expression_role = true;
+            }
+        }
+        if ancestor.kind() == "exprTpl" {
+            let Some(entity) = ancestor.child_by_field_name("entity") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(entity).contains(target_span)
+                && generic_suffix_follows_completion(document, entity, ancestor, replacement_end)
+            {
+                return Ok(CompletionCallContext::Conservative);
+            }
+            expression_role = true;
         }
         if ancestor.kind().starts_with("decl")
             || matches!(
@@ -3322,16 +3464,379 @@ fn completion_call_context(
         {
             return Ok(CompletionCallContext::Conservative);
         }
+        if matches!(ancestor.kind(), "goto" | "label" | "caseLabel") {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if matches!(ancestor.kind(), "varDef" | "varAssignDef") {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        match ancestor.kind() {
+            "for" => {
+                if ancestor
+                    .child_by_field_name("end")
+                    .is_some_and(|end| Span::from_node(end).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "foreach" => {
+                if ancestor
+                    .child_by_field_name("iterator")
+                    .is_some_and(|iterator| Span::from_node(iterator).contains(target_span))
+                {
+                    return Ok(CompletionCallContext::Conservative);
+                }
+                if ancestor
+                    .child_by_field_name("iterable")
+                    .is_some_and(|iterable| Span::from_node(iterable).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "if" | "ifElse" | "while" => {
+                if ancestor
+                    .child_by_field_name("condition")
+                    .is_some_and(|condition| Span::from_node(condition).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "repeat" => {
+                if ancestor
+                    .child_by_field_name("condition")
+                    .is_some_and(|condition| Span::from_node(condition).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "with" => {
+                if ancestor
+                    .child_by_field_name("entity")
+                    .is_some_and(|entity| Span::from_node(entity).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "raise" => {
+                if ancestor
+                    .child_by_field_name("exception")
+                    .is_some_and(|exception| Span::from_node(exception).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "case" => {
+                let mut cursor = ancestor.walk();
+                let first_case = ancestor
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "caseCase");
+                if first_case.is_none_or(|case_case| target_span.end <= case_case.start_byte()) {
+                    expression_role = true;
+                }
+            }
+            _ => {}
+        }
+        if matches!(
+            ancestor.kind(),
+            "statement"
+                | "exprBinary"
+                | "exprUnary"
+                | "exprParens"
+                | "exprSubscript"
+                | "exprBrackets"
+                | "exprAs"
+                | "exprConditional"
+                | "exprArgs"
+        ) {
+            expression_role = true;
+        }
     }
 
-    // A completion token is only a call site when the parser has kept it in an
-    // expression.  The explicit prefix/range checks keep a cursor in a
-    // declaration or a member's left-hand qualification conservative even
-    // when error recovery attaches it to a broad ancestor.
-    if prefix_start > replacement_end || target_span.start > offset {
+    // A completion token is only a call site when a positively recognized
+    // expression role contains it.  Unknown/recovered syntax remains plain;
+    // merely being attached to a broad parser ancestor is not enough proof.
+    if !expression_role || prefix_start > replacement_end || target_span.start > offset {
+        return Ok(CompletionCallContext::Conservative);
+    }
+    if expected_value.is_some_and(|value| value != ExpectedCompletionValue::NonCallable) {
         return Ok(CompletionCallContext::Conservative);
     }
     Ok(CompletionCallContext::Callable)
+}
+
+fn argument_index_containing(args: Node<'_>, target: Span) -> Option<usize> {
+    let mut index = 0usize;
+    let mut cursor = args.walk();
+    for argument in args.named_children(&mut cursor) {
+        if argument.is_extra() {
+            continue;
+        }
+        if Span::from_node(argument).contains(target) {
+            return Some(index);
+        }
+        index = index.saturating_add(1);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_assignment(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    document: &Document,
+    lhs: Node<'_>,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(identifier) = last_identifier_with_budget(lhs, cancel, budget)? else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let mut state = super::ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        document,
+        offset.min(identifier.start_byte()),
+        identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let expected = expected_value_for_symbols(index, candidates, cancel, budget)?;
+    if expected == ExpectedCompletionValue::Unknown
+        && is_implicit_result_reference_with_budget(document, identifier, cancel, budget)?
+    {
+        let scope = document.scope_at(identifier.start_byte());
+        if let Some(annotation) = document.result_type_annotation_for_body_scope(scope) {
+            return expected_value_for_type_ref_in_document(
+                index,
+                current_uri,
+                document,
+                &annotation.type_ref,
+                Some(annotation.scope),
+                cancel,
+                budget,
+            );
+        }
+    }
+    Ok(expected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_argument(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    document: &Document,
+    call: Node<'_>,
+    argument_index: usize,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(entity) = call.child_by_field_name("entity") else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let lookup_identifier = super::callable_lookup_identifier(entity);
+    let mut state = super::ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        document,
+        offset.min(lookup_identifier.start_byte()),
+        lookup_identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let mut expected = Vec::new();
+    for candidate in candidates {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&candidate) else {
+            continue;
+        };
+        if symbol.kind != SymbolKind::Routine {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        }
+        let Some(parameter) = symbol.routine_parameters.get(argument_index) else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        expected.push(expected_value_for_type_ref(
+            index,
+            &candidate,
+            symbol,
+            parameter.type_ref.as_ref(),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn expected_value_for_symbols(
+    index: &NavigationIndex,
+    candidates: Vec<super::Candidate>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let mut expected = Vec::new();
+    for candidate in candidates {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&candidate) else {
+            continue;
+        };
+        expected.push(expected_value_for_type_ref(
+            index,
+            &candidate,
+            symbol,
+            symbol.type_ref.as_ref(),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn combine_expected_values(
+    values: Vec<ExpectedCompletionValue>,
+) -> Result<ExpectedCompletionValue, String> {
+    if values.is_empty() {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    if values.contains(&ExpectedCompletionValue::Unknown) {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    if values.contains(&ExpectedCompletionValue::Callable) {
+        if values
+            .iter()
+            .all(|value| *value == ExpectedCompletionValue::Callable)
+        {
+            return Ok(ExpectedCompletionValue::Callable);
+        }
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    Ok(ExpectedCompletionValue::NonCallable)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_type_ref(
+    index: &NavigationIndex,
+    candidate: &super::Candidate,
+    symbol: &Symbol,
+    type_ref: Option<&super::TypeRef>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(type_ref) = type_ref else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    expected_value_for_type_ref_in_document(
+        index,
+        &candidate.uri,
+        document,
+        type_ref,
+        Some(symbol.scope),
+        cancel,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_type_ref_in_document(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    type_ref: &super::TypeRef,
+    scope: Option<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let mut state = super::ResolutionState::new();
+    let receivers = index.type_receivers_for_type_ref_with_budget(
+        uri,
+        document,
+        type_ref.span.start,
+        type_ref,
+        identifier,
+        scope,
+        &GenericSubstitution::empty(),
+        &mut state,
+        cancel,
+        budget,
+    )?;
+    if receivers.is_empty() {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    let mut callable = false;
+    let mut non_callable = false;
+    let mut unknown = false;
+    for receiver in receivers {
+        match receiver {
+            Receiver::Type(instance) if instance.kind == TypeKind::Callable => callable = true,
+            Receiver::Type(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
+                non_callable = true;
+            }
+            Receiver::Unit(_) => unknown = true,
+        }
+    }
+    Ok(if unknown || (callable && non_callable) {
+        ExpectedCompletionValue::Unknown
+    } else if callable {
+        ExpectedCompletionValue::Callable
+    } else {
+        ExpectedCompletionValue::NonCallable
+    })
+}
+
+fn last_identifier_with_budget<'a>(
+    node: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    check_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    if node.kind() == "identifier" {
+        return Ok(Some(node));
+    }
+    for index in (0..node.named_child_count()).rev() {
+        let Some(child) = node.named_child(index) else {
+            continue;
+        };
+        if let Some(identifier) = last_identifier_with_budget(child, cancel, budget)? {
+            return Ok(Some(identifier));
+        }
+    }
+    Ok(None)
+}
+
+fn generic_suffix_follows_completion(
+    document: &Document,
+    entity: Node<'_>,
+    template: Node<'_>,
+    replacement_end: usize,
+) -> bool {
+    let suffix_start = entity.end_byte().max(replacement_end);
+    document
+        .source
+        .get(suffix_start..template.end_byte())
+        .is_some_and(|suffix| suffix.trim_start().starts_with('<'))
 }
 
 fn routine_call_snippet(
@@ -3343,6 +3848,13 @@ fn routine_call_snippet(
     budget: &mut AssistanceBudget,
 ) -> Result<Option<String>, String> {
     if symbol.kind != SymbolKind::Routine {
+        return Ok(None);
+    }
+    if !symbol.generic_parameters.is_empty()
+        && symbol.generic_parameters.iter().any(|parameter| {
+            substitution.is_none_or(|substitution| substitution.get(&parameter.name).is_none())
+        })
+    {
         return Ok(None);
     }
     let Some(document) = index.documents.get(&candidate.uri) else {

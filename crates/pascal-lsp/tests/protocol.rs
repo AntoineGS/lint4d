@@ -717,6 +717,26 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn pending_request_count(&self, method: &str) -> usize {
+        self.pending
+            .iter()
+            .filter(
+                |message| matches!(message, Message::Request(request) if request.method == method),
+            )
+            .count()
+    }
+
+    #[cfg(feature = "test-support")]
+    fn assert_no_request(&self, method: &str) {
+        let count = self.pending_request_count(method);
+        assert_eq!(
+            count, 0,
+            "unexpected {count} buffered request(s) for {method}: {:?}",
+            self.pending
+        );
+    }
+
+    #[cfg(feature = "test-support")]
     fn next_message(&mut self) -> Message {
         self.pending
             .pop_front()
@@ -2638,6 +2658,89 @@ fn server_indexing_progress_requires_create_ack_and_closes_after_diagnostics() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn interleaved_configuration_and_progress_responses_route_by_request_type() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    let initialize_id = RequestId::from("interleaved-routing-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {
+                "window": {"workDoneProgress": true},
+                "workspace": {"configuration": true}
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+    let initial_configuration = server.request("workspace/configuration");
+    server.send(Message::Response(Response::new_ok(
+        initial_configuration.id,
+        json!([{"projectFile": null}]),
+    )));
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let create = server.request("window/workDoneProgress/create");
+    barrier.wait_until_entered();
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let refreshed_configuration = server.request("workspace/configuration");
+    assert_eq!(refreshed_configuration.method, "workspace/configuration");
+
+    // Deliver the progress-create response while a Task20 configuration
+    // request is pending, then deliver the configuration response.  The
+    // response IDs must be routed by their request registries, not by arrival
+    // order or generic error handling.
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+    server.send(Message::Response(Response::new_ok(
+        refreshed_configuration.id,
+        json!([{"projectFile": null}]),
+    )));
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["value"]["kind"], "begin");
+    let token = begin["token"].clone();
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], token);
+    assert_eq!(report["value"]["kind"], "report");
+
+    barrier.release();
+    assert!(
+        server
+            .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+            .is_some(),
+        "interleaved configuration must not block diagnostics"
+    );
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], token);
+    assert_eq!(end["value"]["kind"], "end");
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn late_server_progress_create_ack_after_success_is_ignored() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
@@ -2897,6 +3000,101 @@ fn cancelling_server_diagnostic_progress_discards_old_result_and_retries() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn rapid_diagnostic_invalidation_retires_old_progress_before_fresh_retry() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let initial = "unit Main;\ninterface\nimplementation\nend.\n";
+    let changed = "unit Main;\ninterface\nprocedure Run;\nimplementation\nend.\n";
+    write_file(&source, initial);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize_with_progress(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": initial
+            }
+        }),
+    );
+
+    let first_create = server.request("window/workDoneProgress/create");
+    let first_token = first_create.params["token"].clone();
+    barrier.wait_until_entered();
+    server.send(Message::Response(Response::new_ok(
+        first_create.id,
+        Value::Null,
+    )));
+    let first_begin = server.notification("$/progress");
+    assert_eq!(first_begin["token"], first_token);
+    assert_eq!(first_begin["value"]["kind"], "begin");
+    let first_report = server.notification("$/progress");
+    assert_eq!(first_report["token"], first_token);
+    assert_eq!(first_report["value"]["kind"], "report");
+
+    // Two source invalidations arrive before the cancelled worker is released;
+    // only the live diagnostic computation may own the first token.
+    for version in [2, 3] {
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&source), "version": version},
+                "contentChanges": [{"text": format!("{changed}\n// version {version}\n")}]
+            }),
+        );
+    }
+    let sync_id = RequestId::from("rapid-invalidation-sync".to_string());
+    server.send_request(sync_id.clone(), "workspace/symbol", json!({"query": "Run"}));
+    let sync = server.response(&sync_id);
+    assert!(
+        sync.error.is_none(),
+        "invalidation synchronization failed: {sync:?}"
+    );
+    let first_end = server.notification("$/progress");
+    assert_eq!(first_end["token"], first_token);
+    assert_eq!(first_end["value"]["kind"], "end");
+
+    // Force the fresh retry to use the same deterministic worker barrier;
+    // the cancelled worker exits by observing its flag, while the retry waits
+    // for an explicit release below.
+    let _ = fs::remove_file(&barrier.release);
+    let second_create = server.request("window/workDoneProgress/create");
+    let second_token = second_create.params["token"].clone();
+    assert_ne!(first_token, second_token);
+    server.send(Message::Response(Response::new_ok(
+        second_create.id,
+        Value::Null,
+    )));
+    let second_begin = server.notification("$/progress");
+    assert_eq!(second_begin["token"], second_token);
+    assert_eq!(second_begin["value"]["kind"], "begin");
+    let second_report = server.notification("$/progress");
+    assert_eq!(second_report["token"], second_token);
+    assert_eq!(second_report["value"]["kind"], "report");
+
+    barrier.release();
+    let diagnostics = server
+        .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+        .expect("fresh retry must publish diagnostics");
+    assert_eq!(diagnostics["uri"], uri(&source).to_string());
+    assert_eq!(
+        diagnostics["version"], 3,
+        "retry must publish the newest version"
+    );
+    let second_end = server.notification("$/progress");
+    assert_eq!(second_end["token"], second_token);
+    assert_eq!(second_end["value"]["kind"], "end");
+    server.assert_no_progress();
+    server.assert_no_notification("textDocument/publishDiagnostics");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn shutdown_retires_unacknowledged_server_progress_creation() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
@@ -3029,16 +3227,6 @@ fn ignored_server_progress_creation_is_bounded_without_blocking_analysis() {
         }
         if version <= 32 {
             creates.push(server.request("window/workDoneProgress/create"));
-        } else {
-            assert!(
-                server
-                    .request_with_timeout(
-                        "window/workDoneProgress/create",
-                        Duration::from_millis(100)
-                    )
-                    .is_none(),
-                "the bounded create registry must not emit a 33rd ignored request"
-            );
         }
         assert!(
             server
@@ -3053,6 +3241,30 @@ fn ignored_server_progress_creation_is_bounded_without_blocking_analysis() {
             .iter()
             .all(|request| request.method == "window/workDoneProgress/create")
     );
+
+    // Wait for diagnostic 33 before checking the create channel.  Any create
+    // request for that operation is emitted at dispatch, before its
+    // diagnostic publication, and is therefore either buffered here or
+    // observed before the synchronized response below.  This avoids using a
+    // short absence window ahead of the workspace's diagnostic debounce.
+    let inspect_id = RequestId::from("ignored-create-bound-inspect".to_string());
+    server.send_request(
+        inspect_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main"}),
+    );
+    let inspect = server.response(&inspect_id);
+    assert!(
+        inspect.error.is_none(),
+        "post-diagnostic synchronization failed: {inspect:?}"
+    );
+    let extra_creates = server.pending_request_count("window/workDoneProgress/create");
+    assert_eq!(
+        creates.len() + extra_creates,
+        32,
+        "all emitted create requests must be counted after diagnostic completion"
+    );
+    server.assert_no_request("window/workDoneProgress/create");
 
     // A late acknowledgement for a terminal operation is consumed as a
     // bounded tombstone, not as a new visible lifecycle.
@@ -3116,7 +3328,21 @@ fn client_progress_token_collision_does_not_claim_server_diagnostic_progress() {
             .is_some(),
         "diagnostic computation must continue despite token collision"
     );
-    server.assert_no_notification("window/workDoneProgress/create");
+    let sync_id = RequestId::from("client-server-token-collision-sync".to_string());
+    server.send_request(
+        sync_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Other"}),
+    );
+    let sync = server.response(&sync_id);
+    assert!(
+        sync.error.is_none(),
+        "collision synchronization failed: {sync:?}"
+    );
+    // create is a JSON-RPC request, not a notification.  Check the correct
+    // channel after a response synchronization so a buffered forbidden
+    // request cannot hide behind a short absence window.
+    server.assert_no_request("window/workDoneProgress/create");
 
     barrier.release();
     let response = server.response(&request_id);
@@ -3416,8 +3642,7 @@ fn coalesced_progress_tokens_remain_isolated_when_one_request_cancels() {
 }
 
 #[cfg(feature = "test-support")]
-#[test]
-fn queued_request_cancellation_ends_its_progress_without_dispatch() {
+fn run_queued_progress_cancellation(cancel_with_work_done_token: bool) {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
     let provider = root.join("Provider.pas");
@@ -3470,7 +3695,14 @@ fn queued_request_cancellation_ends_its_progress_without_dispatch() {
     assert_eq!(queued_begin["token"], "queued-cancel-progress");
     assert_eq!(queued_begin["value"]["message"], "Queued for analysis");
 
-    server.send_notification("$/cancelRequest", json!({"id": queued_id}));
+    if cancel_with_work_done_token {
+        server.send_notification(
+            "window/workDoneProgress/cancel",
+            json!({"token": "queued-cancel-progress"}),
+        );
+    } else {
+        server.send_notification("$/cancelRequest", json!({"id": queued_id}));
+    }
     let queued_response = server.response(&queued_id);
     assert_eq!(
         queued_response.error.expect("queued cancellation").code,
@@ -3498,7 +3730,26 @@ fn queued_request_cancellation_ends_its_progress_without_dispatch() {
         blocker_ends.insert(token.to_string());
     }
     assert_eq!(blocker_ends.len(), 2);
+    assert_eq!(
+        fs::read(&barrier.entered)
+            .expect("queued cancellation barrier entries")
+            .len(),
+        2,
+        "cancelled queued work must not dispatch a third worker"
+    );
     server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_request_cancellation_ends_its_progress_without_dispatch() {
+    run_queued_progress_cancellation(false);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_work_done_progress_cancellation_ends_without_dispatch() {
+    run_queued_progress_cancellation(true);
 }
 
 #[cfg(feature = "test-support")]

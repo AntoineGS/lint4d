@@ -1716,8 +1716,6 @@ struct ProgressEntry {
     title: String,
     create_id: Option<RequestId>,
     begun: bool,
-    finished: bool,
-    finish_message: Option<String>,
 }
 
 /// Tracks work-done progress independently from request/response routing.
@@ -1728,6 +1726,8 @@ struct ProgressEntry {
 /// corresponding `window/workDoneProgress/create` request.  Keeping those two
 /// lifecycles separate prevents a late create response from being mistaken
 /// for a configuration response or from reviving a finished operation.
+/// Terminal, unacknowledged create IDs retain only bounded response tombstones;
+/// their cancellation targets and progress entries are retired immediately.
 #[derive(Debug)]
 struct ProgressTracker {
     server_supported: bool,
@@ -1736,6 +1736,7 @@ struct ProgressTracker {
     entries: HashMap<AnalysisJobId, Vec<ProgressEntry>>,
     tokens: HashMap<ProgressToken, ProgressTarget>,
     creates: HashMap<RequestId, (AnalysisJobId, ProgressToken)>,
+    retired_creates: HashSet<RequestId>,
 }
 
 impl ProgressTracker {
@@ -1747,6 +1748,7 @@ impl ProgressTracker {
             entries: HashMap::new(),
             tokens: HashMap::new(),
             creates: HashMap::new(),
+            retired_creates: HashSet::new(),
         }
     }
 
@@ -1778,8 +1780,6 @@ impl ProgressTracker {
             title: title.to_string(),
             create_id: None,
             begun: true,
-            finished: false,
-            finish_message: None,
         });
         if let Err(error) = send_progress_begin(connection, token, title, "Queued for analysis") {
             self.remove_token(token);
@@ -1795,7 +1795,11 @@ impl ProgressTracker {
         title: &str,
     ) -> Result<(), String> {
         if !self.server_supported
-            || self.creates.len() >= MAX_PROGRESS_CREATES
+            || self
+                .creates
+                .len()
+                .saturating_add(self.retired_creates.len())
+                >= MAX_PROGRESS_CREATES
             || self.tokens.len() >= MAX_PROGRESS_ENTRIES
         {
             return Ok(());
@@ -1826,8 +1830,6 @@ impl ProgressTracker {
             title: title.to_string(),
             create_id: Some(create_id.clone()),
             begun: false,
-            finished: false,
-            finish_message: None,
         });
         let request = Request::new(
             create_id.clone(),
@@ -1857,6 +1859,33 @@ impl ProgressTracker {
         Ok(())
     }
 
+    fn report_started_recipient(
+        &self,
+        connection: &Connection,
+        job_id: AnalysisJobId,
+        request_id: &RequestId,
+    ) -> Result<(), String> {
+        let Some(entry) = self
+            .entries
+            .get(&job_id)
+            .into_iter()
+            .flatten()
+            .find(|entry| {
+                entry.begun
+                    && matches!(
+                        &entry.target,
+                        ProgressTarget::Client {
+                            request_id: entry_request_id,
+                            ..
+                        } if entry_request_id == request_id
+                    )
+            })
+        else {
+            return Ok(());
+        };
+        send_progress_report(connection, &entry.token, "Analysis started")
+    }
+
     fn target(&self, token: &ProgressToken) -> Option<ProgressTarget> {
         self.tokens.get(token).cloned()
     }
@@ -1867,6 +1896,9 @@ impl ProgressTracker {
         response: &Response,
     ) -> Result<bool, String> {
         let Some((job_id, token)) = self.creates.remove(&response.id) else {
+            if self.retired_creates.remove(&response.id) {
+                return Ok(true);
+            }
             return Ok(false);
         };
         let Some(entries) = self.entries.get_mut(&job_id) else {
@@ -1882,15 +1914,10 @@ impl ProgressTracker {
             return Ok(true);
         }
         entry.begun = true;
+        entry.create_id = None;
         let title = entry.title.clone();
-        let finished = entry.finished;
-        let finish_message = entry.finish_message.clone();
         send_progress_begin(connection, &token, &title, "Indexing workspace")?;
         send_progress_report(connection, &token, "Indexing workspace")?;
-        if finished {
-            send_progress_end(connection, &token, finish_message.as_deref())?;
-            self.remove_token(&token);
-        }
         Ok(true)
     }
 
@@ -1929,26 +1956,22 @@ impl ProgressTracker {
         let Some(entries) = self.entries.remove(&job_id) else {
             return Ok(());
         };
-        let mut awaiting_create = Vec::new();
-        for mut entry in entries {
+        let mut first_error = None;
+        for entry in entries {
             if entry.begun {
                 if let Some(connection) = connection {
-                    send_progress_end(connection, &entry.token, message)?;
+                    if let Err(error) = send_progress_end(connection, &entry.token, message) {
+                        first_error.get_or_insert(error);
+                    }
                 }
-                self.tokens.remove(&entry.token);
-            } else if entry.create_id.is_some() {
-                entry.finished = true;
-                entry.finish_message = message.map(str::to_string);
-                awaiting_create.push(entry);
-            } else {
-                self.tokens.remove(&entry.token);
             }
+            if let Some(create_id) = entry.create_id {
+                self.creates.remove(&create_id);
+                self.retired_creates.insert(create_id);
+            }
+            self.tokens.remove(&entry.token);
         }
-        if awaiting_create.is_empty() {
-            return Ok(());
-        }
-        self.entries.insert(job_id, awaiting_create);
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn finish_target(
@@ -1972,6 +1995,7 @@ impl ProgressTracker {
         }
         if let Some(create_id) = entry.create_id {
             self.creates.remove(&create_id);
+            self.retired_creates.insert(create_id);
         }
         self.tokens.remove(token);
         if entries.is_empty() {
@@ -2010,6 +2034,7 @@ impl ProgressTracker {
         self.entries.clear();
         self.tokens.clear();
         self.creates.clear();
+        self.retired_creates.clear();
         Ok(())
     }
 }
@@ -2357,6 +2382,12 @@ struct QueuedClientAnalysis {
     features: ClientFeatures,
     recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientAnalysisState {
+    Queued,
+    Running,
 }
 
 #[derive(Debug)]
@@ -3279,7 +3310,7 @@ impl AnalysisJobs {
                     id: id.clone(),
                     work_done_token: work_done_token.clone(),
                 };
-                if self.attach_client(&primary_id, recipient.clone()) {
+                if let Some(state) = self.attach_client(&primary_id, recipient.clone()) {
                     self.request_to_job.insert(id, primary_id);
                     self.progress.begin_client(
                         connection,
@@ -3287,6 +3318,15 @@ impl AnalysisJobs {
                         &recipient,
                         &title,
                     )?;
+                    if state == ClientAnalysisState::Running {
+                        if let Some(connection) = connection {
+                            self.progress.report_started_recipient(
+                                connection,
+                                AnalysisJobId::Client(primary_id),
+                                &recipient.id,
+                            )?;
+                        }
+                    }
                     return Ok(());
                 }
                 self.observation_jobs.remove(key);
@@ -3339,20 +3379,20 @@ impl AnalysisJobs {
         &mut self,
         primary_id: &AnalysisComputationId,
         recipient: ClientRecipient,
-    ) -> bool {
+    ) -> Option<ClientAnalysisState> {
         if let Some(job) = self.pending.get_mut(primary_id) {
             if !job.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
                 job.recipients.push(recipient);
-                return true;
+                return Some(ClientAnalysisState::Running);
             }
         }
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
         ) {
             job.recipients.push(recipient);
-            return true;
+            return Some(ClientAnalysisState::Queued);
         }
-        false
+        None
     }
 
     fn remove_client_mapping(&mut self, id: &RequestId, primary_id: &AnalysisComputationId) {

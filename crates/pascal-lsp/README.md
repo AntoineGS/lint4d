@@ -121,8 +121,13 @@ Server-initiated indexing/diagnostic progress is used only when the client
 advertises `window.workDoneProgress: true`. The server first sends
 `window/workDoneProgress/create` and withholds progress notifications until a
 successful response. Failed, duplicate, unknown, or late create responses are
-ignored without delaying analysis. At most 32 create requests and 128 progress
-tokens are retained; create IDs use a separate `pascal-lsp-progress-create-`
+ignored without delaying analysis. Terminal work retires an unacknowledged
+create's active token immediately and retains only a bounded response
+tombstone, so a late acknowledgement cannot revive `begin`/`report` activity.
+At most 32 create requests/tombstones and 128 progress tokens are retained;
+once the create bound is saturated by ignored requests, further diagnostics
+continue without server-initiated progress until a response or shutdown
+releases a slot. Create IDs use a separate `pascal-lsp-progress-create-`
 namespace from configuration request IDs.
 
 `$/cancelRequest` cancels the exact request recipient. The server also accepts

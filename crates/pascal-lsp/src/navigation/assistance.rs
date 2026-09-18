@@ -1572,6 +1572,13 @@ impl NavigationIndex {
         }
         for (uri, document) in &self.documents {
             check_cancel(cancel)?;
+            if !self
+                .auto_import_unit_providers
+                .get(&unit_import_key(&document.unit_name))
+                .is_some_and(|providers| providers.iter().any(|provider| provider == uri))
+            {
+                continue;
+            }
             if uri == current_uri
                 || imported_provider_uris.contains(uri)
                 || active_units.contains(&document.unit_name)
@@ -2966,6 +2973,24 @@ fn identifier_prefix_start_with_budget(
     Ok(start)
 }
 
+pub(crate) fn completion_prefix_at_position(source: &str, position: Position) -> Option<String> {
+    let offset = text::position_to_offset(source, position)?;
+    let mut start = offset;
+    while start > 0 {
+        let (candidate, character) = source[..start].char_indices().next_back()?;
+        if is_identifier_continue(character) {
+            start = candidate;
+        } else {
+            break;
+        }
+    }
+    if start > 0 && source.as_bytes().get(start - 1) == Some(&b'&') {
+        start -= 1;
+    }
+    let prefix = source.get(start..offset)?;
+    (!prefix.is_empty()).then(|| prefix.to_owned())
+}
+
 fn is_identifier_continue(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
 }
@@ -3194,6 +3219,9 @@ fn auto_import_edit(
         if clause.contains_offset(offset) {
             return Ok(None);
         }
+        if uses_clause_is_conditionally_enclosed(document, clause) {
+            return Ok(None);
+        }
         if document
             .conditionals
             .directives
@@ -3254,13 +3282,6 @@ fn auto_import_edit(
     if !actual_keyword.eq_ignore_ascii_case(keyword) {
         return Ok(None);
     }
-    let rest = document
-        .source
-        .get(keyword_end..section.end.min(document.source.len()))
-        .unwrap_or_default();
-    let Some((line_end, newline_len)) = line_ending_after_keyword(rest) else {
-        return Ok(None);
-    };
     if document.has_parser_recovery_near(section)
         || document
             .conditionals
@@ -3270,9 +3291,12 @@ fn auto_import_edit(
     {
         return Ok(None);
     }
-    let insertion_offset = keyword_end
-        .saturating_add(line_end)
-        .saturating_add(newline_len);
+    let section_end = section.end.min(document.source.len());
+    let Some(insertion_offset) =
+        safe_absent_uses_insertion_offset(&document.source, keyword_end, section_end)
+    else {
+        return Ok(None);
+    };
     if document.has_parser_recovery_near(Span {
         start: insertion_offset,
         end: insertion_offset,
@@ -3329,6 +3353,28 @@ fn contains_comment(source: &str) -> bool {
     source.contains("//") || source.contains('{') || source.contains("(*")
 }
 
+fn uses_clause_is_conditionally_enclosed(document: &Document, span: Span) -> bool {
+    if !document.conditionals.complete {
+        return true;
+    }
+    let mut starts = Vec::new();
+    for directive in &document.conditionals.directives {
+        match directive.kind {
+            crate::conditional::DirectiveKind::ConditionalStart => starts.push(directive.start),
+            crate::conditional::DirectiveKind::ConditionalEnd => {
+                let Some(start) = starts.pop() else {
+                    return true;
+                };
+                if start <= span.start && span.end <= directive.end {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    !starts.is_empty()
+}
+
 fn indentation_for_import(source: &str, offset: usize, lower_bound: usize) -> String {
     let line_start = source[..offset]
         .rfind(['\r', '\n'])
@@ -3357,19 +3403,28 @@ fn indentation_for_import(source: &str, offset: usize, lower_bound: usize) -> St
         .unwrap_or_default()
 }
 
-fn line_ending_after_keyword(source: &str) -> Option<(usize, usize)> {
-    let index = source
-        .as_bytes()
-        .iter()
-        .position(|byte| *byte == b'\r' || *byte == b'\n')?;
-    let length = if source.as_bytes().get(index) == Some(&b'\r')
-        && source.as_bytes().get(index + 1) == Some(&b'\n')
-    {
-        2
-    } else {
-        1
-    };
-    Some((index, length))
+fn safe_absent_uses_insertion_offset(
+    source: &str,
+    keyword_end: usize,
+    section_end: usize,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut cursor = keyword_end;
+    while cursor < section_end {
+        match bytes[cursor] {
+            b' ' | b'\t' | 0x0b | 0x0c => cursor += 1,
+            b'\r' => {
+                return Some(if bytes.get(cursor + 1) == Some(&b'\n') {
+                    cursor + 2
+                } else {
+                    cursor + 1
+                });
+            }
+            b'\n' => return Some(cursor + 1),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn uses_clause_syntax_is_safe(
@@ -3463,10 +3518,6 @@ fn uses_clause_syntax_is_safe(
             if expect_path {
                 return false;
             }
-            continue;
-        }
-        if byte == b':' && source.as_bytes().get(cursor + 1) == Some(&b'=') {
-            cursor += 2;
             continue;
         }
         if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'&' {

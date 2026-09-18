@@ -776,6 +776,7 @@ fn compact_completion_records(
             include_payload: record.include_payload,
             missing_provider_candidate: record.missing_provider_candidate,
             missing_provider_scope: record.missing_provider_scope.clone(),
+            auto_import_scopes: record.auto_import_scopes.clone(),
         };
         let observation_bytes = compact_completion_record_bytes(&observation);
         bytes = bytes.saturating_add(observation_bytes);
@@ -831,6 +832,23 @@ fn missing_provider_scope_storage_bytes(
         .saturating_add(path_entry_storage_bytes(&scope.path_entry))
 }
 
+fn auto_import_scope_storage_bytes(
+    scope: &crate::workspace::rename::AutoImportProviderScope,
+) -> usize {
+    size_of::<crate::workspace::rename::AutoImportProviderScope>()
+        .saturating_add(path_storage_bytes(&scope.root))
+        .saturating_add(
+            scope
+                .provider_units
+                .iter()
+                .chain(scope.candidate_prefixes.iter())
+                .map(|value| size_of::<String>().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        )
+        .saturating_add(scope.read_policy.retained_size_hint())
+        .saturating_add(path_entry_storage_bytes(&scope.path_entry))
+}
+
 fn compact_completion_record_bytes(record: &SourceRecord) -> usize {
     size_of::<SourceRecord>()
         .saturating_add(record.uri.as_str().len())
@@ -870,6 +888,13 @@ fn compact_completion_record_bytes(record: &SourceRecord) -> usize {
                 .missing_provider_scope
                 .as_ref()
                 .map_or(0, missing_provider_scope_storage_bytes),
+        )
+        .saturating_add(
+            record
+                .auto_import_scopes
+                .iter()
+                .map(auto_import_scope_storage_bytes)
+                .sum::<usize>(),
         )
 }
 
@@ -4658,6 +4683,7 @@ mod tests {
             include_payload: false,
             missing_provider_candidate: false,
             missing_provider_scope: None,
+            auto_import_scopes: Vec::new(),
         }
     }
 

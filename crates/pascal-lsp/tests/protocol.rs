@@ -4626,6 +4626,30 @@ fn completion_auto_imports_an_implementation_symbol_after_existing_interface_use
         applied.contains("implementation\r\nuses AutoImportProvider;\r\n// implementation comment")
     );
     assert!(applied.contains("ExistingUnit in 'ExistingUnit.pas'; // preserve this comment"));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("auto-import-implementation-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "applied implementation binding: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
     server.shutdown();
 }
 
@@ -4633,7 +4657,7 @@ fn completion_auto_imports_an_implementation_symbol_after_existing_interface_use
 fn completion_auto_import_appends_to_an_existing_implementation_uses_clause() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let existing_path = temp.path().join("ExistingUnit.pas");
-    let provider_path = temp.path().join("AppendProvider.pas");
+    let provider_path = temp.path().join("Append").join("Provider.pas");
     let main_path = temp.path().join("AppendConsumer.pas");
     write_file(
         &existing_path,
@@ -4702,6 +4726,30 @@ fn completion_auto_import_appends_to_an_existing_implementation_uses_clause() {
     assert!(applied.contains(
         "  ExistingUnit in 'ExistingUnit.pas',\r\n  Append.Provider; // keep implementation comment"
     ));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("auto-import-append-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "appended implementation binding: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
     server.shutdown();
 }
 
@@ -5038,6 +5086,622 @@ fn completion_auto_import_resolution_rejects_a_late_ambiguous_unit_overlay() {
         .as_ref()
         .unwrap_or_else(|| panic!("late ambiguous unit must invalidate resolution: {response:?}"));
     assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_auto_import_resolution_rejects_provider_set_changes_during_worker() {
+    let provider_source =
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n";
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: TTarget;\n",
+        "begin Value := nil; end;\n",
+        "end.\n",
+    );
+    let negative_source = "unit Other;\ninterface\nimplementation\nend.\n";
+
+    for (case_name, change, new_overlay, expected_resolve_error, expect_fresh_item) in [
+        (
+            "negative-unit",
+            Some("unit Provider;\ninterface\nimplementation\nend.\n"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "negative-symbol",
+            Some("unit Other;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "new-overlay",
+            None,
+            Some(("New.pas", "unit Provider; interface implementation end.\n")),
+            true,
+            false,
+        ),
+        (
+            "unrelated-overlay",
+            Some("unit Other;\ninterface\nimplementation\nend.\n// unrelated\n"),
+            None,
+            false,
+            true,
+        ),
+    ] {
+        let environment = tempfile::tempdir().expect("isolated server environment");
+        let root = environment.path().join("workspace");
+        fs::create_dir_all(&root).expect("workspace root");
+        let provider_path = root.join("Provider.pas");
+        let consumer_path = root.join("Consumer.pas");
+        let other_path = root.join("Other.pas");
+        write_file(&provider_path, provider_source);
+        write_file(&consumer_path, consumer_source);
+        write_file(&other_path, negative_source);
+
+        let (mut server, barrier) =
+            TestServer::launch_with_completion_resolution_barrier(environment);
+        server.initialize_with_completion_resolve_properties(
+            &root,
+            json!(["documentation", "detail"]),
+            json!(["markdown"]),
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&other_path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": negative_source,
+                }
+            }),
+        );
+        let completion_id = RequestId::from(format!("provider-set-{case_name}-completion"));
+        server.send_request(
+            completion_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&consumer_path)},
+                "position": position_after(consumer_source, "TTarget", 0),
+            }),
+        );
+        let initial = server
+            .response(&completion_id)
+            .result
+            .expect("provider-set completion result");
+        let item = initial["items"]
+            .as_array()
+            .expect("provider-set completion items")
+            .iter()
+            .find(|item| item["label"] == "TTargetType")
+            .cloned()
+            .unwrap_or_else(|| panic!("provider-set candidate missing in {case_name}: {initial}"));
+
+        let resolve_id = RequestId::from(format!("provider-set-{case_name}-resolve"));
+        server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+        barrier.wait_until_entered();
+        if let Some(changed) = change {
+            server.send_notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri(&other_path), "version": 2},
+                    "contentChanges": [{"text": changed}],
+                }),
+            );
+        }
+        if let Some((name, text)) = new_overlay {
+            let path = root.join(name);
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&path),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": text,
+                    }
+                }),
+            );
+        }
+        // An unknown request is handled synchronously by the protocol loop;
+        // its response establishes that the preceding overlay notification was
+        // consumed while the resolve worker is paused.
+        let sync_id = RequestId::from(format!("provider-set-{case_name}-sync"));
+        server.send_request(sync_id.clone(), "review/sync", json!({}));
+        let sync = server.response(&sync_id);
+        assert!(
+            sync.error.is_some(),
+            "sync probe unexpectedly succeeded: {sync:?}"
+        );
+        barrier.release();
+        let resolved = server.response(&resolve_id);
+        assert_eq!(
+            resolved.error.is_some(),
+            expected_resolve_error,
+            "resolve result for {case_name}: {resolved:?}"
+        );
+
+        let fresh_id = RequestId::from(format!("provider-set-{case_name}-fresh"));
+        server.send_request(
+            fresh_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&consumer_path)},
+                "position": position_after(consumer_source, "TTarget", 0),
+            }),
+        );
+        let fresh = server
+            .response(&fresh_id)
+            .result
+            .expect("fresh provider-set completion result");
+        let has_item = fresh["items"]
+            .as_array()
+            .expect("fresh provider-set completion items")
+            .iter()
+            .any(|item| item["label"] == "TTargetType");
+        assert_eq!(
+            has_item, expect_fresh_item,
+            "fresh result for {case_name}: {fresh}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_auto_import_requires_project_unit_binding_and_preserves_namespace_binding() {
+    let assert_omitted = |case_name: &str, files: &[(&str, &str)], project: Option<&str>| {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        for (name, source) in files {
+            let path = temp.path().join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("fixture parent");
+            }
+            write_file(&path, source);
+        }
+        if let Some(project) = project {
+            write_file(&temp.path().join("App.dproj"), project);
+        }
+        let main_path = temp.path().join("Consumer.pas");
+        let main_source = files
+            .iter()
+            .find(|(name, _)| *name == "Consumer.pas")
+            .map(|(_, source)| *source)
+            .expect("consumer fixture");
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(main_source, "TTarget", 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "{case_name} completion failed: {response:?}"
+        );
+        let result = response.result.expect("binding-proof completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("binding-proof completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "unproven provider binding unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    };
+
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: TTarget;\n",
+        "begin Value := nil; end;\n",
+        "end.\n",
+    );
+    let provider_source =
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n";
+    let empty_other = "unit Other; interface implementation end.\n";
+
+    assert_omitted(
+        "filename-mismatch",
+        &[
+            ("WrongFilename.pas", provider_source),
+            ("Consumer.pas", consumer_source),
+        ],
+        None,
+    );
+    assert_omitted(
+        "project-subdirectory-without-search-path",
+        &[
+            ("sub/Provider.pas", provider_source),
+            ("Consumer.pas", consumer_source),
+        ],
+        Some(
+            "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource></PropertyGroup></Project>",
+        ),
+    );
+    assert_omitted(
+        "unit-alias-redirect",
+        &[
+            ("Provider.pas", provider_source),
+            ("Other.pas", empty_other),
+            ("Consumer.pas", consumer_source),
+        ],
+        Some(
+            "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitAlias>Provider=Other</DCC_UnitAlias></PropertyGroup></Project>",
+        ),
+    );
+
+    let temp = tempfile::tempdir().expect("namespace workspace");
+    let namespace_provider = temp.path().join("Vendor.Provider.pas");
+    let empty_provider = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("Consumer.pas");
+    write_file(
+        &namespace_provider,
+        "unit Vendor.Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &empty_provider,
+        empty_other.replace("Other", "Provider").as_str(),
+    );
+    write_file(
+        &temp.path().join("App.dproj"),
+        concat!(
+            "<Project><PropertyGroup>",
+            "<MainSource>Consumer.pas</MainSource>",
+            "<DCC_Namespace>Vendor</DCC_Namespace>",
+            "</PropertyGroup></Project>"
+        ),
+    );
+    write_file(&main_path, consumer_source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("namespace-binding-completion".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(consumer_source, "TTarget", 0),
+        }),
+    );
+    let result = server
+        .response(&request_id)
+        .result
+        .expect("namespace completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("namespace completion items")
+        .iter()
+        .find(|item| item["label"] == "TTargetType")
+        .cloned()
+        .expect("namespace provider completion item");
+    assert_eq!(
+        item["additionalTextEdits"][0]["newText"],
+        "uses Vendor.Provider;\n"
+    );
+    let applied = apply_completion_item(consumer_source, &item);
+    assert!(applied.contains("uses Vendor.Provider;"));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("namespace-binding-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "namespace binding locations: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&namespace_provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_omits_unsafe_absent_uses_in_comments_and_same_line_declarations() {
+    let provider_source =
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n";
+    let cases = [
+        (
+            "brace-comment-implementation",
+            concat!(
+                "unit Consumer;\ninterface\n",
+                "implementation { open comment\nclosed }\n",
+                "procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+            "TTarget",
+        ),
+        (
+            "paren-comment-interface",
+            concat!(
+                "unit Consumer;\n",
+                "interface (* open comment\nclosed *)\n",
+                "type TAlias = TTarget;\nimplementation\nend.\n",
+            ),
+            "TTarget",
+        ),
+        (
+            "same-line-implementation",
+            concat!(
+                "unit Consumer;\ninterface\n",
+                "implementation procedure Run;\n",
+                "var Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+            "TTarget",
+        ),
+    ];
+    for (case_name, source, needle) in cases {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        write_file(&temp.path().join("Provider.pas"), provider_source);
+        let main_path = temp.path().join("Consumer.pas");
+        write_file(&main_path, source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "{case_name} completion failed: {response:?}"
+        );
+        let result = response.result.expect("unsafe insertion completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("unsafe insertion completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "unsafe absent-uses insertion unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_auto_import_omits_dangling_and_repeated_uses_alias_operators() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    write_file(
+        &temp.path().join("Provider.pas"),
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &temp.path().join("Existing.pas"),
+        "unit Existing; interface implementation end.\n",
+    );
+    let cases = [
+        ("dangling", "uses Existing := ;\n"),
+        ("repeated", "uses Existing := Existing := ;\n"),
+    ];
+    for (case_name, uses_clause) in cases {
+        let source = format!(
+            "unit Consumer;\ninterface\nimplementation\n{uses_clause}procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n"
+        );
+        let main_path = temp.path().join(format!("{case_name}.pas"));
+        write_file(&main_path, &source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("malformed-{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(&source, "TTarget", 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        if let Some(error) = response.error {
+            assert!(
+                error
+                    .message
+                    .contains("assistance dependency scan incomplete"),
+                "unexpected {case_name} completion failure: {error:?}"
+            );
+            server.shutdown();
+            continue;
+        }
+        let result = response.result.expect("malformed uses completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("malformed uses completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "malformed uses unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_auto_import_omits_uses_clauses_enclosed_by_conditionals() {
+    let temp = tempfile::tempdir().expect("conditional workspace");
+    write_file(
+        &temp.path().join("Provider.pas"),
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &temp.path().join("Existing.pas"),
+        "unit Existing; interface implementation end.\n",
+    );
+    write_file(
+        &temp.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>ImplementationConsumer.pas</MainSource><DCC_Define>FOO</DCC_Define></PropertyGroup></Project>",
+    );
+    let cases = [
+        (
+            "implementation-active",
+            "ImplementationConsumer.pas",
+            concat!(
+                "unit ImplementationConsumer;\ninterface\nimplementation\n",
+                "{$IFDEF FOO}\nuses Existing;\n{$ENDIF}\n",
+                "procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+        ),
+        (
+            "interface-active",
+            "InterfaceConsumer.pas",
+            concat!(
+                "unit InterfaceConsumer;\ninterface\n",
+                "{$IFDEF FOO}\nuses Existing;\n{$ENDIF}\n",
+                "type TAlias = TTarget;\nimplementation\nend.\n",
+            ),
+        ),
+        (
+            "implementation-nested",
+            "NestedConsumer.pas",
+            concat!(
+                "unit NestedConsumer;\ninterface\nimplementation\n",
+                "{$IFDEF FOO}\n{$IFDEF BAR}\nuses Existing;\n{$ENDIF}\n{$ENDIF}\n",
+                "procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+        ),
+    ];
+    for (case_name, file_name, source) in cases {
+        let path = temp.path().join(file_name);
+        write_file(&path, source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "position": position_after(source, "TTarget", 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        if let Some(error) = response.error {
+            assert!(
+                error
+                    .message
+                    .contains("assistance dependency scan incomplete"),
+                "unexpected {case_name} completion failure: {error:?}"
+            );
+            server.shutdown();
+            continue;
+        }
+        let result = response.result.expect("conditional completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("conditional completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "conditionally enclosed uses unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_auto_import_uses_the_prefix_before_a_middle_of_token_caret() {
+    let temp = tempfile::tempdir().expect("middle-token workspace");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("Consumer.pas");
+    write_file(
+        &provider_path,
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: TTargetWrong;\n",
+        "begin Value := nil; end;\n",
+        "end.\n",
+    );
+    write_file(&main_path, source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let start = position_of(source, "TTargetWrong", 0);
+    let prefix_position = Position::new(
+        start.line,
+        start.character + "TTarget".encode_utf16().count() as u32,
+    );
+    let request_id = RequestId::from("middle-token-completion".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": prefix_position,
+        }),
+    );
+    let result = server
+        .response(&request_id)
+        .result
+        .expect("middle-token completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("middle-token completion items")
+        .iter()
+        .find(|item| item["label"] == "TTargetType")
+        .cloned()
+        .expect("middle-token auto-import item");
+    let applied = apply_completion_item(source, &item);
+    assert!(
+        applied.contains("Value: TTargetType;"),
+        "applied middle-token edit: {applied}"
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("middle-token-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "middle-token binding locations: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
     server.shutdown();
 }
 

@@ -742,6 +742,7 @@ fn lint_configuration_for_input(
                 include_payload: false,
                 missing_provider_candidate: false,
                 missing_provider_scope: None,
+                auto_import_scopes: Vec::new(),
             })
         })
         .collect();

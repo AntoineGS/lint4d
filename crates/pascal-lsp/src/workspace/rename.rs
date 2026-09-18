@@ -148,6 +148,9 @@ pub(crate) struct SourceRecord {
     /// from the synthetic direct candidate so live validation can notice a
     /// provider overlay in an existing nested directory without rescanning.
     pub(crate) missing_provider_scope: Option<MissingProviderScope>,
+    /// Bounded semantic observations used to prove that auto-import provider
+    /// uniqueness remains fresh without invalidating on unrelated comments.
+    pub(crate) auto_import_scopes: Vec<AutoImportProviderScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +176,28 @@ impl MissingProviderScope {
     pub(crate) fn allows_without_filesystem(&self, path: &Path) -> bool {
         self.read_policy
             .allows_path_without_filesystem(path, &self.path_entry.provenance)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoImportProviderScope {
+    pub(crate) root: PathBuf,
+    pub(crate) provider_units: Vec<String>,
+    pub(crate) candidate_prefixes: Vec<String>,
+    pub(crate) read_policy: ReadPolicy,
+    pub(crate) path_entry: ProjectPathEntry,
+}
+
+impl AutoImportProviderScope {
+    pub(crate) fn matches_path(&self, path: &Path) -> bool {
+        path_starts_with_ci(path, &self.root)
+            && self
+                .read_policy
+                .allows_path_without_filesystem(path, &self.path_entry.provenance)
+    }
+
+    pub(crate) fn path_is_accepted(&self, workspace: &Workspace, path: &Path) -> bool {
+        workspace.scope_path_is_accepted_for_auto_import(path, self)
     }
 }
 
@@ -1087,6 +1112,7 @@ fn path_record_at(
         include_payload,
         missing_provider_candidate: false,
         missing_provider_scope: None,
+        auto_import_scopes: Vec::new(),
     })
 }
 
@@ -1130,6 +1156,7 @@ pub(crate) fn source_for_input_with_cancel(
                 include_payload: false,
                 missing_provider_candidate: false,
                 missing_provider_scope: None,
+                auto_import_scopes: Vec::new(),
             },
         ));
     }
@@ -1172,6 +1199,7 @@ pub(crate) fn source_for_input_with_owner(
                 include_payload: false,
                 missing_provider_candidate: false,
                 missing_provider_scope: None,
+                auto_import_scopes: Vec::new(),
             },
         ));
     }
@@ -1228,6 +1256,7 @@ pub(crate) fn source_for_input_with_owner(
         include_payload: false,
         missing_provider_candidate: false,
         missing_provider_scope: None,
+        auto_import_scopes: Vec::new(),
     };
     Ok((disk.text, record))
 }
@@ -1618,7 +1647,7 @@ fn contains_any_identifier_bytes(source: &[u8], names: &[String]) -> bool {
     false
 }
 
-fn contains_any_identifier_prefix(source: &str, names: &[String]) -> bool {
+pub(crate) fn contains_any_identifier_prefix(source: &str, names: &[String]) -> bool {
     let bytes = source.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -1673,7 +1702,10 @@ fn contains_any_identifier_prefix_bytes(source: &[u8], names: &[String]) -> bool
     false
 }
 
-fn source_unit_name(source: &str, cancel: &AtomicBool) -> Result<Option<String>, String> {
+pub(crate) fn source_unit_name(
+    source: &str,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, String> {
     let bytes = source.as_bytes();
     let mut cursor = 0usize;
     let Some(keyword) = next_source_identifier(source, &mut cursor, cancel)? else {
@@ -2925,6 +2957,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_scopes: Vec::new(),
                 },
                 overlay.text.len(),
             )
@@ -3008,6 +3041,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_scopes: Vec::new(),
                 },
                 scan.bytes,
             )
@@ -3237,7 +3271,7 @@ pub(crate) fn build_snapshot(
             .document_contexts
             .insert(uri.clone(), context_key.clone());
     }
-    index.set_auto_import_unit_providers(auto_import_unit_providers);
+    index.set_auto_import_unit_providers(auto_import_unit_providers.clone());
     loader.index = index;
     loader.indexed_files = indexed_uris.clone();
     loader.indexed_sizes = indexed_sizes;
@@ -3286,6 +3320,43 @@ pub(crate) fn build_snapshot(
             });
         }
     }
+    if mode == SnapshotMode::Assistance {
+        if let Some(current_uri) = priority.first() {
+            let Some(context_key) = priority_contexts.get(current_uri).cloned() else {
+                auto_import_unit_providers.clear();
+                loader
+                    .index
+                    .set_auto_import_unit_providers(auto_import_unit_providers.clone());
+                return Err(format!(
+                    "auto-import provider context was not retained for {current_uri}"
+                ));
+            };
+            retain_resolvable_auto_import_providers(
+                &mut loader,
+                current_uri,
+                &context_key,
+                &mut auto_import_unit_providers,
+                &mut pins,
+                candidate_names,
+                cancel,
+            )?;
+            loader
+                .index
+                .set_auto_import_unit_providers(auto_import_unit_providers.clone());
+        }
+    }
+    if mode == SnapshotMode::Assistance {
+        if let Some(current_uri) = priority.first() {
+            if let Some(record) = records.get_mut(current_uri) {
+                record.auto_import_scopes = assistance_auto_import_scopes(
+                    &loader,
+                    &priority_contexts,
+                    &auto_import_unit_providers,
+                    candidate_names,
+                );
+            }
+        }
+    }
     if mode == SnapshotMode::Assistance && !complete {
         loader.index.set_auto_import_discovery_complete(false);
     }
@@ -3319,6 +3390,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_scopes: Vec::new(),
                 },
             )
         } else {
@@ -3352,6 +3424,7 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     missing_provider_scope: None,
+                    auto_import_scopes: Vec::new(),
                 },
             )
         };
@@ -3485,6 +3558,148 @@ pub(crate) fn ensure_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), S
             .as_deref()
             .unwrap_or("bounded source discovery did not finish");
         return Err(format!("rename workspace scan incomplete: {reason}"));
+    }
+    Ok(())
+}
+
+fn assistance_auto_import_scopes(
+    workspace: &Workspace,
+    priority_contexts: &HashMap<Url, ContextKey>,
+    providers: &HashMap<String, Vec<Url>>,
+    candidate_prefixes: &[String],
+) -> Vec<AutoImportProviderScope> {
+    if providers.is_empty() || candidate_prefixes.is_empty() {
+        return Vec::new();
+    }
+    let mut provider_units = providers
+        .iter()
+        .filter(|(_, candidates)| {
+            candidates.iter().any(|uri| {
+                workspace.index.source_text(uri).is_some_and(|source| {
+                    contains_any_identifier_prefix(source, candidate_prefixes)
+                })
+            })
+        })
+        .map(|(unit, _)| unit.clone())
+        .collect::<Vec<_>>();
+    provider_units.sort();
+    provider_units.dedup();
+    if provider_units.is_empty() {
+        return Vec::new();
+    }
+    let mut contexts = priority_contexts.values().cloned().collect::<Vec<_>>();
+    contexts.sort_by_key(|key| format!("{key:?}"));
+    contexts.dedup();
+    let mut scopes = Vec::new();
+    for context_key in contexts {
+        let Some(context) = workspace
+            .contexts
+            .get(&context_key)
+            .map(|state| &state.context)
+        else {
+            continue;
+        };
+        let mut roots = context.search_paths.clone();
+        roots.extend(
+            context
+                .main_source_entry
+                .iter()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        roots.extend(
+            context
+                .explicit_unit_entries
+                .values()
+                .flatten()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        roots.extend(mapped_source_roots(context));
+        if roots.is_empty() {
+            roots.extend(
+                workspace
+                    .roots
+                    .iter()
+                    .flat_map(|root| root.source_roots.iter().cloned()),
+            );
+        }
+        roots.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        roots.dedup_by(|left, right| paths_equal_ci(left, right));
+        for root in roots {
+            let root = absolute_path(root);
+            let path_entry = context
+                .search_path_entries
+                .iter()
+                .find(|entry| paths_equal_ci(&entry.path, &root))
+                .cloned()
+                .or_else(|| super::context_path_entry(context, &root))
+                .unwrap_or_else(|| ProjectPathEntry {
+                    path: root.clone(),
+                    provenance: ProjectPathProvenance::Configured,
+                });
+            scopes.push(AutoImportProviderScope {
+                root,
+                provider_units: provider_units.clone(),
+                candidate_prefixes: candidate_prefixes.to_vec(),
+                read_policy: context.read_policy.clone(),
+                path_entry,
+            });
+        }
+    }
+    scopes
+}
+
+fn retain_resolvable_auto_import_providers(
+    loader: &mut Workspace,
+    current_uri: &Url,
+    context_key: &ContextKey,
+    providers: &mut HashMap<String, Vec<Url>>,
+    pinned: &mut HashSet<Url>,
+    candidate_names: &[String],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let Some(context) = loader
+        .contexts
+        .get(context_key)
+        .map(|state| state.context.clone())
+    else {
+        providers.clear();
+        return Ok(());
+    };
+    let names = providers.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Some(candidates) = providers.get(&name) else {
+            continue;
+        };
+        if candidates.len() != 1 {
+            providers.remove(&name);
+            continue;
+        }
+        let expected = candidates[0].clone();
+        let has_candidate_prefix = candidates.iter().any(|uri| {
+            loader
+                .index
+                .source_text(uri)
+                .is_some_and(|source| contains_any_identifier_prefix(source, candidate_names))
+        });
+        if !has_candidate_prefix {
+            continue;
+        }
+        let lookup_name = super::aliased_unit_name(&context, &name);
+        let resolved = loader.resolve_unit_with_cancel(
+            current_uri,
+            &name,
+            &lookup_name,
+            &context,
+            context_key,
+            pinned,
+            Some(cancel),
+        )?;
+        if resolved.as_ref() != Some(&expected) {
+            providers.remove(&name);
+        }
     }
     Ok(())
 }
@@ -8012,6 +8227,7 @@ mod tests {
             include_payload: true,
             missing_provider_candidate: false,
             missing_provider_scope: None,
+            auto_import_scopes: Vec::new(),
         };
 
         let error = read_record_content_hash(&include, &record, &AtomicBool::new(false))

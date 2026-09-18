@@ -9,7 +9,7 @@ use super::rename::{
 };
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions,
-    SemanticTokenResolutionMode,
+    SemanticTokenResolutionMode, completion_prefix_at_position,
 };
 use crate::{NavigationIndex, NavigationTarget};
 #[cfg(test)]
@@ -794,7 +794,7 @@ fn assistance_snapshot(
 ) -> Result<RenameSnapshot, String> {
     let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
     let candidate_names = completion_position
-        .and_then(|position| super::rename::identifier_at_position(&source, position))
+        .and_then(|position| completion_prefix_at_position(&source, position))
         .into_iter()
         .collect::<Vec<_>>();
     let (_context, consumed_configuration) =
@@ -1368,6 +1368,7 @@ fn completion_observations_equal(
         && left.include_payload == right.include_payload
         && left.missing_provider_candidate == right.missing_provider_candidate
         && left.missing_provider_scope == right.missing_provider_scope
+        && left.auto_import_scopes == right.auto_import_scopes
         && match (&left.content_bytes, &right.content_bytes) {
             (Some(left), Some(right)) => left == right,
             _ => true,

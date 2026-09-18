@@ -3379,15 +3379,21 @@ fn completion_call_context(
                 return Ok(CompletionCallContext::Conservative);
             }
             expression_role = true;
-            expected_value = Some(expected_value_for_assignment(
-                index,
-                current_uri,
-                document,
-                lhs,
-                offset,
-                cancel,
-                budget,
-            )?);
+            // Ancestors are visited from the cursor outward.  The innermost
+            // applicable expression owns the expected value; retain Unknown
+            // too, so an outer context cannot turn an unresolved inner value
+            // into an unsafe snippet call.
+            if expected_value.is_none() {
+                expected_value = Some(expected_value_for_assignment(
+                    index,
+                    current_uri,
+                    document,
+                    lhs,
+                    offset,
+                    cancel,
+                    budget,
+                )?);
+            }
         }
         if ancestor.kind() == "exprCall" {
             let Some(args) = ancestor.child_by_field_name("args") else {
@@ -3400,16 +3406,21 @@ fn completion_call_context(
             let Some(argument_index) = argument_index_containing(args, target_span) else {
                 return Ok(CompletionCallContext::Conservative);
             };
-            expected_value = Some(expected_value_for_argument(
-                index,
-                current_uri,
-                document,
-                ancestor,
-                argument_index,
-                offset,
-                cancel,
-                budget,
-            )?);
+            // See the assignment case above: an inner argument expectation,
+            // including an unknown one, must not be overwritten by an outer
+            // call's parameter type.
+            if expected_value.is_none() {
+                expected_value = Some(expected_value_for_argument(
+                    index,
+                    current_uri,
+                    document,
+                    ancestor,
+                    argument_index,
+                    offset,
+                    cancel,
+                    budget,
+                )?);
+            }
         }
         if ancestor.kind() == "exprUnary" {
             let mut cursor = ancestor.walk();
@@ -3589,7 +3600,18 @@ fn expected_value_for_assignment(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<ExpectedCompletionValue, String> {
-    let Some(identifier) = last_identifier_with_budget(lhs, cancel, budget)? else {
+    if lhs.kind() == "exprSubscript" {
+        return expected_value_for_indexed_assignment(
+            index,
+            current_uri,
+            document,
+            lhs,
+            offset,
+            cancel,
+            budget,
+        );
+    }
+    let Some(identifier) = assignment_target_identifier(lhs, cancel, budget)? else {
         return Ok(ExpectedCompletionValue::Unknown);
     };
     let mut state = super::ResolutionState::new();
@@ -3621,6 +3643,274 @@ fn expected_value_for_assignment(
         }
     }
     Ok(expected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_indexed_assignment(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    document: &Document,
+    lhs: Node<'_>,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    // Resolve the container expression itself.  In particular, do not use
+    // the last identifier in `Container[Index]`: that is the index expression
+    // and says nothing about the destination element type.
+    let Some(entity) = lhs.child_by_field_name("entity") else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let lookup_identifier = super::callable_lookup_identifier(entity);
+    if lookup_identifier.kind() != "identifier" {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    let mut state = super::ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        document,
+        offset.min(lookup_identifier.start_byte()),
+        lookup_identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let mut expected = Vec::new();
+    for candidate in candidates {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&candidate) else {
+            continue;
+        };
+        expected.push(expected_value_for_indexed_symbol(
+            index, &candidate, symbol, cancel, budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn expected_value_for_indexed_symbol(
+    index: &NavigationIndex,
+    candidate: &super::Candidate,
+    symbol: &Symbol,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(type_ref) = symbol.type_ref.as_ref() else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(lookup_identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let mut state = super::ResolutionState::new();
+    let receivers = index.type_receivers_for_type_ref_with_budget(
+        &candidate.uri,
+        document,
+        type_ref.span.start,
+        type_ref,
+        lookup_identifier,
+        Some(symbol.scope),
+        &GenericSubstitution::empty(),
+        &mut state,
+        cancel,
+        budget,
+    )?;
+    let mut expected = Vec::new();
+    for receiver in receivers {
+        let Receiver::Type(instance) = receiver else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        if instance.kind != TypeKind::Array {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        }
+        let Some((element_uri, element_type_ref, element_scope)) =
+            array_element_type_ref(index, &instance, cancel, budget)?
+        else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        let Some(element_document) = index.documents.get(&element_uri) else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        expected.push(expected_value_for_type_ref_in_document(
+            index,
+            &element_uri,
+            element_document,
+            &element_type_ref,
+            Some(element_scope),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn array_element_type_ref(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Url, super::TypeRef, usize)>, String> {
+    let mut visited = HashSet::new();
+    array_element_type_ref_at_depth(index, instance, &mut visited, 0, cancel, budget)
+}
+
+fn array_element_type_ref_at_depth(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Url, super::TypeRef, usize)>, String> {
+    const MAX_ARRAY_TYPE_DEPTH: usize = 32;
+    if depth >= MAX_ARRAY_TYPE_DEPTH
+        || !visited.insert((instance.uri.clone(), instance.key.clone()))
+    {
+        return Ok(None);
+    }
+    let candidates = index.type_candidates_in_unit_with_budget(
+        &instance.uri,
+        &instance.key,
+        true,
+        cancel,
+        budget,
+    )?;
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let candidate = &candidates[0];
+    let Some(symbol) = index.symbol(candidate) else {
+        return Ok(None);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(None);
+    };
+    if let Some(type_node) = type_declaration_type_node(document, symbol, cancel, budget)? {
+        let mut declaration_type = type_node;
+        while matches!(declaration_type.kind(), "type" | "typeref") {
+            let Some(child) = first_named_child(declaration_type) else {
+                return Ok(None);
+            };
+            declaration_type = child;
+        }
+        if declaration_type.kind() == "declArray" {
+            let Some(element_node) = last_named_child(declaration_type) else {
+                return Ok(None);
+            };
+            let Some(element_type_ref) = super::type_ref_from_node(element_node, &document.source)
+            else {
+                return Ok(None);
+            };
+            return Ok(Some((
+                candidate.uri.clone(),
+                element_type_ref,
+                symbol.scope,
+            )));
+        }
+    }
+
+    let Some(alias_type_ref) = symbol.type_ref.as_ref() else {
+        return Ok(None);
+    };
+    let Some(lookup_identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        alias_type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut state = super::ResolutionState::new();
+    let receivers = index.type_receivers_for_type_ref_with_budget(
+        &candidate.uri,
+        document,
+        alias_type_ref.span.start,
+        alias_type_ref,
+        lookup_identifier,
+        Some(symbol.scope),
+        &GenericSubstitution::empty(),
+        &mut state,
+        cancel,
+        budget,
+    )?;
+    let mut array_instance = None;
+    for receiver in receivers {
+        let Receiver::Type(receiver) = receiver else {
+            return Ok(None);
+        };
+        if receiver.kind != TypeKind::Array {
+            return Ok(None);
+        }
+        if array_instance.replace(receiver).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(array_instance) = array_instance else {
+        return Ok(None);
+    };
+    array_element_type_ref_at_depth(
+        index,
+        &array_instance,
+        visited,
+        depth.saturating_add(1),
+        cancel,
+        budget,
+    )
+}
+
+fn type_declaration_type_node<'a>(
+    document: &'a Document,
+    symbol: &Symbol,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let Some(mut current) = node_at_offset(
+        document.tree.root_node(),
+        symbol.declaration_span.start,
+        cancel,
+        budget,
+        MAX_COMPLETION_CONTEXT_NODES,
+        "completion",
+    )?
+    else {
+        return Ok(None);
+    };
+    loop {
+        if current.kind() == "declType" {
+            return Ok(current.child_by_field_name("type"));
+        }
+        let Some(parent) = current.parent() else {
+            return Ok(None);
+        };
+        current = parent;
+    }
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    (0..node.named_child_count()).find_map(|index| node.named_child(index))
+}
+
+fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    (0..node.named_child_count())
+        .rev()
+        .find_map(|index| node.named_child(index))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3805,25 +4095,28 @@ fn expected_value_for_type_ref_in_document(
     })
 }
 
-fn last_identifier_with_budget<'a>(
+fn assignment_target_identifier<'a>(
     node: Node<'a>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<Node<'a>>, String> {
     check_cancel(cancel)?;
     budget.require_work(1, cancel)?;
-    if node.kind() == "identifier" {
-        return Ok(Some(node));
-    }
-    for index in (0..node.named_child_count()).rev() {
-        let Some(child) = node.named_child(index) else {
-            continue;
-        };
-        if let Some(identifier) = last_identifier_with_budget(child, cancel, budget)? {
-            return Ok(Some(identifier));
+    match node.kind() {
+        "identifier" => Ok(Some(node)),
+        "exprDot" | "genericDot" | "exprTpl" => {
+            let field = if matches!(node.kind(), "exprDot" | "genericDot") {
+                "rhs"
+            } else {
+                "entity"
+            };
+            let Some(child) = node.child_by_field_name(field) else {
+                return Ok(None);
+            };
+            assignment_target_identifier(child, cancel, budget)
         }
+        _ => Ok(None),
     }
-    Ok(None)
 }
 
 fn generic_suffix_follows_completion(

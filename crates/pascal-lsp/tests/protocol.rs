@@ -3979,6 +3979,198 @@ fn completion_snippets_require_a_proven_expression_call_role() {
 }
 
 #[test]
+fn completion_snippets_preserve_inner_expected_types_and_index_destinations() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("NestedExpectedCompletion.pas");
+    let source = r#"unit NestedExpectedCompletion;
+interface
+type
+  TProc = procedure(Value: Integer);
+  TProcArray = array[0..1] of TProc;
+  TIntArray = array[0..1] of Integer;
+function Count(Callback: TProc): Integer;
+function Make(Value: Integer): Integer;
+procedure Consume(Value: Integer);
+function Opaque(Callback: TUnresolved): Integer;
+procedure Run(Value: Integer);
+implementation
+function Count(Callback: TProc): Integer;
+begin
+  Result := 1;
+end;
+function Make(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+procedure Consume(Value: Integer);
+begin
+end;
+function Opaque(Callback: TUnresolved): Integer;
+begin
+  Result := 1;
+end;
+procedure Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  Value, Index: Integer;
+  Callbacks: TProcArray;
+  Values: TIntArray;
+begin
+  Value := Count(Ru);
+  Consume(Count(Ru));
+  Consume(Ma);
+  Consume(Opaque(Ru));
+  Value := Ma;
+  Callbacks[Index] := Ru;
+  Callbacks[0] := Ru;
+  Values[Index] := Ma;
+  Values[0] := Ma;
+  Unknown[Index] := Ru;
+end;
+end.
+"#;
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize, label: &str| {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&source_path)},
+                    "position": position_after(source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            let result = response.result.expect("completion result");
+            result["items"]
+                .as_array()
+                .expect("completion items")
+                .iter()
+                .find(|item| item["label"] == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+        };
+    let mut failures = Vec::new();
+
+    for (id, needle, occurrence, original, replacement) in [
+        (
+            "nested-procedure-value",
+            "Count(Ru",
+            0,
+            "Value := Count(Ru);",
+            "Value := Count(Run);",
+        ),
+        (
+            "double-nested-procedure-value",
+            "Count(Ru",
+            1,
+            "Consume(Count(Ru));",
+            "Consume(Count(Run));",
+        ),
+        (
+            "unknown-nested-expected-value",
+            "Opaque(Ru",
+            0,
+            "Consume(Opaque(Ru));",
+            "Consume(Opaque(Run));",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, occurrence, "Run");
+        if item["textEdit"]["newText"] != "Run" || !item["insertTextFormat"].is_null() {
+            failures.push(format!(
+                "{id}: expected plain Run, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replacen(original, replacement, 1);
+        if expanded != expected {
+            failures.push(format!("{id}: expanded source was {expanded:?}"));
+        }
+    }
+
+    for (id, needle, occurrence) in [
+        ("nonprocedural-nested-value", "Consume(Ma", 0),
+        ("nonprocedural-indexed-value", "Values[Index] := Ma", 0),
+        ("nonprocedural-literal-indexed-value", "Values[0] := Ma", 0),
+        ("genuine-function-rvalue", "Value := Ma", 0),
+    ] {
+        let item = request(&mut server, id, needle, occurrence, "Make");
+        if item["textEdit"]["newText"] != "Make(${1:Value})$0" || item["insertTextFormat"] != 2 {
+            failures.push(format!(
+                "{id}: expected Make snippet, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+    }
+
+    for (id, needle, occurrence, replacement) in [
+        (
+            "indexed-procedure-value",
+            "Callbacks[Index] := Ru",
+            0,
+            "Callbacks[Index] := Run",
+        ),
+        (
+            "literal-indexed-procedure-value",
+            "Callbacks[0] := Ru",
+            0,
+            "Callbacks[0] := Run",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, occurrence, "Run");
+        if item["textEdit"]["newText"] != "Run" || !item["insertTextFormat"].is_null() {
+            failures.push(format!(
+                "{id}: expected plain Run, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replace(needle, replacement);
+        if expanded != expected {
+            failures.push(format!("{id}: expanded source was {expanded:?}"));
+        }
+    }
+
+    let unproven = request(
+        &mut server,
+        "unproven-indexed-destination",
+        "Unknown[Index] := Ru",
+        0,
+        "Run",
+    );
+    if unproven["textEdit"]["newText"] != "Run" || !unproven["insertTextFormat"].is_null() {
+        failures.push(format!(
+            "unproven-indexed-destination: expected plain Run, got {}",
+            unproven["textEdit"]["newText"]
+        ));
+    }
+    let expanded = apply_completion_item(source, &unproven);
+    let expected = source.replace("Unknown[Index] := Ru", "Unknown[Index] := Run");
+    if expanded != expected {
+        failures.push(format!(
+            "unproven-indexed-destination: expanded source was {expanded:?}"
+        ));
+    }
+
+    assert!(failures.is_empty(), "completion regressions: {failures:#?}");
+    server.shutdown();
+}
+
+#[test]
 fn completion_snippets_stay_plain_for_non_expression_syntax_roles() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let cases = [

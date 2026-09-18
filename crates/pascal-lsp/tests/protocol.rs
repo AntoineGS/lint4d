@@ -238,6 +238,49 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_navigation_and_configuration_preparation_barriers(
+        environment: TempDir,
+    ) -> (Self, TestBarrier, TestBarrier) {
+        let configuration_directory = environment.path().join("configuration-barrier");
+        let navigation_directory = environment.path().join("navigation-barrier");
+        fs::create_dir_all(&configuration_directory).expect("configuration barrier directory");
+        fs::create_dir_all(&navigation_directory).expect("navigation barrier directory");
+        let configuration = TestBarrier {
+            entered: configuration_directory.join("entered"),
+            release: configuration_directory.join("release"),
+        };
+        let navigation = TestBarrier {
+            entered: navigation_directory.join("entered"),
+            release: navigation_directory.join("release"),
+        };
+        let configuration_value = format!(
+            "{}|{}",
+            configuration.entered.display(),
+            configuration.release.display()
+        );
+        let navigation_value = format!(
+            "{}|{}",
+            navigation.entered.display(),
+            navigation.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                (
+                    "PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER",
+                    configuration_value.as_str(),
+                ),
+                (
+                    "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                    navigation_value.as_str(),
+                ),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, configuration, navigation)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier_and_filename_catalogue_limit(
         environment: TempDir,
         limit: usize,
@@ -1076,6 +1119,36 @@ impl TestServer {
                 "initializationOptions": initialization_options,
                 "capabilities": {
                     "workspace": workspace,
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn initialize_with_configuration_and_document_changes(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("configuration-document-changes-initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": initialization_options,
+                "capabilities": {
+                    "workspace": {
+                        "configuration": true,
+                        "workspaceFolders": true,
+                        "workspaceEdit": {"documentChanges": true}
+                    }
                 }
             }),
         );
@@ -26773,4 +26846,512 @@ fn runtime_configuration_preparation_does_not_block_protocol_shutdown() {
         .wait()
         .expect("wait for configuration shutdown");
     assert!(status.success(), "server exited unsuccessfully: {status}");
+}
+
+#[cfg(feature = "test-support")]
+fn begin_configuration_preparation(
+    server: &mut TestServer,
+    settings: Value,
+    barrier: &TestBarrier,
+) {
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": settings.clone()}}),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("runtime configuration refresh");
+    server.send(Message::Response(Response::new_ok(
+        refresh.id,
+        json!([settings]),
+    )));
+    barrier.wait_until_entered();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_rejects_a_deferred_rename_after_document_identity_changes() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let alpha_source = "unit Main; interface var Alpha: Integer; implementation procedure Run; begin Alpha := 1; end; end.\n";
+    let beta_source = alpha_source.replace("Alpha", "BetaVariable");
+    write_file(&main, alpha_source);
+
+    let (mut server, configuration_barrier, navigation_barrier) =
+        TestServer::launch_with_navigation_and_configuration_preparation_barriers(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": alpha_source
+            }
+        }),
+    );
+
+    begin_configuration_preparation(
+        &mut server,
+        json!({"maxFiles": 9999}),
+        &configuration_barrier,
+    );
+    let prepare_id = RequestId::from("deferred-alpha-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareRename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(alpha_source, "Alpha", 0)
+        }),
+    );
+    let rename_id = RequestId::from("deferred-alpha-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(alpha_source, "Alpha", 0),
+            "newName": "Renamed"
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": beta_source}]
+        }),
+    );
+
+    let ping_id = RequestId::from("deferred-rename-ordering-ping".to_string());
+    server.send_request(ping_id.clone(), "review/ping", Value::Null);
+    let ping = server
+        .response_with_timeout(&ping_id, Duration::from_secs(1))
+        .expect("later document change must be processed while preparation is held");
+    assert_eq!(ping.error.expect("unknown method error").code, -32601);
+
+    configuration_barrier.release();
+    navigation_barrier.wait_until_entered();
+    navigation_barrier.release();
+    let prepare = server.response(&prepare_id);
+    let prepare_error = prepare.error.expect("stale prepareRename must fail");
+    assert_eq!(prepare_error.code, -32803);
+    let rename = server.response(&rename_id);
+    let rename_error = rename.error.expect("stale rename must fail");
+    assert_eq!(rename_error.code, -32803);
+    assert!(
+        !rename
+            .result
+            .is_some_and(|value| value.to_string().contains("Renamed"))
+    );
+
+    let recovery_id = RequestId::from("deferred-beta-recovery".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&beta_source, "BetaVariable", 0),
+            "newName": "Renamed"
+        }),
+    );
+    let recovery = server.response(&recovery_id);
+    assert!(
+        recovery.error.is_none(),
+        "current-document rename failed: {recovery:?}"
+    );
+    assert!(
+        recovery
+            .result
+            .expect("recovery edit")
+            .to_string()
+            .contains("Renamed")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_rejects_a_deferred_rename_after_same_version_close_and_reopen() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main; interface var Alpha: Integer; implementation procedure Run; begin Alpha := 1; end; end.\n";
+    write_file(&main, source);
+
+    let (mut server, configuration_barrier, navigation_barrier) =
+        TestServer::launch_with_navigation_and_configuration_preparation_barriers(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    begin_configuration_preparation(
+        &mut server,
+        json!({"maxFiles": 9999}),
+        &configuration_barrier,
+    );
+
+    let rename_id = RequestId::from("same-version-reopen-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Alpha", 0),
+            "newName": "Renamed"
+        }),
+    );
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    configuration_barrier.release();
+    navigation_barrier.wait_until_entered();
+    navigation_barrier.release();
+
+    let response = server.response(&rename_id);
+    assert_eq!(
+        response
+            .error
+            .expect("same-version reopen must stale the request")
+            .code,
+        -32803
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_cancellation_allows_deferred_request_id_reuse() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main; interface procedure Run; implementation procedure Run; begin end; end.\n";
+    write_file(&main, source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    begin_configuration_preparation(&mut server, json!({"maxFiles": 9999}), &barrier);
+
+    let reused_id = RequestId::from("configuration-deferred-reused-id".to_string());
+    server.send_request(
+        reused_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": reused_id.clone()}));
+    let cancelled = server.response(&reused_id);
+    assert_eq!(cancelled.error.expect("cancellation error").code, -32800);
+
+    server.send_request(
+        reused_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.release();
+    let response = server.response(&reused_id);
+    assert!(
+        response.error.is_none(),
+        "reused deferred request failed: {response:?}"
+    );
+    server.assert_no_response(&reused_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_open_after_an_increased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let disk_source = "unit Main; interface implementation end.\n";
+    let overlay_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    write_file(&main, disk_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 64}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 10000}), &barrier);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": overlay_source
+            }
+        }),
+    );
+    let ping_id = RequestId::from("did-open-increase-ping".to_string());
+    server.send_request(ping_id.clone(), "review/ping", Value::Null);
+    let ping = server
+        .response_with_timeout(&ping_id, Duration::from_secs(1))
+        .expect("didOpen must not block protocol progress");
+    assert_eq!(ping.error.expect("unknown method error").code, -32601);
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-open-increase-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "increased limit lost didOpen: {symbols:?}"
+    );
+    let symbol_result = symbols.result.expect("document symbols");
+    let names = symbol_result
+        .as_array()
+        .expect("symbol array")
+        .iter()
+        .filter_map(|symbol| symbol["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"OverlayOnly"));
+    assert!(names.contains(&"Run"));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_open_after_a_decreased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let disk_source = "unit Main; interface implementation end.\n";
+    let oversized_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    let recovered_source = "unit Main; interface var R: Integer; implementation end.\n";
+    write_file(&main, disk_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server
+        .initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 10000}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 64}), &barrier);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": oversized_source
+            }
+        }),
+    );
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-open-decrease-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert_eq!(
+        symbols
+            .error
+            .expect("decreased limit must reject overlay")
+            .code,
+        -32803
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": recovered_source}]
+        }),
+    );
+    let recovery_id = RequestId::from("did-open-decrease-recovery".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let recovery = server.response(&recovery_id);
+    assert!(
+        recovery.error.is_none(),
+        "full replacement must recover: {recovery:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_change_after_an_increased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let short_source = "unit Main; interface implementation end.\n";
+    let oversized_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    write_file(&main, short_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 64}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": short_source
+            }
+        }),
+    );
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 10000}), &barrier);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": oversized_source}]
+        }),
+    );
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-change-increase-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "increased limit lost didChange: {symbols:?}"
+    );
+    assert!(
+        symbols
+            .result
+            .expect("document symbols")
+            .to_string()
+            .contains("OverlayOnly")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_change_after_a_decreased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let oversized_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    let recovered_source = "unit Main; interface var R: Integer; implementation end.\n";
+    write_file(&main, oversized_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server
+        .initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 10000}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": oversized_source
+            }
+        }),
+    );
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 64}), &barrier);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": oversized_source}]
+        }),
+    );
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-change-decrease-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert_eq!(
+        symbols
+            .error
+            .expect("decreased limit must reject change")
+            .code,
+        -32803
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 3},
+            "contentChanges": [{"text": recovered_source}]
+        }),
+    );
+    let recovery_id = RequestId::from("did-change-decrease-recovery".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let recovery = server.response(&recovery_id);
+    assert!(
+        recovery.error.is_none(),
+        "full replacement must recover: {recovery:?}"
+    );
+    server.shutdown();
 }

@@ -70,7 +70,7 @@ const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
-const MAX_CONFIGURATION_REQUEST_QUEUE: usize = 64;
+const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
 const MAX_COMPLETION_RESOLUTION_ENTRIES: usize = 2_048;
 const MAX_COMPLETION_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPLETION_RESOLUTION_DATA_BYTES: usize = 512;
@@ -1123,6 +1123,28 @@ struct ConfigurationPreparationResult {
     prepared: Result<PreparedWorkspaceOptions, String>,
 }
 
+#[derive(Debug, Clone)]
+struct DeferredDocumentIdentity {
+    uri: Url,
+    version: Option<i32>,
+    generation: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DeferredConfigurationRequest {
+    request: Request,
+    configuration_revision: u64,
+    document: Option<DeferredDocumentIdentity>,
+    preceding_document_notification: bool,
+    preceding_configuration_notification: bool,
+}
+
+#[derive(Debug)]
+enum DeferredConfigurationMessage {
+    Request(DeferredConfigurationRequest),
+    Notification(Notification),
+}
+
 struct PendingConfigurationPreparation {
     cancellation: Arc<AtomicBool>,
     handle: JoinHandle<()>,
@@ -1553,6 +1575,10 @@ impl ConfigurationCoordinator {
 
     fn is_preparing(&self) -> bool {
         self.preparation.is_busy()
+    }
+
+    fn deferred_request_revision(&self) -> u64 {
+        self.apply_revision
     }
 
     fn shutdown(&mut self) {
@@ -2414,18 +2440,32 @@ impl AnalysisJobs {
                             }
                         }
                         AnalysisRequest::Prepare { uri, position } => {
-                            let computed = rename::prepare_from_input(
-                                input,
-                                &uri,
-                                position,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Navigation,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::Prepare(computed.value),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::Prepare(Err(error)),
+                                }
+                            } else {
+                                let computed = rename::prepare_from_input(
+                                    input,
+                                    &uri,
+                                    position,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::Prepare(computed.value),
+                                }
                             }
                         }
                         AnalysisRequest::Rename {
@@ -2433,20 +2473,34 @@ impl AnalysisJobs {
                             position,
                             new_name,
                         } => {
-                            let computed = rename::rename_from_input(
-                                input,
-                                &uri,
-                                position,
-                                &new_name,
-                                features.document_changes,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Navigation,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::Rename(Box::new(computed.value)),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::Rename(Box::new(Err(error))),
+                                }
+                            } else {
+                                let computed = rename::rename_from_input(
+                                    input,
+                                    &uri,
+                                    position,
+                                    &new_name,
+                                    features.document_changes,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::Rename(Box::new(computed.value)),
+                                }
                             }
                         }
                         AnalysisRequest::CodeActions(params) => {
@@ -3906,7 +3960,7 @@ fn event_loop(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
-    let mut deferred_configuration_requests = VecDeque::new();
+    let mut deferred_configuration_messages = VecDeque::new();
     let mut jobs = AnalysisJobs::with_test_barriers(test_barriers);
     loop {
         if let Some(effect) = configuration.poll(workspace)? {
@@ -3934,10 +3988,23 @@ fn event_loop(
                 Duration::from_secs(86_400)
             });
         let message = if !configuration.is_preparing() {
-            if let Some(request) = deferred_configuration_requests.pop_front() {
-                Message::Request(request)
-            } else {
-                match connection.receiver.recv_timeout(timeout) {
+            match deferred_configuration_messages.pop_front() {
+                Some(DeferredConfigurationMessage::Request(deferred)) => {
+                    if !deferred_request_is_current(workspace, configuration, &deferred) {
+                        send_error(
+                            connection,
+                            deferred.request.id,
+                            ErrorCode::RequestFailed,
+                            "request became stale while configuration was prepared; retry the request",
+                        )?;
+                        continue;
+                    }
+                    Message::Request(deferred.request)
+                }
+                Some(DeferredConfigurationMessage::Notification(notification)) => {
+                    Message::Notification(notification)
+                }
+                None => match connection.receiver.recv_timeout(timeout) {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
                         if !shutdown_received {
@@ -3950,7 +4017,7 @@ fn event_loop(
                         configuration.shutdown();
                         return Ok(true);
                     }
-                }
+                },
             }
         } else {
             match connection.receiver.recv_timeout(timeout) {
@@ -3973,13 +4040,15 @@ fn event_loop(
             Message::Request(request) if request.method == "shutdown" => {
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
-                for deferred in deferred_configuration_requests.drain(..) {
-                    send_error(
-                        connection,
-                        deferred.id,
-                        ErrorCode::RequestCanceled,
-                        rename::CANCELLATION_MESSAGE,
-                    )?;
+                for deferred in deferred_configuration_messages.drain(..) {
+                    if let DeferredConfigurationMessage::Request(deferred) = deferred {
+                        send_error(
+                            connection,
+                            deferred.request.id,
+                            ErrorCode::RequestCanceled,
+                            rename::CANCELLATION_MESSAGE,
+                        )?;
+                    }
                 }
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
@@ -3995,15 +4064,55 @@ fn event_loop(
                 } else if configuration.is_preparing()
                     && request_requires_configuration(&request.method)
                 {
-                    if deferred_configuration_requests.len() >= MAX_CONFIGURATION_REQUEST_QUEUE {
+                    if deferred_configuration_messages.len() >= MAX_CONFIGURATION_DEFERRED_MESSAGES
+                    {
                         send_error(
                             connection,
                             request.id,
                             ErrorCode::ServerCancelled,
                             "configuration update is still being prepared; retry the request",
                         )?;
+                    } else if deferred_configuration_messages.iter().any(|deferred| {
+                        matches!(
+                            deferred,
+                            DeferredConfigurationMessage::Request(deferred)
+                                if deferred.request.id == request.id
+                        )
+                    }) {
+                        send_error(
+                            connection,
+                            request.id,
+                            ErrorCode::InvalidRequest,
+                            "analysis request ID is already in use",
+                        )?;
                     } else {
-                        deferred_configuration_requests.push_back(request);
+                        let preceding_document_notification =
+                            deferred_configuration_messages.iter().any(|deferred| {
+                                matches!(
+                                    deferred,
+                                    DeferredConfigurationMessage::Notification(notification)
+                                        if notification_may_change_document(&notification.method)
+                                )
+                            });
+                        let preceding_configuration_notification =
+                            deferred_configuration_messages.iter().any(|deferred| {
+                                matches!(
+                                    deferred,
+                                    DeferredConfigurationMessage::Notification(notification)
+                                        if notification_may_change_configuration(
+                                            &notification.method
+                                        )
+                                )
+                            });
+                        deferred_configuration_messages.push_back(
+                            DeferredConfigurationMessage::Request(deferred_configuration_request(
+                                request,
+                                workspace,
+                                configuration,
+                                preceding_document_notification,
+                                preceding_configuration_notification,
+                            )),
+                        );
                     }
                 } else {
                     let source_generation = workspace.source_generation();
@@ -4025,6 +4134,29 @@ fn event_loop(
                 configuration.shutdown();
                 return Ok(shutdown_received);
             }
+            Message::Notification(notification)
+                if configuration.is_preparing()
+                    && notification_requires_configuration_ordering(&notification.method) =>
+            {
+                let coalesce = notification.method == "workspace/didChangeConfiguration"
+                    && matches!(
+                        deferred_configuration_messages.back(),
+                        Some(DeferredConfigurationMessage::Notification(previous))
+                            if previous.method == "workspace/didChangeConfiguration"
+                    );
+                if coalesce {
+                    deferred_configuration_messages.pop_back();
+                } else if deferred_configuration_messages.len()
+                    >= MAX_CONFIGURATION_DEFERRED_MESSAGES
+                {
+                    return Err(
+                        "configuration transition queue is full; cannot safely defer a state-changing notification"
+                            .into(),
+                    );
+                }
+                deferred_configuration_messages
+                    .push_back(DeferredConfigurationMessage::Notification(notification));
+            }
             Message::Notification(notification) => {
                 if notification.method == "$/cancelRequest" {
                     if let Ok(id) = serde_json::from_value::<RequestId>(
@@ -4034,16 +4166,24 @@ fn event_loop(
                             .cloned()
                             .unwrap_or(Value::Null),
                     ) {
-                        if let Some(index) = deferred_configuration_requests
-                            .iter()
-                            .position(|request| request.id == id)
+                        if let Some(index) =
+                            deferred_configuration_messages.iter().position(|deferred| {
+                                matches!(
+                                    deferred,
+                                    DeferredConfigurationMessage::Request(request)
+                                        if request.request.id == id
+                                )
+                            })
                         {
-                            let request = deferred_configuration_requests
+                            let request = deferred_configuration_messages
                                 .remove(index)
                                 .expect("deferred configuration request");
+                            let DeferredConfigurationMessage::Request(request) = request else {
+                                unreachable!("deferred request predicate");
+                            };
                             send_error(
                                 connection,
-                                request.id,
+                                request.request.id,
                                 ErrorCode::RequestCanceled,
                                 rename::CANCELLATION_MESSAGE,
                             )?;
@@ -4175,6 +4315,87 @@ fn request_requires_configuration(method: &str) -> bool {
             | "textDocument/implementation"
             | "textDocument/formatting"
     )
+}
+
+fn notification_requires_configuration_ordering(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/didChangeConfiguration"
+            | "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+            | "workspace/didChangeWatchedFiles"
+            | "workspace/didChangeWorkspaceFolders"
+    )
+}
+
+fn notification_may_change_document(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+            | "workspace/didChangeWatchedFiles"
+            | "workspace/didChangeWorkspaceFolders"
+    )
+}
+
+fn notification_may_change_configuration(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/didChangeConfiguration" | "workspace/didChangeWorkspaceFolders"
+    )
+}
+
+fn request_document_uri(request: &Request) -> Option<Url> {
+    request
+        .params
+        .get("textDocument")
+        .and_then(|document| document.get("uri"))
+        .and_then(Value::as_str)
+        .and_then(|uri| uri.parse().ok())
+}
+
+fn deferred_configuration_request(
+    request: Request,
+    workspace: &Workspace,
+    configuration: &ConfigurationCoordinator,
+    preceding_document_notification: bool,
+    preceding_configuration_notification: bool,
+) -> DeferredConfigurationRequest {
+    let document = request_document_uri(&request).map(|uri| {
+        let (version, generation) = workspace.document_identity(&uri);
+        DeferredDocumentIdentity {
+            version,
+            generation,
+            uri,
+        }
+    });
+    DeferredConfigurationRequest {
+        request,
+        configuration_revision: configuration.deferred_request_revision(),
+        document,
+        preceding_document_notification,
+        preceding_configuration_notification,
+    }
+}
+
+fn deferred_request_is_current(
+    workspace: &Workspace,
+    configuration: &ConfigurationCoordinator,
+    deferred: &DeferredConfigurationRequest,
+) -> bool {
+    let configuration_current = configuration.deferred_request_revision()
+        == deferred.configuration_revision
+        || deferred.preceding_configuration_notification;
+    let document_current = deferred.document.as_ref().is_none_or(|document| {
+        let current = workspace.document_identity(&document.uri);
+        current == (document.version, document.generation)
+            || deferred.preceding_document_notification
+    });
+    configuration_current && document_current
 }
 
 fn handle_request(

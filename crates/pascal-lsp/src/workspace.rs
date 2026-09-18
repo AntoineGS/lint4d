@@ -509,6 +509,10 @@ struct OpenDocument {
     text: Option<String>,
     version: i32,
     rejection: Option<String>,
+    /// Source-generation watermark for this particular open-document
+    /// incarnation. A close followed by an open receives a new watermark
+    /// even when the client reuses a version.
+    identity_generation: u64,
 }
 
 struct DiskSource {
@@ -1106,6 +1110,7 @@ impl Workspace {
                         text: Some(overlay.text.clone()),
                         version: overlay.version,
                         rejection: None,
+                        identity_generation: input.source_generation,
                     },
                 )
             })
@@ -1127,6 +1132,7 @@ impl Workspace {
                             .copied()
                             .unwrap_or_default(),
                         rejection: Some(reason),
+                        identity_generation: input.source_generation,
                     },
                 )
             }))
@@ -1678,6 +1684,7 @@ impl Workspace {
                 text: Some(text),
                 version,
                 rejection: None,
+                identity_generation: self.source_generation,
             },
         );
         self.disk_stamps.remove(&uri);
@@ -1708,6 +1715,7 @@ impl Workspace {
                 text: None,
                 version,
                 rejection: Some(message),
+                identity_generation: self.source_generation,
             },
         );
         self.pending_diagnostics.insert(uri, Instant::now());
@@ -5359,6 +5367,14 @@ impl Workspace {
         self.open_documents
             .get(uri)
             .map(|document| document.version)
+    }
+
+    pub(crate) fn document_identity(&self, uri: &Url) -> (Option<i32>, Option<u64>) {
+        self.open_documents
+            .get(uri)
+            .map_or((None, None), |document| {
+                (Some(document.version), Some(document.identity_generation))
+            })
     }
 
     /// Check a completed dependency-scoped read-only computation against the

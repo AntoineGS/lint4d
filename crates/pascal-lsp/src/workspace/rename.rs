@@ -2718,6 +2718,7 @@ pub(crate) fn build_snapshot(
                 text: Some(overlay.text.clone()),
                 version: overlay.version,
                 rejection: None,
+                identity_generation: input.source_generation,
             },
         );
     }
@@ -2728,6 +2729,7 @@ pub(crate) fn build_snapshot(
                 text: None,
                 version: 0,
                 rejection: Some("open document was rejected by workspace limits".to_string()),
+                identity_generation: input.source_generation,
             },
         );
     }

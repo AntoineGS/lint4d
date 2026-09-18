@@ -125,6 +125,11 @@ pub(crate) struct SourceRecord {
     pub(crate) path: Option<PathBuf>,
     pub(crate) path_stamp: Option<PathStamp>,
     pub(crate) content_hash: Option<u64>,
+    /// Hash of the decoded source text that was actually parsed.  This is
+    /// retained separately from `content_hash`: a full source record may have
+    /// received a later raw-byte fingerprint, and that fingerprint must not
+    /// replace equality with the parsed source.
+    pub(crate) parsed_text_hash: Option<u64>,
     pub(crate) content_bytes: Option<Vec<u8>>,
     pub(crate) candidate_membership: Option<ProjectCandidateMembership>,
     /// The requester-scoped authorization used to read this closed source.
@@ -144,7 +149,7 @@ pub(crate) struct SourceRecord {
     pub(crate) missing_provider_scope: Option<MissingProviderScope>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissingProviderScope {
     pub(crate) root: PathBuf,
     pub(crate) names: Vec<String>,
@@ -732,7 +737,10 @@ impl Workspace {
                             .as_deref()
                             .is_none_or(|text| text_content_hash(text) != expected)
                     },
-                );
+                ) || document
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| parsed_source_changed(record, text));
                 if document.version != record.version.unwrap_or_default() || text_changed {
                     return Err(format!(
                         "source changed while resolving {}; retry the request",
@@ -777,7 +785,7 @@ impl Workspace {
             let content_changed = record.content_hash.map_or_else(
                 || current.text != record.text,
                 |expected| expected != current.content_hash,
-            );
+            ) || parsed_source_changed(record, &current.text);
             if content_changed {
                 return Err(format!(
                     "closed source changed while resolving {}; retry the request",
@@ -812,7 +820,7 @@ pub(crate) fn revalidate_input(
             let text_changed = record.content_hash.map_or_else(
                 || overlay.text != record.text,
                 |expected| text_content_hash(&overlay.text) != expected,
-            );
+            ) || parsed_source_changed(record, &overlay.text);
             if overlay.version != record.version.unwrap_or_default() || text_changed {
                 return Err(format!(
                     "source changed while resolving {}; retry the request",
@@ -851,7 +859,7 @@ pub(crate) fn revalidate_input(
         let content_changed = record.content_hash.map_or_else(
             || current.text != record.text,
             |expected| expected != current.content_hash,
-        );
+        ) || parsed_source_changed(record, &current.text);
         let overlay_changed = input
             .overlays
             .get(&record.uri)
@@ -990,6 +998,15 @@ pub(crate) fn text_content_hash(source: &str) -> u64 {
     hasher.finish()
 }
 
+pub(crate) fn parsed_source_changed(record: &SourceRecord, current_text: &str) -> bool {
+    record
+        .parsed_text_hash
+        .is_some_and(|expected| text_content_hash(current_text) != expected)
+        || (record.parsed_text_hash.is_none()
+            && !record.text.is_empty()
+            && current_text != record.text)
+}
+
 #[derive(Debug)]
 struct ScannedSource {
     data: Vec<u8>,
@@ -1059,6 +1076,7 @@ fn path_record_at(
         path: Some(path),
         path_stamp: stamp,
         content_hash,
+        parsed_text_hash: None,
         content_bytes,
         candidate_membership,
         read_policy,
@@ -1101,6 +1119,7 @@ pub(crate) fn source_for_input_with_cancel(
                 path: None,
                 path_stamp: None,
                 content_hash: None,
+                parsed_text_hash: Some(text_content_hash(&overlay.text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: None,
@@ -1142,6 +1161,7 @@ pub(crate) fn source_for_input_with_owner(
                 path: None,
                 path_stamp: None,
                 content_hash: None,
+                parsed_text_hash: Some(text_content_hash(&overlay.text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: None,
@@ -1197,6 +1217,7 @@ pub(crate) fn source_for_input_with_owner(
         path: None,
         path_stamp: None,
         content_hash: Some(disk.content_hash),
+        parsed_text_hash: Some(text_content_hash(&disk.text)),
         content_bytes: None,
         candidate_membership: None,
         read_policy: Some(read_policy),
@@ -2707,6 +2728,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    parsed_text_hash: Some(text_content_hash(&overlay.text)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: Some(read_policy.clone()),
@@ -2762,13 +2784,14 @@ pub(crate) fn build_snapshot(
                 source.clone(),
                 SourceRecord {
                     uri: uri.clone(),
-                    text: source,
+                    text: source.clone(),
                     version: None,
                     stamp: Some(stamp),
                     open: false,
                     path: None,
                     path_stamp: None,
                     content_hash: Some(scan.content_hash),
+                    parsed_text_hash: Some(text_content_hash(&source)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: Some(read_policy.clone()),
@@ -3061,6 +3084,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    parsed_text_hash: Some(text_content_hash(&overlay.text)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: None,
@@ -3086,13 +3110,14 @@ pub(crate) fn build_snapshot(
                 source.clone(),
                 SourceRecord {
                     uri: uri.clone(),
-                    text: source,
+                    text: source.clone(),
                     version: None,
                     stamp: Some(stamp),
                     open: false,
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    parsed_text_hash: Some(text_content_hash(&source)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: None,
@@ -7613,6 +7638,7 @@ mod tests {
             path: Some(include.clone()),
             path_stamp: None,
             content_hash: Some(1),
+            parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
             read_policy: None,

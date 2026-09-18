@@ -765,6 +765,10 @@ fn compact_completion_records(
             path: record.path.clone(),
             path_stamp: record.path_stamp.clone(),
             content_hash,
+            parsed_text_hash: record.parsed_text_hash.or_else(|| {
+                (!record.text.is_empty())
+                    .then(|| crate::workspace::rename::text_content_hash(&record.text))
+            }),
             content_bytes: None,
             candidate_membership: record.candidate_membership.clone(),
             read_policy: record.read_policy.clone(),
@@ -4473,12 +4477,13 @@ mod tests {
         AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisRequest, AnalysisResult,
         AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
         CompletionResolutionSeed, CompletionResolutionStore, CompletionResult, DocumentationFormat,
-        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
+        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
+        MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
         MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES, MAX_WATCHER_REGISTRATION_RETRIES,
         PendingAnalysis, PriorityQueue, deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
-    use crate::workspace::rename::install_snapshot_priority_barrier;
+    use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
     use crossbeam_channel::RecvTimeoutError;
     use lsp_server::{Connection, Message, RequestId, Response};
     use lsp_types::{
@@ -4632,6 +4637,80 @@ mod tests {
         assert!(
             store.request(&last).is_ok(),
             "newest entry must remain usable"
+        );
+    }
+
+    fn test_completion_record(uri: Url) -> SourceRecord {
+        SourceRecord {
+            uri,
+            text: String::new(),
+            version: Some(1),
+            stamp: None,
+            open: true,
+            path: None,
+            path_stamp: None,
+            content_hash: None,
+            parsed_text_hash: None,
+            content_bytes: None,
+            candidate_membership: None,
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
+            missing_provider_candidate: false,
+            missing_provider_scope: None,
+        }
+    }
+
+    #[test]
+    fn completion_resolution_store_enforces_context_record_and_byte_bounds() {
+        let base_uri = Url::parse("file:///completion-store-bounds.pas").expect("completion URI");
+        let at_limit = (0..MAX_COMPLETION_RESOLUTION_RECORDS)
+            .map(|index| {
+                test_completion_record(
+                    Url::parse(&format!("file:///completion-record-{index}.pas"))
+                        .expect("record URI"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut records_store = CompletionResolutionStore::new();
+        records_store
+            .register(test_completion_analysis(&base_uri, 0), 1, 1, &at_limit)
+            .expect("the exact retained-record limit must be accepted");
+
+        let too_many = (0..=MAX_COMPLETION_RESOLUTION_RECORDS)
+            .map(|index| {
+                test_completion_record(
+                    Url::parse(&format!("file:///completion-too-many-{index}.pas"))
+                        .expect("record URI"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut count_store = CompletionResolutionStore::new();
+        let error = count_store
+            .register(test_completion_analysis(&base_uri, 0), 1, 1, &too_many)
+            .expect_err("the retained-record limit must be enforced");
+        assert!(
+            error.contains("observations") || error.contains("bounded"),
+            "{error}"
+        );
+
+        let huge_uri = Url::parse(&format!(
+            "file:///{}",
+            "x".repeat(MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES)
+        ))
+        .expect("large completion URI");
+        let mut byte_store = CompletionResolutionStore::new();
+        let error = byte_store
+            .register(
+                test_completion_analysis(&huge_uri, 0),
+                1,
+                1,
+                &[test_completion_record(huge_uri)],
+            )
+            .expect_err("the retained context byte limit must be enforced");
+        assert!(
+            error.contains("byte") || error.contains("bounded"),
+            "{error}"
         );
     }
 

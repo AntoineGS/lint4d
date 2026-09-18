@@ -4001,6 +4001,117 @@ fn completion_resolution_preserves_generic_member_specialization() {
 }
 
 #[test]
+fn completion_resolution_preserves_the_exact_overloaded_declaration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("OverloadedProvider.pas");
+    let main_path = temp.path().join("OverloadedMain.pas");
+    let provider_source = "unit OverloadedProvider;\ninterface\n/// <summary>Integer overload documentation.</summary>\nfunction Pick(Value: Integer): Integer; overload;\n/// <summary>String overload documentation.</summary>\nfunction Pick(Value: string): Integer; overload;\nimplementation\nfunction Pick(Value: Integer): Integer;\nbegin\n  Result := Value;\nend;\nfunction Pick(Value: string): Integer;\nbegin\n  Result := Length(Value);\nend;\nend.\n";
+    let main_source = "unit OverloadedMain;\ninterface\nuses OverloadedProvider;\nimplementation\nprocedure Caller;\nbegin\n  Pi\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("overloaded-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Pi", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("overloaded completion result");
+    let items = initial["items"]
+        .as_array()
+        .expect("overloaded completion items");
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "Pick")
+        .cloned()
+        .expect("overloaded Pick item");
+    assert!(item["documentation"].is_null());
+    assert!(item["detail"].is_null());
+
+    let resolve_id = RequestId::from("overloaded-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "overloaded resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("overloaded resolved item");
+    assert_eq!(
+        resolved["detail"],
+        "function Pick(Value: Integer): Integer;"
+    );
+    assert_eq!(
+        resolved["documentation"]["value"],
+        "Integer overload documentation."
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_preserves_the_exact_helper_declaration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("HelperCompletion.pas");
+    let source = "unit HelperCompletion;\ninterface\ntype\n  TWidget = class\n  end;\n  TWidgetHelper = class helper for TWidget\n    /// <summary>Helper method documentation.</summary>\n    procedure Assist(Value: Integer);\n  end;\n\nprocedure Caller;\n\nimplementation\n\nprocedure TWidgetHelper.Assist(Value: Integer);\nbegin\nend;\n\nprocedure Caller;\nvar\n  Widget: TWidget;\nbegin\n  Widget.Assist(1);\n  Widget.\nend;\n\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("helper-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Widget.", 1)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("helper completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("helper completion items")
+        .iter()
+        .find(|item| item["label"] == "Assist")
+        .cloned()
+        .expect("helper Assist item");
+    assert!(item["documentation"].is_null());
+    assert!(item["detail"].is_null());
+
+    let resolve_id = RequestId::from("helper-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "helper resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("helper resolved item");
+    assert_eq!(resolved["detail"], "procedure Assist(Value: Integer);");
+    assert_eq!(
+        resolved["documentation"]["value"],
+        "Helper method documentation."
+    );
+    server.shutdown();
+}
+
+#[test]
 fn completion_resolution_rejects_a_requester_overlay_changed_after_completion() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("RequesterCompletion.pas");
@@ -4057,6 +4168,79 @@ fn completion_resolution_rejects_a_requester_overlay_changed_after_completion() 
     server.shutdown();
 }
 
+#[test]
+fn completion_resolution_rejects_a_provider_overlay_change() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main_path = temp.path().join("OverlayMain.pas");
+    let provider_path = temp.path().join("OverlayProvider.pas");
+    let main_source = "unit OverlayMain;\ninterface\nuses OverlayProvider;\nimplementation\nprocedure Caller;\nbegin\n  OverlayDoc\nend;\nend.\n";
+    let provider_source = "unit OverlayProvider;\ninterface\n/// <summary>Original provider documentation.</summary>\nfunction OverlayDocumented: Integer;\nimplementation\nfunction OverlayDocumented: Integer;\nbegin\n  Result := 1;\nend;\nend.\n";
+    let changed_provider = provider_source.replace(
+        "Original provider documentation",
+        "Changed provider documentation",
+    );
+    write_file(&main_path, main_source);
+    write_file(&provider_path, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+    let completion_id = RequestId::from("provider-overlay-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  OverlayDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("provider overlay completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("provider overlay completion items")
+        .iter()
+        .find(|item| item["label"] == "OverlayDocumented")
+        .cloned()
+        .expect("provider overlay completion item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": changed_provider
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("provider-overlay-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("provider overlay change must invalidate resolution");
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn completion_resolution_cancellation_returns_once_while_worker_is_in_flight() {
@@ -4103,6 +4287,70 @@ fn completion_resolution_cancellation_returns_once_while_worker_is_in_flight() {
     assert_eq!(error.message, "request cancelled");
     barrier.release();
     server.assert_no_response(&resolve_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_resolution_rejects_stale_non_cancelled_worker_delivery() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("StaleCompletion.pas");
+    let source = "unit StaleCompletion;\ninterface\n/// <summary>Original documentation.</summary>\nfunction OriginalDocumented: Integer;\nimplementation\nfunction OriginalDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  OriginalDoc\nend;\nend.\n";
+    let changed_source = source.replace("OriginalDoc", "ChangedDoc");
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_completion_resolution_barrier(environment);
+    server.initialize_with_completion_resolve_properties(
+        &root,
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("stale-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  OriginalDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("stale completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("stale completion items")
+        .iter()
+        .find(|item| item["label"] == "OriginalDocumented")
+        .cloned()
+        .expect("stale completion item");
+
+    let resolve_id = RequestId::from("stale-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": changed_source
+            }
+        }),
+    );
+    barrier.release();
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("a changed workspace must reject the non-cancelled worker result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
     server.shutdown();
 }
 

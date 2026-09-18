@@ -2327,6 +2327,7 @@ impl Workspace {
                 path: None,
                 path_stamp: None,
                 content_hash: None,
+                parsed_text_hash: Some(rename::text_content_hash(text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: None,
@@ -2363,6 +2364,7 @@ impl Workspace {
                 path: Some(path.to_path_buf()),
                 path_stamp: path_stamp(path),
                 content_hash: Some(content_hash),
+                parsed_text_hash: Some(rename::text_content_hash(text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: Some(read_policy.clone()),
@@ -2424,6 +2426,7 @@ impl Workspace {
                     path: Some(path),
                     path_stamp,
                     content_hash: content.as_ref().map(|bytes| content_hash_bytes(bytes)),
+                    parsed_text_hash: None,
                     content_bytes: content.clone(),
                     candidate_membership: None,
                     read_policy: None,
@@ -4393,6 +4396,7 @@ impl Workspace {
                         path: Some(path.clone()),
                         path_stamp: path_stamp(&path),
                         content_hash: None,
+                        parsed_text_hash: None,
                         content_bytes: None,
                         candidate_membership: None,
                         read_policy: None,
@@ -4444,6 +4448,7 @@ impl Workspace {
                     path: Some(path.clone()),
                     path_stamp: path_stamp(&path),
                     content_hash: None,
+                    parsed_text_hash: None,
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: None,
@@ -4979,7 +4984,7 @@ impl Workspace {
                     || record
                         .content_hash
                         .is_some_and(|expected| rename::text_content_hash(text) != expected)
-                    || record.content_hash.is_none() && text != record.text
+                    || rename::parsed_source_changed(record, text)
                 {
                     return Err(format!(
                         "source changed while resolving {}; retry the request",

@@ -222,13 +222,29 @@ pub(crate) fn completion_metadata_from_input(
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    let records = snapshot_records(&snapshot);
+    let snapshot_records = snapshot_records(&snapshot);
     if let Err(error) = ensure_assistance_ready(&snapshot, &source_uri) {
         return with_records(
             source_generation,
             configuration_generation,
             Err(error),
-            records,
+            snapshot_records,
+        );
+    }
+    if let Err(error) = completion_observations_match(original_records, &snapshot_records) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            snapshot_records,
+        );
+    }
+    if let Err(error) = revalidate_input(&input, original_records, cancel) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            snapshot_records,
         );
     }
     if is_cancelled(cancel) {
@@ -250,7 +266,7 @@ pub(crate) fn completion_metadata_from_input(
                 source_generation,
                 configuration_generation,
                 Err(error),
-                records,
+                snapshot_records,
             );
         }
     };
@@ -265,7 +281,7 @@ pub(crate) fn completion_metadata_from_input(
                 "completion declaration is no longer an exact candidate; request completion again"
                     .to_string(),
             ),
-            records,
+            snapshot_records,
         );
     };
     if matching.next().is_some() {
@@ -273,7 +289,7 @@ pub(crate) fn completion_metadata_from_input(
             source_generation,
             configuration_generation,
             Err("completion declaration became ambiguous; request completion again".to_string()),
-            records,
+            snapshot_records,
         );
     }
     let value = snapshot.index.completion_metadata_for_seed(
@@ -286,6 +302,8 @@ pub(crate) fn completion_metadata_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
+    let mut records = snapshot_records;
+    records.extend(original_records.iter().cloned());
     with_records(source_generation, configuration_generation, value, records)
 }
 
@@ -1303,16 +1321,67 @@ fn with_records<T>(
     }
 }
 
+fn completion_observations_match(
+    original: &[super::rename::SourceRecord],
+    rebuilt: &[super::rename::SourceRecord],
+) -> Result<(), String> {
+    let mut matched = vec![false; rebuilt.len()];
+    for original_record in original {
+        let Some(index) = rebuilt
+            .iter()
+            .enumerate()
+            .position(|(index, rebuilt_record)| {
+                !matched[index] && completion_observations_equal(original_record, rebuilt_record)
+            })
+        else {
+            return Err(
+                "completion dependency observations changed while resolving; retry the request"
+                    .to_string(),
+            );
+        };
+        matched[index] = true;
+    }
+    Ok(())
+}
+
+fn completion_observations_equal(
+    left: &super::rename::SourceRecord,
+    right: &super::rename::SourceRecord,
+) -> bool {
+    super::canonical_file_uri(&left.uri) == super::canonical_file_uri(&right.uri)
+        && (left.text.is_empty() || right.text.is_empty() || left.text == right.text)
+        && left.version == right.version
+        && left.stamp == right.stamp
+        && left.open == right.open
+        && left.path == right.path
+        && left.path_stamp == right.path_stamp
+        && (left.open || left.content_hash == right.content_hash)
+        && left.parsed_text_hash == right.parsed_text_hash
+        && left.candidate_membership == right.candidate_membership
+        && left.read_policy == right.read_policy
+        && left.path_entry == right.path_entry
+        && left.include_payload == right.include_payload
+        && left.missing_provider_candidate == right.missing_provider_candidate
+        && left.missing_provider_scope == right.missing_provider_scope
+        && match (&left.content_bytes, &right.content_bytes) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_from_input, document_symbols_from_input, highlights_from_input,
-        hover_from_input, references_from_input, selection_ranges_from_input,
-        semantic_tokens_from_input, signature_help_from_input, type_definitions_from_input,
+        completion_from_input, completion_from_input_with_options, completion_metadata_from_input,
+        document_symbols_from_input, highlights_from_input, hover_from_input,
+        references_from_input, selection_ranges_from_input, semantic_tokens_from_input,
+        signature_help_from_input, type_definitions_from_input,
     };
+    use crate::navigation::CompletionOptions;
     use crate::workspace::rename::{
-        CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input, owner_for_input,
-        project_context_and_metadata_for_input, revalidate_input,
+        CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input,
+        install_snapshot_priority_barrier, owner_for_input, project_context_and_metadata_for_input,
+        revalidate_input,
     };
     use crate::workspace::{Workspace, WorkspaceOptions, content_hash_bytes};
     use lsp_types::{MarkupKind, Position, Url};
@@ -1328,6 +1397,8 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::thread;
     use tempfile::TempDir;
 
     fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
@@ -1987,6 +2058,158 @@ mod tests {
         assert_assistance_read_set(&fixture, &signature.records);
         revalidate_input(&fixture.input, &signature.records, &cancel)
             .expect("unchanged populated signature read set must revalidate");
+    }
+
+    struct ClosedCompletionFixture {
+        _temp: TempDir,
+        main: PathBuf,
+        provider: PathBuf,
+        main_source: String,
+        provider_source: String,
+        input: WorkspaceInput,
+    }
+
+    fn closed_completion_fixture() -> ClosedCompletionFixture {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let main = temp.path().join("Main.pas");
+        let provider = temp.path().join("Provider.pas");
+        let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nbegin\n  Doc\nend;\nend.\n".to_string();
+        let provider_source = "unit Provider;\ninterface\n/// <summary>OLD DOCUMENTATION.</summary>\nfunction DocOld: Integer;\nimplementation\nfunction DocOld: Integer;\nbegin\n  Result := 1;\nend;\nend.\n".to_string();
+        fs::write(&main, &main_source).expect("main source");
+        fs::write(&provider, &provider_source).expect("provider source");
+        let workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        ClosedCompletionFixture {
+            _temp: temp,
+            main,
+            provider,
+            main_source,
+            provider_source,
+            input: workspace.analysis_input(),
+        }
+    }
+
+    #[test]
+    fn completion_resolution_rejects_provider_change_after_original_validation() {
+        let fixture = closed_completion_fixture();
+        let main_uri = source_uri(&fixture.main);
+        let provider_uri = source_uri(&fixture.provider);
+        let position = position_after(&fixture.main_source, "  Doc");
+        let cancel = AtomicBool::new(false);
+        let completion = completion_from_input_with_options(
+            fixture.input.clone(),
+            &main_uri,
+            position,
+            CompletionOptions {
+                format: MarkupKind::Markdown,
+                defer_documentation: true,
+                defer_detail: true,
+            },
+            &cancel,
+        );
+        let completion_result = completion.value.expect("completion result");
+        let seed = completion_result
+            .seeds
+            .iter()
+            .find(|seed| seed.candidate_uri() == &provider_uri)
+            .expect("provider completion seed");
+        let candidate_index = seed.candidate_index();
+        let original_records = completion.records.clone();
+        let expected_source_generation = fixture.input.source_generation;
+        let expected_configuration_generation = fixture.input.configuration_generation;
+        let (ready_sender, ready_receiver) = channel();
+        let (release_sender, release_receiver) = channel();
+        install_snapshot_priority_barrier(main_uri.clone(), ready_sender, release_receiver);
+
+        let input = fixture.input.clone();
+        let worker = thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            completion_metadata_from_input(
+                input,
+                &main_uri,
+                position,
+                expected_source_generation,
+                expected_configuration_generation,
+                &provider_uri,
+                candidate_index,
+                MarkupKind::Markdown,
+                true,
+                true,
+                &original_records,
+                &cancel,
+            )
+        });
+        ready_receiver
+            .recv()
+            .expect("resolve snapshot barrier entered");
+        let changed_provider = fixture
+            .provider_source
+            .replace("DocOld", "DocNew")
+            .replace("OLD DOCUMENTATION", "NEW DOCUMENTATION");
+        fs::write(&fixture.provider, changed_provider).expect("changed provider source");
+        release_sender
+            .send(())
+            .expect("release resolve snapshot barrier");
+        let computed = worker.join().expect("resolve worker");
+        assert!(
+            computed.value.is_err(),
+            "provider revision changed after original validation: {computed:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_source_revalidation_rejects_inconsistent_parsed_text_and_hash() {
+        let fixture = closed_completion_fixture();
+        let main_uri = source_uri(&fixture.main);
+        let provider_uri = source_uri(&fixture.provider);
+        let cancel = AtomicBool::new(false);
+        let completion = completion_from_input(
+            fixture.input.clone(),
+            &main_uri,
+            position_after(&fixture.main_source, "  Doc"),
+            &cancel,
+        );
+        assert!(
+            completion.value.is_ok(),
+            "completion result: {completion:?}"
+        );
+        let provider_record = completion
+            .records
+            .iter()
+            .find(|record| record.uri == provider_uri && record.path.is_none())
+            .cloned()
+            .expect("full provider source record");
+        let changed_provider = fixture
+            .provider_source
+            .replace("DocOld", "DocNew")
+            .replace("OLD DOCUMENTATION", "NEW DOCUMENTATION");
+        let before = fs::metadata(&fixture.provider).expect("provider metadata");
+        fs::write(&fixture.provider, &changed_provider).expect("changed provider source");
+        restore_mtime(&fixture.provider, &before);
+
+        let mut inconsistent = provider_record;
+        inconsistent.content_hash = Some(content_hash_bytes(changed_provider.as_bytes()));
+        let workspace = test_workspace(
+            vec![
+                fixture
+                    .provider
+                    .parent()
+                    .expect("fixture root")
+                    .to_path_buf(),
+            ],
+            WorkspaceOptions::default(),
+        );
+        workspace
+            .revalidate_records(std::slice::from_ref(&inconsistent))
+            .expect_err("shared validation must retain parsed-source equality");
+        let validation = revalidate_input(&fixture.input, &[inconsistent], &cancel);
+        let error =
+            validation.expect_err("parsed source equality must not be replaced by a later hash");
+        assert!(
+            error.contains("changed") || error.contains("resolving"),
+            "{error}"
+        );
     }
 
     #[test]

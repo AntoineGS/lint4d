@@ -105,6 +105,21 @@ clients. Cancelling a client request releases its recipient slot immediately,
 while the shared computation may remain queued or running for its other
 recipients.
 
+Stdio output is nonblocking and ordered. The writer-facing queue keeps a
+16-message partial-result-data reserve and a 260-message control reserve,
+with 16 MiB total pending bytes and an 8 MiB per-message/aggregate pending
+control-byte bound. When a valid ordinary response temporarily cannot fit,
+it is retained in a separate FIFO deferred queue rather than terminating the
+session: deferred results are capped at 260 messages and 64 MiB, deferred
+lifecycle/control output at 260 messages and 8 MiB, and the combined deferred
+queue at 520 messages and 72 MiB. A result is retired from analysis/admission
+accounting only after its response (or a bounded request-scoped fallback) has
+been accepted by one of those queues. Individual control/result messages still
+must fit the 8 MiB bound; an oversized ordinary result receives `-32803`
+without closing the session. Partial data is not accumulated in the deferred
+queue, so a paused client cannot create an unbounded retry loop. Shutdown
+abandons undrainable output only after the existing bounded teardown deadline.
+
 ### Work-done progress and cancellation
 
 The server advertises work-done progress for supported long-running providers,

@@ -123,12 +123,26 @@ const MAX_OUTBOUND_MESSAGES: usize = 32;
 const MAX_PENDING_OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OUTBOUND_CONTROL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARTIAL_DELIVERY_BYTES: usize = 64 * 1024 * 1024;
+// Temporary control pressure is retained separately from the normal writer
+// queue.  Result payloads and lifecycle/control messages have independent
+// bounded budgets so a large result cannot consume the terminal-message
+// reserve.  The deferred queue is FIFO and is drained whenever writer space
+// returns; it is not an unbounded retry buffer.
+const MAX_DEFERRED_OUTBOUND_RESULT_BYTES: usize = MAX_PARTIAL_DELIVERY_BYTES;
+const MAX_DEFERRED_OUTBOUND_CONTROL_BYTES: usize = MAX_PENDING_OUTBOUND_CONTROL_BYTES;
+const MAX_DEFERRED_OUTBOUND_BYTES: usize =
+    MAX_DEFERRED_OUTBOUND_RESULT_BYTES + MAX_DEFERRED_OUTBOUND_CONTROL_BYTES;
+const MAX_DEFERRED_OUTBOUND_RESULT_MESSAGES: usize = MAX_PENDING_OUTBOUND_CONTROL_MESSAGES;
+const MAX_DEFERRED_OUTBOUND_CONTROL_MESSAGES: usize = MAX_PENDING_OUTBOUND_CONTROL_MESSAGES;
+const MAX_DEFERRED_OUTBOUND_MESSAGES: usize =
+    MAX_DEFERRED_OUTBOUND_RESULT_MESSAGES + MAX_DEFERRED_OUTBOUND_CONTROL_MESSAGES;
 const MAX_PARTIAL_VALIDATION_RETIREMENTS: usize = MAX_CLIENT_ANALYSIS_RECIPIENTS;
 
 #[derive(Debug)]
 enum OutputError {
     Disconnected,
     Backpressure,
+    ResultBackpressure,
     MessageTooLarge,
     Encoding(String),
 }
@@ -139,6 +153,9 @@ impl std::fmt::Display for OutputError {
             Self::Disconnected => formatter.write_str("LSP writer disconnected"),
             Self::Backpressure => formatter
                 .write_str("LSP output queue is full; the client did not drain the connection"),
+            Self::ResultBackpressure => formatter.write_str(
+                "deferred LSP result output is full; the client did not drain the connection",
+            ),
             Self::MessageTooLarge => formatter
                 .write_str("LSP output message exceeds the bounded control/output message budget"),
             Self::Encoding(error) => {
@@ -154,6 +171,17 @@ impl Error for OutputError {}
 enum OutboundClass {
     Data,
     Control,
+    Result,
+}
+
+impl OutboundClass {
+    fn is_control(self) -> bool {
+        matches!(self, Self::Control | Self::Result)
+    }
+
+    fn is_result(self) -> bool {
+        matches!(self, Self::Result)
+    }
 }
 
 #[derive(Debug)]
@@ -170,37 +198,135 @@ struct OutboundQueue {
     pending_data_messages: usize,
     pending_control_messages: usize,
     pending_control_bytes: usize,
+    deferred: VecDeque<PendingOutboundMessage>,
+    deferred_bytes: usize,
+    deferred_control_messages: usize,
+    deferred_result_messages: usize,
+    deferred_control_bytes: usize,
+    deferred_result_bytes: usize,
 }
 
 impl OutboundQueue {
     fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.deferred.is_empty()
     }
 
     fn flush(&mut self, sender: &Sender<Message>) -> Result<(), OutputError> {
-        while let Some(pending) = self.pending.front() {
-            match sender.try_send(pending.message.clone()) {
-                Ok(()) => {
-                    let pending = self.pending.pop_front().expect("pending message exists");
-                    self.pending_bytes = self.pending_bytes.saturating_sub(pending.bytes);
-                    match pending.class {
-                        OutboundClass::Data => {
-                            self.pending_data_messages =
-                                self.pending_data_messages.saturating_sub(1);
-                        }
-                        OutboundClass::Control => {
-                            self.pending_control_messages =
-                                self.pending_control_messages.saturating_sub(1);
-                            self.pending_control_bytes =
-                                self.pending_control_bytes.saturating_sub(pending.bytes);
+        loop {
+            while let Some(pending) = self.pending.front() {
+                match sender.try_send(pending.message.clone()) {
+                    Ok(()) => {
+                        let pending = self.pending.pop_front().expect("pending message exists");
+                        self.pending_bytes = self.pending_bytes.saturating_sub(pending.bytes);
+                        match pending.class {
+                            OutboundClass::Data => {
+                                self.pending_data_messages =
+                                    self.pending_data_messages.saturating_sub(1);
+                            }
+                            OutboundClass::Control | OutboundClass::Result => {
+                                self.pending_control_messages =
+                                    self.pending_control_messages.saturating_sub(1);
+                                self.pending_control_bytes =
+                                    self.pending_control_bytes.saturating_sub(pending.bytes);
+                            }
                         }
                     }
+                    Err(TrySendError::Full(_)) => return Ok(()),
+                    Err(TrySendError::Disconnected(_)) => return Err(OutputError::Disconnected),
                 }
-                Err(TrySendError::Full(_)) => return Ok(()),
-                Err(TrySendError::Disconnected(_)) => return Err(OutputError::Disconnected),
+            }
+
+            let Some(deferred) = self.deferred.front() else {
+                return Ok(());
+            };
+            if !self.can_fit_pending(deferred.bytes, deferred.class) {
+                return Ok(());
+            }
+            let deferred = self.deferred.pop_front().expect("deferred message exists");
+            self.deferred_bytes = self.deferred_bytes.saturating_sub(deferred.bytes);
+            if deferred.class.is_result() {
+                self.deferred_result_messages = self.deferred_result_messages.saturating_sub(1);
+                self.deferred_result_bytes =
+                    self.deferred_result_bytes.saturating_sub(deferred.bytes);
+            } else {
+                self.deferred_control_messages = self.deferred_control_messages.saturating_sub(1);
+                self.deferred_control_bytes =
+                    self.deferred_control_bytes.saturating_sub(deferred.bytes);
+            }
+            self.push_pending(deferred);
+        }
+    }
+
+    fn can_fit_pending(&self, bytes: usize, class: OutboundClass) -> bool {
+        let total_messages = self
+            .pending_data_messages
+            .saturating_add(self.pending_control_messages);
+        if total_messages >= MAX_PENDING_OUTBOUND_MESSAGES
+            || self.pending_bytes.saturating_add(bytes) > MAX_PENDING_OUTBOUND_BYTES
+        {
+            return false;
+        }
+        match class {
+            OutboundClass::Data => self.pending_data_messages < MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+            OutboundClass::Control | OutboundClass::Result => {
+                self.pending_control_messages < MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
+                    && self.pending_control_bytes.saturating_add(bytes)
+                        <= MAX_PENDING_OUTBOUND_CONTROL_BYTES
             }
         }
-        Ok(())
+    }
+
+    fn push_pending(&mut self, pending: PendingOutboundMessage) {
+        self.pending_bytes = self.pending_bytes.saturating_add(pending.bytes);
+        match pending.class {
+            OutboundClass::Data => self.pending_data_messages += 1,
+            OutboundClass::Control | OutboundClass::Result => {
+                self.pending_control_messages += 1;
+                self.pending_control_bytes =
+                    self.pending_control_bytes.saturating_add(pending.bytes);
+            }
+        }
+        self.pending.push_back(pending);
+    }
+
+    fn defer(&mut self, pending: PendingOutboundMessage) -> Result<bool, OutputError> {
+        // A successful deferral is output admission: the message is now
+        // owned by this bounded queue, so the producer may retire its
+        // request/result state without retrying or duplicating it.  Results
+        // and lifecycle controls have separate count/byte budgets so a
+        // result burst cannot consume all control capacity.
+        let (deferred_messages, max_deferred_messages, deferred_bytes, max_deferred_bytes) =
+            if pending.class.is_result() {
+                (
+                    &mut self.deferred_result_messages,
+                    MAX_DEFERRED_OUTBOUND_RESULT_MESSAGES,
+                    &mut self.deferred_result_bytes,
+                    MAX_DEFERRED_OUTBOUND_RESULT_BYTES,
+                )
+            } else {
+                (
+                    &mut self.deferred_control_messages,
+                    MAX_DEFERRED_OUTBOUND_CONTROL_MESSAGES,
+                    &mut self.deferred_control_bytes,
+                    MAX_DEFERRED_OUTBOUND_CONTROL_BYTES,
+                )
+            };
+        if *deferred_messages >= max_deferred_messages
+            || deferred_bytes.saturating_add(pending.bytes) > max_deferred_bytes
+            || self.deferred.len() >= MAX_DEFERRED_OUTBOUND_MESSAGES
+            || self.deferred_bytes.saturating_add(pending.bytes) > MAX_DEFERRED_OUTBOUND_BYTES
+        {
+            return Err(if pending.class.is_result() {
+                OutputError::ResultBackpressure
+            } else {
+                OutputError::Backpressure
+            });
+        }
+        *deferred_messages += 1;
+        *deferred_bytes = deferred_bytes.saturating_add(pending.bytes);
+        self.deferred_bytes = self.deferred_bytes.saturating_add(pending.bytes);
+        self.deferred.push_back(pending);
+        Ok(true)
     }
 
     fn enqueue(
@@ -214,50 +340,35 @@ impl OutboundQueue {
             .map_err(|error| OutputError::Encoding(error.to_string()))?
             .len();
         if bytes > MAX_PENDING_OUTBOUND_BYTES
-            || (class == OutboundClass::Control && bytes > MAX_PENDING_OUTBOUND_CONTROL_BYTES)
+            || (class.is_control() && bytes > MAX_PENDING_OUTBOUND_CONTROL_BYTES)
         {
             return Err(OutputError::MessageTooLarge);
         }
-        let total_messages = self
-            .pending_data_messages
-            .saturating_add(self.pending_control_messages);
-        let total_bytes = self.pending_bytes.saturating_add(bytes);
-        if total_messages >= MAX_PENDING_OUTBOUND_MESSAGES
-            || total_bytes > MAX_PENDING_OUTBOUND_BYTES
-        {
-            return match class {
-                OutboundClass::Data => Ok(false),
-                OutboundClass::Control => Err(OutputError::Backpressure),
-            };
-        }
-        if class == OutboundClass::Data
-            && self.pending_data_messages >= MAX_PENDING_OUTBOUND_DATA_MESSAGES
-        {
-            return Ok(false);
-        }
-        if class == OutboundClass::Control
-            && (self.pending_control_messages >= MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
-                || self.pending_control_bytes.saturating_add(bytes)
-                    > MAX_PENDING_OUTBOUND_CONTROL_BYTES)
-        {
-            return Err(OutputError::Backpressure);
-        }
-
-        self.pending.push_back(PendingOutboundMessage {
+        let pending = PendingOutboundMessage {
             message,
             bytes,
             class,
-        });
-        self.pending_bytes = total_bytes;
-        match class {
-            OutboundClass::Data => self.pending_data_messages += 1,
-            OutboundClass::Control => {
-                self.pending_control_messages += 1;
-                self.pending_control_bytes = self.pending_control_bytes.saturating_add(bytes);
-            }
+        };
+        if !self.deferred.is_empty() {
+            return match class {
+                OutboundClass::Data => Ok(false),
+                OutboundClass::Control | OutboundClass::Result => self.defer(pending),
+            };
         }
+        if !self.can_fit_pending(bytes, class) {
+            return match class {
+                OutboundClass::Data => Ok(false),
+                OutboundClass::Control | OutboundClass::Result => self.defer(pending),
+            };
+        }
+        self.push_pending(pending);
         self.flush(sender)?;
         Ok(true)
+    }
+
+    #[cfg(test)]
+    fn deferred_result_bytes(&self) -> usize {
+        self.deferred_result_bytes
     }
 }
 
@@ -267,6 +378,7 @@ impl OutboundQueue {
 /// memory-connection unit tests lightweight.
 trait ProtocolSender {
     fn send_control(&self, message: Message) -> Result<(), OutputError>;
+    fn send_result(&self, message: Message) -> Result<(), OutputError>;
     fn send_data(&self, message: Message) -> Result<bool, OutputError>;
 }
 
@@ -277,6 +389,10 @@ impl ProtocolSender for Connection {
             Err(TrySendError::Full(_)) => Err(OutputError::Backpressure),
             Err(TrySendError::Disconnected(_)) => Err(OutputError::Disconnected),
         }
+    }
+
+    fn send_result(&self, message: Message) -> Result<(), OutputError> {
+        self.send_control(message)
     }
 
     fn send_data(&self, message: Message) -> Result<bool, OutputError> {
@@ -356,6 +472,15 @@ impl ProtocolSender for ProtocolConnection {
             &self.connection.sender,
             message,
             OutboundClass::Control,
+        )?;
+        Ok(())
+    }
+
+    fn send_result(&self, message: Message) -> Result<(), OutputError> {
+        self.outbound.borrow_mut().enqueue(
+            &self.connection.sender,
+            message,
+            OutboundClass::Result,
         )?;
         Ok(())
     }
@@ -7430,13 +7555,23 @@ fn send_ok<T: serde::Serialize>(
     value: T,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let fallback_id = id.clone();
-    match connection.send_control(Message::Response(Response::new_ok(id, value))) {
+    // `send_result` accepts either the writer queue or the bounded deferred
+    // queue.  Only an individually oversized message, or exhaustion of the
+    // bounded result budget, becomes a request-scoped error; temporary
+    // occupancy of the ordinary control budget is not session-fatal.
+    match connection.send_result(Message::Response(Response::new_ok(id, value))) {
         Ok(()) => Ok(()),
         Err(OutputError::MessageTooLarge) => send_error(
             connection,
             fallback_id,
             ErrorCode::RequestFailed,
             "analysis result exceeds the bounded LSP output size; retry with a narrower request",
+        ),
+        Err(OutputError::ResultBackpressure) => send_error(
+            connection,
+            fallback_id,
+            ErrorCode::RequestFailed,
+            "temporary LSP output capacity is full; retry the request after the client drains",
         ),
         Err(error) => Err(error.into()),
     }
@@ -7688,7 +7823,8 @@ mod tests {
         FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
         MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
         MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
-        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
         MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, PartialDelivery,
         PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload, PendingAnalysis,
         PriorityQueue, TestBarrierConfig, deliver_analysis_result, invalidate_analysis_result,
@@ -8348,6 +8484,175 @@ mod tests {
         );
         assert_eq!(queue.pending_control_messages, 1);
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn deferred_result_byte_boundary_accepts_exact_limit_and_defers_one_byte_over() {
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(Message::Notification(Notification::new(
+                "$/occupied".to_string(),
+                serde_json::Value::Null,
+            )))
+            .expect("occupy writer queue");
+        let mut queue = OutboundQueue::default();
+        let result = |id: &str, value| {
+            Message::Response(Response::new_ok(RequestId::from(id.to_string()), value))
+        };
+        let first = result(
+            "deferred-first",
+            serde_json::Value::String("x".repeat(MAX_PENDING_OUTBOUND_CONTROL_BYTES / 2)),
+        );
+        let first_bytes = serde_json::to_vec(&first)
+            .expect("first result encoding")
+            .len();
+        let second_overhead = serde_json::to_vec(&result(
+            "deferred-second",
+            serde_json::Value::String(String::new()),
+        ))
+        .expect("empty second result encoding")
+        .len();
+        let second = result(
+            "deferred-second",
+            serde_json::Value::String(
+                "x".repeat(MAX_PENDING_OUTBOUND_CONTROL_BYTES - first_bytes - second_overhead),
+            ),
+        );
+        let second_bytes = serde_json::to_vec(&second)
+            .expect("second result encoding")
+            .len();
+        assert!(first_bytes < MAX_PENDING_OUTBOUND_CONTROL_BYTES);
+        assert!(second_bytes < MAX_PENDING_OUTBOUND_CONTROL_BYTES);
+        assert_eq!(
+            first_bytes.saturating_add(second_bytes),
+            MAX_PENDING_OUTBOUND_CONTROL_BYTES
+        );
+
+        let over = result("deferred-over", serde_json::Value::Null);
+        let over_bytes = serde_json::to_vec(&over)
+            .expect("over-limit result encoding")
+            .len();
+        assert!(
+            first_bytes
+                .saturating_add(second_bytes)
+                .saturating_add(over_bytes)
+                > MAX_PENDING_OUTBOUND_CONTROL_BYTES,
+            "the third individually valid result must cross the aggregate pending boundary"
+        );
+
+        assert!(
+            queue
+                .enqueue(&sender, first, OutboundClass::Result)
+                .expect("first result enqueue")
+        );
+        assert!(
+            queue
+                .enqueue(&sender, second, OutboundClass::Result)
+                .expect("exact-boundary result enqueue")
+        );
+        assert_eq!(
+            queue.pending_control_bytes,
+            MAX_PENDING_OUTBOUND_CONTROL_BYTES
+        );
+        assert_eq!(queue.deferred_result_bytes(), 0);
+        assert!(
+            queue
+                .enqueue(&sender, over, OutboundClass::Result)
+                .expect("one-byte-over result deferral")
+        );
+        assert_eq!(queue.deferred_result_bytes(), over_bytes);
+        assert!(queue.has_pending());
+
+        assert!(matches!(
+            receiver.recv().expect("occupied message"),
+            Message::Notification(_)
+        ));
+        queue.flush(&sender).expect("flush first result");
+        let first = receiver.recv().expect("first deferred-boundary result");
+        match first {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::from("deferred-first".to_string()))
+            }
+            message => panic!("unexpected first deferred-boundary message: {message:?}"),
+        }
+        queue.flush(&sender).expect("flush exact-boundary result");
+        let second = receiver.recv().expect("second deferred-boundary result");
+        match second {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::from("deferred-second".to_string()))
+            }
+            message => panic!("unexpected second deferred-boundary message: {message:?}"),
+        }
+        queue.flush(&sender).expect("flush deferred result");
+        let over = receiver.recv().expect("one-byte-over deferred result");
+        match over {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::from("deferred-over".to_string()))
+            }
+            message => panic!("unexpected one-byte-over deferred message: {message:?}"),
+        }
+        assert_eq!(queue.deferred_result_bytes(), 0);
+        assert!(!queue.has_pending());
+    }
+
+    #[test]
+    fn deferred_output_keeps_result_and_control_count_reserves_separate() {
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(Message::Notification(Notification::new(
+                "$/occupied".to_string(),
+                serde_json::Value::Null,
+            )))
+            .expect("occupy writer queue");
+        let mut queue = OutboundQueue::default();
+        let control = || {
+            Message::Notification(Notification::new(
+                "$/control".to_string(),
+                serde_json::Value::Null,
+            ))
+        };
+        for _ in 0..MAX_PENDING_OUTBOUND_CONTROL_MESSAGES {
+            assert!(
+                queue
+                    .enqueue(&sender, control(), OutboundClass::Control)
+                    .expect("control enqueue")
+            );
+        }
+        assert_eq!(
+            queue.pending_control_messages,
+            MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
+        );
+
+        let result = Message::Response(Response::new_ok(
+            RequestId::from("deferred-count-result".to_string()),
+            serde_json::Value::Null,
+        ));
+        assert!(
+            queue
+                .enqueue(&sender, result, OutboundClass::Result)
+                .expect("result deferral")
+        );
+        assert_eq!(queue.deferred_result_messages, 1);
+
+        assert!(
+            queue
+                .enqueue(&sender, control(), OutboundClass::Control)
+                .expect("control deferral")
+        );
+        assert_eq!(queue.deferred_control_messages, 1);
+
+        let mut received = 0;
+        while queue.has_pending() {
+            queue.flush(&sender).expect("flush bounded count burst");
+            if queue.has_pending() {
+                receiver.recv().expect("receive bounded count burst");
+                received += 1;
+            }
+        }
+        while receiver.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES + 3);
     }
 
     #[test]

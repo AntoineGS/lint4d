@@ -1759,6 +1759,24 @@ fn workspace_symbol_source(unit_name: &str, variable_count: usize) -> String {
     source
 }
 
+#[cfg(feature = "test-support")]
+fn wide_workspace_symbol_source(
+    unit_name: &str,
+    prefix: &str,
+    variable_count: usize,
+    name_width: usize,
+) -> String {
+    let mut source = format!("unit {unit_name};\ninterface\nvar\n");
+    for index in 0..variable_count {
+        source.push_str(&format!(
+            "  {prefix}{index}_{}: Integer;\n",
+            "x".repeat(name_width)
+        ));
+    }
+    source.push_str("implementation\nend.\n");
+    source
+}
+
 fn workspace_edit_uris(edit: &Value) -> HashSet<String> {
     if let Some(changes) = edit["documentChanges"].as_array() {
         return changes
@@ -3509,6 +3527,119 @@ fn coalesced_work_done_lifecycles_survive_a_paused_stdout_queue() {
     assert!(
         healthy.error.is_none(),
         "the session must remain usable after the coalesced control burst: {healthy:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn large_ordinary_results_survive_temporary_control_byte_pressure() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Flood.pas"),
+        &wide_workspace_symbol_source("Flood", "Flood", 7_000, 0),
+    );
+    for index in 0..3 {
+        write_file(
+            &root.path().join(format!("Large{index}.pas")),
+            &wide_workspace_symbol_source(&format!("Large{index}"), "Large", 1_000, 1_500),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let flood_id = RequestId::from("temporary-byte-flood".to_string());
+    server.send_request(
+        flood_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Flood", "partialResultToken": "temporary-flood"}),
+    );
+    server.pause_stdout();
+    thread::sleep(Duration::from_secs(2));
+
+    let ordinary_ids = [
+        RequestId::from("large-ordinary-1".to_string()),
+        RequestId::from("large-ordinary-2".to_string()),
+    ];
+    for (index, id) in ordinary_ids.iter().enumerate() {
+        server.send_request(
+            id.clone(),
+            "workspace/symbol",
+            json!({
+                "query": "Large",
+                "workDoneToken": format!("large-ordinary-work-{index}")
+            }),
+        );
+    }
+    thread::sleep(Duration::from_secs(1));
+    server.resume_stdout();
+
+    let expected_ids = ordinary_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut responses = HashMap::new();
+    let mut work_done_ends = HashMap::<String, usize>::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while responses.len() < expected_ids.len() || work_done_ends.len() < expected_ids.len() {
+        assert!(
+            Instant::now() < deadline,
+            "large ordinary lifecycle did not drain: responses={}, ends={}, pending={:?}",
+            responses.len(),
+            work_done_ends.len(),
+            server.pending
+        );
+        match server.next_message() {
+            Message::Response(response) if expected_ids.contains(&response.id) => {
+                assert!(
+                    response.error.is_none(),
+                    "individually valid ordinary result was not preserved: {response:?}"
+                );
+                let result = response
+                    .result
+                    .expect("large ordinary result")
+                    .as_array()
+                    .expect("large ordinary result array")
+                    .len();
+                assert_eq!(result, 3_003);
+                assert!(responses.insert(response.id, result).is_none());
+            }
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                if notification.params["value"]["kind"] == "end"
+                    && notification.params["token"]
+                        .as_str()
+                        .is_some_and(|token| token.starts_with("large-ordinary-work-"))
+                {
+                    let token = notification.params["token"]
+                        .as_str()
+                        .expect("large ordinary work-done token")
+                        .to_string();
+                    *work_done_ends.entry(token).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(responses.len(), expected_ids.len());
+    assert_eq!(
+        work_done_ends,
+        HashMap::from([
+            ("large-ordinary-work-0".to_string(), 1),
+            ("large-ordinary-work-1".to_string(), 1),
+        ])
+    );
+
+    server.send_notification("$/cancelRequest", json!({"id": flood_id}));
+    let _ = server.response(&flood_id);
+
+    let healthy_id = RequestId::from("temporary-byte-follow-up".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Missing"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "session must remain usable after deferred large results: {healthy:?}"
     );
     server.shutdown();
 }

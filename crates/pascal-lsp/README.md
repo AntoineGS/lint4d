@@ -509,9 +509,69 @@ registrations are retried up to three times; paths
 that remain rejected enter that degraded mode and no longer consume the bounded
 explicit-watcher allowance.
 
-`workspace/didChangeConfiguration` and general runtime settings overrides are
-not supported. Change sidecar files or restart the client after changing
-`initializationOptions`.
+### Runtime configuration (LSP)
+
+The canonical runtime settings section is `pascalLsp`. It uses the same
+supported fields as `initializationOptions`; it does not introduce a second
+configuration schema:
+
+```json
+{
+  "pascalLsp": {
+    "projectFile": "src/Shop.dproj",
+    "buildConfig": "Debug",
+    "platform": "Win32",
+    "sourcePaths": ["../shared", "/opt/delphi/rtl"],
+    "exclude": ["**/__history/**"],
+    "maxFiles": 10000,
+    "maxFileBytes": 2097152,
+    "maxTotalBytes": 268435456
+  }
+}
+```
+
+Clients that advertise `workspace.configuration: true` receive a standard
+`workspace/configuration` request for section `pascalLsp` after the server has
+received `initialized`. A single-root workspace request includes that root's
+`scopeUri`. Runtime settings are global in this server: a multi-root request
+omits `scopeUri`, and one returned setting set applies to every workspace root.
+Adding or removing workspace folders refreshes this scope decision.
+The pull response must contain one array item for this one requested section;
+`null` is the explicit reset value, while malformed or wrong-length array
+responses leave the last valid runtime state unchanged.
+
+Clients without pull capability do not receive a server request. They can
+push the same object in `workspace/didChangeConfiguration`, for example:
+
+```json
+{
+  "settings": {
+    "pascalLsp": { "buildConfig": "Release" }
+  }
+}
+```
+
+Runtime values override the corresponding initialization option for the
+session. Existing project ownership and explicit session-local project
+selections remain authoritative, and the existing project metadata, sidecar,
+read-policy, and open-buffer precedence is unchanged. A `null` value or an
+omitted field resets that field to its initialization fallback; a `null`
+section (or an empty section) resets all runtime overrides. A malformed whole
+section is ignored. A malformed individual field is retained at its previous
+valid value while valid unrelated fields still apply. Unknown fields are
+ignored. Runtime changes that alter effective values bump source/configuration
+generations, invalidate affected indexes and contexts, and reschedule open
+document diagnostics; identical effective settings do not rebuild state.
+Expensive reads and rebuilds remain in the bounded analysis workers, and
+runtime settings never grant filesystem access beyond the existing read
+policy.
+
+The coordinator coalesces refresh notifications, keeps at most one pull in
+flight, and discards obsolete or duplicate replies. Pull errors preserve the
+last valid runtime state. Runtime lists are capped at 256 entries and strings
+at 4 KiB; numeric limits are clamped to the safe caps in the Limits table.
+The historical `pascal-lsp` spelling is accepted as a compatibility alias,
+but new client configurations should use `pascalLsp`.
 
 ### Project selection protocol and Neovim picker
 

@@ -10,22 +10,23 @@ use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
-    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, Workspace, WorkspaceOptions,
-    canonical_file_uri,
+    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, RuntimeOptionsOverride,
+    RuntimeOptionsUpdate, Workspace, WorkspaceOptions, canonical_file_uri, parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionItem,
-    CompletionList, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlightParams, FileChangeType,
-    FileSystemWatcher, FoldingRangeParams, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, InitializeParams, MarkupKind, OneOf, Position,
-    PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams, Registration,
-    RegistrationParams, RelativePattern, SelectionRangeParams, ServerInfo, SignatureHelpParams,
-    TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
+    CompletionList, CompletionParams, CompletionResponse, ConfigurationItem, ConfigurationParams,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
+    FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
+    InitializeParams, MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams,
+    ReferenceParams, Registration, RegistrationParams, RelativePattern, SelectionRangeParams,
+    ServerInfo, SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit,
+    WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1082,6 +1083,286 @@ impl DiagnosticNotificationEffect {
             self.cancel.push(uri);
         }
     }
+}
+
+const RUNTIME_CONFIGURATION_SECTION: &str = "pascalLsp";
+const CONFIGURATION_REQUEST_PREFIX: &str = "pascal-lsp-configuration-";
+const MAX_RETIRED_CONFIGURATION_REQUESTS: usize = 8;
+
+#[derive(Debug)]
+struct PendingConfigurationRequest {
+    id: RequestId,
+    revision: u64,
+}
+
+struct ConfigurationCoordinator {
+    base_options: WorkspaceOptions,
+    runtime_options: RuntimeOptionsOverride,
+    pull_supported: bool,
+    initialized: bool,
+    scope_uri: Option<Url>,
+    next_request_id: u64,
+    revision: u64,
+    refresh_pending: bool,
+    pending: Option<PendingConfigurationRequest>,
+    retired: VecDeque<RequestId>,
+}
+
+impl ConfigurationCoordinator {
+    fn new(scope_uri: Option<Url>, options: WorkspaceOptions, pull_supported: bool) -> Self {
+        Self {
+            base_options: options,
+            runtime_options: RuntimeOptionsOverride::default(),
+            pull_supported,
+            initialized: false,
+            scope_uri,
+            next_request_id: 0,
+            revision: 0,
+            refresh_pending: false,
+            pending: None,
+            retired: VecDeque::new(),
+        }
+    }
+
+    fn update_scope(&mut self, scope_uri: Option<Url>) {
+        self.scope_uri = scope_uri;
+    }
+
+    fn on_initialized(
+        &mut self,
+        connection: &Connection,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.initialized = true;
+        self.request_refresh(connection)
+    }
+
+    fn handle_notification(
+        &mut self,
+        connection: &Connection,
+        workspace: &mut Workspace,
+        notification: &Notification,
+    ) -> Result<DiagnosticNotificationEffect, Box<dyn Error + Send + Sync>> {
+        let params: DidChangeConfigurationParams =
+            serde_json::from_value(notification.params.clone()).map_err(|error| {
+                format!("invalid parameters for workspace/didChangeConfiguration: {error}")
+            })?;
+        if !self.initialized {
+            return Ok(DiagnosticNotificationEffect::default());
+        }
+        if self.pull_supported {
+            self.request_refresh(connection)?;
+            return Ok(DiagnosticNotificationEffect::default());
+        }
+
+        let settings = runtime_settings_section(&params.settings)?;
+        Ok(self.apply_value(settings.as_ref(), workspace))
+    }
+
+    fn request_refresh(
+        &mut self,
+        connection: &Connection,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.pull_supported || !self.initialized {
+            return Ok(());
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "configuration revision space exhausted".to_string())?;
+        self.refresh_pending = true;
+        self.send_pending(connection)
+    }
+
+    fn send_pending(
+        &mut self,
+        connection: &Connection,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.pull_supported
+            || !self.initialized
+            || !self.refresh_pending
+            || self.pending.is_some()
+        {
+            return Ok(());
+        }
+        let request_number = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| "configuration request ID space exhausted".to_string())?;
+        self.next_request_id = request_number;
+        let id = RequestId::from(format!("{CONFIGURATION_REQUEST_PREFIX}{request_number}"));
+        let params = ConfigurationParams {
+            items: vec![ConfigurationItem {
+                scope_uri: self.scope_uri.clone(),
+                section: Some(RUNTIME_CONFIGURATION_SECTION.to_string()),
+            }],
+        };
+        connection.sender.send(Message::Request(Request::new(
+            id.clone(),
+            "workspace/configuration".to_string(),
+            serde_json::to_value(params)?,
+        )))?;
+        self.refresh_pending = false;
+        self.pending = Some(PendingConfigurationRequest {
+            id,
+            revision: self.revision,
+        });
+        Ok(())
+    }
+
+    fn handle_response(
+        &mut self,
+        connection: &Connection,
+        workspace: &mut Workspace,
+        response: &Response,
+    ) -> Result<Option<DiagnosticNotificationEffect>, Box<dyn Error + Send + Sync>> {
+        if self.retired.iter().any(|id| id == &response.id) {
+            eprintln!(
+                "pascal-lsp: ignored duplicate workspace/configuration response {}",
+                response.id
+            );
+            return Ok(Some(DiagnosticNotificationEffect::default()));
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(None);
+        };
+        if pending.id != response.id {
+            return Ok(None);
+        }
+
+        let pending = self.pending.take().expect("pending configuration request");
+        self.retired.push_back(pending.id.clone());
+        while self.retired.len() > MAX_RETIRED_CONFIGURATION_REQUESTS {
+            self.retired.pop_front();
+        }
+
+        let mut effect = DiagnosticNotificationEffect::default();
+        if pending.revision == self.revision {
+            if let Some(error) = &response.error {
+                eprintln!(
+                    "pascal-lsp: workspace/configuration request failed ({}): {}",
+                    error.code, error.message
+                );
+            } else if let Some(result) = response.result.as_ref() {
+                effect = self.apply_pull_result(result, workspace);
+            } else {
+                eprintln!(
+                    "pascal-lsp: ignored malformed workspace/configuration response {}",
+                    response.id
+                );
+            }
+        }
+        self.send_pending(connection)?;
+        Ok(Some(effect))
+    }
+
+    fn apply_pull_result(
+        &mut self,
+        result: &Value,
+        workspace: &mut Workspace,
+    ) -> DiagnosticNotificationEffect {
+        match runtime_pull_value(result) {
+            Ok(value) => self.apply_value(Some(&value), workspace),
+            Err(error) => {
+                eprintln!("pascal-lsp: ignored workspace/configuration response: {error}");
+                DiagnosticNotificationEffect::default()
+            }
+        }
+    }
+
+    fn apply_value(
+        &mut self,
+        value: Option<&Value>,
+        workspace: &mut Workspace,
+    ) -> DiagnosticNotificationEffect {
+        let before = self.runtime_options.effective(&self.base_options);
+        let warnings = match value {
+            None | Some(Value::Null) => self.runtime_options.apply(RuntimeOptionsUpdate::reset()),
+            Some(value) => match parse_runtime_options(value) {
+                Ok(update) => self.runtime_options.apply(update),
+                Err(error) => {
+                    eprintln!("pascal-lsp: ignored runtime configuration: {error}");
+                    return DiagnosticNotificationEffect::default();
+                }
+            },
+        };
+        for warning in warnings {
+            eprintln!("pascal-lsp: warning: {warning}");
+        }
+        let after = self.runtime_options.effective(&self.base_options);
+        if before == after || !workspace.apply_runtime_options(after) {
+            return DiagnosticNotificationEffect::default();
+        }
+
+        let mut effect = DiagnosticNotificationEffect::default();
+        for uri in workspace.open_document_uris() {
+            effect.cancel_uri(uri.clone());
+            effect.refresh_uri(uri);
+        }
+        effect
+    }
+
+    fn shutdown(&mut self) {
+        self.initialized = false;
+        self.refresh_pending = false;
+        self.pending = None;
+        self.retired.clear();
+    }
+}
+
+fn runtime_settings_section(settings: &Value) -> Result<Option<Value>, String> {
+    if settings.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = settings.as_object() else {
+        return Err("settings must be an object or null".to_string());
+    };
+    if let Some(value) = object.get(RUNTIME_CONFIGURATION_SECTION) {
+        return Ok(Some(value.clone()));
+    }
+    if let Some(value) = object.get("pascal-lsp") {
+        return Ok(Some(value.clone()));
+    }
+    if [
+        "sourcePaths",
+        "exclude",
+        "projectFile",
+        "buildConfig",
+        "platform",
+        "maxFiles",
+        "maxFileBytes",
+        "maxTotalBytes",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        return Ok(Some(settings.clone()));
+    }
+    Ok(None)
+}
+
+fn runtime_pull_value(result: &Value) -> Result<Value, String> {
+    if result.is_null() {
+        return Ok(Value::Null);
+    }
+    let Some(values) = result.as_array() else {
+        return Err("result must be an array for the requested configuration item".to_string());
+    };
+    if values.len() != 1 {
+        return Err("result must contain exactly one configuration item".to_string());
+    }
+    let value = &values[0];
+    if let Some(object) = value.as_object() {
+        if let Some(section) = object.get(RUNTIME_CONFIGURATION_SECTION) {
+            return Ok(section.clone());
+        }
+        if let Some(section) = object.get("pascal-lsp") {
+            return Ok(section.clone());
+        }
+    }
+    Ok(value.clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3323,6 +3604,7 @@ fn run_connection(
     };
     let roots = workspace_roots(&initialize);
     let workspace_folders_supported = supports_workspace_folders(&initialize.capabilities);
+    let configuration_pull_supported = supports_configuration(&initialize.capabilities);
     let watcher_registration_supported =
         supports_watched_file_registration(&initialize.capabilities);
     let relative_pattern_support = supports_relative_pattern(&initialize.capabilities);
@@ -3340,7 +3622,13 @@ fn run_connection(
         }),
     )?;
 
-    let mut workspace = Workspace::new(roots, options);
+    let mut workspace = Workspace::new(roots, options.clone());
+    let mut configuration = ConfigurationCoordinator::new(
+        workspace.configuration_scope_uri(),
+        options,
+        configuration_pull_supported,
+    );
+    configuration.on_initialized(connection)?;
     let watcher_registration = watcher_registration_supported
         .then(|| register_file_watcher(connection, &workspace, relative_pattern_support))
         .transpose()?;
@@ -3350,6 +3638,7 @@ fn run_connection(
         &mut workspace,
         workspace_folders_supported,
         client_features,
+        &mut configuration,
         watcher_registration,
         test_barriers,
     )
@@ -3360,6 +3649,7 @@ fn event_loop(
     workspace: &mut Workspace,
     workspace_folders_supported: bool,
     client_features: ClientFeatures,
+    configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -3388,6 +3678,7 @@ fn event_loop(
             }
             Err(RecvTimeoutError::Disconnected) => {
                 jobs.shutdown();
+                configuration.shutdown();
                 return Ok(true);
             }
         };
@@ -3395,6 +3686,7 @@ fn event_loop(
         match message {
             Message::Request(request) if request.method == "shutdown" => {
                 jobs.shutdown_with_connection(connection)?;
+                configuration.shutdown();
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
             }
@@ -3423,6 +3715,7 @@ fn event_loop(
             }
             Message::Notification(notification) if notification.method == "exit" => {
                 jobs.shutdown();
+                configuration.shutdown();
                 return Ok(shutdown_received);
             }
             Message::Notification(notification) => {
@@ -3439,12 +3732,32 @@ fn event_loop(
                     }
                     continue;
                 }
-                match handle_notification(
-                    connection,
-                    workspace,
-                    notification,
-                    workspace_folders_supported,
-                ) {
+                let notification_method = notification.method.clone();
+                let result = if notification_method == "initialized" {
+                    configuration.on_initialized(connection)?;
+                    Ok(DiagnosticNotificationEffect::default())
+                } else if notification_method == "workspace/didChangeConfiguration" {
+                    configuration
+                        .handle_notification(connection, workspace, &notification)
+                        .map_err(|error| error.to_string())
+                } else {
+                    let refresh_configuration =
+                        notification_method == "workspace/didChangeWorkspaceFolders";
+                    let result = handle_notification(
+                        connection,
+                        workspace,
+                        notification,
+                        workspace_folders_supported,
+                    );
+                    if refresh_configuration && result.is_ok() {
+                        configuration.update_scope(workspace.configuration_scope_uri());
+                        configuration
+                            .request_refresh(connection)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    result
+                };
+                match result {
                     Ok(effect) => {
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
@@ -3458,26 +3771,36 @@ fn event_loop(
                 }
             }
             Message::Response(response) => {
-                let watcher_response = watcher_registration
-                    .as_mut()
-                    .and_then(|registration| registration.handle_response(&response));
-                if let Some(accepted) = watcher_response {
-                    if !accepted {
-                        if let Some(error) = &response.error {
-                            eprintln!(
-                                "pascal-lsp: watcher registration {} rejected ({}): {}",
-                                response.id, error.code, error.message
-                            );
-                        }
-                    }
+                if let Some(effect) =
+                    configuration.handle_response(connection, workspace, &response)?
+                {
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
                     }
-                } else if let Some(error) = response.error {
-                    eprintln!(
-                        "pascal-lsp: client request {} failed ({}): {}",
-                        response.id, error.code, error.message
-                    );
+                    jobs.cancel_diagnostics_for(&effect.cancel);
+                    jobs.refresh_diagnostics(workspace, &effect.refresh);
+                } else {
+                    let watcher_response = watcher_registration
+                        .as_mut()
+                        .and_then(|registration| registration.handle_response(&response));
+                    if let Some(accepted) = watcher_response {
+                        if !accepted {
+                            if let Some(error) = &response.error {
+                                eprintln!(
+                                    "pascal-lsp: watcher registration {} rejected ({}): {}",
+                                    response.id, error.code, error.message
+                                );
+                            }
+                        }
+                        if let Some(registration) = watcher_registration.as_mut() {
+                            sync_file_watcher(connection, workspace, registration)?;
+                        }
+                    } else if let Some(error) = response.error {
+                        eprintln!(
+                            "pascal-lsp: client request {} failed ({}): {}",
+                            response.id, error.code, error.message
+                        );
+                    }
                 }
             }
         }
@@ -4474,6 +4797,15 @@ fn supports_workspace_folders(client: &ClientCapabilities) -> bool {
         .as_ref()
         .and_then(|workspace| workspace.workspace_folders)
         .unwrap_or(false)
+}
+
+fn supports_configuration(client: &ClientCapabilities) -> bool {
+    let supported = client
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.configuration)
+        .unwrap_or(false);
+    supported
 }
 
 fn supports_watched_file_registration(client: &ClientCapabilities) -> bool {

@@ -88,7 +88,7 @@ fn filename_catalogue_entry_limit() -> usize {
     MAX_FILENAME_CATALOGUE_ENTRIES
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
@@ -105,7 +105,7 @@ impl Default for ResourceLimits {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceOptions {
     pub source_paths: Vec<String>,
     pub exclude: Vec<String>,
@@ -113,6 +113,274 @@ pub struct WorkspaceOptions {
     pub build_config: Option<String>,
     pub platform: Option<String>,
     pub limits: ResourceLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeOption<T> {
+    Absent,
+    Reset,
+    Value(T),
+    Invalid(String),
+}
+
+impl<T> Default for RuntimeOption<T> {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeOptionsUpdate {
+    pub(crate) source_paths: RuntimeOption<Vec<String>>,
+    pub(crate) exclude: RuntimeOption<Vec<String>>,
+    pub(crate) project_file: RuntimeOption<PathBuf>,
+    pub(crate) build_config: RuntimeOption<String>,
+    pub(crate) platform: RuntimeOption<String>,
+    pub(crate) max_files: RuntimeOption<usize>,
+    pub(crate) max_file_bytes: RuntimeOption<usize>,
+    pub(crate) max_total_bytes: RuntimeOption<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeOptionsOverride {
+    source_paths: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    project_file: Option<Option<PathBuf>>,
+    build_config: Option<Option<String>>,
+    platform: Option<Option<String>>,
+    max_files: Option<usize>,
+    max_file_bytes: Option<usize>,
+    max_total_bytes: Option<usize>,
+}
+
+const MAX_RUNTIME_LIST_ENTRIES: usize = 256;
+const MAX_RUNTIME_STRING_BYTES: usize = 4 * 1024;
+
+impl RuntimeOptionsUpdate {
+    pub(crate) fn reset() -> Self {
+        Self {
+            source_paths: RuntimeOption::Reset,
+            exclude: RuntimeOption::Reset,
+            project_file: RuntimeOption::Reset,
+            build_config: RuntimeOption::Reset,
+            platform: RuntimeOption::Reset,
+            max_files: RuntimeOption::Reset,
+            max_file_bytes: RuntimeOption::Reset,
+            max_total_bytes: RuntimeOption::Reset,
+        }
+    }
+}
+
+impl RuntimeOptionsOverride {
+    pub(crate) fn effective(&self, base: &WorkspaceOptions) -> WorkspaceOptions {
+        WorkspaceOptions {
+            source_paths: self
+                .source_paths
+                .clone()
+                .unwrap_or_else(|| base.source_paths.clone()),
+            exclude: self.exclude.clone().unwrap_or_else(|| base.exclude.clone()),
+            project_file: self
+                .project_file
+                .as_ref()
+                .and_then(|value| value.clone())
+                .or_else(|| base.project_file.clone()),
+            build_config: self
+                .build_config
+                .as_ref()
+                .and_then(|value| value.clone())
+                .or_else(|| base.build_config.clone()),
+            platform: self
+                .platform
+                .as_ref()
+                .and_then(|value| value.clone())
+                .or_else(|| base.platform.clone()),
+            limits: ResourceLimits {
+                max_files: self.max_files.unwrap_or(base.limits.max_files),
+                max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
+                max_total_bytes: self.max_total_bytes.unwrap_or(base.limits.max_total_bytes),
+            },
+        }
+    }
+
+    pub(crate) fn apply(&mut self, update: RuntimeOptionsUpdate) -> Vec<String> {
+        let mut warnings = Vec::new();
+        apply_runtime_field(
+            &mut self.source_paths,
+            update.source_paths,
+            "sourcePaths",
+            &mut warnings,
+        );
+        apply_runtime_field(&mut self.exclude, update.exclude, "exclude", &mut warnings);
+        apply_runtime_optional_field(
+            &mut self.project_file,
+            update.project_file,
+            "projectFile",
+            &mut warnings,
+        );
+        apply_runtime_optional_field(
+            &mut self.build_config,
+            update.build_config,
+            "buildConfig",
+            &mut warnings,
+        );
+        apply_runtime_optional_field(
+            &mut self.platform,
+            update.platform,
+            "platform",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.max_files,
+            update.max_files,
+            "maxFiles",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.max_file_bytes,
+            update.max_file_bytes,
+            "maxFileBytes",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.max_total_bytes,
+            update.max_total_bytes,
+            "maxTotalBytes",
+            &mut warnings,
+        );
+        warnings
+    }
+}
+
+fn apply_runtime_field<T: Clone>(
+    target: &mut Option<T>,
+    value: RuntimeOption<T>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) {
+    match value {
+        RuntimeOption::Absent | RuntimeOption::Reset => *target = None,
+        RuntimeOption::Value(value) => *target = Some(value),
+        RuntimeOption::Invalid(error) => warnings.push(format!("ignoring runtime {name}: {error}")),
+    }
+}
+
+fn apply_runtime_optional_field<T: Clone>(
+    target: &mut Option<Option<T>>,
+    value: RuntimeOption<T>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) {
+    match value {
+        RuntimeOption::Absent => *target = None,
+        RuntimeOption::Reset => *target = Some(None),
+        RuntimeOption::Value(value) => *target = Some(Some(value)),
+        RuntimeOption::Invalid(error) => warnings.push(format!("ignoring runtime {name}: {error}")),
+    }
+}
+
+pub(crate) fn parse_runtime_options(
+    value: &serde_json::Value,
+) -> Result<RuntimeOptionsUpdate, String> {
+    let Some(object) = value.as_object() else {
+        return Err("runtime pascalLsp settings must be an object or null".to_string());
+    };
+
+    Ok(RuntimeOptionsUpdate {
+        source_paths: parse_runtime_list(object, "sourcePaths"),
+        exclude: parse_runtime_list(object, "exclude"),
+        project_file: parse_runtime_string(object, "projectFile").map_path_buf(),
+        build_config: parse_runtime_string(object, "buildConfig"),
+        platform: parse_runtime_string(object, "platform"),
+        max_files: parse_runtime_limit(object, "maxFiles", DEFAULT_MAX_FILES),
+        max_file_bytes: parse_runtime_limit(object, "maxFileBytes", DEFAULT_MAX_FILE_BYTES),
+        max_total_bytes: parse_runtime_limit(object, "maxTotalBytes", DEFAULT_MAX_TOTAL_BYTES),
+    })
+}
+
+fn parse_runtime_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> RuntimeOption<Vec<String>> {
+    let Some(value) = object.get(name) else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(values) = value.as_array() else {
+        return RuntimeOption::Invalid("must be an array of strings".to_string());
+    };
+    if values.len() > MAX_RUNTIME_LIST_ENTRIES {
+        return RuntimeOption::Invalid(format!(
+            "contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+        ));
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return RuntimeOption::Invalid("must contain only strings".to_string());
+        };
+        if value.len() > MAX_RUNTIME_STRING_BYTES {
+            return RuntimeOption::Invalid(format!(
+                "contains a string longer than {MAX_RUNTIME_STRING_BYTES} bytes"
+            ));
+        }
+        parsed.push(value.to_string());
+    }
+    RuntimeOption::Value(parsed)
+}
+
+fn parse_runtime_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> RuntimeOption<String> {
+    let Some(value) = object.get(name) else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(value) = value.as_str() else {
+        return RuntimeOption::Invalid("must be a string or null".to_string());
+    };
+    if value.len() > MAX_RUNTIME_STRING_BYTES {
+        return RuntimeOption::Invalid(format!("is longer than {MAX_RUNTIME_STRING_BYTES} bytes"));
+    }
+    RuntimeOption::Value(value.to_string())
+}
+
+impl RuntimeOption<String> {
+    fn map_path_buf(self) -> RuntimeOption<PathBuf> {
+        match self {
+            RuntimeOption::Absent => RuntimeOption::Absent,
+            RuntimeOption::Reset => RuntimeOption::Reset,
+            RuntimeOption::Value(value) => RuntimeOption::Value(PathBuf::from(value)),
+            RuntimeOption::Invalid(error) => RuntimeOption::Invalid(error),
+        }
+    }
+}
+
+fn parse_runtime_limit(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    maximum: usize,
+) -> RuntimeOption<usize> {
+    let Some(value) = object.get(name) else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(value) = value.as_u64() else {
+        return RuntimeOption::Invalid("must be a positive integer or null".to_string());
+    };
+    let Ok(value) = usize::try_from(value) else {
+        return RuntimeOption::Invalid("is too large for this platform".to_string());
+    };
+    if value == 0 {
+        return RuntimeOption::Invalid("must be at least 1".to_string());
+    }
+    RuntimeOption::Value(value.min(maximum))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -664,6 +932,61 @@ impl Workspace {
         workspace
     }
 
+    /// Replace the effective workspace options after a validated runtime
+    /// configuration update.  Runtime settings are global for this workspace;
+    /// explicit per-directory project selections remain in `project_selections`
+    /// and are re-applied during the next request.
+    pub(crate) fn apply_runtime_options(&mut self, options: WorkspaceOptions) -> bool {
+        if self.options == options {
+            return false;
+        }
+
+        self.options = options;
+        let root_paths = self
+            .roots
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        self.roots = root_paths
+            .into_iter()
+            .map(|root| WorkspaceRoot::new(root, &self.options))
+            .collect();
+
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.mark_global_change();
+        self.contexts.clear();
+        self.document_contexts.clear();
+        self.open_document_contexts.clear();
+        self.document_owners.clear();
+        self.owner_last_used.clear();
+        self.cached_documents.clear();
+        self.directory_catalogues.clear();
+        self.filename_catalogues.clear();
+        self.package_catalogues.clear();
+        self.package_metadata_cache.clear();
+        self.deleted_overrides.clear();
+        self.source_change_generations.clear();
+        self.configuration_change_generations.clear();
+        self.source_change_observations.clear();
+
+        self.index = NavigationIndex::new();
+        self.indexed_files.clear();
+        self.indexed_sizes.clear();
+        self.indexed_bytes = 0;
+        self.disk_stamps.clear();
+        self.last_used.clear();
+        self.file_cap_warning_sent = false;
+        self.total_cap_warning_sent = false;
+        if let Some(records) = self.analysis_records.as_mut() {
+            records.clear();
+        }
+        for uri in self.open_documents.keys().cloned().collect::<Vec<_>>() {
+            self.schedule_diagnostics(uri);
+        }
+        true
+    }
+
     pub(crate) fn from_analysis_input(input: &rename::WorkspaceInput) -> Self {
         let roots = input
             .roots
@@ -783,6 +1106,12 @@ impl Workspace {
 
     fn workspace_root_paths(&self) -> Vec<PathBuf> {
         self.roots.iter().map(|root| root.path.clone()).collect()
+    }
+
+    pub(crate) fn configuration_scope_uri(&self) -> Option<Url> {
+        (self.roots.len() == 1)
+            .then(|| Url::from_file_path(&self.roots[0].path).ok())
+            .flatten()
     }
 
     /// Return configuration candidates that may affect any known context.

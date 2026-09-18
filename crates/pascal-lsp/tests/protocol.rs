@@ -192,6 +192,30 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_navigation_barrier_and_configuration(
+        environment: TempDir,
+    ) -> (Self, TestBarrier) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let barrier_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_NAVIGATION_BARRIER"),
+            Some(barrier_value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier_and_filename_catalogue_limit(
         environment: TempDir,
         limit: usize,
@@ -648,6 +672,31 @@ impl TestServer {
         }
     }
 
+    fn request_with_timeout(&mut self, method: &str, timeout: Duration) -> Option<Request> {
+        if let Some(index) = self.pending.iter().position(
+            |message| matches!(message, Message::Request(request) if request.method == method),
+        ) {
+            return match self.pending.remove(index).expect("pending request") {
+                Message::Request(request) => Some(request),
+                _ => unreachable!("pending request predicate"),
+            };
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(Message::Request(request)))) if request.method == method => {
+                    return Some(request);
+                }
+                Ok(Ok(Some(message))) => self.pending.push_back(message),
+                Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Ok(Err(error)) => panic!("failed reading request: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+            }
+        }
+        None
+    }
+
     fn receive_until(&mut self, deadline: Instant) -> Message {
         let remaining = deadline.saturating_duration_since(Instant::now());
         self.messages
@@ -972,6 +1021,76 @@ impl TestServer {
                             "relativePatternSupport": relative_pattern_support
                         },
                         "workspaceEdit": {"documentChanges": document_changes}
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    fn initialize_with_configuration_capability(
+        &mut self,
+        root: &Path,
+        configuration: Option<bool>,
+        initialization_options: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("configuration-initialize".to_string());
+        let mut workspace = json!({
+            "workspaceFolders": true,
+        });
+        if let Some(configuration) = configuration {
+            workspace["configuration"] = json!(configuration);
+        }
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": initialization_options,
+                "capabilities": {
+                    "workspace": workspace,
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    fn initialize_with_configuration_capability_and_folders(
+        &mut self,
+        root: &Path,
+        folders: &[&Path],
+        configuration: bool,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let workspace_folders = folders
+            .iter()
+            .map(|folder| {
+                json!({
+                    "uri": uri(folder),
+                    "name": folder.display().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let id = RequestId::from("configuration-folders-initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "workspaceFolders": workspace_folders,
+                "capabilities": {
+                    "workspace": {
+                        "workspaceFolders": true,
+                        "configuration": configuration,
                     }
                 }
             }),
@@ -25626,4 +25745,556 @@ fn cancellation_takes_precedence_over_stale_generation_for_formatting() {
         .expect("cancelled formatting must respond");
     assert_eq!(response.error.expect("cancellation error").code, -32800);
     server.assert_no_response(&request_id);
+}
+
+#[test]
+fn configuration_pull_is_negotiated_after_initialized_with_scope_and_namespace() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+
+    let request = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration pull request after initialized");
+    assert_eq!(request.params["items"][0]["section"], "pascalLsp");
+    assert_eq!(
+        request.params["items"][0]["scopeUri"],
+        uri(root).to_string()
+    );
+    server.send(Message::Response(Response::new_ok(
+        request.id,
+        json!([{"projectFile": null}]),
+    )));
+    server.shutdown();
+}
+
+#[test]
+fn configuration_pull_waits_for_the_initialized_notification() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("configuration-lifecycle-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(root),
+            "capabilities": {
+                "workspace": {
+                    "configuration": true
+                }
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    assert!(
+        server
+            .request_with_timeout("workspace/configuration", Duration::from_millis(100))
+            .is_none(),
+        "configuration must not be pulled before initialized"
+    );
+
+    server.send_notification("initialized", json!({}));
+    let request = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration pull after initialized");
+    server.send(Message::Response(Response::new_ok(request.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn multi_root_configuration_uses_the_documented_global_scope() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(&first).expect("first workspace folder");
+    fs::create_dir_all(&second).expect("second workspace folder");
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability_and_folders(
+        &first,
+        &[first.as_path(), second.as_path()],
+        true,
+    );
+    let request = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("global configuration pull request");
+    assert!(
+        request.params["items"][0]["scopeUri"].is_null(),
+        "global runtime settings must not use one root's scope for every root"
+    );
+    server.send(Message::Response(Response::new_ok(request.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn adding_a_workspace_folder_switches_a_global_configuration_pull_to_unscoped() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(&first).expect("first workspace folder");
+    fs::create_dir_all(&second).expect("second workspace folder");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(&first, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    assert_eq!(
+        initial.params["items"][0]["scopeUri"],
+        uri(&first).to_string()
+    );
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+
+    server.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{"uri": uri(&second), "name": "second"}],
+                "removed": []
+            }
+        }),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("workspace-folder configuration refresh");
+    assert!(
+        refresh.params["items"][0]["scopeUri"].is_null(),
+        "global runtime settings must become unscoped after a second root is added"
+    );
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn pushed_configuration_is_used_without_pull_capability() {
+    for capability in [Some(false), None] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let project = root.join("App.dproj");
+        write_file(&main, "unit Main; interface implementation end.");
+        write_file(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        server.initialize_with_configuration_capability(root, capability, Value::Null);
+        assert!(
+            server
+                .request_with_timeout("workspace/configuration", Duration::from_millis(100))
+                .is_none(),
+            "push-only clients must not receive a pull request"
+        );
+        server.send_notification(
+            "workspace/didChangeConfiguration",
+            json!({"settings": {"pascalLsp": {"projectFile": "App.dproj"}}}),
+        );
+
+        let id = RequestId::from("pushed-configuration-context".to_string());
+        server.send_request(
+            id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&main)}}),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "project context failed: {response:?}"
+        );
+        assert_eq!(
+            response.result.expect("project context")["selectionMode"],
+            "configured"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn configuration_refresh_coalesces_and_discards_an_obsolete_pull_reply() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+    let first = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+
+    for _ in 0..2 {
+        server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    }
+    server.send(Message::Response(Response::new_ok(
+        first.id,
+        json!([{"projectFile": "A.dproj"}]),
+    )));
+
+    let second = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("coalesced configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        second.id,
+        json!([{"projectFile": "B.dproj"}]),
+    )));
+
+    let id = RequestId::from("coalesced-configuration-context".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "project context failed: {response:?}"
+    );
+    assert_eq!(
+        response.result.expect("project context")["selectedProjectUri"],
+        uri(&project_b).to_string()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_invalidates_an_inflight_navigation_at_the_delivery_barrier() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main; interface uses Provider; implementation procedure Run; begin ProviderRoutine; end; end.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit Provider; interface procedure ProviderRoutine; implementation procedure ProviderRoutine; begin end; end.\n",
+    );
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_configuration(environment);
+    server.initialize_with_configuration_capability(&root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+
+    let request_id = RequestId::from("runtime-stale-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ProviderRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let update = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration refresh pull");
+    server.send(Message::Response(Response::new_ok(
+        update.id,
+        json!([{"maxFiles": 1}]),
+    )));
+    barrier.release();
+
+    let response = server.response(&request_id);
+    assert_eq!(response.error.expect("stale navigation error").code, -32803);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn identical_runtime_configuration_does_not_stale_an_inflight_navigation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main; interface uses Provider; implementation procedure Run; begin ProviderRoutine; end; end.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit Provider; interface procedure ProviderRoutine; implementation procedure ProviderRoutine; begin end; end.\n",
+    );
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_configuration(environment);
+    server.initialize_with_configuration_capability(&root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        initial.id,
+        json!([{"maxFiles": 1}]),
+    )));
+
+    let request_id = RequestId::from("runtime-identical-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ProviderRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let update = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration refresh pull");
+    server.send(Message::Response(Response::new_ok(
+        update.id,
+        json!([{"maxFiles": 1}]),
+    )));
+    barrier.release();
+
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "identical runtime settings must not stale a request: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_preserves_malformed_fields_and_null_resets_to_initialization() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(
+        root,
+        Some(false),
+        json!({"pascalLsp": {"projectFile": "B.dproj"}}),
+    );
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"projectFile": "A.dproj"}}}),
+    );
+    let configured_id = RequestId::from("runtime-configured-context".to_string());
+    server.send_request(
+        configured_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let configured = server.response(&configured_id);
+    assert_eq!(
+        configured.result.expect("configured context")["selectedProjectUri"],
+        uri(&project_a).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"projectFile": 7, "maxFiles": 2}}}),
+    );
+    let retained_id = RequestId::from("runtime-malformed-context".to_string());
+    server.send_request(
+        retained_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let retained = server.response(&retained_id);
+    assert_eq!(
+        retained.result.expect("retained context")["selectedProjectUri"],
+        uri(&project_a).to_string(),
+        "a malformed projectFile must not erase the valid runtime project"
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": null}}),
+    );
+    let reset_id = RequestId::from("runtime-reset-context".to_string());
+    server.send_request(
+        reset_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let reset = server.response(&reset_id);
+    assert_eq!(
+        reset.result.expect("reset context")["selectedProjectUri"],
+        uri(&project_b).to_string(),
+        "null must restore the initialization projectFile fallback"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pushed_runtime_configuration_refreshes_open_document_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source = "unit Main; interface implementation end.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(false), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let initial =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        initial["diagnostics"].as_array().is_some_and(Vec::is_empty),
+        "baseline diagnostics should be empty: {initial}"
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"projectFile": "Missing.dproj"}}}),
+    );
+    let refreshed =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        refreshed["diagnostics"].as_array().is_some(),
+        "runtime configuration should publish a diagnostic refresh: {refreshed}"
+    );
+    assert_eq!(refreshed["uri"], uri(&main).to_string());
+    assert_eq!(refreshed["version"], 1);
+    server.shutdown();
+}
+
+#[test]
+fn configuration_errors_and_duplicate_replies_keep_the_last_valid_runtime_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+    let first = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        first.id.clone(),
+        json!([{"projectFile": "A.dproj"}]),
+    )));
+
+    let configured_id = RequestId::from("error-preservation-configured".to_string());
+    server.send_request(
+        configured_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert_eq!(
+        server
+            .response(&configured_id)
+            .result
+            .expect("configured context")["selectedProjectUri"],
+        uri(&project_a).to_string()
+    );
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let second = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("refresh configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        first.id,
+        json!([{"projectFile": "B.dproj"}]),
+    )));
+    server.send(Message::Response(Response::new_err(
+        second.id,
+        -32603,
+        "configuration unavailable".to_string(),
+    )));
+
+    let retained_id = RequestId::from("error-preservation-retained".to_string());
+    server.send_request(
+        retained_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert_eq!(
+        server
+            .response(&retained_id)
+            .result
+            .expect("retained context")["selectedProjectUri"],
+        uri(&project_a).to_string(),
+        "configuration errors and duplicate old replies must not overwrite valid state"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn an_empty_configuration_pull_result_preserves_the_last_valid_runtime_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project = root.join("A.dproj");
+    let other_project = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project_path in [&project, &other_project] {
+        write_file(
+            project_path,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        initial.id,
+        json!([{"projectFile": "A.dproj"}]),
+    )));
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("refresh configuration pull");
+    server.send(Message::Response(Response::new_ok(refresh.id, json!([]))));
+
+    let id = RequestId::from("empty-configuration-result-context".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert_eq!(
+        response.result.expect("project context")["selectedProjectUri"],
+        uri(&project).to_string(),
+        "an empty response array must not reset the last valid runtime value"
+    );
+    server.shutdown();
 }

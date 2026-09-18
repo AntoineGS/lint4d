@@ -58,6 +58,7 @@ const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
 const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AUTO_IMPORT_PROVIDER_SOURCES: usize = 512;
 const INCLUDE_BYTE_BUDGET_ERROR: &str =
     "include byte limit would be exceeded before reading the file";
 
@@ -303,6 +304,8 @@ struct Enumeration {
     complete: bool,
     reason: Option<String>,
     visited_entries: usize,
+    auto_import_complete: bool,
+    auto_import_unit_providers: HashMap<String, Vec<Url>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1615,6 +1618,180 @@ fn contains_any_identifier_bytes(source: &[u8], names: &[String]) -> bool {
     false
 }
 
+fn contains_any_identifier_prefix(source: &str, names: &[String]) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        if start == index {
+            continue;
+        }
+        let Some(identifier) = source.get(start..index) else {
+            continue;
+        };
+        if names.iter().any(|name| {
+            let name = name.trim_start_matches('&');
+            !name.is_empty()
+                && identifier.len() >= name.len()
+                && identifier[..name.len()].eq_ignore_ascii_case(name)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_any_identifier_prefix_bytes(source: &[u8], names: &[String]) -> bool {
+    let mut index = 0;
+    while index < source.len() {
+        while index < source.len() && !is_identifier_byte(source[index]) {
+            index += 1;
+        }
+        let start = index;
+        while index < source.len() && is_identifier_byte(source[index]) {
+            index += 1;
+        }
+        if start == index {
+            continue;
+        }
+        let identifier = &source[start..index];
+        if names.iter().any(|name| {
+            let name = name.trim_start_matches('&').as_bytes();
+            !name.is_empty()
+                && identifier.len() >= name.len()
+                && identifier[..name.len()].eq_ignore_ascii_case(name)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn source_unit_name(source: &str, cancel: &AtomicBool) -> Result<Option<String>, String> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0usize;
+    let Some(keyword) = next_source_identifier(source, &mut cursor, cancel)? else {
+        return Ok(None);
+    };
+    if !keyword.eq_ignore_ascii_case("unit") {
+        return Ok(None);
+    }
+    let Some(first) = next_source_identifier(source, &mut cursor, cancel)? else {
+        return Ok(None);
+    };
+    let mut parts = vec![first];
+    loop {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'.') {
+            break;
+        }
+        cursor += 1;
+        let Some(part) = next_source_identifier(source, &mut cursor, cancel)? else {
+            return Ok(None);
+        };
+        parts.push(part);
+    }
+    let name = parts
+        .into_iter()
+        .map(|part| part.trim_start_matches('&').to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    Ok((!name.is_empty()).then_some(name))
+}
+
+fn next_source_identifier(
+    source: &str,
+    cursor: &mut usize,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, String> {
+    let bytes = source.as_bytes();
+    loop {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        while bytes
+            .get(*cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            *cursor += 1;
+        }
+        if bytes.get(*cursor) == Some(&b'/') && bytes.get(*cursor + 1) == Some(&b'/') {
+            *cursor += 2;
+            while *cursor < bytes.len() && bytes[*cursor] != b'\r' && bytes[*cursor] != b'\n' {
+                *cursor += 1;
+            }
+            continue;
+        }
+        if bytes.get(*cursor) == Some(&b'{') {
+            *cursor += 1;
+            while *cursor < bytes.len() && bytes[*cursor] != b'}' {
+                *cursor += 1;
+            }
+            if *cursor == bytes.len() {
+                return Ok(None);
+            }
+            *cursor += 1;
+            continue;
+        }
+        if bytes.get(*cursor) == Some(&b'(') && bytes.get(*cursor + 1) == Some(&b'*') {
+            *cursor += 2;
+            while *cursor + 1 < bytes.len()
+                && !(bytes[*cursor] == b'*' && bytes[*cursor + 1] == b')')
+            {
+                *cursor += 1;
+            }
+            if *cursor + 1 >= bytes.len() {
+                return Ok(None);
+            }
+            *cursor += 2;
+            continue;
+        }
+        if bytes.get(*cursor) == Some(&b'\'') {
+            *cursor += 1;
+            while *cursor < bytes.len() {
+                if bytes[*cursor] == b'\'' {
+                    if bytes.get(*cursor + 1) == Some(&b'\'') {
+                        *cursor += 2;
+                    } else {
+                        *cursor += 1;
+                        break;
+                    }
+                } else {
+                    *cursor += 1;
+                }
+            }
+            continue;
+        }
+        let Some(&byte) = bytes.get(*cursor) else {
+            return Ok(None);
+        };
+        if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'&' {
+            let start = *cursor;
+            *cursor += 1;
+            while bytes
+                .get(*cursor)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                *cursor += 1;
+            }
+            return Ok(source.get(start..*cursor).map(str::to_owned));
+        }
+        return Ok(None);
+    }
+}
+
 fn may_contain_include_directive(source: &[u8]) -> bool {
     source.windows(2).any(|window| window == b"{$")
         || source.windows(3).any(|window| window == b"(*$")
@@ -2522,7 +2699,15 @@ pub(crate) fn build_snapshot(
             }
         }
     }
-    let mut enumeration = enumerate_sources(&loader, input, &priority, mode, cancel)?;
+    let mut enumeration = enumerate_sources(
+        &mut loader,
+        input,
+        &priority,
+        &priority_contexts,
+        candidate_names,
+        mode,
+        cancel,
+    )?;
     let project_contexts = if mode == SnapshotMode::WorkspaceSymbols {
         discover_project_metadata_contexts(&mut loader, &mut enumeration, cancel)?
     } else {
@@ -2579,7 +2764,9 @@ pub(crate) fn build_snapshot(
         cancel,
     )?;
     enumeration.sort_paths(&priority);
+    let auto_import_complete = enumeration.auto_import_complete;
     let paths = enumeration.paths;
+    let mut auto_import_unit_providers = enumeration.auto_import_unit_providers;
     let mut complete = enumeration.complete;
     let mut incomplete_reason = enumeration.reason;
     let mut baseline = enumeration.baseline;
@@ -2623,6 +2810,7 @@ pub(crate) fn build_snapshot(
     let mut editable = HashSet::new();
     let mut contexts = HashMap::new();
     let mut index = NavigationIndex::new();
+    index.set_auto_import_discovery_complete(auto_import_complete);
     let mut indexed_sizes = HashMap::new();
     let mut indexed_stamps = HashMap::new();
     let mut indexed_uris = HashSet::new();
@@ -2706,6 +2894,7 @@ pub(crate) fn build_snapshot(
                     continue;
                 }
             };
+        let mut auto_import_provider_recorded = false;
         let (source, record, source_bytes) = if let Some(seed) =
             priority_seed.as_ref().filter(|seed| seed.record.uri == uri)
         {
@@ -2757,10 +2946,12 @@ pub(crate) fn build_snapshot(
                 }
             };
             scanned_bytes = scanned_bytes.saturating_add(scan.bytes);
-            baseline_content_hashes
-                .entry(path_key(&path))
-                .or_insert(scan.content_hash);
-            baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            if mode != SnapshotMode::Assistance {
+                baseline_content_hashes
+                    .entry(path_key(&path))
+                    .or_insert(scan.content_hash);
+                baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            }
             if scanned_bytes > MAX_RENAME_SCANNED_BYTES {
                 complete = false;
                 incomplete_reason.get_or_insert_with(|| {
@@ -2771,13 +2962,31 @@ pub(crate) fn build_snapshot(
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
+            let source = decode_bytes(&scan.data).into_owned();
+            if mode == SnapshotMode::Assistance && !is_priority {
+                auto_import_provider_recorded = true;
+                if let Some(unit_name) = source_unit_name(&source, cancel)? {
+                    auto_import_unit_providers
+                        .entry(unit_name)
+                        .or_default()
+                        .push(uri.clone());
+                }
+            }
             let direct_candidate = candidate_names.is_empty()
                 || !candidate_names_are_ascii
-                || contains_any_identifier_bytes(&scan.data, candidate_names);
-            if !is_priority && !direct_candidate && !may_contain_include_directive(&scan.data) {
+                || contains_any_identifier_bytes(&scan.data, candidate_names)
+                || (mode == SnapshotMode::Assistance
+                    && contains_any_identifier_prefix_bytes(&scan.data, candidate_names));
+            let may_contain_include = may_contain_include_directive(&scan.data);
+            if !is_priority && !direct_candidate && !may_contain_include {
                 continue;
             }
-            let source = decode_bytes(&scan.data).into_owned();
+            if mode == SnapshotMode::Assistance {
+                baseline_content_hashes
+                    .entry(path_key(&path))
+                    .or_insert(scan.content_hash);
+                baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            }
             let stamp = disk_stamp(&path)
                 .ok_or_else(|| format!("rename workspace scan could not stat source {path:?}"))?;
             (
@@ -2803,6 +3012,14 @@ pub(crate) fn build_snapshot(
                 scan.bytes,
             )
         };
+        if mode == SnapshotMode::Assistance && !is_priority && !auto_import_provider_recorded {
+            if let Some(unit_name) = source_unit_name(&source, cancel)? {
+                auto_import_unit_providers
+                    .entry(unit_name)
+                    .or_default()
+                    .push(uri.clone());
+            }
+        }
         if !record.open {
             baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
         }
@@ -2813,7 +3030,9 @@ pub(crate) fn build_snapshot(
         }
         let should_index = is_priority
             || candidate_names.is_empty()
-            || contains_any_identifier(&source, candidate_names);
+            || contains_any_identifier(&source, candidate_names)
+            || (mode == SnapshotMode::Assistance
+                && contains_any_identifier_prefix(&source, candidate_names));
         if !should_index {
             let owner_directives = directives(&source);
             if owner_directives
@@ -3009,11 +3228,16 @@ pub(crate) fn build_snapshot(
             "rename workspace source scan was empty; no Pascal sources were retained".to_string(),
         );
     }
+    for providers in auto_import_unit_providers.values_mut() {
+        providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        providers.dedup();
+    }
     for (uri, context_key) in &contexts {
         loader
             .document_contexts
             .insert(uri.clone(), context_key.clone());
     }
+    index.set_auto_import_unit_providers(auto_import_unit_providers);
     loader.index = index;
     loader.indexed_files = indexed_uris.clone();
     loader.indexed_sizes = indexed_sizes;
@@ -3061,6 +3285,9 @@ pub(crate) fn build_snapshot(
                 )
             });
         }
+    }
+    if mode == SnapshotMode::Assistance && !complete {
+        loader.index.set_auto_import_discovery_complete(false);
     }
 
     let indexed_uris = loader.indexed_files.clone();
@@ -3263,20 +3490,20 @@ pub(crate) fn ensure_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), S
 }
 
 fn enumerate_sources(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     input: &WorkspaceInput,
     priority: &[Url],
+    priority_contexts: &HashMap<Url, ContextKey>,
+    candidate_names: &[String],
     mode: SnapshotMode,
     cancel: &AtomicBool,
 ) -> Result<Enumeration, String> {
     let mut result = Enumeration {
         complete: true,
+        auto_import_complete: true,
         ..Enumeration::default()
     };
-    if matches!(
-        mode,
-        SnapshotMode::Local | SnapshotMode::LocalWithImports | SnapshotMode::Assistance
-    ) {
+    if matches!(mode, SnapshotMode::Local | SnapshotMode::LocalWithImports) {
         for uri in priority {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -3297,6 +3524,18 @@ fn enumerate_sources(
                 add_baseline_path(&mut result.baseline, path.clone());
                 result.add_path(path, None);
             }
+        }
+        return Ok(result);
+    }
+    if mode == SnapshotMode::Assistance {
+        if !candidate_names.is_empty() {
+            enumerate_assistance_provider_sources(
+                workspace,
+                input,
+                priority_contexts,
+                &mut result,
+                cancel,
+            )?;
         }
         return Ok(result);
     }
@@ -3415,6 +3654,133 @@ fn enumerate_sources(
     result.sort_paths(priority);
 
     Ok(result)
+}
+
+fn enumerate_assistance_provider_sources(
+    workspace: &mut Workspace,
+    input: &WorkspaceInput,
+    priority_contexts: &HashMap<Url, ContextKey>,
+    enumeration: &mut Enumeration,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut contexts = priority_contexts.values().cloned().collect::<Vec<_>>();
+    contexts.sort_by_key(|key| format!("{key:?}"));
+    contexts.dedup();
+
+    for context_key in contexts {
+        let Some(context) = workspace
+            .contexts
+            .get(&context_key)
+            .map(|state| state.context.clone())
+        else {
+            enumeration.auto_import_complete = false;
+            continue;
+        };
+        let mut context_roots = context.search_paths.clone();
+        context_roots.extend(
+            context
+                .main_source_entry
+                .iter()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        context_roots.extend(
+            context
+                .explicit_unit_entries
+                .values()
+                .flatten()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        context_roots.extend(mapped_source_roots(&context));
+        if context_roots.is_empty() {
+            context_roots.extend(
+                workspace
+                    .roots
+                    .iter()
+                    .flat_map(|root| root.source_roots.iter().cloned()),
+            );
+        }
+        context_roots.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        context_roots.dedup_by(|left, right| paths_equal_ci(left, right));
+
+        for root in context_roots {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            let root = absolute_path(root);
+            let catalogue = workspace.filename_catalogue_with_cancel(&root, Some(cancel))?;
+            if !catalogue.complete {
+                enumeration.auto_import_complete = false;
+            }
+            for (directory, stamp) in catalogue.directories {
+                add_baseline_path_with_stamp(&mut enumeration.baseline, directory, stamp);
+            }
+            let mut provider_paths = catalogue
+                .entries
+                .into_values()
+                .flatten()
+                .map(absolute_path)
+                .collect::<Vec<_>>();
+            provider_paths.sort_by_key(|left| path_key(left));
+            provider_paths.dedup_by(|left, right| paths_equal_ci(left, right));
+            for path in provider_paths {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                    enumeration.auto_import_complete = false;
+                    return Ok(());
+                }
+                if !is_pascal_path(&path)
+                    || !workspace.ensure_supported_project_context(
+                        &path,
+                        &context,
+                        Some(&context_key),
+                    )
+                {
+                    continue;
+                }
+                enumeration.add_path(path, Some(context_key.clone()));
+            }
+
+            let mut overlay_paths = Vec::new();
+            for (uri, overlay) in &input.overlays {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                let Some(path) = uri.to_file_path().ok() else {
+                    continue;
+                };
+                overlay_paths.push((absolute_path(path), overlay.text.len()));
+            }
+            overlay_paths.sort_by(|left, right| path_key(&left.0).cmp(&path_key(&right.0)));
+            overlay_paths.dedup_by(|left, right| paths_equal_ci(&left.0, &right.0));
+            for (path, overlay_bytes) in overlay_paths {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                if !is_pascal_path(&path)
+                    || !path_starts_with_native(&path, &root)
+                    || !workspace.ensure_supported_project_context(
+                        &path,
+                        &context,
+                        Some(&context_key),
+                    )
+                {
+                    continue;
+                }
+                if overlay_bytes > input.options.limits.max_file_bytes {
+                    enumeration.auto_import_complete = false;
+                    continue;
+                }
+                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                    enumeration.auto_import_complete = false;
+                    return Ok(());
+                }
+                enumeration.add_path(path, Some(context_key.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn add_baseline_path(baseline: &mut BaselineAccumulator, path: PathBuf) {

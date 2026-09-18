@@ -168,6 +168,8 @@ pub(crate) enum SemanticTokenResolutionMode {
 pub struct NavigationIndex {
     documents: HashMap<Url, Document>,
     units: HashMap<String, Vec<Url>>,
+    auto_import_discovery_complete: Option<bool>,
+    auto_import_unit_providers: HashMap<String, Vec<Url>>,
 }
 
 /// A byte span in a parsed Pascal source document.
@@ -188,6 +190,14 @@ impl NavigationIndex {
     /// Construct an empty navigation index.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_auto_import_discovery_complete(&mut self, complete: bool) {
+        self.auto_import_discovery_complete = Some(complete);
+    }
+
+    pub(crate) fn set_auto_import_unit_providers(&mut self, providers: HashMap<String, Vec<Url>>) {
+        self.auto_import_unit_providers = providers;
     }
 
     /// Return the source-accurate outline for one indexed document.
@@ -8417,7 +8427,7 @@ impl Document {
                 continue;
             }
             let name = canonical_path(&identifier_texts(*module_name, &source));
-            if name.is_empty() {
+            if name.is_empty() || name.eq_ignore_ascii_case("in") {
                 continue;
             }
             imports.push(ImportMetadata {

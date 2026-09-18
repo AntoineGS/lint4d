@@ -158,7 +158,7 @@ pub(crate) fn completion_from_input_with_options(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -218,7 +218,7 @@ pub(crate) fn completion_metadata_from_input(
     }
     let source_uri = super::canonical_file_uri(source_uri);
     let candidate_uri = super::canonical_file_uri(candidate_uri);
-    let snapshot = match assistance_snapshot(&input, &source_uri, cancel) {
+    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -342,7 +342,7 @@ pub(crate) fn signature_help_from_input_with_format(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -391,7 +391,7 @@ pub(crate) fn semantic_tokens_from_input(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -789,15 +789,20 @@ fn binding_snapshot(
 fn assistance_snapshot(
     input: &WorkspaceInput,
     uri: &Url,
+    completion_position: Option<Position>,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
-    let (_source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
+    let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
+    let candidate_names = completion_position
+        .and_then(|position| super::rename::identifier_at_position(&source, position))
+        .into_iter()
+        .collect::<Vec<_>>();
     let (_context, consumed_configuration) =
         project_context_and_metadata_for_input(input, uri, cancel)?;
     build_snapshot(
         input,
         std::slice::from_ref(uri),
-        &[],
+        &candidate_names,
         SnapshotMode::Assistance,
         Some(SnapshotSeed::new(record).with_consumed_configuration(&consumed_configuration)),
         &[],

@@ -4638,6 +4638,16 @@ impl Workspace {
     }
 
     fn filename_catalogue(&mut self, root: &Path) -> FilenameCatalogue {
+        self.filename_catalogue_with_cancel(root, None)
+            .unwrap_or_default()
+    }
+
+    fn filename_catalogue_with_cancel(
+        &mut self,
+        root: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<FilenameCatalogue, String> {
+        check_workspace_cancel(cancel)?;
         let root = absolute_path(root.to_path_buf());
         let entry_limit = filename_catalogue_entry_limit();
         let fresh = self
@@ -4653,7 +4663,7 @@ impl Workspace {
             self.use_clock = self.use_clock.saturating_add(1);
             if let Some(catalogue) = self.filename_catalogues.get_mut(&root) {
                 catalogue.last_used = self.use_clock;
-                return catalogue.clone();
+                return Ok(catalogue.clone());
             }
         }
         let mut entries: HashMap<String, Vec<PathBuf>> = HashMap::new();
@@ -4666,6 +4676,7 @@ impl Workspace {
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
             .map(|workspace_root| workspace_root.excludes.clone());
         for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+            check_workspace_cancel(cancel)?;
             if visited >= entry_limit {
                 complete = false;
                 break;
@@ -4703,7 +4714,7 @@ impl Workspace {
         };
         self.filename_catalogues.insert(root, catalogue.clone());
         self.trim_filename_catalogues();
-        catalogue
+        Ok(catalogue)
     }
 
     fn trim_filename_catalogues(&mut self) {

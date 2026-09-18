@@ -20,10 +20,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
-use lsp_types::{Position, Url};
+use lsp_types::{Position, TextEdit, Url};
 use pascal_core::FileInfo;
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
-use pascal_lsp::{NavigationTarget, ProjectContext};
+use pascal_lsp::{NavigationTarget, ProjectContext, text};
 use pascal_project::delphi_overrides::OverrideSession;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1112,6 +1112,37 @@ fn position_after(source: &str, needle: &str, occurrence: usize) -> Position {
         start.line,
         start.character + needle.encode_utf16().count() as u32,
     )
+}
+
+fn apply_completion_item(source: &str, item: &Value) -> String {
+    let mut edits = Vec::new();
+    let primary: TextEdit =
+        serde_json::from_value(item["textEdit"].clone()).expect("completion primary text edit");
+    edits.push(primary);
+    if let Some(additional) = item["additionalTextEdits"].as_array() {
+        edits.extend(
+            additional
+                .iter()
+                .cloned()
+                .map(|edit| serde_json::from_value(edit).expect("completion additional text edit")),
+        );
+    }
+    let mut byte_edits = edits
+        .into_iter()
+        .map(|edit| {
+            let start = text::position_to_offset(source, edit.range.start)
+                .expect("completion edit start is a UTF-16 boundary");
+            let end = text::position_to_offset(source, edit.range.end)
+                .expect("completion edit end is a UTF-16 boundary");
+            (start, end, edit.new_text)
+        })
+        .collect::<Vec<_>>();
+    byte_edits.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+    let mut result = source.to_owned();
+    for (start, end, new_text) in byte_edits {
+        result.replace_range(start..end, &new_text);
+    }
+    result
 }
 
 fn final_qualified_type_position(source: &str, qualified_name: &str) -> Position {
@@ -4389,6 +4420,667 @@ fn completion_request_returns_semantic_items_and_plain_text_edits() {
             "start": {"line": 6, "character": 2},
             "end": {"line": 6, "character": 11},
         })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_imports_an_interface_symbol_with_crlf_and_non_bmp_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("AutoImportProvider.pas");
+    let main_path = temp.path().join("AutoImportInterface.pas");
+    let provider_source = concat!(
+        "unit AutoImportProvider;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TImportedType = class\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "end.\r\n",
+    );
+    let main_source = concat!(
+        "unit AutoImportInterface;\r\n",
+        "interface\r\n",
+        "// 😀 keep this comment\r\n",
+        "type\r\n",
+        "  TConsumer = class\r\n",
+        "    procedure Use(Value: TImportedType);\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "procedure TConsumer.Use(Value: TImportedType);\r\n",
+        "begin\r\n",
+        "  Value := Value;\r\n",
+        "end;\r\n",
+        "procedure Probe;\r\n",
+        "var\r\n",
+        "  ImportedValue: TImportedType;\r\n",
+        "begin\r\n",
+        "  ImportedValue := nil;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let request_id = RequestId::from("auto-import-interface".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TImported", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let result = response.result.expect("completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "TImportedType")
+        .cloned()
+        .expect("unimported interface type completion item");
+    assert!(
+        item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("AutoImportProvider")),
+        "auto-import item must identify its provider: {item}"
+    );
+    let additional = item["additionalTextEdits"]
+        .as_array()
+        .expect("auto-import additional edits");
+    assert_eq!(additional.len(), 1);
+    assert_eq!(additional[0]["newText"], "uses AutoImportProvider;\r\n");
+    assert_eq!(
+        additional[0]["range"],
+        json!({
+            "start": {"line": 2, "character": 0},
+            "end": {"line": 2, "character": 0},
+        })
+    );
+    let original_edit = item["textEdit"].clone();
+    let original_additional = item["additionalTextEdits"].clone();
+    let resolve_id = RequestId::from("auto-import-interface-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item.clone());
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "auto-import completion resolve failed: {resolved:?}"
+    );
+    let resolved = resolved.result.expect("resolved auto-import item");
+    assert_eq!(resolved["textEdit"], original_edit);
+    assert_eq!(resolved["additionalTextEdits"], original_additional);
+    let applied = apply_completion_item(main_source, &item);
+    assert!(applied.contains("interface\r\nuses AutoImportProvider;\r\n// 😀 keep this comment"));
+    assert!(applied.contains("Value: TImportedType"));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied
+            }
+        }),
+    );
+    let definition_id = RequestId::from("auto-import-interface-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "ImportedValue :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "applied source binding locations: {locations:?}\n{applied}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_imports_an_implementation_symbol_after_existing_interface_uses() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let existing_path = temp.path().join("ExistingUnit.pas");
+    let provider_path = temp.path().join("AutoImportProvider.pas");
+    let main_path = temp.path().join("AutoImportImplementation.pas");
+    let existing_source = "unit ExistingUnit;\r\ninterface\r\nimplementation\r\nend.\r\n";
+    let provider_source = concat!(
+        "unit AutoImportProvider;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TImportedType = class\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "end.\r\n",
+    );
+    let main_source = concat!(
+        "unit AutoImportImplementation;\r\n",
+        "interface\r\n",
+        "uses\r\n",
+        "  ExistingUnit in 'ExistingUnit.pas'; // preserve this comment\r\n",
+        "implementation\r\n",
+        "// implementation comment\r\n",
+        "procedure Run;\r\n",
+        "var\r\n",
+        "  Value: TImported;\r\n",
+        "begin\r\n",
+        "  Value := Value;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&existing_path, existing_source);
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("auto-import-implementation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TImported", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let result = response.result.expect("completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "TImportedType")
+        .cloned()
+        .expect("unimported implementation procedure completion item");
+    assert!(
+        item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("AutoImportProvider")),
+        "auto-import item must identify its provider: {item}"
+    );
+    let additional = item["additionalTextEdits"]
+        .as_array()
+        .expect("auto-import additional edits");
+    assert_eq!(additional.len(), 1);
+    assert_eq!(additional[0]["newText"], "uses AutoImportProvider;\r\n");
+    assert_eq!(
+        additional[0]["range"],
+        json!({
+            "start": {"line": 5, "character": 0},
+            "end": {"line": 5, "character": 0},
+        })
+    );
+    let applied = apply_completion_item(main_source, &item);
+    assert!(
+        applied.contains("implementation\r\nuses AutoImportProvider;\r\n// implementation comment")
+    );
+    assert!(applied.contains("ExistingUnit in 'ExistingUnit.pas'; // preserve this comment"));
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_appends_to_an_existing_implementation_uses_clause() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let existing_path = temp.path().join("ExistingUnit.pas");
+    let provider_path = temp.path().join("AppendProvider.pas");
+    let main_path = temp.path().join("AppendConsumer.pas");
+    write_file(
+        &existing_path,
+        "unit ExistingUnit;\r\ninterface\r\nimplementation\r\nend.\r\n",
+    );
+    write_file(
+        &provider_path,
+        concat!(
+            "unit Append.Provider;\r\n",
+            "interface\r\n",
+            "type\r\n",
+            "  TAppendedType = class\r\n",
+            "  end;\r\n",
+            "implementation\r\n",
+            "end.\r\n",
+        ),
+    );
+    let main_source = concat!(
+        "unit AppendConsumer;\r\n",
+        "interface\r\n",
+        "implementation\r\n",
+        "uses\r\n",
+        "  ExistingUnit in 'ExistingUnit.pas'; // keep implementation comment\r\n",
+        "procedure Run;\r\n",
+        "var\r\n",
+        "  Value: TAppended;\r\n",
+        "begin\r\n",
+        "  Value := Value;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("auto-import-append".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TAppended", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "TAppendedType")
+        .cloned()
+        .expect("appended auto-import item");
+    assert_eq!(
+        item["additionalTextEdits"][0]["newText"],
+        ",\r\n  Append.Provider"
+    );
+    assert_eq!(
+        item["additionalTextEdits"][0]["range"],
+        json!({
+            "start": {"line": 4, "character": 36},
+            "end": {"line": 4, "character": 36},
+        })
+    );
+    let applied = apply_completion_item(main_source, &item);
+    assert!(applied.contains(
+        "  ExistingUnit in 'ExistingUnit.pas',\r\n  Append.Provider; // keep implementation comment"
+    ));
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_omits_ambiguous_private_and_conditional_providers() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    write_file(
+        &temp.path().join("ConditionalProvider.pas"),
+        concat!(
+            "unit ConditionalProvider;\n",
+            "interface\n",
+            "{$IFDEF NEVER_DEFINED}\n",
+            "type\n",
+            "  TConditionalType = class\n",
+            "  end;\n",
+            "{$ENDIF}\n",
+            "implementation\n",
+            "end.\n",
+        ),
+    );
+    write_file(
+        &temp.path().join("PrivateProvider.pas"),
+        concat!(
+            "unit PrivateProvider;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure HiddenProcedure;\n",
+            "begin\n",
+            "end;\n",
+            "end.\n",
+        ),
+    );
+    write_file(
+        &temp.path().join("DuplicateProviderA.pas"),
+        concat!(
+            "unit DuplicateProvider;\n",
+            "interface\n",
+            "type\n",
+            "  TDuplicateType = class\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+    );
+    write_file(
+        &temp.path().join("DuplicateProviderB.pas"),
+        concat!(
+            "unit DuplicateProvider;\n",
+            "interface\n",
+            "type\n",
+            "  TOtherType = class\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+    );
+    for (file_name, unit_name) in [
+        ("SharedProviderA.pas", "SharedProviderA"),
+        ("SharedProviderB.pas", "SharedProviderB"),
+    ] {
+        write_file(
+            &temp.path().join(file_name),
+            &format!(
+                "unit {unit_name};\ninterface\ntype\n  TSharedType = class\n  end;\nimplementation\nend.\n"
+            ),
+        );
+    }
+    write_file(
+        &temp.path().join("ShadowProvider.pas"),
+        "unit ShadowProvider;\ninterface\ntype\n  TShadowType = class\n  end;\nimplementation\nend.\n",
+    );
+    let main_path = temp.path().join("NegativeAutoImportConsumer.pas");
+    let main_source = concat!(
+        "unit NegativeAutoImportConsumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure ConditionalCase;\n",
+        "var\n",
+        "  Value: TConditional;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "procedure PrivateCase;\n",
+        "begin\n",
+        "  HiddenProc;\n",
+        "end;\n",
+        "procedure DuplicateCase;\n",
+        "var\n",
+        "  Value: TDuplicate;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "procedure SharedCase;\n",
+        "var\n",
+        "  Value: TShared;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "procedure ShadowCase;\n",
+        "var\n",
+        "  TShadowType: Integer;\n",
+        "begin\n",
+        "  TShadow;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let completion =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize| -> Value {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&main_path)},
+                    "position": position_after(main_source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            response.result.expect("completion result")
+        };
+    let conditional = completion(&mut server, "auto-negative-conditional", "TConditional", 0);
+    assert!(
+        conditional["items"]
+            .as_array()
+            .expect("conditional completion items")
+            .iter()
+            .all(|item| item["label"] != "TConditionalType")
+    );
+    let private = completion(&mut server, "auto-negative-private", "HiddenProc", 0);
+    assert!(
+        private["items"]
+            .as_array()
+            .expect("private completion items")
+            .iter()
+            .all(|item| item["label"] != "HiddenProcedure")
+    );
+    let duplicate = completion(&mut server, "auto-negative-unit", "TDuplicate", 0);
+    assert!(
+        duplicate["items"]
+            .as_array()
+            .expect("ambiguous-unit completion items")
+            .iter()
+            .all(|item| item["label"] != "TDuplicateType")
+    );
+    let shared = completion(&mut server, "auto-negative-symbol", "TShared", 0);
+    assert!(
+        shared["items"]
+            .as_array()
+            .expect("ambiguous-symbol completion items")
+            .iter()
+            .all(|item| item["label"] != "TSharedType")
+    );
+    let shadow = completion(&mut server, "auto-negative-shadow", "TShadow", 1);
+    let shadow_item = shadow["items"]
+        .as_array()
+        .expect("shadow completion items")
+        .iter()
+        .find(|item| item["label"] == "TShadowType")
+        .expect("local shadow completion item");
+    assert!(shadow_item["additionalTextEdits"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_omits_malformed_uses_and_does_not_duplicate_imports() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    for unit_name in ["ExistingUnit", "BrokenUnit"] {
+        write_file(
+            &temp.path().join(format!("{unit_name}.pas")),
+            &format!("unit {unit_name};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+    write_file(
+        &temp.path().join("MalformedProvider.pas"),
+        "unit MalformedProvider;\ninterface\ntype\n  TMalformedType = class\n  end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &temp.path().join("DuplicateProvider.pas"),
+        "unit DuplicateProvider;\ninterface\ntype\n  TDuplicateImported = class\n  end;\nimplementation\nend.\n",
+    );
+    let malformed_path = temp.path().join("MalformedUsesConsumer.pas");
+    let malformed_source = concat!(
+        "unit MalformedUsesConsumer;\n",
+        "interface\n",
+        "uses ExistingUnit BrokenUnit;\n",
+        "type\n",
+        "  TConsumer = class\n",
+        "    Value: TMalformed;\n",
+        "  end;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    let duplicate_path = temp.path().join("DuplicateUsesConsumer.pas");
+    let duplicate_source = concat!(
+        "unit DuplicateUsesConsumer;\n",
+        "interface\n",
+        "uses DuplicateProvider;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var\n",
+        "  Value: TDuplicateImported;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&malformed_path, malformed_source);
+    write_file(&duplicate_path, duplicate_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("auto-import-malformed-uses".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&malformed_path)},
+            "position": position_after(malformed_source, "TMalformed", 0),
+        }),
+    );
+    let malformed = server.response(&request_id);
+    assert!(
+        malformed.error.is_none(),
+        "completion failed: {malformed:?}"
+    );
+    let malformed_result = malformed.result.expect("malformed completion result");
+    assert!(
+        malformed_result["items"]
+            .as_array()
+            .expect("malformed completion items")
+            .iter()
+            .all(|item| item["label"] != "TMalformedType"),
+        "malformed uses unexpectedly offered a target: {malformed_result}"
+    );
+
+    let request_id = RequestId::from("auto-import-duplicate-uses".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&duplicate_path)},
+            "position": position_after(duplicate_source, "TDuplicateImported", 0),
+        }),
+    );
+    let duplicate = server.response(&request_id);
+    assert!(
+        duplicate.error.is_none(),
+        "completion failed: {duplicate:?}"
+    );
+    let duplicate_result = duplicate.result.expect("duplicate completion result");
+    let duplicate_item = duplicate_result["items"]
+        .as_array()
+        .expect("duplicate completion items")
+        .iter()
+        .find(|item| item["label"] == "TDuplicateImported")
+        .expect("already imported completion item");
+    assert!(duplicate_item["additionalTextEdits"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_resolution_rejects_a_late_ambiguous_unit_overlay() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("LateAmbiguityConsumer.pas");
+    let late_path = temp.path().join("LateProvider.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TLateTargetType = class\n  end;\nimplementation\nend.\n";
+    let main_source = concat!(
+        "unit LateAmbiguityConsumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var\n",
+        "  Value: TLateTarget;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("late-unit-ambiguity-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TLateTarget", 0),
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("late ambiguity completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("late ambiguity completion items")
+        .iter()
+        .find(|item| item["label"] == "TLateTargetType")
+        .cloned()
+        .expect("late ambiguity auto-import item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&late_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit Provider; interface implementation end.\n"
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("late-unit-ambiguity-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("late ambiguous unit must invalidate resolution: {response:?}"));
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_auto_import_discovery_reports_a_bounded_catalogue_as_incomplete() {
+    let environment = tempfile::tempdir().expect("isolated test environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    let main_path = root.join("BoundedConsumer.pas");
+    write_file(
+        &root.join("BoundedProvider.pas"),
+        "unit BoundedProvider;\ninterface\ntype\n  TBoundedType = class\n  end;\nimplementation\nend.\n",
+    );
+    let main_source = "unit BoundedConsumer;\ninterface\nimplementation\nprocedure Run;\nvar\n  Value: TBounded;\nbegin\n  Value := Value;\nend;\nend.\n";
+    write_file(&main_path, main_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_filename_catalogue_limit(environment, 1);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("auto-import-bounded".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TBounded", 0),
+        }),
+    );
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "bounded completion failed: {response:?}"
+    );
+    let result = response.result.expect("bounded completion result");
+    assert_eq!(result["isIncomplete"], true);
+    assert!(
+        result["items"]
+            .as_array()
+            .expect("bounded completion items")
+            .iter()
+            .all(|item| item["label"] != "TBoundedType")
     );
     server.shutdown();
 }

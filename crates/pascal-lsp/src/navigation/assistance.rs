@@ -117,6 +117,7 @@ impl<'a> CompletionAccumulator<'a> {
         substitution: Option<&GenericSubstitution>,
         symbol: &Symbol,
         precedence: usize,
+        auto_import: Option<AutoImportCandidate>,
     ) {
         if let Some(inaccessible_precedence) = self.inaccessible.get(&symbol.key).copied() {
             if inaccessible_precedence < precedence {
@@ -141,6 +142,7 @@ impl<'a> CompletionAccumulator<'a> {
                     CompletionCandidate {
                         candidate,
                         substitution: substitution.cloned(),
+                        auto_import,
                     },
                     precedence,
                 ),
@@ -219,6 +221,7 @@ pub(crate) struct CompletionResult {
 pub(crate) struct CompletionResolutionSeed {
     candidate: Candidate,
     substitution: Option<GenericSubstitution>,
+    auto_import: Option<AutoImportCandidate>,
 }
 
 impl CompletionResolutionSeed {
@@ -227,6 +230,7 @@ impl CompletionResolutionSeed {
         Self {
             candidate: Candidate { uri, index },
             substitution: None,
+            auto_import: None,
         }
     }
 
@@ -254,6 +258,13 @@ pub(crate) struct CompletionMetadata {
 struct CompletionCandidate {
     candidate: Candidate,
     substitution: Option<GenericSubstitution>,
+    auto_import: Option<AutoImportCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct AutoImportCandidate {
+    unit_name: String,
+    additional_text_edits: Vec<TextEdit>,
 }
 
 struct SpecializedRoutineSignature {
@@ -439,20 +450,28 @@ impl NavigationIndex {
                 display.as_ref().map_or(0, |display| display.excerpt.len()),
                 cancel,
             )?;
+            let auto_import = completion_candidate.auto_import.clone();
+            let detail =
+                completion_detail(display.map(|display| display.excerpt), auto_import.as_ref());
+            budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
             items.push(CompletionItem {
                 label: symbol.name.clone(),
                 kind: Some(completion_kind(symbol.kind)),
-                detail: display.map(|display| display.excerpt),
+                detail,
                 documentation,
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                     range,
                     symbol.name.clone(),
                 ))),
+                additional_text_edits: auto_import
+                    .as_ref()
+                    .map(|auto_import| auto_import.additional_text_edits.clone()),
                 ..CompletionItem::default()
             });
             seeds.push(CompletionResolutionSeed {
                 candidate: candidate.clone(),
                 substitution: completion_candidate.substitution,
+                auto_import,
             });
         }
         if response_truncated {
@@ -488,13 +507,15 @@ impl NavigationIndex {
         };
         budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
         let detail = if resolve_detail {
-            self.declaration_display(
-                &seed.candidate,
-                seed.substitution.as_ref(),
-                cancel,
-                &mut budget,
-            )?
-            .map(|display| display.excerpt)
+            let declaration = self
+                .declaration_display(
+                    &seed.candidate,
+                    seed.substitution.as_ref(),
+                    cancel,
+                    &mut budget,
+                )?
+                .map(|display| display.excerpt);
+            completion_detail(declaration, seed.auto_import.as_ref())
         } else {
             None
         };
@@ -843,6 +864,9 @@ impl NavigationIndex {
                 && offset <= current.span.end
         });
         let mut accumulator = CompletionAccumulator::new(prefix, completion_is_declaration, budget);
+        if self.auto_import_discovery_complete == Some(false) {
+            accumulator.is_incomplete = true;
+        }
         let mut private_spans = HashMap::new();
         let unqualified = matches!(&member, CompletionMember::Unqualified);
         let member_receivers = match member {
@@ -1145,6 +1169,22 @@ impl NavigationIndex {
                         }
                     }
                 }
+            }
+
+            if unqualified
+                && !suppress_unqualified_globals
+                && !accumulator.prefix.is_empty()
+                && self.auto_import_discovery_complete == Some(true)
+            {
+                self.add_auto_import_completion_candidates(
+                    &mut accumulator,
+                    current_uri,
+                    current_document,
+                    offset,
+                    &mut private_spans,
+                    precedence.saturating_add(1),
+                    cancel,
+                )?;
             }
         }
 
@@ -1480,6 +1520,214 @@ impl NavigationIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn add_auto_import_completion_candidates(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        private_spans: &mut HashMap<Url, HashSet<super::Span>>,
+        precedence: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let region = current_document.region_at(offset);
+        if !matches!(region, Region::Interface | Region::Implementation) {
+            return Ok(());
+        }
+        let active_uses =
+            current_document.active_uses_with_budget(region, cancel, accumulator.budget)?;
+        if active_uses
+            .iter()
+            .any(|unit| current_document.unknown_imports.contains(unit.as_str()))
+        {
+            return Ok(());
+        }
+        let active_units = active_uses
+            .into_iter()
+            .map(|unit| canonical_name(unit))
+            .collect::<HashSet<_>>();
+        let imported_provider_uris = current_document
+            .active_uses(region)
+            .into_iter()
+            .flat_map(|unit| self.unit_urls_for_import(current_document, unit))
+            .collect::<HashSet<_>>();
+
+        let mut unit_providers = HashMap::<String, Vec<Url>>::new();
+        for (unit_name, providers) in &self.auto_import_unit_providers {
+            let unit_name = unit_import_key(unit_name);
+            if unit_name.is_empty()
+                || active_units.contains(&unit_name)
+                || unit_name == unit_import_key(&current_document.unit_name)
+            {
+                continue;
+            }
+            for uri in providers {
+                if uri != current_uri && !imported_provider_uris.contains(uri) {
+                    unit_providers
+                        .entry(unit_name.clone())
+                        .or_default()
+                        .push(uri.clone());
+                }
+            }
+        }
+        for (uri, document) in &self.documents {
+            check_cancel(cancel)?;
+            if uri == current_uri
+                || imported_provider_uris.contains(uri)
+                || active_units.contains(&document.unit_name)
+                || document.unit_name == current_document.unit_name
+                || document.unit_name.is_empty()
+            {
+                continue;
+            }
+            unit_providers
+                .entry(unit_import_key(&document.unit_name))
+                .or_default()
+                .push(uri.clone());
+        }
+        for providers in unit_providers.values_mut() {
+            providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            providers.dedup();
+        }
+
+        let mut by_symbol = HashMap::<String, Vec<(Candidate, String, Url)>>::new();
+        for (uri, document) in &self.documents {
+            let Some(providers) = unit_providers.get(&unit_import_key(&document.unit_name)) else {
+                continue;
+            };
+            if providers.len() != 1 || providers[0] != *uri {
+                continue;
+            }
+            for index in &document.exported_symbol_indices {
+                check_cancel(cancel)?;
+                if !accumulator.take_scan_slot(cancel)? {
+                    return Ok(());
+                }
+                let Some(symbol) = document.symbols.get(*index) else {
+                    continue;
+                };
+                if symbol.owner_type.is_some()
+                    || symbol.kind == SymbolKind::Unit
+                    || symbol.local_only
+                    || symbol.region != Region::Interface
+                    || symbol.origin != Origin::Declaration
+                    || symbol.unresolved_abbreviated
+                    || !completion_symbol_kind_supported(symbol.kind)
+                    || document.interface_range.is_none()
+                    || document
+                        .interface_range
+                        .is_some_and(|range| document.has_parser_recovery_near(range))
+                    || !accumulator.matches(symbol)
+                    || self.candidate_is_conditionally_unavailable(&Candidate {
+                        uri: uri.clone(),
+                        index: *index,
+                    })
+                {
+                    continue;
+                }
+                by_symbol.entry(symbol.key.clone()).or_default().push((
+                    Candidate {
+                        uri: uri.clone(),
+                        index: *index,
+                    },
+                    document.unit_display_name.clone(),
+                    uri.clone(),
+                ));
+            }
+        }
+
+        for candidates in by_symbol.into_values() {
+            check_cancel(cancel)?;
+            let mut provider_uris = candidates
+                .iter()
+                .map(|(_, _, uri)| uri.clone())
+                .collect::<Vec<_>>();
+            provider_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            provider_uris.dedup();
+            if provider_uris.len() != 1 || candidates.len() != 1 {
+                continue;
+            }
+            let (candidate, unit_name, _) = candidates
+                .into_iter()
+                .next()
+                .expect("candidate count checked above");
+            let mut state = super::ResolutionState::new();
+            match self.candidate_access_decision_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                &mut state,
+                cancel,
+                accumulator.budget,
+            )? {
+                super::AccessDecision::Visible => {}
+                super::AccessDecision::Unknown => {
+                    accumulator.is_incomplete = true;
+                    continue;
+                }
+                super::AccessDecision::Inaccessible => continue,
+            }
+            let Some(edit) = auto_import_edit(
+                current_document,
+                region,
+                &unit_name,
+                &self.uses_clause_spans(current_document, region),
+                offset,
+                cancel,
+                accumulator.budget,
+            )?
+            else {
+                continue;
+            };
+            self.add_completion_candidate_with_substitution_and_import(
+                accumulator,
+                candidate,
+                None,
+                current_uri,
+                private_spans,
+                precedence,
+                offset,
+                cancel,
+                Some(AutoImportCandidate {
+                    unit_name,
+                    additional_text_edits: vec![edit],
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn candidate_is_conditionally_unavailable(&self, candidate: &Candidate) -> bool {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return true;
+        };
+        let Some(symbol) = document.symbols.get(candidate.index) else {
+            return true;
+        };
+        document
+            .conditional_unknown_symbols
+            .get(candidate.index)
+            .copied()
+            .unwrap_or(true)
+            || document
+                .conditionals
+                .inactive_spans
+                .iter()
+                .any(|span| span.start <= symbol.span.start && symbol.span.end <= span.end)
+    }
+
+    fn uses_clause_spans(&self, document: &Document, region: Region) -> Vec<Span> {
+        let mut spans = Vec::new();
+        super::collect_nodes(document.tree.root_node(), &mut |node| {
+            if node.kind() == "declUses" && super::region_for_node(node) == region {
+                spans.push(Span::from_node(node));
+            }
+        });
+        spans
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn add_member_completion_candidates(
         &self,
         accumulator: &mut CompletionAccumulator,
@@ -1593,6 +1841,32 @@ impl NavigationIndex {
         offset: usize,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        self.add_completion_candidate_with_substitution_and_import(
+            accumulator,
+            candidate,
+            substitution,
+            current_uri,
+            _private_spans,
+            precedence,
+            offset,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_completion_candidate_with_substitution_and_import(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        candidate: Candidate,
+        substitution: Option<&GenericSubstitution>,
+        current_uri: &Url,
+        _private_spans: &mut HashMap<Url, HashSet<super::Span>>,
+        precedence: usize,
+        offset: usize,
+        cancel: &AtomicBool,
+        auto_import: Option<AutoImportCandidate>,
+    ) -> Result<(), String> {
         check_cancel(cancel)?;
         let Some(symbol) = self.symbol(&candidate) else {
             return Ok(());
@@ -1649,7 +1923,7 @@ impl NavigationIndex {
                 return Ok(());
             }
         }
-        accumulator.insert(candidate, substitution, symbol, precedence);
+        accumulator.insert(candidate, substitution, symbol, precedence, auto_import);
         Ok(())
     }
 
@@ -2862,6 +3136,367 @@ fn bare_member_path_with_budget<'a>(
 
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn completion_detail(
+    declaration: Option<String>,
+    auto_import: Option<&AutoImportCandidate>,
+) -> Option<String> {
+    match (declaration, auto_import) {
+        (Some(declaration), Some(auto_import)) => {
+            Some(format!("{declaration} — unit {}", auto_import.unit_name))
+        }
+        (None, Some(auto_import)) => Some(format!("unit {}", auto_import.unit_name)),
+        (declaration, None) => declaration,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn auto_import_edit(
+    document: &Document,
+    region: Region,
+    unit_name: &str,
+    clause_spans: &[Span],
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TextEdit>, String> {
+    check_cancel(cancel)?;
+    if unit_name.is_empty() || clause_spans.len() > 1 {
+        return Ok(None);
+    }
+    let imported_key = unit_import_key(unit_name);
+    let already_imported = match region {
+        Region::Interface => document
+            .interface_uses
+            .iter()
+            .any(|name| unit_import_key(name) == imported_key),
+        Region::Implementation => document
+            .interface_uses
+            .iter()
+            .chain(document.implementation_uses.iter())
+            .any(|name| unit_import_key(name) == imported_key),
+        Region::Other => true,
+    };
+    if already_imported {
+        return Ok(None);
+    }
+    let newline = source_newline(&document.source);
+    let section = match region {
+        Region::Interface => document.interface_range,
+        Region::Implementation => document.implementation_range,
+        Region::Other => None,
+    };
+    let Some(section) = section else {
+        return Ok(None);
+    };
+    if let Some(clause) = clause_spans.first().copied() {
+        if clause.contains_offset(offset) {
+            return Ok(None);
+        }
+        if document
+            .conditionals
+            .directives
+            .iter()
+            .any(|directive| directive.start < clause.end && directive.end > clause.start)
+        {
+            return Ok(None);
+        }
+        let source = document.source.as_ref();
+        let mut semicolon = clause.end.min(source.len());
+        while semicolon > clause.start
+            && source
+                .as_bytes()
+                .get(semicolon - 1)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            semicolon -= 1;
+        }
+        if semicolon == clause.start || source.as_bytes().get(semicolon - 1) != Some(&b';') {
+            return Ok(None);
+        }
+        semicolon -= 1;
+        if !uses_clause_syntax_is_safe(source, clause, semicolon, &document.imports) {
+            return Ok(None);
+        }
+        let last_import_end = document
+            .imports
+            .iter()
+            .filter(|import| {
+                import.span.start >= clause.start
+                    && import.span.end <= semicolon
+                    && import.span.end > clause.start
+            })
+            .map(|import| import.span.end)
+            .max();
+        if last_import_end.is_none_or(|end| contains_comment(&source[end..semicolon])) {
+            return Ok(None);
+        }
+        let multiline = source[clause.start..semicolon].contains(['\r', '\n']);
+        let insertion = if multiline {
+            let indent = indentation_for_import(source, semicolon, clause.start);
+            format!(",{newline}{indent}{unit_name}")
+        } else {
+            format!(", {unit_name}")
+        };
+        return text_edit_at_offset(source, semicolon, &insertion, cancel, budget);
+    }
+
+    let keyword = match region {
+        Region::Interface => "interface",
+        Region::Implementation => "implementation",
+        Region::Other => return Ok(None),
+    };
+    let keyword_end = section.start.saturating_add(keyword.len());
+    let Some(actual_keyword) = document.source.get(section.start..keyword_end) else {
+        return Ok(None);
+    };
+    if !actual_keyword.eq_ignore_ascii_case(keyword) {
+        return Ok(None);
+    }
+    let rest = document
+        .source
+        .get(keyword_end..section.end.min(document.source.len()))
+        .unwrap_or_default();
+    let Some((line_end, newline_len)) = line_ending_after_keyword(rest) else {
+        return Ok(None);
+    };
+    if document.has_parser_recovery_near(section)
+        || document
+            .conditionals
+            .directives
+            .iter()
+            .any(|directive| directive.start >= section.start && directive.end <= section.end)
+    {
+        return Ok(None);
+    }
+    let insertion_offset = keyword_end
+        .saturating_add(line_end)
+        .saturating_add(newline_len);
+    if document.has_parser_recovery_near(Span {
+        start: insertion_offset,
+        end: insertion_offset,
+    }) {
+        return Ok(None);
+    }
+    let insertion = format!("uses {unit_name};{newline}");
+    text_edit_at_offset(
+        document.source.as_ref(),
+        insertion_offset,
+        &insertion,
+        cancel,
+        budget,
+    )
+}
+
+fn text_edit_at_offset(
+    source: &str,
+    offset: usize,
+    new_text: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TextEdit>, String> {
+    check_cancel(cancel)?;
+    budget.require_bytes(new_text.len(), cancel)?;
+    let position = text::offset_to_position(source, offset)
+        .ok_or_else(|| "auto-import insertion is not a UTF-16 boundary".to_string())?;
+    Ok(Some(TextEdit::new(
+        Range::new(position, position),
+        new_text.to_owned(),
+    )))
+}
+
+fn source_newline(source: &str) -> &'static str {
+    if source.contains("\r\n") {
+        "\r\n"
+    } else if source.contains('\n') {
+        "\n"
+    } else if source.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    }
+}
+
+fn unit_import_key(name: &str) -> String {
+    name.split('.')
+        .map(canonical_name)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn contains_comment(source: &str) -> bool {
+    source.contains("//") || source.contains('{') || source.contains("(*")
+}
+
+fn indentation_for_import(source: &str, offset: usize, lower_bound: usize) -> String {
+    let line_start = source[..offset]
+        .rfind(['\r', '\n'])
+        .map_or(lower_bound, |index| index + 1);
+    let current = source
+        .get(line_start..offset)
+        .unwrap_or_default()
+        .chars()
+        .take_while(|character| {
+            character.is_whitespace() && *character != '\r' && *character != '\n'
+        })
+        .collect::<String>();
+    if !current.is_empty() {
+        return current;
+    }
+    source[lower_bound..offset]
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let indentation = line
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .collect::<String>();
+            (!indentation.is_empty()).then_some(indentation)
+        })
+        .unwrap_or_default()
+}
+
+fn line_ending_after_keyword(source: &str) -> Option<(usize, usize)> {
+    let index = source
+        .as_bytes()
+        .iter()
+        .position(|byte| *byte == b'\r' || *byte == b'\n')?;
+    let length = if source.as_bytes().get(index) == Some(&b'\r')
+        && source.as_bytes().get(index + 1) == Some(&b'\n')
+    {
+        2
+    } else {
+        1
+    };
+    Some((index, length))
+}
+
+fn uses_clause_syntax_is_safe(
+    source: &str,
+    clause: Span,
+    semicolon: usize,
+    imports: &[super::ImportMetadata],
+) -> bool {
+    let mut import_spans = imports
+        .iter()
+        .filter_map(|import| {
+            (import.span.start >= clause.start
+                && import.span.end <= semicolon
+                && import.span.start < import.span.end)
+                .then_some((import.span.start, import.span.end))
+        })
+        .collect::<Vec<_>>();
+    import_spans.sort_unstable();
+
+    let mut cursor = clause.start;
+    let mut import_index = 0;
+    let mut expect_entry = true;
+    let mut expect_path = false;
+    let mut saw_import = false;
+    let mut saw_uses = false;
+    while cursor < semicolon {
+        if import_index < import_spans.len() && cursor == import_spans[import_index].0 {
+            if !expect_entry || expect_path {
+                return false;
+            }
+            cursor = import_spans[import_index].1;
+            import_index += 1;
+            expect_entry = false;
+            saw_import = true;
+            continue;
+        }
+        let Some(byte) = source.as_bytes().get(cursor).copied() else {
+            return false;
+        };
+        if byte.is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if byte == b',' {
+            if expect_entry || expect_path || !saw_import {
+                return false;
+            }
+            expect_entry = true;
+            cursor += 1;
+            continue;
+        }
+        if source[cursor..].starts_with("//") {
+            let Some(relative_end) = source[cursor + 2..].find(['\r', '\n']) else {
+                return false;
+            };
+            cursor = cursor + 2 + relative_end;
+            continue;
+        }
+        if byte == b'{' {
+            let Some(relative_end) = source[cursor + 1..].find('}') else {
+                return false;
+            };
+            cursor = cursor + 1 + relative_end + 1;
+            continue;
+        }
+        if source[cursor..].starts_with("(*") {
+            let Some(relative_end) = source[cursor + 2..].find("*)") else {
+                return false;
+            };
+            cursor = cursor + 2 + relative_end + 2;
+            continue;
+        }
+        if byte == b'\'' {
+            if !expect_path {
+                return false;
+            }
+            cursor += 1;
+            while cursor < semicolon {
+                if source.as_bytes()[cursor] != b'\'' {
+                    cursor += 1;
+                    continue;
+                }
+                if source.as_bytes().get(cursor + 1) == Some(&b'\'') {
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                    expect_path = false;
+                    break;
+                }
+            }
+            if expect_path {
+                return false;
+            }
+            continue;
+        }
+        if byte == b':' && source.as_bytes().get(cursor + 1) == Some(&b'=') {
+            cursor += 2;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'&' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < semicolon && is_identifier_byte(source.as_bytes()[cursor]) {
+                cursor += 1;
+            }
+            let Some(identifier) = source.get(start..cursor) else {
+                return false;
+            };
+            if identifier.eq_ignore_ascii_case("uses") {
+                if saw_uses || saw_import {
+                    return false;
+                }
+                saw_uses = true;
+                continue;
+            }
+            if identifier.eq_ignore_ascii_case("in") {
+                if !saw_import || expect_entry || expect_path {
+                    return false;
+                }
+                expect_path = true;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    !expect_entry && !expect_path && saw_import && import_index == import_spans.len()
 }
 
 fn completion_kind(kind: SymbolKind) -> CompletionItemKind {
@@ -4807,13 +5442,13 @@ mod tests {
         let mut same_scope_budget = AssistanceBudget::new(16, 16, "test");
         let mut same_scope = CompletionAccumulator::new("same", false, &mut same_scope_budget);
         same_scope.mark_uncertain(&symbol.key, 2);
-        same_scope.insert(candidate.clone(), None, &symbol, 2);
+        same_scope.insert(candidate.clone(), None, &symbol, 2, None);
         assert!(same_scope.candidates.is_empty());
         assert_eq!(same_scope.uncertain.get(&symbol.key), Some(&2));
 
         let mut shadowed_budget = AssistanceBudget::new(16, 16, "test");
         let mut shadowed = CompletionAccumulator::new("same", false, &mut shadowed_budget);
-        shadowed.insert(candidate, None, &symbol, 0);
+        shadowed.insert(candidate, None, &symbol, 0, None);
         shadowed.mark_uncertain(&symbol.key, 1);
         assert!(shadowed.candidates.contains_key(&symbol.key));
         assert!(shadowed.uncertain.is_empty());

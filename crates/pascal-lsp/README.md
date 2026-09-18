@@ -185,12 +185,21 @@ with the same spelling.
 Completion is case-insensitive and uses the nearest lexical locals and
 parameters, visible class members, current-unit declarations, and resolved
 imported declarations. It preserves declaration casing and returns plain
-identifier `TextEdit`s; it does not insert snippets, imports, or additional
-edits. Imported private/protected members and unrelated workspace names are not
-offered. Conditional uncertainty, ambiguous receivers, and bounded candidate
-truncation are reported conservatively with `CompletionList.isIncomplete` rather
-than as a falsely complete result. Expression receivers are resolved source-first
-as well: calls such as `MakeValue().Member`, constructors such as
+identifier `TextEdit`s. For an unqualified identifier, it can also offer a
+unique exported declaration from an authorized project source unit that is not
+already imported. These auto-import items identify their unit and carry one
+safe `additionalTextEdit` for the interface or implementation `uses` clause;
+the edit preserves CRLF/LF style, existing comments, dotted names, and explicit
+`in 'path'` entries. Auto-import discovery is bounded to 512 provider source
+units and reports `CompletionList.isIncomplete` when the authorized filename
+catalogue is incomplete; cancellation and read-policy failures fail closed.
+Ambiguous units/symbols, conditional or private declarations, the current unit,
+compiled-library-only symbols, malformed/conditional `uses` clauses, and unsafe
+insertion points are omitted. Conditional uncertainty, ambiguous receivers,
+and bounded candidate truncation are reported conservatively with
+`CompletionList.isIncomplete` rather than as a falsely complete result.
+Expression receivers are resolved source-first as well: calls such as
+`MakeValue().Member`, constructors such as
 `TWidget.Create.Member`, casts such as `TWidget(Value).Member` and
 `(Value as TWidget).Member`, and nested result chains are supported when their
 named types are unambiguous. The receiver's declaring unit is retained when a

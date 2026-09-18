@@ -183,6 +183,14 @@ enum BindingGroup {
     Parameter(ParameterBindingKey),
 }
 
+#[derive(Clone, Copy)]
+struct BindingLocationOptions<'a> {
+    document_uri: Option<&'a Url>,
+    strict_resolution: bool,
+    cancel: Option<&'a AtomicBool>,
+    result_limit: Option<usize>,
+}
+
 impl NavigationIndex {
     /// Return deduplicated, binding-resolved source locations for an
     /// identifier, optionally including every declaration site.
@@ -192,17 +200,38 @@ impl NavigationIndex {
         position: lsp_types::Position,
         include_declaration: bool,
     ) -> Result<Vec<lsp_types::Location>, String> {
-        self.binding_locations_impl(uri, position, include_declaration, None, true, None)
+        self.binding_locations_impl(
+            uri,
+            position,
+            include_declaration,
+            BindingLocationOptions {
+                document_uri: None,
+                strict_resolution: true,
+                cancel: None,
+                result_limit: Some(MAX_BINDING_LOCATIONS),
+            },
+        )
     }
 
-    pub(crate) fn binding_locations_with_cancel(
+    pub(crate) fn binding_locations_with_cancel_and_limit(
         &self,
         uri: &Url,
         position: lsp_types::Position,
         include_declaration: bool,
         cancel: &AtomicBool,
+        result_limit: usize,
     ) -> Result<Vec<lsp_types::Location>, String> {
-        self.binding_locations_impl(uri, position, include_declaration, None, true, Some(cancel))
+        self.binding_locations_impl(
+            uri,
+            position,
+            include_declaration,
+            BindingLocationOptions {
+                document_uri: None,
+                strict_resolution: true,
+                cancel: Some(cancel),
+                result_limit: Some(result_limit),
+            },
+        )
     }
 
     pub(crate) fn binding_locations_in_document_with_cancel(
@@ -211,7 +240,67 @@ impl NavigationIndex {
         position: lsp_types::Position,
         cancel: &AtomicBool,
     ) -> Result<Vec<lsp_types::Location>, String> {
-        self.binding_locations_impl(uri, position, true, Some(uri), false, Some(cancel))
+        self.binding_locations_impl(
+            uri,
+            position,
+            true,
+            BindingLocationOptions {
+                document_uri: Some(uri),
+                strict_resolution: false,
+                cancel: Some(cancel),
+                result_limit: Some(MAX_BINDING_LOCATIONS),
+            },
+        )
+    }
+
+    /// Return a conservative syntactic upper bound for the number of
+    /// occurrences that could belong to the identifier selected at a
+    /// position.  Callers use this before binding resolution so several
+    /// expanded include contexts cannot each spend the full per-context
+    /// reference budget before the aggregate cap is enforced.
+    pub(crate) fn identifier_occurrence_upper_bound(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        include_declaration: bool,
+        document_uri: Option<&Url>,
+    ) -> Result<usize, String> {
+        let document = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
+        let offset = super::text::position_to_offset(&document.source, position)
+            .ok_or_else(|| "position is outside the source document".to_string())?;
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Ok(0);
+        };
+        if document.conditionals.is_unknown_at(offset) {
+            return Ok(0);
+        }
+        let selected_name = canonical_name(&node_text(identifier, &document.source));
+        let mut count = 0usize;
+        for (candidate_uri, candidate) in &self.documents {
+            if document_uri.is_some_and(|requested| requested != candidate_uri) {
+                continue;
+            }
+            for identifier in identifier_nodes(candidate.tree.root_node()) {
+                if has_ancestor_kind(identifier, "ppDirective") {
+                    continue;
+                }
+                if !include_declaration
+                    && candidate
+                        .symbols
+                        .iter()
+                        .any(|symbol| symbol.span == Span::from_node(identifier))
+                {
+                    continue;
+                }
+                if canonical_name(&node_text(identifier, &candidate.source)) == selected_name {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        Ok(count)
     }
 
     fn binding_locations_impl(
@@ -219,11 +308,9 @@ impl NavigationIndex {
         uri: &Url,
         position: lsp_types::Position,
         include_declaration: bool,
-        document_uri: Option<&Url>,
-        strict_resolution: bool,
-        cancel: Option<&AtomicBool>,
+        options: BindingLocationOptions<'_>,
     ) -> Result<Vec<lsp_types::Location>, String> {
-        check_cancel(cancel)?;
+        check_cancel(options.cancel)?;
         let document = self
             .documents
             .get(uri)
@@ -241,8 +328,8 @@ impl NavigationIndex {
 
         let selected_identifier = identifier_at(document.tree.root_node(), offset)
             .expect("identifier presence checked above");
-        if !strict_resolution
-            && document_uri.is_some()
+        if !options.strict_resolution
+            && options.document_uri.is_some()
             && !self.selected_occurrence_is_supported(uri, document, selected_identifier, offset)
         {
             return Ok(Vec::new());
@@ -251,13 +338,13 @@ impl NavigationIndex {
         let (binding, _) = self.binding_plan(uri, position)?;
         let occurrences = self.collect_occurrences_bounded(
             &binding,
-            document_uri,
+            options.document_uri,
             include_declaration,
-            strict_resolution,
-            Some(MAX_BINDING_LOCATIONS),
-            cancel,
+            options.strict_resolution,
+            options.result_limit,
+            options.cancel,
         )?;
-        self.locations_for_occurrences(&occurrences, cancel)
+        self.locations_for_occurrences(&occurrences, options.cancel)
     }
 
     fn selected_occurrence_is_supported(

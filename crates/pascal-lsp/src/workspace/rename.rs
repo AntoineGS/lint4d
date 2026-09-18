@@ -15,7 +15,8 @@ use super::{
 use crate::NavigationIndex;
 use crate::conditional::{self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind};
 use crate::include_expansion::{
-    self, ExpansionLimits, ExpansionResult, IncludeResolver, ResolvedInclude,
+    self, ExpansionLimits, ExpansionResult, IncludeObservation as ExpansionIncludeObservation,
+    IncludeResolver, ResolvedInclude,
 };
 use crate::navigation::ParsedDocument;
 use crate::text;
@@ -60,6 +61,9 @@ const MAX_RENAME_INCLUDE_DIRECTIVES: usize = 16_384;
 const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
 const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
+const MAX_RENAME_INCLUDE_OWNER_DISCOVERY: usize = 256;
+const MAX_SNAPSHOT_BINDING_LOCATIONS: usize = 10_000;
+const MAX_SNAPSHOT_MAPPING_WORK: usize = 1_000_000;
 const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_AUTO_IMPORT_PROVIDER_SOURCES: usize = 512;
 const INCLUDE_BYTE_BUDGET_ERROR: &str =
@@ -327,28 +331,35 @@ pub(crate) struct RenameSnapshot {
 }
 
 impl RenameSnapshot {
-    fn virtual_query_positions(&self, uri: &Url, position: Position) -> Vec<(Url, Position)> {
+    fn virtual_query_positions_with_budget(
+        &self,
+        uri: &Url,
+        position: Position,
+        budget: &mut include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<(Url, Position)>, String> {
         let Some(source) = self
             .sources
             .get(uri)
             .or_else(|| self.records.get(uri).map(|record| &record.text))
         else {
-            return vec![(uri.clone(), position)];
+            return Ok(vec![(uri.clone(), position)]);
         };
         let Some(offset) = text::position_to_offset(source, position) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if offset >= source.len() {
-            return vec![(uri.clone(), position)];
+            return Ok(vec![(uri.clone(), position)]);
         }
         let width = source[offset..].chars().next().map_or(1, char::len_utf8);
         let physical_range = offset..offset.saturating_add(width);
         let mut positions = Vec::new();
         let mut mapped_by_expansion = false;
         for (root_uri, expansion) in &self.expansions {
-            let virtual_ranges = expansion
-                .expanded
-                .reverse_range(uri, physical_range.clone());
+            let virtual_ranges = expansion.expanded.reverse_range_with_budget(
+                uri,
+                physical_range.clone(),
+                budget,
+            )?;
             if !virtual_ranges.is_empty() {
                 mapped_by_expansion = true;
             }
@@ -374,30 +385,37 @@ impl RenameSnapshot {
                 .then_with(|| left.1.character.cmp(&right.1.character))
         });
         positions.dedup();
-        positions
+        Ok(positions)
     }
 
-    fn map_location(&self, location: Location) -> Vec<Location> {
+    fn map_location_with_budget(
+        &self,
+        location: Location,
+        budget: &mut include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<Location>, String> {
         let Some(expansion) = self.expansions.get(&location.uri) else {
-            return vec![location];
+            return Ok(vec![location]);
         };
         if !expansion.complete {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let Some(start) = text::position_to_offset(expansion.expanded.text(), location.range.start)
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(end) = text::position_to_offset(expansion.expanded.text(), location.range.end)
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let spans = match expansion.expanded.map_range(start..end) {
+        let spans = match expansion
+            .expanded
+            .map_range_with_budget(start..end, budget)?
+        {
             crate::include_expansion::VirtualMapping::Exact(span) => vec![span],
             crate::include_expansion::VirtualMapping::Many(spans) => spans,
-            crate::include_expansion::VirtualMapping::Unmapped => return Vec::new(),
+            crate::include_expansion::VirtualMapping::Unmapped => return Ok(Vec::new()),
         };
-        spans
+        Ok(spans
             .into_iter()
             .filter_map(|span| {
                 let source = expansion
@@ -408,13 +426,20 @@ impl RenameSnapshot {
                 let end = text::offset_to_position(source, span.range.end)?;
                 Some(Location::new(span.uri, Range::new(start, end)))
             })
-            .collect()
+            .collect())
     }
 
-    fn map_locations(&self, locations: Vec<Location>) -> Vec<Location> {
+    fn map_locations_with_budget(
+        &self,
+        locations: Vec<Location>,
+        budget: &mut include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<Location>, String> {
         let mut mapped = locations
             .into_iter()
-            .flat_map(|location| self.map_location(location))
+            .map(|location| self.map_location_with_budget(location, budget))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         mapped.sort_by(|left, right| {
             left.uri
@@ -424,21 +449,55 @@ impl RenameSnapshot {
                 .then_with(|| left.range.start.character.cmp(&right.range.start.character))
         });
         mapped.dedup();
-        mapped
+        Ok(mapped)
+    }
+
+    fn physical_span_is_contextually_repeated(
+        &self,
+        uri: &Url,
+        range: &std::ops::Range<usize>,
+        budget: &mut include_expansion::MappingBudget<'_>,
+    ) -> Result<bool, String> {
+        let mut owners = 0usize;
+        for expansion in self
+            .expansions
+            .values()
+            .filter(|expansion| expansion.complete)
+        {
+            let occurrences =
+                expansion
+                    .expanded
+                    .reverse_range_with_budget(uri, range.clone(), budget)?;
+            if occurrences.len() > 1 {
+                return Ok(true);
+            }
+            if !occurrences.is_empty() {
+                owners = owners.saturating_add(1);
+                if owners > 1 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn prepare_rename(
         &self,
         uri: &Url,
         position: Position,
+        cancel: &AtomicBool,
     ) -> Result<PrepareRenameResponse, String> {
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
         let mut ranges = Vec::new();
-        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+        for (query_uri, query_position) in
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?
+        {
             let response = self.index.prepare_rename(&query_uri, query_position)?;
             let PrepareRenameResponse::Range(range) = response else {
                 return Err("rename target has unsupported placeholder metadata".to_string());
             };
-            let locations = self.map_location(Location::new(query_uri, range));
+            let locations =
+                self.map_location_with_budget(Location::new(query_uri, range), &mut budget)?;
             if locations.len() != 1 {
                 return Err("rename target does not map to one physical source range".to_string());
             }
@@ -465,9 +524,13 @@ impl RenameSnapshot {
         uri: &Url,
         position: Position,
         new_name: &str,
+        cancel: &AtomicBool,
     ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
         let mut edits = HashMap::new();
-        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+        let query_positions =
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        for (query_uri, query_position) in query_positions {
             let raw = self
                 .index
                 .rename_edits(&query_uri, query_position, new_name)?;
@@ -493,7 +556,10 @@ impl RenameSnapshot {
                     else {
                         return Err("rename edit ends outside the expanded source".to_string());
                     };
-                    let span = match expansion.expanded.map_range(start..end) {
+                    let span = match expansion
+                        .expanded
+                        .map_range_with_budget(start..end, &mut budget)?
+                    {
                         crate::include_expansion::VirtualMapping::Exact(span) => span,
                         crate::include_expansion::VirtualMapping::Many(_) => {
                             return Err("rename edit crosses physical include segments".to_string());
@@ -502,6 +568,16 @@ impl RenameSnapshot {
                             return Err("rename edit maps to synthetic include text".to_string());
                         }
                     };
+                    if self.physical_span_is_contextually_repeated(
+                        &span.uri,
+                        &span.range,
+                        &mut budget,
+                    )? {
+                        return Err(
+                            "rename edit has multiple contextual physical owners; refusing an ambiguous include edit"
+                                .to_string(),
+                        );
+                    }
                     let source = expansion
                         .source_texts
                         .get(&span.uri)
@@ -547,15 +623,70 @@ impl RenameSnapshot {
         cancel: &AtomicBool,
     ) -> Result<Vec<Location>, String> {
         let mut locations = Vec::new();
-        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
-            locations.extend(self.index.binding_locations_with_cancel(
+        let mut seen = HashSet::new();
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let query_positions =
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        let mut upper_bound = 0usize;
+        for (query_uri, query_position) in &query_positions {
+            upper_bound =
+                upper_bound.saturating_add(self.index.identifier_occurrence_upper_bound(
+                    query_uri,
+                    *query_position,
+                    include_declaration,
+                    None,
+                )?);
+            if upper_bound > MAX_SNAPSHOT_BINDING_LOCATIONS {
+                return Err(format!(
+                    "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
+                ));
+            }
+        }
+        for (query_uri, query_position) in query_positions {
+            let remaining = MAX_SNAPSHOT_BINDING_LOCATIONS.saturating_sub(locations.len());
+            if remaining == 0 {
+                return Err(format!(
+                    "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
+                ));
+            }
+            let query_locations = self.index.binding_locations_with_cancel_and_limit(
                 &query_uri,
                 query_position,
                 include_declaration,
                 cancel,
-            )?);
+                remaining,
+            )?;
+            for location in query_locations {
+                for mapped in self.map_location_with_budget(location, &mut budget)? {
+                    if is_cancelled(cancel) {
+                        return Err(CANCELLATION_MESSAGE.to_string());
+                    }
+                    let key = (
+                        mapped.uri.as_str().to_owned(),
+                        mapped.range.start.line,
+                        mapped.range.start.character,
+                        mapped.range.end.line,
+                        mapped.range.end.character,
+                    );
+                    if seen.insert(key) {
+                        if locations.len() >= MAX_SNAPSHOT_BINDING_LOCATIONS {
+                            return Err(format!(
+                                "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
+                            ));
+                        }
+                        locations.push(mapped);
+                    }
+                }
+            }
         }
-        Ok(self.map_locations(locations))
+        locations.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+        });
+        Ok(locations)
     }
 
     pub(crate) fn binding_locations_in_document(
@@ -565,7 +696,25 @@ impl RenameSnapshot {
         cancel: &AtomicBool,
     ) -> Result<Vec<Location>, String> {
         let mut locations = Vec::new();
-        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let query_positions =
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        let mut upper_bound = 0usize;
+        for (query_uri, query_position) in &query_positions {
+            upper_bound =
+                upper_bound.saturating_add(self.index.identifier_occurrence_upper_bound(
+                    query_uri,
+                    *query_position,
+                    true,
+                    Some(query_uri),
+                )?);
+            if upper_bound > MAX_SNAPSHOT_BINDING_LOCATIONS {
+                return Err(format!(
+                    "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
+                ));
+            }
+        }
+        for (query_uri, query_position) in query_positions {
             let query_locations = self.index.binding_locations_in_document_with_cancel(
                 &query_uri,
                 query_position,
@@ -573,7 +722,7 @@ impl RenameSnapshot {
             )?;
             locations.extend(query_locations);
         }
-        Ok(self.map_locations(locations))
+        self.map_locations_with_budget(locations, &mut budget)
     }
 }
 
@@ -1094,6 +1243,27 @@ impl Workspace {
         let cancel = AtomicBool::new(false);
         for record in records {
             if let Some(path) = &record.path {
+                if record.missing_provider_candidate {
+                    let uri = Url::from_file_path(absolute_path(path.clone()))
+                        .ok()
+                        .map(|uri| canonical_file_uri(&uri));
+                    if uri
+                        .as_ref()
+                        .and_then(|uri| self.open_documents.get(uri))
+                        .is_some_and(|document| document.text.is_some())
+                    {
+                        return Err(format!(
+                            "include provider appeared as an overlay while resolving {}; retry the request",
+                            path.display()
+                        ));
+                    }
+                    if record.path_stamp.is_none() && path_stamp(path).is_some() {
+                        return Err(format!(
+                            "include provider appeared on disk while resolving {}; retry the request",
+                            path.display()
+                        ));
+                    }
+                }
                 revalidate_path_record(path, record, &cancel)?;
                 continue;
             }
@@ -1832,7 +2002,12 @@ fn expanded_binding_info_for_input(
     if !workspace.load_source_with_cancel(&uri, &context_key, &HashSet::new(), Some(cancel))? {
         return Ok(None);
     }
-    let positions = workspace.virtual_query_positions(&uri, position);
+    let mut mapping_budget = include_expansion::MappingBudget::new(
+        cancel,
+        workspace.include_expansion_limits().max_work,
+    );
+    let positions =
+        workspace.virtual_query_positions_with_budget(&uri, position, &mut mapping_budget)?;
     if positions.is_empty() {
         // An incomplete expansion must not be mistaken for a harmless
         // whitespace/comment position.  The physical target may be valid,
@@ -1848,11 +2023,12 @@ fn expanded_binding_info_for_input(
                     .and_then(|tail| tail.chars().next())
                     .map_or(1, char::len_utf8);
                 Some(workspace.expansions.values().any(|expansion| {
-                    !expansion.complete
-                        && !expansion
-                            .expanded
-                            .reverse_range(&uri, offset..offset.saturating_add(width))
-                            .is_empty()
+                    let reverse = expansion.expanded.reverse_range_with_budget(
+                        &uri,
+                        offset..offset.saturating_add(width),
+                        &mut mapping_budget,
+                    );
+                    !expansion.complete && reverse.map(|ranges| !ranges.is_empty()).unwrap_or(false)
                 }))
             })
             .unwrap_or(false);
@@ -2416,7 +2592,7 @@ pub(crate) fn prepare_from_input(
             records: Vec::new(),
         };
     }
-    let value = snapshot.prepare_rename(&uri, position);
+    let value = snapshot.prepare_rename(&uri, position, cancel);
     let records = snapshot_records(&snapshot);
     Computed {
         source_generation,
@@ -2559,7 +2735,7 @@ pub(crate) fn rename_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    let raw_edits = match snapshot.rename_edits(&uri, position, new_name) {
+    let raw_edits = match snapshot.rename_edits(&uri, position, new_name, cancel) {
         Ok(edits) => edits,
         Err(error) => {
             if error == "no renameable identifier at position" {
@@ -3630,7 +3806,7 @@ pub(crate) fn build_snapshot(
                         &mut expansion,
                         &conditional,
                     );
-                    if !expansion.complete {
+                    if !expansion.complete && mode != SnapshotMode::Assistance {
                         complete = false;
                         if let Some(error) = expansion.errors.first() {
                             incomplete_reason.get_or_insert_with(|| {
@@ -4019,6 +4195,16 @@ pub(crate) fn build_snapshot(
         loader.index.set_auto_import_discovery_complete(false);
     }
 
+    // A source-bearing include is represented by each owning virtual root.
+    // Keeping the same physical fragment as an additional standalone parsed
+    // document makes strict rename/reference scans treat root-visible names as
+    // unresolved in the fragment's isolated scope.  Retain its physical text
+    // and records for mapping/revalidation, but remove the standalone parser
+    // document whenever an owning expansion proved the dependency.
+    let included_uris = loader.include_parents.keys().cloned().collect::<Vec<_>>();
+    for included_uri in included_uris {
+        loader.index.remove(&included_uri);
+    }
     let indexed_uris = loader.indexed_files.clone();
     for uri in indexed_uris {
         if records.contains_key(&uri) {
@@ -4611,6 +4797,57 @@ fn enumerate_sources(
             if path.is_file() || input.overlays.contains_key(uri) {
                 add_baseline_path(&mut result.baseline, path.clone());
                 result.add_path(path, None);
+            }
+        }
+        if priority.iter().any(|uri| {
+            uri.to_file_path().ok().is_some_and(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("inc"))
+            })
+        }) {
+            let root_paths = workspace
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>();
+            for root_path in root_paths {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                let catalogue =
+                    workspace.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
+                if !catalogue.complete {
+                    result.complete = false;
+                    result.reason.get_or_insert_with(|| {
+                        format!(
+                            "include owner discovery was incomplete under {}",
+                            root_path.display()
+                        )
+                    });
+                }
+                for (directory, stamp) in catalogue.directories {
+                    add_baseline_path_with_stamp(&mut result.baseline, directory, stamp);
+                }
+                let mut owner_paths = catalogue
+                    .entries
+                    .into_values()
+                    .flatten()
+                    .map(absolute_path)
+                    .collect::<Vec<_>>();
+                owner_paths.sort_by_key(|path| path_key(path));
+                owner_paths.dedup_by(|left, right| paths_equal_ci(left, right));
+                for path in owner_paths
+                    .into_iter()
+                    .take(MAX_RENAME_INCLUDE_OWNER_DISCOVERY)
+                {
+                    if is_cancelled(cancel) {
+                        return Err(CANCELLATION_MESSAGE.to_string());
+                    }
+                    if workspace.accepts_path(&path) && is_safe_source_path(workspace, &path) {
+                        add_baseline_path(&mut result.baseline, path.clone());
+                        result.add_path(path, None);
+                    }
+                }
             }
         }
         return Ok(result);
@@ -6216,6 +6453,15 @@ fn resolve_include_path_with_overrides(
     directories: &[PathBuf],
     overrides: &EffectiveOverrides,
 ) -> IncludeLookup {
+    resolve_include_path_with_overrides_and_overlay(directive, directories, overrides, |_| false)
+}
+
+fn resolve_include_path_with_overrides_and_overlay(
+    directive: &Directive,
+    directories: &[PathBuf],
+    overrides: &EffectiveOverrides,
+    has_overlay: impl Fn(&Path) -> bool,
+) -> IncludeLookup {
     let Some(raw) = include_name(directive) else {
         return IncludeLookup {
             observations: Vec::new(),
@@ -6263,6 +6509,12 @@ fn resolve_include_path_with_overrides(
             path: candidate.clone(),
             stamp,
         });
+        if has_overlay(&candidate) {
+            selected = Some(candidate);
+            selected_directory = Some(directory.clone());
+            selected_route = route;
+            break;
+        }
         match metadata {
             Ok(metadata) if metadata.is_file() => {
                 selected = Some(candidate);
@@ -6547,16 +6799,25 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
             .map(absolute_path)
             .map_err(|_| format!("include owner is not a file URI: {owner}"))?;
         let directories = include_search_directories(&owner_path, Some(self.context));
-        let mut lookup =
-            resolve_include_path_with_overrides(&directive, &directories, &self.context.overrides);
-        if lookup.selected.is_none() {
-            lookup = self.resolve_overlay_include(&directive, &directories)?;
-        }
-        if let Some(error) = lookup.error {
-            return Err(error);
+        let lookup = resolve_include_path_with_overrides_and_overlay(
+            &directive,
+            &directories,
+            &self.context.overrides,
+            |candidate| {
+                Url::from_file_path(candidate)
+                    .ok()
+                    .map(|uri| super::canonical_file_uri(&uri))
+                    .and_then(|uri| self.workspace.open_documents.get(&uri))
+                    .is_some_and(|document| document.text.is_some())
+            },
+        );
+        if let Some(error) = lookup.error.as_ref() {
+            return Err(error.clone());
         }
         let path = lookup
             .selected
+            .as_ref()
+            .cloned()
             .ok_or_else(|| "include path is unresolved".to_string())?;
         let route = lookup.selected_route.clone();
         let relative = include_name(&directive).is_some_and(|raw| Path::new(&raw).is_relative());
@@ -6608,6 +6869,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
         let include_uri = Url::from_file_path(&path)
             .map(|uri| super::canonical_file_uri(&uri))
             .map_err(|()| format!("could not create a URI for include {path:?}"))?;
+        let mut observations = self.expansion_observations(&lookup);
         self.legacy_authorizations
             .insert(include_uri.clone(), legacy_authorized);
         if let Some(document) = self.workspace.open_documents.get(&include_uri) {
@@ -6619,6 +6881,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                     uri: include_uri,
                     text: text.clone(),
                     path_entry: Some(path_entry),
+                    observations,
                 });
             }
         }
@@ -6639,68 +6902,102 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                 Some(cancel),
             )?,
         };
+        if let Some(observation) = observations
+            .iter_mut()
+            .find(|observation| paths_equal_ci(&observation.path, &path))
+        {
+            observation.content_hash = Some(source.content_hash);
+            observation.present = true;
+        }
         Ok(ResolvedInclude {
             uri: include_uri,
             text: source.text,
             path_entry: Some(path_entry),
+            observations,
         })
+    }
+
+    fn include_size_hint(
+        &mut self,
+        owner: &Url,
+        body: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<usize>, String> {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: body.to_owned(),
+            start: 0,
+            end: body.len(),
+        };
+        let owner_path = owner
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include owner is not a file URI: {owner}"))?;
+        let directories = include_search_directories(&owner_path, Some(self.context));
+        let lookup = resolve_include_path_with_overrides_and_overlay(
+            &directive,
+            &directories,
+            &self.context.overrides,
+            |candidate| {
+                Url::from_file_path(candidate)
+                    .ok()
+                    .map(|uri| super::canonical_file_uri(&uri))
+                    .and_then(|uri| self.workspace.open_documents.get(&uri))
+                    .is_some_and(|document| document.text.is_some())
+            },
+        );
+        if let Some(error) = lookup.error {
+            return Err(error);
+        }
+        let Some(path) = lookup.selected else {
+            return Ok(None);
+        };
+        let Some(uri) = Url::from_file_path(&path)
+            .ok()
+            .map(|uri| super::canonical_file_uri(&uri))
+        else {
+            return Ok(None);
+        };
+        if let Some(text) = self
+            .workspace
+            .open_documents
+            .get(&uri)
+            .and_then(|document| document.text.as_ref())
+        {
+            return Ok(Some(text.len()));
+        }
+        Ok(fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| usize::try_from(metadata.len()).ok()))
     }
 }
 
 impl WorkspaceIncludeResolver<'_> {
-    fn resolve_overlay_include(
-        &self,
-        directive: &Directive,
-        directories: &[PathBuf],
-    ) -> Result<IncludeLookup, String> {
-        let Some(raw) = include_name(directive) else {
-            return Ok(IncludeLookup {
-                observations: Vec::new(),
-                selected: None,
-                selected_directory: None,
-                selected_route: IncludeRoute::Legacy,
-                error: None,
-            });
-        };
-        for directory in directories {
-            let resolved = self
-                .context
-                .overrides
-                .resolve_path(&raw, directory)
-                .map_err(|error| error.to_string())?;
-            let path = absolute_path(resolved.path);
-            let Some(uri) = Url::from_file_path(&path).ok() else {
-                continue;
-            };
-            let uri = super::canonical_file_uri(&uri);
-            if self
-                .workspace
-                .open_documents
-                .get(&uri)
-                .is_some_and(|document| document.text.is_some())
-            {
-                let route = resolved
-                    .mapping
-                    .as_ref()
-                    .map_or(IncludeRoute::Legacy, |mapping| IncludeRoute::Mapped {
-                        root: super::native_mapping_root(&mapping.to),
+    fn expansion_observations(&self, lookup: &IncludeLookup) -> Vec<ExpansionIncludeObservation> {
+        lookup
+            .observations
+            .iter()
+            .map(|observation| {
+                let overlay = Url::from_file_path(&observation.path)
+                    .ok()
+                    .map(|uri| super::canonical_file_uri(&uri))
+                    .and_then(|uri| self.workspace.open_documents.get(&uri))
+                    .and_then(|document| {
+                        document.text.as_ref().map(|text| (document.version, text))
                     });
-                return Ok(IncludeLookup {
-                    observations: Vec::new(),
-                    selected: Some(path),
-                    selected_directory: Some(directory.clone()),
-                    selected_route: route,
-                    error: None,
-                });
-            }
-        }
-        Ok(IncludeLookup {
-            observations: Vec::new(),
-            selected: None,
-            selected_directory: None,
-            selected_route: IncludeRoute::Legacy,
-            error: None,
-        })
+                ExpansionIncludeObservation {
+                    path: observation.path.clone(),
+                    stamp: observation.stamp.clone(),
+                    present: observation.stamp.is_some() || overlay.is_some(),
+                    overlay_version: overlay.map(|(version, _)| version),
+                    content_hash: overlay.map(|(_, text)| text_content_hash(text)),
+                }
+            })
+            .collect()
     }
 }
 

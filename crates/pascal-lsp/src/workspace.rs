@@ -46,6 +46,7 @@ const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
+const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
 const MAX_DIRECTORY_CATALOGUES: usize = 1024;
 const MAX_FILENAME_CATALOGUE_ENTRIES: usize = 10_000;
 const MAX_FILENAME_CATALOGUES: usize = 256;
@@ -857,6 +858,7 @@ pub(crate) struct ExpansionRecord {
     pub(crate) expanded: ExpandedSource,
     pub(crate) source_texts: HashMap<Url, String>,
     pub(crate) dependency_entries: HashMap<Url, ProjectPathEntry>,
+    pub(crate) include_observations: Vec<crate::include_expansion::IncludeObservation>,
     pub(crate) dependencies: HashSet<Url>,
     pub(crate) complete: bool,
 }
@@ -942,7 +944,7 @@ pub struct Workspace {
     use_clock: u64,
     open_text_bytes: usize,
     pending_diagnostics: HashMap<Url, Instant>,
-    diagnostic_publications: HashMap<Url, HashSet<Url>>,
+    diagnostic_publications: HashMap<Url, HashMap<Url, Vec<LspDiagnostic>>>,
     // Bounded event overrides are needed because some clients report a
     // deletion before the filesystem has caught up. They are cleared by a
     // create/change event or as soon as the observed stamp changes.
@@ -1360,6 +1362,20 @@ impl Workspace {
         if !self.ensure_supported_with_context(uri, &context_key) {
             return Ok(Vec::new());
         }
+        if uri
+            .to_file_path()
+            .ok()
+            .is_some_and(|path| extension_is(&path, "inc"))
+        {
+            self.discover_include_owners_with_cancel(uri, cancel)?;
+            if self
+                .include_parents
+                .get(uri)
+                .is_some_and(|parents| parents.len() > 1)
+            {
+                return Err(format!("include source has ambiguous owning roots: {uri}"));
+            }
+        }
         let empty_pins = HashSet::new();
         match self.load_source_with_cancel(uri, &context_key, &empty_pins, Some(cancel)) {
             Ok(true) => {}
@@ -1389,6 +1405,83 @@ impl Workspace {
             "navigation source changed repeatedly while resolving {}; result is incomplete",
             uri
         ))
+    }
+
+    fn discover_include_owners_with_cancel(
+        &mut self,
+        include_uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if self
+            .include_parents
+            .get(include_uri)
+            .is_some_and(|parents| parents.len() > 1)
+        {
+            return Ok(());
+        }
+        let include_path = include_uri
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include URI is not a file URI: {include_uri}"))?;
+        let mut candidates = HashSet::new();
+        for (uri, document) in &self.open_documents {
+            if document.text.is_some()
+                && uri != include_uri
+                && uri
+                    .to_file_path()
+                    .ok()
+                    .is_some_and(|path| is_analyzable_source_path(&path))
+            {
+                candidates.insert(canonical_file_uri(uri));
+            }
+        }
+        let root_paths = self
+            .roots
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        for root_path in root_paths {
+            check_workspace_cancel(Some(cancel))?;
+            let catalogue = self.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
+            for paths in catalogue.entries.values() {
+                for path in paths {
+                    let path = absolute_path(path.clone());
+                    if path != include_path {
+                        if let Ok(uri) = Url::from_file_path(path) {
+                            candidates.insert(canonical_file_uri(&uri));
+                        }
+                    }
+                }
+            }
+            if candidates.len() >= MAX_INCLUDE_OWNER_DISCOVERY {
+                break;
+            }
+        }
+        let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for (inspected, owner_uri) in candidates.into_iter().enumerate() {
+            check_workspace_cancel(Some(cancel))?;
+            if inspected >= MAX_INCLUDE_OWNER_DISCOVERY {
+                self.warn(format!(
+                    "include owner discovery limit ({MAX_INCLUDE_OWNER_DISCOVERY}) reached for {include_uri}"
+                ));
+                break;
+            }
+            let owner_context = match self.context_for_uri_with_cancel(&owner_uri, Some(cancel)) {
+                Ok(context) => context,
+                Err(_) => continue,
+            };
+            if !self.ensure_supported_with_context(&owner_uri, &owner_context) {
+                continue;
+            }
+            let pins = HashSet::from([include_uri.clone(), owner_uri.clone()]);
+            let _loaded =
+                self.load_source_with_cancel(&owner_uri, &owner_context, &pins, Some(cancel))?;
+        }
+        // The requested source is still loaded as an ordinary document below
+        // when no owner was found.  That preserves direct-document behavior;
+        // contextual lookup only uses owners proved by an expansion.
+        Ok(())
     }
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
@@ -1964,26 +2057,70 @@ impl Workspace {
     pub(crate) fn replace_diagnostic_publications(
         &mut self,
         root_uri: &Url,
-        publications: impl IntoIterator<Item = Url>,
-    ) -> Vec<Url> {
-        let current = publications.into_iter().collect::<HashSet<_>>();
+        publications: impl IntoIterator<Item = queries::DiagnosticPublication>,
+    ) -> Vec<queries::DiagnosticPublication> {
+        let current = publications.into_iter().fold(
+            HashMap::<Url, Vec<LspDiagnostic>>::new(),
+            |mut current, publication| {
+                current
+                    .entry(publication.uri)
+                    .or_default()
+                    .extend(publication.diagnostics);
+                current
+            },
+        );
         let previous = self
             .diagnostic_publications
             .insert(root_uri.clone(), current.clone())
             .unwrap_or_default();
-        previous
-            .difference(&current)
-            .filter(|uri| *uri != root_uri)
-            .cloned()
-            .collect()
+        let mut affected = previous.keys().cloned().collect::<HashSet<_>>();
+        affected.extend(current.keys().cloned());
+        self.aggregate_diagnostic_publications(affected)
     }
 
-    pub(crate) fn clear_diagnostic_publications(&mut self, root_uri: &Url) -> Vec<Url> {
-        self.diagnostic_publications
+    pub(crate) fn clear_diagnostic_publications(
+        &mut self,
+        root_uri: &Url,
+    ) -> Vec<queries::DiagnosticPublication> {
+        let previous = self
+            .diagnostic_publications
             .remove(root_uri)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.aggregate_diagnostic_publications(previous.keys().cloned().collect())
+    }
+
+    fn aggregate_diagnostic_publications(
+        &self,
+        affected: HashSet<Url>,
+    ) -> Vec<queries::DiagnosticPublication> {
+        let mut affected = affected.into_iter().collect::<Vec<_>>();
+        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected
             .into_iter()
-            .filter(|uri| uri != root_uri)
+            .map(|uri| {
+                let mut roots = self.diagnostic_publications.keys().collect::<Vec<_>>();
+                roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+                let mut diagnostics = Vec::new();
+                for root in roots {
+                    let Some(contribution) = self
+                        .diagnostic_publications
+                        .get(root)
+                        .and_then(|publications| publications.get(&uri))
+                    else {
+                        continue;
+                    };
+                    for diagnostic in contribution {
+                        if !diagnostics.contains(diagnostic) {
+                            diagnostics.push(diagnostic.clone());
+                        }
+                    }
+                }
+                queries::DiagnosticPublication {
+                    version: self.document_version(&uri),
+                    uri,
+                    diagnostics,
+                }
+            })
             .collect()
     }
 
@@ -2292,7 +2429,7 @@ impl Workspace {
 
         loop {
             check_workspace_cancel(cancel)?;
-            let locations = self.resolve_virtual_navigation(uri, position, target);
+            let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
             if !locations.is_empty() {
                 return Ok(locations);
             }
@@ -2333,7 +2470,7 @@ impl Workspace {
         }
 
         check_workspace_cancel(cancel)?;
-        Ok(self.resolve_virtual_navigation(uri, position, target))
+        self.resolve_virtual_navigation(uri, position, target, cancel)
     }
 
     fn resolve_virtual_navigation(
@@ -2341,12 +2478,21 @@ impl Workspace {
         uri: &Url,
         position: Position,
         target: NavigationTarget,
-    ) -> Vec<Location> {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Location>, String> {
+        let fallback_cancel = AtomicBool::new(false);
+        let cancel = cancel.unwrap_or(&fallback_cancel);
+        let mut budget = crate::include_expansion::MappingBudget::new(
+            cancel,
+            self.include_expansion_limits().max_work,
+        );
         let mut locations = Vec::new();
-        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+        for (query_uri, query_position) in
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?
+        {
             locations.extend(self.index.navigate(&query_uri, query_position, target));
         }
-        self.map_navigation_locations(locations)
+        self.map_navigation_locations_with_budget(locations, &mut budget)
     }
 
     fn load_imports_with_cancel(
@@ -2759,6 +2905,17 @@ impl Workspace {
         self.touch(uri);
         if let Some(expansion) = expansion {
             self.store_expansion(uri, source, expansion);
+            let context = self
+                .contexts
+                .get(context_key)
+                .map(|state| state.context.clone())
+                .ok_or_else(|| format!("project context was not retained for {uri}"))?;
+            let fallback_cancel = AtomicBool::new(false);
+            self.record_expansion_analysis_sources(
+                uri,
+                &context,
+                cancel.unwrap_or(&fallback_cancel),
+            )?;
         }
         Ok(true)
     }
@@ -2811,14 +2968,24 @@ impl Workspace {
         }
         let mut source_texts = HashMap::from([(uri.clone(), physical_source.clone())]);
         let mut dependency_entries = HashMap::new();
+        let mut include_observations = Vec::new();
         let mut dependencies = HashSet::new();
         for dependency in result.dependencies {
             dependencies.insert(dependency.uri.clone());
             source_texts.insert(dependency.uri.clone(), dependency.text);
+            include_observations.extend(dependency.observations);
             if let Some(path_entry) = dependency.path_entry {
                 dependency_entries.insert(dependency.uri.clone(), path_entry);
             }
         }
+        include_observations.sort_by(|left, right| {
+            left.path
+                .to_string_lossy()
+                .cmp(&right.path.to_string_lossy())
+                .then_with(|| left.present.cmp(&right.present))
+                .then_with(|| left.overlay_version.cmp(&right.overlay_version))
+        });
+        include_observations.dedup();
         for dependency in &dependencies {
             self.include_parents
                 .entry(dependency.clone())
@@ -2832,6 +2999,7 @@ impl Workspace {
                 expanded: result.expanded,
                 source_texts,
                 dependency_entries,
+                include_observations,
                 dependencies,
                 complete: result.complete,
             },
@@ -2847,19 +3015,39 @@ impl Workspace {
         let Some(expansion) = self.expansions.get(root_uri).cloned() else {
             return Err(format!("include expansion was not retained for {root_uri}"));
         };
-        let Some((root_source, root_version)) =
+        for observation in &expansion.include_observations {
+            check_workspace_cancel(Some(cancel))?;
+            self.record_include_analysis_observation(observation, context);
+        }
+        if let Some((root_source, root_version)) =
             self.open_documents.get(root_uri).and_then(|document| {
                 document
                     .text
                     .as_ref()
                     .map(|source| (source.clone(), document.version))
             })
-        else {
-            return Err(format!(
-                "diagnostic root disappeared while expanding {root_uri}"
-            ));
-        };
-        self.record_open_analysis_source(root_uri, &root_source, root_version);
+        {
+            self.record_open_analysis_source(root_uri, &root_source, root_version);
+        } else {
+            let root_path = root_uri
+                .to_file_path()
+                .map(absolute_path)
+                .map_err(|_| format!("include root is not a file URI: {root_uri}"))?;
+            let root_stamp = disk_stamp(&root_path)
+                .ok_or_else(|| format!("include root disappeared while expanding {root_uri}"))?;
+            self.record_closed_analysis_source(
+                root_uri,
+                &expansion.physical_source,
+                root_stamp,
+                content_hash_bytes(expansion.physical_source.as_bytes()),
+                &root_path,
+                &context.read_policy,
+                &context_path_entry(context, &root_path).unwrap_or_else(|| ProjectPathEntry {
+                    path: root_path.clone(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                }),
+            );
+        }
 
         let dependency_entries = expansion.dependency_entries.clone();
         let mut dependencies = expansion
@@ -2933,6 +3121,51 @@ impl Workspace {
         Ok(())
     }
 
+    fn record_include_analysis_observation(
+        &mut self,
+        observation: &crate::include_expansion::IncludeObservation,
+        context: &pascal_project::ProjectContext,
+    ) {
+        let path = absolute_path(observation.path.clone());
+        let Some(uri) = Url::from_file_path(&path).ok() else {
+            return;
+        };
+        let uri = canonical_file_uri(&uri);
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        if records.contains_key(&uri) {
+            return;
+        }
+        let path_entry = context_path_entry(context, &path).unwrap_or_else(|| ProjectPathEntry {
+            path: path.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        });
+        records.insert(
+            uri.clone(),
+            rename::SourceRecord {
+                uri,
+                text: String::new(),
+                version: None,
+                stamp: None,
+                open: false,
+                path: Some(path),
+                path_stamp: observation.stamp.clone(),
+                content_hash: None,
+                parsed_text_hash: None,
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: Some(context.read_policy.clone()),
+                path_entry: Some(path_entry),
+                include_payload: false,
+                missing_provider_candidate: !observation.present,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            },
+        );
+    }
+
     fn remove_expansion(&mut self, uri: &Url) {
         let Some(previous) = self.expansions.remove(uri) else {
             return;
@@ -2990,12 +3223,17 @@ impl Workspace {
             .find_map(|expansion| expansion.source_texts.get(uri).cloned())
     }
 
-    fn virtual_query_positions(&self, uri: &Url, position: Position) -> Vec<(Url, Position)> {
+    fn virtual_query_positions_with_budget(
+        &self,
+        uri: &Url,
+        position: Position,
+        budget: &mut crate::include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<(Url, Position)>, String> {
         let Some(source) = self.source_text_for_mapping(uri) else {
-            return vec![(uri.clone(), position)];
+            return Ok(vec![(uri.clone(), position)]);
         };
         let Some(offset) = text::position_to_offset(&source, position) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let width = source
             .get(offset..)
@@ -3005,9 +3243,11 @@ impl Workspace {
         let mut positions = Vec::new();
         let mut mapped_by_expansion = false;
         for (root_uri, expansion) in &self.expansions {
-            let virtual_ranges = expansion
-                .expanded
-                .reverse_range(uri, physical_range.clone());
+            let virtual_ranges = expansion.expanded.reverse_range_with_budget(
+                uri,
+                physical_range.clone(),
+                budget,
+            )?;
             if !virtual_ranges.is_empty() {
                 mapped_by_expansion = true;
             }
@@ -3033,28 +3273,34 @@ impl Workspace {
                 .then_with(|| left.1.character.cmp(&right.1.character))
         });
         positions.dedup();
-        positions
+        Ok(positions)
     }
 
-    fn map_navigation_location(&self, location: Location) -> Vec<Location> {
+    fn map_navigation_location_with_budget(
+        &self,
+        location: Location,
+        budget: &mut crate::include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<Location>, String> {
         let Some(expansion) = self.expansions.get(&location.uri) else {
-            return vec![location];
+            return Ok(vec![location]);
         };
         let Some(start) = text::position_to_offset(expansion.expanded.text(), location.range.start)
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(end) = text::position_to_offset(expansion.expanded.text(), location.range.end)
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let map = expansion.expanded.map_range(start..end);
+        let map = expansion
+            .expanded
+            .map_range_with_budget(start..end, budget)?;
         let spans = match map {
             crate::include_expansion::VirtualMapping::Exact(span) => vec![span],
             crate::include_expansion::VirtualMapping::Many(spans) => spans,
-            crate::include_expansion::VirtualMapping::Unmapped => return Vec::new(),
+            crate::include_expansion::VirtualMapping::Unmapped => return Ok(Vec::new()),
         };
-        spans
+        Ok(spans
             .into_iter()
             .filter_map(|span| {
                 let source = expansion.source_texts.get(&span.uri)?;
@@ -3062,13 +3308,20 @@ impl Workspace {
                 let end = text::offset_to_position(source, span.range.end)?;
                 Some(Location::new(span.uri, Range::new(start, end)))
             })
-            .collect()
+            .collect())
     }
 
-    fn map_navigation_locations(&self, locations: Vec<Location>) -> Vec<Location> {
+    fn map_navigation_locations_with_budget(
+        &self,
+        locations: Vec<Location>,
+        budget: &mut crate::include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<Location>, String> {
         let mut mapped = locations
             .into_iter()
-            .flat_map(|location| self.map_navigation_location(location))
+            .map(|location| self.map_navigation_location_with_budget(location, budget))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         mapped.sort_by(|left, right| {
             left.uri
@@ -3078,7 +3331,7 @@ impl Workspace {
                 .then_with(|| left.range.start.character.cmp(&right.range.start.character))
         });
         mapped.dedup();
-        mapped
+        Ok(mapped)
     }
 
     fn make_room_for(
@@ -6219,6 +6472,10 @@ impl Workspace {
             .get(uri)
             .cloned()
             .ok_or_else(|| format!("include expansion was not retained for {uri}"))?;
+        let mut mapping_budget = crate::include_expansion::MappingBudget::new(
+            cancel,
+            self.include_expansion_limits().max_work,
+        );
         let mut mapped = HashMap::<Url, Vec<LspDiagnostic>>::new();
         for diagnostic in raw {
             check_workspace_cancel(Some(cancel))?;
@@ -6239,7 +6496,22 @@ impl Workspace {
             if start >= end {
                 continue;
             }
-            let span = match expansion.expanded.map_range(start..end) {
+            if conditional
+                .unknown_spans
+                .iter()
+                .any(|unknown| unknown.start < end && start < unknown.end)
+            {
+                // A lint result in a branch whose activity is not known is
+                // not a trustworthy physical diagnostic.  Keep the
+                // fail-closed policy used by navigation and edits: withhold
+                // the uncertain item rather than publishing a confident
+                // warning for one speculative branch.
+                continue;
+            }
+            let span = match expansion
+                .expanded
+                .map_range_with_budget(start..end, &mut mapping_budget)?
+            {
                 crate::include_expansion::VirtualMapping::Exact(span) => span,
                 crate::include_expansion::VirtualMapping::Many(_)
                 | crate::include_expansion::VirtualMapping::Unmapped => continue,

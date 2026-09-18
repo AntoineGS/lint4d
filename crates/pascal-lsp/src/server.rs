@@ -5657,25 +5657,21 @@ fn deliver_analysis_result_with_store(
             Err(error) => {
                 let uri = diagnostics.uri;
                 let version = diagnostics.version;
-                let cleared =
-                    workspace.replace_diagnostic_publications(&uri, std::iter::once(uri.clone()));
-                for stale_uri in cleared {
-                    send_diagnostics(
-                        connection,
-                        &stale_uri,
-                        workspace.document_version(&stale_uri),
-                        Vec::new(),
-                    )?;
-                }
-                send_diagnostics(
-                    connection,
+                let updates = workspace.replace_diagnostic_publications(
                     &uri,
-                    version,
-                    vec![crate::workspace::server_diagnostic(
-                        &error,
-                        lsp_types::DiagnosticSeverity::ERROR,
-                    )],
-                )
+                    std::iter::once(queries::DiagnosticPublication {
+                        uri: uri.clone(),
+                        version,
+                        diagnostics: vec![crate::workspace::server_diagnostic(
+                            &error,
+                            lsp_types::DiagnosticSeverity::ERROR,
+                        )],
+                    }),
+                );
+                for update in updates {
+                    send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
+                }
+                Ok(())
             }
         },
         AnalysisResultValue::TypeDefinitions(value) => match value {
@@ -7342,17 +7338,17 @@ fn handle_notification(
             let params: DidCloseTextDocumentParams = parse_notification(&notification)?;
             let uri = params.text_document.uri;
             if workspace.close_document(&uri) {
-                for stale_uri in workspace.clear_diagnostic_publications(&uri) {
-                    send_diagnostics(
-                        connection,
-                        &stale_uri,
-                        workspace.document_version(&stale_uri),
-                        Vec::new(),
-                    )
-                    .map_err(|error| error.to_string())?;
+                let updates = workspace.clear_diagnostic_publications(&uri);
+                let mut root_was_updated = false;
+                for update in updates {
+                    root_was_updated |= update.uri == uri;
+                    send_diagnostics(connection, &update.uri, update.version, update.diagnostics)
+                        .map_err(|error| error.to_string())?;
                 }
-                send_diagnostics(connection, &uri, None, Vec::new())
-                    .map_err(|error| error.to_string())?;
+                if !root_was_updated {
+                    send_diagnostics(connection, &uri, None, Vec::new())
+                        .map_err(|error| error.to_string())?;
+                }
             }
             let mut effect = DiagnosticNotificationEffect::default();
             effect.cancel_uri(uri);
@@ -7453,25 +7449,9 @@ fn send_diagnostic_publications(
     root_uri: &Url,
     publications: Vec<queries::DiagnosticPublication>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let current_uris = publications
-        .iter()
-        .map(|publication| publication.uri.clone());
-    let cleared = workspace.replace_diagnostic_publications(root_uri, current_uris);
-    for uri in cleared {
-        send_diagnostics(
-            connection,
-            &uri,
-            workspace.document_version(&uri),
-            Vec::new(),
-        )?;
-    }
-    for publication in publications {
-        send_diagnostics(
-            connection,
-            &publication.uri,
-            publication.version,
-            publication.diagnostics,
-        )?;
+    let updates = workspace.replace_diagnostic_publications(root_uri, publications);
+    for update in updates {
+        send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
     }
     Ok(())
 }

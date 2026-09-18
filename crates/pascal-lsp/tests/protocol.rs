@@ -12133,15 +12133,19 @@ fn references_and_highlights_map_source_bearing_include_occurrences() {
     );
     let highlights = server.response(&highlights_id);
     assert!(highlights.error.is_none(), "{highlights:?}");
+    let highlight_ranges = highlights
+        .result
+        .as_ref()
+        .expect("highlight result")
+        .as_array()
+        .expect("highlight array");
+    assert_eq!(highlight_ranges.len(), 1);
     assert_eq!(
-        highlights
-            .result
-            .as_ref()
-            .expect("highlight result")
-            .as_array()
-            .expect("highlight array")
-            .len(),
-        2
+        highlight_ranges[0]["range"],
+        json!({
+            "start": {"line": 6, "character": 6},
+            "end": {"line": 6, "character": 17}
+        })
     );
     server.shutdown();
 }
@@ -12204,6 +12208,273 @@ fn source_bearing_include_expansion_prefers_an_open_overlay() {
             0,
         )],
     );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_include_prefers_a_local_overlay_before_a_later_disk_search_path() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let sub = temp.path().join("sub");
+    let lib = temp.path().join("lib");
+    fs::create_dir_all(&sub).expect("sub directory");
+    fs::create_dir_all(&lib).expect("lib directory");
+    let main = sub.join("Main.pas");
+    let local_include = sub.join("Shared.inc");
+    let disk_include = lib.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  OverlayValue := 1;\nend;\nend.\n";
+    let overlay_source = "const OverlayValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&disk_include, "const DiskValue = 1;\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"sourcePaths": ["lib"]}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&local_include),
+                "languageId": "pascal",
+                "version": 1,
+                "text": overlay_source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let id = RequestId::from("local-overlay-before-search-path".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "OverlayValue", 0),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "navigation failed: {response:?}");
+    assert_exact_location_signatures(
+        response
+            .result
+            .as_ref()
+            .expect("navigation result")
+            .as_array()
+            .unwrap(),
+        vec![expected_location_signature(
+            &local_include,
+            overlay_source,
+            "OverlayValue",
+            0,
+        )],
+    );
+    server.shutdown();
+}
+
+#[test]
+fn unknown_conditional_source_does_not_publish_confident_lint_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let source = "unit Main;\ninterface\n{$IFDEF UNKNOWN}\nconst bad_const = 1;\n{$ENDIF}\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &temp.path().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        !diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn shared_include_diagnostics_survive_closing_one_root() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let a = temp.path().join("A.pas");
+    let b = temp.path().join("B.pas");
+    let shared = temp.path().join("Shared.inc");
+    let a_source = "unit A;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let b_source = "unit B;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let shared_source = "const bad_const = 1;\n";
+    write_file(&a, a_source);
+    write_file(&b, b_source);
+    write_file(&shared, shared_source);
+    write_file(
+        &temp.path().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (path, source, version) in [(&a, a_source, 1), (&b, b_source, 1)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": version,
+                    "text": source
+                }
+            }),
+        );
+        let _ = diagnostics_for_uri(&mut server, &uri(&shared));
+    }
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&a)}}),
+    );
+    let remaining = diagnostics_for_uri(&mut server, &uri(&shared));
+    assert!(
+        remaining["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn navigation_rejects_a_changed_include_overlay_before_delivery() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let shared = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    let shared_v1 = "const SharedValue = 1;\n";
+    let shared_v2 = "\n\nconst SharedValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&shared, shared_v1);
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    for (path, source, version) in [(&shared, shared_v1, 1), (&main, main_source, 1)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": version,
+                    "text": source
+                }
+            }),
+        );
+    }
+    let id = RequestId::from("stale-include-navigation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "SharedValue", 0),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&shared), "version": 2},
+            "contentChanges": [{"text": shared_v2}]
+        }),
+    );
+    let symbols_id = RequestId::from("synchronize-new-include-position".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "symbol synchronization failed: {symbols:?}"
+    );
+    assert!(
+        symbols.result.is_some(),
+        "symbol synchronization returned no result: {symbols:?}"
+    );
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "stale include navigation must be rejected"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_reverse_contexts_share_the_10000_reference_cap() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let a = temp.path().join("A.pas");
+    let b = temp.path().join("B.pas");
+    let shared = temp.path().join("Shared.inc");
+    let mut a_source = String::from(
+        "unit A;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    let mut b_source = String::from(
+        "unit B;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..5_000 {
+        a_source.push_str("  Log(SharedValue);\n");
+        b_source.push_str("  Log(SharedValue);\n");
+    }
+    a_source.push_str("end;\nend.\n");
+    b_source.push_str("end;\nend.\n");
+    let shared_source = "const SharedValue = 1;\n";
+    write_file(&a, &a_source);
+    write_file(&b, &b_source);
+    write_file(&shared, shared_source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (path, source) in [(&a, &a_source), (&b, &b_source)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source
+                }
+            }),
+        );
+    }
+    let id = RequestId::from("source-bearing-reference-cap".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&shared)},
+            "position": {"line": 0, "character": 6},
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("aggregate reference result must fail closed");
+    assert!(error.message.contains("10000"), "{error:?}");
+    assert!(response.result.is_none());
     server.shutdown();
 }
 

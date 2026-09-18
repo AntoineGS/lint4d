@@ -2867,6 +2867,107 @@ fn include_declaration_rename_updates_its_root_consumers() {
 }
 
 #[test]
+fn fresh_include_rename_uses_its_single_owning_root_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root_path = temp.path().join("Main.pas");
+    let include_path = temp.path().join("Use.inc");
+    let root = "unit Main;\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let include = "Log(RootValue);\n";
+    fs::write(&root_path, root).expect("root source");
+    fs::write(&include_path, include).expect("include source");
+    let include_uri = Url::from_file_path(&include_path).expect("include URI");
+    let root_uri = Url::from_file_path(&root_path).expect("root URI");
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+
+    let edit = workspace
+        .rename_edits(
+            &include_uri,
+            position_of(include, "RootValue", 0),
+            "RenamedRoot",
+            false,
+        )
+        .expect("fresh include rename should use its owning root");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![
+            (
+                root_uri,
+                range_of(root, "RootValue", 0),
+                "RenamedRoot".to_owned(),
+            ),
+            (
+                include_uri,
+                range_of(include, "RootValue", 0),
+                "RenamedRoot".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn rename_rejects_a_physical_include_edit_with_conflicting_root_bindings() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let a_path = temp.path().join("A.pas");
+    let b_path = temp.path().join("B.pas");
+    let use_path = temp.path().join("Use.inc");
+    let a = "unit A;\ninterface\nconst SharedValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let b = "unit B;\ninterface\nconst SharedValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let use_source = "Log(SharedValue);\n";
+    fs::write(&a_path, a).expect("A source");
+    fs::write(&b_path, b).expect("B source");
+    fs::write(&use_path, use_source).expect("include source");
+    let a_uri = Url::from_file_path(&a_path).expect("A URI");
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(a_uri.clone(), a.to_owned(), 1)
+        .expect("open A");
+
+    assert!(
+        workspace
+            .rename_edits(
+                &a_uri,
+                position_of(a, "SharedValue", 0),
+                "ChangedValue",
+                false,
+            )
+            .is_err(),
+        "a physical include edit must not be applied to a conflicting root binding"
+    );
+}
+
+#[test]
+fn rename_rejects_a_repeated_include_with_distinct_local_bindings() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main_path = temp.path().join("Main.pas");
+    let use_path = temp.path().join("Use.inc");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure First;\nvar SharedValue: Integer;\nbegin\n{$I Use.inc}\nend;\nprocedure Second;\nvar SharedValue: Integer;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let use_source = "Log(SharedValue);\n";
+    fs::write(&main_path, source).expect("main source");
+    fs::write(&use_path, use_source).expect("include source");
+    let main_uri = Url::from_file_path(&main_path).expect("main URI");
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(main_uri.clone(), source.to_owned(), 1)
+        .expect("open main");
+
+    assert!(
+        workspace
+            .rename_edits(
+                &main_uri,
+                position_of(source, "SharedValue: Integer", 0),
+                "ChangedValue",
+                false,
+            )
+            .is_err(),
+        "a repeated include must not inherit one local binding's rename"
+    );
+}
+
+#[test]
 fn mixed_boolean_and_comparison_precedence_keeps_the_active_include_audited() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("MixedOperators.pas");

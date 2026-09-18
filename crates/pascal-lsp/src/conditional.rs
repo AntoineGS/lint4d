@@ -176,6 +176,63 @@ impl ConditionalAnalysis {
                 })
         })
     }
+
+    /// Unknown branch activity is only unsafe for source analysis when the
+    /// branch can contribute Pascal tokens or another include. Compiler-only
+    /// directive blocks do not affect the parsed binding graph and may be
+    /// carried through safely.
+    pub(crate) fn unknown_activity_requires_fail_closed(&self) -> bool {
+        if self.unknown_spans.is_empty() {
+            return false;
+        }
+        if self.directives.iter().any(|directive| {
+            directive.activity == Truth::Unknown && directive.kind == DirectiveKind::Include
+        }) {
+            return true;
+        }
+        self.unknown_spans.iter().any(|span| {
+            self.projected_source
+                .get(span.clone())
+                .is_some_and(contains_pascal_tokens)
+        })
+    }
+}
+
+fn contains_pascal_tokens(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'{' {
+            let Some(close) = bytes[index + 1..].iter().position(|byte| *byte == b'}') else {
+                return true;
+            };
+            index = index.saturating_add(close).saturating_add(2);
+            continue;
+        }
+        if bytes[index] == b'(' && bytes.get(index + 1) == Some(&b'*') {
+            let Some(close) = bytes[index + 2..]
+                .windows(2)
+                .position(|window| window == b"*)")
+            else {
+                return true;
+            };
+            index = index.saturating_add(close).saturating_add(4);
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -192,14 +249,24 @@ struct LexResult {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Environment {
+pub(crate) struct ConditionalEnvironment {
     values: HashMap<String, Truth>,
     bytes: usize,
 }
 
-impl Environment {
+impl ConditionalEnvironment {
     fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn from_defines(defines: &[String]) -> Self {
+        let mut environment = Self::new();
+        for define in defines {
+            if let Some(symbol) = canonical_symbol(define) {
+                environment.insert(symbol, Truth::True);
+            }
+        }
+        environment
     }
 
     fn len(&self) -> usize {
@@ -240,12 +307,21 @@ impl Environment {
 #[derive(Debug)]
 struct ConditionalFrame {
     parent_active: Truth,
-    before_environment: Environment,
+    before_environment: ConditionalEnvironment,
     remaining: Truth,
     current_active: Truth,
     has_else: bool,
-    merged_environment: Option<Environment>,
+    merged_environment: Option<ConditionalEnvironment>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IncludeTransition {
+    pub(crate) complete: bool,
+    pub(crate) environment_known: bool,
+}
+
+type IncludeCallback<'a> =
+    &'a mut dyn FnMut(&ConditionalDirective, &mut ConditionalEnvironment) -> IncludeTransition;
 
 /// Analyze a source buffer using the selected project's positive define facts.
 #[cfg(test)]
@@ -346,9 +422,47 @@ fn analyze_inner(
         Some(environment) => environment,
         None => {
             complete = false;
-            Environment::new()
+            ConditionalEnvironment::new()
         }
     };
+    analyze_lexed(source, lexed, &mut environment, cancel, None, complete)
+}
+
+pub(crate) fn analyze_with_include_callback(
+    source: &str,
+    environment: &mut ConditionalEnvironment,
+    cancel: &AtomicBool,
+    include: &mut dyn FnMut(
+        &ConditionalDirective,
+        &mut ConditionalEnvironment,
+    ) -> IncludeTransition,
+) -> ConditionalAnalysis {
+    let lexed = lex_directives(source, Some(cancel));
+    analyze_lexed(
+        source,
+        lexed,
+        environment,
+        Some(cancel),
+        Some(include),
+        true,
+    )
+}
+
+fn analyze_lexed(
+    source: &str,
+    lexed: LexResult,
+    environment: &mut ConditionalEnvironment,
+    cancel: Option<&AtomicBool>,
+    mut include: Option<IncludeCallback<'_>>,
+    initial_complete: bool,
+) -> ConditionalAnalysis {
+    let mut budget = AnalysisBudget {
+        cancel,
+        work: 0,
+        byte_work: 0,
+        exhausted: false,
+    };
+    let mut complete = initial_complete && lexed.complete;
     let mut active = Truth::True;
     let mut frames = Vec::new();
     let mut inactive_spans = Vec::new();
@@ -386,8 +500,8 @@ fn analyze_inner(
                     complete = false;
                     active = Truth::Unknown;
                 } else {
-                    let condition = evaluate_condition(&raw.body, &environment, &mut complete);
-                    let Some(before_environment) = clone_environment(&environment, &mut budget)
+                    let condition = evaluate_condition(&raw.body, environment, &mut complete);
+                    let Some(before_environment) = clone_environment(environment, &mut budget)
                     else {
                         complete = false;
                         cursor = raw.end;
@@ -423,7 +537,7 @@ fn analyze_inner(
                     complete = false;
                 }
                 if frame.current_active != Truth::False
-                    && !merge_environment(&mut frame.merged_environment, &environment, &mut budget)
+                    && !merge_environment(&mut frame.merged_environment, environment, &mut budget)
                 {
                     complete = false;
                     cursor = raw.end;
@@ -436,14 +550,14 @@ fn analyze_inner(
                     cursor = raw.end;
                     break;
                 };
-                environment = restored_environment;
+                *environment = restored_environment;
 
                 if is_else {
                     frame.has_else = true;
                     frame.current_active = frame.parent_active.and(frame.remaining);
                     frame.remaining = Truth::False;
                 } else {
-                    let condition = evaluate_condition(&raw.body, &environment, &mut complete);
+                    let condition = evaluate_condition(&raw.body, environment, &mut complete);
                     frame.current_active = frame.parent_active.and(frame.remaining).and(condition);
                     frame.remaining = frame.remaining.and(condition.not());
                 }
@@ -460,13 +574,13 @@ fn analyze_inner(
                     continue;
                 };
                 let Some(merged_environment) =
-                    merge_conditional_environment(&mut frame, &environment, &mut budget)
+                    merge_conditional_environment(&mut frame, environment, &mut budget)
                 else {
                     complete = false;
                     cursor = raw.end;
                     break;
                 };
-                environment = merged_environment;
+                *environment = merged_environment;
                 active = frame.parent_active;
             }
             DirectiveKind::Define | DirectiveKind::Undef => {
@@ -476,7 +590,7 @@ fn analyze_inner(
                     } else {
                         Truth::False
                     };
-                    if !apply_fact(&mut environment, &symbol, value, active, &mut budget) {
+                    if !apply_fact(environment, &symbol, value, active, &mut budget) {
                         complete = false;
                     }
                 } else {
@@ -488,7 +602,22 @@ fn analyze_inner(
                 // directives. Unless their contents have been soundly
                 // processed, no previously known fact survives an active
                 // include boundary.
-                if active != Truth::False {
+                if active == Truth::True {
+                    if let Some(include) = include.as_deref_mut() {
+                        let transition = include(
+                            directives.last().expect("include directive was recorded"),
+                            environment,
+                        );
+                        if !transition.complete {
+                            complete = false;
+                        }
+                        if !transition.environment_known {
+                            environment.clear();
+                        }
+                    } else {
+                        environment.clear();
+                    }
+                } else if active == Truth::Unknown {
                     environment.clear();
                 }
             }
@@ -535,8 +664,8 @@ fn analyze_inner(
 fn initial_environment(
     project_defines: &[String],
     budget: &mut AnalysisBudget<'_>,
-) -> Option<Environment> {
-    let mut environment = Environment::new();
+) -> Option<ConditionalEnvironment> {
+    let mut environment = ConditionalEnvironment::new();
     for define in project_defines {
         if !budget.charge(1) {
             return None;
@@ -576,16 +705,16 @@ fn canonical_symbol(symbol: &str) -> Option<String> {
     Some(symbol.to_ascii_uppercase())
 }
 
-fn environment_value(environment: &Environment, symbol: &str) -> Truth {
+fn environment_value(environment: &ConditionalEnvironment, symbol: &str) -> Truth {
     canonical_symbol(symbol)
         .and_then(|symbol| environment.get(&symbol).copied())
         .unwrap_or(Truth::Unknown)
 }
 
 fn clone_environment(
-    environment: &Environment,
+    environment: &ConditionalEnvironment,
     budget: &mut AnalysisBudget<'_>,
-) -> Option<Environment> {
+) -> Option<ConditionalEnvironment> {
     if environment.len() > MAX_ENVIRONMENT_ENTRIES
         || !budget.charge(environment.len())
         || !budget.check_environment_bytes(environment.bytes())
@@ -598,7 +727,7 @@ fn clone_environment(
 }
 
 fn apply_fact(
-    environment: &mut Environment,
+    environment: &mut ConditionalEnvironment,
     symbol: &str,
     value: Truth,
     activity: Truth,
@@ -637,9 +766,9 @@ fn apply_fact(
 
 fn merge_conditional_environment(
     frame: &mut ConditionalFrame,
-    current_environment: &Environment,
+    current_environment: &ConditionalEnvironment,
     budget: &mut AnalysisBudget<'_>,
-) -> Option<Environment> {
+) -> Option<ConditionalEnvironment> {
     let mut merged = frame.merged_environment.take();
     if frame.current_active != Truth::False
         && !merge_environment(&mut merged, current_environment, budget)
@@ -666,8 +795,8 @@ fn merge_conditional_environment(
 }
 
 fn merge_environment(
-    target: &mut Option<Environment>,
-    incoming: &Environment,
+    target: &mut Option<ConditionalEnvironment>,
+    incoming: &ConditionalEnvironment,
     budget: &mut AnalysisBudget<'_>,
 ) -> bool {
     let Some(current) = target.as_mut() else {
@@ -938,7 +1067,11 @@ pub(crate) fn defined_symbol(body: &str) -> Option<String> {
     directive_symbol(body)
 }
 
-fn evaluate_condition(body: &str, environment: &Environment, complete: &mut bool) -> Truth {
+fn evaluate_condition(
+    body: &str,
+    environment: &ConditionalEnvironment,
+    complete: &mut bool,
+) -> Truth {
     let keyword = directive_keyword(body)
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
@@ -967,7 +1100,11 @@ fn evaluate_condition(body: &str, environment: &Environment, complete: &mut bool
     }
 }
 
-fn evaluate_expression(expression: &str, environment: &Environment, complete: &mut bool) -> Truth {
+fn evaluate_expression(
+    expression: &str,
+    environment: &ConditionalEnvironment,
+    complete: &mut bool,
+) -> Truth {
     if expression.len() > MAX_EXPRESSION_BYTES {
         *complete = false;
         return Truth::Unknown;
@@ -1132,7 +1269,7 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
 struct ExpressionParser<'a> {
     tokens: Vec<ExprToken>,
     index: usize,
-    environment: &'a Environment,
+    environment: &'a ConditionalEnvironment,
     malformed: bool,
 }
 

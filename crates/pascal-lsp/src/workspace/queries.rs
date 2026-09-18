@@ -728,6 +728,7 @@ pub(crate) fn highlights_from_input(
     }
     let value = locations
         .into_iter()
+        .filter(|location| location.uri == uri)
         .map(|location| DocumentHighlight {
             range: location.range,
             kind: None,

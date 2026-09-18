@@ -1,3 +1,5 @@
+#[cfg(feature = "test-support")]
+use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -15,6 +17,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(feature = "test-support")]
+use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "test-support")]
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver};
@@ -158,6 +164,8 @@ struct TestServer {
     messages: Receiver<io::Result<Option<Message>>>,
     pending: VecDeque<Message>,
     _environment: Option<TempDir>,
+    #[cfg(feature = "test-support")]
+    stdout_paused: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-support")]
@@ -468,6 +476,11 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_partial_validation_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_PARTIAL_VALIDATION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_workspace_symbols_and_diagnostics_barriers(
         environment: TempDir,
     ) -> (Self, TestBarrier, TestBarrier) {
@@ -585,9 +598,17 @@ impl TestServer {
     fn from_child(mut child: Child) -> Self {
         let stdout = child.stdout.take().expect("child stdout");
         let (sender, receiver) = mpsc::channel();
+        #[cfg(feature = "test-support")]
+        let stdout_paused = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        let reader_pause = Arc::clone(&stdout_paused);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
+                #[cfg(feature = "test-support")]
+                while reader_pause.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 match Message::read(&mut reader) {
                     Ok(message) => {
                         let is_eof = message.is_none();
@@ -608,6 +629,8 @@ impl TestServer {
             messages: receiver,
             pending: VecDeque::new(),
             _environment: None,
+            #[cfg(feature = "test-support")]
+            stdout_paused,
         }
     }
 
@@ -704,6 +727,16 @@ impl TestServer {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn pause_stdout(&self) {
+        self.stdout_paused.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "test-support")]
+    fn resume_stdout(&self) {
+        self.stdout_paused.store(false, Ordering::Release);
     }
 
     #[cfg(feature = "test-support")]
@@ -2806,6 +2839,64 @@ fn oversized_partial_item_fails_only_its_request_and_keeps_the_session_alive() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn oversized_ordinary_result_is_request_scoped_and_keeps_the_session_alive() {
+    let root = tempfile::tempdir().expect("workspace");
+    for unit in 0..10 {
+        let mut source = format!("unit Unit{unit};\ninterface\nvar\n");
+        for index in 0..800 {
+            source.push_str(&format!(
+                "  Symbol{unit}_{index}_{}: Integer;\n",
+                "x".repeat(1_000)
+            ));
+        }
+        source.push_str("implementation\nend.\n");
+        write_file(&root.path().join(format!("Unit{unit}.pas")), &source);
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let large_id = RequestId::from("ordinary-large-result".to_string());
+    server.send_request(
+        large_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol"}),
+    );
+    let large = server.response(&large_id);
+    assert_eq!(
+        large
+            .error
+            .expect("oversized ordinary result must fail")
+            .code,
+        -32803,
+        "a valid result that exceeds the bounded control budget must fail only its request"
+    );
+
+    let healthy_id = RequestId::from("ordinary-large-result-follow-up".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol0_0_"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "an oversized ordinary result must not terminate the session: {healthy:?}"
+    );
+    assert_eq!(
+        healthy
+            .result
+            .expect("healthy ordinary result")
+            .as_array()
+            .expect("healthy ordinary array")
+            .len(),
+        1
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn references_partial_result_integer_token_matches_complete_result_with_declaration() {
     let (_temp, main, provider, main_source, _provider_source) = standard_workspace();
     let root = main.parent().expect("workspace root");
@@ -3328,6 +3419,151 @@ fn coalesced_partial_recipients_keep_independent_tokens_and_ordinary_results() {
             .len(),
         first_items.len()
     );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn coalesced_work_done_lifecycles_survive_a_paused_stdout_queue() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Main.pas"),
+        &workspace_symbol_source("Main", 7_000),
+    );
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let flood_id = RequestId::from("paused-output-flood".to_string());
+    server.send_request(
+        flood_id,
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "paused-flood"}),
+    );
+    server.pause_stdout();
+    thread::sleep(Duration::from_secs(2));
+
+    let expected_ids = (0..30)
+        .map(|index| RequestId::from(format!("paused-coalesced-{index}")))
+        .collect::<HashSet<_>>();
+    for (index, id) in expected_ids.iter().enumerate() {
+        server.send_request(
+            id.clone(),
+            "workspace/symbol",
+            json!({
+                "query": "Missing",
+                "partialResultToken": format!("paused-partial-{index}"),
+                "workDoneToken": format!("paused-work-done-{index}")
+            }),
+        );
+    }
+    server.resume_stdout();
+
+    let mut responses = HashSet::new();
+    let mut work_done_ends = HashMap::<String, usize>::new();
+    let lifecycle_deadline = Instant::now() + Duration::from_secs(15);
+    while responses.len() < expected_ids.len() || work_done_ends.len() < expected_ids.len() {
+        assert!(
+            Instant::now() < lifecycle_deadline,
+            "coalesced lifecycle did not drain: responses={}, ends={}, pending={:?}",
+            responses.len(),
+            work_done_ends.len(),
+            server.pending
+        );
+        match server.next_message() {
+            Message::Response(response) if expected_ids.contains(&response.id) => {
+                assert!(
+                    response.error.is_none(),
+                    "every admitted coalesced request needs a terminal success: {response:?}"
+                );
+                assert!(responses.insert(response.id));
+            }
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                if notification.params["value"]["kind"] == "end"
+                    && notification.params["token"]
+                        .as_str()
+                        .is_some_and(|token| token.starts_with("paused-work-done-"))
+                {
+                    let token = notification.params["token"]
+                        .as_str()
+                        .expect("work-done token")
+                        .to_string();
+                    *work_done_ends.entry(token).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(responses.len(), expected_ids.len());
+    assert!(
+        work_done_ends.values().all(|count| *count == 1),
+        "each admitted work-done token must end exactly once: {work_done_ends:?}"
+    );
+
+    let healthy_id = RequestId::from("paused-output-follow-up".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Missing"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "the session must remain usable after the coalesced control burst: {healthy:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelled_partial_validators_are_bounded_until_they_retire() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Main.pas"),
+        &workspace_symbol_source("Main", 64),
+    );
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    let root_path = server
+        ._environment
+        .as_ref()
+        .expect("test environment")
+        .path()
+        .to_path_buf();
+    server.initialize(&root_path, Value::Null);
+
+    let mut admitted = 0;
+    let mut rejected = None;
+    for index in 0..40 {
+        let id = RequestId::from(format!("retiring-validator-{index}"));
+        server.send_request(
+            id.clone(),
+            "workspace/symbol",
+            json!({
+                "query": format!("Symbol{index}"),
+                "partialResultToken": format!("retiring-partial-{index}")
+            }),
+        );
+        if let Some(response) = server.response_with_timeout(&id, Duration::from_millis(100)) {
+            rejected = response.error;
+            break;
+        }
+        barrier.wait_for_entries(index + 1);
+        server.send_notification("$/cancelRequest", json!({"id": id}));
+        let response = server.response(&id);
+        assert_eq!(
+            response.error.expect("cancellation response").code,
+            -32800,
+            "an admitted request must be cancelled before the next replacement"
+        );
+        admitted += 1;
+    }
+
+    let error = rejected.expect("retiring validator admission must eventually be bounded");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        admitted, 33,
+        "retiring validators must consume the existing 33-recipient admission budget"
+    );
+    barrier.release();
     server.shutdown();
 }
 

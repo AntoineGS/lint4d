@@ -104,23 +104,32 @@ const MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK: usize = 128;
 const MAX_PARTIAL_RESULT_BYTES_PER_CHUNK: usize = 64 * 1024;
 const MAX_PARTIAL_RESULT_ITEM_BYTES: usize = MAX_PARTIAL_RESULT_BYTES_PER_CHUNK;
 const MAX_PARTIAL_RESULT_CHUNKS_PER_TURN: usize = 1;
+// A client recipient can require begin, started-report, terminal response,
+// and end output while stdout is paused.  Keep enough bounded control slots
+// for every admitted recipient, with a small allowance for diagnostics,
+// watcher, and configuration traffic.  Data chunks have their own reserve.
+const MAX_CLIENT_CONTROL_MESSAGES_PER_RECIPIENT: usize = 4;
+const MAX_PENDING_OUTBOUND_CONTROL_MESSAGES: usize = MAX_CLIENT_ANALYSIS_RECIPIENTS
+    * MAX_CLIENT_CONTROL_MESSAGES_PER_RECIPIENT
+    + MAX_PROGRESS_ENTRIES;
+const MAX_PENDING_OUTBOUND_DATA_MESSAGES: usize = 16;
+const MAX_PENDING_OUTBOUND_MESSAGES: usize =
+    MAX_PENDING_OUTBOUND_CONTROL_MESSAGES + MAX_PENDING_OUTBOUND_DATA_MESSAGES;
 const MAX_OUTBOUND_MESSAGES: usize = 32;
 /// Messages accepted by the protocol loop but not yet accepted by the
 /// transport writer are retained here.  Partial-result data is deliberately
 /// limited to a small prefix of this queue so terminal responses and
 /// cancellation/progress control messages always have reserved capacity.
-const MAX_PENDING_OUTBOUND_MESSAGES: usize = 128;
-const MAX_PENDING_OUTBOUND_DATA_MESSAGES: usize = 16;
-const MAX_PENDING_OUTBOUND_CONTROL_MESSAGES: usize =
-    MAX_PENDING_OUTBOUND_MESSAGES - MAX_PENDING_OUTBOUND_DATA_MESSAGES;
 const MAX_PENDING_OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OUTBOUND_CONTROL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARTIAL_DELIVERY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PARTIAL_VALIDATION_RETIREMENTS: usize = MAX_CLIENT_ANALYSIS_RECIPIENTS;
 
 #[derive(Debug)]
 enum OutputError {
     Disconnected,
     Backpressure,
+    MessageTooLarge,
     Encoding(String),
 }
 
@@ -130,6 +139,8 @@ impl std::fmt::Display for OutputError {
             Self::Disconnected => formatter.write_str("LSP writer disconnected"),
             Self::Backpressure => formatter
                 .write_str("LSP output queue is full; the client did not drain the connection"),
+            Self::MessageTooLarge => formatter
+                .write_str("LSP output message exceeds the bounded control/output message budget"),
             Self::Encoding(error) => {
                 write!(formatter, "could not encode outbound LSP message: {error}")
             }
@@ -202,6 +213,11 @@ impl OutboundQueue {
         let bytes = serde_json::to_vec(&message)
             .map_err(|error| OutputError::Encoding(error.to_string()))?
             .len();
+        if bytes > MAX_PENDING_OUTBOUND_BYTES
+            || (class == OutboundClass::Control && bytes > MAX_PENDING_OUTBOUND_CONTROL_BYTES)
+        {
+            return Err(OutputError::MessageTooLarge);
+        }
         let total_messages = self
             .pending_data_messages
             .saturating_add(self.pending_control_messages);
@@ -519,6 +535,7 @@ enum TestBarrier {
     CompletionResolution,
     WorkspaceSymbols,
     References,
+    PartialValidation,
 }
 
 #[cfg(feature = "test-support")]
@@ -531,6 +548,7 @@ pub struct TestBarrierConfig {
     completion_resolution: Option<TestBarrierPaths>,
     workspace_symbols: Option<TestBarrierPaths>,
     references: Option<TestBarrierPaths>,
+    partial_validation: Option<TestBarrierPaths>,
     dispatch: Option<PathBuf>,
 }
 
@@ -557,6 +575,7 @@ impl TestBarrierConfig {
             completion_resolution: None,
             workspace_symbols: None,
             references: None,
+            partial_validation: None,
             dispatch: None,
         }
     }
@@ -584,6 +603,15 @@ impl TestBarrierConfig {
     pub fn with_references(mut self, references: Option<(PathBuf, PathBuf)>) -> Self {
         self.references =
             references.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_partial_validation(
+        mut self,
+        partial_validation: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.partial_validation =
+            partial_validation.map(|(entered, release)| TestBarrierPaths { entered, release });
         self
     }
 
@@ -622,6 +650,7 @@ impl TestBarrierConfig {
             TestBarrier::CompletionResolution => self.completion_resolution.as_ref(),
             TestBarrier::WorkspaceSymbols => self.workspace_symbols.as_ref(),
             TestBarrier::References => self.references.as_ref(),
+            TestBarrier::PartialValidation => self.partial_validation.as_ref(),
         }
     }
 }
@@ -675,6 +704,37 @@ fn wait_at_test_barrier(
         }
         thread::sleep(ANALYSIS_POLL_INTERVAL);
     }
+}
+
+#[cfg(feature = "test-support")]
+fn wait_at_uninterruptible_test_barrier(
+    barrier: TestBarrier,
+    config: &TestBarrierConfig,
+) -> Result<(), String> {
+    let Some(paths) = config.paths(barrier) else {
+        return Ok(());
+    };
+    let mut marker = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&paths.entered)
+        .map_err(|error| format!("could not enter test barrier: {error}"))?;
+    marker
+        .write_all(b"x")
+        .map_err(|error| format!("could not record test barrier entry: {error}"))?;
+    drop(marker);
+    while !paths.release.exists() {
+        thread::sleep(ANALYSIS_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+fn wait_at_uninterruptible_test_barrier(
+    _barrier: TestBarrier,
+    _config: &TestBarrierConfig,
+) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(not(feature = "test-support"))]
@@ -2071,6 +2131,7 @@ struct PartialDeliveryRecipient {
 struct PartialDeliveryValidation {
     input: Arc<rename::RevalidationInput>,
     records: Arc<Vec<SourceRecord>>,
+    test_barriers: TestBarrierConfig,
     cancellation: Arc<AtomicBool>,
     receiver: Option<Receiver<Result<(), String>>>,
     handle: Option<JoinHandle<()>>,
@@ -2080,10 +2141,12 @@ impl PartialDeliveryValidation {
     fn new(
         input: Arc<rename::RevalidationInput>,
         records: Arc<Vec<SourceRecord>>,
+        test_barriers: TestBarrierConfig,
     ) -> Result<Self, String> {
         let mut validation = Self {
             input,
             records,
+            test_barriers,
             cancellation: Arc::new(AtomicBool::new(false)),
             receiver: None,
             handle: None,
@@ -2100,14 +2163,21 @@ impl PartialDeliveryValidation {
         let input = Arc::clone(&self.input);
         let records = Arc::clone(&self.records);
         let cancellation = Arc::clone(&self.cancellation);
+        let test_barriers = self.test_barriers.clone();
         let handle = thread::Builder::new()
             .name("PascalLspPartialValidation".to_string())
             .spawn(move || {
-                let result = rename::revalidate_revalidation_input(
-                    &input,
-                    records.as_slice(),
-                    &cancellation,
-                );
+                let result = match wait_at_uninterruptible_test_barrier(
+                    TestBarrier::PartialValidation,
+                    &test_barriers,
+                ) {
+                    Ok(()) => rename::revalidate_revalidation_input(
+                        &input,
+                        records.as_slice(),
+                        &cancellation,
+                    ),
+                    Err(error) => Err(error),
+                };
                 let _ = sender.send(result);
             })
             .map_err(|error| format!("could not start partial result validation: {error}"))?;
@@ -2135,6 +2205,15 @@ impl PartialDeliveryValidation {
         }
         Some(result)
     }
+
+    fn cancel(&self) {
+        self.cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_running(&self) -> bool {
+        self.receiver.is_some() || self.handle.is_some()
+    }
 }
 
 impl Drop for PartialDeliveryValidation {
@@ -2154,6 +2233,12 @@ struct PartialDelivery {
     next_recipient: usize,
     retained_bytes: usize,
     validation: PartialDeliveryValidation,
+}
+
+#[derive(Debug)]
+struct RetiredPartialValidation {
+    validation: PartialDeliveryValidation,
+    retained_bytes: usize,
 }
 
 fn partial_payload_from_result(
@@ -3051,6 +3136,7 @@ struct AnalysisJobs {
     pending: std::collections::HashMap<AnalysisComputationId, PendingAnalysis>,
     diagnostics: HashMap<AnalysisComputationId, PendingDiagnostic>,
     partial_deliveries: VecDeque<PartialDelivery>,
+    retired_partial_validations: VecDeque<RetiredPartialValidation>,
     partial_tokens: HashMap<ProgressToken, (AnalysisComputationId, RequestId)>,
     queue: PriorityQueue<QueuedAnalysis>,
     request_to_job: HashMap<RequestId, AnalysisComputationId>,
@@ -3080,6 +3166,7 @@ impl AnalysisJobs {
             pending: std::collections::HashMap::new(),
             diagnostics: HashMap::new(),
             partial_deliveries: VecDeque::new(),
+            retired_partial_validations: VecDeque::new(),
             partial_tokens: HashMap::new(),
             queue: PriorityQueue::new(),
             request_to_job: HashMap::new(),
@@ -3810,14 +3897,54 @@ impl AnalysisJobs {
             .iter()
             .map(|delivery| delivery.recipients.len())
             .sum::<usize>();
-        running.saturating_add(queued).saturating_add(delivering)
+        running
+            .saturating_add(queued)
+            .saturating_add(delivering)
+            .saturating_add(self.retired_partial_validations.len())
     }
 
     fn partial_delivery_bytes(&self) -> usize {
-        self.partial_deliveries
+        let delivering = self
+            .partial_deliveries
             .iter()
             .map(|delivery| delivery.retained_bytes)
-            .sum()
+            .sum::<usize>();
+        let retiring = self
+            .retired_partial_validations
+            .iter()
+            .map(|validation| validation.retained_bytes)
+            .sum::<usize>();
+        delivering.saturating_add(retiring)
+    }
+
+    fn reap_retired_partial_validations(&mut self) {
+        let mut remaining = VecDeque::new();
+        while let Some(mut retired) = self.retired_partial_validations.pop_front() {
+            if retired.validation.poll().is_none() {
+                remaining.push_back(retired);
+            }
+        }
+        self.retired_partial_validations = remaining;
+    }
+
+    fn retire_partial_validation(
+        &mut self,
+        validation: PartialDeliveryValidation,
+        retained_bytes: usize,
+    ) {
+        if !validation.is_running() {
+            return;
+        }
+        validation.cancel();
+        debug_assert!(
+            self.retired_partial_validations.len() < MAX_PARTIAL_VALIDATION_RETIREMENTS,
+            "retiring partial validation bound must be checked before removal"
+        );
+        self.retired_partial_validations
+            .push_back(RetiredPartialValidation {
+                validation,
+                retained_bytes,
+            });
     }
 
     fn start_diagnostics(&mut self, uri: Url, _workspace: &Workspace) -> Result<(), String> {
@@ -3868,6 +3995,7 @@ impl AnalysisJobs {
         tokens: AnalysisProgressTokens,
         connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
+        self.reap_retired_partial_validations();
         if self.shutting_down {
             return Err("analysis server is shutting down".to_string());
         }
@@ -4156,6 +4284,7 @@ impl AnalysisJobs {
     }
 
     fn cancel(&mut self, connection: &dyn ProtocolSender, id: &RequestId) -> Result<(), String> {
+        self.reap_retired_partial_validations();
         let Some(primary_id) = self.request_to_job.get(id).cloned() else {
             return Ok(());
         };
@@ -4265,16 +4394,33 @@ impl AnalysisJobs {
                 .expect("partial recipient selected for cancellation");
             let recipient = delivery.recipients.remove(recipient_index);
             self.remove_client_mapping(id, &primary_id);
-            send_error(
-                connection,
-                id.clone(),
-                ErrorCode::RequestCanceled,
-                rename::CANCELLATION_MESSAGE,
-            )
-            .map_err(|error| error.to_string())?;
-            self.finish_partial_recipient(connection, delivery.job_id, &recipient)
+            let delivery_job_id = delivery.job_id;
+            if delivery.recipients.is_empty() {
+                let PartialDelivery {
+                    validation,
+                    retained_bytes,
+                    ..
+                } = delivery;
+                self.retire_partial_validation(validation, retained_bytes);
+                send_error(
+                    connection,
+                    id.clone(),
+                    ErrorCode::RequestCanceled,
+                    rename::CANCELLATION_MESSAGE,
+                )
                 .map_err(|error| error.to_string())?;
-            if !delivery.recipients.is_empty() {
+                self.finish_partial_recipient(connection, delivery_job_id, &recipient)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                send_error(
+                    connection,
+                    id.clone(),
+                    ErrorCode::RequestCanceled,
+                    rename::CANCELLATION_MESSAGE,
+                )
+                .map_err(|error| error.to_string())?;
+                self.finish_partial_recipient(connection, delivery_job_id, &recipient)
+                    .map_err(|error| error.to_string())?;
                 delivery.next_recipient %= delivery.recipients.len();
                 self.partial_deliveries.insert(index, delivery);
             }
@@ -4587,8 +4733,15 @@ impl AnalysisJobs {
         code: ErrorCode,
         message: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let recipients = delivery
-            .recipients
+        let PartialDelivery {
+            job_id,
+            recipients,
+            retained_bytes,
+            validation,
+            ..
+        } = delivery;
+        self.retire_partial_validation(validation, retained_bytes);
+        let recipients = recipients
             .into_iter()
             .map(|recipient| ClientRecipient {
                 id: recipient.id,
@@ -4596,7 +4749,7 @@ impl AnalysisJobs {
                 partial_result_token: Some(recipient.token),
             })
             .collect();
-        self.fail_client_recipients(connection, delivery.job_id, recipients, code, message)
+        self.fail_client_recipients(connection, job_id, recipients, code, message)
     }
 
     fn send_bulk_result(
@@ -4733,6 +4886,28 @@ impl AnalysisJobs {
                     );
                 }
             };
+            if self
+                .partial_deliveries
+                .len()
+                .saturating_add(self.retired_partial_validations.len())
+                >= MAX_PARTIAL_VALIDATION_RETIREMENTS
+            {
+                let recipients = partial_recipients
+                    .into_iter()
+                    .map(|recipient| ClientRecipient {
+                        id: recipient.id,
+                        work_done_token: None,
+                        partial_result_token: Some(recipient.token),
+                    })
+                    .collect();
+                return self.fail_client_recipients(
+                    connection,
+                    primary_id,
+                    recipients,
+                    ErrorCode::RequestFailed,
+                    "partial result validation capacity is full; retry the request",
+                );
+            }
             if self.partial_delivery_bytes().saturating_add(retained_bytes)
                 > MAX_PARTIAL_DELIVERY_BYTES
             {
@@ -4753,7 +4928,11 @@ impl AnalysisJobs {
                 );
             }
             let records = Arc::new(records);
-            let validation = match PartialDeliveryValidation::new(revalidation_input, records) {
+            let validation = match PartialDeliveryValidation::new(
+                revalidation_input,
+                records,
+                self.test_barriers.clone(),
+            ) {
                 Ok(validation) => validation,
                 Err(error) => {
                     let recipients = partial_recipients
@@ -4792,6 +4971,7 @@ impl AnalysisJobs {
         connection: &dyn ProtocolSender,
         workspace: &Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.reap_retired_partial_validations();
         for _ in 0..MAX_PARTIAL_RESULT_CHUNKS_PER_TURN {
             let Some(mut delivery) = self.partial_deliveries.pop_front() else {
                 return Ok(());
@@ -4877,6 +5057,7 @@ impl AnalysisJobs {
         connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.reap_retired_partial_validations();
         while let Ok(result) = self.receiver.try_recv() {
             match result.id {
                 AnalysisJobId::Diagnostic(id) => {
@@ -4997,6 +5178,7 @@ impl AnalysisJobs {
             && self.diagnostics.is_empty()
             && self.queue.is_empty()
             && self.partial_deliveries.is_empty()
+            && self.retired_partial_validations.is_empty()
     }
 
     fn shutdown(&mut self) {
@@ -5043,7 +5225,15 @@ impl AnalysisJobs {
         }
         let partial_deliveries = std::mem::take(&mut self.partial_deliveries);
         for delivery in partial_deliveries {
-            for recipient in delivery.recipients {
+            let PartialDelivery {
+                job_id,
+                recipients,
+                retained_bytes,
+                validation,
+                ..
+            } = delivery;
+            self.retire_partial_validation(validation, retained_bytes);
+            for recipient in recipients {
                 let request_id = recipient.id.clone();
                 if let Some(connection) = connection {
                     send_error(
@@ -5054,7 +5244,7 @@ impl AnalysisJobs {
                     )
                     .map_err(|error| error.to_string())?;
                 }
-                self.remove_client_mapping(&request_id, &delivery.job_id);
+                self.remove_client_mapping(&request_id, &job_id);
                 self.release_partial_token(&ClientRecipient {
                     id: request_id.clone(),
                     work_done_token: None,
@@ -5062,7 +5252,7 @@ impl AnalysisJobs {
                 });
                 self.progress.finish_recipient(
                     connection,
-                    AnalysisJobId::Client(delivery.job_id),
+                    AnalysisJobId::Client(job_id),
                     &request_id,
                     Some("Cancelled"),
                 )?;
@@ -5121,6 +5311,13 @@ impl AnalysisJobs {
                 break;
             }
             pending = remaining;
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
+        }
+        while !self.retired_partial_validations.is_empty() {
+            self.reap_retired_partial_validations();
+            if self.retired_partial_validations.is_empty() || Instant::now() >= deadline {
+                break;
+            }
             thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
         Ok(())
@@ -7232,8 +7429,17 @@ fn send_ok<T: serde::Serialize>(
     id: RequestId,
     value: T,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection.send_control(Message::Response(Response::new_ok(id, value)))?;
-    Ok(())
+    let fallback_id = id.clone();
+    match connection.send_control(Message::Response(Response::new_ok(id, value))) {
+        Ok(()) => Ok(()),
+        Err(OutputError::MessageTooLarge) => send_error(
+            connection,
+            fallback_id,
+            ErrorCode::RequestFailed,
+            "analysis result exceeds the bounded LSP output size; retry with a narrower request",
+        ),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn send_error(
@@ -7485,7 +7691,7 @@ mod tests {
         MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
         MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, PartialDelivery,
         PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload, PendingAnalysis,
-        PriorityQueue, deliver_analysis_result, invalidate_analysis_result,
+        PriorityQueue, TestBarrierConfig, deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
@@ -8155,6 +8361,7 @@ mod tests {
         let validation = PartialDeliveryValidation::new(
             Arc::new(workspace.revalidation_input()),
             Arc::clone(&records),
+            TestBarrierConfig::disabled(),
         )
         .expect("validation worker");
         let recipients = (0..MAX_CLIENT_ANALYSIS_RECIPIENTS)
@@ -8192,6 +8399,53 @@ mod tests {
             )
             .expect_err("delivering recipients must count toward admission");
         assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn retired_partial_validation_keeps_worker_and_bytes_until_reaped() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let barrier_directory = temp.path().join("partial-validation-barrier");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let entered = barrier_directory.join("entered");
+        let release = barrier_directory.join("release");
+        let validation = PartialDeliveryValidation::new(
+            Arc::new(workspace.revalidation_input()),
+            Arc::new(Vec::new()),
+            TestBarrierConfig::default()
+                .with_partial_validation(Some((entered.clone(), release.clone()))),
+        )
+        .expect("validation worker");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "validation worker must reach the held test barrier"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut jobs = AnalysisJobs::new();
+        jobs.retire_partial_validation(validation, 1234);
+        assert_eq!(jobs.client_recipient_count(), 1);
+        assert_eq!(jobs.partial_delivery_bytes(), 1234);
+        assert_eq!(jobs.retired_partial_validations.len(), 1);
+
+        fs::write(&release, b"release").expect("release validation barrier");
+        while !jobs.retired_partial_validations.is_empty() {
+            jobs.reap_retired_partial_validations();
+            assert!(
+                Instant::now() < deadline,
+                "retired validation worker must be reaped after release"
+            );
+            if !jobs.retired_partial_validations.is_empty() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(jobs.client_recipient_count(), 0);
+        assert_eq!(jobs.partial_delivery_bytes(), 0);
     }
 
     #[test]

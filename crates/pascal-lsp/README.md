@@ -761,7 +761,9 @@ Partial delivery is also subject to the global 33-recipient client-analysis
 admission bound: queued, running, coalesced, and already-delivering recipients
 all count, so a request beyond the bound receives a retryable queue-capacity
 error rather than creating unbounded retained work. Retained staged payloads
-are bounded to 64 MiB as well.
+are bounded to 64 MiB as well; a cancelled freshness validator continues to
+consume its bounded worker slot and retained-byte charge until it actually
+retires.
 An individual item larger than 64 KiB fails only its own partial request with a
 request-failed error; it does not terminate the LSP session or affect ordinary
 requests. Partial-result data uses nonblocking bounded output with reserved
@@ -771,10 +773,13 @@ client that stopped reading.
 
 After all chunks, the successful final response is an empty array so items are
 not duplicated. Empty results use only that final empty response. Without a
-`partialResultToken`, the ordinary complete array response is unchanged. Partial
-tokens are independent of work-done progress tokens, request IDs, and server
-IDs; active collisions are rejected and finished tokens may be reused. Coalesced
-recipients retain separate partial tokens and cancellation lifecycles.
+`partialResultToken`, the ordinary complete array response is unchanged when it
+fits the bounded outbound control budget; an otherwise valid encoded response
+larger than 8 MiB returns a request-scoped error rather than terminating the
+session. Partial tokens are independent of work-done progress tokens, request
+IDs, and server IDs; active collisions are rejected and finished tokens may be
+reused. Coalesced recipients retain separate partial tokens and cancellation
+lifecycles.
 
 ### Document highlights
 

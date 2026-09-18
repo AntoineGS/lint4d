@@ -7,6 +7,8 @@ const TEST_DIAGNOSTICS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER"
 const TEST_SELECTION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_SELECTION_BARRIER";
 const TEST_COMPLETION_RESOLUTION_BARRIER_ENV: &str =
     "PASCAL_LSP_TEST_COMPLETION_RESOLUTION_BARRIER";
+const TEST_WORKSPACE_SYMBOLS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER";
+const TEST_REFERENCES_BARRIER_ENV: &str = "PASCAL_LSP_TEST_REFERENCES_BARRIER";
 const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
 
 fn barrier_from_environment(variable: &str) -> Result<Option<(PathBuf, PathBuf)>, String> {
@@ -30,6 +32,10 @@ fn test_barrier_config() -> Result<TestBarrierConfig, String> {
     .with_completion_resolution(barrier_from_environment(
         TEST_COMPLETION_RESOLUTION_BARRIER_ENV,
     )?)
+    .with_workspace_symbols(barrier_from_environment(
+        TEST_WORKSPACE_SYMBOLS_BARRIER_ENV,
+    )?)
+    .with_references(barrier_from_environment(TEST_REFERENCES_BARRIER_ENV)?)
     .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from)))
 }
 

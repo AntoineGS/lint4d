@@ -463,6 +463,11 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_workspace_symbols_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_barrier(environment: TempDir, variable: &str) -> (Self, TestBarrier) {
         let barrier_directory = environment.path().join("analysis-barrier");
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
@@ -1574,6 +1579,31 @@ fn result_locations(response: Response) -> Vec<Value> {
 }
 
 #[cfg(feature = "test-support")]
+fn collect_partial_response(
+    server: &mut TestServer,
+    request_id: &RequestId,
+    token: &Value,
+) -> (Vec<Value>, Response) {
+    let mut items = Vec::new();
+    loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                assert_eq!(&notification.params["token"], token);
+                let chunk = notification.params["value"]
+                    .as_array()
+                    .expect("partial progress value must be an array");
+                assert!(!chunk.is_empty(), "partial chunks must not be empty");
+                items.extend(chunk.iter().cloned());
+            }
+            Message::Response(response) if &response.id == request_id => {
+                return (items, response);
+            }
+            other => server.pending.push_back(other),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
 fn assert_queue_overflow(response: Response) {
     let error = response.error.expect("analysis queue overflow error");
     assert_eq!(error.code, -32803);
@@ -1581,6 +1611,18 @@ fn assert_queue_overflow(response: Response) {
 }
 
 fn location_signature(location: &Value) -> (String, u32, u32, u32, u32) {
+    (
+        location["uri"].as_str().unwrap_or_default().to_owned(),
+        location["range"]["start"]["line"].as_u64().unwrap() as u32,
+        location["range"]["start"]["character"].as_u64().unwrap() as u32,
+        location["range"]["end"]["line"].as_u64().unwrap() as u32,
+        location["range"]["end"]["character"].as_u64().unwrap() as u32,
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn symbol_signature(symbol: &Value) -> (String, u32, u32, u32, u32) {
+    let location = &symbol["location"];
     (
         location["uri"].as_str().unwrap_or_default().to_owned(),
         location["range"]["start"]["line"].as_u64().unwrap() as u32,
@@ -2560,6 +2602,464 @@ fn workspace_symbol_request_reports_string_work_done_progress_in_order() {
     let integer_end = server.notification("$/progress");
     assert_eq!(integer_end["token"], 37);
     assert_eq!(integer_end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn workspace_symbol_partial_result_string_token_chunks_without_final_duplicates() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = workspace_symbol_source("Main", 400);
+    write_file(&source, &text);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let partial_id = RequestId::from("workspace-symbol-partial".to_string());
+    server.send_request(
+        partial_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "symbols-partial"}),
+    );
+
+    let mut partial_items = Vec::new();
+    let final_result = loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                assert_eq!(notification.params["token"], "symbols-partial");
+                let value = notification.params["value"]
+                    .as_array()
+                    .expect("partial result progress value must be an array");
+                assert!(
+                    !value.is_empty(),
+                    "non-empty output must use non-empty chunks"
+                );
+                partial_items.extend(value.iter().cloned());
+            }
+            Message::Response(response) if response.id == partial_id => {
+                break response.result.expect("partial final result");
+            }
+            other => server.pending.push_back(other),
+        }
+    };
+    assert!(final_result.as_array().expect("final array").is_empty());
+    assert!(
+        partial_items.len() > 1,
+        "the bounded delivery should produce multiple chunks/items"
+    );
+
+    let ordinary_id = RequestId::from("workspace-symbol-ordinary".to_string());
+    server.send_request(
+        ordinary_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol"}),
+    );
+    let ordinary = server
+        .response(&ordinary_id)
+        .result
+        .expect("ordinary result")
+        .as_array()
+        .expect("ordinary array")
+        .clone();
+    assert_eq!(partial_items, ordinary);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn references_partial_result_integer_token_matches_complete_result_with_declaration() {
+    let (_temp, main, provider, main_source, _provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root");
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let partial_id = RequestId::from("references-partial-integer".to_string());
+    server.send_request(
+        partial_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&main_source, "PublicRoutine", 0),
+            "context": {"includeDeclaration": true},
+            "partialResultToken": 77
+        }),
+    );
+    let (partial_items, partial_response) =
+        collect_partial_response(&mut server, &partial_id, &json!(77));
+    assert!(
+        partial_response.error.is_none(),
+        "partial references failed"
+    );
+    assert!(
+        partial_response
+            .result
+            .expect("partial final references")
+            .as_array()
+            .expect("partial final array")
+            .is_empty()
+    );
+
+    let ordinary_id = RequestId::from("references-ordinary-after-partial".to_string());
+    server.send_request(
+        ordinary_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&main_source, "PublicRoutine", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let ordinary_items = result_locations(server.response(&ordinary_id));
+    assert_eq!(partial_items, ordinary_items);
+    assert!(
+        partial_items
+            .iter()
+            .any(|location| location["uri"] == uri(&provider).to_string()),
+        "declaration-inclusive references must retain the provider declaration"
+    );
+    let unique = partial_items
+        .iter()
+        .map(location_signature)
+        .collect::<HashSet<_>>();
+    assert_eq!(unique.len(), partial_items.len());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn empty_partial_workspace_result_has_only_the_final_empty_response() {
+    let root = tempfile::tempdir().expect("workspace");
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("empty-partial-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Missing", "partialResultToken": "empty-partial"}),
+    );
+    let (items, response) = collect_partial_response(&mut server, &id, &json!("empty-partial"));
+    assert!(items.is_empty());
+    assert!(
+        response.error.is_none(),
+        "empty partial request failed: {response:?}"
+    );
+    assert_eq!(response.result, Some(Value::Array(Vec::new())));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn malformed_partial_result_token_is_rejected_without_analysis() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Main.pas"),
+        "unit Main; interface implementation end.\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("malformed-partial-token".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main", "partialResultToken": {"not": "a token"}}),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("malformed partial token error");
+    assert_eq!(error.code, -32602);
+    assert!(error.message.contains("partialResultToken"));
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn partial_and_work_done_tokens_use_separate_progress_payloads() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 400));
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let id = RequestId::from("partial-and-workdone".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({
+            "query": "Symbol",
+            "workDoneToken": "work-done",
+            "partialResultToken": "partial-items"
+        }),
+    );
+
+    let mut partial_items = Vec::new();
+    let mut work_kinds = Vec::new();
+    let response = loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                let token = &notification.params["token"];
+                let value = &notification.params["value"];
+                if token == "partial-items" {
+                    partial_items.extend(
+                        value
+                            .as_array()
+                            .expect("partial token must carry arrays")
+                            .iter()
+                            .cloned(),
+                    );
+                } else {
+                    assert_eq!(token, "work-done");
+                    work_kinds.push(
+                        value["kind"]
+                            .as_str()
+                            .expect("work progress kind")
+                            .to_owned(),
+                    );
+                }
+            }
+            Message::Response(response) if response.id == id => break response,
+            other => server.pending.push_back(other),
+        }
+    };
+    assert!(response.error.is_none(), "combined progress request failed");
+    assert_eq!(response.result, Some(Value::Array(Vec::new())));
+    assert!(!partial_items.is_empty());
+    assert_eq!(work_kinds, ["begin", "report"]);
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "work-done");
+    assert_eq!(end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn active_partial_token_collision_is_rejected_and_token_can_be_reused() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 1_200));
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let first_id = RequestId::from("partial-token-owner".to_string());
+    server.send_request(
+        first_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "reused-token"}),
+    );
+    let first_chunk = server.notification("$/progress");
+    assert_eq!(first_chunk["token"], "reused-token");
+    assert!(first_chunk["value"].as_array().is_some());
+
+    let collision_id = RequestId::from("partial-token-collision".to_string());
+    server.send_request(
+        collision_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "reused-token"}),
+    );
+    let collision = server.response(&collision_id);
+    let collision_error = collision.error.expect("active token collision error");
+    assert_eq!(collision_error.code, -32803);
+    assert!(collision_error.message.contains("progress token"));
+
+    let (items, response) =
+        collect_partial_response(&mut server, &first_id, &json!("reused-token"));
+    assert!(response.error.is_none(), "original partial request failed");
+    assert!(!items.is_empty());
+
+    let reused_id = RequestId::from("partial-token-reused".to_string());
+    server.send_request(
+        reused_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol1199", "partialResultToken": "reused-token"}),
+    );
+    let (_reused_items, reused_response) =
+        collect_partial_response(&mut server, &reused_id, &json!("reused-token"));
+    assert!(
+        reused_response.error.is_none(),
+        "finished token must be reusable"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_partial_delivery_stops_future_chunks_and_returns_request_canceled() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = workspace_symbol_source("Main", 3_000);
+    write_file(&source, &text);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("cancel-partial-delivery".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "cancel-partial"}),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "cancel-partial");
+    assert!(first["value"].as_array().is_some());
+
+    server.send_notification("$/cancelRequest", json!({"id": id}));
+    let response = server.response(&id);
+    let error = response.error.expect("partial cancellation error");
+    assert_eq!(error.code, -32800);
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn source_change_between_partial_chunks_fails_without_a_successful_final_response() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = workspace_symbol_source("Main", 2_000);
+    write_file(&source, &text);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let id = RequestId::from("stale-partial-delivery".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "stale-partial"}),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "stale-partial");
+    assert!(first["value"].as_array().is_some());
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source), "version": 2},
+            "contentChanges": [{"text": text}]
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("stale partial delivery error");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("stale"));
+    server.assert_no_response(&id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn coalesced_partial_recipients_keep_independent_tokens_and_ordinary_results() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 1_000));
+    let (mut server, barrier) = TestServer::launch_with_workspace_symbols_barrier(root);
+    let root_path = source.parent().expect("workspace root");
+    server.initialize(root_path, Value::Null);
+
+    let first_id = RequestId::from("coalesced-partial-one".to_string());
+    let second_id = RequestId::from("coalesced-partial-two".to_string());
+    let ordinary_id = RequestId::from("coalesced-ordinary".to_string());
+    let query = "Symbol";
+    server.send_request(
+        first_id.clone(),
+        "workspace/symbol",
+        json!({"query": query, "partialResultToken": "coalesced-one"}),
+    );
+    barrier.wait_until_entered();
+    server.send_request(
+        second_id.clone(),
+        "workspace/symbol",
+        json!({"query": query, "partialResultToken": "coalesced-two"}),
+    );
+    server.send_request(
+        ordinary_id.clone(),
+        "workspace/symbol",
+        json!({"query": query}),
+    );
+    barrier.release();
+
+    let mut first_items = Vec::new();
+    let mut second_items = Vec::new();
+    let mut first_response = None;
+    let mut second_response = None;
+    let mut ordinary_response = None;
+    while first_response.is_none() || second_response.is_none() || ordinary_response.is_none() {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                let chunk = notification.params["value"]
+                    .as_array()
+                    .expect("coalesced partial chunk");
+                if notification.params["token"] == "coalesced-one" {
+                    first_items.extend(chunk.iter().cloned());
+                } else if notification.params["token"] == "coalesced-two" {
+                    second_items.extend(chunk.iter().cloned());
+                } else {
+                    panic!(
+                        "unexpected coalesced token: {:?}",
+                        notification.params["token"]
+                    );
+                }
+            }
+            Message::Response(response) if response.id == first_id => {
+                first_response = Some(response)
+            }
+            Message::Response(response) if response.id == second_id => {
+                second_response = Some(response)
+            }
+            Message::Response(response) if response.id == ordinary_id => {
+                ordinary_response = Some(response)
+            }
+            other => server.pending.push_back(other),
+        }
+    }
+    assert!(
+        first_response
+            .as_ref()
+            .expect("first response")
+            .error
+            .is_none()
+    );
+    assert!(
+        second_response
+            .as_ref()
+            .expect("second response")
+            .error
+            .is_none()
+    );
+    assert!(
+        ordinary_response
+            .as_ref()
+            .expect("ordinary response")
+            .error
+            .is_none()
+    );
+    let ordinary_items = ordinary_response
+        .and_then(|response| response.result)
+        .expect("ordinary result")
+        .as_array()
+        .expect("ordinary result array")
+        .clone();
+    assert_eq!(first_items, ordinary_items);
+    assert_eq!(second_items, ordinary_items);
+    assert_eq!(
+        first_items
+            .iter()
+            .map(symbol_signature)
+            .collect::<HashSet<_>>()
+            .len(),
+        first_items.len()
+    );
     server.shutdown();
 }
 

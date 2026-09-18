@@ -738,6 +738,32 @@ location list. Unsupported or ambiguous bindings are rejected rather than
 guessed; inherited or `with`-dependent lookup, unknown class ancestors, and unsupported
 overload relationships can therefore make a reference request fail.
 
+### Partial results
+
+`workspace/symbol` and `textDocument/references` accept the standard
+`partialResultToken` in either its string or integer form. When supplied, the
+server first computes and validates the complete bounded snapshot, then sends
+ordered result-array chunks as `$/progress` notifications using that token. A
+chunk contains at most 128 items and 64 KiB of encoded JSON (an individual item
+may not exceed the same byte bound); delivery sends at most one chunk per
+protocol turn and uses the bounded outbound writer queue without blocking the
+protocol thread. Workspace-symbol results retain their 10,000-entry limit.
+
+References are never streamed as soon as plausible matches are discovered:
+workspace membership, imports, binding identity, declaration inclusion, and
+all other completeness checks must succeed before the first reference chunk is
+published. This prevents a partial location list from being mistaken for a
+complete safe result. A source or configuration change during delivery stops
+the stream and returns a stale-result error; cancellation likewise stops future
+chunks and returns the request-cancelled error.
+
+After all chunks, the successful final response is an empty array so items are
+not duplicated. Empty results use only that final empty response. Without a
+`partialResultToken`, the ordinary complete array response is unchanged. Partial
+tokens are independent of work-done progress tokens, request IDs, and server
+IDs; active collisions are rejected and finished tokens may be reused. Coalesced
+recipients retain separate partial tokens and cancellation lifecycles.
+
 ### Document highlights
 
 `textDocument/documentHighlight` is restricted to the requested document and,

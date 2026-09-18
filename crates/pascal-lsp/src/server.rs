@@ -15,7 +15,7 @@ use crate::workspace::{
     parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionItem,
@@ -24,10 +24,11 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
     FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
-    InitializeParams, MarkupKind, OneOf, Position, PrepareRenameResponse, ProgressToken,
+    InitializeParams, Location, MarkupKind, OneOf, Position, PrepareRenameResponse, ProgressToken,
     PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
-    SelectionRangeParams, ServerInfo, SignatureHelpParams, TextDocumentIdentifier, Url, WatchKind,
-    WorkDoneProgressCancelParams, WorkspaceEdit, WorkspaceFolder,
+    SelectionRangeParams, ServerInfo, SignatureHelpParams, SymbolInformation,
+    TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams, WorkspaceEdit,
+    WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,15 @@ const MAX_PROGRESS_ENTRIES: usize = 128;
 const MAX_PROGRESS_CREATES: usize = 32;
 const PROGRESS_CREATE_REQUEST_PREFIX: &str = "pascal-lsp-progress-create-";
 const PROGRESS_TOKEN_PREFIX: &str = "pascal-lsp-progress-";
+/// Partial results are delivered one bounded notification at a time.  Keeping
+/// this separate from work-done progress prevents a large result from becoming
+/// an unbounded protocol-loop operation or from being confused with lifecycle
+/// progress reports.
+const MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK: usize = 128;
+const MAX_PARTIAL_RESULT_BYTES_PER_CHUNK: usize = 64 * 1024;
+const MAX_PARTIAL_RESULT_ITEM_BYTES: usize = MAX_PARTIAL_RESULT_BYTES_PER_CHUNK;
+const MAX_PARTIAL_RESULT_CHUNKS_PER_TURN: usize = 1;
+const MAX_OUTBOUND_MESSAGES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalysisPriority {
@@ -258,6 +268,8 @@ enum TestBarrier {
     Diagnostics,
     Selection,
     CompletionResolution,
+    WorkspaceSymbols,
+    References,
 }
 
 #[cfg(feature = "test-support")]
@@ -268,6 +280,8 @@ pub struct TestBarrierConfig {
     diagnostics: Option<TestBarrierPaths>,
     selection: Option<TestBarrierPaths>,
     completion_resolution: Option<TestBarrierPaths>,
+    workspace_symbols: Option<TestBarrierPaths>,
+    references: Option<TestBarrierPaths>,
     dispatch: Option<PathBuf>,
 }
 
@@ -292,6 +306,8 @@ impl TestBarrierConfig {
                 .map(|(entered, release)| TestBarrierPaths { entered, release }),
             selection: None,
             completion_resolution: None,
+            workspace_symbols: None,
+            references: None,
             dispatch: None,
         }
     }
@@ -307,6 +323,18 @@ impl TestBarrierConfig {
     ) -> Self {
         self.completion_resolution =
             completion_resolution.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_workspace_symbols(mut self, workspace_symbols: Option<(PathBuf, PathBuf)>) -> Self {
+        self.workspace_symbols =
+            workspace_symbols.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_references(mut self, references: Option<(PathBuf, PathBuf)>) -> Self {
+        self.references =
+            references.map(|(entered, release)| TestBarrierPaths { entered, release });
         self
     }
 
@@ -343,6 +371,8 @@ impl TestBarrierConfig {
             TestBarrier::Diagnostics => self.diagnostics.as_ref(),
             TestBarrier::Selection => self.selection.as_ref(),
             TestBarrier::CompletionResolution => self.completion_resolution.as_ref(),
+            TestBarrier::WorkspaceSymbols => self.workspace_symbols.as_ref(),
+            TestBarrier::References => self.references.as_ref(),
         }
     }
 }
@@ -1696,6 +1726,119 @@ enum AnalysisJobId {
 struct ClientRecipient {
     id: RequestId,
     work_done_token: Option<ProgressToken>,
+    partial_result_token: Option<ProgressToken>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnalysisProgressTokens {
+    work_done: Option<ProgressToken>,
+    partial_result: Option<ProgressToken>,
+}
+
+#[derive(Debug, Clone)]
+enum PartialResultPayload {
+    WorkspaceSymbols(Arc<Vec<SymbolInformation>>),
+    References(Arc<Vec<Location>>),
+}
+
+impl PartialResultPayload {
+    fn len(&self) -> usize {
+        match self {
+            Self::WorkspaceSymbols(items) => items.len(),
+            Self::References(items) => items.len(),
+        }
+    }
+
+    fn item_json_len(&self, index: usize) -> Result<usize, String> {
+        let bytes = match self {
+            Self::WorkspaceSymbols(items) => serde_json::to_vec(&items[index]),
+            Self::References(items) => serde_json::to_vec(&items[index]),
+        }
+        .map_err(|error| format!("could not encode partial result item: {error}"))?
+        .len();
+        if bytes > MAX_PARTIAL_RESULT_ITEM_BYTES {
+            return Err(format!(
+                "partial result item exceeds the {MAX_PARTIAL_RESULT_ITEM_BYTES}-byte limit"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn chunk(&self, start: usize) -> Result<Option<(usize, Value)>, String> {
+        if start >= self.len() {
+            return Ok(None);
+        }
+        let mut end = start;
+        let mut encoded_bytes: usize = 2; // The enclosing JSON array brackets.
+        while end < self.len() && end.saturating_sub(start) < MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK {
+            let item_bytes = self.item_json_len(end)?;
+            let comma_bytes = usize::from(end > start);
+            let candidate = encoded_bytes
+                .saturating_add(comma_bytes)
+                .saturating_add(item_bytes);
+            if end > start && candidate > MAX_PARTIAL_RESULT_BYTES_PER_CHUNK {
+                break;
+            }
+            if end == start && candidate > MAX_PARTIAL_RESULT_BYTES_PER_CHUNK {
+                return Err(format!(
+                    "partial result item exceeds the {MAX_PARTIAL_RESULT_BYTES_PER_CHUNK}-byte chunk limit"
+                ));
+            }
+            encoded_bytes = candidate;
+            end = end.saturating_add(1);
+        }
+
+        let value = match self {
+            Self::WorkspaceSymbols(items) => serde_json::to_value(&items[start..end]),
+            Self::References(items) => serde_json::to_value(&items[start..end]),
+        }
+        .map_err(|error| format!("could not encode partial result chunk: {error}"))?;
+        Ok(Some((end, value)))
+    }
+
+    fn empty_result(&self) -> Value {
+        match self {
+            Self::WorkspaceSymbols(_) | Self::References(_) => Value::Array(Vec::new()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PartialDeliveryRecipient {
+    id: RequestId,
+    token: ProgressToken,
+    next_item: usize,
+}
+
+#[derive(Debug)]
+struct PartialDelivery {
+    job_id: AnalysisComputationId,
+    source_generation: u64,
+    configuration_generation: u64,
+    payload: PartialResultPayload,
+    recipients: Vec<PartialDeliveryRecipient>,
+    next_recipient: usize,
+}
+
+fn partial_payload_from_result(
+    value: AnalysisResultValue,
+) -> Option<Result<PartialResultPayload, String>> {
+    match value {
+        AnalysisResultValue::WorkspaceSymbols(value) => {
+            Some(value.map(|value| PartialResultPayload::WorkspaceSymbols(Arc::new(value))))
+        }
+        AnalysisResultValue::References(value) => {
+            Some(value.map(|value| PartialResultPayload::References(Arc::new(value))))
+        }
+        _ => None,
+    }
+}
+
+fn is_partial_result_value(value: &AnalysisResultValue) -> bool {
+    matches!(
+        value,
+        AnalysisResultValue::WorkspaceSymbols(_) | AnalysisResultValue::References(_)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2531,6 +2674,8 @@ struct AnalysisJobs {
     receiver: Receiver<AnalysisResult>,
     pending: std::collections::HashMap<AnalysisComputationId, PendingAnalysis>,
     diagnostics: HashMap<AnalysisComputationId, PendingDiagnostic>,
+    partial_deliveries: VecDeque<PartialDelivery>,
+    partial_tokens: HashMap<ProgressToken, (AnalysisComputationId, RequestId)>,
     queue: PriorityQueue<QueuedAnalysis>,
     request_to_job: HashMap<RequestId, AnalysisComputationId>,
     observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
@@ -2558,6 +2703,8 @@ impl AnalysisJobs {
             receiver,
             pending: std::collections::HashMap::new(),
             diagnostics: HashMap::new(),
+            partial_deliveries: VecDeque::new(),
+            partial_tokens: HashMap::new(),
             queue: PriorityQueue::new(),
             request_to_job: HashMap::new(),
             observation_jobs: HashMap::new(),
@@ -3083,17 +3230,31 @@ impl AnalysisJobs {
                             }
                         }
                         AnalysisRequest::WorkspaceSymbols { query } => {
-                            let computed = queries::workspace_symbols_from_input(
-                                input,
-                                &query,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::WorkspaceSymbols,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::WorkspaceSymbols(computed.value),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::WorkspaceSymbols(Err(error)),
+                                }
+                            } else {
+                                let computed = queries::workspace_symbols_from_input(
+                                    input,
+                                    &query,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::WorkspaceSymbols(computed.value),
+                                }
                             }
                         }
                         AnalysisRequest::References {
@@ -3101,19 +3262,33 @@ impl AnalysisJobs {
                             position,
                             include_declaration,
                         } => {
-                            let computed = queries::references_from_input(
-                                input,
-                                &uri,
-                                position,
-                                include_declaration,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::References,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::References(computed.value),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::References(Err(error)),
+                                }
+                            } else {
+                                let computed = queries::references_from_input(
+                                    input,
+                                    &uri,
+                                    position,
+                                    include_declaration,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::References(computed.value),
+                                }
                             }
                         }
                         AnalysisRequest::DocumentHighlights { uri, position } => {
@@ -3273,6 +3448,7 @@ impl AnalysisJobs {
         Ok(())
     }
 
+    #[cfg(test)]
     fn enqueue_client(
         &mut self,
         id: RequestId,
@@ -3282,11 +3458,61 @@ impl AnalysisJobs {
         work_done_token: Option<ProgressToken>,
         connection: Option<&Connection>,
     ) -> Result<(), String> {
+        self.enqueue_client_with_partial(
+            id,
+            request,
+            workspace,
+            features,
+            AnalysisProgressTokens {
+                work_done: work_done_token,
+                partial_result: None,
+            },
+            connection,
+        )
+    }
+
+    fn enqueue_client_with_partial(
+        &mut self,
+        id: RequestId,
+        request: AnalysisRequest,
+        workspace: &Workspace,
+        features: ClientFeatures,
+        tokens: AnalysisProgressTokens,
+        connection: Option<&Connection>,
+    ) -> Result<(), String> {
         if self.shutting_down {
             return Err("analysis server is shutting down".to_string());
         }
         if self.request_to_job.contains_key(&id) {
             return Err("analysis request ID is already in use".to_string());
+        }
+        if tokens.partial_result.is_some()
+            && !matches!(
+                &request,
+                AnalysisRequest::WorkspaceSymbols { .. } | AnalysisRequest::References { .. }
+            )
+        {
+            return Err("partialResultToken is unsupported for this request".to_string());
+        }
+        if tokens.partial_result.as_ref() == tokens.work_done.as_ref()
+            && tokens.partial_result.is_some()
+        {
+            return Err("workDoneToken and partialResultToken must be distinct".to_string());
+        }
+        if tokens
+            .partial_result
+            .as_ref()
+            .is_some_and(|token| self.partial_tokens.contains_key(token))
+            || tokens
+                .partial_result
+                .as_ref()
+                .is_some_and(|token| self.progress.target(token).is_some())
+            || tokens
+                .work_done
+                .as_ref()
+                .is_some_and(|token| self.partial_tokens.contains_key(token))
+        {
+            return Err("progress token is already in use by another operation".to_string());
         }
 
         let title = progress_title(&request).to_string();
@@ -3308,10 +3534,12 @@ impl AnalysisJobs {
                 }
                 let recipient = ClientRecipient {
                     id: id.clone(),
-                    work_done_token: work_done_token.clone(),
+                    work_done_token: tokens.work_done.clone(),
+                    partial_result_token: tokens.partial_result.clone(),
                 };
                 if let Some(state) = self.attach_client(&primary_id, recipient.clone()) {
                     self.request_to_job.insert(id, primary_id);
+                    self.register_partial_token(&recipient, primary_id);
                     self.progress.begin_client(
                         connection,
                         AnalysisJobId::Client(primary_id),
@@ -3343,7 +3571,8 @@ impl AnalysisJobs {
         self.request_to_job.insert(id.clone(), primary_id);
         let recipient = ClientRecipient {
             id,
-            work_done_token,
+            work_done_token: tokens.work_done,
+            partial_result_token: tokens.partial_result,
         };
         if let Some(key) = key.clone() {
             self.observation_jobs.insert(key, primary_id);
@@ -3358,6 +3587,7 @@ impl AnalysisJobs {
                 key,
             }),
         );
+        self.register_partial_token(&recipient, primary_id);
         self.progress.begin_client(
             connection,
             AnalysisJobId::Client(primary_id),
@@ -3393,6 +3623,35 @@ impl AnalysisJobs {
             return Some(ClientAnalysisState::Queued);
         }
         None
+    }
+
+    fn register_partial_token(
+        &mut self,
+        recipient: &ClientRecipient,
+        primary_id: AnalysisComputationId,
+    ) {
+        if let Some(token) = recipient.partial_result_token.as_ref() {
+            let previous = self
+                .partial_tokens
+                .insert(token.clone(), (primary_id, recipient.id.clone()));
+            debug_assert!(
+                previous.is_none(),
+                "partial token was checked before admission"
+            );
+        }
+    }
+
+    fn release_partial_token(&mut self, recipient: &ClientRecipient) {
+        let Some(token) = recipient.partial_result_token.as_ref() else {
+            return;
+        };
+        if self
+            .partial_tokens
+            .get(token)
+            .is_some_and(|(_, request_id)| request_id == &recipient.id)
+        {
+            self.partial_tokens.remove(token);
+        }
     }
 
     fn remove_client_mapping(&mut self, id: &RequestId, primary_id: &AnalysisComputationId) {
@@ -3461,6 +3720,7 @@ impl AnalysisJobs {
                 ANALYSIS_SUPERSEDED_MESSAGE,
             )?;
             for recipient in job.recipients {
+                self.release_partial_token(&recipient);
                 self.progress.finish_recipient(
                     connection,
                     AnalysisJobId::Client(*primary_id),
@@ -3493,6 +3753,7 @@ impl AnalysisJobs {
             ANALYSIS_SUPERSEDED_MESSAGE,
         )?;
         for recipient in recipients {
+            self.release_partial_token(&recipient);
             self.progress.finish_recipient(
                 connection,
                 AnalysisJobId::Client(*primary_id),
@@ -3510,6 +3771,7 @@ impl AnalysisJobs {
 
         let mut queued_empty = false;
         let mut found_queued = false;
+        let mut cancelled_recipient = None;
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
         ) {
@@ -3518,6 +3780,7 @@ impl AnalysisJobs {
                 .iter()
                 .position(|recipient| &recipient.id == id)
             {
+                cancelled_recipient = job.recipients.get(position).cloned();
                 job.recipients.remove(position);
                 queued_empty = job.recipients.is_empty();
                 found_queued = true;
@@ -3537,6 +3800,9 @@ impl AnalysisJobs {
                 id,
                 Some("Cancelled"),
             )?;
+            if let Some(recipient) = cancelled_recipient.as_ref() {
+                self.release_partial_token(recipient);
+            }
             if queued_empty {
                 if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
                     |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
@@ -3550,12 +3816,14 @@ impl AnalysisJobs {
         let mut found_running = false;
         let mut cancel_worker = false;
         let mut key = None;
+        let mut cancelled_recipient = None;
         if let Some(job) = self.pending.get_mut(&primary_id) {
             if let Some(position) = job
                 .recipients
                 .iter()
                 .position(|recipient| &recipient.id == id)
             {
+                cancelled_recipient = job.recipients.get(position).cloned();
                 job.recipients.remove(position);
                 cancel_worker = job.recipients.is_empty();
                 key = job.key.clone();
@@ -3583,9 +3851,45 @@ impl AnalysisJobs {
                 id,
                 Some("Cancelled"),
             )?;
-        } else {
-            self.request_to_job.remove(id);
+            if let Some(recipient) = cancelled_recipient.as_ref() {
+                self.release_partial_token(recipient);
+            }
+            return Ok(());
         }
+
+        if let Some(index) = self.partial_deliveries.iter().position(|delivery| {
+            delivery
+                .recipients
+                .iter()
+                .any(|recipient| &recipient.id == id)
+        }) {
+            let mut delivery = self
+                .partial_deliveries
+                .remove(index)
+                .expect("partial delivery selected for cancellation");
+            let recipient_index = delivery
+                .recipients
+                .iter()
+                .position(|recipient| &recipient.id == id)
+                .expect("partial recipient selected for cancellation");
+            let recipient = delivery.recipients.remove(recipient_index);
+            self.remove_client_mapping(id, &primary_id);
+            send_error(
+                connection,
+                id.clone(),
+                ErrorCode::RequestCanceled,
+                rename::CANCELLATION_MESSAGE,
+            )
+            .map_err(|error| error.to_string())?;
+            self.finish_partial_recipient(connection, delivery.job_id, &recipient)
+                .map_err(|error| error.to_string())?;
+            if !delivery.recipients.is_empty() {
+                delivery.next_recipient %= delivery.recipients.len();
+                self.partial_deliveries.insert(index, delivery);
+            }
+            return Ok(());
+        }
+        self.request_to_job.remove(id);
         Ok(())
     }
 
@@ -3819,6 +4123,8 @@ impl AnalysisJobs {
                         first_error.get_or_insert_with(|| error.to_string());
                     }
                     if let Some(client_job) = failure.client_job {
+                        self.remove_client_mapping(&recipient.id, &client_job);
+                        self.release_partial_token(recipient);
                         if let Err(error) = self.progress.finish_recipient(
                             Some(connection),
                             AnalysisJobId::Client(client_job),
@@ -3834,6 +4140,240 @@ impl AnalysisJobs {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn finish_partial_recipient(
+        &mut self,
+        connection: &Connection,
+        job_id: AnalysisComputationId,
+        recipient: &PartialDeliveryRecipient,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.remove_client_mapping(&recipient.id, &job_id);
+        self.release_partial_token(&ClientRecipient {
+            id: recipient.id.clone(),
+            work_done_token: None,
+            partial_result_token: Some(recipient.token.clone()),
+        });
+        self.progress
+            .finish_recipient(
+                Some(connection),
+                AnalysisJobId::Client(job_id),
+                &recipient.id,
+                None,
+            )
+            .map_err(|error| error.into())
+    }
+
+    fn fail_client_recipients(
+        &mut self,
+        connection: &Connection,
+        job_id: AnalysisComputationId,
+        recipients: Vec<ClientRecipient>,
+        code: ErrorCode,
+        message: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for recipient in recipients {
+            self.remove_client_mapping(&recipient.id, &job_id);
+            send_error(connection, recipient.id.clone(), code, message)?;
+            self.release_partial_token(&recipient);
+            self.progress
+                .finish_recipient(
+                    Some(connection),
+                    AnalysisJobId::Client(job_id),
+                    &recipient.id,
+                    Some("Failed"),
+                )
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        }
+        Ok(())
+    }
+
+    fn fail_partial_delivery(
+        &mut self,
+        connection: &Connection,
+        delivery: PartialDelivery,
+        code: ErrorCode,
+        message: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let recipients = delivery
+            .recipients
+            .into_iter()
+            .map(|recipient| ClientRecipient {
+                id: recipient.id,
+                work_done_token: None,
+                partial_result_token: Some(recipient.token),
+            })
+            .collect();
+        self.fail_client_recipients(connection, delivery.job_id, recipients, code, message)
+    }
+
+    fn send_bulk_result(
+        connection: &Connection,
+        id: RequestId,
+        payload: &PartialResultPayload,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match payload {
+            PartialResultPayload::WorkspaceSymbols(items) => send_ok(connection, id, &**items),
+            PartialResultPayload::References(items) => send_ok(connection, id, &**items),
+        }
+    }
+
+    fn start_partial_delivery(
+        &mut self,
+        connection: &Connection,
+        workspace: &Workspace,
+        result: AnalysisResult,
+        recipients: Vec<ClientRecipient>,
+        primary_id: AnalysisComputationId,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if analysis_result_is_stale(workspace, &result) {
+            return self.fail_client_recipients(
+                connection,
+                primary_id,
+                recipients,
+                ErrorCode::RequestFailed,
+                "analysis result became stale; retry the request",
+            );
+        }
+
+        let AnalysisResult {
+            source_generation,
+            configuration_generation,
+            value,
+            ..
+        } = result;
+        let Some(payload) = partial_payload_from_result(value) else {
+            return Err("partial result was attached to an unsupported analysis".into());
+        };
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(error) => {
+                for recipient in recipients {
+                    self.remove_client_mapping(&recipient.id, &primary_id);
+                    send_analysis_error(connection, recipient.id.clone(), error.clone())?;
+                    self.release_partial_token(&recipient);
+                    self.progress
+                        .finish_recipient(
+                            Some(connection),
+                            AnalysisJobId::Client(primary_id),
+                            &recipient.id,
+                            Some("Failed"),
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                }
+                return Ok(());
+            }
+        };
+
+        let mut partial_recipients = Vec::new();
+        for recipient in recipients {
+            if let Some(token) = recipient.partial_result_token.clone() {
+                if payload.len() == 0 {
+                    send_ok(connection, recipient.id.clone(), payload.empty_result())?;
+                    self.remove_client_mapping(&recipient.id, &primary_id);
+                    self.release_partial_token(&recipient);
+                    self.progress
+                        .finish_recipient(
+                            Some(connection),
+                            AnalysisJobId::Client(primary_id),
+                            &recipient.id,
+                            None,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                } else {
+                    partial_recipients.push(PartialDeliveryRecipient {
+                        id: recipient.id,
+                        token,
+                        next_item: 0,
+                    });
+                }
+            } else {
+                Self::send_bulk_result(connection, recipient.id.clone(), &payload)?;
+                self.remove_client_mapping(&recipient.id, &primary_id);
+                self.release_partial_token(&recipient);
+                self.progress
+                    .finish_recipient(
+                        Some(connection),
+                        AnalysisJobId::Client(primary_id),
+                        &recipient.id,
+                        None,
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+            }
+        }
+
+        if !partial_recipients.is_empty() {
+            self.partial_deliveries.push_back(PartialDelivery {
+                job_id: primary_id,
+                source_generation,
+                configuration_generation,
+                payload,
+                recipients: partial_recipients,
+                next_recipient: 0,
+            });
+        }
+        Ok(())
+    }
+
+    fn pump_partial_deliveries(
+        &mut self,
+        connection: &Connection,
+        workspace: &Workspace,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for _ in 0..MAX_PARTIAL_RESULT_CHUNKS_PER_TURN {
+            let Some(mut delivery) = self.partial_deliveries.pop_front() else {
+                return Ok(());
+            };
+            if delivery.source_generation != workspace.source_generation()
+                || delivery.configuration_generation != workspace.configuration_generation()
+            {
+                self.fail_partial_delivery(
+                    connection,
+                    delivery,
+                    ErrorCode::RequestFailed,
+                    "analysis result became stale during partial delivery; retry the request",
+                )?;
+                continue;
+            }
+            if delivery.recipients.is_empty() {
+                continue;
+            }
+            let recipient_index = delivery.next_recipient % delivery.recipients.len();
+            let recipient = &delivery.recipients[recipient_index];
+            let Some((end, value)) = delivery.payload.chunk(recipient.next_item)? else {
+                let recipient = delivery.recipients.remove(recipient_index);
+                send_ok(
+                    connection,
+                    recipient.id.clone(),
+                    delivery.payload.empty_result(),
+                )?;
+                self.finish_partial_recipient(connection, delivery.job_id, &recipient)?;
+                if !delivery.recipients.is_empty() {
+                    delivery.next_recipient %= delivery.recipients.len();
+                    self.partial_deliveries.push_back(delivery);
+                }
+                continue;
+            };
+            if !send_partial_result_chunk(connection, &recipient.token, value)? {
+                self.partial_deliveries.push_front(delivery);
+                return Ok(());
+            }
+            delivery.recipients[recipient_index].next_item = end;
+            if end >= delivery.payload.len() {
+                let recipient = delivery.recipients.remove(recipient_index);
+                send_ok(
+                    connection,
+                    recipient.id.clone(),
+                    delivery.payload.empty_result(),
+                )?;
+                self.finish_partial_recipient(connection, delivery.job_id, &recipient)?;
+            }
+            if !delivery.recipients.is_empty() {
+                delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
+                self.partial_deliveries.push_back(delivery);
+            }
+        }
+        Ok(())
     }
 
     fn poll(
@@ -3890,10 +4430,10 @@ impl AnalysisJobs {
                     let key = job.key;
                     let _ = job.handle.join();
                     self.remove_observation(key.as_ref(), &primary_id);
-                    for recipient in &recipients {
-                        self.remove_client_mapping(&recipient.id, &primary_id);
-                    }
                     if cancelled {
+                        for recipient in &recipients {
+                            self.remove_client_mapping(&recipient.id, &primary_id);
+                        }
                         Self::send_client_error(
                             Some(connection),
                             recipients.iter().map(|recipient| recipient.id.clone()),
@@ -3902,6 +4442,7 @@ impl AnalysisJobs {
                         )
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         for recipient in &recipients {
+                            self.release_partial_token(recipient);
                             self.progress
                                 .finish_recipient(
                                     Some(connection),
@@ -3914,24 +4455,36 @@ impl AnalysisJobs {
                                 })?;
                         }
                     } else if !recipients.is_empty() {
-                        for recipient in &recipients {
-                            deliver_analysis_result_with_store(
-                                connection,
-                                workspace,
-                                &mut self.completion_resolutions,
-                                result.clone(),
-                                Some(recipient.id.clone()),
+                        if recipients
+                            .iter()
+                            .any(|recipient| recipient.partial_result_token.is_some())
+                            && is_partial_result_value(&result.value)
+                        {
+                            self.start_partial_delivery(
+                                connection, workspace, result, recipients, primary_id,
                             )?;
-                            self.progress
-                                .finish_recipient(
-                                    Some(connection),
-                                    AnalysisJobId::Client(primary_id),
-                                    &recipient.id,
-                                    None,
-                                )
-                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
-                                    error.into()
-                                })?;
+                        } else {
+                            for recipient in &recipients {
+                                deliver_analysis_result_with_store(
+                                    connection,
+                                    workspace,
+                                    &mut self.completion_resolutions,
+                                    result.clone(),
+                                    Some(recipient.id.clone()),
+                                )?;
+                                self.remove_client_mapping(&recipient.id, &primary_id);
+                                self.release_partial_token(recipient);
+                                self.progress
+                                    .finish_recipient(
+                                        Some(connection),
+                                        AnalysisJobId::Client(primary_id),
+                                        &recipient.id,
+                                        None,
+                                    )
+                                    .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                        error.into()
+                                    })?;
+                            }
                         }
                     }
                 }
@@ -3944,7 +4497,10 @@ impl AnalysisJobs {
     }
 
     fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.diagnostics.is_empty() && self.queue.is_empty()
+        self.pending.is_empty()
+            && self.diagnostics.is_empty()
+            && self.queue.is_empty()
+            && self.partial_deliveries.is_empty()
     }
 
     fn shutdown(&mut self) {
@@ -3979,6 +4535,7 @@ impl AnalysisJobs {
                     rename::CANCELLATION_MESSAGE,
                 )?;
                 for recipient in job.recipients {
+                    self.release_partial_token(&recipient);
                     self.progress.finish_recipient(
                         connection,
                         AnalysisJobId::Client(job.id),
@@ -3986,6 +4543,33 @@ impl AnalysisJobs {
                         Some("Cancelled"),
                     )?;
                 }
+            }
+        }
+        let partial_deliveries = std::mem::take(&mut self.partial_deliveries);
+        for delivery in partial_deliveries {
+            for recipient in delivery.recipients {
+                let request_id = recipient.id.clone();
+                if let Some(connection) = connection {
+                    send_error(
+                        connection,
+                        request_id.clone(),
+                        ErrorCode::RequestCanceled,
+                        rename::CANCELLATION_MESSAGE,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                self.remove_client_mapping(&request_id, &delivery.job_id);
+                self.release_partial_token(&ClientRecipient {
+                    id: request_id.clone(),
+                    work_done_token: None,
+                    partial_result_token: Some(recipient.token),
+                });
+                self.progress.finish_recipient(
+                    connection,
+                    AnalysisJobId::Client(delivery.job_id),
+                    &request_id,
+                    Some("Cancelled"),
+                )?;
             }
         }
         self.observation_jobs.clear();
@@ -4014,9 +4598,13 @@ impl AnalysisJobs {
                 ErrorCode::RequestCanceled,
                 rename::CANCELLATION_MESSAGE,
             )?;
+            for recipient in &job.recipients {
+                self.release_partial_token(recipient);
+            }
         }
 
         self.progress.shutdown(connection)?;
+        self.partial_tokens.clear();
 
         let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
         while !pending.is_empty() {
@@ -4081,6 +4669,37 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
         )
 }
 
+fn analysis_result_is_stale(workspace: &Workspace, result: &AnalysisResult) -> bool {
+    if is_dependency_scoped_result(&result.value, &result.records) {
+        workspace
+            .dependency_scoped_result_is_fresh(
+                result.source_generation,
+                result.configuration_generation,
+                &result.records,
+            )
+            .is_err()
+    } else {
+        result.source_generation != workspace.source_generation()
+            || result.configuration_generation != workspace.configuration_generation()
+    }
+}
+
+fn send_partial_result_chunk(
+    connection: &Connection,
+    token: &ProgressToken,
+    value: Value,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let message = Message::Notification(Notification::new(
+        "$/progress".to_string(),
+        serde_json::json!({"token": token, "value": value}),
+    ));
+    match connection.sender.try_send(message) {
+        Ok(()) => Ok(true),
+        Err(TrySendError::Full(_)) => Ok(false),
+        Err(TrySendError::Disconnected(_)) => Err("LSP writer disconnected".into()),
+    }
+}
+
 #[cfg(test)]
 fn deliver_analysis_result(
     connection: &Connection,
@@ -4105,18 +4724,7 @@ fn deliver_analysis_result_with_store(
     result: AnalysisResult,
     client_id: Option<RequestId>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let stale = if is_dependency_scoped_result(&result.value, &result.records) {
-        workspace
-            .dependency_scoped_result_is_fresh(
-                result.source_generation,
-                result.configuration_generation,
-                &result.records,
-            )
-            .is_err()
-    } else {
-        result.source_generation != workspace.source_generation()
-            || result.configuration_generation != workspace.configuration_generation()
-    };
+    let stale = analysis_result_is_stale(workspace, &result);
     if stale {
         if let AnalysisResultValue::Diagnostics(diagnostics) = &result.value {
             workspace.reschedule_diagnostics(diagnostics.uri.clone());
@@ -4414,7 +5022,7 @@ impl StdioThreads {
 }
 
 fn bounded_stdio() -> (Connection, StdioThreads) {
-    let (writer_sender, writer_receiver) = bounded::<Message>(0);
+    let (writer_sender, writer_receiver) = bounded::<Message>(MAX_OUTBOUND_MESSAGES);
     let writer = thread::Builder::new()
         .name("PascalLspWriter".to_string())
         .spawn(move || {
@@ -4716,6 +5324,7 @@ fn event_loop(
                             ErrorCode::RequestFailed,
                             "request became stale while configuration was prepared; retry the request",
                         )?;
+                        jobs.pump_partial_deliveries(connection, workspace)?;
                         continue;
                     }
                     Message::Request(deferred.request)
@@ -4729,6 +5338,7 @@ fn event_loop(
                         if !shutdown_received {
                             publish_due_diagnostics(connection, workspace, &mut jobs)?;
                         }
+                        jobs.pump_partial_deliveries(connection, workspace)?;
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
@@ -4745,6 +5355,7 @@ fn event_loop(
                     if !shutdown_received {
                         publish_due_diagnostics(connection, workspace, &mut jobs)?;
                     }
+                    jobs.pump_partial_deliveries(connection, workspace)?;
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -4901,6 +5512,7 @@ fn event_loop(
                         jobs.cancel_progress(connection, &params.token)
                             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
+                    jobs.pump_partial_deliveries(connection, workspace)?;
                     continue;
                 }
                 if notification.method == "$/cancelRequest" {
@@ -4938,6 +5550,7 @@ fn event_loop(
                             )?;
                         }
                     }
+                    jobs.pump_partial_deliveries(connection, workspace)?;
                     continue;
                 }
                 let notification_method = notification.method.clone();
@@ -5036,6 +5649,7 @@ fn event_loop(
                 }
             }
         }
+        jobs.pump_partial_deliveries(connection, workspace)?;
     }
 }
 
@@ -5048,12 +5662,35 @@ fn start_analysis(
     features: ClientFeatures,
     work_done_token: Option<ProgressToken>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if let Err(error) = jobs.enqueue_client(
+    start_analysis_with_partial(
+        connection,
+        workspace,
+        jobs,
+        id,
+        request,
+        features,
+        AnalysisProgressTokens {
+            work_done: work_done_token,
+            partial_result: None,
+        },
+    )
+}
+
+fn start_analysis_with_partial(
+    connection: &Connection,
+    workspace: &Workspace,
+    jobs: &mut AnalysisJobs,
+    id: RequestId,
+    request: AnalysisRequest,
+    features: ClientFeatures,
+    tokens: AnalysisProgressTokens,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if let Err(error) = jobs.enqueue_client_with_partial(
         id.clone(),
         request,
         workspace,
         features,
-        work_done_token,
+        tokens,
         Some(connection),
     ) {
         send_error(connection, id, ErrorCode::RequestFailed, error)?;
@@ -5071,6 +5708,18 @@ fn request_work_done_token(request: &Request) -> Result<Option<ProgressToken>, S
     serde_json::from_value(value.clone())
         .map(Some)
         .map_err(|error| format!("workDoneToken must be a string or integer: {error}"))
+}
+
+fn request_partial_result_token(request: &Request) -> Result<Option<ProgressToken>, String> {
+    let Some(value) = request.params.get("partialResultToken") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| format!("partialResultToken must be a string or integer: {error}"))
 }
 
 fn request_requires_configuration(method: &str) -> bool {
@@ -5223,6 +5872,25 @@ fn handle_request(
             )?;
             return Ok(());
         }
+    };
+    let partial_result_token = if matches!(
+        request.method.as_str(),
+        "workspace/symbol" | "textDocument/references"
+    ) {
+        match request_partial_result_token(&request) {
+            Ok(token) => token,
+            Err(error) => {
+                send_error(
+                    connection,
+                    request.id.clone(),
+                    ErrorCode::InvalidParams,
+                    error,
+                )?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
     };
     match request.method.as_str() {
         "pascal/projectContext" => {
@@ -5426,7 +6094,7 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            start_analysis(
+            start_analysis_with_partial(
                 connection,
                 workspace,
                 jobs,
@@ -5435,7 +6103,10 @@ fn handle_request(
                     query: params.query,
                 },
                 client_features,
-                work_done_token.clone(),
+                AnalysisProgressTokens {
+                    work_done: work_done_token.clone(),
+                    partial_result: partial_result_token.clone(),
+                },
             )?;
         }
         "textDocument/references" => {
@@ -5447,7 +6118,7 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            start_analysis(
+            start_analysis_with_partial(
                 connection,
                 workspace,
                 jobs,
@@ -5458,7 +6129,10 @@ fn handle_request(
                     include_declaration: params.context.include_declaration,
                 },
                 client_features,
-                work_done_token.clone(),
+                AnalysisProgressTokens {
+                    work_done: work_done_token.clone(),
+                    partial_result: partial_result_token.clone(),
+                },
             )?;
         }
         "textDocument/documentHighlight" => {

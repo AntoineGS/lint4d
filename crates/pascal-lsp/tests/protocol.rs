@@ -27095,6 +27095,136 @@ fn runtime_configuration_cancellation_allows_deferred_request_id_reuse() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn runtime_configuration_request_flood_cannot_displace_a_document_change() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source_v1 = "unit Main; interface var Alpha: Integer; implementation procedure Run; begin Alpha := 1; end; end.\n";
+    let source_v2 = source_v1.replace("Alpha", "Bravo");
+    let source_v3 = source_v1.replace("Alpha", "Charlie");
+    write_file(&main, source_v1);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source_v1
+            }
+        }),
+    );
+    begin_configuration_preparation(&mut server, json!({"maxFiles": 9999}), &barrier);
+
+    let request_ids = (0..64)
+        .map(|index| RequestId::from(format!("flooded-document-symbol-{index}")))
+        .collect::<Vec<_>>();
+    for request_id in &request_ids {
+        server.send_request(
+            request_id.clone(),
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": uri(&main)}}),
+        );
+    }
+
+    let excess_id = RequestId::from("flooded-document-symbol-excess".to_string());
+    server.send_request(
+        excess_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let before_edit_ping_id = RequestId::from("flooded-before-edit-ping".to_string());
+    server.send_request(before_edit_ping_id.clone(), "review/ping", Value::Null);
+    let excess = server
+        .response_with_timeout(&excess_id, Duration::from_secs(1))
+        .expect("excess request must be rejected while preparation is held");
+    assert_eq!(
+        excess.error.expect("excess request error").code,
+        -32802,
+        "request capacity must remain bounded"
+    );
+    let before_edit_ping = server
+        .response_with_timeout(&before_edit_ping_id, Duration::from_secs(1))
+        .expect("server must remain responsive before the edit");
+    assert_eq!(
+        before_edit_ping.error.expect("unknown method error").code,
+        -32601
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": source_v2}]
+        }),
+    );
+    let after_edit_ping_id = RequestId::from("flooded-after-edit-ping".to_string());
+    server.send_request(after_edit_ping_id.clone(), "review/ping", Value::Null);
+    let after_edit_ping = server
+        .response_with_timeout(&after_edit_ping_id, Duration::from_secs(1))
+        .expect("a valid edit must not terminate the server");
+    assert_eq!(
+        after_edit_ping.error.expect("unknown method error").code,
+        -32601
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 3},
+            "contentChanges": [{"text": source_v3}]
+        }),
+    );
+
+    barrier.release();
+    let mut cancelled = 0;
+    for request_id in &request_ids {
+        let response = server.response(request_id);
+        if let Some(error) = response.error {
+            assert!(
+                error.code == -32802 || error.code == -32803,
+                "only retryable or stale flood requests may be rejected: {error:?}"
+            );
+            if error.code == -32802 {
+                cancelled += 1;
+            }
+        }
+    }
+    assert_eq!(
+        cancelled, 2,
+        "the two notifications must reclaim exactly two request slots"
+    );
+
+    let symbols_id = RequestId::from("flooded-document-symbol-v3".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "the final document overlay must remain authoritative after the flood: {symbols:?}"
+    );
+    assert!(
+        symbols
+            .result
+            .expect("document symbols")
+            .to_string()
+            .contains("Charlie")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn runtime_configuration_processes_did_open_after_an_increased_file_limit() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");

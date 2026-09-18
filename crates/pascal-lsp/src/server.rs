@@ -71,6 +71,12 @@ const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
 const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
+// Keep one slot available for an authoritative state-changing notification
+// even when only retryable feature requests are arriving.
+const MAX_CONFIGURATION_DEFERRED_REQUESTS: usize =
+    MAX_CONFIGURATION_DEFERRED_MESSAGES.saturating_sub(1);
+const CONFIGURATION_REQUEST_RETRY_MESSAGE: &str =
+    "configuration update is still being prepared; retry the request";
 const MAX_COMPLETION_RESOLUTION_ENTRIES: usize = 2_048;
 const MAX_COMPLETION_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPLETION_RESOLUTION_DATA_BYTES: usize = 512;
@@ -4068,13 +4074,20 @@ fn event_loop(
                 } else if configuration.is_preparing()
                     && request_requires_configuration(&request.method)
                 {
+                    let deferred_request_count = deferred_configuration_messages
+                        .iter()
+                        .filter(|deferred| {
+                            matches!(deferred, DeferredConfigurationMessage::Request(_))
+                        })
+                        .count();
                     if deferred_configuration_messages.len() >= MAX_CONFIGURATION_DEFERRED_MESSAGES
+                        || deferred_request_count >= MAX_CONFIGURATION_DEFERRED_REQUESTS
                     {
                         send_error(
                             connection,
                             request.id,
                             ErrorCode::ServerCancelled,
-                            "configuration update is still being prepared; retry the request",
+                            CONFIGURATION_REQUEST_RETRY_MESSAGE,
                         )?;
                     } else if deferred_configuration_messages.iter().any(|deferred| {
                         matches!(
@@ -4153,6 +4166,10 @@ fn event_loop(
                     deferred_configuration_messages.pop_back();
                 } else if deferred_configuration_messages.len()
                     >= MAX_CONFIGURATION_DEFERRED_MESSAGES
+                    && !reject_deferred_configuration_request(
+                        connection,
+                        &mut deferred_configuration_messages,
+                    )?
                 {
                     return Err(
                         "configuration transition queue is full; cannot safely defer a state-changing notification"
@@ -4352,6 +4369,28 @@ fn notification_may_change_configuration(method: &str) -> bool {
         method,
         "workspace/didChangeConfiguration" | "workspace/didChangeWorkspaceFolders"
     )
+}
+
+fn reject_deferred_configuration_request(
+    connection: &Connection,
+    messages: &mut VecDeque<DeferredConfigurationMessage>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let Some(index) = messages
+        .iter()
+        .rposition(|message| matches!(message, DeferredConfigurationMessage::Request(_)))
+    else {
+        return Ok(false);
+    };
+    let Some(DeferredConfigurationMessage::Request(deferred)) = messages.remove(index) else {
+        unreachable!("deferred request predicate");
+    };
+    send_error(
+        connection,
+        deferred.request.id,
+        ErrorCode::ServerCancelled,
+        CONFIGURATION_REQUEST_RETRY_MESSAGE,
+    )?;
+    Ok(true)
 }
 
 fn request_document_uri(request: &Request) -> Option<Url> {

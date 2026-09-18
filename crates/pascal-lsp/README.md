@@ -566,6 +566,15 @@ Expensive reads and rebuilds remain in the bounded analysis workers, and
 runtime settings never grant filesystem access beyond the existing read
 policy.
 
+While a runtime configuration rebuild is in progress, configuration-dependent
+requests and state-changing notifications share a bounded FIFO of 64 messages.
+At most 63 retryable requests are admitted initially, leaving room for an
+authoritative notification; if later notifications need more room, the newest
+deferred request is rejected with a retryable `-32802` response rather than
+dropped edits. The queue remains count-bounded, and each retained LSP payload
+is subject to the server's 8 MiB input limit. Cancellation and shutdown still
+drain deferred requests with explicit responses.
+
 The coordinator coalesces refresh notifications, keeps at most one pull in
 flight, and discards obsolete or duplicate replies. Pull errors preserve the
 last valid runtime state. Runtime lists are capped at 256 entries and strings

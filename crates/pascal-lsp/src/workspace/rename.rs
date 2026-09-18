@@ -8,17 +8,20 @@
 
 use super::{
     ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
-    WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_configuration_file,
-    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, path_starts_with_native,
-    paths_equal_ci, read_disk_source,
+    WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_analyzable_source_path,
+    is_configuration_file, is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci,
+    path_starts_with_native, paths_equal_ci, read_disk_source,
 };
 use crate::NavigationIndex;
 use crate::conditional::{self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind};
+use crate::include_expansion::{
+    self, ExpansionLimits, ExpansionResult, IncludeResolver, ResolvedInclude,
+};
 use crate::navigation::ParsedDocument;
 use crate::text;
 use lsp_types::{
-    DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
-    PrepareRenameResponse, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    DocumentChanges, Location, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
+    PrepareRenameResponse, Range, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::decode_bytes;
 use pascal_project::delphi_overrides::EffectiveOverrides;
@@ -313,6 +316,7 @@ pub(crate) struct RenameSnapshot {
     pub(crate) index: NavigationIndex,
     pub(crate) sources: HashMap<Url, String>,
     pub(crate) records: HashMap<Url, SourceRecord>,
+    pub(crate) expansions: HashMap<Url, super::ExpansionRecord>,
     pub(crate) readable: HashSet<Url>,
     pub(crate) editable: HashSet<Url>,
     pub(crate) complete: bool,
@@ -320,6 +324,257 @@ pub(crate) struct RenameSnapshot {
     pub(crate) include_errors: Vec<String>,
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
+}
+
+impl RenameSnapshot {
+    fn virtual_query_positions(&self, uri: &Url, position: Position) -> Vec<(Url, Position)> {
+        let Some(source) = self
+            .sources
+            .get(uri)
+            .or_else(|| self.records.get(uri).map(|record| &record.text))
+        else {
+            return vec![(uri.clone(), position)];
+        };
+        let Some(offset) = text::position_to_offset(source, position) else {
+            return Vec::new();
+        };
+        if offset >= source.len() {
+            return vec![(uri.clone(), position)];
+        }
+        let width = source[offset..].chars().next().map_or(1, char::len_utf8);
+        let physical_range = offset..offset.saturating_add(width);
+        let mut positions = Vec::new();
+        let mut mapped_by_expansion = false;
+        for (root_uri, expansion) in &self.expansions {
+            let virtual_ranges = expansion
+                .expanded
+                .reverse_range(uri, physical_range.clone());
+            if !virtual_ranges.is_empty() {
+                mapped_by_expansion = true;
+            }
+            if !expansion.complete {
+                continue;
+            }
+            for virtual_range in virtual_ranges {
+                if let Some(virtual_position) =
+                    text::offset_to_position(expansion.expanded.text(), virtual_range.start)
+                {
+                    positions.push((root_uri.clone(), virtual_position));
+                }
+            }
+        }
+        if positions.is_empty() && !mapped_by_expansion && self.index.contains(uri) {
+            positions.push((uri.clone(), position));
+        }
+        positions.sort_by(|left, right| {
+            left.0
+                .as_str()
+                .cmp(right.0.as_str())
+                .then_with(|| left.1.line.cmp(&right.1.line))
+                .then_with(|| left.1.character.cmp(&right.1.character))
+        });
+        positions.dedup();
+        positions
+    }
+
+    fn map_location(&self, location: Location) -> Vec<Location> {
+        let Some(expansion) = self.expansions.get(&location.uri) else {
+            return vec![location];
+        };
+        if !expansion.complete {
+            return Vec::new();
+        }
+        let Some(start) = text::position_to_offset(expansion.expanded.text(), location.range.start)
+        else {
+            return Vec::new();
+        };
+        let Some(end) = text::position_to_offset(expansion.expanded.text(), location.range.end)
+        else {
+            return Vec::new();
+        };
+        let spans = match expansion.expanded.map_range(start..end) {
+            crate::include_expansion::VirtualMapping::Exact(span) => vec![span],
+            crate::include_expansion::VirtualMapping::Many(spans) => spans,
+            crate::include_expansion::VirtualMapping::Unmapped => return Vec::new(),
+        };
+        spans
+            .into_iter()
+            .filter_map(|span| {
+                let source = expansion
+                    .source_texts
+                    .get(&span.uri)
+                    .or_else(|| self.sources.get(&span.uri))?;
+                let start = text::offset_to_position(source, span.range.start)?;
+                let end = text::offset_to_position(source, span.range.end)?;
+                Some(Location::new(span.uri, Range::new(start, end)))
+            })
+            .collect()
+    }
+
+    fn map_locations(&self, locations: Vec<Location>) -> Vec<Location> {
+        let mut mapped = locations
+            .into_iter()
+            .flat_map(|location| self.map_location(location))
+            .collect::<Vec<_>>();
+        mapped.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+        });
+        mapped.dedup();
+        mapped
+    }
+
+    fn prepare_rename(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Result<PrepareRenameResponse, String> {
+        let mut ranges = Vec::new();
+        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+            let response = self.index.prepare_rename(&query_uri, query_position)?;
+            let PrepareRenameResponse::Range(range) = response else {
+                return Err("rename target has unsupported placeholder metadata".to_string());
+            };
+            let locations = self.map_location(Location::new(query_uri, range));
+            if locations.len() != 1 {
+                return Err("rename target does not map to one physical source range".to_string());
+            }
+            ranges.push(locations[0].range);
+        }
+        ranges.sort_by_key(|range| {
+            (
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character,
+            )
+        });
+        ranges.dedup();
+        ranges
+            .into_iter()
+            .next()
+            .map(PrepareRenameResponse::Range)
+            .ok_or_else(|| "rename target is unresolved or ambiguous".to_string())
+    }
+
+    fn rename_edits(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
+        let mut edits = HashMap::new();
+        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+            let raw = self
+                .index
+                .rename_edits(&query_uri, query_position, new_name)?;
+            for (edit_uri, document_edits) in raw {
+                for edit in document_edits {
+                    let Some(expansion) = self.expansions.get(&edit_uri) else {
+                        edits
+                            .entry(edit_uri.clone())
+                            .or_insert_with(Vec::new)
+                            .push(edit);
+                        continue;
+                    };
+                    if !expansion.complete {
+                        return Err("rename include expansion is incomplete".to_string());
+                    }
+                    let Some(start) =
+                        text::position_to_offset(expansion.expanded.text(), edit.range.start)
+                    else {
+                        return Err("rename edit starts outside the expanded source".to_string());
+                    };
+                    let Some(end) =
+                        text::position_to_offset(expansion.expanded.text(), edit.range.end)
+                    else {
+                        return Err("rename edit ends outside the expanded source".to_string());
+                    };
+                    let span = match expansion.expanded.map_range(start..end) {
+                        crate::include_expansion::VirtualMapping::Exact(span) => span,
+                        crate::include_expansion::VirtualMapping::Many(_) => {
+                            return Err("rename edit crosses physical include segments".to_string());
+                        }
+                        crate::include_expansion::VirtualMapping::Unmapped => {
+                            return Err("rename edit maps to synthetic include text".to_string());
+                        }
+                    };
+                    let source = expansion
+                        .source_texts
+                        .get(&span.uri)
+                        .or_else(|| self.sources.get(&span.uri))
+                        .ok_or_else(|| format!("rename source was not retained: {}", span.uri))?;
+                    let start = text::offset_to_position(source, span.range.start)
+                        .ok_or_else(|| "rename edit has an invalid physical start".to_string())?;
+                    let end = text::offset_to_position(source, span.range.end)
+                        .ok_or_else(|| "rename edit has an invalid physical end".to_string())?;
+                    let mapped = TextEdit::new(Range::new(start, end), edit.new_text);
+                    let target = edits.entry(span.uri).or_insert_with(Vec::new);
+                    if let Some(existing) = target
+                        .iter()
+                        .find(|existing| existing.range == mapped.range)
+                    {
+                        if existing.new_text != mapped.new_text {
+                            return Err("rename produced conflicting physical edits".to_string());
+                        }
+                    } else {
+                        target.push(mapped);
+                    }
+                }
+            }
+        }
+        for document_edits in edits.values_mut() {
+            document_edits.sort_by_key(|edit| {
+                (
+                    edit.range.start.line,
+                    edit.range.start.character,
+                    edit.range.end.line,
+                    edit.range.end.character,
+                )
+            });
+        }
+        Ok(edits)
+    }
+
+    pub(crate) fn binding_locations(
+        &self,
+        uri: &Url,
+        position: Position,
+        include_declaration: bool,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Location>, String> {
+        let mut locations = Vec::new();
+        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+            locations.extend(self.index.binding_locations_with_cancel(
+                &query_uri,
+                query_position,
+                include_declaration,
+                cancel,
+            )?);
+        }
+        Ok(self.map_locations(locations))
+    }
+
+    pub(crate) fn binding_locations_in_document(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Location>, String> {
+        let mut locations = Vec::new();
+        for (query_uri, query_position) in self.virtual_query_positions(uri, position) {
+            let query_locations = self.index.binding_locations_in_document_with_cancel(
+                &query_uri,
+                query_position,
+                cancel,
+            )?;
+            locations.extend(query_locations);
+        }
+        Ok(self.map_locations(locations))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1466,6 +1721,8 @@ pub(crate) struct BindingClassification {
     pub(crate) consumed_configuration: Vec<SourceRecord>,
 }
 
+type ExpandedBindingInfo = Option<(Option<(crate::navigation::RenameBindingInfo, bool)>, bool)>;
+
 pub(crate) fn binding_info_for_input(
     input: &WorkspaceInput,
     uri: &Url,
@@ -1535,7 +1792,15 @@ fn binding_classification_for_input(
         } else {
             &context.defines
         };
-    let (info, ignored_or_empty) = binding_info_for_source(
+    let expanded_info = expanded_binding_info_for_input(
+        input,
+        uri,
+        position,
+        additional_names,
+        self_contained_mode,
+        cancel,
+    )?;
+    let (info, ignored_or_empty) = expanded_info.unwrap_or(binding_info_for_source(
         uri,
         &source,
         position,
@@ -1543,7 +1808,7 @@ fn binding_classification_for_input(
         defines,
         self_contained_mode,
         cancel,
-    )?;
+    )?);
     Ok(BindingClassification {
         source,
         record,
@@ -1551,6 +1816,99 @@ fn binding_classification_for_input(
         ignored_or_empty,
         consumed_configuration,
     })
+}
+
+fn expanded_binding_info_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    additional_names: &[String],
+    self_contained_mode: SelfContainedMode,
+    cancel: &AtomicBool,
+) -> Result<ExpandedBindingInfo, String> {
+    let uri = canonical_file_uri(uri);
+    let mut workspace = Workspace::from_analysis_input(input);
+    let context_key = workspace.context_for_uri_with_cancel(&uri, Some(cancel))?;
+    if !workspace.load_source_with_cancel(&uri, &context_key, &HashSet::new(), Some(cancel))? {
+        return Ok(None);
+    }
+    let positions = workspace.virtual_query_positions(&uri, position);
+    if positions.is_empty() {
+        // An incomplete expansion must not be mistaken for a harmless
+        // whitespace/comment position.  The physical target may be valid,
+        // but refusing to classify it lets the caller's bounded snapshot
+        // report the include/conditional incompleteness instead of silently
+        // returning no references or highlights.
+        let incomplete_mapping = workspace
+            .source_text_for_mapping(&uri)
+            .and_then(|source| {
+                let offset = text::position_to_offset(&source, position)?;
+                let width = source
+                    .get(offset..)
+                    .and_then(|tail| tail.chars().next())
+                    .map_or(1, char::len_utf8);
+                Some(workspace.expansions.values().any(|expansion| {
+                    !expansion.complete
+                        && !expansion
+                            .expanded
+                            .reverse_range(&uri, offset..offset.saturating_add(width))
+                            .is_empty()
+                }))
+            })
+            .unwrap_or(false);
+        if incomplete_mapping {
+            return Ok(Some((None, false)));
+        }
+        return Ok(Some((None, true)));
+    }
+
+    let mut selected: Option<(crate::navigation::RenameBindingInfo, bool)> = None;
+    let mut ignored = false;
+    for (query_uri, query_position) in positions {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let query_ignored = workspace
+            .index
+            .position_is_ignored_or_empty(&query_uri, query_position)?;
+        if query_ignored {
+            ignored = true;
+            continue;
+        }
+        let Some(info) = workspace
+            .index
+            .rename_binding_info_with_cancel(&query_uri, query_position, cancel)
+            .ok()
+        else {
+            return Ok(Some((None, false)));
+        };
+        let can_check_self_contained = match self_contained_mode {
+            SelfContainedMode::None => false,
+            SelfContainedMode::AnyBinding => true,
+            SelfContainedMode::LocalBinding => info.local,
+        };
+        let self_contained = can_check_self_contained
+            && workspace.index.self_contained_rename_binding_with_cancel(
+                &query_uri,
+                query_position,
+                additional_names,
+                cancel,
+            );
+        let current = (info, self_contained);
+        if selected.as_ref().is_some_and(|previous| {
+            previous.1 != current.1
+                || previous.0.local != current.0.local
+                || previous.0.names.iter().collect::<HashSet<_>>()
+                    != current.0.names.iter().collect::<HashSet<_>>()
+        }) {
+            return Ok(Some((None, false)));
+        }
+        selected = Some(current);
+    }
+    if selected.is_none() && ignored {
+        return Ok(Some((None, true)));
+    }
+    Ok(Some((selected, ignored)))
 }
 
 pub(crate) fn project_context_and_metadata_for_input(
@@ -1946,7 +2304,7 @@ fn next_source_identifier(
     }
 }
 
-fn may_contain_include_directive(source: &[u8]) -> bool {
+pub(crate) fn may_contain_include_directive(source: &[u8]) -> bool {
     source.windows(2).any(|window| window == b"{$")
         || source.windows(3).any(|window| window == b"(*$")
 }
@@ -2058,7 +2416,7 @@ pub(crate) fn prepare_from_input(
             records: Vec::new(),
         };
     }
-    let value = snapshot.index.prepare_rename(&uri, position);
+    let value = snapshot.prepare_rename(&uri, position);
     let records = snapshot_records(&snapshot);
     Computed {
         source_generation,
@@ -2083,6 +2441,11 @@ pub(crate) fn rename_from_input(
         Ok(source) => source,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    let initial_disk_stamp = uri
+        .to_file_path()
+        .ok()
+        .map(absolute_path)
+        .and_then(|path| disk_stamp(&path));
     let original_name = match identifier_at_position(&initial_source, position) {
         Some(name) => name,
         None => {
@@ -2097,7 +2460,31 @@ pub(crate) fn rename_from_input(
     let classification =
         match binding_info_for_input(&input, &uri, position, &additional_names, cancel) {
             Ok(result) => result,
-            Err(error) => return failed(source_generation, configuration_generation, error),
+            Err(error) => {
+                // The scope-classification read is deliberately separate from
+                // the initial target read.  If the target changed between
+                // those reads, report the stale-source condition even when
+                // the new contents no longer contain an identifier at the
+                // original position.
+                let stamp_changed = uri
+                    .to_file_path()
+                    .ok()
+                    .map(absolute_path)
+                    .and_then(|path| disk_stamp(&path))
+                    != initial_disk_stamp;
+                if stamp_changed
+                    || error == "no renameable identifier at position"
+                    || source_for_input_with_cancel(&input, &uri, Some(cancel))
+                        .is_ok_and(|(current, _)| current != initial_source)
+                {
+                    return failed(
+                        source_generation,
+                        configuration_generation,
+                        format!("source changed while classifying rename target {uri}"),
+                    );
+                }
+                return failed(source_generation, configuration_generation, error);
+            }
         };
     let BindingClassification {
         source: planning_source,
@@ -2172,9 +2559,32 @@ pub(crate) fn rename_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    let raw_edits = match snapshot.index.rename_edits(&uri, position, new_name) {
+    let raw_edits = match snapshot.rename_edits(&uri, position, new_name) {
         Ok(edits) => edits,
         Err(error) => {
+            if error == "no renameable identifier at position" {
+                return Computed {
+                    source_generation,
+                    configuration_generation,
+                    value: Err(format!(
+                        "source changed while resolving rename target {uri}"
+                    )),
+                    records: Vec::new(),
+                };
+            }
+            let include_sensitive = snapshot
+                .sources
+                .values()
+                .any(|source| may_contain_include_directive(source.as_bytes()))
+                || snapshot
+                    .expansions
+                    .values()
+                    .any(|expansion| !expansion.dependencies.is_empty());
+            let error = if include_sensitive {
+                format!("include-expanded rename could not resolve a complete binding: {error}")
+            } else {
+                error
+            };
             return Computed {
                 source_generation,
                 configuration_generation,
@@ -2743,7 +3153,7 @@ fn add_priority_sources(
                 legacy_route,
             )
         });
-        if !readable || !is_pascal_path(&path) {
+        if !readable || !is_analyzable_source_path(&path) {
             continue;
         }
         if path.is_file() || input.overlays.contains_key(uri) {
@@ -2849,6 +3259,14 @@ pub(crate) fn build_snapshot(
                 .get(context_key)
                 .is_some_and(|state| state.context.discovery_complete)
             {
+                let target_has_include = priority_seed
+                    .as_ref()
+                    .is_some_and(|seed| may_contain_include_directive(seed.record.text.as_bytes()));
+                if target_has_include {
+                    return Err(format!(
+                        "rename workspace scan incomplete: include dependency context is ambiguous or incomplete for {uri}"
+                    ));
+                }
                 return Err(format!(
                     "rename workspace scan incomplete: project context is ambiguous or incomplete for {uri}"
                 ));
@@ -3191,11 +3609,87 @@ pub(crate) fn build_snapshot(
                 .entry(path_key(&path))
                 .or_insert(content_hash);
         }
+        let may_contain_include = may_contain_include_directive(source.as_bytes());
+        let mut indexed_source = source.clone();
+        if mode != SnapshotMode::WorkspaceSymbols && may_contain_include {
+            let expansion_defines = loader
+                .contexts
+                .get(&source_context_key)
+                .map(|state| state.context.defines.clone())
+                .unwrap_or_default();
+            match loader.expand_source_with_cancel(&uri, &source, &source_context_key, Some(cancel))
+            {
+                Ok(expansion) => {
+                    let mut expansion = expansion;
+                    let conditional = conditional::analyze_with_cancel(
+                        expansion.expanded.text(),
+                        &expansion_defines,
+                        cancel,
+                    );
+                    include_expansion::reconcile_conditional_completeness(
+                        &mut expansion,
+                        &conditional,
+                    );
+                    if !expansion.complete {
+                        complete = false;
+                        if let Some(error) = expansion.errors.first() {
+                            incomplete_reason.get_or_insert_with(|| {
+                                format!("include expansion incomplete: {error}")
+                            });
+                        } else {
+                            incomplete_reason.get_or_insert_with(|| {
+                                "include expansion did not complete".to_string()
+                            });
+                        }
+                    }
+                    // Keep the raw expanded buffer here.  NavigationIndex
+                    // owns conditional projection and records the resulting
+                    // unknown/inactive spans; passing an already-projected
+                    // buffer would erase the information needed to fail
+                    // closed for conditional references and edits.
+                    indexed_source = expansion.expanded.text().to_owned();
+                    loader.store_expansion(&uri, source.clone(), expansion);
+                    let expanded_source_contains_candidate = candidate_names.is_empty()
+                        || contains_any_identifier(&indexed_source, candidate_names)
+                        || (mode == SnapshotMode::Assistance
+                            && contains_any_identifier_prefix(&indexed_source, candidate_names));
+                    if expanded_source_contains_candidate {
+                        if let Some(expansion) = loader.expansions.get(&uri).cloned() {
+                            retain_expansion_dependencies(
+                                &mut loader,
+                                input,
+                                &uri,
+                                &source_context_key,
+                                &expansion,
+                                &mut sources,
+                                &mut records,
+                                &mut readable,
+                                &mut editable,
+                                &mut contexts,
+                                &mut baseline,
+                                &mut baseline_content_hashes,
+                                &mut retained_files,
+                                &mut retained_bytes,
+                                &mut complete,
+                                &mut incomplete_reason,
+                                cancel,
+                            )?;
+                        }
+                    }
+                }
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(error) => {
+                    complete = false;
+                    incomplete_reason
+                        .get_or_insert_with(|| format!("include expansion failed: {error}"));
+                }
+            }
+        }
         let should_index = is_priority
             || candidate_names.is_empty()
-            || contains_any_identifier(&source, candidate_names)
+            || contains_any_identifier(&indexed_source, candidate_names)
             || (mode == SnapshotMode::Assistance
-                && contains_any_identifier_prefix(&source, candidate_names));
+                && contains_any_identifier_prefix(&indexed_source, candidate_names));
         if !should_index {
             let owner_directives = directives(&source);
             if owner_directives
@@ -3363,7 +3857,7 @@ pub(crate) fn build_snapshot(
         index
             .update_with_defines_and_cached_with_cancel(
                 uri.clone(),
-                source.clone(),
+                indexed_source.clone(),
                 &defines,
                 cached,
                 cancel,
@@ -3372,7 +3866,7 @@ pub(crate) fn build_snapshot(
         retained_files = retained_files.saturating_add(1);
         retained_bytes = retained_bytes.saturating_add(source_bytes);
         indexed_uris.insert(uri.clone());
-        indexed_sizes.insert(uri.clone(), source.len());
+        indexed_sizes.insert(uri.clone(), indexed_source.len());
         if let Some(stamp) = record.stamp.clone() {
             indexed_stamps.insert(uri.clone(), stamp);
         }
@@ -3702,6 +4196,7 @@ pub(crate) fn build_snapshot(
         index: loader.index,
         sources,
         records,
+        expansions: loader.expansions,
         readable,
         editable,
         complete,
@@ -3710,6 +4205,204 @@ pub(crate) fn build_snapshot(
         baseline_records,
         mode,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_expansion_dependencies(
+    loader: &mut Workspace,
+    input: &WorkspaceInput,
+    root_uri: &Url,
+    context_key: &ContextKey,
+    expansion: &super::ExpansionRecord,
+    sources: &mut HashMap<Url, String>,
+    records: &mut HashMap<Url, SourceRecord>,
+    readable: &mut HashSet<Url>,
+    editable: &mut HashSet<Url>,
+    contexts: &mut HashMap<Url, ContextKey>,
+    baseline: &mut BaselineAccumulator,
+    baseline_content_hashes: &mut HashMap<String, u64>,
+    retained_files: &mut usize,
+    retained_bytes: &mut usize,
+    complete: &mut bool,
+    incomplete_reason: &mut Option<String>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let dependency_entries = expansion.dependency_entries.clone();
+    let mut dependencies = expansion
+        .source_texts
+        .iter()
+        .filter(|(uri, _)| *uri != root_uri)
+        .map(|(uri, source)| (uri.clone(), source.clone()))
+        .collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+
+    for (uri, source) in dependencies {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if records.contains_key(&uri) {
+            if sources
+                .get(&uri)
+                .is_some_and(|existing| existing != &source)
+            {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} was observed under conflicting contexts")
+                });
+            }
+            continue;
+        }
+        let path = uri
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include source is not a file URI: {uri}"))?;
+        let (read_policy, path_entry) = if let Some(path_entry) = dependency_entries.get(&uri) {
+            let Some(context) = loader.contexts.get(context_key).map(|state| &state.context) else {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} has no retained project context")
+                });
+                continue;
+            };
+            (context.read_policy.clone(), path_entry.clone())
+        } else {
+            match snapshot_payload_dependency(loader, context_key, &path) {
+                Ok(value) => value,
+                Err(error) if loader.accepts_path(&path) => {
+                    let Some(context) =
+                        loader.contexts.get(context_key).map(|state| &state.context)
+                    else {
+                        *complete = false;
+                        incomplete_reason.get_or_insert(error);
+                        continue;
+                    };
+                    (
+                        context.read_policy.clone(),
+                        ProjectPathEntry {
+                            path: path.clone(),
+                            provenance: ProjectPathProvenance::LegacyNative,
+                        },
+                    )
+                }
+                Err(error) => {
+                    *complete = false;
+                    incomplete_reason.get_or_insert(error);
+                    continue;
+                }
+            }
+        };
+        contexts.insert(uri.clone(), context_key.clone());
+        loader
+            .document_contexts
+            .insert(uri.clone(), context_key.clone());
+
+        let record = if let Some(document) = loader.open_documents.get(&uri) {
+            let Some(open_source) = document.text.as_ref() else {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} was rejected and cannot be retained")
+                });
+                continue;
+            };
+            if open_source != &source {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} changed during expansion")
+                });
+                continue;
+            }
+            SourceRecord {
+                uri: uri.clone(),
+                text: source.clone(),
+                version: Some(document.version),
+                stamp: None,
+                open: true,
+                path: None,
+                path_stamp: None,
+                content_hash: None,
+                parsed_text_hash: Some(text_content_hash(&source)),
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: Some(read_policy.clone()),
+                path_entry: Some(path_entry.clone()),
+                include_payload: false,
+                missing_provider_candidate: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            }
+        } else {
+            let allow_legacy_payload =
+                matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
+            let disk = match read_disk_source(
+                &path,
+                input.options.limits.max_file_bytes,
+                &read_policy,
+                &path_entry,
+                allow_legacy_payload,
+            ) {
+                Ok(disk) => disk,
+                Err(error) => {
+                    *complete = false;
+                    incomplete_reason.get_or_insert_with(|| {
+                        format!("could not re-read include source {uri}: {error}")
+                    });
+                    continue;
+                }
+            };
+            if disk.text != source {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} changed during expansion")
+                });
+                continue;
+            }
+            baseline.set_include_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            baseline_content_hashes.insert(path_key(&path), disk.content_hash);
+            SourceRecord {
+                uri: uri.clone(),
+                text: source.clone(),
+                version: None,
+                stamp: Some(disk.stamp),
+                open: false,
+                path: None,
+                path_stamp: None,
+                content_hash: Some(disk.content_hash),
+                parsed_text_hash: Some(text_content_hash(&source)),
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: Some(read_policy.clone()),
+                path_entry: Some(path_entry.clone()),
+                include_payload: true,
+                missing_provider_candidate: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            }
+        };
+
+        if *retained_files >= input.options.limits.max_files
+            || retained_bytes.saturating_add(source.len()) > input.options.limits.max_total_bytes
+        {
+            *complete = false;
+            incomplete_reason.get_or_insert_with(|| {
+                "retained source limits were reached while retaining include dependencies"
+                    .to_string()
+            });
+            continue;
+        }
+        *retained_files = retained_files.saturating_add(1);
+        *retained_bytes = retained_bytes.saturating_add(source.len());
+        if is_readable_source_for_context(loader, &path, Some(context_key)) {
+            readable.insert(uri.clone());
+        }
+        if is_editable_source_path(loader, &path) {
+            editable.insert(uri.clone());
+        }
+        sources.insert(uri.clone(), source);
+        records.insert(uri, record);
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
@@ -3728,6 +4421,15 @@ pub(crate) fn ensure_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), S
             .incomplete_reason
             .as_deref()
             .unwrap_or("bounded source discovery did not finish");
+        if snapshot
+            .sources
+            .get(uri)
+            .is_some_and(|source| may_contain_include_directive(source.as_bytes()))
+        {
+            return Err(format!(
+                "rename workspace scan incomplete: include dependency analysis is incomplete: {reason}"
+            ));
+        }
         return Err(format!("rename workspace scan incomplete: {reason}"));
     }
     Ok(())
@@ -4861,7 +5563,7 @@ impl IncludeAuditor<'_> {
             legacy_authorized,
         };
         let analysis = self.inspect_include_file(&path, inspection, 0)?;
-        if !analysis.safe || analysis.relevant {
+        if !analysis.safe || (analysis.relevant && self.name_free_assistance) {
             let reason = analysis
                 .reason
                 .unwrap_or_else(|| format!("include {path:?} contains source content"));
@@ -4951,6 +5653,32 @@ impl IncludeAuditor<'_> {
             ));
         }
         let directories = include_search_directories(path, Some(inspection.context));
+        let active_key = canonical_include_key(path);
+        if self.active.contains(&active_key) {
+            return Ok(IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has an include cycle"),
+                false,
+            ));
+        }
+        let path_uri = Url::from_file_path(path)
+            .ok()
+            .map(|uri| super::canonical_file_uri(&uri));
+        let expansion_legacy_authorized = path_uri.as_ref().is_some_and(|path_uri| {
+            self.loader.expansions.iter().any(|(root_uri, expansion)| {
+                self.loader
+                    .document_contexts
+                    .get(root_uri)
+                    .is_some_and(|owner_context| owner_context == inspection.context_key)
+                    && expansion
+                        .dependency_entries
+                        .get(path_uri)
+                        .is_some_and(|entry| {
+                            matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                        })
+            })
+        });
+        let effective_legacy_authorized =
+            inspection.legacy_authorized || expansion_legacy_authorized;
         let cache_key = include_cache_key(
             path,
             &directories,
@@ -4959,15 +5687,8 @@ impl IncludeAuditor<'_> {
             inspection.selected_directory,
             inspection.relative,
             &inspection.route,
-            inspection.legacy_authorized,
+            effective_legacy_authorized,
         );
-        let active_key = canonical_include_key(path);
-        if self.active.contains(&active_key) {
-            return Ok(IncludeAnalysis::unsafe_with_reason(
-                format!("include {path:?} has an include cycle"),
-                false,
-            ));
-        }
         if let Some(analysis) = self.cache.get(&cache_key) {
             return Ok(analysis.clone());
         }
@@ -4977,7 +5698,7 @@ impl IncludeAuditor<'_> {
             inspection.context_key,
             inspection.context,
             &inspection.route,
-            inspection.legacy_authorized,
+            effective_legacy_authorized,
         ) {
             let analysis = IncludeAnalysis::unsafe_with_reason(
                 format!("include {path:?} is outside the owning project's readable roots"),
@@ -4993,7 +5714,7 @@ impl IncludeAuditor<'_> {
             }),
             IncludeRoute::Legacy => {
                 super::context_path_entry(inspection.context, path).or_else(|| {
-                    inspection.legacy_authorized.then(|| ProjectPathEntry {
+                    effective_legacy_authorized.then(|| ProjectPathEntry {
                         path: path.to_path_buf(),
                         provenance: ProjectPathProvenance::LegacyNative,
                     })
@@ -5101,6 +5822,11 @@ impl IncludeAuditor<'_> {
                 .potentially_active_contains_identifier(&include_source.text, self.candidate_names)
                 || conditional.pascal_condition_contains_identifier(self.candidate_names)
         };
+        let conditional_candidate_is_uncertain =
+            !self.name_free_assistance
+                && (self.candidate_names.iter().any(|name| {
+                    conditional.unknown_contains_identifier(&include_source.text, name)
+                }) || conditional.pascal_condition_contains_identifier(self.candidate_names));
         let include_directives = conditional
             .directives
             .iter()
@@ -5121,6 +5847,11 @@ impl IncludeAuditor<'_> {
         } else if !conditional.complete {
             IncludeAnalysis::unsafe_with_reason(
                 format!("include {path:?} has malformed or incomplete conditional directives"),
+                relevant,
+            )
+        } else if conditional_candidate_is_uncertain {
+            IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has conditional compilation affecting the rename"),
                 relevant,
             )
         } else if conditional.directives.iter().any(|directive| {
@@ -5160,7 +5891,7 @@ impl IncludeAuditor<'_> {
                     inspection.legacy_authorized,
                     depth,
                 )?;
-                if !child.safe || child.relevant {
+                if !child.safe || (child.relevant && self.name_free_assistance) {
                     self.stopped = true;
                     nested = Some(IncludeAnalysis::unsafe_with_reason(
                         child
@@ -5173,7 +5904,7 @@ impl IncludeAuditor<'_> {
             }
             self.active.remove(&active_key);
             nested.unwrap_or_else(|| {
-                if relevant {
+                if self.name_free_assistance && relevant {
                     IncludeAnalysis::unsafe_with_reason(
                         format!("include {path:?} contains source content"),
                         true,
@@ -5753,6 +6484,224 @@ struct IncludeSource {
     text: String,
     content_hash: u64,
     bytes: usize,
+}
+
+pub(super) fn expand_source_with_workspace(
+    workspace: &Workspace,
+    root_uri: &Url,
+    source: &str,
+    context_key: &ContextKey,
+    limits: ExpansionLimits,
+    cancel: &AtomicBool,
+) -> Result<ExpansionResult, String> {
+    let context = workspace
+        .contexts
+        .get(context_key)
+        .map(|state| state.context.clone())
+        .ok_or_else(|| format!("project context was not retained for {root_uri}"))?;
+    let mut resolver = WorkspaceIncludeResolver {
+        workspace,
+        context: &context,
+        context_key,
+        max_file_bytes: workspace.options.limits.max_file_bytes,
+        max_total_bytes: workspace.options.limits.max_total_bytes,
+        legacy_authorizations: HashMap::new(),
+    };
+    include_expansion::expand_source(
+        root_uri.clone(),
+        source,
+        &context.defines,
+        &mut resolver,
+        limits,
+        cancel,
+    )
+}
+
+struct WorkspaceIncludeResolver<'a> {
+    workspace: &'a Workspace,
+    context: &'a ProjectContext,
+    context_key: &'a ContextKey,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    legacy_authorizations: HashMap<Url, bool>,
+}
+
+impl IncludeResolver for WorkspaceIncludeResolver<'_> {
+    fn resolve_include(
+        &mut self,
+        owner: &Url,
+        body: &str,
+        cancel: &AtomicBool,
+    ) -> Result<ResolvedInclude, String> {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: body.to_owned(),
+            start: 0,
+            end: body.len(),
+        };
+        let owner_path = owner
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include owner is not a file URI: {owner}"))?;
+        let directories = include_search_directories(&owner_path, Some(self.context));
+        let mut lookup =
+            resolve_include_path_with_overrides(&directive, &directories, &self.context.overrides);
+        if lookup.selected.is_none() {
+            lookup = self.resolve_overlay_include(&directive, &directories)?;
+        }
+        if let Some(error) = lookup.error {
+            return Err(error);
+        }
+        let path = lookup
+            .selected
+            .ok_or_else(|| "include path is unresolved".to_string())?;
+        let route = lookup.selected_route.clone();
+        let relative = include_name(&directive).is_some_and(|raw| Path::new(&raw).is_relative());
+        let legacy_authorized = if !matches!(&route, IncludeRoute::Legacy) {
+            false
+        } else if let Some(inherited) = self.legacy_authorizations.get(owner).copied() {
+            inherited_legacy_authorization(
+                inherited,
+                &owner_path,
+                &directive,
+                lookup.selected_directory.as_deref(),
+                self.context,
+            )
+        } else {
+            legacy_include_is_authorized(
+                self.workspace,
+                self.context,
+                &owner_path,
+                lookup.selected_directory.as_deref(),
+                relative,
+            )
+        };
+        if !is_readable_include_for_context(
+            self.workspace,
+            &path,
+            self.context_key,
+            self.context,
+            &route,
+            legacy_authorized,
+        ) {
+            return Err(format!(
+                "include {path:?} is outside the owning project's readable roots"
+            ));
+        }
+        let path_entry = match &route {
+            IncludeRoute::Mapped { root } => ProjectPathEntry {
+                path: path.clone(),
+                provenance: ProjectPathProvenance::Mapped { root: root.clone() },
+            },
+            IncludeRoute::Legacy => super::context_path_entry(self.context, &path)
+                .or_else(|| {
+                    legacy_authorized.then(|| ProjectPathEntry {
+                        path: path.clone(),
+                        provenance: ProjectPathProvenance::LegacyNative,
+                    })
+                })
+                .ok_or_else(|| "include has no requester-scoped read authorization".to_string())?,
+        };
+        let include_uri = Url::from_file_path(&path)
+            .map(|uri| super::canonical_file_uri(&uri))
+            .map_err(|()| format!("could not create a URI for include {path:?}"))?;
+        self.legacy_authorizations
+            .insert(include_uri.clone(), legacy_authorized);
+        if let Some(document) = self.workspace.open_documents.get(&include_uri) {
+            if let Some(reason) = &document.rejection {
+                return Err(format!("include {include_uri} was rejected: {reason}"));
+            }
+            if let Some(text) = &document.text {
+                return Ok(ResolvedInclude {
+                    uri: include_uri,
+                    text: text.clone(),
+                    path_entry: Some(path_entry),
+                });
+            }
+        }
+        let source = match &route {
+            IncludeRoute::Mapped { .. } => read_mapped_include(
+                &self.context.read_policy,
+                &path_entry,
+                self.max_file_bytes,
+                self.max_total_bytes,
+                cancel,
+            )?,
+            IncludeRoute::Legacy => read_include(
+                &path,
+                &self.context.read_policy,
+                &path_entry,
+                self.max_file_bytes,
+                Some(self.max_total_bytes),
+                Some(cancel),
+            )?,
+        };
+        Ok(ResolvedInclude {
+            uri: include_uri,
+            text: source.text,
+            path_entry: Some(path_entry),
+        })
+    }
+}
+
+impl WorkspaceIncludeResolver<'_> {
+    fn resolve_overlay_include(
+        &self,
+        directive: &Directive,
+        directories: &[PathBuf],
+    ) -> Result<IncludeLookup, String> {
+        let Some(raw) = include_name(directive) else {
+            return Ok(IncludeLookup {
+                observations: Vec::new(),
+                selected: None,
+                selected_directory: None,
+                selected_route: IncludeRoute::Legacy,
+                error: None,
+            });
+        };
+        for directory in directories {
+            let resolved = self
+                .context
+                .overrides
+                .resolve_path(&raw, directory)
+                .map_err(|error| error.to_string())?;
+            let path = absolute_path(resolved.path);
+            let Some(uri) = Url::from_file_path(&path).ok() else {
+                continue;
+            };
+            let uri = super::canonical_file_uri(&uri);
+            if self
+                .workspace
+                .open_documents
+                .get(&uri)
+                .is_some_and(|document| document.text.is_some())
+            {
+                let route = resolved
+                    .mapping
+                    .as_ref()
+                    .map_or(IncludeRoute::Legacy, |mapping| IncludeRoute::Mapped {
+                        root: super::native_mapping_root(&mapping.to),
+                    });
+                return Ok(IncludeLookup {
+                    observations: Vec::new(),
+                    selected: Some(path),
+                    selected_directory: Some(directory.clone()),
+                    selected_route: route,
+                    error: None,
+                });
+            }
+        }
+        Ok(IncludeLookup {
+            observations: Vec::new(),
+            selected: None,
+            selected_directory: None,
+            selected_route: IncludeRoute::Legacy,
+            error: None,
+        })
+    }
 }
 
 fn read_include(
@@ -7288,6 +8237,49 @@ mod tests {
             &cancel,
         );
         assert_eq!(result.err().as_deref(), Some("request cancelled"));
+    }
+
+    #[test]
+    fn include_payload_content_hashes_reject_changed_snapshot_inputs() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let include = root.join("Body.inc");
+        let provider_source =
+            "unit Provider;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\n{$I Body.inc}\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(&include, "{$DEFINE SAFE}\n").expect("include source");
+
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let cancel = AtomicBool::new(false);
+        let snapshot = build_snapshot(
+            &input,
+            std::slice::from_ref(&provider_uri),
+            &["badConst".to_owned(), "GoodConst".to_owned()],
+            SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("include snapshot");
+        let records = snapshot_records(&snapshot);
+        assert!(records.iter().any(|record| {
+            record.path.as_deref().is_some_and(|path| path == include) && record.include_payload
+        }));
+
+        fs::write(&include, "{$DEFINE CHANGED}\n").expect("changed include source");
+        let error = revalidate_input(&input, &records, &cancel)
+            .expect_err("changed include payload must stale the snapshot");
+        assert!(
+            error.contains("Body.inc") || error.contains("changed"),
+            "unexpected include revalidation error: {error}"
+        );
     }
 
     #[test]

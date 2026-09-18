@@ -6,6 +6,7 @@
 
 pub(crate) mod conditional;
 pub(crate) mod configuration;
+pub(crate) mod include_expansion;
 pub mod navigation;
 pub mod server;
 pub mod text;

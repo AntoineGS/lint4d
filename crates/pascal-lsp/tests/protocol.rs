@@ -12086,6 +12086,128 @@ fn references_include_unopened_consumers() {
 }
 
 #[test]
+fn references_and_highlights_map_source_bearing_include_occurrences() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let include_source = "const SharedValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let references_id = RequestId::from("include-expanded-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let references = server.response(&references_id);
+    assert!(references.error.is_none(), "{references:?}");
+    assert_exact_location_signatures(
+        references
+            .result
+            .as_ref()
+            .expect("reference result")
+            .as_array()
+            .expect("reference array"),
+        vec![
+            expected_location_signature(&include, include_source, "SharedValue", 0),
+            expected_location_signature(&main, main_source, "SharedValue", 0),
+        ],
+    );
+
+    let highlights_id = RequestId::from("include-expanded-highlights".to_string());
+    server.send_request(
+        highlights_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0)
+        }),
+    );
+    let highlights = server.response(&highlights_id);
+    assert!(highlights.error.is_none(), "{highlights:?}");
+    assert_eq!(
+        highlights
+            .result
+            .as_ref()
+            .expect("highlight result")
+            .as_array()
+            .expect("highlight array")
+            .len(),
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_include_expansion_prefers_an_open_overlay() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  OverlayValue := 1;\nend;\nend.\n";
+    let disk_include = "const DiskValue = 1;\n";
+    let overlay_include = "const OverlayValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&include, disk_include);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&include),
+                "languageId": "pascal",
+                "version": 3,
+                "text": overlay_include
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let id = RequestId::from("include-overlay-navigation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "OverlayValue", 0),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_exact_location_signatures(
+        response
+            .result
+            .as_ref()
+            .expect("navigation result")
+            .as_array()
+            .expect("navigation array"),
+        vec![expected_location_signature(
+            &include,
+            overlay_include,
+            "OverlayValue",
+            0,
+        )],
+    );
+    server.shutdown();
+}
+
+#[test]
 fn references_reject_a_variable_rhs_in_a_cast_receiver() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("InvalidCastReferences.pas");
@@ -22030,6 +22152,197 @@ fn diagnostics_normalize_bare_carriage_returns_for_lint_positions() {
 }
 
 #[test]
+fn diagnostics_expand_source_bearing_includes_and_publish_physical_ranges() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let include_source = "const bad_const = 1;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    let diagnostic = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "constant-naming")
+        .expect("constant naming diagnostic");
+    assert_eq!(diagnostic["range"]["start"]["line"], 0);
+    assert_eq!(diagnostic["range"]["start"]["character"], 6);
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_preserve_unicode_and_crlf_ranges_in_included_sources() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let include_source = "😀\r\nconst bad_const = 1;\r\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&include));
+    let diagnostic = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "constant-naming")
+        .expect("constant naming diagnostic");
+    assert_eq!(diagnostic["range"]["start"]["line"], 1);
+    assert_eq!(diagnostic["range"]["start"]["character"], 6);
+    assert_eq!(diagnostic["range"]["end"]["character"], 15);
+    server.shutdown();
+}
+
+#[test]
+fn removing_a_source_bearing_include_clears_its_published_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let with_include = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let without_include = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&main, with_include);
+    write_file(&include, "const bad_const = 1;\n");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": with_include
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "constant-naming" })
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": without_include}]
+        }),
+    );
+    let cleared = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        cleared["diagnostics"].as_array().unwrap().is_empty(),
+        "removed include diagnostics were not cleared: {cleared}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn changed_include_content_invalidates_and_recomputes_root_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(&include, "const bad_const = 1;\n");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "constant-naming" })
+    );
+
+    write_file(&include, "const GoodConst = 1;\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&include), "type": 2}]}),
+    );
+    let updated = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        updated["diagnostics"].as_array().unwrap().is_empty(),
+        "changed include diagnostics were not recomputed: {updated}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn formatting_reads_unopened_disk_documents_without_writing_them() {
     let (_temp, main, _provider, _main_source, _provider_source) = standard_workspace();
     let root = main.parent().expect("workspace root");
@@ -22055,6 +22368,35 @@ fn formatting_reads_unopened_disk_documents_without_writing_them() {
     assert_eq!(
         fs::read_to_string(&format_path).expect("read original"),
         format_source
+    );
+    server.shutdown();
+}
+
+#[test]
+fn formatting_rejects_include_sources_without_editing_them() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let include = temp.path().join("Shared.inc");
+    let source = "procedure Run;\nbegin\nLog(1);\nend;\n";
+    write_file(&include, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("format-include-rejected".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&include)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("include formatting must be rejected");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("unsupported Pascal file extension"));
+    assert_eq!(
+        fs::read_to_string(&include).expect("include source"),
+        source
     );
     server.shutdown();
 }
@@ -24200,6 +24542,63 @@ fn public_rename_rejects_an_unresolved_include_in_an_unrelated_source() {
     assert!(
         error.message.to_ascii_lowercase().contains("include"),
         "unexpected unresolved unrelated include error: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn creating_a_previously_missing_include_revalidates_rename_resolution() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let optional = root.join("Optional.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\n{$I Optional.inc}\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let first_id = RequestId::from("missing-include-before-create".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let first = server.response(&first_id);
+    assert!(
+        first
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.to_ascii_lowercase().contains("include")),
+        "missing include must block the initial rename: {first:?}"
+    );
+
+    write_file(&optional, "{$DEFINE SAFE}\n");
+    let second_id = RequestId::from("missing-include-after-create".to_string());
+    server.send_request(
+        second_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let second = server.response(&second_id);
+    assert!(
+        second.error.is_none(),
+        "created include remained stale: {second:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&second.result.expect("rename result")),
+        HashSet::from([uri(&provider).to_string(), uri(&consumer).to_string()])
     );
     server.shutdown();
 }

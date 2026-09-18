@@ -932,6 +932,12 @@ fn directive_symbol(body: &str) -> Option<String> {
     canonical_symbol(argument)
 }
 
+/// Return the canonical symbol from a DEFINE/UNDEF directive for bounded
+/// consumers that carry conditional facts across source boundaries.
+pub(crate) fn defined_symbol(body: &str) -> Option<String> {
+    directive_symbol(body)
+}
+
 fn evaluate_condition(body: &str, environment: &Environment, complete: &mut bool) -> Truth {
     let keyword = directive_keyword(body)
         .map(str::to_ascii_lowercase)

@@ -2779,6 +2779,94 @@ fn active_or_unknown_unresolved_includes_still_block_rename() {
 }
 
 #[test]
+fn resolved_source_bearing_include_supports_physical_rename_edits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root_path = temp.path().join("Main.pas");
+    let include_path = temp.path().join("Shared.inc");
+    let root = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    let include = "const SharedValue = 1;\n";
+    fs::write(&root_path, root).expect("root source");
+    fs::write(&include_path, include).expect("include source");
+    let root_uri = Url::from_file_path(&root_path).expect("root URI");
+    let include_uri = Url::from_file_path(&include_path).expect("include URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), root.to_owned(), 1)
+        .expect("open root source");
+
+    let edit = workspace
+        .rename_edits(
+            &root_uri,
+            position_of(root, "SharedValue :=", 0),
+            "RenamedShared",
+            false,
+        )
+        .expect("resolved include should support rename");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![
+            (
+                root_uri,
+                range_of(root, "SharedValue", 0),
+                "RenamedShared".to_owned(),
+            ),
+            (
+                include_uri,
+                range_of(include, "SharedValue", 0),
+                "RenamedShared".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn include_declaration_rename_updates_its_root_consumers() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root_path = temp.path().join("Main.pas");
+    let include_path = temp.path().join("Shared.inc");
+    let root = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    let include = "const SharedValue = 1;\n";
+    fs::write(&root_path, root).expect("root source");
+    fs::write(&include_path, include).expect("include source");
+    let root_uri = Url::from_file_path(&root_path).expect("root URI");
+    let include_uri = Url::from_file_path(&include_path).expect("include URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(include_uri.clone(), include.to_owned(), 1)
+        .expect("open include source");
+
+    let edit = workspace
+        .rename_edits(
+            &include_uri,
+            position_of(include, "SharedValue", 0),
+            "RenamedShared",
+            false,
+        )
+        .expect("include declaration should support rename");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![
+            (
+                root_uri,
+                range_of(root, "SharedValue", 0),
+                "RenamedShared".to_owned(),
+            ),
+            (
+                include_uri,
+                range_of(include, "SharedValue", 0),
+                "RenamedShared".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
 fn mixed_boolean_and_comparison_precedence_keeps_the_active_include_audited() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("MixedOperators.pas");

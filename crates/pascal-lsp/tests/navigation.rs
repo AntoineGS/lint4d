@@ -71,6 +71,134 @@ fn assert_location_start(location: &Location, expected_uri: &Url, expected: Posi
 }
 
 #[test]
+fn workspace_navigation_expands_a_source_bearing_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&include, "const SharedValue = 1;\n").expect("include source");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let include_uri = Url::from_file_path(&include).expect("include URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    let locations = workspace.navigate(
+        &root_uri,
+        position_of(source, "SharedValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(
+        locations,
+        vec![Location::new(
+            include_uri,
+            Range::new(Position::new(0, 6), Position::new(0, 17)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_uses_define_side_effects_from_an_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let include = temp.path().join("Defines.inc");
+    let source = "unit Main;\ninterface\n{$I Defines.inc}\n{$IFDEF ENABLED}\nconst EnabledValue = 1;\n{$ENDIF}\nimplementation\nprocedure Run;\nbegin\n  EnabledValue := 1;\nend;\nend.\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&include, "{$DEFINE ENABLED}\n").expect("include source");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let include_uri = Url::from_file_path(&include).expect("include URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(source, "EnabledValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            root_uri,
+            Range::new(Position::new(4, 6), Position::new(4, 18)),
+        )]
+    );
+    assert!(include_uri.to_file_path().is_ok());
+}
+
+#[test]
+fn workspace_navigation_expands_a_nested_include_after_a_shared_define() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let defines = temp.path().join("Defines.inc");
+    let conditional = temp.path().join("Conditional.inc");
+    let nested = temp.path().join("Nested.inc");
+    let source = "unit Main;\ninterface\n{$I Defines.inc}\n{$I Conditional.inc}\nimplementation\nprocedure Run;\nbegin\n  NestedValue := 1;\nend;\nend.\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&defines, "{$DEFINE ENABLED}\n").expect("define include");
+    fs::write(
+        &conditional,
+        "{$IFDEF ENABLED}\n{$I Nested.inc}\n{$ENDIF}\n",
+    )
+    .expect("conditional include");
+    fs::write(&nested, "const NestedValue = 1;\n").expect("nested include");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let nested_uri = Url::from_file_path(&nested).expect("nested URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(source, "NestedValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            nested_uri,
+            Range::new(Position::new(0, 6), Position::new(0, 17)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_maps_include_ranges_with_unicode_and_crlf() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    let include_source = "😀\r\nconst SharedValue = 1;\r\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&include, include_source).expect("include source");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let include_uri = Url::from_file_path(&include).expect("include URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(source, "SharedValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            include_uri,
+            Range::new(Position::new(1, 6), Position::new(1, 17)),
+        )]
+    );
+}
+
+#[test]
 fn class_helper_members_navigate_from_the_helped_class() {
     let source = r#"unit ClassHelperNavigation;
 interface

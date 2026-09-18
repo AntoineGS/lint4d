@@ -1563,7 +1563,7 @@ struct NavigationAnalysis {
 struct DiagnosticsAnalysis {
     uri: Url,
     version: Option<i32>,
-    value: Result<Vec<lsp_types::Diagnostic>, String>,
+    value: Result<Vec<queries::DiagnosticPublication>, String>,
     discard: bool,
 }
 
@@ -3598,7 +3598,7 @@ impl AnalysisJobs {
                                 let value = computed.value.map(|result| DiagnosticsAnalysis {
                                     uri: result.uri,
                                     version: result.version,
-                                    value: Ok(result.diagnostics),
+                                    value: Ok(result.publications),
                                     discard: false,
                                 });
                                 AnalysisResult {
@@ -5647,20 +5647,36 @@ fn deliver_analysis_result_with_store(
             ),
         },
         AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
-            Ok(value) => send_diagnostics(connection, &diagnostics.uri, diagnostics.version, value),
+            Ok(publications) => {
+                send_diagnostic_publications(connection, workspace, &diagnostics.uri, publications)
+            }
             Err(error) if error == rename::CANCELLATION_MESSAGE => {
                 workspace.reschedule_diagnostics(diagnostics.uri);
                 Ok(())
             }
-            Err(error) => send_diagnostics(
-                connection,
-                &diagnostics.uri,
-                diagnostics.version,
-                vec![crate::workspace::server_diagnostic(
-                    &error,
-                    lsp_types::DiagnosticSeverity::ERROR,
-                )],
-            ),
+            Err(error) => {
+                let uri = diagnostics.uri;
+                let version = diagnostics.version;
+                let cleared =
+                    workspace.replace_diagnostic_publications(&uri, std::iter::once(uri.clone()));
+                for stale_uri in cleared {
+                    send_diagnostics(
+                        connection,
+                        &stale_uri,
+                        workspace.document_version(&stale_uri),
+                        Vec::new(),
+                    )?;
+                }
+                send_diagnostics(
+                    connection,
+                    &uri,
+                    version,
+                    vec![crate::workspace::server_diagnostic(
+                        &error,
+                        lsp_types::DiagnosticSeverity::ERROR,
+                    )],
+                )
+            }
         },
         AnalysisResultValue::TypeDefinitions(value) => match value {
             Ok(value) => send_ok(
@@ -7326,6 +7342,15 @@ fn handle_notification(
             let params: DidCloseTextDocumentParams = parse_notification(&notification)?;
             let uri = params.text_document.uri;
             if workspace.close_document(&uri) {
+                for stale_uri in workspace.clear_diagnostic_publications(&uri) {
+                    send_diagnostics(
+                        connection,
+                        &stale_uri,
+                        workspace.document_version(&stale_uri),
+                        Vec::new(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
                 send_diagnostics(connection, &uri, None, Vec::new())
                     .map_err(|error| error.to_string())?;
             }
@@ -7419,6 +7444,35 @@ fn send_diagnostics(
             version,
         },
     )))?;
+    Ok(())
+}
+
+fn send_diagnostic_publications(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    root_uri: &Url,
+    publications: Vec<queries::DiagnosticPublication>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let current_uris = publications
+        .iter()
+        .map(|publication| publication.uri.clone());
+    let cleared = workspace.replace_diagnostic_publications(root_uri, current_uris);
+    for uri in cleared {
+        send_diagnostics(
+            connection,
+            &uri,
+            workspace.document_version(&uri),
+            Vec::new(),
+        )?;
+    }
+    for publication in publications {
+        send_diagnostics(
+            connection,
+            &publication.uri,
+            publication.version,
+            publication.diagnostics,
+        )?;
+    }
     Ok(())
 }
 

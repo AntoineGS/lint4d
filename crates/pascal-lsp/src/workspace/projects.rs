@@ -1,8 +1,8 @@
 //! Runtime Delphi project selection and project-context protocol data.
 
 use super::{
-    ContextKey, OwnerOrigin, Workspace, absolute_path, canonical_file_uri, is_pascal_path,
-    path_stamp,
+    ContextKey, OwnerOrigin, Workspace, absolute_path, canonical_file_uri,
+    is_analyzable_source_path, path_stamp,
 };
 use crate::NavigationIndex;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
@@ -278,7 +278,7 @@ fn document_path(uri: &Url) -> Result<PathBuf, String> {
         .to_file_path()
         .map_err(|_| format!("project context requires a file URI: {uri}"))?;
     let path = absolute_path(path);
-    if !is_pascal_path(&path) {
+    if !is_analyzable_source_path(&path) {
         return Err(format!(
             "unsupported Pascal document path: {}",
             path.display()

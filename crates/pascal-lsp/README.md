@@ -481,6 +481,29 @@ references still do. Project defines are used as positive conditional facts;
 `buildConfig` and `platform` select the project context but do not synthesize
 compiler-version or host-environment facts.
 
+### Source-bearing Pascal includes
+
+The LSP expands resolvable `{$I ...}`/`{$INCLUDE ...}` files into bounded,
+virtual source buffers for navigation, references, document highlights, and
+open-buffer diagnostics. Include declarations, definitions, and diagnostics
+are mapped back to their physical `.inc` (or Pascal) URI and source range;
+repeated and nested includes retain every physical occurrence. Unsaved open
+buffers take precedence over disk files, including when an included file is
+opened only as an overlay. Include content carries the requester project's
+read authorization and mapping provenance through nested resolution, and
+changes to an include invalidate its indexed parents and published diagnostics.
+
+Expansion is deliberately conservative. Active includes must resolve within
+the effective readable roots; cycles, unknown or incomplete conditional
+activity, stale dependency content, and expansion depth/file/directive/byte/
+source-map/work limits fail closed rather than producing partial locations or
+edits. Project and local `DEFINE`/`UNDEF` facts are shared across expanded
+source in the bounded analyzer, but compiler-version, `IFOPT`, environment,
+and Pascal-dependent conditional expressions remain unknown unless proven by
+the source. `.inc` files are analyzable source dependencies, but formatting is
+restricted to `.pas`, `.dpr`, and `.dpk` files so the formatter never edits a
+virtual or include fragment implicitly.
+
 In the MultidevComponents example, `MDIBDatabase.pas` is genuinely shared by
 multiple packages, so automatic project selection still refuses to guess.
 Explicit `MDDatabaseXE3.dproj` with Debug/Win32 now evaluates successfully.
@@ -498,6 +521,9 @@ not apply to source discovery. The initialization `exclude` option controls
 source discovery. `.fmt4d.toml` controls formatting; this slice does not
 translate LSP indentation options into formatter settings. Formatting is
 explicit and returns an edit to the client: the server does not write files.
+Include files (`.inc`) participate in source analysis but are rejected as
+direct formatting targets; only `.pas`, `.dpr`, and `.dpk` buffers are
+formatted.
 DCU-dependent lint rules are not enabled through a project context in this
 slice, and the CLI's baseline filtering is not applied.
 
@@ -970,10 +996,11 @@ Not implemented or incomplete:
 
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
-- Full compiler-equivalent conditional evaluation and include-file expansion.
-  The bounded analyzer does not infer `CompilerVersion`, `IFOPT`, or other host
-  compiler state. Unknown alternatives and relevant Pascal-dependent include
-  content can therefore produce no navigation result or block rename.
+- Full compiler-equivalent conditional evaluation is not implemented. The
+  bounded include expander does not infer `CompilerVersion`, `IFOPT`, or other
+  host compiler state. Unknown alternatives and Pascal-dependent include
+  expressions therefore produce no navigation result, withhold diagnostics,
+  or block rename rather than being guessed.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
 - Compiler-equivalent overload selection and anonymous callable inference are
@@ -1012,12 +1039,15 @@ directory, evaluated `DCC_IncludePath`, then ordered unit/client source paths.
 Nested includes are audited within depth, file, directive, and byte limits;
 lookup observations and content hashes participate in stale-input checks.
 Comments and recognized compiler-only directives, including conditional compiler
-flags, do not by themselves block a rename. Known-inactive unresolved includes
-are skipped; active or unknown unresolved includes still block. Pascal-dependent
-conditional expressions and relevant source-bearing includes remain unsupported;
-missing or unreadable includes cannot be treated as evidence that no reference
-exists. Source conditional compilation is projected for analysis rather than
-textually expanded. Unit/module renames (which require
+flags, do not by themselves block a rename. Fully resolved and audited active
+source-bearing includes may contribute physical edits in their `.inc` or Pascal
+sources; the planner maps virtual edits back to those files and rejects
+synthetic, cross-segment, external, stale, or incomplete edits. Known-inactive
+unresolved includes are skipped; active or unknown unresolved includes still
+block. Pascal-dependent conditional expressions and incomplete include audits
+remain unsupported; missing or unreadable includes cannot be treated as
+evidence that no reference exists. Source conditional compilation is projected
+for analysis rather than textually expanded. Unit/module renames (which require
 `RenameFile`), inherited or `with`-dependent lookup, overloaded/override relationships,
 compiled-only consumers, and other unsupported bindings are also rejected by
 the shared planner. Name collisions and reference capture are rejected before

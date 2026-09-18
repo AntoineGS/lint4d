@@ -29,6 +29,13 @@ pub(crate) struct NavigationResult {
 pub(crate) struct DiagnosticsResult {
     pub(crate) uri: Url,
     pub(crate) version: Option<i32>,
+    pub(crate) publications: Vec<DiagnosticPublication>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DiagnosticPublication {
+    pub(crate) uri: Url,
+    pub(crate) version: Option<i32>,
     pub(crate) diagnostics: Vec<lsp_types::Diagnostic>,
 }
 
@@ -615,10 +622,7 @@ pub(crate) fn references_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let value =
-        snapshot
-            .index
-            .binding_locations_with_cancel(&uri, position, include_declaration, cancel);
+    let value = snapshot.binding_locations(&uri, position, include_declaration, cancel);
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -697,10 +701,7 @@ pub(crate) fn highlights_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let locations = match snapshot
-        .index
-        .binding_locations_in_document_with_cancel(&uri, position, cancel)
-    {
+    let locations = match snapshot.binding_locations_in_document(&uri, position, cancel) {
         Ok(locations) => locations,
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
@@ -900,6 +901,15 @@ fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), St
             .incomplete_reason
             .as_deref()
             .unwrap_or("bounded source discovery did not finish");
+        if snapshot
+            .sources
+            .get(uri)
+            .is_some_and(|source| super::rename::may_contain_include_directive(source.as_bytes()))
+        {
+            return Err(format!(
+                "reference workspace scan incomplete: include dependency analysis is incomplete: {reason}"
+            ));
+        }
         return Err(format!("reference workspace scan incomplete: {reason}"));
     }
     Ok(())
@@ -1219,7 +1229,7 @@ pub(crate) fn diagnostics_from_input(
         Ok(diagnostics) => Ok(DiagnosticsResult {
             uri,
             version,
-            diagnostics,
+            publications: diagnostics,
         }),
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);

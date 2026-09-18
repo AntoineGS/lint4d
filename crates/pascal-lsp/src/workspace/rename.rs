@@ -1343,6 +1343,8 @@ pub(crate) fn owner_for_input(
         key: key.clone(),
         state,
         origin: owner_origin.unwrap_or_else(|| workspace.owner_origin_for_context_key(&key)),
+        needs_revalidation: false,
+        follow_current_project_file: false,
         legacy_route: workspace.document_owners.get(&uri).and_then(|owner| {
             (owner.key == key)
                 .then(|| owner.legacy_route.clone())
@@ -6917,6 +6919,8 @@ mod tests {
                 key: key.clone(),
                 state,
                 origin: super::super::OwnerOrigin::Inherited,
+                needs_revalidation: false,
+                follow_current_project_file: false,
                 legacy_route: None,
             },
         );

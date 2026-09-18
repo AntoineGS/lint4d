@@ -76,6 +76,44 @@ fn check_workspace_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
     }
 }
 
+fn wait_for_runtime_configuration_preparation(cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(feature = "test-support")]
+    {
+        let Some(spec) = std::env::var_os("PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER")
+        else {
+            return Ok(());
+        };
+        let spec = spec.to_string_lossy();
+        let Some((entered, release)) = spec.split_once('|') else {
+            return Err(
+                "PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER must contain <entered>|<release>"
+                    .to_string(),
+            );
+        };
+        let entered = PathBuf::from(entered);
+        let release = PathBuf::from(release);
+        if let Some(parent) = entered.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("could not create configuration barrier: {error}"))?;
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&entered)
+            .and_then(|mut marker| std::io::Write::write_all(&mut marker, b"x"))
+            .map_err(|error| format!("could not enter configuration barrier: {error}"))?;
+        while !release.exists() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = cancel;
+    Ok(())
+}
+
 fn filename_catalogue_entry_limit() -> usize {
     #[cfg(feature = "test-support")]
     if let Some(limit) = std::env::var(TEST_FILENAME_CATALOGUE_ENTRIES_ENV)
@@ -662,6 +700,8 @@ pub(crate) struct KnownDocumentOwner {
     key: ContextKey,
     state: ContextState,
     origin: OwnerOrigin,
+    needs_revalidation: bool,
+    follow_current_project_file: bool,
     pub(crate) legacy_route: Option<LegacyRouteProof>,
 }
 
@@ -730,9 +770,17 @@ impl LintExcludeMatcher {
 }
 
 fn compile_exclude_patterns(patterns: &[String]) -> Option<GlobSet> {
+    compile_exclude_patterns_with_cancel(patterns, None).unwrap_or_default()
+}
+
+fn compile_exclude_patterns_with_cancel(
+    patterns: &[String],
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<GlobSet>, String> {
     let mut builder = GlobSetBuilder::new();
     let mut valid_pattern_count = 0;
     for pattern in patterns {
+        check_workspace_cancel(cancel)?;
         let normalized = pattern.replace('\\', "/");
         let glob = {
             #[cfg(windows)]
@@ -757,13 +805,14 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<GlobSet> {
         }
     }
     if valid_pattern_count == 0 {
-        return None;
+        return Ok(None);
     }
+    check_workspace_cancel(cancel)?;
     match builder.build() {
-        Ok(set) => Some(set),
+        Ok(set) => Ok(Some(set)),
         Err(error) => {
             eprintln!("pascal-lsp: warning: failed to build exclude globs: {error}");
-            None
+            Ok(None)
         }
     }
 }
@@ -799,13 +848,21 @@ struct WorkspaceRoot {
 
 impl WorkspaceRoot {
     fn new(path: PathBuf, options: &WorkspaceOptions) -> Self {
+        let patterns = compile_exclude_patterns(&options.exclude);
+        Self::new_with_patterns(path, options, patterns)
+    }
+
+    fn new_with_patterns(
+        path: PathBuf,
+        options: &WorkspaceOptions,
+        patterns: Option<GlobSet>,
+    ) -> Self {
         let path = absolute_path(path);
         // Lint configuration is selected per effective project context at
         // request time. Only explicit client exclusions belong to the root
         // discovery filter; applying one configuration here would hide files
         // owned by another project from navigation and rename completeness.
         let config_root = path.clone();
-        let patterns = options.exclude.clone();
         let mut source_roots = vec![path.clone()];
         for source in &options.source_paths {
             let source_path = PathBuf::from(source);
@@ -822,7 +879,11 @@ impl WorkspaceRoot {
         Self {
             path: path.clone(),
             source_roots,
-            excludes: ExcludeMatcher::new(&path, &config_root, &patterns),
+            excludes: ExcludeMatcher {
+                root: path.clone(),
+                config_root,
+                patterns,
+            },
         }
     }
 
@@ -842,6 +903,12 @@ fn production_override_session() -> (OverrideSession, Vec<String>) {
         Ok(path) => (OverrideSession::new(Some(path)), Vec::new()),
         Err(error) => (OverrideSession::new(None), vec![error]),
     }
+}
+
+pub(crate) struct PreparedWorkspaceOptions {
+    pub(crate) options: WorkspaceOptions,
+    pub(crate) root_paths: Vec<PathBuf>,
+    roots: Vec<WorkspaceRoot>,
 }
 
 #[derive(Default)]
@@ -888,6 +955,17 @@ pub struct Workspace {
     global_configuration_change_generation: u64,
 }
 
+fn build_workspace_roots(
+    root_paths: Vec<PathBuf>,
+    options: &WorkspaceOptions,
+) -> Vec<WorkspaceRoot> {
+    let patterns = compile_exclude_patterns(&options.exclude);
+    root_paths
+        .into_iter()
+        .map(|root| WorkspaceRoot::new_with_patterns(root, options, patterns.clone()))
+        .collect()
+}
+
 impl Workspace {
     pub fn new(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Self {
         let (overrides, warnings) = production_override_session();
@@ -906,10 +984,7 @@ impl Workspace {
         options: WorkspaceOptions,
         overrides: OverrideSession,
     ) -> Self {
-        let roots = roots
-            .into_iter()
-            .map(|root| WorkspaceRoot::new(root, &options))
-            .collect();
+        let roots = build_workspace_roots(roots, &options);
         let mut workspace = Self {
             options,
             overrides,
@@ -932,25 +1007,48 @@ impl Workspace {
         workspace
     }
 
-    /// Replace the effective workspace options after a validated runtime
-    /// configuration update.  Runtime settings are global for this workspace;
-    /// explicit per-directory project selections remain in `project_selections`
-    /// and are re-applied during the next request.
-    pub(crate) fn apply_runtime_options(&mut self, options: WorkspaceOptions) -> bool {
-        if self.options == options {
+    pub(crate) fn configuration_root_paths(&self) -> Vec<PathBuf> {
+        self.roots.iter().map(|root| root.path.clone()).collect()
+    }
+
+    pub(crate) fn prepare_runtime_options_for_roots(
+        root_paths: Vec<PathBuf>,
+        options: WorkspaceOptions,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedWorkspaceOptions, String> {
+        wait_for_runtime_configuration_preparation(cancel)?;
+        check_workspace_cancel(Some(cancel))?;
+        let root_paths = root_paths
+            .into_iter()
+            .map(absolute_path)
+            .collect::<Vec<_>>();
+        let patterns = compile_exclude_patterns_with_cancel(&options.exclude, Some(cancel))?;
+        let roots = root_paths
+            .iter()
+            .cloned()
+            .map(|root| WorkspaceRoot::new_with_patterns(root, &options, patterns.clone()))
+            .collect();
+        Ok(PreparedWorkspaceOptions {
+            options,
+            root_paths,
+            roots,
+        })
+    }
+
+    pub(crate) fn apply_prepared_runtime_options(
+        &mut self,
+        prepared: PreparedWorkspaceOptions,
+    ) -> bool {
+        if self.options == prepared.options {
+            return false;
+        }
+        if self.configuration_root_paths() != prepared.root_paths {
             return false;
         }
 
-        self.options = options;
-        let root_paths = self
-            .roots
-            .iter()
-            .map(|root| root.path.clone())
-            .collect::<Vec<_>>();
-        self.roots = root_paths
-            .into_iter()
-            .map(|root| WorkspaceRoot::new(root, &self.options))
-            .collect();
+        let project_file_changed = self.options.project_file != prepared.options.project_file;
+        self.options = prepared.options;
+        self.roots = prepared.roots;
 
         self.bump_source_generation();
         self.bump_configuration_generation();
@@ -958,14 +1056,18 @@ impl Workspace {
         self.contexts.clear();
         self.document_contexts.clear();
         self.open_document_contexts.clear();
-        self.document_owners.clear();
-        self.owner_last_used.clear();
+        for owner in self.document_owners.values_mut() {
+            owner.needs_revalidation = true;
+            if project_file_changed && owner.key.selection_scope.is_none() {
+                owner.follow_current_project_file = true;
+            }
+            owner.legacy_route = None;
+        }
         self.cached_documents.clear();
         self.directory_catalogues.clear();
         self.filename_catalogues.clear();
         self.package_catalogues.clear();
         self.package_metadata_cache.clear();
-        self.deleted_overrides.clear();
         self.source_change_generations.clear();
         self.configuration_change_generations.clear();
         self.source_change_observations.clear();
@@ -1779,7 +1881,6 @@ impl Workspace {
         self.filename_catalogues.clear();
         self.package_catalogues.clear();
         self.package_metadata_cache.clear();
-        self.deleted_overrides.clear();
     }
 
     pub fn next_diagnostic_timeout(&self) -> Option<Duration> {
@@ -2835,6 +2936,7 @@ impl Workspace {
         };
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
+                && !owner.follow_current_project_file
                 && self.known_owner_selection_is_current_with_cancel(&path, &owner, cancel)?
             {
                 return self
@@ -2908,7 +3010,9 @@ impl Workspace {
         project_options: &ProjectOptions,
         cancel: Option<&AtomicBool>,
     ) -> Result<ContextKey, String> {
-        if self.context_state_is_fresh_with_open_documents(&owner.state, cancel)? {
+        if !owner.needs_revalidation
+            && self.context_state_is_fresh_with_open_documents(&owner.state, cancel)?
+        {
             self.contexts.insert(owner.key.clone(), owner.state.clone());
             self.select_document_context(uri, &owner.key, owner.origin);
             return Ok(owner.key.clone());
@@ -3085,9 +3189,12 @@ impl Workspace {
     ) -> Result<(ContextKey, ProjectContext), String> {
         if let Some(owner) = self.document_owners.get(uri) {
             if owner.origin != OwnerOrigin::Automatic
+                && !owner.follow_current_project_file
                 && self.known_owner_selection_is_current(path, owner)
             {
-                if self.context_state_is_fresh_with_open_documents(&owner.state, None)? {
+                if !owner.needs_revalidation
+                    && self.context_state_is_fresh_with_open_documents(&owner.state, None)?
+                {
                     return Ok((owner.key.clone(), owner.state.context.clone()));
                 }
                 let discovery =
@@ -3266,6 +3373,8 @@ impl Workspace {
                 key: key.clone(),
                 state,
                 origin,
+                needs_revalidation: false,
+                follow_current_project_file: false,
                 legacy_route,
             },
         );
@@ -7210,6 +7319,8 @@ mod tests {
             key: key.clone(),
             state: ContextState::default(),
             origin: super::OwnerOrigin::Inherited,
+            needs_revalidation: false,
+            follow_current_project_file: false,
             legacy_route: Some(super::LegacyRouteProof {
                 source: source.clone(),
                 context: key.clone(),
@@ -7241,6 +7352,8 @@ mod tests {
             key: key.clone(),
             state: ContextState::default(),
             origin: super::OwnerOrigin::Inherited,
+            needs_revalidation: false,
+            follow_current_project_file: false,
             legacy_route: Some(super::LegacyRouteProof {
                 source,
                 context: key,

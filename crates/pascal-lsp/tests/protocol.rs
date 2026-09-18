@@ -216,6 +216,28 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_configuration_preparation_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let barrier_directory = environment.path().join("configuration-barrier");
+        fs::create_dir_all(&barrier_directory).expect("configuration barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let barrier_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER"),
+            Some(barrier_value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier_and_filename_catalogue_limit(
         environment: TempDir,
         limit: usize,
@@ -26297,4 +26319,458 @@ fn an_empty_configuration_pull_result_preserves_the_last_valid_runtime_state() {
         "an empty response array must not reset the last valid runtime value"
     );
     server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_preserves_a_closed_shared_owner_for_navigation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let fixture = shared_owner_fixture(temp.path());
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let select_id = RequestId::from("runtime-shared-owner-select-a".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let load_id = RequestId::from("runtime-shared-owner-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let before_context_id = RequestId::from("runtime-shared-owner-before-context".to_string());
+    server.send_request(
+        before_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.shared)}}),
+    );
+    let before_context = server.response(&before_context_id);
+    assert_eq!(
+        before_context.result.expect("shared owner context")["selectedProjectUri"],
+        uri(&fixture.a_project).to_string()
+    );
+
+    server.send_request(
+        RequestId::from("runtime-shared-owner-before-navigation".to_string()),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    let before_navigation = result_locations(server.response(&RequestId::from(
+        "runtime-shared-owner-before-navigation".to_string(),
+    )));
+    assert_eq!(
+        before_navigation[0]["uri"],
+        uri(&fixture.a_config).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+
+    let after_context_id = RequestId::from("runtime-shared-owner-after-context".to_string());
+    server.send_request(
+        after_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.shared)}}),
+    );
+    let after_context = server.response(&after_context_id);
+    let after_context = after_context
+        .result
+        .expect("shared owner context after update");
+    assert_eq!(after_context["selectionMode"], "directory");
+    assert_eq!(
+        after_context["selectedProjectUri"],
+        uri(&fixture.a_project).to_string()
+    );
+
+    let after_navigation_id = RequestId::from("runtime-shared-owner-after-navigation".to_string());
+    server.send_request(
+        after_navigation_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    let after_navigation = result_locations(server.response(&after_navigation_id));
+    assert_eq!(after_navigation.len(), 1);
+    assert_eq!(
+        after_navigation[0]["uri"],
+        uri(&fixture.a_config).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_recomputes_an_open_shared_owner_without_adopting_a_peer() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let fixture = open_shared_owner_fixture(temp.path());
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let select_id = RequestId::from("runtime-open-shared-owner-select-a".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let load_id = RequestId::from("runtime-open-shared-owner-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&fixture.shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": &fixture.shared_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let navigation_id = RequestId::from("runtime-open-shared-owner-navigation".to_string());
+    server.send_request(
+        navigation_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    let locations = result_locations(server.response(&navigation_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&fixture.a_config).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_keeps_a_removed_shared_owner_invalid() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let fixture = shared_owner_fixture(temp.path());
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let select_id = RequestId::from("runtime-removed-shared-owner-select-a".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let load_id = RequestId::from("runtime-removed-shared-owner-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    fs::remove_file(&fixture.a_project).expect("remove selected project");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&fixture.a_project), "type": 3}]}),
+    );
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+
+    let navigation_id = RequestId::from("runtime-removed-shared-owner-navigation".to_string());
+    server.send_request(
+        navigation_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert!(
+        result_locations(server.response(&navigation_id)).is_empty(),
+        "a removed owner must remain invalid after runtime invalidation"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn scoped_runtime_configuration_does_not_leak_across_workspace_folder_changes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(&first).expect("first workspace folder");
+    fs::create_dir_all(&second).expect("second workspace folder");
+    let first_main = first.join("Main.pas");
+    let second_main = second.join("Main.pas");
+    let first_project = first.join("App.dproj");
+    let second_project = second.join("App.dproj");
+    let project =
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>";
+    write_file(&first_main, "unit Main; interface implementation end.");
+    write_file(&second_main, "unit Main; interface implementation end.");
+    write_file(&first_project, project);
+    write_file(&second_project, project);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(&first, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial scoped configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        initial.id,
+        json!([{"projectFile": "App.dproj"}]),
+    )));
+
+    let first_context_id = RequestId::from("scoped-runtime-first-context".to_string());
+    server.send_request(
+        first_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&first_main)}}),
+    );
+    assert_eq!(
+        server
+            .response(&first_context_id)
+            .result
+            .expect("first context")["selectedProjectUri"],
+        uri(&first_project).to_string()
+    );
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let stale_refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("scoped refresh before folder change");
+    server.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{"uri": uri(&second), "name": "second"}],
+                "removed": []
+            }
+        }),
+    );
+    server.send(Message::Response(Response::new_ok(
+        stale_refresh.id,
+        json!([{"projectFile": "App.dproj"}]),
+    )));
+
+    let unscoped = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("unscoped configuration pull after adding a root");
+    assert!(unscoped.params["items"][0]["scopeUri"].is_null());
+    server.send(Message::Response(Response::new_err(
+        unscoped.id,
+        -32603,
+        "settings unavailable".to_string(),
+    )));
+
+    let second_context_id = RequestId::from("scoped-runtime-second-context".to_string());
+    server.send_request(
+        second_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&second_main)}}),
+    );
+    let second_context = server
+        .response(&second_context_id)
+        .result
+        .expect("second context after scoped error");
+    assert_ne!(second_context["selectionMode"], "configured");
+    assert_ne!(
+        second_context["selectedProjectUri"],
+        uri(&first_project).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [{"uri": uri(&first), "name": "first"}]
+            }
+        }),
+    );
+    let replacement = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("single-root replacement configuration pull");
+    assert_eq!(
+        replacement.params["items"][0]["scopeUri"],
+        uri(&second).to_string()
+    );
+    server.send(Message::Response(Response::new_ok(
+        replacement.id,
+        json!([]),
+    )));
+
+    let replacement_context_id = RequestId::from("scoped-runtime-replacement-context".to_string());
+    server.send_request(
+        replacement_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&second_main)}}),
+    );
+    let replacement_context = server
+        .response(&replacement_context_id)
+        .result
+        .expect("replacement context");
+    assert_ne!(
+        replacement_context["selectedProjectUri"],
+        uri(&first_project).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_preserves_watched_deletions_until_a_create_or_change_event() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source =
+        "unit Provider; interface procedure Run; implementation procedure Run; begin end; end.\n";
+    let main_source =
+        "unit Main; interface uses Provider; implementation procedure Use; begin Run; end; end.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let before_id = RequestId::from("runtime-delete-before".to_string());
+    server.send_request(
+        before_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&before_id))[0]["uri"],
+        uri(&provider).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&provider), "type": 3}]}),
+    );
+    let deleted_id = RequestId::from("runtime-delete-after-event".to_string());
+    server.send_request(
+        deleted_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert!(result_locations(server.response(&deleted_id)).is_empty());
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let after_runtime_id = RequestId::from("runtime-delete-after-runtime".to_string());
+    server.send_request(
+        after_runtime_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert!(
+        result_locations(server.response(&after_runtime_id)).is_empty(),
+        "runtime invalidation must not resurrect a watched-deleted source"
+    );
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&provider), "type": 1}]}),
+    );
+    let recovered_id = RequestId::from("runtime-delete-after-create".to_string());
+    server.send_request(
+        recovered_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&recovered_id))[0]["uri"],
+        uri(&provider).to_string()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_preparation_does_not_block_protocol_shutdown() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_capability(&root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("runtime configuration refresh");
+    server.send(Message::Response(Response::new_ok(
+        refresh.id,
+        json!([{"exclude": ["generated/**"]}]),
+    )));
+    barrier.wait_until_entered();
+
+    let ping_id = RequestId::from("configuration-preparation-ping".to_string());
+    server.send_request(ping_id.clone(), "review/ping", Value::Null);
+    let ping = server
+        .response_with_timeout(&ping_id, Duration::from_secs(1))
+        .expect("protocol request while configuration is prepared");
+    assert_eq!(ping.error.expect("unknown method error").code, -32601);
+
+    let shutdown_id = RequestId::from("configuration-preparation-shutdown".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+    let shutdown = server
+        .response_with_timeout(&shutdown_id, Duration::from_secs(1))
+        .expect("shutdown while configuration is prepared");
+    assert!(shutdown.error.is_none(), "shutdown failed: {shutdown:?}");
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server
+        .child
+        .wait()
+        .expect("wait for configuration shutdown");
+    assert!(status.success(), "server exited unsuccessfully: {status}");
 }

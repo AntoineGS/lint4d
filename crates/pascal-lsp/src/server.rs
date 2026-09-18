@@ -10,8 +10,9 @@ use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
-    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, RuntimeOptionsOverride,
-    RuntimeOptionsUpdate, Workspace, WorkspaceOptions, canonical_file_uri, parse_runtime_options,
+    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, PreparedWorkspaceOptions,
+    RuntimeOptionsOverride, RuntimeOptionsUpdate, Workspace, WorkspaceOptions, canonical_file_uri,
+    parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
@@ -69,6 +70,7 @@ const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
+const MAX_CONFIGURATION_REQUEST_QUEUE: usize = 64;
 const MAX_COMPLETION_RESOLUTION_ENTRIES: usize = 2_048;
 const MAX_COMPLETION_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPLETION_RESOLUTION_DATA_BYTES: usize = 512;
@@ -1089,43 +1091,225 @@ const RUNTIME_CONFIGURATION_SECTION: &str = "pascalLsp";
 const CONFIGURATION_REQUEST_PREFIX: &str = "pascal-lsp-configuration-";
 const MAX_RETIRED_CONFIGURATION_REQUESTS: usize = 8;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigurationScope {
+    Global,
+    Scoped(Url),
+}
+
+impl ConfigurationScope {
+    fn from_uri(uri: Option<Url>) -> Self {
+        uri.map_or(Self::Global, Self::Scoped)
+    }
+
+    fn is_compatible_with(&self, scope_uri: Option<&Url>) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Scoped(scope) => scope_uri.is_some_and(|current| current == scope),
+        }
+    }
+}
+
+struct ConfigurationPreparationRequest {
+    revision: u64,
+    options: WorkspaceOptions,
+    root_paths: Vec<PathBuf>,
+}
+
+struct ConfigurationPreparationResult {
+    revision: u64,
+    options: WorkspaceOptions,
+    root_paths: Vec<PathBuf>,
+    prepared: Result<PreparedWorkspaceOptions, String>,
+}
+
+struct PendingConfigurationPreparation {
+    cancellation: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+struct ConfigurationPreparationJobs {
+    sender: Sender<ConfigurationPreparationResult>,
+    receiver: Receiver<ConfigurationPreparationResult>,
+    pending: Option<PendingConfigurationPreparation>,
+    queued: Option<ConfigurationPreparationRequest>,
+    shutting_down: bool,
+}
+
+impl ConfigurationPreparationJobs {
+    fn new() -> Self {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        Self {
+            sender,
+            receiver,
+            pending: None,
+            queued: None,
+            shutting_down: false,
+        }
+    }
+
+    fn request(&mut self, request: ConfigurationPreparationRequest) -> Result<(), String> {
+        if self.shutting_down {
+            return Err("configuration preparation is shutting down".to_string());
+        }
+        if let Some(pending) = &self.pending {
+            pending
+                .cancellation
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.queued = Some(request);
+            return Ok(());
+        }
+        self.spawn(request)
+    }
+
+    fn spawn(&mut self, request: ConfigurationPreparationRequest) -> Result<(), String> {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let sender = self.sender.clone();
+        let revision = request.revision;
+        let options = request.options;
+        let root_paths = request.root_paths;
+        let worker_options = options.clone();
+        let worker_root_paths = root_paths.clone();
+        let handle = thread::Builder::new()
+            .name("PascalLspConfiguration".to_string())
+            .spawn(move || {
+                let prepared = Workspace::prepare_runtime_options_for_roots(
+                    worker_root_paths.clone(),
+                    worker_options,
+                    &worker_cancellation,
+                );
+                let _ = sender.send(ConfigurationPreparationResult {
+                    revision,
+                    options,
+                    root_paths: worker_root_paths,
+                    prepared,
+                });
+            })
+            .map_err(|error| format!("could not start configuration worker: {error}"))?;
+        self.pending = Some(PendingConfigurationPreparation {
+            cancellation,
+            handle,
+        });
+        Ok(())
+    }
+
+    fn cancel_pending(&mut self) {
+        self.queued = None;
+        if let Some(pending) = &self.pending {
+            pending
+                .cancellation
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn poll(&mut self) -> Option<ConfigurationPreparationResult> {
+        let result = self.receiver.try_recv().ok()?;
+        if let Some(pending) = self.pending.take() {
+            let _ = pending.handle.join();
+        }
+        if let Some(request) = self.queued.take() {
+            if let Err(error) = self.spawn(request) {
+                eprintln!("pascal-lsp: configuration worker failed to start: {error}");
+            }
+        }
+        Some(result)
+    }
+
+    fn is_busy(&self) -> bool {
+        self.pending.is_some() || self.queued.is_some()
+    }
+
+    fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        self.queued = None;
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        pending
+            .cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
+        let mut pending = Some(pending);
+        while let Some(job) = pending.take() {
+            if job.handle.is_finished() {
+                let _ = job.handle.join();
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            pending = Some(job);
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PendingConfigurationRequest {
     id: RequestId,
     revision: u64,
+    scope: ConfigurationScope,
 }
 
 struct ConfigurationCoordinator {
     base_options: WorkspaceOptions,
     runtime_options: RuntimeOptionsOverride,
+    applied_options: WorkspaceOptions,
     pull_supported: bool,
     initialized: bool,
     scope_uri: Option<Url>,
+    accepted_scope: Option<ConfigurationScope>,
     next_request_id: u64,
     revision: u64,
+    apply_revision: u64,
     refresh_pending: bool,
     pending: Option<PendingConfigurationRequest>,
     retired: VecDeque<RequestId>,
+    preparation: ConfigurationPreparationJobs,
 }
 
 impl ConfigurationCoordinator {
     fn new(scope_uri: Option<Url>, options: WorkspaceOptions, pull_supported: bool) -> Self {
         Self {
-            base_options: options,
+            base_options: options.clone(),
             runtime_options: RuntimeOptionsOverride::default(),
+            applied_options: options.clone(),
             pull_supported,
             initialized: false,
             scope_uri,
+            accepted_scope: None,
             next_request_id: 0,
             revision: 0,
+            apply_revision: 0,
             refresh_pending: false,
             pending: None,
             retired: VecDeque::new(),
+            preparation: ConfigurationPreparationJobs::new(),
         }
     }
 
-    fn update_scope(&mut self, scope_uri: Option<Url>) {
+    fn update_scope(
+        &mut self,
+        scope_uri: Option<Url>,
+        workspace: &Workspace,
+    ) -> Result<(), String> {
+        let changed = self.scope_uri != scope_uri;
         self.scope_uri = scope_uri;
+        if changed
+            && self
+                .accepted_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.is_compatible_with(self.scope_uri.as_ref()))
+        {
+            self.runtime_options = RuntimeOptionsOverride::default();
+            self.accepted_scope = None;
+            self.schedule_effective_options(workspace)?;
+        }
+        Ok(())
     }
 
     fn on_initialized(
@@ -1158,7 +1342,8 @@ impl ConfigurationCoordinator {
         }
 
         let settings = runtime_settings_section(&params.settings)?;
-        Ok(self.apply_value(settings.as_ref(), workspace))
+        self.apply_value(settings.as_ref(), workspace, ConfigurationScope::Global)
+            .map_err(|error| error.into())
     }
 
     fn request_refresh(
@@ -1208,6 +1393,7 @@ impl ConfigurationCoordinator {
         self.pending = Some(PendingConfigurationRequest {
             id,
             revision: self.revision,
+            scope: ConfigurationScope::from_uri(self.scope_uri.clone()),
         });
         Ok(())
     }
@@ -1238,7 +1424,6 @@ impl ConfigurationCoordinator {
             self.retired.pop_front();
         }
 
-        let mut effect = DiagnosticNotificationEffect::default();
         if pending.revision == self.revision {
             if let Some(error) = &response.error {
                 eprintln!(
@@ -1246,7 +1431,7 @@ impl ConfigurationCoordinator {
                     error.code, error.message
                 );
             } else if let Some(result) = response.result.as_ref() {
-                effect = self.apply_pull_result(result, workspace);
+                self.apply_pull_result(result, workspace, pending.scope)?;
             } else {
                 eprintln!(
                     "pascal-lsp: ignored malformed workspace/configuration response {}",
@@ -1255,19 +1440,23 @@ impl ConfigurationCoordinator {
             }
         }
         self.send_pending(connection)?;
-        Ok(Some(effect))
+        Ok(Some(DiagnosticNotificationEffect::default()))
     }
 
     fn apply_pull_result(
         &mut self,
         result: &Value,
         workspace: &mut Workspace,
-    ) -> DiagnosticNotificationEffect {
+        scope: ConfigurationScope,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         match runtime_pull_value(result) {
-            Ok(value) => self.apply_value(Some(&value), workspace),
+            Ok(value) => self
+                .apply_value(Some(&value), workspace, scope)
+                .map(|_| ())
+                .map_err(|error| error.into()),
             Err(error) => {
                 eprintln!("pascal-lsp: ignored workspace/configuration response: {error}");
-                DiagnosticNotificationEffect::default()
+                Ok(())
             }
         }
     }
@@ -1276,15 +1465,18 @@ impl ConfigurationCoordinator {
         &mut self,
         value: Option<&Value>,
         workspace: &mut Workspace,
-    ) -> DiagnosticNotificationEffect {
+        scope: ConfigurationScope,
+    ) -> Result<DiagnosticNotificationEffect, String> {
         let before = self.runtime_options.effective(&self.base_options);
+        let previous_runtime_options = self.runtime_options.clone();
+        let previous_scope = self.accepted_scope.clone();
         let warnings = match value {
             None | Some(Value::Null) => self.runtime_options.apply(RuntimeOptionsUpdate::reset()),
             Some(value) => match parse_runtime_options(value) {
                 Ok(update) => self.runtime_options.apply(update),
                 Err(error) => {
                     eprintln!("pascal-lsp: ignored runtime configuration: {error}");
-                    return DiagnosticNotificationEffect::default();
+                    return Ok(DiagnosticNotificationEffect::default());
                 }
             },
         };
@@ -1292,16 +1484,75 @@ impl ConfigurationCoordinator {
             eprintln!("pascal-lsp: warning: {warning}");
         }
         let after = self.runtime_options.effective(&self.base_options);
-        if before == after || !workspace.apply_runtime_options(after) {
-            return DiagnosticNotificationEffect::default();
+        self.accepted_scope = Some(scope);
+        if before != after {
+            if let Err(error) = self.schedule_effective_options(workspace) {
+                self.runtime_options = previous_runtime_options;
+                self.accepted_scope = previous_scope;
+                return Err(error);
+            }
+        } else {
+            self.schedule_effective_options(workspace)?;
         }
+        Ok(DiagnosticNotificationEffect::default())
+    }
 
-        let mut effect = DiagnosticNotificationEffect::default();
-        for uri in workspace.open_document_uris() {
-            effect.cancel_uri(uri.clone());
-            effect.refresh_uri(uri);
+    fn schedule_effective_options(&mut self, workspace: &Workspace) -> Result<(), String> {
+        self.apply_revision = self
+            .apply_revision
+            .checked_add(1)
+            .ok_or_else(|| "configuration application revision space exhausted".to_string())?;
+        let options = self.runtime_options.effective(&self.base_options);
+        if options == self.applied_options {
+            self.preparation.cancel_pending();
+            return Ok(());
         }
-        effect
+        self.preparation.request(ConfigurationPreparationRequest {
+            revision: self.apply_revision,
+            options,
+            root_paths: workspace.configuration_root_paths(),
+        })
+    }
+
+    fn poll(
+        &mut self,
+        workspace: &mut Workspace,
+    ) -> Result<Option<DiagnosticNotificationEffect>, Box<dyn Error + Send + Sync>> {
+        let Some(result) = self.preparation.poll() else {
+            return Ok(None);
+        };
+        let desired = self.runtime_options.effective(&self.base_options);
+        if result.revision != self.apply_revision || result.options != desired {
+            return Ok(None);
+        }
+        if result.root_paths != workspace.configuration_root_paths() {
+            self.schedule_effective_options(workspace)?;
+            return Ok(None);
+        }
+        let prepared = match result.prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!("pascal-lsp: configuration preparation failed: {error}");
+                return Ok(None);
+            }
+        };
+        if workspace.apply_prepared_runtime_options(prepared) {
+            self.applied_options = result.options;
+            let mut effect = DiagnosticNotificationEffect::default();
+            for uri in workspace.open_document_uris() {
+                effect.cancel_uri(uri.clone());
+                effect.refresh_uri(uri);
+            }
+            return Ok(Some(effect));
+        }
+        if self.applied_options != result.options {
+            self.schedule_effective_options(workspace)?;
+        }
+        Ok(None)
+    }
+
+    fn is_preparing(&self) -> bool {
+        self.preparation.is_busy()
     }
 
     fn shutdown(&mut self) {
@@ -1309,6 +1560,7 @@ impl ConfigurationCoordinator {
         self.refresh_pending = false;
         self.pending = None;
         self.retired.clear();
+        self.preparation.shutdown();
     }
 }
 
@@ -3654,8 +3906,16 @@ fn event_loop(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
+    let mut deferred_configuration_requests = VecDeque::new();
     let mut jobs = AnalysisJobs::with_test_barriers(test_barriers);
     loop {
+        if let Some(effect) = configuration.poll(workspace)? {
+            if let Some(registration) = watcher_registration.as_mut() {
+                sync_file_watcher(connection, workspace, registration)?;
+            }
+            jobs.cancel_diagnostics_for(&effect.cancel);
+            jobs.refresh_diagnostics(workspace, &effect.refresh);
+        }
         if !shutdown_received {
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
         }
@@ -3667,19 +3927,45 @@ fn event_loop(
                 Duration::from_secs(86_400)
             } else {
                 ANALYSIS_POLL_INTERVAL
+            })
+            .min(if configuration.is_preparing() {
+                ANALYSIS_POLL_INTERVAL
+            } else {
+                Duration::from_secs(86_400)
             });
-        let message = match connection.receiver.recv_timeout(timeout) {
-            Ok(message) => message,
-            Err(RecvTimeoutError::Timeout) => {
-                if !shutdown_received {
-                    publish_due_diagnostics(connection, workspace, &mut jobs)?;
+        let message = if !configuration.is_preparing() {
+            if let Some(request) = deferred_configuration_requests.pop_front() {
+                Message::Request(request)
+            } else {
+                match connection.receiver.recv_timeout(timeout) {
+                    Ok(message) => message,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if !shutdown_received {
+                            publish_due_diagnostics(connection, workspace, &mut jobs)?;
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        jobs.shutdown();
+                        configuration.shutdown();
+                        return Ok(true);
+                    }
                 }
-                continue;
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                jobs.shutdown();
-                configuration.shutdown();
-                return Ok(true);
+        } else {
+            match connection.receiver.recv_timeout(timeout) {
+                Ok(message) => message,
+                Err(RecvTimeoutError::Timeout) => {
+                    if !shutdown_received {
+                        publish_due_diagnostics(connection, workspace, &mut jobs)?;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    jobs.shutdown();
+                    configuration.shutdown();
+                    return Ok(true);
+                }
             }
         };
 
@@ -3687,6 +3973,14 @@ fn event_loop(
             Message::Request(request) if request.method == "shutdown" => {
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
+                for deferred in deferred_configuration_requests.drain(..) {
+                    send_error(
+                        connection,
+                        deferred.id,
+                        ErrorCode::RequestCanceled,
+                        rename::CANCELLATION_MESSAGE,
+                    )?;
+                }
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
             }
@@ -3698,6 +3992,19 @@ fn event_loop(
                         ErrorCode::InvalidRequest,
                         "request received after shutdown",
                     )?;
+                } else if configuration.is_preparing()
+                    && request_requires_configuration(&request.method)
+                {
+                    if deferred_configuration_requests.len() >= MAX_CONFIGURATION_REQUEST_QUEUE {
+                        send_error(
+                            connection,
+                            request.id,
+                            ErrorCode::ServerCancelled,
+                            "configuration update is still being prepared; retry the request",
+                        )?;
+                    } else {
+                        deferred_configuration_requests.push_back(request);
+                    }
                 } else {
                     let source_generation = workspace.source_generation();
                     let configuration_generation = workspace.configuration_generation();
@@ -3727,8 +4034,24 @@ fn event_loop(
                             .cloned()
                             .unwrap_or(Value::Null),
                     ) {
-                        jobs.cancel(connection, &id)
-                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                        if let Some(index) = deferred_configuration_requests
+                            .iter()
+                            .position(|request| request.id == id)
+                        {
+                            let request = deferred_configuration_requests
+                                .remove(index)
+                                .expect("deferred configuration request");
+                            send_error(
+                                connection,
+                                request.id,
+                                ErrorCode::RequestCanceled,
+                                rename::CANCELLATION_MESSAGE,
+                            )?;
+                        } else {
+                            jobs.cancel(connection, &id).map_err(
+                                |error| -> Box<dyn Error + Send + Sync> { error.into() },
+                            )?;
+                        }
                     }
                     continue;
                 }
@@ -3750,7 +4073,9 @@ fn event_loop(
                         workspace_folders_supported,
                     );
                     if refresh_configuration && result.is_ok() {
-                        configuration.update_scope(workspace.configuration_scope_uri());
+                        configuration
+                            .update_scope(workspace.configuration_scope_uri(), workspace)
+                            .map_err(|error| error.to_string())?;
                         configuration
                             .request_refresh(connection)
                             .map_err(|error| error.to_string())?;
@@ -3821,6 +4146,35 @@ fn start_analysis(
         send_error(connection, id, ErrorCode::RequestFailed, error)?;
     }
     Ok(())
+}
+
+fn request_requires_configuration(method: &str) -> bool {
+    matches!(
+        method,
+        "pascal/projectContext"
+            | "pascal/selectProject"
+            | "textDocument/hover"
+            | "textDocument/completion"
+            | "completionItem/resolve"
+            | "textDocument/signatureHelp"
+            | "textDocument/typeDefinition"
+            | "textDocument/documentSymbol"
+            | "workspace/symbol"
+            | "textDocument/references"
+            | "textDocument/documentHighlight"
+            | "textDocument/selectionRange"
+            | "textDocument/semanticTokens/full"
+            | "textDocument/semanticTokens/range"
+            | "textDocument/foldingRange"
+            | "textDocument/prepareRename"
+            | "textDocument/rename"
+            | "textDocument/codeAction"
+            | "codeAction/resolve"
+            | "textDocument/declaration"
+            | "textDocument/definition"
+            | "textDocument/implementation"
+            | "textDocument/formatting"
+    )
 }
 
 fn handle_request(

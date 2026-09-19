@@ -4010,6 +4010,7 @@ impl NavigationIndex {
                 );
             }
         }
+        let receiver_lookup_scope = state.begin_receiver_lookup_scope();
         let references = self.unqualified_references_with_budget_and_state(
             current_uri,
             current_document,
@@ -4099,6 +4100,17 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        if self.proven_unique_unit_receiver_with_budget(
+            current_uri,
+            current_document,
+            offset,
+            &urls,
+            state,
+            cancel,
+            budget,
+        )? {
+            state.complete_receiver_lookup_as_unit(receiver_lookup_scope);
+        }
         Ok(urls.into_iter().map(Receiver::Unit).collect())
     }
 
@@ -5557,6 +5569,89 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
         self.unit_urls_for_import_with_budget(current_document, &key, cancel, budget)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn proven_unique_unit_receiver_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        unit_urls: &[Url],
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let Some(unit_uri) = unit_urls.first().filter(|_| unit_urls.len() == 1) else {
+            return Ok(false);
+        };
+        let Some(unit_document) = self.documents.get(unit_uri) else {
+            return Ok(false);
+        };
+        budget.require_work(
+            unit_document
+                .parser_recovery_spans
+                .len()
+                .saturating_add(unit_document.conditionals.unknown_spans.len()),
+            cancel,
+        )?;
+        if !unit_document.parser_recovery_spans.is_empty()
+            || !unit_document.conditionals.unknown_spans.is_empty()
+        {
+            return Ok(false);
+        }
+
+        let Some(indices) = unit_document
+            .symbol_indices_by_scope_key
+            .get(&(ROOT_SCOPE, unit_document.unit_name.clone()))
+        else {
+            return Ok(false);
+        };
+        budget.require_work(indices.len(), cancel)?;
+        let mut unit_candidate = None;
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = unit_document.symbols.get(*index) else {
+                continue;
+            };
+            if symbol.kind != SymbolKind::Unit {
+                continue;
+            }
+            if unit_candidate.is_some() {
+                return Ok(false);
+            }
+            unit_candidate = Some(Candidate {
+                uri: unit_uri.clone(),
+                index: *index,
+            });
+        }
+        let Some(candidate) = unit_candidate else {
+            return Ok(false);
+        };
+        if self.candidate_is_conditionally_unknown(&candidate) {
+            return Ok(false);
+        }
+        Ok(
+            match self.candidate_access_decision_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                state,
+                cancel,
+                budget,
+            )? {
+                AccessDecision::Visible => true,
+                AccessDecision::Unknown => {
+                    state.mark_receiver_uncertain();
+                    false
+                }
+                AccessDecision::Inaccessible => {
+                    state.mark_inaccessible_candidate();
+                    false
+                }
+            },
+        )
     }
 
     fn visible_unit_urls_for_path_with_budget(
@@ -8814,6 +8909,11 @@ struct ResolutionState {
     suppress_with_lookup: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ReceiverLookupScope {
+    implicit_system_namespace_incomplete: bool,
+}
+
 impl ResolutionState {
     fn new() -> Self {
         Self {
@@ -8844,6 +8944,21 @@ impl ResolutionState {
 
     fn mark_implicit_system_namespace_incomplete(&mut self) {
         self.implicit_system_namespace_incomplete = true;
+    }
+
+    fn begin_receiver_lookup_scope(&self) -> ReceiverLookupScope {
+        ReceiverLookupScope {
+            implicit_system_namespace_incomplete: self.implicit_system_namespace_incomplete,
+        }
+    }
+
+    fn complete_receiver_lookup_as_unit(&mut self, scope: ReceiverLookupScope) {
+        // A failed unqualified probe may inspect the open implicit System
+        // namespace.  That uncertainty belongs to the probe, not to a
+        // subsequently proven unit receiver.  Other uncertainty flags are
+        // deliberately retained, so unknown with/receiver/helper state cannot
+        // be cleared by a unit-shaped fallback.
+        self.implicit_system_namespace_incomplete = scope.implicit_system_namespace_incomplete;
     }
 
     fn mark_inaccessible_candidate(&mut self) {
@@ -13195,6 +13310,194 @@ mod tests {
                 )
                 .expect("shadowed System proof status"),
             SemanticProofStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_a_missing_export_on_a_proven_qualified_unit() {
+        let provider_uri = Url::parse("file:///tmp/semantic-diagnostics-qualified-provider.pas")
+            .expect("provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-diagnostics-qualified-consumer.pas")
+            .expect("consumer URI");
+        let provider = concat!(
+            "unit Provider;\n",
+            "interface\n",
+            "var Known: Integer;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses Provider;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  Provider.Known := 1;\n",
+            "  Provider.MissingExport := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("Provider".to_owned(), provider_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(diagnostics.len(), 1, "only the missing export is absent");
+        assert_eq!(diagnostics[0].kind, SemanticDiagnosticKind::MissingMember);
+        assert_eq!(diagnostics[0].message, "missing member 'MissingExport'");
+        let missing_offset = consumer.find("MissingExport").expect("missing export");
+        assert_eq!(
+            diagnostics[0].span,
+            SourceSpan {
+                start: missing_offset,
+                end: missing_offset + "MissingExport".len(),
+            }
+        );
+
+        let known_offset = consumer.find("Known").expect("known export");
+        assert_eq!(
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &consumer_uri,
+                    text::offset_to_position(consumer, known_offset).expect("known position"),
+                    &AtomicBool::new(false),
+                )
+                .expect("known proof status"),
+            SemanticProofStatus::Resolved
+        );
+        assert_eq!(
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &consumer_uri,
+                    text::offset_to_position(consumer, missing_offset).expect("missing position"),
+                    &AtomicBool::new(false),
+                )
+                .expect("missing proof status"),
+            SemanticProofStatus::ProvenAbsent
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_do_not_treat_a_shadowed_unit_name_as_a_unit() {
+        let provider_uri = Url::parse("file:///tmp/semantic-diagnostics-shadowed-provider.pas")
+            .expect("provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-diagnostics-shadowed-consumer.pas")
+            .expect("consumer URI");
+        let provider = "unit Provider;\ninterface\nvar Known: Integer;\nimplementation\nend.\n";
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses Provider;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Provider: Integer;\n",
+            "begin\n",
+            "  Provider.MissingExport := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("shadowed consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("Provider".to_owned(), provider_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "a shadowed unit name is not a proven unit namespace: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_a_missing_export_for_ambiguous_units() {
+        let first_uri = Url::parse("file:///tmp/semantic-diagnostics-ambiguous-provider-a.pas")
+            .expect("first provider URI");
+        let second_uri = Url::parse("file:///tmp/semantic-diagnostics-ambiguous-provider-b.pas")
+            .expect("second provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-ambiguous-provider-consumer.pas")
+                .expect("consumer URI");
+        let provider = "unit Provider;\ninterface\nvar Known: Integer;\nimplementation\nend.\n";
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses Provider;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  Provider.MissingExport := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(first_uri, provider.to_owned())
+            .expect("first provider parses");
+        index
+            .update(second_uri, provider.to_owned())
+            .expect("second provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("ambiguous consumer parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "ambiguous unit identity cannot prove a missing export: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_a_missing_export_for_an_unknown_receiver() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-unknown-unit-receiver.pas")
+            .expect("consumer URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsUnknownUnitReceiver;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  UnknownReceiver.MissingExport := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("unknown receiver parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "an unknown receiver cannot prove a missing export: {diagnostics:?}"
         );
     }
 

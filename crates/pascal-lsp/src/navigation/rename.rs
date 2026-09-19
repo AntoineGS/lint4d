@@ -260,13 +260,16 @@ impl NavigationIndex {
         )
     }
 
-    pub(crate) fn binding_locations_with_cancel_and_limit_and_budget(
+    /// Resolve one virtual context without applying the public physical result
+    /// cap.  Include expansion can produce repeated virtual occurrences that
+    /// map back to one physical range; the workspace wrapper applies the
+    /// response limit only after that exact mapping and deduplication.
+    pub(crate) fn binding_locations_with_cancel_and_work_budget(
         &self,
         uri: &Url,
         position: lsp_types::Position,
         include_declaration: bool,
         cancel: &AtomicBool,
-        result_limit: usize,
         work_budget: &mut BindingWorkBudget,
     ) -> Result<Vec<lsp_types::Location>, String> {
         self.binding_locations_impl(
@@ -277,18 +280,20 @@ impl NavigationIndex {
                 document_uri: None,
                 strict_resolution: true,
                 cancel: Some(cancel),
-                result_limit: Some(result_limit),
+                result_limit: None,
                 work_budget: Some(work_budget),
             },
         )
     }
 
-    pub(crate) fn binding_locations_in_document_with_cancel_and_limit_and_budget(
+    /// As above, but restrict occurrence collection to one virtual document.
+    /// The shared work budget remains the traversal and memory bound while the
+    /// caller owns the final physical-result limit.
+    pub(crate) fn binding_locations_in_document_with_cancel_and_work_budget(
         &self,
         uri: &Url,
         position: lsp_types::Position,
         cancel: &AtomicBool,
-        result_limit: usize,
         work_budget: &mut BindingWorkBudget,
     ) -> Result<Vec<lsp_types::Location>, String> {
         self.binding_locations_impl(
@@ -299,7 +304,7 @@ impl NavigationIndex {
                 document_uri: Some(uri),
                 strict_resolution: false,
                 cancel: Some(cancel),
-                result_limit: Some(result_limit),
+                result_limit: None,
                 work_budget: Some(work_budget),
             },
         )

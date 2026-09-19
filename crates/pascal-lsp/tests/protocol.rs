@@ -12543,6 +12543,7 @@ fn source_bearing_reverse_contexts_count_deduplicated_physical_results() {
     for (uses_a, uses_b, partial) in [
         (5_000usize, 4_999usize, false),
         (5_000usize, 4_999usize, true),
+        (5_001usize, 5_000usize, true),
     ] {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let a = temp.path().join("A.pas");
@@ -12629,6 +12630,169 @@ fn source_bearing_reverse_contexts_count_deduplicated_physical_results() {
         }
         server.shutdown();
     }
+}
+
+#[test]
+fn source_bearing_repeated_include_deduplicates_before_reference_cap() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let main = temp.path().join("Main.pas");
+    let uses = temp.path().join("Uses.inc");
+    let mut uses_source = String::new();
+    for _ in 0..4_999 {
+        uses_source.push_str("  Log(SharedValue);\n");
+    }
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "const SharedValue = 1;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "{$I Uses.inc}\n",
+        "{$I Uses.inc}\n",
+        "{$I Uses.inc}\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&main, main_source);
+    write_file(&uses, &uses_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("repeated-include-reference-cap".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("repeated include references");
+    let locations = result.as_array().expect("reference array");
+    assert_eq!(locations.len(), 5_000);
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&uses).to_string())
+            .count(),
+        4_999
+    );
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&main).to_string())
+            .count(),
+        1
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_mixed_roots_and_repeated_includes_deduplicate_physical_results() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let a = temp.path().join("A.pas");
+    let b = temp.path().join("B.pas");
+    let declaration = temp.path().join("Shared.inc");
+    let uses = temp.path().join("Uses.inc");
+    let make_root = |unit: &str| {
+        format!(
+            "unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nprocedure Run;\nbegin\n{{$I Uses.inc}}\n{{$I Uses.inc}}\nend;\nend.\n"
+        )
+    };
+    let mut uses_source = String::new();
+    for _ in 0..5_000 {
+        uses_source.push_str("  Log(SharedValue);\n");
+    }
+    let a_source = make_root("A");
+    let b_source = make_root("B");
+    write_file(&a, &a_source);
+    write_file(&b, &b_source);
+    write_file(&declaration, "const SharedValue = 1;\n");
+    write_file(&uses, &uses_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("mixed-root-repeated-reference-cap".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&declaration)},
+            "position": {"line": 0, "character": 6},
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("mixed-root references");
+    let locations = result.as_array().expect("reference array");
+    assert_eq!(locations.len(), 5_001);
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&uses).to_string())
+            .count(),
+        5_000
+    );
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&declaration).to_string())
+            .count(),
+        1
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_repeated_include_maps_non_bmp_crlf_ranges_once() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let main = temp.path().join("Main.pas");
+    let uses = temp.path().join("Uses.inc");
+    let main_source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "const SharedValue = 1;\r\n",
+        "implementation\r\n",
+        "procedure Run;\r\n",
+        "begin\r\n",
+        "{$I Uses.inc}\r\n",
+        "{$I Uses.inc}\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    let uses_source = "// 💩\r\n  Log(SharedValue);\r\n";
+    write_file(&main, main_source);
+    write_file(&uses, uses_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("repeated-include-non-bmp-crlf".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("non-BMP CRLF references");
+    let locations = result.as_array().expect("reference array");
+    assert_exact_location_signatures(
+        locations,
+        vec![
+            expected_location_signature(&uses, uses_source, "SharedValue", 0),
+            expected_location_signature(&main, main_source, "SharedValue", 0),
+        ],
+    );
+    server.shutdown();
 }
 
 #[test]

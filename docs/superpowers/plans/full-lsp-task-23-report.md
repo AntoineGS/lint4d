@@ -125,3 +125,79 @@ set was rerun after the final implementation.
   - focused final tests `/tmp/opencode/task23-round2-focused-final.out` — SHA-256 `18909af1dd623b80862b148a01d6761b691cb91f89fb062bc94ae54145cb741f`
 
 No merge, push, Task24 integration, or independent approval was performed.
+
+## Round-three corrective disposition (R9.2)
+
+The follow-up R9.2 reproduction exposed a remaining boundary: one physical
+binding queried through three repeated `Uses.inc` inclusions produced 14,998
+virtual occurrences but only 5,000 unique physical locations. The per-virtual-
+context 10,000-entry limit rejected that valid result before source-map
+deduplication.
+
+The navigation layer now exposes work-budgeted virtual binding collection
+without applying the public result cap. `BindingWorkBudget` and the existing
+cancel-aware source-map budget still bound traversal, resolution, mapping, and
+retained vectors. The workspace layer maps every retained virtual location to
+an exact physical URI/range, deduplicates across repeated inclusions and
+different root contexts, and applies the 10,000 physical-location cap only
+after that mapping. Over-limit analysis still returns an error before partial
+delivery; under-limit partial results retain their existing chunked behavior.
+
+Boundary coverage now includes:
+
+- `source_bearing_repeated_include_deduplicates_before_reference_cap`: three
+  repeated root inclusions, 4,999 virtual uses, and 5,000 unique physical
+  results;
+- `source_bearing_mixed_roots_and_repeated_includes_deduplicate_physical_results`:
+  repeated inclusions across two roots;
+- `source_bearing_reverse_contexts_count_deduplicated_physical_results` and
+  `references_and_highlights_enforce_exact_10000_entry_boundaries`: exact
+  10,000/over-10,000 physical boundaries, including partial-result success and
+  over-limit delivery with no chunks;
+- `source_bearing_repeated_include_maps_non_bmp_crlf_ranges_once`: exact
+  physical UTF-16 ranges through non-BMP CRLF include text; and
+- the existing ambiguous-context controls
+  `workspace_queries_reject_an_incomplete_non_priority_consumer_context` and
+  `workspace_queries_reject_a_missing_optset_in_a_non_priority_consumer_context`.
+
+### Round-three evidence hashes
+
+- RED repeated-include reproduction
+  `/tmp/opencode/task23-round3-red-r9-2.out` — SHA-256
+  `fca66b1038ed51d9be3c53a14dc839907db7b8bc6d66bccb38341d6465c93a2a`
+- RED mixed-root/repeated reproduction
+  `/tmp/opencode/task23-round3-red-r9-2-mixed.out` — SHA-256
+  `aae80911f001ee7228bb221e0b2b8926a2afa1ed0d394704b7462db990b01962`
+- focused source-bearing GREEN set
+  `/tmp/opencode/task23-round3-focused-final.out` — SHA-256
+  `d7590c76da3ad7314452d7892238f3528d84e335e74370259c26b2ea9d2251bd`
+- exact physical-boundary GREEN check
+  `/tmp/opencode/task23-round3-green-r9-2-exact-boundaries.out` — SHA-256
+  `865e182bed5428a9d23ef70e3e2dc5fb492eb154c5d8604fe74ade1b91e0eb6c`
+- response-bound/partial and ambiguity controls
+  `/tmp/opencode/task23-round3-green-r9-2-response-bound.out` — SHA-256
+  `3e400365239702a0403b0b0817e471409e40874ac358be9eaf1eb12361291997`
+  and `/tmp/opencode/task23-round3-green-r9-2-ambiguous-controls.out` — SHA-256
+  `53356db590da5302c8e27c5ea518ef5d8c26cdaff3fd3830309c2fb6275f2fb1`
+- non-BMP/CRLF mapping check
+  `/tmp/opencode/task23-round3-green-r9-2-nonbmp-crlf.out` — SHA-256
+  `ca04028f8e1e0922984d5bc34f6f629c665f16b5013c2f709805f25f99b2b8ff`
+- workspace check
+  `/tmp/opencode/task23-round3-final-check.out` — SHA-256
+  `a41051563a4cb5fc1b1bcdd9aa0ba28ca80f7736d629d90cc138218756e8e3a9`
+- Clippy
+  `/tmp/opencode/task23-round3-final-clippy.out` — SHA-256
+  `99f71393b9903dca098310bb446022a4bdee195ea9996f351a787195555210a6`
+- workspace tests
+  `/tmp/opencode/task23-round3-final-workspace-tests.out` — SHA-256
+  `bea6a90ddd6b07362a7d37b851dc017fdf614cdc5b5958c297ec67439b6d102e`
+- all Pascal-LSP targets/features, serialized for deterministic protocol
+  harness timing
+  `/tmp/opencode/task23-round3-final-all-targets-all-features-serial.out` —
+  SHA-256
+  `2d4990cffba58a9aab772a6234702075a7a13af24619380cf2aa65c66c3dcc34`
+
+The default parallel all-features harness encountered a transient existing
+protocol timeout; the isolated test passed, and the complete serialized
+all-target/all-feature run passed. No merge, push, Task24 integration, or
+independent approval was performed.

@@ -62,7 +62,7 @@ const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
 const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_RENAME_INCLUDE_OWNER_DISCOVERY: usize = 256;
-const MAX_SNAPSHOT_BINDING_LOCATIONS: usize = 10_000;
+const MAX_SNAPSHOT_PHYSICAL_LOCATIONS: usize = 10_000;
 const MAX_SNAPSHOT_MAPPING_WORK: usize = 1_000_000;
 const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_AUTO_IMPORT_PROVIDER_SOURCES: usize = 512;
@@ -687,16 +687,13 @@ impl RenameSnapshot {
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
         for (query_uri, query_position) in query_positions {
             resolution_budget.charge()?;
-            let query_locations = self
-                .index
-                .binding_locations_with_cancel_and_limit_and_budget(
-                    &query_uri,
-                    query_position,
-                    include_declaration,
-                    cancel,
-                    MAX_SNAPSHOT_BINDING_LOCATIONS,
-                    &mut resolution_budget,
-                )?;
+            let query_locations = self.index.binding_locations_with_cancel_and_work_budget(
+                &query_uri,
+                query_position,
+                include_declaration,
+                cancel,
+                &mut resolution_budget,
+            )?;
             for location in query_locations {
                 for mapped in self.map_location_with_budget(
                     location,
@@ -715,9 +712,9 @@ impl RenameSnapshot {
                         mapped.range.end.character,
                     );
                     if seen.insert(key) {
-                        if locations.len() >= MAX_SNAPSHOT_BINDING_LOCATIONS {
+                        if locations.len() >= MAX_SNAPSHOT_PHYSICAL_LOCATIONS {
                             return Err(format!(
-                                "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
+                                "binding reference result exceeds the {MAX_SNAPSHOT_PHYSICAL_LOCATIONS}-entry limit"
                             ));
                         }
                         locations.push(mapped);
@@ -753,11 +750,10 @@ impl RenameSnapshot {
             resolution_budget.charge()?;
             let query_locations = self
                 .index
-                .binding_locations_in_document_with_cancel_and_limit_and_budget(
+                .binding_locations_in_document_with_cancel_and_work_budget(
                     &query_uri,
                     query_position,
                     cancel,
-                    MAX_SNAPSHOT_BINDING_LOCATIONS,
                     &mut resolution_budget,
                 )?;
             locations.extend(query_locations);
@@ -768,9 +764,11 @@ impl RenameSnapshot {
             &mut virtual_indexes,
             &mut physical_indexes,
         )?;
-        if locations.len() > MAX_SNAPSHOT_BINDING_LOCATIONS {
+        // This is deliberately after physical mapping/deduplication: one
+        // source occurrence can be visited by several virtual include roots.
+        if locations.len() > MAX_SNAPSHOT_PHYSICAL_LOCATIONS {
             return Err(format!(
-                "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
+                "binding reference result exceeds the {MAX_SNAPSHOT_PHYSICAL_LOCATIONS}-entry limit"
             ));
         }
         Ok(locations)

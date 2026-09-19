@@ -13,6 +13,9 @@ use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::ops::Range;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 const MAX_DIRECTIVES: usize = 16_384;
 const MAX_CONDITIONAL_DEPTH: usize = 256;
 const MAX_EXPRESSION_TOKENS: usize = 256;
@@ -21,6 +24,11 @@ const MAX_ENVIRONMENT_ENTRIES: usize = 32_768;
 const MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
 const MAX_ENVIRONMENT_WORK: usize = 1_000_000;
 const MAX_ENVIRONMENT_BYTE_WORK: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static SYMBOL_NORMALIZATION_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 pub use pascal_project::ConditionalFact as Truth;
 pub use pascal_project::{CompilerVersion, ConditionalContext, ConstantValue};
@@ -272,6 +280,9 @@ impl ConditionalEnvironment {
             }
         }
         for (symbol, value) in &context.defines {
+            if !admit_raw_context_key(budget, symbol) {
+                return None;
+            }
             let raw_symbol = canonical_symbol_ref(symbol)?;
             if !admit_context_entry(budget, raw_symbol.len(), size_of::<Truth>()) {
                 return None;
@@ -286,6 +297,9 @@ impl ConditionalEnvironment {
             }
         }
         for (option, value) in &context.options {
+            if !admit_raw_context_key(budget, option) {
+                return None;
+            }
             let raw_option = canonical_symbol_ref(option)?;
             if !admit_context_entry(budget, raw_option.len(), size_of::<Truth>()) {
                 return None;
@@ -301,6 +315,9 @@ impl ConditionalEnvironment {
             }
         }
         for (name, value) in &context.constants {
+            if !admit_raw_context_key(budget, name) {
+                return None;
+            }
             let raw_name = canonical_symbol_ref(name)?;
             if !admit_context_entry(
                 budget,
@@ -791,7 +808,16 @@ fn admit_context_entry(
         budget.exhausted = true;
         return false;
     }
-    budget.charge(key_len.max(1)) && budget.charge_bytes(entry_bytes)
+    budget.charge_bytes(entry_bytes)
+}
+
+/// Account for the complete caller-provided key before any trimming,
+/// validation, case folding, or alias normalization can inspect it.  The
+/// length lookup itself is constant time; the first budget charge polls
+/// cancellation before `canonical_symbol_ref` is allowed to scan the input.
+fn admit_raw_context_key(budget: &mut AnalysisBudget<'_>, raw_key: &str) -> bool {
+    let raw_len = raw_key.len();
+    budget.charge(raw_len.max(1)) && budget.charge_bytes(raw_len)
 }
 
 fn analyze_inner(
@@ -1133,6 +1159,8 @@ fn canonical_symbol(symbol: &str) -> Option<String> {
 }
 
 fn canonical_symbol_ref(symbol: &str) -> Option<&str> {
+    #[cfg(test)]
+    SYMBOL_NORMALIZATION_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let symbol = symbol.trim().trim_start_matches('&');
     let mut bytes = symbol.bytes();
     let first = bytes.next()?;
@@ -2961,4 +2989,35 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "writeableconst"
             | "x"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct AlreadyCancelled;
+
+    impl CancellationToken for AlreadyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn cancelled_context_admission_does_not_normalize_raw_keys() {
+        let mut context = ConditionalContext::default();
+        context
+            .defines
+            .insert("X".repeat(2 * 1024 * 1024), Truth::True);
+        SYMBOL_NORMALIZATION_CALLS.with(|calls| calls.set(0));
+
+        let analysis = analyze_with_context_and_cancel("", &context, &AlreadyCancelled);
+
+        assert!(!analysis.complete);
+        let normalizations = SYMBOL_NORMALIZATION_CALLS.with(Cell::get);
+        assert_eq!(
+            normalizations, 0,
+            "raw key was normalized after cancellation"
+        );
+    }
 }

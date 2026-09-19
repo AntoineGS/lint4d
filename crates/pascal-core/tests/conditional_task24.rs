@@ -780,6 +780,77 @@ fn oversized_constant_names_are_rejected_before_key_allocation() {
 }
 
 #[test]
+fn raw_padding_is_bounded_for_defines_options_and_constants() {
+    let padding = " ".repeat(1_000_000);
+
+    let mut defines = ConditionalContext::default();
+    defines.defines.insert(format!("{padding}&K"), Truth::True);
+    let define_analysis =
+        conditional::analyze_with_context("{$IFDEF K}{$DEFINE HIT}{$ENDIF}", &defines);
+    assert!(!define_analysis.complete);
+    assert_eq!(
+        define_analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE HIT"))
+            .expect("define branch")
+            .activity,
+        Truth::Unknown
+    );
+
+    let mut options = ConditionalContext::default();
+    options.options.insert(format!("{padding}&R"), Truth::True);
+    let option_analysis =
+        conditional::analyze_with_context("{$IFOPT R+}{$DEFINE HIT}{$ENDIF}", &options);
+    assert!(!option_analysis.complete);
+    assert_eq!(
+        option_analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE HIT"))
+            .expect("option branch")
+            .activity,
+        Truth::Unknown
+    );
+
+    let mut constants = ConditionalContext::default();
+    constants
+        .constants
+        .insert(format!("{padding}&Limit"), ConstantValue::Integer(1));
+    let constant_analysis =
+        conditional::analyze_with_context("{$IF Limit = 1}{$DEFINE HIT}{$ENDIF}", &constants);
+    assert!(!constant_analysis.complete);
+    assert_eq!(
+        constant_analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE HIT"))
+            .expect("constant branch")
+            .activity,
+        Truth::Unknown
+    );
+}
+
+#[test]
+fn raw_key_work_budget_accepts_the_exact_boundary() {
+    let mut context = ConditionalContext::default();
+    context
+        .defines
+        .insert(format!("{}&K", " ".repeat(999_998)), Truth::True);
+    let analysis = conditional::analyze_with_context("{$IFDEF K}{$DEFINE HIT}{$ENDIF}", &context);
+    assert!(analysis.complete);
+    assert_eq!(
+        analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE HIT"))
+            .expect("boundary branch")
+            .activity,
+        Truth::True
+    );
+}
+
+#[test]
 fn cancelled_large_casefolded_admission_stops_before_retaining_the_context() {
     let mut context = ConditionalContext::default();
     for index in 0..8_000 {

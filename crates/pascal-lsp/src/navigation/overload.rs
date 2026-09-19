@@ -2001,20 +2001,8 @@ fn default_property_result_type(
     if !lookup.ancestry_known || !lookup.ambiguous_names.is_empty() {
         return Ok(None);
     }
-    let candidates = index.filter_accessible_candidates_with_state_and_budget(
-        current_uri,
-        current_document,
-        offset,
-        lookup.candidates,
-        state,
-        cancel,
-        budget,
-    )?;
-    if state_has_uncertainty(state) {
-        return Ok(None);
-    }
     let mut properties = Vec::new();
-    for member in candidates {
+    for member in lookup.candidates {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         let Some(member_symbol) = index.symbol(&member) else {
@@ -2025,6 +2013,18 @@ fn default_property_result_type(
         {
             properties.push(member);
         }
+    }
+    let properties = index.filter_accessible_candidates_with_state_and_budget(
+        current_uri,
+        current_document,
+        offset,
+        properties,
+        state,
+        cancel,
+        budget,
+    )?;
+    if state_has_uncertainty(state) {
+        return Ok(None);
     }
     let Some(property) = properties.first().filter(|_| properties.len() == 1) else {
         return Ok(None);

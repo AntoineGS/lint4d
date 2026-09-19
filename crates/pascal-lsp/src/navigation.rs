@@ -14775,6 +14775,119 @@ mod tests {
     }
 
     #[test]
+    fn round5_r3_public_default_property_ignores_unrelated_inaccessible_members() {
+        let local_uri = Url::parse("file:///tmp/semantic-round5-r3-public-default.pas")
+            .expect("R5 public-default URI");
+        let local = concat!(
+            "unit SemanticRound5R3PublicDefault;\n",
+            "interface\n",
+            "type\n",
+            "  TFieldBox = class\n",
+            "  public\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "    property Items[Index: Integer]: Integer read GetItem; default;\n",
+            "  strict private\n",
+            "    Unrelated: Integer;\n",
+            "  end;\n",
+            "  TGetterBox = class\n",
+            "  strict private\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "  public\n",
+            "    property Items[Index: Integer]: Integer read GetItem; default;\n",
+            "  end;\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var B: Boolean; FieldBox: TFieldBox; GetterBox: TGetterBox;\n",
+            "begin\n",
+            "  B := FieldBox[0];\n",
+            "  TakeBoolean(FieldBox[0]);\n",
+            "  B := GetterBox[0];\n",
+            "  TakeBoolean(GetterBox[0]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let provider_uri = Url::parse("file:///tmp/semantic-round5-r3-private-getter.pas")
+            .expect("R5 private-getter provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-round5-r3-imported-default.pas")
+            .expect("R5 imported-default URI");
+        let provider = concat!(
+            "unit SemanticRound5R3PrivateGetter;\n",
+            "interface\n",
+            "type\n",
+            "  TImportedBox = class\n",
+            "  strict private\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "  public\n",
+            "    property Items[Index: Integer]: Integer read GetItem; default;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit SemanticRound5R3ImportedDefault;\n",
+            "interface\n",
+            "uses SemanticRound5R3PrivateGetter;\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var B: Boolean; Imported: TImportedBox;\n",
+            "begin\n",
+            "  B := Imported[0];\n",
+            "  TakeBoolean(Imported[0]);\n",
+            "end;\n",
+            "end.\n",
+        );
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(local_uri.clone(), local.to_owned())
+            .expect("R5 local public-default fixture parses");
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("R5 private-getter provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("R5 imported-default fixture parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("SemanticRound5R3PrivateGetter".to_owned(), provider_uri)],
+        );
+
+        let local_diagnostics = index
+            .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
+            .expect("R5 local public-default diagnostics complete");
+        assert_eq!(
+            local_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "type mismatch: cannot assign 'Integer' to 'Boolean'",
+                "incompatible argument: expected 'Boolean', found 'Integer'",
+                "type mismatch: cannot assign 'Integer' to 'Boolean'",
+                "incompatible argument: expected 'Boolean', found 'Integer'",
+            ],
+            "unrelated private fields and private getters must not poison public default properties: {local_diagnostics:?}"
+        );
+
+        let imported_diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("R5 imported public-default diagnostics complete");
+        assert_eq!(
+            imported_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "type mismatch: cannot assign 'Integer' to 'Boolean'",
+                "incompatible argument: expected 'Boolean', found 'Integer'",
+            ],
+            "a public property may expose a private getter across units: {imported_diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn correction_r4_accepts_known_nil_references_and_suppresses_unknown_aliases() {
         let uri = Url::parse("file:///tmp/semantic-correction-r4.pas").expect("R4 URI");
         let source = concat!(

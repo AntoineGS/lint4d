@@ -5658,14 +5658,20 @@ impl NavigationIndex {
     }
 
     fn unit_export_domain_for_uri(&self, unit_uri: &Url) -> UnitExportDomain {
-        match self.implicit_system_namespace_status() {
-            ImplicitSystemNamespaceStatus::SourceBacked { uri } if &uri == unit_uri => {
-                // A source-backed System proves the selected unit identity
-                // and its source exports, but not the compiler/runtime export
-                // surface that is absent from that source catalogue.
-                UnitExportDomain::OpenImplicitSystem
-            }
-            _ => UnitExportDomain::Closed,
+        let Some(unit_document) = self.documents.get(unit_uri) else {
+            return UnitExportDomain::Unknown;
+        };
+        if unit_document.unit_name.is_empty() {
+            return UnitExportDomain::Unknown;
+        }
+        if unit_document.unit_name == "system" {
+            // A selected System document proves the source unit identity and
+            // its source exports, but not the compiler/runtime export surface
+            // that is absent from that source catalogue.  Other retained
+            // System documents do not change the selected document's domain.
+            UnitExportDomain::OpenImplicitSystem
+        } else {
+            UnitExportDomain::Closed
         }
     }
 
@@ -8933,6 +8939,7 @@ struct ReceiverLookupScope {
 enum UnitExportDomain {
     Closed,
     OpenImplicitSystem,
+    Unknown,
 }
 
 impl ResolutionState {
@@ -13396,6 +13403,71 @@ mod tests {
                 )
                 .expect("known System proof status"),
             SemanticProofStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_selected_system_domain_open_with_another_retained_system() {
+        let first_system_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-selected-system-first.pas")
+                .expect("first System URI");
+        let second_system_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-selected-system-second.pas")
+                .expect("second System URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-selected-system-consumer.pas")
+                .expect("consumer URI");
+        let system = concat!(
+            "unit System;\n",
+            "interface\n",
+            "const KnownSystem = 1;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses System;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  System.ExitCode := 0;\n",
+            "  I := System.Round(1.2);\n",
+            "  I := System.KnownSystem;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(first_system_uri.clone(), system.to_owned())
+            .expect("first System parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("System".to_owned(), first_system_uri)),
+        );
+
+        assert!(
+            index
+                .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+                .expect("single-System diagnostics complete")
+                .is_empty(),
+            "the selected source-backed System domain stays open"
+        );
+
+        index
+            .update(second_system_uri, system.to_owned())
+            .expect("second System parses");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("multi-System diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "another retained System must not close the selected System domain: {diagnostics:?}"
         );
     }
 

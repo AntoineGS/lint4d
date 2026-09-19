@@ -2091,6 +2091,58 @@ fn standard_workspace() -> (TempDir, PathBuf, PathBuf, String, String) {
     (temp, main, provider, main_source, provider_source)
 }
 
+#[test]
+fn numeric_compiler_version_rename_edits_only_the_active_branch() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Probe.pas");
+    let source = concat!(
+        "unit Probe;\n",
+        "interface\n",
+        "var Counter: Integer;\n",
+        "implementation\n",
+        "procedure P;\n",
+        "begin\n",
+        "{$IF CompilerVersion = 18.50}\n",
+        "  Counter := 1;\n",
+        "{$ELSE}\n",
+        "  Counter := 2;\n",
+        "{$ENDIF}\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({"compilerVersion": "18.5"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let request_id = RequestId::from("numeric-compiler-version-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": {"line": 2, "character": 4},
+            "newName": "Updated"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "rename failed: {response:?}");
+    let edit = response.result.expect("rename edit");
+    assert_exact_rename_edits(&edit, &source_path, source, "Counter", 2, "Updated");
+    assert!(!edit.to_string().contains("\"line\":9"));
+    server.shutdown();
+}
+
 #[cfg(unix)]
 #[test]
 fn delphi_overrides_user_config_navigates_to_native_source() {

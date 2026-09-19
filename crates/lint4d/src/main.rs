@@ -456,6 +456,7 @@ fn lint_project_file(
     let options = CfgSnapshotOptions {
         prepare_configured_sources: true,
         configuration_id: Some(source_project.configuration_id.clone()),
+        conditional_context: conditional_context.clone(),
         preparation_environment: cfg_pascal::PreparationEnvironment::Partial,
         initial_defined_symbols: conditional_context
             .defines

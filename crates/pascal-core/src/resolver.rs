@@ -874,7 +874,15 @@ impl<S: SourceStore> UnitResolver<S> {
             let include_route = self.legacy_routes.get(&importer.source.id).cloned();
             let conditional_context = self.context.effective_conditional_context();
             let mut conditional_environment =
-                crate::conditional::ConditionalEnvironment::from_context(&conditional_context);
+                match crate::conditional::ConditionalEnvironment::try_from_context(
+                    &conditional_context,
+                ) {
+                    Some(environment) => environment,
+                    None => {
+                        complete = false;
+                        crate::conditional::ConditionalEnvironment::default()
+                    }
+                };
             let include_result = self.resolve_includes_for_source(
                 &importer.source,
                 &mut conditional_environment,

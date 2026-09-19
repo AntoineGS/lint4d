@@ -316,7 +316,7 @@ fn project_conditional_metadata_fills_only_unknown_explicit_facts() {
     );
     assert_eq!(
         context.conditional_context.option("RANGE_CHECKS"),
-        ConditionalFact::True
+        ConditionalFact::False
     );
     assert_eq!(
         context.conditional_context.constant("BuildLevel"),
@@ -325,5 +325,64 @@ fn project_conditional_metadata_fills_only_unknown_explicit_facts() {
     assert_eq!(
         context.conditional_context.define("PROJECT_DEFINE"),
         ConditionalFact::True
+    );
+}
+
+#[test]
+fn documented_compiler_version_property_is_discovered() {
+    let directory = tempdir().expect("temporary workspace");
+    let source = directory.path().join("Main.pas");
+    let project = directory.path().join("App.dproj");
+    write(&source, "unit Main; interface implementation end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><CompilerVersion>18.5</CompilerVersion></PropertyGroup></Project>",
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[directory.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .expect("project discovery");
+
+    assert_eq!(
+        context.conditional_context.compiler_version,
+        Some(CompilerVersion::parse("18.5").expect("version"))
+    );
+}
+
+#[test]
+fn conflicting_compiler_version_properties_remain_unknown() {
+    let directory = tempdir().expect("temporary workspace");
+    let source = directory.path().join("Main.pas");
+    let project = directory.path().join("App.dproj");
+    write(&source, "unit Main; interface implementation end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><CompilerVersion>18.5</CompilerVersion><DCC_CompilerVersion>24.0</DCC_CompilerVersion></PropertyGroup></Project>",
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[directory.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .expect("project discovery");
+
+    assert_eq!(context.conditional_context.compiler_version, None);
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("conflicting CompilerVersion"))
     );
 }

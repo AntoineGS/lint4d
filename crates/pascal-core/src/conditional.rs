@@ -6,8 +6,9 @@
 //! [`Truth::Unknown`].
 
 use crate::resolver::{CancellationToken, NoCancellation};
+use pascal_project::canonical_option_name;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::ops::Range;
@@ -45,6 +46,10 @@ pub struct ConditionalDirective {
     pub end: usize,
     /// Whether the directive itself is in a branch that may execute.
     pub activity: Truth,
+    /// The condition evaluated by an IF/ELSEIF directive, when its expression
+    /// was syntactically supported.  This is used by downstream configured
+    /// projections; an unknown condition remains `None`.
+    pub condition: Option<Truth>,
 }
 
 impl ConditionalDirective {
@@ -219,8 +224,10 @@ pub struct ConditionalEnvironment {
     values: HashMap<String, Truth>,
     options: HashMap<String, Truth>,
     constants: BTreeMap<String, ConstantValue>,
+    source_constants: BTreeSet<String>,
     compiler_version: Option<CompilerVersion>,
     bytes: usize,
+    rejected_context: bool,
 }
 
 impl ConditionalEnvironment {
@@ -233,18 +240,55 @@ impl ConditionalEnvironment {
     }
 
     pub fn from_context(context: &ConditionalContext) -> Self {
+        Self::try_from_context(context).unwrap_or_else(|| Self {
+            rejected_context: true,
+            ..Self::default()
+        })
+    }
+
+    /// Build an environment without cloning any retained payload until all
+    /// entry and byte limits have been checked.
+    pub fn try_from_context(context: &ConditionalContext) -> Option<Self> {
         let mut environment = Self::new();
-        environment.compiler_version = context.compiler_version;
+        if let Some(version) = context.compiler_version {
+            if !environment.set_compiler_version(version) {
+                return None;
+            }
+        }
         for (symbol, value) in &context.defines {
-            environment.insert_value(symbol.clone(), *value);
+            let symbol = canonical_symbol(symbol)?;
+            let value = environment
+                .get(&symbol)
+                .copied()
+                .map_or(*value, |previous| previous.merge(*value));
+            if !environment.try_insert_value(&symbol, value) {
+                return None;
+            }
         }
         for (option, value) in &context.options {
-            environment.insert_option(option.clone(), *value);
+            let option = canonical_option_name(option)?;
+            let value = environment
+                .options
+                .get(&option)
+                .copied()
+                .map_or(*value, |previous| previous.merge(*value));
+            if !environment.try_insert_option(&option, value) {
+                return None;
+            }
         }
         for (name, value) in &context.constants {
-            environment.insert_constant(name.clone(), value.clone());
+            let name = canonical_symbol(name)?;
+            if let Some(previous) = environment.constants.get(&name) {
+                if previous != value {
+                    return None;
+                }
+                continue;
+            }
+            if !environment.try_insert_constant(&name, value) {
+                return None;
+            }
         }
-        environment
+        Some(environment)
     }
 
     pub fn to_context(&self) -> ConditionalContext {
@@ -265,24 +309,131 @@ impl ConditionalEnvironment {
     }
 
     fn insert_value(&mut self, key: String, value: Truth) {
-        self.account_key(&key);
+        self.replace_fact_bytes(&key, self.value_entry_size(&key));
         self.values.insert(key, value);
     }
 
     fn insert_option(&mut self, key: String, value: Truth) {
-        self.account_key(&key);
+        self.replace_option_bytes(&key, self.value_entry_size(&key));
         self.options.insert(key, value);
     }
 
     fn insert_constant(&mut self, key: String, value: ConstantValue) {
-        self.account_key(&key);
+        self.replace_constant_bytes(&key, self.constant_entry_size(&key, &value));
         self.constants.insert(key, value);
     }
 
-    fn account_key(&mut self, key: &str) {
+    fn value_entry_size(&self, key: &str) -> usize {
+        key.len().saturating_add(size_of::<Truth>())
+    }
+
+    fn constant_entry_size(&self, key: &str, value: &ConstantValue) -> usize {
+        key.len()
+            .saturating_add(size_of::<ConstantValue>())
+            .saturating_add(constant_size(value))
+    }
+
+    fn replace_fact_bytes(&mut self, key: &str, new_bytes: usize) {
+        let old_bytes = self
+            .values
+            .contains_key(key)
+            .then(|| self.value_entry_size(key))
+            .unwrap_or(0);
         self.bytes = self
             .bytes
-            .saturating_add(key.len().saturating_add(size_of::<Truth>()));
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+    }
+
+    fn replace_option_bytes(&mut self, key: &str, new_bytes: usize) {
+        let old_bytes = self
+            .options
+            .contains_key(key)
+            .then(|| self.value_entry_size(key))
+            .unwrap_or(0);
+        self.bytes = self
+            .bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+    }
+
+    fn replace_constant_bytes(&mut self, key: &str, new_bytes: usize) {
+        let old_bytes = self
+            .constants
+            .get(key)
+            .map(|value| self.constant_entry_size(key, value))
+            .unwrap_or(0);
+        self.bytes = self
+            .bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+    }
+
+    fn set_compiler_version(&mut self, version: CompilerVersion) -> bool {
+        let old_bytes = if self.compiler_version.is_some() {
+            size_of::<CompilerVersion>()
+        } else {
+            0
+        };
+        let new_bytes = size_of::<CompilerVersion>();
+        let Some(bytes) = self.bytes.saturating_sub(old_bytes).checked_add(new_bytes) else {
+            return false;
+        };
+        if bytes > MAX_ENVIRONMENT_BYTES {
+            return false;
+        }
+        self.bytes = bytes;
+        self.compiler_version = Some(version);
+        true
+    }
+
+    fn try_insert_value(&mut self, key: &str, value: Truth) -> bool {
+        let additional = if self.values.contains_key(key) {
+            0
+        } else {
+            self.value_entry_size(key)
+        };
+        if self.len() >= MAX_ENVIRONMENT_ENTRIES && additional > 0 {
+            return false;
+        }
+        if self.bytes.saturating_add(additional) > MAX_ENVIRONMENT_BYTES {
+            return false;
+        }
+        self.insert_value(key.to_owned(), value);
+        true
+    }
+
+    fn try_insert_option(&mut self, key: &str, value: Truth) -> bool {
+        let additional = if self.options.contains_key(key) {
+            0
+        } else {
+            self.value_entry_size(key)
+        };
+        if self.len() >= MAX_ENVIRONMENT_ENTRIES && additional > 0 {
+            return false;
+        }
+        if self.bytes.saturating_add(additional) > MAX_ENVIRONMENT_BYTES {
+            return false;
+        }
+        self.insert_option(key.to_owned(), value);
+        true
+    }
+
+    fn try_insert_constant(&mut self, key: &str, value: &ConstantValue) -> bool {
+        let additional = if let Some(previous) = self.constants.get(key) {
+            self.constant_entry_size(key, value)
+                .saturating_sub(self.constant_entry_size(key, previous))
+        } else {
+            self.constant_entry_size(key, value)
+        };
+        if self.len() >= MAX_ENVIRONMENT_ENTRIES && !self.constants.contains_key(key) {
+            return false;
+        }
+        if self.bytes.saturating_add(additional) > MAX_ENVIRONMENT_BYTES {
+            return false;
+        }
+        self.insert_constant(key.to_owned(), value.clone());
+        true
     }
 
     /// Whether this environment carries any inherited DEFINE/UNDEF facts.
@@ -302,20 +453,27 @@ impl ConditionalEnvironment {
         let mut facts = self.values.iter().collect::<Vec<_>>();
         facts.sort_by(|left, right| left.0.cmp(right.0));
         let mut hasher = DefaultHasher::new();
+        1_u8.hash(&mut hasher);
+        facts.len().hash(&mut hasher);
         for (symbol, value) in facts {
             symbol.hash(&mut hasher);
             value.hash(&mut hasher);
         }
         let mut options = self.options.iter().collect::<Vec<_>>();
         options.sort_by(|left, right| left.0.cmp(right.0));
+        2_u8.hash(&mut hasher);
+        options.len().hash(&mut hasher);
         for (option, value) in options {
             option.hash(&mut hasher);
             value.hash(&mut hasher);
         }
+        3_u8.hash(&mut hasher);
+        self.constants.len().hash(&mut hasher);
         for (name, value) in &self.constants {
             name.hash(&mut hasher);
             value.hash(&mut hasher);
         }
+        4_u8.hash(&mut hasher);
         self.compiler_version.hash(&mut hasher);
         hasher.finish()
     }
@@ -352,28 +510,69 @@ impl ConditionalEnvironment {
         self.values.clear();
         self.options.clear();
         self.constants.clear();
-        self.bytes = 0;
+        self.source_constants.clear();
+        self.bytes = if self.compiler_version.is_some() {
+            size_of::<CompilerVersion>()
+        } else {
+            0
+        };
     }
 
     fn insert(&mut self, key: String, value: Truth) {
-        if !self.values.contains_key(&key) {
-            self.account_key(&key);
-        }
-        self.values.insert(key, value);
+        self.insert_value(key, value);
     }
 
     fn insert_option_value(&mut self, key: String, value: Truth) {
-        if !self.options.contains_key(&key) {
-            self.account_key(&key);
-        }
-        self.options.insert(key, value);
+        self.insert_option(key, value);
     }
 
     fn insert_constant_value(&mut self, key: String, value: ConstantValue) {
-        if !self.constants.contains_key(&key) {
-            self.account_key(&key);
+        self.insert_constant(key, value);
+    }
+
+    fn remove_constant(&mut self, key: &str) {
+        if let Some(value) = self.constants.remove(key) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(self.constant_entry_size(key, &value));
         }
-        self.constants.insert(key, value);
+        self.source_constants.remove(key);
+    }
+
+    fn remove_source_constants(&mut self) {
+        let names = self.source_constants.iter().cloned().collect::<Vec<_>>();
+        for name in names {
+            self.remove_constant(&name);
+        }
+    }
+
+    fn source_constants_fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.source_constants.hash(&mut hasher);
+        for name in &self.source_constants {
+            if let Some(value) = self.constants.get(name) {
+                value.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    fn recompute_bytes(&mut self) {
+        let mut bytes = if self.compiler_version.is_some() {
+            size_of::<CompilerVersion>()
+        } else {
+            0
+        };
+        for key in self.values.keys() {
+            bytes = bytes.saturating_add(self.value_entry_size(key));
+        }
+        for key in self.options.keys() {
+            bytes = bytes.saturating_add(self.value_entry_size(key));
+        }
+        for (key, value) in &self.constants {
+            bytes = bytes.saturating_add(self.constant_entry_size(key, value));
+        }
+        self.bytes = bytes;
     }
 }
 
@@ -526,13 +725,16 @@ pub fn analyze_with_include_callback(
     ) -> IncludeTransition,
 ) -> ConditionalAnalysis {
     let lexed = lex_directives(source, Some(cancel));
+    let initial_complete = !environment.rejected_context
+        && environment.len() <= MAX_ENVIRONMENT_ENTRIES
+        && environment.bytes() <= MAX_ENVIRONMENT_BYTES;
     analyze_lexed(
         source,
         lexed,
         environment,
         Some(cancel),
         Some(include),
-        true,
+        initial_complete,
     )
 }
 
@@ -566,7 +768,11 @@ fn analyze_lexed(
         exhausted: false,
     };
     let mut complete = initial_complete && lexed.complete;
-    let mut active = Truth::True;
+    let mut active = if initial_complete {
+        Truth::True
+    } else {
+        Truth::Unknown
+    };
     let mut frames = Vec::new();
     let mut inactive_spans = Vec::new();
     let mut unknown_spans = Vec::new();
@@ -604,6 +810,7 @@ fn analyze_lexed(
             start: raw.start,
             end: raw.end,
             activity: active,
+            condition: None,
         });
 
         match kind {
@@ -613,6 +820,9 @@ fn analyze_lexed(
                     active = Truth::Unknown;
                 } else {
                     let condition = evaluate_condition(&raw.body, environment, &mut complete);
+                    if let Some(directive) = directives.last_mut() {
+                        directive.condition = Some(condition);
+                    }
                     let Some(before_environment) = clone_environment(environment, &mut budget)
                     else {
                         complete = false;
@@ -670,6 +880,9 @@ fn analyze_lexed(
                     frame.remaining = Truth::False;
                 } else {
                     let condition = evaluate_condition(&raw.body, environment, &mut complete);
+                    if let Some(directive) = directives.last_mut() {
+                        directive.condition = Some(condition);
+                    }
                     frame.current_active = frame.parent_active.and(frame.remaining).and(condition);
                     frame.remaining = frame.remaining.and(condition.not());
                 }
@@ -716,6 +929,7 @@ fn analyze_lexed(
                 // include boundary.
                 if active == Truth::True {
                     if let Some(include) = include.as_deref_mut() {
+                        let source_constants_before = environment.source_constants_fingerprint();
                         let transition = include(
                             directives.last().expect("include directive was recorded"),
                             environment,
@@ -725,6 +939,14 @@ fn analyze_lexed(
                         }
                         if !transition.environment_known {
                             environment.clear();
+                        } else if environment.source_constants_fingerprint()
+                            != source_constants_before
+                        {
+                            // A source-derived constant may belong to a local
+                            // include/routine scope.  It is not safe to carry
+                            // it back to the including frame without a full
+                            // binding identity proof.
+                            environment.remove_source_constants();
                         }
                     } else {
                         environment.clear();
@@ -792,7 +1014,7 @@ fn initial_environment(
     context: &ConditionalContext,
     budget: &mut AnalysisBudget<'_>,
 ) -> Option<ConditionalEnvironment> {
-    let environment = ConditionalEnvironment::from_context(context);
+    let environment = ConditionalEnvironment::try_from_context(context)?;
     for define in context.defines.keys() {
         if !budget.charge(1) {
             return None;
@@ -818,6 +1040,7 @@ fn initial_environment(
     }
     if !budget.check_environment_bytes(environment.bytes())
         || environment.len() > MAX_ENVIRONMENT_ENTRIES
+        || !budget.charge_bytes(environment.bytes())
     {
         budget.exhausted = true;
         return None;
@@ -827,10 +1050,10 @@ fn initial_environment(
 
 fn canonical_symbol(symbol: &str) -> Option<String> {
     let symbol = symbol.trim().trim_start_matches('&');
-    if symbol.is_empty()
-        || !symbol
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+    let mut bytes = symbol.bytes();
+    let first = bytes.next()?;
+    if (!first.is_ascii_alphabetic() && first != b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
     {
         return None;
     }
@@ -872,7 +1095,11 @@ fn apply_fact(
     let next = match activity {
         Truth::True => value,
         Truth::False => previous,
-        Truth::Unknown => previous.merge(value),
+        // The current environment is the environment under the branch
+        // assumption.  Reachability uncertainty is handled by the enclosing
+        // frame's exit merge; merging here would lose facts equal on every
+        // unknown branch.
+        Truth::Unknown => value,
     };
     if let Some(symbol) = canonical_symbol(symbol) {
         if !budget.charge_bytes(symbol.len()) {
@@ -906,7 +1133,7 @@ fn apply_option_fact(
     if !budget.charge(1) {
         return false;
     }
-    let key = match canonical_symbol(option) {
+    let key = match canonical_option_name(option) {
         Some(key) => key,
         None => return false,
     };
@@ -914,7 +1141,7 @@ fn apply_option_fact(
     let next = match activity {
         Truth::True => value,
         Truth::False => previous,
-        Truth::Unknown => previous.merge(value),
+        Truth::Unknown => value,
     };
     if !budget.charge_bytes(key.len()) {
         return false;
@@ -955,25 +1182,43 @@ fn is_option_directive(body: &str) -> bool {
     }
     let base = keyword.trim_end_matches(['+', '-']);
     is_harmless_keyword(base)
-        || matches!(
-            base,
-            "b" | "booleval"
-                | "c"
-                | "codepage"
-                | "hints"
-                | "i"
-                | "ioerrors"
-                | "optimization"
-                | "overflowchecks"
-                | "q"
-                | "rangechecks"
-                | "r"
-                | "referenceinfo"
-                | "runtimechecks"
-                | "typedaddress"
-                | "u"
-                | "x"
-        )
+        || supported_option_name(base).is_some()
+        || keyword.ends_with(['+', '-'])
+        || state_value_word(directive_arguments(body))
+}
+
+fn state_value_word(argument: &str) -> bool {
+    argument
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("no")
+                || value == "+"
+                || value == "-"
+        })
+}
+
+fn supported_option_name(name: &str) -> Option<String> {
+    let name = canonical_option_name(name)?;
+    matches!(
+        name.as_str(),
+        "R" | "O"
+            | "Q"
+            | "C"
+            | "B"
+            | "I"
+            | "X"
+            | "U"
+            | "RUNTIME_CHECKS"
+            | "DEBUG_INFORMATION"
+            | "REFERENCE_INFO"
+    )
+    .then_some(name)
 }
 
 fn apply_option_directive(
@@ -995,29 +1240,57 @@ fn apply_option_directive(
                 .map(|name| (name, Some(Truth::False)))
         })
         .unwrap_or((keyword, None));
-    let value = suffix_value.or_else(|| {
-        match argument
-            .split_ascii_whitespace()
-            .next()
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("on" | "true" | "+" | "yes") => Some(Truth::True),
-            Some("off" | "false" | "-" | "no") => Some(Truth::False),
-            None => None,
-            _ => None,
+    let malformed_suffix = name.ends_with(['+', '-']);
+    let normalized_name = name.trim_end_matches(['+', '-']);
+    let Some(canonical_name) = supported_option_name(normalized_name) else {
+        if suffix_value.is_some() || state_value_word(argument) {
+            if let Some(canonical_name) = canonical_option_name(normalized_name) {
+                return apply_option_fact(
+                    environment,
+                    &canonical_name,
+                    Truth::Unknown,
+                    activity,
+                    budget,
+                );
+            }
         }
-    });
-    let Some(value) = value else {
         // Many harmless compiler directives carry a directive-specific value
         // rather than an on/off switch (for example `WARN SYMBOL_DEPRECATED
         // OFF`, `MESSAGE ERROR 'text'`, or `APPTYPE CONSOLE`).  They do not
-        // establish a fact consumed by the conditional evaluator, so an
-        // unsupported value on one of these directives must not make an
-        // otherwise well-formed analysis incomplete.
-        return is_harmless_keyword(&name.trim_end_matches(['+', '-']).to_ascii_lowercase());
+        // establish a fact consumed by the conditional evaluator.
+        return is_harmless_keyword(&normalized_name.to_ascii_lowercase());
     };
-    apply_option_fact(environment, name, value, activity, budget)
+    let value = if malformed_suffix {
+        Truth::Unknown
+    } else {
+        match suffix_value {
+            Some(value) if argument.is_empty() => value,
+            Some(_) => Truth::Unknown,
+            None => {
+                let mut words = argument.split_ascii_whitespace();
+                match (words.next(), words.next()) {
+                    (Some(value), None)
+                        if value.eq_ignore_ascii_case("on")
+                            || value.eq_ignore_ascii_case("true")
+                            || value.eq_ignore_ascii_case("+")
+                            || value.eq_ignore_ascii_case("yes") =>
+                    {
+                        Truth::True
+                    }
+                    (Some(value), None)
+                        if value.eq_ignore_ascii_case("off")
+                            || value.eq_ignore_ascii_case("false")
+                            || value.eq_ignore_ascii_case("-")
+                            || value.eq_ignore_ascii_case("no") =>
+                    {
+                        Truth::False
+                    }
+                    _ => Truth::Unknown,
+                }
+            }
+        }
+    };
+    apply_option_fact(environment, &canonical_name, value, activity, budget)
 }
 
 fn observe_source_constants(
@@ -1028,7 +1301,7 @@ fn observe_source_constants(
     complete: &mut bool,
     budget: &mut AnalysisBudget<'_>,
 ) -> bool {
-    if activity != Truth::True || range.start >= range.end {
+    if activity == Truth::False || range.start >= range.end {
         return true;
     }
     let Some(text) = source.get(range.clone()) else {
@@ -1048,7 +1321,18 @@ fn observe_source_constants(
         if !text[keyword_start..keyword_end].eq_ignore_ascii_case("const") {
             continue;
         }
-        if !source_constant_is_provably_global(source, range.start.saturating_add(keyword_start)) {
+        let Some(is_global) = source_constant_is_provably_global(
+            source,
+            range.start.saturating_add(keyword_start),
+            budget,
+        ) else {
+            return false;
+        };
+        if !is_global {
+            // A local/class/record declaration can shadow an already-known
+            // unit fact.  Without binding identity, invalidate all
+            // source-derived constants instead of retaining the outer value.
+            environment.remove_source_constants();
             continue;
         }
         let mut declaration = keyword_end;
@@ -1091,25 +1375,18 @@ fn observe_source_constants(
                     *complete = false;
                     return false;
                 };
-                if !budget.charge_bytes(name.len().saturating_add(constant_size(&value))) {
+                if !budget.charge_bytes(
+                    name.len()
+                        .saturating_add(size_of::<ConstantValue>())
+                        .saturating_add(constant_size(&value)),
+                ) {
                     return false;
                 }
-                if !environment.constants.contains_key(&name)
-                    && environment.len() >= MAX_ENVIRONMENT_ENTRIES
-                {
+                if !environment.try_insert_constant(&name, &value) {
                     budget.exhausted = true;
                     return false;
                 }
-                if !environment.constants.contains_key(&name)
-                    && !budget.check_environment_bytes(
-                        environment
-                            .bytes()
-                            .saturating_add(name.len().saturating_add(constant_size(&value))),
-                    )
-                {
-                    return false;
-                }
-                environment.insert_constant_value(name, value);
+                environment.source_constants.insert(name);
             }
             declaration = end.saturating_add(1);
         }
@@ -1122,13 +1399,23 @@ fn observe_source_constants(
 /// not belong in this bounded directive evaluator: once a routine or block
 /// introducer has appeared, a later `const` may be local and must not be
 /// treated as a compiler-wide fact.
-fn source_constant_is_provably_global(source: &str, keyword_start: usize) -> bool {
+fn source_constant_is_provably_global(
+    source: &str,
+    keyword_start: usize,
+    budget: &mut AnalysisBudget<'_>,
+) -> Option<bool> {
     let Some(prefix) = source.get(..keyword_start) else {
-        return false;
+        return Some(false);
     };
+    if !budget.charge(prefix.len()) || !budget.charge_bytes(prefix.len()) {
+        return None;
+    }
     let bytes = prefix.as_bytes();
     let mut cursor = 0;
     while let Some((start, end)) = next_source_identifier(bytes, cursor) {
+        if !budget.poll() {
+            return None;
+        }
         cursor = end;
         let identifier = &prefix[start..end];
         if identifier.eq_ignore_ascii_case("procedure")
@@ -1137,11 +1424,13 @@ fn source_constant_is_provably_global(source: &str, keyword_start: usize) -> boo
             || identifier.eq_ignore_ascii_case("destructor")
             || identifier.eq_ignore_ascii_case("operator")
             || identifier.eq_ignore_ascii_case("begin")
+            || identifier.eq_ignore_ascii_case("class")
+            || identifier.eq_ignore_ascii_case("record")
         {
-            return false;
+            return Some(false);
         }
     }
-    true
+    Some(true)
 }
 
 fn next_source_identifier(bytes: &[u8], mut cursor: usize) -> Option<(usize, usize)> {
@@ -1224,11 +1513,6 @@ fn merge_conditional_environment(
     {
         return None;
     }
-    if frame.parent_active != Truth::True
-        && !merge_environment(&mut merged, &frame.before_environment, budget)
-    {
-        return None;
-    }
     if !frame.has_else
         && frame.remaining != Truth::False
         && !merge_environment(&mut merged, &frame.before_environment, budget)
@@ -1250,33 +1534,52 @@ fn merge_environment(
     if !budget.charge(current.len().saturating_add(incoming.len())) {
         return false;
     }
-    let additional_bytes = incoming
-        .keys()
-        .filter(|key| !current.contains_key(key.as_str()))
-        .map(|key| key.len().saturating_add(size_of::<Truth>()))
-        .chain(
-            incoming
-                .options
-                .keys()
-                .filter(|key| !current.options.contains_key(key.as_str()))
-                .map(|key| key.len().saturating_add(size_of::<Truth>())),
-        )
-        .chain(
-            incoming
-                .constants
-                .keys()
-                .filter(|key| !current.constants.contains_key(key.as_str()))
-                .map(|key| key.len().saturating_add(size_of::<ConstantValue>())),
-        )
-        .try_fold(0usize, |total, bytes| total.checked_add(bytes));
-    let Some(additional_bytes) = additional_bytes else {
-        budget.exhausted = true;
-        return false;
-    };
-    let Some(merged_bytes) = current.bytes().checked_add(additional_bytes) else {
-        budget.exhausted = true;
-        return false;
-    };
+    let mut keys = current.keys().cloned().collect::<Vec<_>>();
+    keys.extend(incoming.keys().cloned());
+    keys.sort();
+    keys.dedup();
+    let mut option_keys = current.options.keys().cloned().collect::<Vec<_>>();
+    option_keys.extend(incoming.options.keys().cloned());
+    option_keys.sort();
+    option_keys.dedup();
+    let mut constant_keys = current.constants.keys().cloned().collect::<Vec<_>>();
+    constant_keys.extend(incoming.constants.keys().cloned());
+    constant_keys.sort();
+    constant_keys.dedup();
+
+    let mut merged_bytes = current
+        .compiler_version
+        .zip(incoming.compiler_version)
+        .filter(|(left, right)| left == right)
+        .map(|_| size_of::<CompilerVersion>())
+        .unwrap_or(0);
+    for key in &keys {
+        let Some(bytes) = merged_bytes.checked_add(current.value_entry_size(key)) else {
+            budget.exhausted = true;
+            return false;
+        };
+        merged_bytes = bytes;
+    }
+    for key in &option_keys {
+        let Some(bytes) = merged_bytes.checked_add(current.value_entry_size(key)) else {
+            budget.exhausted = true;
+            return false;
+        };
+        merged_bytes = bytes;
+    }
+    for key in &constant_keys {
+        if let (Some(left), Some(right)) = (current.constants.get(key), incoming.constants.get(key))
+        {
+            if left == right {
+                let Some(bytes) = merged_bytes.checked_add(current.constant_entry_size(key, left))
+                else {
+                    budget.exhausted = true;
+                    return false;
+                };
+                merged_bytes = bytes;
+            }
+        }
+    }
     if !budget.check_environment_bytes(merged_bytes)
         || !budget.charge_bytes(
             current
@@ -1287,19 +1590,12 @@ fn merge_environment(
     {
         return false;
     }
-    let mut keys = current.keys().cloned().collect::<Vec<_>>();
-    keys.extend(incoming.keys().cloned());
-    keys.sort();
-    keys.dedup();
+
     for key in keys {
         let left = current.get(&key).copied().unwrap_or(Truth::Unknown);
         let right = incoming.get(&key).copied().unwrap_or(Truth::Unknown);
         current.insert(key, left.merge(right));
     }
-    let mut option_keys = current.options.keys().cloned().collect::<Vec<_>>();
-    option_keys.extend(incoming.options.keys().cloned());
-    option_keys.sort();
-    option_keys.dedup();
     for key in option_keys {
         let left = current.options.get(&key).copied().unwrap_or(Truth::Unknown);
         let right = incoming
@@ -1309,10 +1605,6 @@ fn merge_environment(
             .unwrap_or(Truth::Unknown);
         current.insert_option_value(key, left.merge(right));
     }
-    let mut constant_keys = current.constants.keys().cloned().collect::<Vec<_>>();
-    constant_keys.extend(incoming.constants.keys().cloned());
-    constant_keys.sort();
-    constant_keys.dedup();
     for key in constant_keys {
         let value = match (current.constants.get(&key), incoming.constants.get(&key)) {
             (Some(left), Some(right)) if left == right => Some(left.clone()),
@@ -1321,7 +1613,7 @@ fn merge_environment(
         if let Some(value) = value {
             current.insert_constant_value(key, value);
         } else {
-            current.constants.remove(&key);
+            current.remove_constant(&key);
         }
     }
     current.compiler_version = if current.compiler_version == incoming.compiler_version {
@@ -1329,6 +1621,13 @@ fn merge_environment(
     } else {
         None
     };
+    current
+        .source_constants
+        .extend(incoming.source_constants.iter().cloned());
+    current
+        .source_constants
+        .retain(|name| current.constants.contains_key(name));
+    current.recompute_bytes();
     if current.len() > MAX_ENVIRONMENT_ENTRIES || current.bytes() > MAX_ENVIRONMENT_BYTES {
         budget.exhausted = true;
         return false;
@@ -1578,20 +1877,29 @@ fn evaluate_condition(
             }),
         "if" | "elseif" | "elif" => evaluate_expression(arguments, environment, complete),
         "ifopt" => {
-            let option = arguments.trim().trim_end_matches(['+', '-']);
-            if option.is_empty() {
-                *complete = false;
-                Truth::Unknown
-            } else {
-                let value = environment.option(option);
-                match arguments.trim().chars().last() {
-                    Some('+') => value,
-                    Some('-') => value.not(),
-                    _ => {
-                        *complete = false;
-                        Truth::Unknown
-                    }
+            let argument = arguments.trim();
+            let mut characters = argument.chars();
+            let last = match characters.next_back() {
+                Some(last) => last,
+                None => {
+                    *complete = false;
+                    return Truth::Unknown;
                 }
+            };
+            if !matches!(last, '+' | '-') {
+                *complete = false;
+                return Truth::Unknown;
+            }
+            let option = characters.as_str().trim();
+            let Some(option) = canonical_option_name(option) else {
+                *complete = false;
+                return Truth::Unknown;
+            };
+            let value = environment.option(&option);
+            match last {
+                '+' => value,
+                '-' => value.not(),
+                _ => unreachable!("IFOPT suffix was checked above"),
             }
         }
         _ => {
@@ -1637,6 +1945,7 @@ fn evaluate_typed_expression(
     }
     if parser.malformed || parser.work > MAX_EXPRESSION_TOKENS {
         *complete = false;
+        return Value::Error;
     }
     result
 }
@@ -1920,7 +2229,11 @@ impl ExpressionParser<'_> {
             self.parse_unary().not()
         } else if matches!(self.peek(), ExprToken::Plus) {
             self.take();
-            self.parse_unary()
+            match self.parse_unary() {
+                Value::Number(value) => Value::Number(value),
+                Value::Error => Value::Error,
+                _ => Value::Unknown,
+            }
         } else if matches!(self.peek(), ExprToken::Minus) {
             self.take();
             self.parse_unary().negate()
@@ -1970,31 +2283,27 @@ impl ExpressionParser<'_> {
         };
         self.take();
         let right = self.parse_additive();
-        left = Value::Truth(compare_values(left, right, operator));
+        left = compare_values(left, right, operator);
         left
     }
 
     fn parse_value(&mut self) -> Value {
         match self.take() {
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("defined") => {
-                let symbol = if matches!(self.peek(), ExprToken::LParen) {
-                    self.take();
-                    let symbol = match self.take() {
-                        ExprToken::Identifier(value) => Some(value),
-                        _ => None,
-                    };
-                    if !matches!(self.peek(), ExprToken::RParen) {
-                        self.malformed = true;
-                    } else {
-                        self.take();
-                    }
-                    symbol
-                } else {
-                    match self.take() {
-                        ExprToken::Identifier(value) => Some(value),
-                        _ => None,
-                    }
+                if !matches!(self.peek(), ExprToken::LParen) {
+                    self.malformed = true;
+                    return Value::Error;
+                }
+                self.take();
+                let symbol = match self.take() {
+                    ExprToken::Identifier(value) => Some(value),
+                    _ => None,
                 };
+                if !matches!(self.peek(), ExprToken::RParen) {
+                    self.malformed = true;
+                } else {
+                    self.take();
+                }
                 symbol
                     .map(|symbol| Value::Truth(environment_value(self.environment, &symbol)))
                     .unwrap_or_else(|| {
@@ -2006,15 +2315,11 @@ impl ExpressionParser<'_> {
                 let symbol = self.parse_function_identifier();
                 symbol
                     .map(|symbol| {
-                        Value::Truth(
-                            if self.environment.constant(&symbol).is_some()
-                                || self.environment.values.contains_key(&symbol)
-                            {
-                                Truth::True
-                            } else {
-                                Truth::Unknown
-                            },
-                        )
+                        Value::Truth(if self.environment.constant(&symbol).is_some() {
+                            Truth::True
+                        } else {
+                            Truth::Unknown
+                        })
                     })
                     .unwrap_or_else(|| {
                         self.malformed = true;
@@ -2039,11 +2344,18 @@ impl ExpressionParser<'_> {
                 if matches!(self.peek(), ExprToken::LParen) {
                     self.take();
                     let mut argument = None;
+                    let mut arity = 0usize;
                     if !matches!(self.peek(), ExprToken::RParen) {
-                        argument = Some(self.parse_comparison());
-                        while matches!(self.peek(), ExprToken::Comma) {
+                        loop {
+                            let value = self.parse_comparison();
+                            if argument.is_none() {
+                                argument = Some(value);
+                            }
+                            arity = arity.saturating_add(1);
+                            if !matches!(self.peek(), ExprToken::Comma) {
+                                break;
+                            }
                             self.take();
-                            let _ = self.parse_comparison();
                         }
                     }
                     if !matches!(self.peek(), ExprToken::RParen) {
@@ -2051,18 +2363,22 @@ impl ExpressionParser<'_> {
                     } else {
                         self.take();
                     }
+                    if arity != 1 {
+                        self.malformed = true;
+                        return Value::Error;
+                    }
                     match identifier.to_ascii_lowercase().as_str() {
                         "length" => argument
                             .and_then(|value| match value {
-                                Value::String(value) => {
-                                    i64::try_from(value.chars().count()).ok().map(Value::Number)
+                                Value::String(value) if value.is_ascii() => {
+                                    i64::try_from(value.len()).ok().map(Value::Number)
                                 }
                                 _ => None,
                             })
                             .unwrap_or(Value::Unknown),
                         "ord" => argument
                             .and_then(|value| match value {
-                                Value::String(value) => {
+                                Value::String(value) if value.is_ascii() => {
                                     let mut chars = value.chars();
                                     let character = chars.next()?;
                                     (chars.next().is_none())
@@ -2076,17 +2392,9 @@ impl ExpressionParser<'_> {
                                 _ => None,
                             })
                             .unwrap_or(Value::Unknown),
-                        "sizeof" => argument
-                            .and_then(|value| match value {
-                                Value::String(value) => {
-                                    i64::try_from(value.len()).ok().map(Value::Number)
-                                }
-                                Value::Number(_) | Value::Truth(_) | Value::Version(_) => {
-                                    Some(Value::Number(1))
-                                }
-                                Value::Unknown => None,
-                            })
-                            .unwrap_or(Value::Unknown),
+                        // No type/width information is carried by the
+                        // bounded context, so SizeOf is never a proven fact.
+                        "sizeof" => Value::Unknown,
                         _ => Value::Unknown,
                     }
                 } else {
@@ -2108,7 +2416,7 @@ impl ExpressionParser<'_> {
             ExprToken::String(value) => Value::String(value),
             ExprToken::Invalid | ExprToken::End => {
                 self.malformed = true;
-                Value::Unknown
+                Value::Error
             }
             ExprToken::LParen
             | ExprToken::RParen
@@ -2125,30 +2433,27 @@ impl ExpressionParser<'_> {
             | ExprToken::Greater
             | ExprToken::GreaterEqual => {
                 self.malformed = true;
-                Value::Unknown
+                Value::Error
             }
         }
     }
 
     fn parse_function_identifier(&mut self) -> Option<String> {
-        if matches!(self.peek(), ExprToken::LParen) {
-            self.take();
-            let value = match self.take() {
-                ExprToken::Identifier(value) => Some(canonical_symbol(&value)?),
-                _ => None,
-            };
-            if !matches!(self.peek(), ExprToken::RParen) {
-                self.malformed = true;
-            } else {
-                self.take();
-            }
-            value
-        } else {
-            match self.take() {
-                ExprToken::Identifier(value) => canonical_symbol(&value),
-                _ => None,
-            }
+        if !matches!(self.peek(), ExprToken::LParen) {
+            self.malformed = true;
+            return None;
         }
+        self.take();
+        let value = match self.take() {
+            ExprToken::Identifier(value) => Some(canonical_symbol(&value)?),
+            _ => None,
+        };
+        if !matches!(self.peek(), ExprToken::RParen) {
+            self.malformed = true;
+        } else {
+            self.take();
+        }
+        value
     }
 }
 
@@ -2159,6 +2464,7 @@ enum Value {
     String(String),
     Version(CompilerVersion),
     Unknown,
+    Error,
 }
 
 impl Value {
@@ -2177,7 +2483,7 @@ impl Value {
         match self {
             Self::Truth(Truth::True) => Some(ConstantValue::Boolean(true)),
             Self::Truth(Truth::False) => Some(ConstantValue::Boolean(false)),
-            Self::Truth(Truth::Unknown) | Self::Unknown => None,
+            Self::Truth(Truth::Unknown) | Self::Unknown | Self::Error => None,
             Self::Number(value) => Some(ConstantValue::Integer(*value)),
             Self::String(value) => Some(ConstantValue::String(value.clone())),
             Self::Version(value) => Some(ConstantValue::Version(*value)),
@@ -2187,7 +2493,9 @@ impl Value {
     fn as_truth(&self) -> Truth {
         match self {
             Self::Truth(value) => *value,
-            Self::Number(_) | Self::String(_) | Self::Version(_) | Self::Unknown => Truth::Unknown,
+            Self::Number(_) | Self::String(_) | Self::Version(_) | Self::Unknown | Self::Error => {
+                Truth::Unknown
+            }
         }
     }
 
@@ -2196,13 +2504,18 @@ impl Value {
             Self::Truth(value) => Some(*value),
             Self::Unknown => Some(Truth::Unknown),
             Self::Number(_) | Self::String(_) | Self::Version(_) => None,
+            Self::Error => None,
         }
     }
 
     fn and(self, other: Self) -> Self {
+        if matches!(self, Self::Error) || matches!(other, Self::Error) {
+            return Self::Error;
+        }
         match (self, other) {
             (Self::Truth(left), Self::Truth(right)) => Self::Truth(left.and(right)),
             (Self::Number(left), Self::Number(right)) => Self::Number(left & right),
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
             (left, right) => match (left.logical_truth(), right.logical_truth()) {
                 (Some(left), Some(right)) => Self::Truth(left.and(right)),
                 _ => Self::Unknown,
@@ -2211,9 +2524,13 @@ impl Value {
     }
 
     fn or(self, other: Self) -> Self {
+        if matches!(self, Self::Error) || matches!(other, Self::Error) {
+            return Self::Error;
+        }
         match (self, other) {
             (Self::Truth(left), Self::Truth(right)) => Self::Truth(left.or(right)),
             (Self::Number(left), Self::Number(right)) => Self::Number(left | right),
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
             (left, right) => match (left.logical_truth(), right.logical_truth()) {
                 (Some(left), Some(right)) => Self::Truth(left.or(right)),
                 _ => Self::Unknown,
@@ -2222,6 +2539,9 @@ impl Value {
     }
 
     fn xor(self, other: Self) -> Self {
+        if matches!(self, Self::Error) || matches!(other, Self::Error) {
+            return Self::Error;
+        }
         match (self, other) {
             (Self::Number(left), Self::Number(right)) => Self::Number(left ^ right),
             (Self::Truth(left), Self::Truth(right)) => Self::Truth(match (left, right) {
@@ -2234,14 +2554,17 @@ impl Value {
     }
 
     fn add(self, other: Self) -> Self {
+        if matches!(self, Self::Error) || matches!(other, Self::Error) {
+            return Self::Error;
+        }
         match (self, other) {
             (Self::Number(left), Self::Number(right)) => left
                 .checked_add(right)
                 .map(Self::Number)
-                .unwrap_or(Self::Unknown),
+                .unwrap_or(Self::Error),
             (Self::String(left), Self::String(right)) => {
                 if left.len().saturating_add(right.len()) > MAX_EXPRESSION_BYTES {
-                    Self::Unknown
+                    Self::Error
                 } else {
                     Self::String(format!("{left}{right}"))
                 }
@@ -2251,26 +2574,30 @@ impl Value {
     }
 
     fn subtract(self, other: Self) -> Self {
+        if matches!(self, Self::Error) || matches!(other, Self::Error) {
+            return Self::Error;
+        }
         match (self, other) {
             (Self::Number(left), Self::Number(right)) => left
                 .checked_sub(right)
                 .map(Self::Number)
-                .unwrap_or(Self::Unknown),
+                .unwrap_or(Self::Error),
             _ => Self::Unknown,
         }
     }
 
     fn negate(self) -> Self {
         match self {
-            Self::Number(value) => value
-                .checked_neg()
-                .map(Self::Number)
-                .unwrap_or(Self::Unknown),
+            Self::Number(value) => value.checked_neg().map(Self::Number).unwrap_or(Self::Error),
+            Self::Error => Self::Error,
             _ => Self::Unknown,
         }
     }
 
     fn arithmetic(self, other: Self, operator: BinaryArithmetic) -> Self {
+        if matches!(self, Self::Error) || matches!(other, Self::Error) {
+            return Self::Error;
+        }
         if matches!(operator, BinaryArithmetic::And) {
             return self.and(other);
         }
@@ -2282,14 +2609,14 @@ impl Value {
             BinaryArithmetic::Multiply => left
                 .checked_mul(right)
                 .map(Self::Number)
-                .unwrap_or(Self::Unknown),
+                .unwrap_or(Self::Error),
             BinaryArithmetic::Divide => {
                 if right == 0 {
-                    Self::Unknown
+                    Self::Error
                 } else {
                     left.checked_div(right)
                         .map(Self::Number)
-                        .unwrap_or(Self::Unknown)
+                        .unwrap_or(Self::Error)
                 }
             }
             // Delphi's `/` operator is real division. Real values are outside
@@ -2298,23 +2625,23 @@ impl Value {
             BinaryArithmetic::RealDivide => Self::Unknown,
             BinaryArithmetic::Remainder => {
                 if right == 0 {
-                    Self::Unknown
+                    Self::Error
                 } else {
                     left.checked_rem(right)
                         .map(Self::Number)
-                        .unwrap_or(Self::Unknown)
+                        .unwrap_or(Self::Error)
                 }
             }
             BinaryArithmetic::ShiftLeft => u32::try_from(right)
                 .ok()
                 .and_then(|shift| left.checked_shl(shift))
                 .map(Self::Number)
-                .unwrap_or(Self::Unknown),
+                .unwrap_or(Self::Error),
             BinaryArithmetic::ShiftRight => u32::try_from(right)
                 .ok()
                 .filter(|shift| *shift < 64)
                 .map(|shift| Self::Number(left >> shift))
-                .unwrap_or(Self::Unknown),
+                .unwrap_or(Self::Error),
         }
     }
 
@@ -2323,6 +2650,7 @@ impl Value {
             Self::Truth(value) => Self::Truth(value.not()),
             Self::Number(value) => Self::Number(!value),
             Self::String(_) | Self::Version(_) | Self::Unknown => Self::Unknown,
+            Self::Error => Self::Error,
         }
     }
 }
@@ -2356,20 +2684,46 @@ enum Comparison {
     GreaterEqual,
 }
 
-fn compare_values(left: Value, right: Value, comparison: Comparison) -> Truth {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => compare_order(left, right, comparison),
-        (Value::String(left), Value::String(right)) => compare_order(left, right, comparison),
-        (Value::Version(left), Value::Version(right)) => compare_order(left, right, comparison),
-        (Value::Version(left), Value::Number(right)) if right >= 0 => {
-            compare_order(left, CompilerVersion::new(right as u32, 0), comparison)
-        }
-        (Value::Number(left), Value::Version(right)) if left >= 0 => {
-            compare_order(CompilerVersion::new(left as u32, 0), right, comparison)
-        }
-        (Value::Truth(left), Value::Truth(right)) => compare_truths(left, right, comparison),
-        _ => Truth::Unknown,
+fn compare_values(left: Value, right: Value, comparison: Comparison) -> Value {
+    if matches!(left, Value::Error) || matches!(right, Value::Error) {
+        return Value::Error;
     }
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            Value::Truth(compare_order(left, right, comparison))
+        }
+        (Value::String(left), Value::String(right)) => {
+            Value::Truth(compare_order(left, right, comparison))
+        }
+        (Value::Version(left), Value::Version(right)) => left
+            .cmp_numeric(right)
+            .map(|ordering| Value::Truth(compare_ordering(ordering, comparison)))
+            .unwrap_or(Value::Truth(Truth::Unknown)),
+        (Value::Version(left), Value::Number(right)) => left
+            .cmp_integer(right)
+            .map(|ordering| Value::Truth(compare_ordering(ordering, comparison)))
+            .unwrap_or(Value::Truth(Truth::Unknown)),
+        (Value::Number(left), Value::Version(right)) => right
+            .cmp_integer(left)
+            .map(|ordering| Value::Truth(compare_ordering(ordering.reverse(), comparison)))
+            .unwrap_or(Value::Truth(Truth::Unknown)),
+        (Value::Truth(left), Value::Truth(right)) => {
+            Value::Truth(compare_truths(left, right, comparison))
+        }
+        _ => Value::Truth(Truth::Unknown),
+    }
+}
+
+fn compare_ordering(ordering: std::cmp::Ordering, comparison: Comparison) -> Truth {
+    let value = match comparison {
+        Comparison::Equal => ordering == std::cmp::Ordering::Equal,
+        Comparison::NotEqual => ordering != std::cmp::Ordering::Equal,
+        Comparison::Less => ordering == std::cmp::Ordering::Less,
+        Comparison::LessEqual => ordering != std::cmp::Ordering::Greater,
+        Comparison::Greater => ordering == std::cmp::Ordering::Greater,
+        Comparison::GreaterEqual => ordering != std::cmp::Ordering::Less,
+    };
+    if value { Truth::True } else { Truth::False }
 }
 
 fn compare_truths(left: Truth, right: Truth, comparison: Comparison) -> Truth {

@@ -15,7 +15,9 @@ pub mod conditional;
 pub mod configuration;
 pub mod delphi_overrides;
 
-pub use conditional::{CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue};
+pub use conditional::{
+    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
+};
 pub use configuration::{ConfigRead, config_directories, read_config};
 
 use crate::delphi_overrides::{
@@ -2999,44 +3001,48 @@ fn merge_project_conditional_context(
     }
 
     if context.compiler_version.is_none() {
-        let raw = builder
-            .property("compiler_version")
-            .or_else(|| builder.property("dcc_compilerversion"));
-        if let Some(raw) = raw {
-            match CompilerVersion::parse(&raw) {
-                Some(version) => context.compiler_version = Some(version),
-                None => warnings.push(format!(
-                    "unsupported compiler version metadata {raw:?}; CompilerVersion remains unknown"
+        let documented = builder.property("compilerversion");
+        let dcc = builder.property("dcc_compilerversion");
+        if let (Some(documented), Some(dcc)) = (documented.as_deref(), dcc.as_deref()) {
+            match (
+                CompilerVersion::parse(documented),
+                CompilerVersion::parse(dcc),
+            ) {
+                (Some(left), Some(right)) if left == right => {
+                    context.compiler_version = Some(left);
+                }
+                _ => warnings.push(format!(
+                    "conflicting CompilerVersion metadata ({documented:?} vs {dcc:?}); CompilerVersion remains unknown"
                 )),
+            }
+        } else if let Some(raw) = documented.as_deref().or(dcc.as_deref()) {
+            if let Some(version) = CompilerVersion::parse(raw) {
+                context.compiler_version = Some(version);
+            } else {
+                warnings.push(format!(
+                    "unsupported compiler version metadata {raw:?}; CompilerVersion remains unknown"
+                ));
             }
         }
     }
 
     // These are the bounded project-property spellings with stable Delphi
     // IFOPT aliases.  Unknown properties are intentionally not guessed.
-    const OPTION_PROPERTIES: &[(&str, &[&str])] = &[
-        ("dcc_rangechecks", &["R", "RANGE_CHECKS", "RANGECHECKS"]),
-        (
-            "dcc_overflowchecks",
-            &["Q", "OVERFLOW_CHECKS", "OVERFLOWCHECKS"],
-        ),
-        ("dcc_optimization", &["O", "OPTIMIZATION"]),
-        ("dcc_assertions", &["C", "ASSERTIONS"]),
-        ("dcc_runtimechecks", &["RUNTIME_CHECKS", "RUNTIMECHECKS"]),
-        (
-            "dcc_debuginformation",
-            &["DEBUG_INFORMATION", "DEBUGINFORMATION"],
-        ),
+    const OPTION_PROPERTIES: &[(&str, &str)] = &[
+        ("dcc_rangechecks", "R"),
+        ("dcc_overflowchecks", "Q"),
+        ("dcc_optimization", "O"),
+        ("dcc_assertions", "C"),
+        ("dcc_runtimechecks", "RUNTIME_CHECKS"),
+        ("dcc_debuginformation", "DEBUG_INFORMATION"),
     ];
-    for (property, aliases) in OPTION_PROPERTIES {
+    for (property, canonical) in OPTION_PROPERTIES {
         let Some(raw) = builder.property(property) else {
             continue;
         };
         let value = parse_conditional_fact(&raw).unwrap_or(ConditionalFact::Unknown);
-        for alias in *aliases {
-            if !context.options.contains_key(*alias) {
-                context.set_option(alias, value);
-            }
+        if !context.options.contains_key(*canonical) {
+            context.set_option(canonical, value);
         }
     }
     context

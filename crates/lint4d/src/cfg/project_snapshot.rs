@@ -4,9 +4,11 @@
 //! does not rediscover files or infer import targets: it copies the resolver's
 //! explicit decisions into `cfg-pascal`'s caller-owned snapshot contract.
 
+use pascal_core::conditional::{DirectiveKind, Truth};
 use pascal_core::resolver::{
     LoadedSource, ResolutionReport, ResolutionTarget, ResolvedImport, ResolvedProject, SourceId,
 };
+use pascal_project::ConditionalContext;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
@@ -99,6 +101,9 @@ impl From<cfg_pascal::ProjectSnapshotError> for CfgSnapshotError {
 pub struct CfgSnapshotOptions {
     pub prepare_configured_sources: bool,
     pub configuration_id: Option<String>,
+    /// Full Task24 conditional context used to project known `IF`/`IFOPT`
+    /// expressions into the strict cfg-pascal preparation subset.
+    pub conditional_context: ConditionalContext,
     pub preparation_environment: cfg_pascal::PreparationEnvironment,
     pub initial_defined_symbols: Vec<String>,
     pub initial_undefined_symbols: Vec<String>,
@@ -110,6 +115,7 @@ impl Default for CfgSnapshotOptions {
         Self {
             prepare_configured_sources: false,
             configuration_id: None,
+            conditional_context: ConditionalContext::default(),
             preparation_environment: cfg_pascal::PreparationEnvironment::Complete,
             initial_defined_symbols: Vec::new(),
             initial_undefined_symbols: Vec::new(),
@@ -187,6 +193,22 @@ pub fn to_cfg_project_snapshot(
     }
 
     let snapshots = source_snapshots(&units, &project.include_sources);
+    let projected_snapshots =
+        match project_conditional_snapshots(&snapshots, &options.conditional_context) {
+            Ok(snapshots) => snapshots,
+            Err(reason) => {
+                status = incomplete_status(status, reason);
+                return Ok(CfgProjectSnapshot {
+                    snapshot: raw_snapshot,
+                    target_unit: root_unit,
+                    status,
+                    resolution,
+                    target_path: root_source.path,
+                    target_source_id: root_source.id,
+                    target_analysis_bytes: root_analysis_bytes.clone(),
+                });
+            }
+        };
     let include_bindings = match preparation_include_bindings(&project, &snapshots) {
         Ok(bindings) => bindings,
         Err(reason) => {
@@ -205,7 +227,7 @@ pub fn to_cfg_project_snapshot(
 
     let prepared_inputs = match prepare_units(
         &units,
-        &snapshots,
+        &projected_snapshots,
         &include_bindings,
         configuration_id,
         &options,
@@ -407,6 +429,88 @@ fn source_snapshots(
         }
     }
     snapshots
+}
+
+/// Rewrite only conditions proved by the shared evaluator into the strict
+/// `cfg-pascal` expression subset.  Every replacement is byte-length-preserving
+/// so source-map ranges still identify the original source coordinates.  An
+/// unsupported or unknown condition is left intact and consequently keeps
+/// configured CFG preparation incomplete rather than inventing a branch.
+fn project_conditional_snapshots(
+    snapshots: &[cfg_pascal::SourceSnapshot],
+    context: &ConditionalContext,
+) -> Result<Vec<cfg_pascal::SourceSnapshot>, String> {
+    snapshots
+        .iter()
+        .map(|snapshot| {
+            let source = std::str::from_utf8(snapshot.bytes()).map_err(|_| {
+                format!(
+                    "conditional CFG projection requires UTF-8 source {}",
+                    snapshot.source_id().as_str()
+                )
+            })?;
+            let analysis = pascal_core::conditional::analyze_with_context(source, context);
+            if !analysis.complete {
+                return Err(format!(
+                    "conditional analysis incomplete for {}",
+                    snapshot.source_id().as_str()
+                ));
+            }
+            let mut projected = source.as_bytes().to_vec();
+            for directive in &analysis.directives {
+                let Some(condition) = directive.condition else {
+                    continue;
+                };
+                if !matches!(
+                    directive.kind,
+                    DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
+                ) {
+                    continue;
+                }
+                let keyword = directive
+                    .body
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap_or_default();
+                let replacement_keyword = match keyword.to_ascii_lowercase().as_str() {
+                    "if" => "IF",
+                    "elseif" | "elif" => "ELSEIF",
+                    "ifopt" => "IF",
+                    _ => continue,
+                };
+                let literal = match condition {
+                    Truth::True => "TRUE",
+                    Truth::False => "FALSE",
+                    Truth::Unknown => continue,
+                };
+                let replacement = format!("{replacement_keyword} {literal}");
+                let body_start = if source.as_bytes().get(directive.start + 1) == Some(&b'$') {
+                    directive.start + 2
+                } else {
+                    directive.start + 3
+                };
+                let body_end =
+                    if source.as_bytes().get(directive.end.saturating_sub(2)) == Some(&b'*') {
+                        directive.end.saturating_sub(2)
+                    } else {
+                        directive.end.saturating_sub(1)
+                    };
+                if body_start > body_end
+                    || body_end > projected.len()
+                    || replacement.len() > body_end - body_start
+                {
+                    continue;
+                }
+                projected[body_start..body_end].fill(b' ');
+                projected[body_start..body_start + replacement.len()]
+                    .copy_from_slice(replacement.as_bytes());
+            }
+            Ok(cfg_pascal::SourceSnapshot::new(
+                snapshot.source_id().clone(),
+                projected,
+            ))
+        })
+        .collect()
 }
 
 fn analysis_bytes(source: &LoadedSource) -> Arc<[u8]> {

@@ -466,7 +466,15 @@ pub(crate) fn expand_source_with_context<R: IncludeResolver>(
         active: HashSet::new(),
         cancel,
     };
-    let mut environment = conditional::ConditionalEnvironment::from_context(context);
+    let Some(mut environment) = conditional::ConditionalEnvironment::try_from_context(context)
+    else {
+        state.result.complete = false;
+        state
+            .result
+            .errors
+            .push("conditional environment exceeds evaluator bounds".to_string());
+        return Ok(state.result);
+    };
     let (complete, expanded) =
         expand_file(&mut state, root_uri, source, &mut environment, resolver, 0)?;
     state.result.expanded = expanded;

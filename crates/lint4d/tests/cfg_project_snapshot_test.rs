@@ -8,6 +8,7 @@ use pascal_core::resolver::{
     ImportSection, ImportSite, LoadedSource, ResolutionReport, ResolutionTarget, ResolvedImport,
     ResolvedInclude, ResolvedProject, ResolvedUnit, SourceId, SourceRevision,
 };
+use pascal_project::{CompilerVersion, ConditionalContext};
 
 fn source(id: &str, path: &str, bytes: &[u8]) -> LoadedSource {
     LoadedSource {
@@ -82,6 +83,7 @@ fn raw_snapshot_options() -> CfgSnapshotOptions {
     CfgSnapshotOptions {
         prepare_configured_sources: false,
         configuration_id: None,
+        conditional_context: ConditionalContext::default(),
         preparation_environment: cfg_pascal::PreparationEnvironment::Complete,
         initial_defined_symbols: Vec::new(),
         initial_undefined_symbols: Vec::new(),
@@ -250,5 +252,84 @@ fn adapter_prepares_configured_includes_and_preserves_their_origin() {
             .source_id()
             .as_str(),
         include_id.as_str()
+    );
+}
+
+#[test]
+fn adapter_routes_compiler_context_into_configured_cfg_preparation() {
+    let root_bytes = b"unit App; interface {$IF CompilerVersion >= 24} const Enabled = 1; {$ENDIF} implementation end.";
+    let root_id = SourceId::new("source:/workspace/App.pas");
+    let project = ResolvedProject {
+        root: ResolvedUnit {
+            requested_name: "App".to_string(),
+            declared_name: "App".to_string(),
+            source: source(root_id.as_str(), "/workspace/App.pas", root_bytes),
+        },
+        units: Vec::new(),
+        imports: Vec::new(),
+        includes: Vec::new(),
+        include_sources: Vec::new(),
+        complete: true,
+        report: report(true),
+    };
+    let options = CfgSnapshotOptions {
+        prepare_configured_sources: true,
+        configuration_id: Some("debug".to_string()),
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(24, 0)),
+        ..raw_snapshot_options()
+    };
+
+    let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
+    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    let target = snapshot.snapshot.units().first().expect("target unit");
+    assert!(target.is_prepared());
+    assert!(
+        target
+            .source()
+            .windows(b"Enabled".len())
+            .any(|window| { window == b"Enabled" })
+    );
+}
+
+#[test]
+fn adapter_projects_compiler_context_in_cross_unit_cfg_inputs() {
+    let mut project = project_with_import(ResolutionTarget::Found(SourceId::new(
+        "source:/workspace/Errors.pas",
+    )));
+    let dependency_source = b"unit Errors; interface {$IF CompilerVersion >= 24} procedure Enabled; {$ENDIF} implementation {$IF CompilerVersion >= 24} procedure Enabled; begin end; {$ENDIF} end.";
+    project.units[0].source = source(
+        "source:/workspace/Errors.pas",
+        "/workspace/Errors.pas",
+        dependency_source,
+    );
+
+    let options = CfgSnapshotOptions {
+        prepare_configured_sources: true,
+        configuration_id: Some("debug".to_string()),
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(24, 0)),
+        ..raw_snapshot_options()
+    };
+    let snapshot = to_cfg_project_snapshot(project, options).expect("prepared project snapshot");
+    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    let dependency = snapshot
+        .snapshot
+        .units()
+        .iter()
+        .find(|unit| unit.id().as_str().ends_with("Errors.pas"))
+        .expect("prepared dependency unit");
+    assert!(dependency.is_prepared());
+    assert!(
+        dependency
+            .source()
+            .windows(b"procedure Enabled".len())
+            .any(|window| window == b"procedure Enabled")
+    );
+    let cfgs = cfg_pascal::build_file_cfgs_in_project(&snapshot.snapshot, dependency.id())
+        .expect("context-projected dependency CFG");
+    assert!(
+        !cfgs.is_empty(),
+        "enabled cross-unit procedure should have a CFG"
     );
 }

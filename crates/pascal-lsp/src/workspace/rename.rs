@@ -5870,8 +5870,15 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             auditor.stopped = true;
             break;
         };
-        let mut environment =
-            conditional::ConditionalEnvironment::from_context(&conditional_context);
+        let Some(mut environment) =
+            conditional::ConditionalEnvironment::try_from_context(&conditional_context)
+        else {
+            auditor.record_error(format!(
+                "rename cannot prove completeness because conditional environment exceeds evaluator bounds for {uri}"
+            ));
+            auditor.stopped = true;
+            break;
+        };
         let mut callback_error = None;
         let mut include =
             |directive: &ConditionalDirective,

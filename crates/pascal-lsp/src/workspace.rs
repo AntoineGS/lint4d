@@ -190,7 +190,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) project_file: RuntimeOption<PathBuf>,
     pub(crate) build_config: RuntimeOption<String>,
     pub(crate) platform: RuntimeOption<String>,
-    pub(crate) conditional_context: RuntimeOption<ConditionalContext>,
+    pub(crate) conditional_context: RuntimeConditionalContextUpdate,
     pub(crate) max_files: RuntimeOption<usize>,
     pub(crate) max_file_bytes: RuntimeOption<usize>,
     pub(crate) max_total_bytes: RuntimeOption<usize>,
@@ -203,10 +203,105 @@ pub(crate) struct RuntimeOptionsOverride {
     project_file: Option<Option<PathBuf>>,
     build_config: Option<Option<String>>,
     platform: Option<Option<String>>,
-    conditional_context: Option<Option<ConditionalContext>>,
+    conditional_context: RuntimeConditionalContextOverride,
     max_files: Option<usize>,
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeConditionalContextUpdate {
+    compiler_version: RuntimeOption<CompilerVersion>,
+    options: RuntimeOption<std::collections::BTreeMap<String, ConditionalFact>>,
+    defines: RuntimeOption<Vec<String>>,
+    undefines: RuntimeOption<Vec<String>>,
+    constants: RuntimeOption<std::collections::BTreeMap<String, ConstantValue>>,
+}
+
+impl RuntimeConditionalContextUpdate {
+    fn reset() -> Self {
+        Self {
+            compiler_version: RuntimeOption::Reset,
+            options: RuntimeOption::Reset,
+            defines: RuntimeOption::Reset,
+            undefines: RuntimeOption::Reset,
+            constants: RuntimeOption::Reset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RuntimeConditionalContextOverride {
+    compiler_version: Option<CompilerVersion>,
+    options: Option<std::collections::BTreeMap<String, ConditionalFact>>,
+    defines: Option<Vec<String>>,
+    undefines: Option<Vec<String>>,
+    constants: Option<std::collections::BTreeMap<String, ConstantValue>>,
+}
+
+impl RuntimeConditionalContextOverride {
+    fn apply(&mut self, update: RuntimeConditionalContextUpdate, warnings: &mut Vec<String>) {
+        apply_runtime_optional_value(
+            &mut self.compiler_version,
+            update.compiler_version,
+            "compilerVersion",
+            warnings,
+        );
+        apply_runtime_optional_value(
+            &mut self.options,
+            update.options,
+            "compilerOptions",
+            warnings,
+        );
+        apply_runtime_optional_value(
+            &mut self.defines,
+            update.defines,
+            "conditionalDefines",
+            warnings,
+        );
+        apply_runtime_optional_value(
+            &mut self.undefines,
+            update.undefines,
+            "conditionalUndefines",
+            warnings,
+        );
+        apply_runtime_optional_value(
+            &mut self.constants,
+            update.constants,
+            "conditionalConstants",
+            warnings,
+        );
+    }
+
+    fn effective(&self, base: &ConditionalContext) -> ConditionalContext {
+        let mut context = base.clone();
+        if let Some(version) = self.compiler_version {
+            context.compiler_version = Some(version);
+        }
+        if let Some(options) = &self.options {
+            context.options = options.clone();
+        }
+        if let Some(constants) = &self.constants {
+            context.constants = constants.clone();
+        }
+        if let Some(defines) = &self.defines {
+            context
+                .defines
+                .retain(|_, value| *value != ConditionalFact::True);
+            for define in defines {
+                context.set_define(define, ConditionalFact::True);
+            }
+        }
+        if let Some(undefines) = &self.undefines {
+            context
+                .defines
+                .retain(|_, value| *value != ConditionalFact::False);
+            for define in undefines {
+                context.set_define(define, ConditionalFact::False);
+            }
+        }
+        context
+    }
 }
 
 const MAX_RUNTIME_LIST_ENTRIES: usize = 256;
@@ -220,7 +315,7 @@ impl RuntimeOptionsUpdate {
             project_file: RuntimeOption::Reset,
             build_config: RuntimeOption::Reset,
             platform: RuntimeOption::Reset,
-            conditional_context: RuntimeOption::Reset,
+            conditional_context: RuntimeConditionalContextUpdate::reset(),
             max_files: RuntimeOption::Reset,
             max_file_bytes: RuntimeOption::Reset,
             max_total_bytes: RuntimeOption::Reset,
@@ -253,9 +348,7 @@ impl RuntimeOptionsOverride {
                 .or_else(|| base.platform.clone()),
             conditional_context: self
                 .conditional_context
-                .as_ref()
-                .and_then(|value| value.clone())
-                .unwrap_or_else(|| base.conditional_context.clone()),
+                .effective(&base.conditional_context),
             limits: ResourceLimits {
                 max_files: self.max_files.unwrap_or(base.limits.max_files),
                 max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
@@ -291,12 +384,8 @@ impl RuntimeOptionsOverride {
             "platform",
             &mut warnings,
         );
-        apply_runtime_optional_field(
-            &mut self.conditional_context,
-            update.conditional_context,
-            "conditionalContext",
-            &mut warnings,
-        );
+        self.conditional_context
+            .apply(update.conditional_context, &mut warnings);
         apply_runtime_field(
             &mut self.max_files,
             update.max_files,
@@ -346,6 +435,19 @@ fn apply_runtime_optional_field<T: Clone>(
     }
 }
 
+fn apply_runtime_optional_value<T: Clone>(
+    target: &mut Option<T>,
+    value: RuntimeOption<T>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) {
+    match value {
+        RuntimeOption::Absent | RuntimeOption::Reset => *target = None,
+        RuntimeOption::Value(value) => *target = Some(value),
+        RuntimeOption::Invalid(error) => warnings.push(format!("ignoring runtime {name}: {error}")),
+    }
+}
+
 pub(crate) fn parse_runtime_options(
     value: &serde_json::Value,
 ) -> Result<RuntimeOptionsUpdate, String> {
@@ -359,45 +461,131 @@ pub(crate) fn parse_runtime_options(
         project_file: parse_runtime_string(object, "projectFile").map_path_buf(),
         build_config: parse_runtime_string(object, "buildConfig"),
         platform: parse_runtime_string(object, "platform"),
-        conditional_context: parse_runtime_conditional_context(object),
+        conditional_context: RuntimeConditionalContextUpdate {
+            compiler_version: parse_runtime_compiler_version(object),
+            options: parse_runtime_conditional_options(object),
+            defines: parse_runtime_conditional_symbols(object, "conditionalDefines"),
+            undefines: parse_runtime_conditional_symbols(object, "conditionalUndefines"),
+            constants: parse_runtime_conditional_constants(object),
+        },
         max_files: parse_runtime_limit(object, "maxFiles", DEFAULT_MAX_FILES),
         max_file_bytes: parse_runtime_limit(object, "maxFileBytes", DEFAULT_MAX_FILE_BYTES),
         max_total_bytes: parse_runtime_limit(object, "maxTotalBytes", DEFAULT_MAX_TOTAL_BYTES),
     })
 }
 
-fn parse_runtime_conditional_context(
+fn parse_runtime_compiler_version(
     object: &serde_json::Map<String, serde_json::Value>,
-) -> RuntimeOption<ConditionalContext> {
-    let fields = [
-        "compilerVersion",
-        "compilerOptions",
-        "conditionalDefines",
-        "conditionalUndefines",
-        "conditionalConstants",
-    ];
-    if !fields.iter().any(|field| object.contains_key(*field)) {
+) -> RuntimeOption<CompilerVersion> {
+    let Some(value) = object.get("compilerVersion") else {
         return RuntimeOption::Absent;
-    }
-    if fields
-        .iter()
-        .any(|field| object.get(*field).is_some_and(serde_json::Value::is_null))
-        && fields
-            .iter()
-            .all(|field| object.get(*field).is_none_or(serde_json::Value::is_null))
-    {
+    };
+    if value.is_null() {
         return RuntimeOption::Reset;
     }
-    match parse_conditional_context_values(
-        object.get("compilerVersion"),
-        object.get("compilerOptions"),
-        object.get("conditionalDefines"),
-        object.get("conditionalUndefines"),
-        object.get("conditionalConstants"),
-    ) {
-        Ok(context) => RuntimeOption::Value(context),
-        Err(error) => RuntimeOption::Invalid(error),
+    let Some(text) = value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value.as_number().map(ToString::to_string))
+    else {
+        return RuntimeOption::Invalid("must be a string or number".to_string());
+    };
+    if text.len() > MAX_RUNTIME_STRING_BYTES {
+        return RuntimeOption::Invalid(format!("is longer than {MAX_RUNTIME_STRING_BYTES} bytes"));
     }
+    match CompilerVersion::parse(&text) {
+        Some(version) => RuntimeOption::Value(version),
+        None => RuntimeOption::Invalid("must be a decimal version such as 24.0".to_string()),
+    }
+}
+
+fn parse_runtime_conditional_options(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> RuntimeOption<std::collections::BTreeMap<String, ConditionalFact>> {
+    let Some(value) = object.get("compilerOptions") else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(values) = value.as_object() else {
+        return RuntimeOption::Invalid("must be an object or null".to_string());
+    };
+    if values.len() > MAX_RUNTIME_LIST_ENTRIES {
+        return RuntimeOption::Invalid(format!(
+            "contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+        ));
+    }
+    let mut context = ConditionalContext::default();
+    for (name, value) in values {
+        if name.len() > MAX_RUNTIME_STRING_BYTES {
+            return RuntimeOption::Invalid("contains an overlong option name".to_string());
+        }
+        if let Err(error) = validate_runtime_conditional_name(name) {
+            return RuntimeOption::Invalid(format!("compilerOptions.{name} {error}"));
+        }
+        let Some(fact) = parse_conditional_fact_value(value) else {
+            return RuntimeOption::Invalid(format!(
+                "compilerOptions.{name} must be boolean, null, or on/off"
+            ));
+        };
+        context.set_option(name, fact);
+    }
+    RuntimeOption::Value(context.options)
+}
+
+fn parse_runtime_conditional_constants(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> RuntimeOption<std::collections::BTreeMap<String, ConstantValue>> {
+    let Some(value) = object.get("conditionalConstants") else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(values) = value.as_object() else {
+        return RuntimeOption::Invalid("must be an object or null".to_string());
+    };
+    if values.len() > MAX_RUNTIME_LIST_ENTRIES {
+        return RuntimeOption::Invalid(format!(
+            "contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+        ));
+    }
+    let mut context = ConditionalContext::default();
+    for (name, value) in values {
+        if name.len() > MAX_RUNTIME_STRING_BYTES {
+            return RuntimeOption::Invalid("contains an overlong constant name".to_string());
+        }
+        if let Err(error) = validate_runtime_conditional_name(name) {
+            return RuntimeOption::Invalid(format!("conditionalConstants.{name} {error}"));
+        }
+        let constant = match value {
+            serde_json::Value::Bool(value) => ConstantValue::Boolean(*value),
+            serde_json::Value::String(value) if value.len() <= MAX_RUNTIME_STRING_BYTES => {
+                ConstantValue::String(value.clone())
+            }
+            serde_json::Value::String(_) => {
+                return RuntimeOption::Invalid(format!(
+                    "conditionalConstants.{name} is longer than {MAX_RUNTIME_STRING_BYTES} bytes"
+                ));
+            }
+            serde_json::Value::Number(value) => {
+                let Some(value) = value.as_i64() else {
+                    return RuntimeOption::Invalid(format!(
+                        "conditionalConstants.{name} must be an integer"
+                    ));
+                };
+                ConstantValue::Integer(value)
+            }
+            _ => {
+                return RuntimeOption::Invalid(format!(
+                    "conditionalConstants.{name} must be boolean, integer, or string"
+                ));
+            }
+        };
+        context.set_constant(name, constant);
+    }
+    RuntimeOption::Value(context.constants)
 }
 
 fn parse_runtime_list(
@@ -431,6 +619,61 @@ fn parse_runtime_list(
         parsed.push(value.to_string());
     }
     RuntimeOption::Value(parsed)
+}
+
+fn parse_runtime_conditional_symbols(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> RuntimeOption<Vec<String>> {
+    let Some(value) = object.get(name) else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(values) = value.as_array() else {
+        return RuntimeOption::Invalid("must be an array of strings".to_string());
+    };
+    if values.len() > MAX_RUNTIME_LIST_ENTRIES {
+        return RuntimeOption::Invalid(format!(
+            "contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+        ));
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return RuntimeOption::Invalid("must contain only strings".to_string());
+        };
+        if value.len() > MAX_RUNTIME_STRING_BYTES {
+            return RuntimeOption::Invalid(format!(
+                "contains a string longer than {MAX_RUNTIME_STRING_BYTES} bytes"
+            ));
+        }
+        if let Err(error) = validate_runtime_conditional_name(value) {
+            return RuntimeOption::Invalid(format!(
+                "contains an invalid symbol {value:?}: {error}"
+            ));
+        }
+        parsed.push(value.to_string());
+    }
+    RuntimeOption::Value(parsed)
+}
+
+fn validate_runtime_conditional_name(name: &str) -> Result<(), &'static str> {
+    let name = name.trim().strip_prefix('&').unwrap_or(name.trim());
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return Err("must not be empty");
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err("must start with an ASCII letter or underscore");
+    }
+    if !characters
+        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '.')
+    {
+        return Err("contains unsupported characters");
+    }
+    Ok(())
 }
 
 fn parse_runtime_string(
@@ -520,6 +763,11 @@ fn parse_conditional_context_values(
             .map(ToOwned::to_owned)
             .or_else(|| value.as_number().map(ToString::to_string))
             .ok_or_else(|| "compilerVersion must be a string or number".to_string())?;
+        if text.len() > MAX_RUNTIME_STRING_BYTES {
+            return Err(format!(
+                "compilerVersion is longer than {MAX_RUNTIME_STRING_BYTES} bytes"
+            ));
+        }
         let version = CompilerVersion::parse(&text)
             .ok_or_else(|| "compilerVersion must be a decimal version such as 24.0".to_string())?;
         context.compiler_version = Some(version);
@@ -549,6 +797,8 @@ fn parse_conditional_context_values(
             if name.len() > MAX_RUNTIME_STRING_BYTES {
                 return Err("compilerOptions contains an overlong option name".to_string());
             }
+            validate_runtime_conditional_name(name)
+                .map_err(|error| format!("compilerOptions.{name} {error}"))?;
             let fact = parse_conditional_fact_value(value).ok_or_else(|| {
                 format!("compilerOptions.{name} must be boolean, null, or on/off")
             })?;
@@ -565,9 +815,21 @@ fn parse_conditional_context_values(
             ));
         }
         for (name, value) in object {
+            if name.len() > MAX_RUNTIME_STRING_BYTES {
+                return Err("conditionalConstants contains an overlong constant name".to_string());
+            }
+            validate_runtime_conditional_name(name)
+                .map_err(|error| format!("conditionalConstants.{name} {error}"))?;
             let constant = match value {
                 serde_json::Value::Bool(value) => ConstantValue::Boolean(*value),
-                serde_json::Value::String(value) => ConstantValue::String(value.clone()),
+                serde_json::Value::String(value) if value.len() <= MAX_RUNTIME_STRING_BYTES => {
+                    ConstantValue::String(value.clone())
+                }
+                serde_json::Value::String(_) => {
+                    return Err(format!(
+                        "conditionalConstants.{name} is longer than {MAX_RUNTIME_STRING_BYTES} bytes"
+                    ));
+                }
                 serde_json::Value::Number(value) => {
                     let value = value
                         .as_i64()
@@ -610,6 +872,8 @@ fn parse_conditional_symbol_list(
         if name.len() > MAX_RUNTIME_STRING_BYTES {
             return Err(format!("{field} contains an overlong symbol"));
         }
+        validate_runtime_conditional_name(name)
+            .map_err(|error| format!("{field} contains an invalid symbol {name:?}: {error}"))?;
         context.set_define(name, fact);
     }
     Ok(())
@@ -7258,18 +7522,21 @@ impl Workspace {
         let options = lint4d::cfg::CfgSnapshotOptions {
             prepare_configured_sources: context.project_file.is_some(),
             configuration_id: Some(configuration_id),
+            conditional_context: conditional_context.clone(),
             preparation_environment: lint4d::cfg::PreparationEnvironment::Partial,
-            initial_defined_symbols: context
-                .effective_conditional_context()
+            initial_defined_symbols: conditional_context
                 .defines
-                .into_iter()
-                .filter_map(|(name, value)| (value == ConditionalFact::True).then_some(name))
+                .iter()
+                .filter_map(|(name, value)| {
+                    (*value == ConditionalFact::True).then_some(name.clone())
+                })
                 .collect(),
-            initial_undefined_symbols: context
-                .effective_conditional_context()
+            initial_undefined_symbols: conditional_context
                 .defines
-                .into_iter()
-                .filter_map(|(name, value)| (value == ConditionalFact::False).then_some(name))
+                .iter()
+                .filter_map(|(name, value)| {
+                    (*value == ConditionalFact::False).then_some(name.clone())
+                })
                 .collect(),
             ..Default::default()
         };
@@ -8387,8 +8654,8 @@ fn is_immutable_override_file(path: &Path) -> bool {
 mod tests {
     use super::{
         ContextState, DiagnosticLineIndex, FileChange, MAX_SOURCE_CHANGE_OBSERVATIONS,
-        ResourceLimits, Workspace, WorkspaceOptions, context_state_is_fresh_with_cancel,
-        normalize_line_endings, scan_external_units,
+        ResourceLimits, RuntimeOptionsOverride, Workspace, WorkspaceOptions,
+        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
@@ -8425,26 +8692,38 @@ mod tests {
             }
         }))
         .expect("typed runtime conditional settings");
-        let super::RuntimeOption::Value(context) = update.conditional_context else {
-            panic!("conditional settings were not parsed");
+        let update = update.conditional_context;
+        assert!(matches!(
+            update.compiler_version,
+            super::RuntimeOption::Value(version) if version == CompilerVersion::new(24, 0)
+        ));
+        let super::RuntimeOption::Value(options) = update.options else {
+            panic!("conditional options were not parsed");
         };
-
-        assert_eq!(context.compiler_version, Some(CompilerVersion::new(24, 0)));
-        assert_eq!(context.option("R"), ConditionalFact::True);
-        assert_eq!(context.option("Q"), ConditionalFact::False);
-        assert_eq!(context.option("Unknown"), ConditionalFact::Unknown);
-        assert_eq!(context.define("FEATURE"), ConditionalFact::True);
-        assert_eq!(context.define("LEGACY"), ConditionalFact::False);
+        assert_eq!(options.get("R"), Some(&ConditionalFact::True));
+        assert_eq!(options.get("Q"), Some(&ConditionalFact::False));
+        assert_eq!(options.get("UNKNOWN"), Some(&ConditionalFact::Unknown));
+        let super::RuntimeOption::Value(defines) = update.defines else {
+            panic!("conditional defines were not parsed");
+        };
+        assert_eq!(defines, vec!["FEATURE".to_string()]);
+        let super::RuntimeOption::Value(undefines) = update.undefines else {
+            panic!("conditional undefines were not parsed");
+        };
+        assert_eq!(undefines, vec!["LEGACY".to_string()]);
+        let super::RuntimeOption::Value(constants) = update.constants else {
+            panic!("conditional constants were not parsed");
+        };
         assert_eq!(
-            context.constant("BuildLevel"),
+            constants.get("BUILDLEVEL"),
             Some(&ConstantValue::Integer(7))
         );
         assert_eq!(
-            context.constant("Flavor"),
+            constants.get("FLAVOR"),
             Some(&ConstantValue::String("desktop".to_string()))
         );
         assert_eq!(
-            context.constant("Enabled"),
+            constants.get("ENABLED"),
             Some(&ConstantValue::Boolean(true))
         );
 
@@ -8456,9 +8735,91 @@ mod tests {
             "invalid runtime values are retained as warnings"
         );
         assert!(matches!(
-            invalid.expect("runtime option update").conditional_context,
+            invalid
+                .expect("runtime option update")
+                .conditional_context
+                .compiler_version,
             super::RuntimeOption::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn runtime_conditional_names_are_validated_instead_of_silently_dropped() {
+        let update = super::parse_runtime_options(&json!({
+            "conditionalConstants": {"not valid": 1},
+            "compilerOptions": {"R+": true},
+            "conditionalDefines": ["not valid"]
+        }))
+        .expect("runtime option update");
+        assert!(matches!(
+            update.conditional_context.constants,
+            super::RuntimeOption::Invalid(_)
+        ));
+        assert!(matches!(
+            update.conditional_context.options,
+            super::RuntimeOption::Invalid(_)
+        ));
+        assert!(matches!(
+            update.conditional_context.defines,
+            super::RuntimeOption::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_conditional_fields_keep_initialization_fallback_independently() {
+        let base = WorkspaceOptions {
+            conditional_context: ConditionalContext::default()
+                .with_compiler_version(CompilerVersion::new(24, 0))
+                .with_option("Q", ConditionalFact::True),
+            ..WorkspaceOptions::default()
+        };
+        let update = super::parse_runtime_options(&json!({
+            "compilerOptions": {"R": false}
+        }))
+        .expect("partial runtime conditional update");
+        let mut overrides = RuntimeOptionsOverride::default();
+        let warnings = overrides.apply(update);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        let effective = overrides.effective(&base);
+        assert_eq!(
+            effective.conditional_context.compiler_version,
+            Some(CompilerVersion::new(24, 0))
+        );
+        assert_eq!(
+            effective.conditional_context.option("R"),
+            ConditionalFact::False
+        );
+        assert_eq!(
+            effective.conditional_context.option("Q"),
+            ConditionalFact::Unknown
+        );
+    }
+
+    #[test]
+    fn runtime_conditional_fields_apply_valid_values_when_another_field_is_invalid() {
+        let base = WorkspaceOptions {
+            conditional_context: ConditionalContext::default()
+                .with_compiler_version(CompilerVersion::new(24, 0)),
+            ..WorkspaceOptions::default()
+        };
+        let update = super::parse_runtime_options(&json!({
+            "compilerVersion": "not-a-version",
+            "compilerOptions": {"R": false}
+        }))
+        .expect("per-field runtime parsing");
+        let mut overrides = RuntimeOptionsOverride::default();
+        let warnings = overrides.apply(update);
+        assert_eq!(warnings.len(), 1);
+        let effective = overrides.effective(&base);
+        assert_eq!(
+            effective.conditional_context.compiler_version,
+            Some(CompilerVersion::new(24, 0))
+        );
+        assert_eq!(
+            effective.conditional_context.option("R"),
+            ConditionalFact::False
+        );
     }
 
     #[test]

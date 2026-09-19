@@ -531,8 +531,10 @@ explicit conditional-context fields:
 }
 ```
 
-`compilerVersion` is parsed as exact decimal major/minor/patch components (for
-example `24`, `24.0`, or `24.0.1`), never as a binary floating-point value.
+`compilerVersion` is parsed as a bounded exact decimal number (for example `24`,
+`24.0`, or `18.50`); trailing fractional zeroes are normalized and dotted
+patch input such as `24.0.1` is rejected because Delphi's value is numeric, not
+a semantic-version tuple. It is never parsed as a binary floating-point value.
 Option values accept booleans, `on`/`off` (and their true/false spellings), or
 `null` for `Unknown`. Runtime JSON constants are booleans, integers, or
 strings. Missing facts are `Unknown`; the server never infers them from the
@@ -1152,7 +1154,7 @@ formatting edits and recover after a newer acceptable update.
 Conditional analysis has additional fixed safety bounds: at most 16,384
 directives per source, 256 nested conditional frames, 4,096 bytes per
 conditional expression, 256 expression tokens, 32,768 retained environment
-entries, 1 MiB of retained environment-key bytes, 1,000,000 aggregate
+entries, 1 MiB of retained environment key/value payload bytes, 1,000,000 aggregate
 environment operations, and 16 MiB of aggregate environment copy/merge byte
 work. Exceeding a bound marks the source unknown rather than returning a
 partial proof. Includes used by rename are separately bounded by 4,096 files,

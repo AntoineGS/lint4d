@@ -28,7 +28,8 @@ overload model, not a parallel compiler. It covers assignments and bound
 routine-call arguments whose types are proven from source, built-in literals,
 safe numeric widening, character/string conversion, `nil` to class/interface
 references, pointers, callable types, and dynamic arrays, class/interface
-upcasts with known ancestry, and exact writable `var`/`out` arguments.
+upcasts with known ancestry, indexed/dereferenced writable elements, and
+exact writable `var`/`out` arguments.
 Grouped parameters and omitted defaults are honored.
 An overload call is diagnosed only when every applicable retained candidate is
 proven incompatible; one compatible, ambiguous, unsupported, or uncertain
@@ -44,8 +45,9 @@ diagnostics. The new codes are:
 | Type mismatch | `pascal-type-mismatch` |
 | Incompatible argument | `pascal-incompatible-argument` |
 
-Aliases whose target type is not proven, non-`nil` pointer/variant/anonymous
-callable conversions, enum/record compatibility beyond retained identity,
+Aliases whose target type is not proven, unresolved by-reference identities,
+non-`nil` pointer/variant/anonymous callable conversions, enum/record
+compatibility beyond retained identity, unmodeled record operators,
 compiler-dependent conversions, conditional or parser-recovery states,
 unresolved values, and incomplete imports/receivers/helpers/ancestry remain
 silent. A mismatch is not published merely because an unresolved implicit
@@ -383,10 +385,11 @@ selection as completion and navigation.
 
 Overload matching is intentionally conservative and source-based. It recognizes
 Delphi built-in integer, real, string, character, Boolean, and `nil` literals,
-including radix integers and concatenated string fragments, typed
-variables/parameters, defaults, and `var`/`out` lvalue requirements. Character
-values can match string parameters, but ordinal numeric conversion requires an
-explicit source call such as `Ord(value)`. Integer literal ranges and declared
+including radix integers and concatenated string fragments (a single certain
+logical character is `Char`), typed variables/parameters, defaults, and
+`var`/`out` lvalue requirements. Character values can match string parameters,
+but ordinal numeric conversion requires an explicit source call such as
+`Ord(value)`. Integer literal ranges and declared
 integer widths are preserved, including the proven `Integer`/`LongInt` alias;
 `var`/`out` matches require an exact known type and a writable argument (value
 parameters are writable, while `const` parameters and properties are not), and

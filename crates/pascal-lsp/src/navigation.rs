@@ -14044,6 +14044,42 @@ mod tests {
     }
 
     #[test]
+    fn round2_r2_counts_logical_characters_across_empty_literal_fragments() {
+        let uri = Url::parse("file:///tmp/semantic-round2-r2-composite-char.pas")
+            .expect("R2 composite URI");
+        let source = concat!(
+            "unit SemanticRound2R2CompositeChar;\n",
+            "interface\n",
+            "procedure Take(Value: Char);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var C: Char;\n",
+            "begin\n",
+            "  C := ''#65; Take(''#65); C := #65''; Take(#65'');\n",
+            "  Take('ab');\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R2 composite fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R2 composite diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["incompatible argument: expected 'Char', found 'String'"],
+            "empty literal fragments do not add logical characters: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn correction_r3_suppresses_unknown_lvalues_and_missing_member_cascades() {
         let uri = Url::parse("file:///tmp/semantic-correction-r3.pas").expect("R3 URI");
         let source = concat!(
@@ -14117,6 +14153,192 @@ mod tests {
         assert!(
             diagnostics.is_empty(),
             "incomplete imports and with receivers must suppress argument claims: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round2_r3_suppresses_unknown_byref_actuals_and_keeps_known_controls() {
+        let uri = Url::parse("file:///tmp/semantic-round2-r3-unknown-byref-actual.pas")
+            .expect("R3 unknown actual URI");
+        let source = concat!(
+            "unit SemanticRound2R3UnknownByrefActual;\n",
+            "interface\n",
+            "type TUnknown = MissingType;\n",
+            "procedure Take(var Value: Integer);\n",
+            "procedure TakeOut(out Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var B: Boolean; U: TUnknown;\n",
+            "begin\n",
+            "  Take(B); Take(1); Take(U); TakeOut(U);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 unknown actual fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 unknown actual diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+                "incompatible argument: expected 'Integer', found 'non-writable expression'",
+            ],
+            "unresolved by-reference actual types remain unknown: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round2_r3_suppresses_unknown_byref_formals_and_overload_candidates() {
+        let uri = Url::parse("file:///tmp/semantic-round2-r3-unknown-byref-formal.pas")
+            .expect("R3 unknown formal URI");
+        let source = concat!(
+            "unit SemanticRound2R3UnknownByrefFormal;\n",
+            "interface\n",
+            "type TAlias = MissingType;\n",
+            "procedure Take(var Value: TAlias);\n",
+            "procedure TakeOut(out Value: TAlias);\n",
+            "procedure Overloaded(var Value: TAlias); overload;\n",
+            "procedure Overloaded(var Value: Boolean); overload;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  Take(I); TakeOut(I); Overloaded(I);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 unknown formal fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 unknown formal diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "unknown by-reference formals and overload candidates suppress claims: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round2_r3_infers_indexed_and_dereferenced_element_types() {
+        let uri =
+            Url::parse("file:///tmp/semantic-round2-r3-element-types.pas").expect("R3 element URI");
+        let source = concat!(
+            "unit SemanticRound2R3ElementTypes;\n",
+            "interface\n",
+            "procedure TakeInteger(Value: Integer);\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "procedure MutateInteger(var Value: Integer);\n",
+            "procedure MutateBoolean(var Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var A: array[0..1] of Boolean; P: ^Boolean; I: Integer;\n",
+            "begin\n",
+            "  I := A[0]; I := P^;\n",
+            "  TakeInteger(A[0]); TakeInteger(P^);\n",
+            "  TakeBoolean(A[0]); TakeBoolean(P^);\n",
+            "  MutateInteger(A[0]); MutateInteger(P^);\n",
+            "  MutateBoolean(A[0]); MutateBoolean(P^);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 element fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 element diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "type mismatch: cannot assign 'Boolean' to 'Integer'",
+                "type mismatch: cannot assign 'Boolean' to 'Integer'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+            ],
+            "known indexed and dereferenced element types must drive both positive and silent controls: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round2_r3_suppresses_ambiguous_indexed_element_types() {
+        let first_uri = Url::parse("file:///tmp/semantic-round2-r3-elements-a.pas")
+            .expect("first element provider URI");
+        let second_uri = Url::parse("file:///tmp/semantic-round2-r3-elements-b.pas")
+            .expect("second element provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-round2-r3-elements-consumer.pas")
+            .expect("element consumer URI");
+        let first = concat!(
+            "unit ElementsA;\n",
+            "interface\n",
+            "var Values: array[0..1] of Boolean;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let second = concat!(
+            "unit ElementsB;\n",
+            "interface\n",
+            "var Values: array[0..1] of Integer;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit ElementsConsumer;\n",
+            "interface\n",
+            "uses ElementsA, ElementsB;\n",
+            "procedure Take(Value: Integer);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  Take(Values[0]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(first_uri.clone(), first.to_owned())
+            .expect("first element provider parses");
+        index
+            .update(second_uri.clone(), second.to_owned())
+            .expect("second element provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("element consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [
+                ("ElementsA".to_owned(), first_uri),
+                ("ElementsB".to_owned(), second_uri),
+            ],
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("ambiguous element diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "differing candidate element types remain uncertain: {diagnostics:?}"
         );
     }
 
@@ -14211,6 +14433,42 @@ mod tests {
     }
 
     #[test]
+    fn round2_r5_suppresses_nil_for_records_with_unmodeled_operators() {
+        let uri = Url::parse("file:///tmp/semantic-round2-r5-record-nil-operator.pas")
+            .expect("R5 record nil URI");
+        let source = concat!(
+            "unit SemanticRound2R5RecordNilOperator;\n",
+            "interface\n",
+            "type TRec = record class operator Implicit(Value: Pointer): TRec; end;\n",
+            "procedure Take(Value: TRec);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var R: TRec; B: Boolean; I: Integer;\n",
+            "begin\n",
+            "  R := nil; Take(nil); B := I;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R5 record nil fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R5 record nil diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
+            "record operator conversions keep nil compatibility uncertain: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn correction_r6_resolves_the_implicit_tobject_ancestor() {
         let system_uri =
             Url::parse("file:///tmp/semantic-correction-r6-system.pas").expect("System URI");
@@ -14259,6 +14517,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
             "a class with no explicit parent has a proven source-backed TObject ancestor: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round2_r6_resolves_implicit_tobject_when_child_is_in_selected_system_source() {
+        let system_uri =
+            Url::parse("file:///tmp/semantic-round2-r6-system.pas").expect("System URI");
+        let main_uri = Url::parse("file:///tmp/semantic-round2-r6-main.pas").expect("Main URI");
+        let system = concat!(
+            "unit System;\n",
+            "interface\n",
+            "type TObject = class end; TChild = class end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let main = concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses System;\n",
+            "procedure Take(Value: TObject);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Obj: TObject; Child: TChild; B: Boolean; I: Integer;\n",
+            "begin\n",
+            "  Obj := Child; Take(Child); B := I;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(system_uri.clone(), system.to_owned())
+            .expect("same-System fixture parses");
+        index
+            .update(main_uri.clone(), main.to_owned())
+            .expect("same-System consumer parses");
+        index.bind_imports(
+            &main_uri,
+            std::iter::once(("System".to_owned(), system_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&main_uri, &AtomicBool::new(false))
+            .expect("same-System diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
+            "the selected System.TObject remains the implicit root for co-located classes: {diagnostics:?}"
         );
     }
 

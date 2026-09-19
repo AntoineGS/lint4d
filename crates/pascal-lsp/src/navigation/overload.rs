@@ -1,8 +1,8 @@
 use super::{
     AncestryResolutionState, AncestryStatus, AssistanceBudget, BuiltinType, Candidate, Document,
     GenericSubstitution, IntegerKind, NavigationIndex, Origin, ParameterMode, Receiver, Region,
-    ResolutionState, ResolvedType, RoutineParameter, Span, Symbol, SymbolKind, TypeIdentity,
-    TypeInstance, TypeKind, TypeRef, TypeShape, assistance, canonical_name,
+    ResolutionState, ResolvedType, RoutineKind, RoutineParameter, Span, Symbol, SymbolKind,
+    TypeIdentity, TypeInstance, TypeKind, TypeRef, TypeShape, assistance, canonical_name,
     check_navigation_cancel,
 };
 use lsp_types::Url;
@@ -471,7 +471,7 @@ fn score_group_detailed(
                 uncertain = true;
                 continue;
             };
-            match nil_compatibility(index, expected) {
+            match nil_compatibility(index, expected, cancel, budget)? {
                 Compatibility::Compatible => cost = cost.saturating_add(1),
                 Compatibility::Unknown => uncertain = true,
                 Compatibility::Incompatible => {
@@ -721,7 +721,7 @@ pub(super) fn analyze_assignment(
         return Ok(AssignmentAnalysis::Incomplete);
     }
     if rhs_info.nil_literal {
-        return Ok(match nil_compatibility(index, &expected) {
+        return Ok(match nil_compatibility(index, &expected, cancel, budget)? {
             Compatibility::Compatible => AssignmentAnalysis::Compatible,
             Compatibility::Unknown => AssignmentAnalysis::Incomplete,
             Compatibility::Incompatible => AssignmentAnalysis::Incompatible {
@@ -1637,7 +1637,7 @@ fn element_type_for_expression(
             symbol.kind,
             SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::Field | SymbolKind::Property
         ) {
-            continue;
+            return Ok(None);
         }
         let Some(shape) = symbol.type_shape.as_ref() else {
             return Ok(None);
@@ -1652,10 +1652,13 @@ fn element_type_for_expression(
             budget,
             &mut HashSet::new(),
         )?;
-        if result.as_ref() != identity.as_ref() {
+        let Some(identity) = identity else {
+            return Ok(None);
+        };
+        if result.as_ref().is_some_and(|current| current != &identity) {
             return Ok(None);
         }
-        result = identity;
+        result = Some(identity);
     }
     Ok(result)
 }
@@ -1860,8 +1863,7 @@ fn infer_numeric_literal(text: &str) -> TypeIdentity {
 
 fn classify_literal_fragments(text: &str) -> Option<LiteralClassification> {
     let mut remaining = text.trim();
-    let mut fragments = 0usize;
-    let mut character_fragment = false;
+    let mut logical_characters = 0usize;
     let mut character_value_is_certain = true;
     while !remaining.is_empty() {
         remaining = remaining.trim_start();
@@ -1882,8 +1884,6 @@ fn classify_literal_fragments(text: &str) -> Option<LiteralClassification> {
                 return None;
             }
             remaining = &digits[length..];
-            fragments += 1;
-            character_fragment = true;
             let value = if let Some(hex_digits) = after_hash.strip_prefix('$') {
                 &hex_digits[..length]
             } else {
@@ -1892,19 +1892,19 @@ fn classify_literal_fragments(text: &str) -> Option<LiteralClassification> {
             let radix = if after_hash.starts_with('$') { 16 } else { 10 };
             character_value_is_certain = character_value_is_certain
                 && u32::from_str_radix(value, radix).is_ok_and(|value| value <= u8::MAX as u32);
+            logical_characters = logical_characters.saturating_add(1);
             continue;
         }
         if remaining.starts_with('\'') {
             let bytes = remaining.as_bytes();
             let mut index = 1;
-            let mut logical_characters = 0usize;
             while index < bytes.len() {
                 if bytes[index] != b'\'' {
                     let character = remaining[index..].chars().next()?;
-                    logical_characters = logical_characters.saturating_add(1);
                     if !character.is_ascii() {
                         character_value_is_certain = false;
                     }
+                    logical_characters = logical_characters.saturating_add(1);
                     index += character.len_utf8();
                     continue;
                 }
@@ -1914,8 +1914,6 @@ fn classify_literal_fragments(text: &str) -> Option<LiteralClassification> {
                     continue;
                 }
                 remaining = &remaining[index + 1..];
-                fragments += 1;
-                character_fragment = logical_characters == 1;
                 break;
             }
             if index >= bytes.len() {
@@ -1925,15 +1923,10 @@ fn classify_literal_fragments(text: &str) -> Option<LiteralClassification> {
         }
         return None;
     }
-    if fragments != 1 {
-        return Some(LiteralClassification::String);
-    }
-    if character_fragment && character_value_is_certain {
-        Some(LiteralClassification::Character)
-    } else if character_fragment {
-        None
-    } else {
-        Some(LiteralClassification::String)
+    match logical_characters {
+        1 if character_value_is_certain => Some(LiteralClassification::Character),
+        1 => None,
+        _ => Some(LiteralClassification::String),
     }
 }
 
@@ -2411,26 +2404,32 @@ fn compatibility_from_conversion(conversion: Conversion) -> Compatibility {
     }
 }
 
-fn nil_compatibility(index: &NavigationIndex, expected: &TypeIdentity) -> Compatibility {
-    match expected {
+fn nil_compatibility(
+    index: &NavigationIndex,
+    expected: &TypeIdentity,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Compatibility, String> {
+    Ok(match expected {
         TypeIdentity::Named { uri, key, kind, .. } => match kind {
             TypeKind::Class
             | TypeKind::Interface
             | TypeKind::Pointer
             | TypeKind::Callable
             | TypeKind::DynamicArray => Compatibility::Compatible,
+            TypeKind::Record => record_nil_compatibility(index, uri, key, cancel, budget)?,
             TypeKind::Other => {
                 let Some(document) = index.documents.get(uri) else {
-                    return Compatibility::Unknown;
+                    return Ok(Compatibility::Unknown);
                 };
                 let Some(indices) = document.type_symbol_indices.get(key) else {
-                    return Compatibility::Unknown;
+                    return Ok(Compatibility::Unknown);
                 };
                 if indices.len() != 1 {
-                    return Compatibility::Unknown;
+                    return Ok(Compatibility::Unknown);
                 }
                 let Some(symbol) = document.symbols.get(indices[0]) else {
-                    return Compatibility::Unknown;
+                    return Ok(Compatibility::Unknown);
                 };
                 match symbol.type_kind {
                     TypeKind::Pointer | TypeKind::Callable | TypeKind::DynamicArray => {
@@ -2440,13 +2439,46 @@ fn nil_compatibility(index: &NavigationIndex, expected: &TypeIdentity) -> Compat
                     _ => Compatibility::Incompatible,
                 }
             }
-            TypeKind::Record
-            | TypeKind::Enum
-            | TypeKind::Array
-            | TypeKind::String
-            | TypeKind::File => Compatibility::Incompatible,
+            TypeKind::Enum | TypeKind::Array | TypeKind::String | TypeKind::File => {
+                Compatibility::Incompatible
+            }
         },
         TypeIdentity::Builtin(_) | TypeIdentity::IntegerLiteral(_) => Compatibility::Incompatible,
+    })
+}
+
+fn record_nil_compatibility(
+    index: &NavigationIndex,
+    uri: &Url,
+    key: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Compatibility, String> {
+    let Some(document) = index.documents.get(uri) else {
+        return Ok(Compatibility::Unknown);
+    };
+    let Some(indices) = document.type_symbol_indices.get(key) else {
+        return Ok(Compatibility::Unknown);
+    };
+    if indices.len() != 1 {
+        return Ok(Compatibility::Unknown);
+    }
+    let Some(type_symbol) = document.symbols.get(indices[0]) else {
+        return Ok(Compatibility::Unknown);
+    };
+    if type_symbol.kind != SymbolKind::Type || type_symbol.type_kind != TypeKind::Record {
+        return Ok(Compatibility::Unknown);
+    }
+
+    budget.require_work(document.symbols.len(), cancel)?;
+    if document.symbols.iter().any(|symbol| {
+        symbol.kind == SymbolKind::Routine
+            && symbol.routine_kind == RoutineKind::Operator
+            && symbol.owner_type.as_deref() == Some(key)
+    }) {
+        Ok(Compatibility::Unknown)
+    } else {
+        Ok(Compatibility::Incompatible)
     }
 }
 
@@ -2487,6 +2519,19 @@ fn byref_type_match(actual: &TypeIdentity, expected: &TypeIdentity) -> Compatibi
         {
             Compatibility::Unknown
         }
+        (
+            TypeIdentity::Builtin(_),
+            TypeIdentity::Named {
+                kind: expected_kind,
+                ..
+            },
+        ) if *expected_kind == TypeKind::Other => Compatibility::Unknown,
+        (
+            TypeIdentity::Named {
+                kind: actual_kind, ..
+            },
+            TypeIdentity::Builtin(_),
+        ) if *actual_kind == TypeKind::Other => Compatibility::Unknown,
         _ => Compatibility::Incompatible,
     }
 }
@@ -2567,6 +2612,26 @@ fn upcast_distance(
             return Ok(Upcast::Unknown);
         };
         if entry.kind == TypeKind::Class && !entry.parent_declared {
+            let implicit_parent = implicit_tobject_identity(
+                index,
+                uri,
+                document,
+                entry.name_span.start,
+                state,
+                cancel,
+                budget,
+            )?;
+            let expected_is_implicit_root = implicit_parent.as_ref().is_some_and(|parent| {
+                matches!(
+                    parent,
+                    TypeIdentity::Named {
+                        uri,
+                        key,
+                        args,
+                        ..
+                    } if uri == expected_uri && key == expected_key && args == expected_args
+                )
+            });
             // A rootless class can only have the implicit TObject ancestor.
             // Consequently it cannot be a distinct rootless class (or any
             // other explicitly declared class) when the expected type is not
@@ -2581,31 +2646,25 @@ fn upcast_distance(
             }
             if uri == expected_uri && key != expected_key {
                 if let Some(expected_document) = index.documents.get(expected_uri) {
-                    if expected_document
-                        .type_ancestry
-                        .get(expected_key)
-                        .is_some_and(|entries| {
-                            entries.len() == 1 && entries[0].kind == TypeKind::Class
-                        })
+                    if !expected_is_implicit_root
+                        && expected_document
+                            .type_ancestry
+                            .get(expected_key)
+                            .is_some_and(|entries| {
+                                entries.len() == 1 && entries[0].kind == TypeKind::Class
+                            })
                     {
                         return Ok(Upcast::No);
                     }
                 }
             }
-            let Some(parent) = implicit_tobject_identity(
-                index,
-                uri,
-                document,
-                entry.name_span.start,
-                state,
-                cancel,
-                budget,
-            )?
-            else {
+            let Some(parent) = implicit_parent else {
                 return Ok(Upcast::Unknown);
             };
             let next_distance = distance.saturating_add(1);
-            queue.push_back((parent, next_distance));
+            if parent != current {
+                queue.push_back((parent, next_distance));
+            }
         }
         let Some(ResolvedType::Named(instance)) = resolved_type_from_identity(index, &current)
         else {

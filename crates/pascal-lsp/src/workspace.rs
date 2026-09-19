@@ -7503,16 +7503,17 @@ impl Workspace {
                 .expanded
                 .reverse_range_with_budget(physical_uri, physical_range.clone(), budget)?
                 .is_empty();
+            if !expansion.complete && current_root_includes_physical {
+                // An incomplete expansion may have stopped before resolving
+                // an include in an unknown or otherwise unvisited suffix.
+                // Its lack of a retained dependency or reverse mapping is
+                // therefore not evidence that this physical span is not a
+                // possible owner.  Keep the current claim silent until the
+                // competing root's ownership is complete enough to exclude.
+                return Ok(false);
+            }
             if !known_dependency && mapping_is_empty {
                 continue;
-            }
-            if !expansion.complete && current_root_includes_physical {
-                // A partial expansion proves ownership only through its
-                // retained prefix.  Its undiscovered suffix may still reach
-                // this physical include, so it cannot be ignored as a
-                // competing context merely because no reverse span was
-                // retained for it.
-                return Ok(false);
             }
             if mapping_is_empty {
                 // A complete expansion that merely depends on the same file

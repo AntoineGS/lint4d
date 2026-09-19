@@ -2109,7 +2109,7 @@ fn standard_workspace() -> (TempDir, PathBuf, PathBuf, String, String) {
 }
 
 #[test]
-fn diagnostics_report_a_proven_unresolved_identifier_with_exact_protocol_fields() {
+fn diagnostics_suppress_unqualified_global_absence_without_a_system_catalogue() {
     let root = tempfile::tempdir().expect("workspace");
     let source_path = root.path().join("Main.pas");
     let source = concat!(
@@ -2143,19 +2143,9 @@ fn diagnostics_report_a_proven_unresolved_identifier_with_exact_protocol_fields(
     let diagnostics = diagnostics["diagnostics"]
         .as_array()
         .expect("diagnostics array");
-    let diagnostic = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-unresolved-identifier")
-        .expect("unresolved identifier diagnostic");
-    assert_eq!(diagnostic["source"], "pascal-lsp");
-    assert_eq!(diagnostic["severity"], 1);
-    assert_eq!(diagnostic["message"], "unresolved identifier 'Kno'");
-    assert_eq!(
-        diagnostic["range"],
-        json!({
-            "start": {"line": 6, "character": 2},
-            "end": {"line": 6, "character": 5},
-        })
+    assert!(
+        diagnostics.is_empty(),
+        "an unavailable implicit System namespace cannot prove Kno absent: {diagnostics:?}"
     );
     server.shutdown();
 }
@@ -2343,15 +2333,20 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
     let provider_disk = concat!(
         "unit Provider;\n",
         "interface\n",
-        "const Existing = 1;\n",
+        "type\n",
+        "  TRec = record\n",
+        "    Existing: Integer;\n",
+        "  end;\n",
         "implementation\n",
         "end.\n",
     );
     let provider_overlay = concat!(
         "unit Provider;\n",
         "interface\n",
-        "const Existing = 1;\n",
-        "      MissingExport = 2;\n",
+        "type\n",
+        "  TRec = record\n",
+        "    Existing, Missing: Integer;\n",
+        "  end;\n",
         "implementation\n",
         "end.\n",
     );
@@ -2361,8 +2356,9 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
         "uses Provider;\n",
         "implementation\n",
         "procedure Run;\n",
+        "var Box: TRec;\n",
         "begin\n",
-        "  MissingExport := 1;\n",
+        "  Box.Missing := 1;\n",
         "end;\n",
         "end.\n",
     );
@@ -2388,7 +2384,7 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
             .as_array()
             .expect("initial diagnostics")
             .iter()
-            .any(|diagnostic| diagnostic["message"] == "unresolved identifier 'MissingExport'")
+            .any(|diagnostic| diagnostic["message"] == "missing member 'Missing'")
     );
 
     server.send_notification(
@@ -2408,7 +2404,7 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
             .as_array()
             .expect("refreshed diagnostics")
             .iter()
-            .all(|diagnostic| diagnostic["message"] != "unresolved identifier 'MissingExport'"),
+            .all(|diagnostic| diagnostic["message"] != "missing member 'Missing'"),
         "provider overlay should remove the consumer diagnostic: {refreshed}"
     );
     server.shutdown();
@@ -2424,7 +2420,8 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
         let a_source = concat!(
             "unit A;\n",
             "interface\n",
-            "var SharedName: Integer;\n",
+            "type TShared = record Value: Integer; end;\n",
+            "var SharedBox: TShared;\n",
             "implementation\n",
             "{$I Shared.inc}\n",
             "end.\n",
@@ -2432,11 +2429,13 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
         let b_source = concat!(
             "unit B;\n",
             "interface\n",
+            "type TShared = record Other: Integer; end;\n",
+            "var SharedBox: TShared;\n",
             "implementation\n",
             "{$I Shared.inc}\n",
             "end.\n",
         );
-        let shared_source = "procedure Run; begin SharedName := 1; end;\n";
+        let shared_source = "procedure Run; begin SharedBox.Value := 1; end;\n";
         write_file(&a, a_source);
         write_file(&b, b_source);
         write_file(&shared, shared_source);
@@ -2485,8 +2484,8 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
                         .expect("include diagnostics")
                         .iter()
                         .all(|diagnostic| {
-                            !(diagnostic["code"] == "pascal-unresolved-identifier"
-                                && diagnostic["message"] == "unresolved identifier 'SharedName'")
+                            !(diagnostic["code"] == "pascal-missing-member"
+                                && diagnostic["message"] == "missing member 'Value'")
                         }),
                     "shared include claim must be retracted for open order {open_order:?}: {diagnostics}"
                 );
@@ -2497,8 +2496,8 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
                         .expect("include diagnostics")
                         .iter()
                         .all(|diagnostic| {
-                            !(diagnostic["code"] == "pascal-unresolved-identifier"
-                                && diagnostic["message"] == "unresolved identifier 'SharedName'")
+                            !(diagnostic["code"] == "pascal-missing-member"
+                                && diagnostic["message"] == "missing member 'Value'")
                         }),
                     "shared include claim must be suppressed for open order {open_order:?}: {diagnostics}"
                 );
@@ -2510,18 +2509,20 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
 
 #[test]
 fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and_overlays() {
-    let shared_source = "procedure Run; begin SharedName := 1; end;\n";
+    let shared_source = "procedure Run; begin SharedBox.SharedName := 1; end;\n";
     let a_empty = concat!(
         "unit A;\n",
         "interface\n",
-        "var SharedName: Integer;\n",
+        "type TShared = record SharedName: Integer; end;\n",
+        "var SharedBox: TShared;\n",
         "implementation\n",
         "end.\n",
     );
     let a_complete = concat!(
         "unit A;\n",
         "interface\n",
-        "var SharedName: Integer;\n",
+        "type TShared = record SharedName: Integer; end;\n",
+        "var SharedBox: TShared;\n",
         "implementation\n",
         "{$I Shared.inc}\n",
         "end.\n",
@@ -2529,7 +2530,8 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
     let a_incomplete = concat!(
         "unit A;\n",
         "interface\n",
-        "var SharedName: Integer;\n",
+        "type TShared = record SharedName: Integer; end;\n",
+        "var SharedBox: TShared;\n",
         "implementation\n",
         "{$I Shared.inc}\n",
         "{$I Missing.inc}\n",
@@ -2538,9 +2540,13 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
     let b_source = concat!(
         "unit B;\n",
         "interface\n",
+        "type TShared = record Other: Integer; end;\n",
+        "var SharedBox: TShared;\n",
+        "type TOwn = record Value: Integer; end;\n",
+        "var OwnBox: TOwn;\n",
         "implementation\n",
         "{$I Shared.inc}\n",
-        "procedure Other; begin OwnTypoo := 1; end;\n",
+        "procedure Other; begin OwnBox.OwnTypoo := 1; end;\n",
         "end.\n",
     );
 
@@ -2580,8 +2586,7 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                         .as_array()
                         .expect("B diagnostics")
                         .iter()
-                        .any(|diagnostic| diagnostic["message"]
-                            == "unresolved identifier 'OwnTypoo'"),
+                        .any(|diagnostic| diagnostic["message"] == "missing member 'OwnTypoo'"),
                     "the competing root's independent local claim must remain visible: {root_diagnostics}"
                 );
             }
@@ -2595,7 +2600,7 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                 .as_array()
                 .expect("initial shared diagnostics")
                 .iter()
-                .any(|diagnostic| diagnostic["message"] == "unresolved identifier 'SharedName'"),
+                .any(|diagnostic| diagnostic["message"] == "missing member 'SharedName'"),
             "initial claim should be visible before the competing root owns Shared.inc: {initial}"
         );
 
@@ -2626,9 +2631,7 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                         .as_array()
                         .expect("shared diagnostics")
                         .iter()
-                        .all(|diagnostic| {
-                            diagnostic["message"] != "unresolved identifier 'SharedName'"
-                        })
+                        .all(|diagnostic| diagnostic["message"] != "missing member 'SharedName'")
                 }
             )
             .is_some(),
@@ -2659,7 +2662,7 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                     .as_array()
                     .expect("shared diagnostics")
                     .iter()
-                    .all(|diagnostic| diagnostic["message"] != "unresolved identifier 'SharedName'"),
+                    .all(|diagnostic| diagnostic["message"] != "missing member 'SharedName'"),
                 "incomplete overlay must not restore a physical include claim: {publication}"
             );
         }
@@ -2688,7 +2691,7 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                     .as_array()
                     .expect("shared diagnostics")
                     .iter()
-                    .all(|diagnostic| diagnostic["message"] != "unresolved identifier 'SharedName'"),
+                    .all(|diagnostic| diagnostic["message"] != "missing member 'SharedName'"),
                 "removing the missing include must not restore a claim while both roots remain owners: {publication}"
             );
         }
@@ -2707,14 +2710,128 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                         .as_array()
                         .expect("shared diagnostics after close")
                         .iter()
-                        .any(|diagnostic| {
-                            diagnostic["message"] == "unresolved identifier 'SharedName'"
-                        })
+                        .any(|diagnostic| diagnostic["message"] == "missing member 'SharedName'")
                 }
             )
             .is_some(),
             "closing the competing root must restore the sole-owner claim"
         );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn diagnostics_suppress_shared_claims_for_unknown_suffix_ownership() {
+    let shared_source = "procedure Run; begin SharedBox.SharedName := 1; end;\n";
+    let a_source = concat!(
+        "unit A;\n",
+        "interface\n",
+        "type TShared = record SharedName: Integer; end;\n",
+        "var SharedBox: TShared;\n",
+        "implementation\n",
+        "{$I Missing.inc}\n",
+        "{$IFDEF FEATURE}\n",
+        "{$I Shared.inc}\n",
+        "{$ENDIF}\n",
+        "end.\n",
+    );
+    let b_source = concat!(
+        "unit B;\n",
+        "interface\n",
+        "type TShared = record Other: Integer; end;\n",
+        "var SharedBox: TShared;\n",
+        "type TOwn = record Value: Integer; end;\n",
+        "var OwnBox: TOwn;\n",
+        "implementation\n",
+        "{$I Shared.inc}\n",
+        "procedure Other; begin OwnBox.OwnTypoo := 1; end;\n",
+        "end.\n",
+    );
+
+    for open_order in [["A.pas", "B.pas"], ["B.pas", "A.pas"]] {
+        let root = tempfile::tempdir().expect("workspace");
+        let a = root.path().join("A.pas");
+        let b = root.path().join("B.pas");
+        let shared = root.path().join("Shared.inc");
+        write_file(&a, a_source);
+        write_file(&b, b_source);
+        write_file(&shared, shared_source);
+
+        let mut server = TestServer::launch();
+        server.initialize(root.path(), Value::Null);
+        for file_name in open_order {
+            let path = root.path().join(file_name);
+            let source = if file_name == "A.pas" {
+                a_source
+            } else {
+                b_source
+            };
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&path),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": source,
+                    }
+                }),
+            );
+            let root_diagnostics = diagnostics_for_uri(&mut server, &uri(&path));
+            if file_name == "B.pas" {
+                assert!(
+                    root_diagnostics["diagnostics"]
+                        .as_array()
+                        .expect("B diagnostics")
+                        .iter()
+                        .any(|diagnostic| diagnostic["message"] == "missing member 'OwnTypoo'"),
+                    "the competing root's independent local claim must remain visible: {root_diagnostics}"
+                );
+            }
+        }
+
+        // Re-run the incomplete root to exercise the publication refresh
+        // barrier in both open orders, including the order that first
+        // published B's physical include claim.
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&a), "version": 2},
+                "contentChanges": [{"text": a_source}],
+            }),
+        );
+        let _ = diagnostics_for_uri(&mut server, &uri(&a));
+        let saw_physical_claim = std::cell::Cell::new(false);
+        let saw_retraction = std::cell::Cell::new(false);
+        let _ = diagnostics_for_uri_until(
+            &mut server,
+            &uri(&shared),
+            Duration::from_secs(3),
+            |publication| {
+                let has_claim = publication["diagnostics"]
+                    .as_array()
+                    .expect("shared diagnostics")
+                    .iter()
+                    .any(|diagnostic| diagnostic["message"] == "missing member 'SharedName'");
+                if has_claim {
+                    saw_physical_claim.set(true);
+                    false
+                } else {
+                    saw_retraction.set(true);
+                    true
+                }
+            },
+        );
+        if open_order[0] == "B.pas" {
+            assert!(
+                saw_physical_claim.get(),
+                "B-first order must exercise retraction of the prior physical claim"
+            );
+            assert!(
+                saw_retraction.get(),
+                "B-first order must publish the retracted physical state"
+            );
+        }
         server.shutdown();
     }
 }

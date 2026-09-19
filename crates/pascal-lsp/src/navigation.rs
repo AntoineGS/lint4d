@@ -1723,7 +1723,7 @@ impl NavigationIndex {
         }
 
         let implicit_system =
-            self.implicit_system_references_with_budget(key, identifier, state, cancel, budget)?;
+            self.implicit_system_references_with_budget(key, state, cancel, budget)?;
         if !implicit_system.is_empty() {
             return Ok(implicit_system);
         }
@@ -1734,7 +1734,6 @@ impl NavigationIndex {
     fn implicit_system_references_with_budget(
         &self,
         key: &str,
-        identifier: Node<'_>,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
@@ -1742,17 +1741,10 @@ impl NavigationIndex {
         let status = self.implicit_system_namespace_status();
         let ImplicitSystemNamespaceStatus::SourceBacked { uri } = status else {
             // The compiler's implicit System namespace is not represented by
-            // a complete source catalogue here.  A failed value lookup
-            // therefore cannot prove that the name is absent.  An
-            // unqualified assignment target is the one closed binding form:
-            // it must name a writable source declaration, so preserve the
-            // existing unresolved-name proof for genuine targets such as
-            // `Typoo := 1`.
-            if matches!(status, ImplicitSystemNamespaceStatus::Unavailable)
-                && is_assignment_target_identifier(identifier)
-            {
-                return Ok(Vec::new());
-            }
+            // a complete source catalogue here.  A failed value lookup,
+            // including an assignment target, therefore cannot prove that
+            // the name is absent: compiler-provided writable globals may be
+            // missing from the retained source index.
             state.mark_implicit_system_namespace_incomplete();
             return Ok(Vec::new());
         };
@@ -12392,23 +12384,6 @@ fn is_right_hand_member(dot: Node<'_>, identifier: Node<'_>) -> bool {
         .is_some_and(|rhs| Span::from_node(rhs).contains(Span::from_node(identifier)))
 }
 
-fn is_assignment_target_identifier(identifier: Node<'_>) -> bool {
-    let span = Span::from_node(identifier);
-    let mut current = Some(identifier);
-    while let Some(node) = current {
-        if node.kind() == "assignment" {
-            return node
-                .child_by_field_name("lhs")
-                .is_some_and(|lhs| Span::from_node(lhs).contains(span));
-        }
-        if matches!(node.kind(), "block" | "statements") {
-            return false;
-        }
-        current = node.parent();
-    }
-    false
-}
-
 fn location_for_span(uri: &Url, source: &str, span: Span) -> Option<Location> {
     let start = text::offset_to_position(source, span.start)?;
     let end = text::offset_to_position(source, span.end)?;
@@ -12721,7 +12696,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_diagnostics_prove_a_missing_local_name() {
+    fn semantic_diagnostics_leave_an_unqualified_global_name_incomplete_without_system_source() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-local.pas").expect("fixture URI");
         let source = "unit SemanticDiagnosticsLocal;\ninterface\nvar Known: Integer;\nimplementation\nprocedure Run;\nbegin\n  Kno := 1;\nend;\nend.\n";
         let mut index = NavigationIndex::new();
@@ -12733,20 +12708,18 @@ mod tests {
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("semantic diagnostics complete");
 
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics[0].kind,
-            SemanticDiagnosticKind::UnresolvedIdentifier
-        );
+        assert!(diagnostics.is_empty());
         let start = source.rfind("Kno").expect("missing name");
         assert_eq!(
-            diagnostics[0].span,
-            SourceSpan {
-                start,
-                end: start + "Kno".len(),
-            }
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &uri,
+                    text::offset_to_position(source, start).expect("missing position"),
+                    &AtomicBool::new(false),
+                )
+                .expect("missing proof status"),
+            SemanticProofStatus::Incomplete
         );
-        assert_eq!(diagnostics[0].message, "unresolved identifier 'Kno'");
     }
 
     #[test]
@@ -12790,7 +12763,7 @@ mod tests {
                     &cancel,
                 )
                 .expect("missing proof status"),
-            SemanticProofStatus::ProvenAbsent
+            SemanticProofStatus::Incomplete
         );
     }
 
@@ -12850,6 +12823,9 @@ mod tests {
             "  public\n",
             "    Value: Integer;\n",
             "  end;\n",
+            "  TRec = record\n",
+            "    Value: Integer;\n",
+            "  end;\n",
             "implementation\n",
             "end.\n",
         );
@@ -12859,10 +12835,10 @@ mod tests {
             "uses Provider;\n",
             "implementation\n",
             "procedure Run;\n",
-            "var Box: TBox;\n",
+            "var Box: TBox; R: TRec;\n",
             "begin\n",
             "  Box.Secret := 1;\n",
-            "  UnknownName := 2;\n",
+            "  R.UnknownName := 2;\n",
             "end;\n",
             "end.\n",
         );
@@ -12885,7 +12861,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message == "unresolved identifier 'UnknownName'")
+                .any(|diagnostic| diagnostic.message == "missing member 'UnknownName'")
         );
         assert!(
             !diagnostics
@@ -13071,7 +13047,10 @@ mod tests {
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(messages, vec!["unresolved identifier 'Typoo'"]);
+        assert!(
+            messages.is_empty(),
+            "implicit System misses stay incomplete: {messages:?}"
+        );
     }
 
     #[test]
@@ -13115,11 +13094,43 @@ mod tests {
 
         assert_eq!(
             messages,
-            vec![
-                "missing member 'Missing'",
-                "missing member 'Integer'",
-                "unresolved identifier 'Typoo'"
-            ]
+            vec!["missing member 'Missing'", "missing member 'Integer'"]
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_do_not_treat_assignment_lhs_as_implicit_system_proof() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-assignment-targets.pas")
+            .expect("assignment-target URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsAssignmentTargets;\n",
+            "interface\n",
+            "var A: array[0..9] of Integer;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  ExitCode := 0;\n",
+            "  RandSeed := 42;\n",
+            "  FileMode := 2;\n",
+            "  IsMultiThread := True;\n",
+            "  A[Random(10)] := 1;\n",
+            "  A[Round(1.2)] := 1;\n",
+            "  Typoo := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("assignment-target fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "unavailable implicit System namespace cannot prove any assignment miss: {diagnostics:?}"
         );
     }
 

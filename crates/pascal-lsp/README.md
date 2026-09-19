@@ -23,11 +23,12 @@ does not claim to contain a complete compiler-provided `System` export
 catalogue: a source-backed `System` unit can establish positive bindings, but a
 failed unqualified value/call lookup remains incomplete and is silent rather
 than being closed by a hand-maintained intrinsic-name allowlist. When no
-implicit `System` source is available, the closed unqualified assignment-target
-path still diagnoses genuine missing source names; source-backed or ambiguous
-implicit namespaces remain incomplete on misses. Built-in types, casts, and
-type-valued intrinsic arguments are classified separately and are not treated
-as unresolved value uses.
+implicit `System` source is available, failed unqualified value/call lookups,
+including assignment targets, remain incomplete because compiler-provided
+writable globals may be absent from the source index. Source-backed or
+ambiguous implicit namespaces likewise remain incomplete on misses. Built-in
+types, casts, and type-valued intrinsic arguments are classified separately and
+are not treated as unresolved value uses.
 Declarations, type/generic parameters, routine directives, labels,
 named-argument syntax, units, strings, and comments are not treated as value
 uses. Generic-provider symbol scans are charged to the same semantic work and

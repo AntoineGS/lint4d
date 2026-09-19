@@ -249,15 +249,31 @@ impl ConditionalEnvironment {
     /// Build an environment without cloning any retained payload until all
     /// entry and byte limits have been checked.
     pub fn try_from_context(context: &ConditionalContext) -> Option<Self> {
+        let mut budget = AnalysisBudget {
+            cancel: None,
+            work: 0,
+            byte_work: 0,
+            exhausted: false,
+        };
+        Self::try_from_context_with_budget(context, &mut budget)
+    }
+
+    fn try_from_context_with_budget(
+        context: &ConditionalContext,
+        budget: &mut AnalysisBudget<'_>,
+    ) -> Option<Self> {
         let mut environment = Self::new();
         if let Some(version) = context.compiler_version {
+            if !budget.charge(1) || !budget.charge_bytes(size_of::<CompilerVersion>()) {
+                return None;
+            }
             if !environment.set_compiler_version(version) {
                 return None;
             }
         }
         for (symbol, value) in &context.defines {
             let raw_symbol = canonical_symbol_ref(symbol)?;
-            if !environment.can_admit_value_key(raw_symbol) {
+            if !admit_context_entry(budget, raw_symbol.len(), size_of::<Truth>()) {
                 return None;
             }
             let symbol = canonical_symbol(raw_symbol)?;
@@ -271,7 +287,7 @@ impl ConditionalEnvironment {
         }
         for (option, value) in &context.options {
             let raw_option = canonical_symbol_ref(option)?;
-            if !environment.can_admit_option_key(raw_option) {
+            if !admit_context_entry(budget, raw_option.len(), size_of::<Truth>()) {
                 return None;
             }
             let option = canonical_option_name(raw_option)?;
@@ -286,7 +302,11 @@ impl ConditionalEnvironment {
         }
         for (name, value) in &context.constants {
             let raw_name = canonical_symbol_ref(name)?;
-            if !environment.can_admit_constant_key(raw_name, value) {
+            if !admit_context_entry(
+                budget,
+                raw_name.len(),
+                size_of::<ConstantValue>().saturating_add(constant_size(value)),
+            ) {
                 return None;
             }
             let name = canonical_symbol(raw_name)?;
@@ -562,46 +582,6 @@ impl ConditionalEnvironment {
         self.bytes
     }
 
-    fn can_admit_value_key(&self, key: &str) -> bool {
-        let existing = self
-            .values
-            .keys()
-            .any(|candidate| candidate.eq_ignore_ascii_case(key));
-        self.can_admit_entry(key.len(), size_of::<Truth>(), existing)
-    }
-
-    fn can_admit_option_key(&self, key: &str) -> bool {
-        let existing = self
-            .options
-            .keys()
-            .any(|candidate| candidate.eq_ignore_ascii_case(key));
-        self.can_admit_entry(key.len(), size_of::<Truth>(), existing)
-    }
-
-    fn can_admit_constant_key(&self, key: &str, value: &ConstantValue) -> bool {
-        let existing = self
-            .constants
-            .keys()
-            .any(|candidate| candidate.eq_ignore_ascii_case(key));
-        self.can_admit_entry(
-            key.len(),
-            size_of::<ConstantValue>().saturating_add(constant_size(value)),
-            existing,
-        )
-    }
-
-    fn can_admit_entry(&self, key_len: usize, payload_bytes: usize, existing: bool) -> bool {
-        let Some(entry_bytes) = key_len.checked_add(payload_bytes) else {
-            return false;
-        };
-        let additional = if existing { 0 } else { entry_bytes };
-        (existing || self.len() < MAX_ENVIRONMENT_ENTRIES)
-            && self
-                .bytes
-                .checked_add(additional)
-                .is_some_and(|bytes| bytes <= MAX_ENVIRONMENT_BYTES)
-    }
-
     fn clear(&mut self) {
         self.values.clear();
         self.options.clear();
@@ -793,6 +773,25 @@ impl AnalysisBudget<'_> {
             true
         }
     }
+}
+
+fn admit_context_entry(
+    budget: &mut AnalysisBudget<'_>,
+    key_len: usize,
+    payload_bytes: usize,
+) -> bool {
+    if !budget.poll() {
+        return false;
+    }
+    let Some(entry_bytes) = key_len.checked_add(payload_bytes) else {
+        budget.exhausted = true;
+        return false;
+    };
+    if entry_bytes > MAX_ENVIRONMENT_BYTES {
+        budget.exhausted = true;
+        return false;
+    }
+    budget.charge(key_len.max(1)) && budget.charge_bytes(entry_bytes)
 }
 
 fn analyze_inner(
@@ -1117,30 +1116,7 @@ fn initial_environment(
     context: &ConditionalContext,
     budget: &mut AnalysisBudget<'_>,
 ) -> Option<ConditionalEnvironment> {
-    let environment = ConditionalEnvironment::try_from_context(context)?;
-    for define in context.defines.keys() {
-        if !budget.charge(1) {
-            return None;
-        }
-        if !budget.charge_bytes(define.len()) {
-            return None;
-        }
-    }
-    for option in context.options.keys() {
-        if !budget.charge(1) || !budget.charge_bytes(option.len()) {
-            return None;
-        }
-    }
-    for (name, value) in &context.constants {
-        if !budget.charge(1)
-            || !budget.charge_bytes(name.len().saturating_add(constant_size(value)))
-        {
-            return None;
-        }
-    }
-    if context.compiler_version.is_some() && !budget.charge(1) {
-        return None;
-    }
+    let environment = ConditionalEnvironment::try_from_context_with_budget(context, budget)?;
     if !budget.check_environment_bytes(environment.bytes())
         || environment.len() > MAX_ENVIRONMENT_ENTRIES
         || !budget.charge_bytes(environment.bytes())

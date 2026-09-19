@@ -511,3 +511,143 @@ fn adapter_rejects_one_physical_include_reached_with_two_entry_contexts() {
         CfgSnapshotStatus::Incomplete { .. }
     ));
 }
+
+#[test]
+fn adapter_prepares_short_nested_conditionals_and_includes_with_exact_spans() {
+    let root_bytes = concat!(
+        "unit App; interface ",
+        "{$UNDEF X}",
+        "{$IFDEF X}const Inactive = 1;{$ELSE}",
+        "{$IF 1=1}const NestedActive = 1;{$ENDIF}",
+        "{$ENDIF}",
+        "{$I body.inc} implementation end."
+    )
+    .as_bytes();
+    let include_bytes =
+        b"{$IF 1=0}const IncludedInactive = 1;{$ELSE}const IncludedActive = 1;{$ENDIF}";
+    let root_id = SourceId::new("source:/workspace/App.pas");
+    let include_id = SourceId::new("source:/workspace/body.inc");
+    let include_directive = b"{$I body.inc}";
+    let include_start = root_bytes
+        .windows(include_directive.len())
+        .position(|window| window == include_directive)
+        .expect("include directive");
+    let project = ResolvedProject {
+        root: ResolvedUnit {
+            requested_name: "App".to_string(),
+            declared_name: "App".to_string(),
+            source: source(root_id.as_str(), "/workspace/App.pas", root_bytes),
+        },
+        units: Vec::new(),
+        imports: Vec::new(),
+        includes: vec![ResolvedInclude {
+            including_source_id: root_id.clone(),
+            byte_range: include_start..include_start + include_directive.len(),
+            requested_name: "body.inc".to_string(),
+            target: ResolutionTarget::Found(include_id.clone()),
+        }],
+        include_sources: vec![source(
+            include_id.as_str(),
+            "/workspace/body.inc",
+            include_bytes,
+        )],
+        complete: true,
+        report: report(true),
+    };
+    let options = CfgSnapshotOptions {
+        prepare_configured_sources: true,
+        configuration_id: Some("debug".to_string()),
+        ..raw_snapshot_options()
+    };
+
+    let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
+    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    let target = snapshot.snapshot.units().first().expect("prepared root");
+    assert!(target.is_prepared());
+    assert!(
+        target
+            .source()
+            .windows(b"NestedActive".len())
+            .any(|window| window == b"NestedActive")
+    );
+    assert!(
+        target
+            .source()
+            .windows(b"IncludedActive".len())
+            .any(|window| window == b"IncludedActive")
+    );
+    assert!(
+        !target
+            .source()
+            .windows(b"Inactive".len())
+            .any(|window| window == b"Inactive")
+    );
+    assert!(
+        !target
+            .source()
+            .windows(b"IncludedInactive".len())
+            .any(|window| window == b"IncludedInactive")
+    );
+
+    let nested_start = root_bytes
+        .windows(b"NestedActive".len())
+        .position(|window| window == b"NestedActive")
+        .expect("nested declaration");
+    let prepared_nested_start = target
+        .source()
+        .windows(b"NestedActive".len())
+        .position(|window| window == b"NestedActive")
+        .expect("prepared nested declaration");
+    let nested_mapping = target
+        .source_map()
+        .expect("prepared source map")
+        .map_range(prepared_nested_start..prepared_nested_start + b"NestedActive".len())
+        .expect("nested mapping");
+    assert_eq!(nested_mapping.len(), 1);
+    assert_eq!(
+        nested_mapping[0]
+            .original()
+            .expect("nested origin")
+            .source_id()
+            .as_str(),
+        root_id.as_str()
+    );
+    assert_eq!(
+        nested_mapping[0]
+            .original()
+            .expect("nested origin")
+            .byte_range(),
+        nested_start..nested_start + b"NestedActive".len()
+    );
+
+    let included_start = include_bytes
+        .windows(b"IncludedActive".len())
+        .position(|window| window == b"IncludedActive")
+        .expect("included declaration");
+    let prepared_included_start = target
+        .source()
+        .windows(b"IncludedActive".len())
+        .position(|window| window == b"IncludedActive")
+        .expect("prepared included declaration");
+    let included_mapping = target
+        .source_map()
+        .expect("prepared source map")
+        .map_range(prepared_included_start..prepared_included_start + b"IncludedActive".len())
+        .expect("included mapping");
+    assert_eq!(included_mapping.len(), 1);
+    assert_eq!(
+        included_mapping[0]
+            .original()
+            .expect("included origin")
+            .source_id()
+            .as_str(),
+        include_id.as_str()
+    );
+    assert_eq!(
+        included_mapping[0]
+            .original()
+            .expect("included origin")
+            .byte_range(),
+        included_start..included_start + b"IncludedActive".len()
+    );
+}

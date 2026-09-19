@@ -4,9 +4,35 @@ use std::cell::Cell;
 use pascal_core::conditional::{
     self, CompilerVersion, ConditionalContext, ConstantValue, IncludeTransition, Truth,
 };
-use pascal_core::resolver::NoCancellation;
+use pascal_core::resolver::{CancellationToken, NoCancellation};
 
 struct CountingAllocator;
+
+struct CancelAfter {
+    calls: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+impl CancelAfter {
+    fn new(limit: usize) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl CancellationToken for CancelAfter {
+    fn is_cancelled(&self) -> bool {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            >= self.limit
+    }
+}
 
 thread_local! {
     static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
@@ -750,6 +776,53 @@ fn oversized_constant_names_are_rejected_before_key_allocation() {
     assert!(
         allocated < 1024 * 1024,
         "oversized key admission allocated {allocated} bytes before rejection"
+    );
+}
+
+#[test]
+fn cancelled_large_casefolded_admission_stops_before_retaining_the_context() {
+    let mut context = ConditionalContext::default();
+    for index in 0..8_000 {
+        let upper = format!("KEY_{index:08}");
+        let lower = upper.to_ascii_lowercase();
+        context.defines.insert(upper, Truth::True);
+        context.defines.insert(lower, Truth::False);
+    }
+    let cancel = CancelAfter::new(64);
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+    ALLOCATED_BYTES.with(|total| total.set(0));
+    let analysis = conditional::analyze_with_context_and_cancel("", &context, &cancel);
+    let allocated = ALLOCATED_BYTES.with(Cell::get);
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+
+    assert!(!analysis.complete);
+    assert!(cancel.calls() <= 70, "admission polling was not bounded");
+    assert!(
+        allocated < 512 * 1024,
+        "cancelled admission retained too much context: {allocated} bytes"
+    );
+}
+
+#[test]
+fn large_casefolded_alias_context_merges_each_logical_define_once() {
+    let mut context = ConditionalContext::default();
+    for index in 0..4_000 {
+        let upper = format!("KEY_{index:08}");
+        let lower = upper.to_ascii_lowercase();
+        context.defines.insert(upper, Truth::True);
+        context.defines.insert(lower, Truth::False);
+    }
+    let source = "{$IFDEF KEY_00000000}{$DEFINE WRONG}{$ENDIF}";
+    let analysis = conditional::analyze_with_context(source, &context);
+    assert!(analysis.complete);
+    assert_eq!(
+        analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE WRONG"))
+            .expect("aliased define branch")
+            .activity,
+        Truth::Unknown
     );
 }
 

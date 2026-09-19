@@ -2092,6 +2092,312 @@ fn standard_workspace() -> (TempDir, PathBuf, PathBuf, String, String) {
 }
 
 #[test]
+fn diagnostics_report_a_proven_unresolved_identifier_with_exact_protocol_fields() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Main.pas");
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "var Known: Integer;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  Kno := 1;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&source_path));
+    let diagnostics = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-unresolved-identifier")
+        .expect("unresolved identifier diagnostic");
+    assert_eq!(diagnostic["source"], "pascal-lsp");
+    assert_eq!(diagnostic["severity"], 1);
+    assert_eq!(diagnostic["message"], "unresolved identifier 'Kno'");
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": {"line": 6, "character": 2},
+            "end": {"line": 6, "character": 5},
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_report_a_missing_member_with_utf16_and_crlf_coordinates() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Main.pas");
+    let source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TBox = class\r\n",
+        "    Value: Integer;\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "procedure Run;\r\n",
+        "var Box: TBox;\r\n",
+        "begin\r\n",
+        "  Writeln('😀'); Box.Missing := 1;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&source_path));
+    let diagnostics = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-missing-member")
+        .expect("missing member diagnostic");
+    assert_eq!(diagnostic["message"], "missing member 'Missing'");
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": {"line": 10, "character": 21},
+            "end": {"line": 10, "character": 28},
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_map_missing_members_in_includes_to_the_physical_document() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    let include = root.path().join("Shared.inc");
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "type\n",
+        "  TBox = class\n",
+        "    Value: Integer;\n",
+        "  end;\n",
+        "implementation\n",
+        "{$I Shared.inc}\n",
+        "end.\n",
+    );
+    let include_source = "procedure Run;\nvar Box: TBox;\nbegin\n  Box.Missing := 1;\nend;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+
+    let root_diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        root_diagnostics["diagnostics"]
+            .as_array()
+            .expect("root diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-missing-member")
+    );
+    let include_diagnostics = diagnostics_for_uri(&mut server, &uri(&include));
+    let diagnostic = include_diagnostics["diagnostics"]
+        .as_array()
+        .expect("include diagnostics")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-missing-member")
+        .expect("physical include missing member diagnostic");
+    assert_eq!(diagnostic["message"], "missing member 'Missing'");
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": {"line": 3, "character": 6},
+            "end": {"line": 3, "character": 13},
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_suppress_unknown_imports_and_inaccessible_members() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "type\n",
+        "  TBox = class\n",
+        "  private\n",
+        "    Secret: Integer;\n",
+        "  public\n",
+        "    Value: Integer;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses MissingProvider, Provider;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Box: TBox;\n",
+        "begin\n",
+        "  Box.Secret := 1;\n",
+        "  UnknownName := 2;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    let diagnostics = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-missing-member"
+                && diagnostic["message"] != "unresolved identifier 'UnknownName'"),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    let provider_disk = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "const Existing = 1;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let provider_overlay = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "const Existing = 1;\n",
+        "      MissingExport = 2;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Provider;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingExport := 1;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_disk);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .expect("initial diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["message"] == "unresolved identifier 'MissingExport'")
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_overlay,
+            }
+        }),
+    );
+    let refreshed = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        refreshed["diagnostics"]
+            .as_array()
+            .expect("refreshed diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["message"] != "unresolved identifier 'MissingExport'"),
+        "provider overlay should remove the consumer diagnostic: {refreshed}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn numeric_compiler_version_rename_edits_only_the_active_branch() {
     let root = tempfile::tempdir().expect("workspace");
     let source_path = root.path().join("Probe.pas");

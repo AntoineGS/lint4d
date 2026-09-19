@@ -184,6 +184,37 @@ pub struct SourceSpan {
     pub end: usize,
 }
 
+/// The proof boundary used by source-semantic diagnostics.
+///
+/// A failed lookup is not automatically an absence proof.  Callers may use
+/// this status to distinguish a name that was not found in a complete model
+/// from a lookup that was ambiguous or had an unsupported input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticProofStatus {
+    Resolved,
+    ProvenAbsent,
+    Ambiguous,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticDiagnosticKind {
+    UnresolvedIdentifier,
+    MissingMember,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticDiagnostic {
+    pub(crate) kind: SemanticDiagnosticKind,
+    pub(crate) span: SourceSpan,
+    pub(crate) message: String,
+}
+
+const MAX_SEMANTIC_DIAGNOSTIC_NODES: usize = 100_000;
+const MAX_SEMANTIC_DIAGNOSTIC_WORK: usize = 100_000;
+const MAX_SEMANTIC_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
+
 /// Metadata for one unit imported by a document's `uses` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportMetadata {
@@ -744,7 +775,7 @@ impl NavigationIndex {
             ) {
                 AccessDecision::Visible => result.push(candidate),
                 AccessDecision::Unknown => state.mark_receiver_uncertain(),
-                AccessDecision::Inaccessible => {}
+                AccessDecision::Inaccessible => state.mark_inaccessible_candidate(),
             }
         }
         result
@@ -776,7 +807,7 @@ impl NavigationIndex {
             )? {
                 AccessDecision::Visible => result.push(candidate),
                 AccessDecision::Unknown => state.mark_receiver_uncertain(),
-                AccessDecision::Inaccessible => {}
+                AccessDecision::Inaccessible => state.mark_inaccessible_candidate(),
             }
         }
         Ok(result)
@@ -796,6 +827,231 @@ impl NavigationIndex {
         };
         Ok(is_ignored_offset(document.tree.root_node(), offset)
             || identifier_at(document.tree.root_node(), offset).is_none())
+    }
+
+    /// Return only source-semantic diagnostics whose absence was proven by the
+    /// bounded navigation model.
+    ///
+    /// This intentionally reports no result when the syntax tree, imports,
+    /// receiver, ancestry, helper selection, accessibility, or traversal
+    /// budget is uncertain.  It is therefore safe to use as an additive
+    /// diagnostic pass without turning compiler-dependent Pascal semantics
+    /// into false positives.
+    pub(crate) fn semantic_diagnostics_with_cancel(
+        &self,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<SemanticDiagnostic>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Err(format!("document is not indexed: {uri}"));
+        };
+        if !document.parser_recovery_spans.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pending = vec![document.tree.root_node()];
+        let mut identifiers = Vec::new();
+        let mut visited = 0usize;
+        while let Some(node) = pending.pop() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("request cancelled".to_string());
+            }
+            visited = visited.saturating_add(1);
+            if visited > MAX_SEMANTIC_DIAGNOSTIC_NODES {
+                return Ok(Vec::new());
+            }
+            if node.kind() == "identifier" {
+                identifiers.push(node);
+                continue;
+            }
+            let mut cursor = node.walk();
+            pending.extend(
+                node.children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+
+        let mut budget = AssistanceBudget::new(
+            MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            MAX_SEMANTIC_DIAGNOSTIC_BYTES,
+            "semantic diagnostics",
+        );
+        let mut diagnostics = Vec::new();
+        for identifier in identifiers {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("request cancelled".to_string());
+            }
+            let status = match self.semantic_proof_at_with_budget(
+                uri,
+                document,
+                identifier.start_byte(),
+                identifier,
+                cancel,
+                &mut budget,
+            ) {
+                Ok(status) => status,
+                Err(error) if error == "request cancelled" => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            };
+            let kind = match status {
+                SemanticProofStatus::ProvenAbsent => {
+                    if member_expression_at(identifier)
+                        .is_some_and(|dot| is_right_hand_member(dot, identifier))
+                    {
+                        SemanticDiagnosticKind::MissingMember
+                    } else {
+                        SemanticDiagnosticKind::UnresolvedIdentifier
+                    }
+                }
+                SemanticProofStatus::Resolved
+                | SemanticProofStatus::Ambiguous
+                | SemanticProofStatus::Incomplete => continue,
+            };
+            if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
+                return Ok(Vec::new());
+            }
+            let name = node_text(identifier, &document.source);
+            let message = match kind {
+                SemanticDiagnosticKind::UnresolvedIdentifier => {
+                    format!("unresolved identifier '{name}'")
+                }
+                SemanticDiagnosticKind::MissingMember => {
+                    format!("missing member '{name}'")
+                }
+            };
+            diagnostics.push(SemanticDiagnostic {
+                kind,
+                span: SourceSpan {
+                    start: identifier.start_byte(),
+                    end: identifier.end_byte(),
+                },
+                message,
+            });
+        }
+        Ok(diagnostics)
+    }
+
+    /// Classify one source identifier using the same conservative proof model
+    /// as [`NavigationIndex::semantic_diagnostics_with_cancel`].
+    #[allow(dead_code)]
+    pub(crate) fn semantic_proof_status_at_with_cancel(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<SemanticProofStatus, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Err(format!("document is not indexed: {uri}"));
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(SemanticProofStatus::Incomplete);
+        };
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Ok(SemanticProofStatus::Incomplete);
+        };
+        let mut budget = AssistanceBudget::new(
+            MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            MAX_SEMANTIC_DIAGNOSTIC_BYTES,
+            "semantic proof status",
+        );
+        self.semantic_proof_at_with_budget(uri, document, offset, identifier, cancel, &mut budget)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn semantic_proof_at_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<SemanticProofStatus, String> {
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(
+            identifier
+                .end_byte()
+                .saturating_sub(identifier.start_byte()),
+            cancel,
+        )?;
+        let non_value =
+            is_non_value_identifier_with_budget(identifier, &document.source, cancel, budget)?;
+        if document.conditionals.is_unknown_at(offset)
+            || document
+                .opaque_ranges
+                .iter()
+                .any(|range| range.contains_offset(offset))
+            || non_value
+        {
+            return Ok(SemanticProofStatus::Incomplete);
+        }
+        if !self.imports_are_complete_for_proof(document, offset, cancel, budget)? {
+            return Ok(SemanticProofStatus::Incomplete);
+        }
+
+        let mut state = ResolutionState::new();
+        let candidates = self.resolve_candidates_at_with_state_and_budget(
+            uri, document, offset, identifier, &mut state, 0, cancel, budget,
+        )?;
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Ok(SemanticProofStatus::Incomplete);
+        }
+        if !candidates.is_empty() {
+            return Ok(SemanticProofStatus::Resolved);
+        }
+        if state.ambiguous {
+            return Ok(SemanticProofStatus::Ambiguous);
+        }
+        if state.member_lookup_incomplete
+            || state.receiver_resolution_uncertain()
+            || state.inaccessible_candidate
+        {
+            return Ok(SemanticProofStatus::Incomplete);
+        }
+        Ok(SemanticProofStatus::ProvenAbsent)
+    }
+
+    fn imports_are_complete_for_proof(
+        &self,
+        document: &Document,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let region = document.region_at(offset);
+        let active_uses = document.active_uses_with_budget(region, cancel, budget)?;
+        for unit in active_uses {
+            check_navigation_cancel(cancel)?;
+            let key = canonical_name(unit);
+            if document.unknown_imports.contains(&key) {
+                return Ok(false);
+            }
+            let urls = self.unit_urls_for_import_with_budget(document, &key, cancel, budget)?;
+            if urls.len() != 1 || urls.iter().any(|url| !self.documents.contains_key(url)) {
+                return Ok(false);
+            }
+            let Some(provider) = urls.first().and_then(|url| self.documents.get(url)) else {
+                return Ok(false);
+            };
+            budget.require_work(
+                provider
+                    .parser_recovery_spans
+                    .len()
+                    .saturating_add(provider.conditionals.unknown_spans.len()),
+                cancel,
+            )?;
+            if !provider.parser_recovery_spans.is_empty()
+                || !provider.conditionals.unknown_spans.is_empty()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Number of retained parsed documents.
@@ -1490,6 +1746,7 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
         let Some(lhs) = dot.child_by_field_name("lhs") else {
+            state.mark_member_lookup_incomplete();
             return Ok(Vec::new());
         };
         budget.require_bytes(member_name.len(), cancel)?;
@@ -1505,6 +1762,14 @@ impl NavigationIndex {
             budget,
             depth.saturating_add(1),
         )?;
+        if receivers.is_empty() {
+            state.mark_member_lookup_incomplete();
+            return Ok(Vec::new());
+        }
+        if receivers.len() != 1 {
+            state.mark_member_lookup_incomplete();
+            state.mark_ambiguous();
+        }
         let mut references = Vec::new();
         for receiver in receivers {
             budget.require_work(1, cancel)?;
@@ -1514,8 +1779,8 @@ impl NavigationIndex {
                         &unit_uri, &key, cancel, budget,
                     )?);
                 }
-                Receiver::Type(instance) => references.extend(
-                    self.member_references_for_instance_with_budget(
+                Receiver::Type(instance) => {
+                    let lookup = self.member_references_for_instance_with_budget(
                         current_uri,
                         current_document,
                         offset,
@@ -1524,10 +1789,22 @@ impl NavigationIndex {
                         instance.uri == *current_uri,
                         cancel,
                         budget,
-                    )?
-                    .candidates,
-                ),
-                Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {}
+                    )?;
+                    if !lookup.ancestry_known || lookup.ambiguous_names.contains(&key) {
+                        state.mark_member_lookup_incomplete();
+                    }
+                    if lookup
+                        .candidates
+                        .iter()
+                        .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+                    {
+                        state.mark_member_lookup_incomplete();
+                    }
+                    references.extend(lookup.candidates);
+                }
+                Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
+                    state.mark_member_lookup_incomplete();
+                }
             }
         }
         Ok(references)
@@ -2767,12 +3044,21 @@ impl NavigationIndex {
         state: &mut ResolutionState,
     ) -> Vec<Candidate> {
         let Some(lhs) = dot.child_by_field_name("lhs") else {
+            state.mark_member_lookup_incomplete();
             return Vec::new();
         };
         let key = canonical_name(member_name);
         let mut references = Vec::new();
         let receivers =
             self.resolve_receivers_with_state(current_uri, current_document, offset, lhs, state);
+        if receivers.is_empty() {
+            state.mark_member_lookup_incomplete();
+            return Vec::new();
+        }
+        if receivers.len() != 1 {
+            state.mark_member_lookup_incomplete();
+            state.mark_ambiguous();
+        }
         for receiver in receivers {
             match receiver {
                 Receiver::Unit(unit_uri) => references.extend(
@@ -2793,9 +3079,21 @@ impl NavigationIndex {
                         &key,
                         instance.uri == *current_uri,
                     );
+                    if !members.ancestry_known || members.ambiguous_names.contains(&key) {
+                        state.mark_member_lookup_incomplete();
+                    }
+                    if members
+                        .candidates
+                        .iter()
+                        .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+                    {
+                        state.mark_member_lookup_incomplete();
+                    }
                     references.extend(members.candidates)
                 }
-                Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {}
+                Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
+                    state.mark_member_lookup_incomplete();
+                }
             }
         }
         references
@@ -8242,6 +8540,9 @@ struct ResolutionState {
     active_members: HashSet<(Url, String, String, usize, GenericSubstitution)>,
     active_generic_constraints: HashSet<(Url, String)>,
     receiver_uncertain: bool,
+    member_lookup_incomplete: bool,
+    inaccessible_candidate: bool,
+    ambiguous: bool,
     with_receivers: Vec<WithReceiverSlot>,
     with_context_depth: usize,
     with_context_resolutions: HashMap<(Url, Span), Option<Vec<WithReceiverSlot>>>,
@@ -8257,6 +8558,9 @@ impl ResolutionState {
             active_members: HashSet::new(),
             active_generic_constraints: HashSet::new(),
             receiver_uncertain: false,
+            member_lookup_incomplete: false,
+            inaccessible_candidate: false,
+            ambiguous: false,
             with_receivers: Vec::new(),
             with_context_depth: 0,
             with_context_resolutions: HashMap::new(),
@@ -8267,6 +8571,18 @@ impl ResolutionState {
 
     fn mark_receiver_uncertain(&mut self) {
         self.receiver_uncertain = true;
+    }
+
+    fn mark_member_lookup_incomplete(&mut self) {
+        self.member_lookup_incomplete = true;
+    }
+
+    fn mark_inaccessible_candidate(&mut self) {
+        self.inaccessible_candidate = true;
+    }
+
+    fn mark_ambiguous(&mut self) {
+        self.ambiguous = true;
     }
 
     fn receiver_resolution_uncertain(&self) -> bool {
@@ -11581,6 +11897,151 @@ fn is_ignored_offset(root: Node<'_>, offset: usize) -> bool {
     false
 }
 
+fn is_non_value_identifier_with_budget(
+    identifier: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let name = canonical_name(&node_text(identifier, source));
+    if is_implicit_or_intrinsic_name(&name) {
+        return Ok(true);
+    }
+    let span = Span::from_node(identifier);
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if matches!(
+            node.kind(),
+            "asm"
+                | "declExport"
+                | "declExports"
+                | "declHelper"
+                | "declLabels"
+                | "inherited"
+                | "label"
+                | "goto"
+                | "procAttribute"
+                | "rttiAttributes"
+        ) {
+            return Ok(true);
+        }
+        if node.kind().starts_with("typeref")
+            || matches!(node.kind(), "type" | "genericArg" | "genericArgs")
+        {
+            return Ok(true);
+        }
+        if node.kind() == "declProp" {
+            return Ok(true);
+        }
+        if node
+            .child_by_field_name("type")
+            .is_some_and(|type_node| Span::from_node(type_node).contains(span))
+            || node
+                .child_by_field_name("parent")
+                .is_some_and(|parent| Span::from_node(parent).contains(span))
+        {
+            return Ok(true);
+        }
+        if node.kind() == "exprBinary"
+            && node
+                .child_by_field_name("lhs")
+                .is_some_and(|lhs| Span::from_node(lhs).contains(span))
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| node_text(operator, source) == ":=")
+            && has_ancestor_kind(node, "exprCall")
+        {
+            return Ok(true);
+        }
+        current = node.parent();
+    }
+    Ok(false)
+}
+
+fn is_implicit_or_intrinsic_name(name: &str) -> bool {
+    matches!(
+        name,
+        "self"
+            | "result"
+            | "inherited"
+            | "exit"
+            | "break"
+            | "continue"
+            | "abort"
+            | "abs"
+            | "arctan"
+            | "assert"
+            | "assigned"
+            | "beep"
+            | "blockread"
+            | "blockwrite"
+            | "chr"
+            | "close"
+            | "comparemem"
+            | "concat"
+            | "copy"
+            | "cos"
+            | "dec"
+            | "delete"
+            | "default"
+            | "dispose"
+            | "exceptobject"
+            | "eof"
+            | "eoln"
+            | "exp"
+            | "filepos"
+            | "filesize"
+            | "fillchar"
+            | "fillbyte"
+            | "filldword"
+            | "fillword"
+            | "finalize"
+            | "freeandnil"
+            | "freemem"
+            | "getmem"
+            | "halt"
+            | "high"
+            | "inc"
+            | "include"
+            | "initialize"
+            | "indexbyte"
+            | "insert"
+            | "int"
+            | "ioresult"
+            | "length"
+            | "ln"
+            | "low"
+            | "move"
+            | "new"
+            | "ord"
+            | "odd"
+            | "pi"
+            | "pred"
+            | "random"
+            | "randomize"
+            | "raise"
+            | "setlength"
+            | "seek"
+            | "sizeof"
+            | "sin"
+            | "sqr"
+            | "sqrt"
+            | "str"
+            | "succ"
+            | "tan"
+            | "typeinfo"
+            | "trunc"
+            | "uniquestring"
+            | "val"
+            | "write"
+            | "writeln"
+            | "read"
+            | "readln"
+    )
+}
+
 fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
     let mut current = Some(identifier);
     while let Some(node) = current {
@@ -11919,6 +12380,323 @@ mod tests {
         assert!(
             !index.contains(&uri),
             "cancelled work must not publish a document"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_prove_a_missing_local_name() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-local.pas").expect("fixture URI");
+        let source = "unit SemanticDiagnosticsLocal;\ninterface\nvar Known: Integer;\nimplementation\nprocedure Run;\nbegin\n  Kno := 1;\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("semantic diagnostic fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].kind,
+            SemanticDiagnosticKind::UnresolvedIdentifier
+        );
+        let start = source.rfind("Kno").expect("missing name");
+        assert_eq!(
+            diagnostics[0].span,
+            SourceSpan {
+                start,
+                end: start + "Kno".len(),
+            }
+        );
+        assert_eq!(diagnostics[0].message, "unresolved identifier 'Kno'");
+    }
+
+    #[test]
+    fn semantic_proof_status_distinguishes_absence_resolution_and_incompleteness() {
+        let uri = Url::parse("file:///tmp/semantic-proof-status.pas").expect("fixture URI");
+        let source = concat!(
+            "unit SemanticProofStatus;\n",
+            "interface\n",
+            "var Known: Integer;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  Known := 1;\n",
+            "  Missing := 2;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("proof fixture parses");
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &uri,
+                    text::offset_to_position(source, source.find("Known :=").expect("known"))
+                        .expect("known position"),
+                    &cancel,
+                )
+                .expect("known proof status"),
+            SemanticProofStatus::Resolved
+        );
+        assert_eq!(
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &uri,
+                    text::offset_to_position(source, source.find("Missing :=").expect("missing"))
+                        .expect("missing position"),
+                    &cancel,
+                )
+                .expect("missing proof status"),
+            SemanticProofStatus::ProvenAbsent
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_a_missing_member_only_for_a_known_receiver() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-member.pas").expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsMember;\n",
+            "interface\n",
+            "type\n",
+            "  TBox = class\n",
+            "    Value: Integer;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Box: TBox;\n",
+            "begin\n",
+            "  Box.Missing := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("member diagnostic fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, SemanticDiagnosticKind::MissingMember);
+        let start = source.rfind("Missing").expect("missing member");
+        assert_eq!(
+            diagnostics[0].span,
+            SourceSpan {
+                start,
+                end: start + "Missing".len(),
+            }
+        );
+        assert_eq!(diagnostics[0].message, "missing member 'Missing'");
+    }
+
+    #[test]
+    fn semantic_diagnostics_do_not_call_an_inaccessible_member_missing() {
+        let provider_uri = Url::parse("file:///tmp/semantic-diagnostics-access-provider.pas")
+            .expect("provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-diagnostics-access-consumer.pas")
+            .expect("consumer URI");
+        let provider = concat!(
+            "unit Provider;\n",
+            "interface\n",
+            "type\n",
+            "  TBox = class\n",
+            "  private\n",
+            "    Secret: Integer;\n",
+            "  public\n",
+            "    Value: Integer;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses Provider;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Box: TBox;\n",
+            "begin\n",
+            "  Box.Secret := 1;\n",
+            "  UnknownName := 2;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("Provider".to_owned(), provider_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "unresolved identifier 'UnknownName'")
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "missing member 'Secret'")
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_non_proven_uses_and_pascal_intrinsics() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-controls.pas").expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsControls;\n",
+            "interface\n",
+            "type\n",
+            "  TUnknown = MissingType;\n",
+            "var Known: Integer;\n",
+            "implementation\n",
+            "function Run: Integer;\n",
+            "begin\n",
+            "  // MissingComment\n",
+            "  Known := 1;\n",
+            "  Writeln('MissingString');\n",
+            "  Abs(Known);\n",
+            "  Copy('value', 1, 1);\n",
+            "  Result := Known;\n",
+            "  Exit;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("controls fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_unknown_conditional_branches() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-conditional.pas").expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsConditional;\n",
+            "interface\n",
+            "implementation\n",
+            "{$IFDEF UNKNOWN_FEATURE}\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  Missing := 1;\n",
+            "end;\n",
+            "{$ENDIF}\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("conditional fixture parses");
+
+        assert!(
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_ambiguous_import_roots() {
+        let first_uri = Url::parse("file:///tmp/semantic-diagnostics-provider-a.pas")
+            .expect("first provider URI");
+        let second_uri = Url::parse("file:///tmp/semantic-diagnostics-provider-b.pas")
+            .expect("second provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-ambiguous.pas").expect("consumer URI");
+        let provider = "unit Provider;\ninterface\nconst Exported = 1;\nimplementation\nend.\n";
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses Provider;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  Missing := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(first_uri, provider.to_owned())
+            .expect("first provider parses");
+        index
+            .update(second_uri, provider.to_owned())
+            .expect("second provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer parses");
+
+        assert!(
+            index
+                .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_honor_cancellation_before_traversal() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-cancelled.pas").expect("fixture URI");
+        let source = "unit SemanticDiagnosticsCancelled;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Missing := 1;\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("cancellation fixture parses");
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            index
+                .semantic_diagnostics_with_cancel(&uri, &cancel)
+                .expect_err("cancelled diagnostics must not publish a result"),
+            "request cancelled"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_fail_closed_at_the_traversal_limit() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-limit.pas").expect("fixture URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsLimit;\ninterface\nvar Known: Integer;\nimplementation\nprocedure Run;\nbegin\n",
+        );
+        for _ in 0..30_000 {
+            source.push_str("  Known := 1;\n");
+        }
+        source.push_str("  Missing := 1;\nend;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("limit fixture parses");
+
+        assert!(
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("bounded semantic diagnostics complete")
+                .is_empty()
         );
     }
 

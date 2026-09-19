@@ -3,6 +3,7 @@
 use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use crate::include_expansion::{ExpandedSource, ExpansionLimits};
+use crate::navigation::{SemanticDiagnostic, SemanticDiagnosticKind};
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{GlobSet, GlobSetBuilder};
 use lsp_types::{
@@ -1470,6 +1471,7 @@ struct SharedLintRequest<'a> {
 #[derive(Debug)]
 struct SharedLintResult {
     diagnostics: Vec<pascal_core::Diagnostic>,
+    semantic_diagnostics: Vec<SemanticDiagnostic>,
 }
 
 impl Workspace {
@@ -7403,6 +7405,53 @@ impl Workspace {
                 None,
             ));
         }
+        for diagnostic in lint_result.semantic_diagnostics {
+            check_workspace_cancel(Some(cancel))?;
+            let start = diagnostic.span.start;
+            let end = diagnostic.span.end;
+            if start >= end || end > expansion.expanded.text().len() {
+                continue;
+            }
+            let span = match expansion
+                .expanded
+                .map_range_with_budget(start..end, &mut mapping_budget)?
+            {
+                crate::include_expansion::VirtualMapping::Exact(span) => span,
+                crate::include_expansion::VirtualMapping::Many(_)
+                | crate::include_expansion::VirtualMapping::Unmapped => continue,
+            };
+            let Some(source) = expansion.source_texts.get(&span.uri) else {
+                continue;
+            };
+            if !self.semantic_span_context_is_unambiguous(
+                uri,
+                &span.uri,
+                &span.range,
+                &context_key,
+                &mut mapping_budget,
+            )? {
+                continue;
+            }
+            let Some(start) = text::offset_to_position(source, span.range.start) else {
+                continue;
+            };
+            let Some(end) = text::offset_to_position(source, span.range.end) else {
+                continue;
+            };
+            let code = match diagnostic.kind {
+                SemanticDiagnosticKind::UnresolvedIdentifier => "pascal-unresolved-identifier",
+                SemanticDiagnosticKind::MissingMember => "pascal-missing-member",
+            };
+            mapped.entry(span.uri).or_default().push(LspDiagnostic::new(
+                Range::new(start, end),
+                Some(DiagnosticSeverity::ERROR),
+                Some(NumberOrString::String(code.to_string())),
+                Some("pascal-lsp".to_string()),
+                diagnostic.message,
+                None,
+                None,
+            ));
+        }
         mapped.entry(uri.clone()).or_default();
         let mut publications = mapped
             .into_iter()
@@ -7414,6 +7463,32 @@ impl Workspace {
             .collect::<Vec<_>>();
         publications.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
         Ok(publications)
+    }
+
+    fn semantic_span_context_is_unambiguous(
+        &self,
+        root_uri: &Url,
+        physical_uri: &Url,
+        physical_range: &std::ops::Range<usize>,
+        context_key: &ContextKey,
+        budget: &mut crate::include_expansion::MappingBudget<'_>,
+    ) -> Result<bool, String> {
+        for (other_root, expansion) in &self.expansions {
+            if other_root == root_uri || !expansion.complete {
+                continue;
+            }
+            if expansion
+                .expanded
+                .reverse_range_with_budget(physical_uri, physical_range.clone(), budget)?
+                .is_empty()
+            {
+                continue;
+            }
+            if expansion.context_key != *context_key {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn run_shared_lint_with_cancel(
@@ -7432,6 +7507,7 @@ impl Workspace {
         } = request;
         check_workspace_cancel(Some(cancel))?;
         let input = self.analysis_input();
+        let semantic_diagnostics = self.semantic_diagnostics_for_input(&input, uri, cancel)?;
         let run_file_local = |lint_source: &[u8], run_cfg_rules| {
             let diagnostics = if run_cfg_rules {
                 lint4d::engine::run_lint_with_cfg_project(
@@ -7450,7 +7526,10 @@ impl Workspace {
                     &lint4d::rules::RuleRegistry::new(),
                 )
             };
-            SharedLintResult { diagnostics }
+            SharedLintResult {
+                diagnostics,
+                semantic_diagnostics: semantic_diagnostics.clone(),
+            }
         };
         let source_text = match std::str::from_utf8(source) {
             Ok(source_text) => source_text,
@@ -7574,7 +7653,39 @@ impl Workspace {
                 Some(&snapshot),
                 &lint4d::rules::RuleRegistry::new(),
             ),
+            semantic_diagnostics,
         })
+    }
+
+    fn semantic_diagnostics_for_input(
+        &mut self,
+        input: &rename::WorkspaceInput,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<SemanticDiagnostic>, String> {
+        let snapshot = match rename::build_snapshot(
+            input,
+            std::slice::from_ref(uri),
+            &[],
+            rename::SnapshotMode::LocalWithImports,
+            None,
+            &[],
+            cancel,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(_) => return Ok(Vec::new()),
+        };
+        if let Some(records) = self.analysis_records.as_mut() {
+            for record in rename::snapshot_records(&snapshot) {
+                resolver::merge_source_record(records, record);
+            }
+        }
+        match snapshot.index.semantic_diagnostics_with_cancel(uri, cancel) {
+            Ok(diagnostics) => Ok(diagnostics),
+            Err(error) if error == CANCELLATION_MESSAGE => Err(error),
+            Err(_) => Ok(Vec::new()),
+        }
     }
 }
 

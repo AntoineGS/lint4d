@@ -9,6 +9,20 @@ structural selection ranges, conservative symbol-aware rename, naming quick
 fixes, and reuses lint4d and fmt4d for diagnostics and formatting.
 It is not a replacement for Delphi's compiler or its complete type system.
 
+### Source-semantic diagnostics
+
+In addition to lint4d rules, diagnostics report `pascal-unresolved-identifier`
+and `pascal-missing-member` only when the bounded source model proves absence.
+The resolver reuses lexical bindings, selected imports, receiver/member lookup,
+helper and `with` precedence, ancestry, accessibility, and conditional state.
+Unknown or ambiguous imports/receivers, incomplete ancestry or helper lookup,
+compiler/implicit names, inaccessible members, parser recovery, unknown
+conditional branches, and exhausted traversal limits are deliberately silent.
+Declarations, type/generic parameters, routine directives, labels,
+named-argument syntax, units, strings, and comments are not treated as value
+uses. These diagnostics are source-based and do not attempt compiler-only type
+inference, interface/override checking, type mismatches, or quick fixes.
+
 ## Build and Run
 
 From the lint4d repository root, with Rust and a C compiler installed:

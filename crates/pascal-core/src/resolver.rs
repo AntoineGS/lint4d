@@ -572,8 +572,9 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut dependencies = Vec::new();
         let mut dependency_ids = HashSet::new();
         let mut complete = true;
+        let conditional_context = self.context.effective_conditional_context();
         let analysis =
-            crate::conditional::analyze_with_cancel(text, &self.context.defines.clone(), cancel);
+            crate::conditional::analyze_with_context_and_cancel(text, &conditional_context, cancel);
         self.check_cancel(cancel)?;
         if (require_byte_preserving_coordinates && text.len() != importer.source.bytes.len())
             || !analysis.complete
@@ -871,9 +872,12 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
             }
             let include_route = self.legacy_routes.get(&importer.source.id).cloned();
+            let conditional_context = self.context.effective_conditional_context();
+            let mut conditional_environment =
+                crate::conditional::ConditionalEnvironment::from_context(&conditional_context);
             let include_result = self.resolve_includes_for_source(
                 &importer.source,
-                &self.context.defines.clone(),
+                &mut conditional_environment,
                 include_route.as_ref(),
                 cancel,
                 0,
@@ -2377,7 +2381,7 @@ impl<S: SourceStore> UnitResolver<S> {
     fn resolve_includes_for_source(
         &mut self,
         source: &LoadedSource,
-        project_defines: &[String],
+        environment: &mut crate::conditional::ConditionalEnvironment,
         legacy_route: Option<&LegacyRoute>,
         cancel: &dyn CancellationToken,
         depth: usize,
@@ -2403,34 +2407,35 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         let metadata = parse_source_metadata(source);
         let text = metadata.text;
-        let analysis = crate::conditional::analyze_with_cancel(&text, project_defines, cancel);
+        let lexical_analysis = crate::conditional::analyze_with_cancel(&text, &[], cancel);
+        let include_directives = lexical_analysis
+            .directives
+            .iter()
+            .filter(|directive| directive.kind == crate::conditional::DirectiveKind::Include)
+            .collect::<Vec<_>>();
+        let remaining_directives = self
+            .limits
+            .max_include_directives
+            .saturating_sub(self.include_directives);
+        let admitted_directives = include_directives.len().min(remaining_directives);
+        self.include_directives = self.include_directives.saturating_add(admitted_directives);
+        let directive_budget_exhausted = admitted_directives < include_directives.len();
         self.check_cancel(cancel)?;
-        if (source.decoded_text.is_none() && text.len() != source.bytes.len()) || !analysis.complete
-        {
+        if source.decoded_text.is_none() && text.len() != source.bytes.len() {
             active.remove(&source.id);
-            let reason = if source.decoded_text.is_none() && text.len() != source.bytes.len() {
-                format!(
-                    "source encoding is not byte-offset preserving for {}",
-                    source.path.display()
-                )
-            } else {
-                format!(
-                    "conditional analysis is incomplete for {}",
-                    source.path.display()
-                )
-            };
+            let reason = format!(
+                "source encoding is not byte-offset preserving for {}",
+                source.path.display()
+            );
             self.mark_incomplete(reason);
-            let total_sites = metadata.include_sites.len();
-            let mut emitted_sites = Vec::new();
-            for (byte_range, requested_name) in metadata.include_sites {
-                self.check_cancel(cancel)?;
-                if self.include_directives >= self.limits.max_include_directives {
-                    break;
-                }
-                self.include_directives = self.include_directives.saturating_add(1);
-                emitted_sites.push((byte_range, requested_name));
-            }
-            if emitted_sites.len() < total_sites {
+            let emitted_sites = include_directives
+                .iter()
+                .take(admitted_directives)
+                .filter_map(|directive| {
+                    include_name(&directive.body).map(|name| (directive.start..directive.end, name))
+                })
+                .collect::<Vec<_>>();
+            if directive_budget_exhausted {
                 self.mark_incomplete(format!(
                     "include directive limit ({}) reached",
                     self.limits.max_include_directives
@@ -2450,62 +2455,146 @@ impl<S: SourceStore> UnitResolver<S> {
             };
             return Ok(result);
         }
+        let mut active_results =
+            HashMap::<usize, (ResolutionTarget<SourceId>, Vec<ResolvedInclude>)>::new();
+        let mut callback_error = None;
+        let analysis = crate::conditional::analyze_with_include_callback(
+            &text,
+            environment,
+            cancel,
+            &mut |directive, environment| {
+                let mut transition = crate::conditional::IncludeTransition {
+                    complete: false,
+                    environment_known: false,
+                };
+                if callback_error.is_some() {
+                    return transition;
+                }
+                let Some(ordinal) = include_directives
+                    .iter()
+                    .position(|candidate| candidate.start == directive.start)
+                else {
+                    callback_error = Some(ResolverError::InvalidRequest(
+                        "conditional include occurrence was not admitted".to_string(),
+                    ));
+                    return transition;
+                };
+                if ordinal >= admitted_directives {
+                    return transition;
+                }
+                let Some(name) = include_name(&directive.body) else {
+                    self.mark_incomplete(
+                        "active include has no statically known file name".to_string(),
+                    );
+                    active_results
+                        .insert(directive.start, (ResolutionTarget::Incomplete, Vec::new()));
+                    return transition;
+                };
+                let outcome = match self.resolve_include_result(
+                    IncludeResolveRequest {
+                        including_path: &source.path,
+                        byte_range: directive.start..directive.end,
+                        requested_name: &name,
+                        legacy_route,
+                    },
+                    cancel,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return transition;
+                    }
+                };
+                match outcome {
+                    Resolution::Found(child) => {
+                        if active.contains(&child.id) {
+                            self.mark_incomplete(format!(
+                                "include cycle at {}",
+                                child.path.display()
+                            ));
+                            active_results.insert(
+                                directive.start,
+                                (ResolutionTarget::Incomplete, Vec::new()),
+                            );
+                            return transition;
+                        }
+                        let nested = match self.resolve_includes_for_source(
+                            &child,
+                            environment,
+                            legacy_route,
+                            cancel,
+                            depth + 1,
+                            active,
+                        ) {
+                            Ok(nested) => nested,
+                            Err(error) => {
+                                callback_error = Some(error);
+                                return transition;
+                            }
+                        };
+                        let complete = nested.complete;
+                        active_results.insert(
+                            directive.start,
+                            (ResolutionTarget::Found(child.id), nested.includes),
+                        );
+                        transition.complete = complete;
+                        transition.environment_known = complete;
+                    }
+                    Resolution::Unavailable { .. } => {
+                        self.mark_incomplete(format!("active include {name} was not found"));
+                        active_results
+                            .insert(directive.start, (ResolutionTarget::Incomplete, Vec::new()));
+                    }
+                    Resolution::Ambiguous { .. } => {
+                        self.mark_incomplete(format!("active include {name} was ambiguous"));
+                        active_results
+                            .insert(directive.start, (ResolutionTarget::Ambiguous, Vec::new()));
+                    }
+                    Resolution::Incomplete { .. } => {
+                        active_results
+                            .insert(directive.start, (ResolutionTarget::Incomplete, Vec::new()));
+                    }
+                }
+                transition
+            },
+        );
+        if let Some(error) = callback_error {
+            active.remove(&source.id);
+            return Err(error);
+        }
+        self.check_cancel(cancel)?;
         let mut result = IncludeWalkResult {
             includes: Vec::new(),
-            complete: true,
+            complete: analysis.complete
+                && analysis.unknown_spans.is_empty()
+                && !directive_budget_exhausted,
         };
-        if analysis.directives.iter().any(|directive| {
+        if !analysis.complete {
+            self.mark_incomplete(format!(
+                "conditional analysis is incomplete for {}",
+                source.path.display()
+            ));
+        }
+        if !analysis.unknown_spans.is_empty() {
+            self.mark_incomplete(format!(
+                "source {} contains unknown conditional activity",
+                source.path.display()
+            ));
+        }
+        if directive_budget_exhausted {
+            self.mark_incomplete(format!(
+                "include directive limit ({}) reached",
+                self.limits.max_include_directives
+            ));
+        }
+        let unsupported_active = analysis.directives.iter().any(|directive| {
             directive.activity != crate::conditional::Truth::False
                 && directive.kind == crate::conditional::DirectiveKind::Other
-        }) {
+        });
+        if unsupported_active {
             result.complete = false;
             self.mark_incomplete(format!(
                 "source {} contains an unsupported active directive",
-                source.path.display()
-            ));
-            let include_directive_count = analysis
-                .directives
-                .iter()
-                .filter(|directive| directive.kind == crate::conditional::DirectiveKind::Include)
-                .count();
-            let remaining_directives = self
-                .limits
-                .max_include_directives
-                .saturating_sub(self.include_directives);
-            let emitted_directives = include_directive_count.min(remaining_directives);
-            self.include_directives = self.include_directives.saturating_add(emitted_directives);
-            if emitted_directives < include_directive_count {
-                result.complete = false;
-                self.mark_incomplete(format!(
-                    "include directive limit ({}) reached",
-                    self.limits.max_include_directives
-                ));
-            }
-            result.includes = analysis
-                .directives
-                .iter()
-                .filter(|directive| directive.kind == crate::conditional::DirectiveKind::Include)
-                .take(emitted_directives)
-                .filter_map(|directive| {
-                    include_name(&directive.body).map(|name| ResolvedInclude {
-                        including_source_id: source.id.clone(),
-                        byte_range: directive.start..directive.end,
-                        requested_name: name,
-                        target: if directive.potentially_active() {
-                            ResolutionTarget::Incomplete
-                        } else {
-                            ResolutionTarget::Unavailable
-                        },
-                    })
-                })
-                .collect();
-            active.remove(&source.id);
-            return Ok(result);
-        }
-        if !analysis.unknown_spans.is_empty() {
-            result.complete = false;
-            self.mark_incomplete(format!(
-                "source {} contains unknown conditional activity",
                 source.path.display()
             ));
         }
@@ -2514,14 +2603,14 @@ impl<S: SourceStore> UnitResolver<S> {
             .iter()
             .filter(|directive| directive.kind == crate::conditional::DirectiveKind::Include)
         {
-            self.check_cancel(cancel)?;
-            self.include_directives = self.include_directives.saturating_add(1);
-            if self.include_directives > self.limits.max_include_directives {
+            let Some(ordinal) = include_directives
+                .iter()
+                .position(|candidate| candidate.start == directive.start)
+            else {
                 result.complete = false;
-                self.mark_incomplete(format!(
-                    "include directive limit ({}) reached",
-                    self.limits.max_include_directives
-                ));
+                continue;
+            };
+            if ordinal >= admitted_directives {
                 break;
             }
             let Some(name) = include_name(&directive.body) else {
@@ -2533,7 +2622,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
                 continue;
             };
-            if !directive.potentially_active() {
+            if directive.activity == crate::conditional::Truth::False {
                 result.includes.push(ResolvedInclude {
                     including_source_id: source.id.clone(),
                     byte_range: directive.start..directive.end,
@@ -2542,7 +2631,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 });
                 continue;
             }
-            if directive.activity == crate::conditional::Truth::Unknown {
+            let Some((mut target, nested)) = active_results.remove(&directive.start) else {
                 result.complete = false;
                 self.mark_incomplete(format!("include {name} has unknown conditional activity"));
                 result.includes.push(ResolvedInclude {
@@ -2552,50 +2641,14 @@ impl<S: SourceStore> UnitResolver<S> {
                     target: ResolutionTarget::Incomplete,
                 });
                 continue;
-            }
-            let outcome = self.resolve_include_result(
-                IncludeResolveRequest {
-                    including_path: &source.path,
-                    byte_range: directive.start..directive.end,
-                    requested_name: &name,
-                    legacy_route,
-                },
-                cancel,
-            );
-            let target = match outcome? {
-                Resolution::Found(child) => {
-                    if active.contains(&child.id) {
-                        result.complete = false;
-                        self.mark_incomplete(format!("include cycle at {}", child.path.display()));
-                        ResolutionTarget::Incomplete
-                    } else {
-                        let nested = self.resolve_includes_for_source(
-                            &child,
-                            &[],
-                            legacy_route,
-                            cancel,
-                            depth + 1,
-                            active,
-                        )?;
-                        result.complete &= nested.complete;
-                        result.includes.extend(nested.includes);
-                        ResolutionTarget::Found(child.id)
-                    }
-                }
-                Resolution::Unavailable { .. } => {
-                    result.complete = false;
-                    self.mark_incomplete(format!("active include {name} was not found"));
-                    ResolutionTarget::Incomplete
-                }
-                Resolution::Ambiguous { .. } => {
-                    result.complete = false;
-                    ResolutionTarget::Ambiguous
-                }
-                Resolution::Incomplete { .. } => {
-                    result.complete = false;
-                    ResolutionTarget::Incomplete
-                }
             };
+            if unsupported_active {
+                target = ResolutionTarget::Incomplete;
+            }
+            if !matches!(target, ResolutionTarget::Found(_)) {
+                result.complete = false;
+            }
+            result.includes.extend(nested);
             result.includes.push(ResolvedInclude {
                 including_source_id: source.id.clone(),
                 byte_range: directive.start..directive.end,
@@ -2716,7 +2769,6 @@ struct ParsedSourceMetadata {
     text: String,
     declared_name: Option<String>,
     imports: Vec<ImportSite>,
-    include_sites: Vec<(Range<usize>, String)>,
 }
 
 fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
@@ -2738,7 +2790,6 @@ fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
                 text,
                 declared_name: None,
                 imports: Vec::new(),
-                include_sites: Vec::new(),
             };
         }
     };
@@ -2776,20 +2827,10 @@ fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
             section,
         });
     }
-    let analysis = crate::conditional::analyze(&text, &[]);
-    let include_sites = analysis
-        .directives
-        .iter()
-        .filter(|directive| directive.kind == crate::conditional::DirectiveKind::Include)
-        .filter_map(|directive| {
-            include_name(&directive.body).map(|name| (directive.start..directive.end, name))
-        })
-        .collect();
     ParsedSourceMetadata {
         text,
         declared_name,
         imports,
-        include_sites,
     }
 }
 

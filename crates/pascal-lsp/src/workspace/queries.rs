@@ -468,9 +468,12 @@ pub(crate) fn folding_ranges_from_input(
     }
 
     let mut index = NavigationIndex::new();
-    if let Err(error) =
-        index.update_with_defines_with_cancel(uri.clone(), source, &context.defines, cancel)
-    {
+    if let Err(error) = index.update_with_context_with_cancel(
+        uri.clone(),
+        source,
+        &context.effective_conditional_context(),
+        cancel,
+    ) {
         return failed(
             source_generation,
             configuration_generation,
@@ -1039,13 +1042,13 @@ fn syntax_index_for_document(
         .get(uri)
         .filter(|cached| cached.context == document.context)
         .map(|cached| cached.parsed.clone());
-    let defines = document.context.defines;
+    let conditional_context = document.context.effective_conditional_context();
     let mut index = NavigationIndex::new();
     index
-        .update_with_defines_and_cached_with_cancel(
+        .update_with_context_and_cached_with_cancel(
             uri.clone(),
             document.source,
-            &defines,
+            &conditional_context,
             cached,
             cancel,
         )

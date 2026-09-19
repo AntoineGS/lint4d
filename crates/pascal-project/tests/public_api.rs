@@ -1,8 +1,8 @@
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
-    MetadataObservation, ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
-    ProjectSelections, ReadPolicy,
-    discover_with_selections_and_observations_with_cancel_and_overrides,
+    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
+    ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectSelections,
+    ReadPolicy, discover_with_selections_and_observations_with_cancel_and_overrides,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -242,4 +242,88 @@ fn public_api_does_not_turn_a_stat_observation_into_payload_authorization() {
         context.metadata_observations.as_slice(),
         [MetadataObservation::Stat { path: observed }] if observed == &path
     ));
+}
+
+#[test]
+fn explicit_conditional_context_survives_project_discovery_without_platform_inference() {
+    let directory = tempdir().expect("temporary workspace");
+    let source = directory.path().join("main.pas");
+    write(&source, "unit Main; interface implementation end.");
+    let explicit = ConditionalContext::default()
+        .with_compiler_version(CompilerVersion::new(24, 0))
+        .with_option("R", ConditionalFact::True)
+        .with_constant("BuildLevel", ConstantValue::Integer(7));
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[directory.path().to_path_buf()],
+        &ProjectOptions {
+            conditional_context: explicit.clone(),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .expect("standalone discovery");
+
+    assert_eq!(
+        context.conditional_context.compiler_version,
+        explicit.compiler_version
+    );
+    assert_eq!(context.conditional_context.options, explicit.options);
+    assert_eq!(context.conditional_context.constants, explicit.constants);
+}
+
+#[test]
+fn project_conditional_metadata_fills_only_unknown_explicit_facts() {
+    let directory = tempdir().expect("temporary workspace");
+    let source = directory.path().join("Main.pas");
+    let project = directory.path().join("App.dproj");
+    write(&source, "unit Main; interface implementation end.");
+    write(
+        &project,
+        concat!(
+            "<Project><PropertyGroup>",
+            "<MainSource>Main.pas</MainSource>",
+            "<CompilerVersion>24.0</CompilerVersion>",
+            "<DCC_RangeChecks>true</DCC_RangeChecks>",
+            "<DCC_Define>PROJECT_DEFINE</DCC_Define>",
+            "</PropertyGroup></Project>"
+        ),
+    );
+    let explicit = ConditionalContext::default()
+        .with_compiler_version(CompilerVersion::new(23, 0))
+        .with_option("R", ConditionalFact::False)
+        .with_constant("BuildLevel", ConstantValue::Integer(7));
+
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[directory.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            conditional_context: explicit,
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .expect("project discovery");
+
+    assert_eq!(
+        context.conditional_context.compiler_version,
+        Some(CompilerVersion::new(23, 0))
+    );
+    assert_eq!(
+        context.conditional_context.option("R"),
+        ConditionalFact::False
+    );
+    assert_eq!(
+        context.conditional_context.option("RANGE_CHECKS"),
+        ConditionalFact::True
+    );
+    assert_eq!(
+        context.conditional_context.constant("BuildLevel"),
+        Some(&ConstantValue::Integer(7))
+    );
+    assert_eq!(
+        context.conditional_context.define("PROJECT_DEFINE"),
+        ConditionalFact::True
+    );
 }

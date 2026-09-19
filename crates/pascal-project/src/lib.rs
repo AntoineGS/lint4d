@@ -11,9 +11,11 @@
 //! `pascal-lsp` owns stateful workspace orchestration, overlays, indexes, and
 //! the include/rename resolver that consumes this crate's bounded results.
 
+pub mod conditional;
 pub mod configuration;
 pub mod delphi_overrides;
 
+pub use conditional::{CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue};
 pub use configuration::{ConfigRead, config_directories, read_config};
 
 use crate::delphi_overrides::{
@@ -59,6 +61,10 @@ pub struct ProjectOptions {
     pub platform: Option<String>,
     /// Additional ordered source roots supplied by the caller.
     pub source_paths: Vec<String>,
+    /// Explicit conditional-compilation facts supplied by the caller. Missing
+    /// facts remain unknown; project metadata is merged without overwriting a
+    /// fact explicitly supplied here.
+    pub conditional_context: ConditionalContext,
 }
 
 pub type ProjectSelections = HashMap<PathBuf, PathBuf>;
@@ -688,6 +694,9 @@ pub struct ProjectContext {
     pub unit_namespaces: Vec<String>,
     pub unit_aliases: HashMap<String, String>,
     pub defines: Vec<String>,
+    /// Effective compiler/version/options/constants used by source analysis.
+    /// `defines` remains as a compatibility projection for existing callers.
+    pub conditional_context: ConditionalContext,
     pub config: Option<String>,
     pub platform: Option<String>,
     /// The immutable Delphi override snapshot used to evaluate this context.
@@ -889,8 +898,22 @@ impl ProjectContext {
         ProjectOptions {
             build_config: self.config.clone(),
             platform: self.platform.clone(),
+            conditional_context: self.conditional_context.clone(),
             ..ProjectOptions::default()
         }
+    }
+
+    /// Return the effective conditional context, including compatibility
+    /// define values retained in older manually-constructed contexts.
+    pub fn effective_conditional_context(&self) -> ConditionalContext {
+        let mut context = self.conditional_context.clone();
+        for define in &self.defines {
+            let name = define.trim().trim_start_matches('&').to_ascii_uppercase();
+            if !name.is_empty() && !context.defines.contains_key(&name) {
+                context.set_define(name, ConditionalFact::True);
+            }
+        }
+        context
     }
 
     /// Discover the nearest safe project context for `file`.
@@ -2772,6 +2795,26 @@ fn build_project_context(
             .collect(),
     );
 
+    let project_defines = property_list(&builder, "dcc_define");
+    let mut conditional_warnings = Vec::new();
+    let conditional_context = merge_project_conditional_context(
+        options,
+        &builder,
+        &project_defines,
+        &mut conditional_warnings,
+    );
+    builder.warnings.extend(conditional_warnings);
+    let mut defines = project_defines;
+    for (name, value) in &conditional_context.defines {
+        if *value == ConditionalFact::True
+            && !defines
+                .iter()
+                .any(|define| define.eq_ignore_ascii_case(name))
+        {
+            defines.push(name.clone());
+        }
+    }
+
     Ok(ProjectContext {
         discovery_complete: !builder.incomplete
             && !project_context_warnings_incomplete(&builder.warnings, explicit),
@@ -2786,7 +2829,8 @@ fn build_project_context(
         explicit_units,
         unit_namespaces: property_list(&builder, "dcc_namespace"),
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
-        defines: property_list(&builder, "dcc_define"),
+        defines,
+        conditional_context,
         config: selected_config(&builder, options),
         platform: selected_platform(&builder, options),
         overrides,
@@ -2846,6 +2890,13 @@ fn build_standalone_context(
     let search_paths = paths_from_entries(&search_path_entries);
     let metadata_observations =
         complete_metadata_observations(&metadata_files, metadata_observations);
+    let conditional_context = options.conditional_context.clone();
+    let defines = conditional_context
+        .defines
+        .iter()
+        .filter(|(_, value)| **value == ConditionalFact::True)
+        .map(|(name, _)| name.clone())
+        .collect();
 
     Ok(ProjectContext {
         discovery_complete,
@@ -2860,7 +2911,8 @@ fn build_standalone_context(
         explicit_units: HashMap::new(),
         unit_namespaces: Vec::new(),
         unit_aliases: HashMap::new(),
-        defines: Vec::new(),
+        defines,
+        conditional_context,
         config: selected_standalone_property(&overrides, options.build_config.as_ref(), "config"),
         platform: selected_standalone_property(&overrides, options.platform.as_ref(), "platform"),
         overrides,
@@ -2930,6 +2982,73 @@ fn selected_platform(builder: &ProjectBuilder, options: &ProjectOptions) -> Opti
         .or_else(|| builder.property("dcc_platform"))
         .filter(|value| !value.is_empty() && !value.contains(UNRESOLVED_MARKER))
         .or_else(|| options.platform.clone())
+}
+
+fn merge_project_conditional_context(
+    options: &ProjectOptions,
+    builder: &ProjectBuilder,
+    project_defines: &[String],
+    warnings: &mut Vec<String>,
+) -> ConditionalContext {
+    let mut context = options.conditional_context.clone();
+    for define in project_defines {
+        let name = define.trim().trim_start_matches('&').to_ascii_uppercase();
+        if !name.is_empty() && !context.defines.contains_key(&name) {
+            context.set_define(name, ConditionalFact::True);
+        }
+    }
+
+    if context.compiler_version.is_none() {
+        let raw = builder
+            .property("compiler_version")
+            .or_else(|| builder.property("dcc_compilerversion"));
+        if let Some(raw) = raw {
+            match CompilerVersion::parse(&raw) {
+                Some(version) => context.compiler_version = Some(version),
+                None => warnings.push(format!(
+                    "unsupported compiler version metadata {raw:?}; CompilerVersion remains unknown"
+                )),
+            }
+        }
+    }
+
+    // These are the bounded project-property spellings with stable Delphi
+    // IFOPT aliases.  Unknown properties are intentionally not guessed.
+    const OPTION_PROPERTIES: &[(&str, &[&str])] = &[
+        ("dcc_rangechecks", &["R", "RANGE_CHECKS", "RANGECHECKS"]),
+        (
+            "dcc_overflowchecks",
+            &["Q", "OVERFLOW_CHECKS", "OVERFLOWCHECKS"],
+        ),
+        ("dcc_optimization", &["O", "OPTIMIZATION"]),
+        ("dcc_assertions", &["C", "ASSERTIONS"]),
+        ("dcc_runtimechecks", &["RUNTIME_CHECKS", "RUNTIMECHECKS"]),
+        (
+            "dcc_debuginformation",
+            &["DEBUG_INFORMATION", "DEBUGINFORMATION"],
+        ),
+    ];
+    for (property, aliases) in OPTION_PROPERTIES {
+        let Some(raw) = builder.property(property) else {
+            continue;
+        };
+        let value = parse_conditional_fact(&raw).unwrap_or(ConditionalFact::Unknown);
+        for alias in *aliases {
+            if !context.options.contains_key(*alias) {
+                context.set_option(alias, value);
+            }
+        }
+    }
+    context
+}
+
+fn parse_conditional_fact(value: &str) -> Option<ConditionalFact> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "+" => Some(ConditionalFact::True),
+        "0" | "false" | "no" | "off" | "-" => Some(ConditionalFact::False),
+        "" => None,
+        _ => Some(ConditionalFact::Unknown),
+    }
 }
 
 fn property_list(builder: &ProjectBuilder, name: &str) -> Vec<String> {

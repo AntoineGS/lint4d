@@ -7887,6 +7887,144 @@ fn completion_resolution_rejects_a_project_context_switch() {
 }
 
 #[test]
+fn completion_resolution_rejects_a_runtime_compiler_context_change() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("RuntimeContextCompletion.pas");
+    let source = concat!(
+        "unit RuntimeContextCompletion;\ninterface\n",
+        "{$IF CompilerVersion >= 24}\n",
+        "/// <summary>Modern documentation.</summary>\n",
+        "function RuntimeDocumented: Integer;\n",
+        "{$ELSE}\n",
+        "/// <summary>Legacy documentation.</summary>\n",
+        "function RuntimeDocumented: Integer;\n",
+        "{$ENDIF}\n",
+        "implementation\n",
+        "function RuntimeDocumented: Integer;\n",
+        "begin\n  Result := 1;\nend;\n",
+        "procedure Caller;\n",
+        "begin\n  RuntimeDoc\nend;\nend.\n"
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"compilerVersion": "24.0"}}}),
+    );
+
+    let completion_id = RequestId::from("runtime-context-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  RuntimeDoc", 0)
+        }),
+    );
+    let completion = server
+        .response(&completion_id)
+        .result
+        .expect("runtime context completion result");
+    let item = completion["items"]
+        .as_array()
+        .expect("runtime context completion items")
+        .iter()
+        .find(|item| item["label"] == "RuntimeDocumented")
+        .cloned()
+        .expect("runtime context documented item");
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"compilerVersion": "23.0"}}}),
+    );
+    let resolve_id = RequestId::from("runtime-context-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert_eq!(
+        response
+            .error
+            .expect("runtime compiler context must stale resolution")
+            .code,
+        -32803
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_accepts_an_effective_noop_runtime_compiler_context_change() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("RuntimeNoopCompletion.pas");
+    let source = concat!(
+        "unit RuntimeNoopCompletion;\ninterface\n",
+        "{$IF CompilerVersion >= 24}\n",
+        "/// <summary>Stable documentation.</summary>\n",
+        "function StableDocumented: Integer;\n",
+        "{$ENDIF}\n",
+        "implementation\n",
+        "function StableDocumented: Integer;\n",
+        "begin\n  Result := 1;\nend;\n",
+        "procedure Caller;\n",
+        "begin\n  StableDoc\nend;\nend.\n"
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"compilerVersion": "24.0"}}}),
+    );
+
+    let completion_id = RequestId::from("runtime-noop-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  StableDoc", 0)
+        }),
+    );
+    let completion = server
+        .response(&completion_id)
+        .result
+        .expect("runtime noop completion result");
+    let item = completion["items"]
+        .as_array()
+        .expect("runtime noop completion items")
+        .iter()
+        .find(|item| item["label"] == "StableDocumented")
+        .cloned()
+        .expect("runtime noop documented item");
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"compilerVersion": "24.0"}}}),
+    );
+    let resolve_id = RequestId::from("runtime-noop-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "an effective no-op runtime context must preserve resolution: {response:?}"
+    );
+    assert_eq!(
+        response.result.expect("runtime noop resolved item")["label"],
+        "StableDocumented"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn completion_resolution_rejects_a_provider_disk_change_without_watcher_notification() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main_path = temp.path().join("Main.pas");
@@ -10604,6 +10742,53 @@ fn unknown_conditional_import_does_not_select_a_known_helper() {
             .contains("one or more imports could not be resolved")
     );
 
+    server.shutdown();
+}
+
+#[test]
+fn initialization_conditional_context_selects_the_explicit_compiler_branch() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("CompilerBranch.pas");
+    let source = concat!(
+        "unit CompilerBranch;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "{$IF CompilerVersion >= 24}\r\n",
+        "  TModern = class\r\n  end;\r\n",
+        "{$ELSE}\r\n",
+        "  TLegacy = class\r\n  end;\r\n",
+        "{$ENDIF}\r\n",
+        "implementation\r\n",
+        "procedure Run;\r\n",
+        "var\r\n",
+        "  Value: TModern;\r\n",
+        "begin\r\n",
+        "end;\r\n",
+        "end.\r\n"
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(
+        temp.path(),
+        json!({"compilerVersion": "24.0", "compilerOptions": {"R": true}}),
+    );
+    let request_id = RequestId::from("explicit-compiler-branch-definition".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, source, "TModern", 1),
+    );
+    let locations = result_locations(server.response(&request_id));
+    assert_exact_location_signatures(
+        &locations,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "TModern",
+            0,
+        )],
+    );
     server.shutdown();
 }
 
@@ -31228,6 +31413,101 @@ fn begin_configuration_preparation(
         json!([settings]),
     )));
     barrier.wait_until_entered();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_compiler_context_change_stales_navigation_and_changes_the_branch() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = concat!(
+        "unit Main;\ninterface\n",
+        "type\n",
+        "{$IF CompilerVersion >= 24}\n",
+        "  TModern = class\n  end;\n",
+        "{$ELSE}\n",
+        "  TLegacy = class\n  end;\n",
+        "{$ENDIF}\n",
+        "implementation\n",
+        "procedure Run;\nvar\n  Value: TModern;\nbegin\nend;\nend.\n"
+    );
+    write_file(&main, source);
+
+    let (mut server, configuration_barrier, navigation_barrier) =
+        TestServer::launch_with_navigation_and_configuration_preparation_barriers(environment);
+    server.initialize_with_configuration_and_document_changes(
+        &root,
+        json!({"compilerVersion": "24.0"}),
+    );
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        initial.id,
+        json!([null]),
+    )));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+
+    let initial_id = RequestId::from("runtime-compiler-initial-definition".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, source, "TModern", 1),
+    );
+    navigation_barrier.wait_until_entered();
+    navigation_barrier.release();
+    assert_eq!(
+        result_locations(server.response(&initial_id)).len(),
+        1,
+        "initial compiler context must select the modern branch"
+    );
+    fs::remove_file(&navigation_barrier.release).expect("rearm navigation barrier");
+
+    let stale_id = RequestId::from("runtime-compiler-stale-definition".to_string());
+    server.send_request(
+        stale_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, source, "TModern", 1),
+    );
+    navigation_barrier.wait_for_entries(2);
+    begin_configuration_preparation(
+        &mut server,
+        json!({"compilerVersion": "23.0"}),
+        &configuration_barrier,
+    );
+    configuration_barrier.release();
+    navigation_barrier.release();
+    assert_eq!(
+        server
+            .response(&stale_id)
+            .error
+            .expect("context change must stale the in-flight query")
+            .code,
+        -32803
+    );
+
+    let recovery_id = RequestId::from("runtime-compiler-recovery-definition".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, source, "TModern", 1),
+    );
+    assert!(
+        result_locations(server.response(&recovery_id)).is_empty(),
+        "the changed compiler context must not reuse the modern branch"
+    );
+    server.shutdown();
 }
 
 #[cfg(feature = "test-support")]

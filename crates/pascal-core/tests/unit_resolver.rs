@@ -740,7 +740,7 @@ fn unknown_conditional_without_include_makes_project_incomplete() {
 }
 
 #[test]
-fn nested_include_does_not_resurrect_parent_project_defines() {
+fn nested_include_inherits_parent_undef_without_resurrecting_project_defines() {
     let mut context = fixture_context();
     context.defines = vec!["FEATURE".to_string()];
     let mut store = MemoryStore::default();
@@ -755,10 +755,29 @@ fn nested_include_does_not_resurrect_parent_project_defines() {
     store.add("/workspace/wrong.inc", "const Wrong = 1;");
     let project = resolve_memory_project(context, store, Default::default());
 
-    assert!(!project.complete);
+    assert!(project.complete);
     assert!(project.includes.iter().any(|include| {
         include.requested_name == "wrong.inc"
-            && matches!(include.target, pascal_core::ResolutionTarget::Incomplete)
+            && matches!(include.target, pascal_core::ResolutionTarget::Unavailable)
+    }));
+}
+
+#[test]
+fn nested_include_define_enables_a_later_sibling_include() {
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/Main.pas",
+        "unit Main; interface {$I child.inc}{$IFDEF FEATURE}{$I enabled.inc}{$ENDIF} implementation end.",
+    );
+    store.add("/workspace/child.inc", "{$DEFINE FEATURE}");
+    store.add("/workspace/enabled.inc", "const Enabled = 1;");
+
+    let project = resolve_memory_project(fixture_context(), store, Default::default());
+
+    assert!(project.complete);
+    assert!(project.includes.iter().any(|include| {
+        include.requested_name == "enabled.inc"
+            && matches!(include.target, pascal_core::ResolutionTarget::Found(_))
     }));
 }
 

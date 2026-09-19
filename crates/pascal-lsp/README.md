@@ -479,9 +479,14 @@ errors. Ordinary absent project-local configuration properties can evaluate as
 empty, while unavailable environment inputs and values affected by uncertain
 imports remain unknown. Compiled-only `.dcp` references do not establish source
 membership or, by themselves, make source discovery incomplete. Missing source
-references still do. Project defines are used as positive conditional facts;
-`buildConfig` and `platform` select the project context but do not synthesize
-compiler-version or host-environment facts.
+references still do. Project defines and explicit conditional facts are carried
+into source analysis; `buildConfig` and `platform` select the project context
+but do not synthesize compiler-version or host-environment facts. Conditional
+facts are merged with this precedence: valid runtime settings override
+initialization settings, caller-provided settings override project metadata,
+and project metadata fills only facts that the caller left unknown. Source
+`DEFINE` and `UNDEF` directives then update the context in source order, and
+the resulting facts are inherited by nested and repeated include occurrences.
 
 ### Source-bearing Pascal includes
 
@@ -500,11 +505,62 @@ the effective readable roots; cycles, unknown or incomplete conditional
 activity, stale dependency content, and expansion depth/file/directive/byte/
 source-map/work limits fail closed rather than producing partial locations or
 edits. Project and local `DEFINE`/`UNDEF` facts are shared across expanded
-source in the bounded analyzer, but compiler-version, `IFOPT`, environment,
-and Pascal-dependent conditional expressions remain unknown unless proven by
-the source. `.inc` files are analyzable source dependencies, but formatting is
-restricted to `.pas`, `.dpr`, and `.dpk` files so the formatter never edits a
-virtual or include fragment implicitly.
+source in the bounded analyzer. Explicit compiler-version and `IFOPT` facts
+are also shared, while host environment values and Pascal-dependent
+expressions remain unknown unless proven by the supported source subset. `.inc`
+files are analyzable source dependencies, but formatting is restricted to
+`.pas`, `.dpr`, and `.dpk` files so the formatter never edits a virtual or
+include fragment implicitly.
+
+### Compiler conditional context
+
+The initialization and `pascalLsp` runtime settings accept the following
+explicit conditional-context fields:
+
+```json
+{
+  "compilerVersion": "24.0",
+  "compilerOptions": {"R": true, "Q": "off", "Unknown": null},
+  "conditionalDefines": ["FEATURE"],
+  "conditionalUndefines": ["LEGACY"],
+  "conditionalConstants": {
+    "BuildNumber": 42,
+    "ProductName": "Shop",
+    "IsTrial": false
+  }
+}
+```
+
+`compilerVersion` is parsed as exact decimal major/minor/patch components (for
+example `24`, `24.0`, or `24.0.1`), never as a binary floating-point value.
+Option values accept booleans, `on`/`off` (and their true/false spellings), or
+`null` for `Unknown`. Runtime JSON constants are booleans, integers, or
+strings. Missing facts are `Unknown`; the server never infers them from the
+host OS, current date, Rust toolchain, or an unrelated target platform.
+
+Project discovery additionally reads explicit `CompilerVersion`/
+`DCC_CompilerVersion` metadata and a bounded set of option properties such as
+`DCC_RangeChecks`, `DCC_OverflowChecks`, `DCC_Optimization`,
+`DCC_Assertions`, `DCC_RuntimeChecks`, and `DCC_DebugInformation`. Explicit
+client facts win over these properties; unsupported or malformed metadata
+stays unknown and is reported as a warning. The same context identity is part
+of project, parsed-source, include-expansion, package, and completion caches,
+so two projects can analyze the same physical source independently.
+
+The evaluator deliberately implements a finite, typed subset of Delphi
+conditional expressions: boolean, decimal/hex integer, string, and version
+literals; named explicit constants; `CompilerVersion`; `Defined`, `Declared`,
+`Length`, `Ord`, and `SizeOf`; unary `not`, `+`, and `-`; arithmetic `*`,
+`/`, `div`, `mod`/`%`, `shl`, and `shr`; boolean/bitwise `and`, `or`, and
+`xor`; and typed relational comparisons (`=`, `<>`/`!=`, `<`, `<=`, `>`,
+`>=`). Delphi `/` is real division and therefore remains unknown in this
+integer-only evaluator. Unsupported functions and types, malformed syntax,
+overflow, zero divisors, conflicting branch facts, and any safety-bound
+exhaustion remain `Unknown` rather than being guessed. Source constants are
+admitted only for the conservative unit/program-level global-scope heuristic;
+local constants and arbitrary Pascal initializers are not treated as
+compiler-wide facts. This is source assistance, not compiler-equivalent
+conditional evaluation.
 
 In the MultidevComponents example, `MDIBDatabase.pas` is genuinely shared by
 multiple packages, so automatic project selection still refuses to guess.
@@ -599,6 +655,11 @@ configuration schema:
     "platform": "Win32",
     "sourcePaths": ["../shared", "/opt/delphi/rtl"],
     "exclude": ["**/__history/**"],
+    "compilerVersion": "24.0",
+    "compilerOptions": {"R": true, "Q": "off"},
+    "conditionalDefines": ["FEATURE"],
+    "conditionalUndefines": ["LEGACY"],
+    "conditionalConstants": {"BuildNumber": 42},
     "maxFiles": 10000,
     "maxFileBytes": 2097152,
     "maxTotalBytes": 268435456
@@ -999,10 +1060,11 @@ Not implemented or incomplete:
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
 - Full compiler-equivalent conditional evaluation is not implemented. The
-  bounded include expander does not infer `CompilerVersion`, `IFOPT`, or other
-  host compiler state. Unknown alternatives and Pascal-dependent include
-  expressions therefore produce no navigation result, withhold diagnostics,
-  or block rename rather than being guessed.
+  bounded include expander uses only explicit `CompilerVersion`, `IFOPT`,
+  define, and constant facts plus its finite typed expression subset; it does
+  not infer host compiler state. Unknown alternatives and Pascal-dependent
+  include expressions therefore produce no navigation result, withhold
+  diagnostics, or block rename rather than being guessed.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
 - Compiler-equivalent overload selection and anonymous callable inference are
@@ -1065,6 +1127,10 @@ request has completed.
 
 | Initialization option | Default and maximum |
 | --- | --- |
+| `compilerVersion` | Optional exact decimal compiler version |
+| `compilerOptions` | Up to 256 named `IFOPT` facts |
+| `conditionalDefines` / `conditionalUndefines` | Up to 256 symbols each |
+| `conditionalConstants` | Up to 256 boolean, integer, or string constants |
 | `projectFile` | Optional `.dproj`, `.dpr`, or `.dpk` project selector |
 | `buildConfig` | Optional selected Delphi build configuration |
 | `platform` | Optional selected Delphi platform |

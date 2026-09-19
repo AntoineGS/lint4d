@@ -19,7 +19,7 @@ use pascal_core::parser::{node_text, parse_file};
 use pascal_core::resolver::{
     FilesystemSourceStore, ImportSection, ImportSite, NoCancellation, ResolverLimits, UnitResolver,
 };
-use pascal_project::{ProjectContext, ProjectOptions};
+use pascal_project::{ConditionalFact, ProjectContext, ProjectOptions};
 use rayon::prelude::*;
 
 /// Exit codes
@@ -452,12 +452,21 @@ fn lint_project_file(
             return None;
         }
     };
+    let conditional_context = source_project.context.effective_conditional_context();
     let options = CfgSnapshotOptions {
         prepare_configured_sources: true,
         configuration_id: Some(source_project.configuration_id.clone()),
-        preparation_environment: cfg_pascal::PreparationEnvironment::Complete,
-        initial_defined_symbols: source_project.context.defines.clone(),
-        initial_undefined_symbols: Vec::new(),
+        preparation_environment: cfg_pascal::PreparationEnvironment::Partial,
+        initial_defined_symbols: conditional_context
+            .defines
+            .iter()
+            .filter_map(|(name, value)| (*value == ConditionalFact::True).then_some(name.clone()))
+            .collect(),
+        initial_undefined_symbols: conditional_context
+            .defines
+            .iter()
+            .filter_map(|(name, value)| (*value == ConditionalFact::False).then_some(name.clone()))
+            .collect(),
         preparation_limits: cfg_pascal::PreparationLimits::default(),
     };
     let snapshot = match to_cfg_project_snapshot(project, options) {
@@ -536,6 +545,7 @@ fn resolve_source_project(cli: &Cli, config: &Config, files: &[FileInfo]) -> Opt
             .clone()
             .or_else(|| config.platform().map(str::to_string)),
         source_paths: Vec::new(),
+        conditional_context: Default::default(),
     };
     let probe = files
         .first()

@@ -3,6 +3,9 @@ use lsp_types::{Location, Position, Range, Url};
 use pascal_core::conditional::{self, ConditionalAnalysis};
 use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::{FileInfo, parser};
+#[cfg(test)]
+use pascal_project::CompilerVersion;
+use pascal_project::ConditionalContext;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
@@ -302,9 +305,15 @@ impl NavigationIndex {
         defines: &[String],
     ) -> Result<(), String> {
         let cancel = AtomicBool::new(false);
-        self.update_with_defines_with_cancel(uri, source, defines, &cancel)
+        self.update_with_context_with_cancel(
+            uri,
+            source,
+            &ConditionalContext::from_defines(defines),
+            &cancel,
+        )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn update_with_defines_with_cancel(
         &mut self,
         uri: Url,
@@ -312,9 +321,16 @@ impl NavigationIndex {
         defines: &[String],
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        self.update_with_defines_and_cached_with_cancel(uri, source, defines, None, cancel)
+        self.update_with_context_and_cached_with_cancel(
+            uri,
+            source,
+            &ConditionalContext::from_defines(defines),
+            None,
+            cancel,
+        )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn update_with_defines_and_cached_with_cancel(
         &mut self,
         uri: Url,
@@ -323,12 +339,39 @@ impl NavigationIndex {
         cached: Option<Arc<ParsedDocument>>,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        self.update_with_context_and_cached_with_cancel(
+            uri,
+            source,
+            &ConditionalContext::from_defines(defines),
+            cached,
+            cancel,
+        )
+    }
+
+    pub(crate) fn update_with_context_with_cancel(
+        &mut self,
+        uri: Url,
+        source: String,
+        context: &ConditionalContext,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.update_with_context_and_cached_with_cancel(uri, source, context, None, cancel)
+    }
+
+    pub(crate) fn update_with_context_and_cached_with_cancel(
+        &mut self,
+        uri: Url,
+        source: String,
+        context: &ConditionalContext,
+        cached: Option<Arc<ParsedDocument>>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
         let previous = self
             .documents
             .get(&uri)
             .map(|document| document.parsed.clone());
         let document =
-            Document::parse_with_cancel(uri.clone(), source, defines, cancel, previous.or(cached))?;
+            Document::parse_with_cancel(uri.clone(), source, context, cancel, previous.or(cached))?;
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
         }
@@ -8251,7 +8294,7 @@ impl ResolutionState {
 pub(crate) struct ParsedDocument {
     source: Arc<str>,
     parser_source: Arc<[u8]>,
-    defines: Arc<[String]>,
+    conditional_context: ConditionalContext,
     tree: Tree,
     parser_recovery_spans: Vec<Span>,
     unit_name: String,
@@ -8311,12 +8354,14 @@ impl Document {
     fn parse_with_cancel(
         uri: Url,
         source: String,
-        defines: &[String],
+        context: &ConditionalContext,
         cancel: &AtomicBool,
         previous: Option<Arc<ParsedDocument>>,
     ) -> Result<Self, String> {
         if let Some(previous) = previous.as_ref() {
-            if previous.source.as_ref() == source.as_str() && previous.defines.as_ref() == defines {
+            if previous.source.as_ref() == source.as_str()
+                && previous.conditional_context == *context
+            {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("request cancelled".to_string());
                 }
@@ -8332,7 +8377,7 @@ impl Document {
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));
         let info = FileInfo::new(path);
-        let conditionals = conditional::analyze_with_cancel(&source, defines, cancel);
+        let conditionals = conditional::analyze_with_context_and_cancel(&source, context, cancel);
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
         }
@@ -8663,7 +8708,7 @@ impl Document {
         let parsed = Arc::new(ParsedDocument {
             source: Arc::from(source),
             parser_source: Arc::from(parser_source.into_boxed_slice()),
-            defines: Arc::from(defines.to_vec().into_boxed_slice()),
+            conditional_context: context.clone(),
             tree,
             parser_recovery_spans,
             unit_name,
@@ -11806,6 +11851,56 @@ mod tests {
     }
 
     #[test]
+    fn changed_compiler_context_rebuilds_the_parsed_model() {
+        let uri = Url::parse("file:///tmp/compiler-context-model.pas").expect("fixture URI");
+        let source = "unit CompilerContextModel;\ninterface\n{$IF CompilerVersion >= 24}\nconst Enabled = 1;\n{$ENDIF}\nimplementation\nend.\n";
+        let mut index = NavigationIndex::new();
+        let old_context = ConditionalContext::default();
+        index
+            .update_with_context_with_cancel(
+                uri.clone(),
+                source.to_owned(),
+                &old_context,
+                &AtomicBool::new(false),
+            )
+            .expect("document without compiler version parses");
+        let without_version = index
+            .documents
+            .get(&uri)
+            .expect("document without compiler version retained")
+            .parsed
+            .clone();
+
+        let new_context =
+            ConditionalContext::default().with_compiler_version(CompilerVersion::new(24, 0));
+        index
+            .update_with_context_with_cancel(
+                uri.clone(),
+                source.to_owned(),
+                &new_context,
+                &AtomicBool::new(false),
+            )
+            .expect("document with compiler version parses");
+        let with_version = index
+            .documents
+            .get(&uri)
+            .expect("document with compiler version retained")
+            .parsed
+            .clone();
+
+        assert!(
+            !Arc::ptr_eq(&without_version, &with_version),
+            "a compiler-context change must invalidate the semantic model"
+        );
+        assert!(
+            with_version
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name.eq_ignore_ascii_case("Enabled"))
+        );
+    }
+
+    #[test]
     fn cancelled_update_does_not_publish_a_parsed_cache_entry() {
         let uri = Url::parse("file:///tmp/cancelled-model.pas").expect("fixture URI");
         let mut index = NavigationIndex::new();
@@ -11902,8 +11997,14 @@ mod tests {
             "unit UsesBudgetConsumer;\ninterface\nuses BudgetProvider;\nimplementation\nend.\n";
         let uri = Url::parse("file:///tmp/uses-budget-consumer.pas").expect("fixture URI");
         let cancel = AtomicBool::new(false);
-        let document = Document::parse_with_cancel(uri, source.to_owned(), &[], &cancel, None)
-            .expect("uses-budget fixture parses");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &cancel,
+            None,
+        )
+        .expect("uses-budget fixture parses");
         let module_name = collect_nodes_matching(document.tree.root_node(), "moduleName")
             .into_iter()
             .find(|node| has_ancestor_kind(*node, "declUses"))
@@ -11935,8 +12036,9 @@ mod tests {
         );
         let uri = Url::parse("file:///tmp/wide-uses-budget.pas").expect("fixture URI");
         let cancel = AtomicBool::new(false);
-        let document = Document::parse_with_cancel(uri, source, &[], &cancel, None)
-            .expect("wide uses fixture parses");
+        let document =
+            Document::parse_with_cancel(uri, source, &ConditionalContext::default(), &cancel, None)
+                .expect("wide uses fixture parses");
         let module_name = collect_nodes_matching(document.tree.root_node(), "moduleName")
             .into_iter()
             .find(|node| has_ancestor_kind(*node, "declUses"))

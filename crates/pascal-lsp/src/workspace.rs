@@ -15,8 +15,9 @@ use pascal_project::delphi_overrides::{
     EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
 };
 use pascal_project::{
-    MetadataObservation, PackageMetadata, ProjectCandidateMembership, ProjectCandidates,
-    ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
+    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
+    PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
+    ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
     ProjectReadObservation, ProjectReadStamp, ProjectSelections, ReadPolicy,
     discover_with_selections, discover_with_selections_and_observations_with_cancel_and_overrides,
     discover_with_selections_and_observations_with_overrides, has_invalid_project_selection,
@@ -162,6 +163,9 @@ pub struct WorkspaceOptions {
     pub project_file: Option<PathBuf>,
     pub build_config: Option<String>,
     pub platform: Option<String>,
+    /// Explicit compiler/option/constant facts for conservative conditional
+    /// source analysis. Unknown values remain unknown.
+    pub conditional_context: ConditionalContext,
     pub limits: ResourceLimits,
 }
 
@@ -186,6 +190,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) project_file: RuntimeOption<PathBuf>,
     pub(crate) build_config: RuntimeOption<String>,
     pub(crate) platform: RuntimeOption<String>,
+    pub(crate) conditional_context: RuntimeOption<ConditionalContext>,
     pub(crate) max_files: RuntimeOption<usize>,
     pub(crate) max_file_bytes: RuntimeOption<usize>,
     pub(crate) max_total_bytes: RuntimeOption<usize>,
@@ -198,6 +203,7 @@ pub(crate) struct RuntimeOptionsOverride {
     project_file: Option<Option<PathBuf>>,
     build_config: Option<Option<String>>,
     platform: Option<Option<String>>,
+    conditional_context: Option<Option<ConditionalContext>>,
     max_files: Option<usize>,
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
@@ -214,6 +220,7 @@ impl RuntimeOptionsUpdate {
             project_file: RuntimeOption::Reset,
             build_config: RuntimeOption::Reset,
             platform: RuntimeOption::Reset,
+            conditional_context: RuntimeOption::Reset,
             max_files: RuntimeOption::Reset,
             max_file_bytes: RuntimeOption::Reset,
             max_total_bytes: RuntimeOption::Reset,
@@ -244,6 +251,11 @@ impl RuntimeOptionsOverride {
                 .as_ref()
                 .and_then(|value| value.clone())
                 .or_else(|| base.platform.clone()),
+            conditional_context: self
+                .conditional_context
+                .as_ref()
+                .and_then(|value| value.clone())
+                .unwrap_or_else(|| base.conditional_context.clone()),
             limits: ResourceLimits {
                 max_files: self.max_files.unwrap_or(base.limits.max_files),
                 max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
@@ -277,6 +289,12 @@ impl RuntimeOptionsOverride {
             &mut self.platform,
             update.platform,
             "platform",
+            &mut warnings,
+        );
+        apply_runtime_optional_field(
+            &mut self.conditional_context,
+            update.conditional_context,
+            "conditionalContext",
             &mut warnings,
         );
         apply_runtime_field(
@@ -341,10 +359,45 @@ pub(crate) fn parse_runtime_options(
         project_file: parse_runtime_string(object, "projectFile").map_path_buf(),
         build_config: parse_runtime_string(object, "buildConfig"),
         platform: parse_runtime_string(object, "platform"),
+        conditional_context: parse_runtime_conditional_context(object),
         max_files: parse_runtime_limit(object, "maxFiles", DEFAULT_MAX_FILES),
         max_file_bytes: parse_runtime_limit(object, "maxFileBytes", DEFAULT_MAX_FILE_BYTES),
         max_total_bytes: parse_runtime_limit(object, "maxTotalBytes", DEFAULT_MAX_TOTAL_BYTES),
     })
+}
+
+fn parse_runtime_conditional_context(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> RuntimeOption<ConditionalContext> {
+    let fields = [
+        "compilerVersion",
+        "compilerOptions",
+        "conditionalDefines",
+        "conditionalUndefines",
+        "conditionalConstants",
+    ];
+    if !fields.iter().any(|field| object.contains_key(*field)) {
+        return RuntimeOption::Absent;
+    }
+    if fields
+        .iter()
+        .any(|field| object.get(*field).is_some_and(serde_json::Value::is_null))
+        && fields
+            .iter()
+            .all(|field| object.get(*field).is_none_or(serde_json::Value::is_null))
+    {
+        return RuntimeOption::Reset;
+    }
+    match parse_conditional_context_values(
+        object.get("compilerVersion"),
+        object.get("compilerOptions"),
+        object.get("conditionalDefines"),
+        object.get("conditionalUndefines"),
+        object.get("conditionalConstants"),
+    ) {
+        Ok(context) => RuntimeOption::Value(context),
+        Err(error) => RuntimeOption::Invalid(error),
+    }
 }
 
 fn parse_runtime_list(
@@ -443,9 +496,141 @@ struct RawWorkspaceOptions {
     project_file: Option<PathBuf>,
     build_config: Option<String>,
     platform: Option<String>,
+    compiler_version: Option<serde_json::Value>,
+    compiler_options: Option<serde_json::Value>,
+    conditional_defines: Option<serde_json::Value>,
+    conditional_undefines: Option<serde_json::Value>,
+    conditional_constants: Option<serde_json::Value>,
     max_files: Option<usize>,
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
+}
+
+fn parse_conditional_context_values(
+    compiler_version: Option<&serde_json::Value>,
+    compiler_options: Option<&serde_json::Value>,
+    conditional_defines: Option<&serde_json::Value>,
+    conditional_undefines: Option<&serde_json::Value>,
+    conditional_constants: Option<&serde_json::Value>,
+) -> Result<ConditionalContext, String> {
+    let mut context = ConditionalContext::default();
+    if let Some(value) = compiler_version.filter(|value| !value.is_null()) {
+        let text = value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| value.as_number().map(ToString::to_string))
+            .ok_or_else(|| "compilerVersion must be a string or number".to_string())?;
+        let version = CompilerVersion::parse(&text)
+            .ok_or_else(|| "compilerVersion must be a decimal version such as 24.0".to_string())?;
+        context.compiler_version = Some(version);
+    }
+    parse_conditional_symbol_list(
+        conditional_defines,
+        "conditionalDefines",
+        &mut context,
+        ConditionalFact::True,
+    )?;
+    parse_conditional_symbol_list(
+        conditional_undefines,
+        "conditionalUndefines",
+        &mut context,
+        ConditionalFact::False,
+    )?;
+    if let Some(value) = compiler_options.filter(|value| !value.is_null()) {
+        let Some(object) = value.as_object() else {
+            return Err("compilerOptions must be an object or null".to_string());
+        };
+        if object.len() > MAX_RUNTIME_LIST_ENTRIES {
+            return Err(format!(
+                "compilerOptions contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+            ));
+        }
+        for (name, value) in object {
+            if name.len() > MAX_RUNTIME_STRING_BYTES {
+                return Err("compilerOptions contains an overlong option name".to_string());
+            }
+            let fact = parse_conditional_fact_value(value).ok_or_else(|| {
+                format!("compilerOptions.{name} must be boolean, null, or on/off")
+            })?;
+            context.set_option(name, fact);
+        }
+    }
+    if let Some(value) = conditional_constants.filter(|value| !value.is_null()) {
+        let Some(object) = value.as_object() else {
+            return Err("conditionalConstants must be an object or null".to_string());
+        };
+        if object.len() > MAX_RUNTIME_LIST_ENTRIES {
+            return Err(format!(
+                "conditionalConstants contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+            ));
+        }
+        for (name, value) in object {
+            let constant = match value {
+                serde_json::Value::Bool(value) => ConstantValue::Boolean(*value),
+                serde_json::Value::String(value) => ConstantValue::String(value.clone()),
+                serde_json::Value::Number(value) => {
+                    let value = value
+                        .as_i64()
+                        .ok_or_else(|| format!("conditionalConstants.{name} must be an integer"))?;
+                    ConstantValue::Integer(value)
+                }
+                _ => {
+                    return Err(format!(
+                        "conditionalConstants.{name} must be boolean, integer, or string"
+                    ));
+                }
+            };
+            context.set_constant(name, constant);
+        }
+    }
+    Ok(context)
+}
+
+fn parse_conditional_symbol_list(
+    value: Option<&serde_json::Value>,
+    field: &str,
+    context: &mut ConditionalContext,
+    fact: ConditionalFact,
+) -> Result<(), String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("{field} must be an array of strings or null"));
+    };
+    if values.len() > MAX_RUNTIME_LIST_ENTRIES {
+        return Err(format!(
+            "{field} contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+        ));
+    }
+    for value in values {
+        let Some(name) = value.as_str() else {
+            return Err(format!("{field} must contain only strings"));
+        };
+        if name.len() > MAX_RUNTIME_STRING_BYTES {
+            return Err(format!("{field} contains an overlong symbol"));
+        }
+        context.set_define(name, fact);
+    }
+    Ok(())
+}
+
+fn parse_conditional_fact_value(value: &serde_json::Value) -> Option<ConditionalFact> {
+    match value {
+        serde_json::Value::Null => Some(ConditionalFact::Unknown),
+        serde_json::Value::Bool(value) => Some(if *value {
+            ConditionalFact::True
+        } else {
+            ConditionalFact::False
+        }),
+        serde_json::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "+" | "1" => Some(ConditionalFact::True),
+            "off" | "false" | "no" | "-" | "0" => Some(ConditionalFact::False),
+            "unknown" => Some(ConditionalFact::Unknown),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl WorkspaceOptions {
@@ -484,6 +669,13 @@ impl WorkspaceOptions {
             project_file: raw.project_file,
             build_config: raw.build_config,
             platform: raw.platform,
+            conditional_context: parse_conditional_context_values(
+                raw.compiler_version.as_ref(),
+                raw.compiler_options.as_ref(),
+                raw.conditional_defines.as_ref(),
+                raw.conditional_undefines.as_ref(),
+                raw.conditional_constants.as_ref(),
+            )?,
             limits,
         })
     }
@@ -602,6 +794,7 @@ struct PackageMetadataKey {
     read_policy: pascal_project::ReadPolicy,
     config: Option<String>,
     platform: Option<String>,
+    conditional_context: ConditionalContext,
 }
 
 #[derive(Debug, Default)]
@@ -615,7 +808,7 @@ struct PackageLookup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ContextKey {
+pub(crate) struct ContextKey {
     project_file: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     project_scope: Option<PathBuf>,
@@ -623,6 +816,7 @@ struct ContextKey {
     selection_project: Option<PathBuf>,
     config: Option<String>,
     platform: Option<String>,
+    conditional_context: ConditionalContext,
     overrides: EffectiveOverrides,
 }
 
@@ -865,6 +1059,7 @@ struct WorkspaceRoot {
 #[derive(Debug, Clone)]
 pub(crate) struct ExpansionRecord {
     pub(crate) physical_source: String,
+    pub(crate) context_key: ContextKey,
     pub(crate) expanded: ExpandedSource,
     pub(crate) source_texts: HashMap<Url, String>,
     pub(crate) dependency_entries: HashMap<Url, ProjectPathEntry>,
@@ -1254,6 +1449,7 @@ impl Workspace {
             build_config: self.options.build_config.clone(),
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
+            conditional_context: self.options.conditional_context.clone(),
         }
     }
 
@@ -2239,6 +2435,7 @@ impl Workspace {
             build_config: self.options.build_config.clone(),
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
+            conditional_context: self.options.conditional_context.clone(),
         };
         let (context_key, context) =
             self.readonly_context_for_uri(uri, &path, &roots, &project_options)?;
@@ -3066,18 +3263,18 @@ impl Workspace {
             }
             return Ok(false);
         }
-        let defines = self
+        let conditional_context = self
             .contexts
             .get(context_key)
-            .map(|state| state.context.defines.clone())
+            .map(|state| state.context.effective_conditional_context())
             .unwrap_or_default();
         let expansion = if rename::may_contain_include_directive(source.as_bytes()) {
             let mut expansion =
                 self.expand_source_with_cancel(uri, &source, context_key, cancel)?;
             let fallback_cancel = AtomicBool::new(false);
-            let conditional = pascal_core::conditional::analyze_with_cancel(
+            let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
                 expansion.expanded.text(),
-                &defines,
+                &conditional_context,
                 cancel.unwrap_or(&fallback_cancel),
             );
             crate::include_expansion::reconcile_conditional_completeness(
@@ -3111,19 +3308,19 @@ impl Workspace {
             })
             .map(|cached| cached.parsed.clone());
         let update = match cancel {
-            Some(cancel) => self.index.update_with_defines_and_cached_with_cancel(
+            Some(cancel) => self.index.update_with_context_and_cached_with_cancel(
                 uri.clone(),
                 indexed_source.clone(),
-                &defines,
+                &conditional_context,
                 cached,
                 cancel,
             ),
             None => {
                 let cancel = AtomicBool::new(false);
-                self.index.update_with_defines_and_cached_with_cancel(
+                self.index.update_with_context_and_cached_with_cancel(
                     uri.clone(),
                     indexed_source.clone(),
-                    &defines,
+                    &conditional_context,
                     cached,
                     &cancel,
                 )
@@ -3153,7 +3350,7 @@ impl Workspace {
         self.index.clear_import_bindings(uri);
         self.touch(uri);
         if let Some(expansion) = expansion {
-            self.store_expansion(uri, source, expansion);
+            self.store_expansion(uri, context_key, source, expansion);
             let context = self
                 .contexts
                 .get(context_key)
@@ -3202,6 +3399,7 @@ impl Workspace {
     fn store_expansion(
         &mut self,
         uri: &Url,
+        context_key: &ContextKey,
         physical_source: String,
         result: crate::include_expansion::ExpansionResult,
     ) {
@@ -3245,6 +3443,7 @@ impl Workspace {
             uri.clone(),
             ExpansionRecord {
                 physical_source,
+                context_key: context_key.clone(),
                 expanded: result.expanded,
                 source_texts,
                 dependency_entries,
@@ -3962,6 +4161,7 @@ impl Workspace {
             build_config: self.options.build_config.clone(),
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
+            conditional_context: self.options.conditional_context.clone(),
         };
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
@@ -4494,6 +4694,9 @@ impl Workspace {
             selection_project: selection.map(|(_, project)| project),
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
+            conditional_context: context
+                .map(ProjectContext::effective_conditional_context)
+                .unwrap_or_default(),
             overrides: context
                 .map(|context| context.overrides.clone())
                 .unwrap_or_default(),
@@ -4527,6 +4730,9 @@ impl Workspace {
             selection_project: selection.map(|(_, project)| project),
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
+            conditional_context: context
+                .map(ProjectContext::effective_conditional_context)
+                .unwrap_or_default(),
             overrides: context
                 .map(|context| context.overrides.clone())
                 .unwrap_or_default(),
@@ -5469,6 +5675,7 @@ impl Workspace {
             read_policy: context.read_policy.clone(),
             config: context.config.clone(),
             platform: context.platform.clone(),
+            conditional_context: context.effective_conditional_context(),
         };
         let stamp = path_stamp(path);
         if let Some(cached) = self.package_metadata_cache.get(&key) {
@@ -5501,6 +5708,7 @@ impl Workspace {
         let options = ProjectOptions {
             build_config: key.config.clone(),
             platform: key.platform.clone(),
+            conditional_context: key.conditional_context.clone(),
             ..ProjectOptions::default()
         };
         let entry = match context_path_entry(context, path) {
@@ -6816,14 +7024,15 @@ impl Workspace {
         check_workspace_cancel(Some(cancel))?;
         let mut expansion =
             self.expand_source_with_cancel(uri, &source, &context_key, Some(cancel))?;
-        let conditional = pascal_core::conditional::analyze_with_cancel(
+        let conditional_context = context.effective_conditional_context();
+        let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
             expansion.expanded.text(),
-            &context.defines,
+            &conditional_context,
             cancel,
         );
         crate::include_expansion::reconcile_conditional_completeness(&mut expansion, &conditional);
         let expansion_complete = expansion.complete;
-        self.store_expansion(uri, source.clone(), expansion);
+        self.store_expansion(uri, &context_key, source.clone(), expansion);
         self.record_expansion_analysis_sources(uri, &context, cancel)?;
         if !expansion_complete {
             return Ok(single_diagnostic_publication(
@@ -6859,6 +7068,7 @@ impl Workspace {
         let expansion = self
             .expansions
             .get(uri)
+            .filter(|expansion| expansion.context_key == context_key)
             .cloned()
             .ok_or_else(|| format!("include expansion was not retained for {uri}"))?;
         let mut mapping_budget = crate::include_expansion::MappingBudget::new(
@@ -6985,10 +7195,11 @@ impl Workspace {
             }
         };
         let mut source_index = NavigationIndex::new();
-        match source_index.update_with_defines_with_cancel(
+        let conditional_context = context.effective_conditional_context();
+        match source_index.update_with_context_with_cancel(
             uri.clone(),
             source_text.to_owned(),
-            &context.defines,
+            &conditional_context,
             cancel,
         ) {
             Ok(()) => {}
@@ -7047,7 +7258,19 @@ impl Workspace {
         let options = lint4d::cfg::CfgSnapshotOptions {
             prepare_configured_sources: context.project_file.is_some(),
             configuration_id: Some(configuration_id),
-            initial_defined_symbols: context.defines.clone(),
+            preparation_environment: lint4d::cfg::PreparationEnvironment::Partial,
+            initial_defined_symbols: context
+                .effective_conditional_context()
+                .defines
+                .into_iter()
+                .filter_map(|(name, value)| (value == ConditionalFact::True).then_some(name))
+                .collect(),
+            initial_undefined_symbols: context
+                .effective_conditional_context()
+                .defines
+                .into_iter()
+                .filter_map(|(name, value)| (value == ConditionalFact::False).then_some(name))
+                .collect(),
             ..Default::default()
         };
         let project_complete = project.complete;
@@ -8172,7 +8395,11 @@ mod tests {
     use pascal_project::delphi_overrides::{
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
     };
-    use pascal_project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance, ReadPolicy};
+    use pascal_project::{
+        CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, ProjectContext,
+        ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
+    };
+    use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     #[cfg(unix)]
@@ -8182,6 +8409,86 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn runtime_conditional_context_parsing_is_typed_and_bounded() {
+        let update = super::parse_runtime_options(&json!({
+            "compilerVersion": "24.0",
+            "compilerOptions": {"R": true, "Q": "off", "Unknown": null},
+            "conditionalDefines": ["FEATURE"],
+            "conditionalUndefines": ["LEGACY"],
+            "conditionalConstants": {
+                "BuildLevel": 7,
+                "Flavor": "desktop",
+                "Enabled": true
+            }
+        }))
+        .expect("typed runtime conditional settings");
+        let super::RuntimeOption::Value(context) = update.conditional_context else {
+            panic!("conditional settings were not parsed");
+        };
+
+        assert_eq!(context.compiler_version, Some(CompilerVersion::new(24, 0)));
+        assert_eq!(context.option("R"), ConditionalFact::True);
+        assert_eq!(context.option("Q"), ConditionalFact::False);
+        assert_eq!(context.option("Unknown"), ConditionalFact::Unknown);
+        assert_eq!(context.define("FEATURE"), ConditionalFact::True);
+        assert_eq!(context.define("LEGACY"), ConditionalFact::False);
+        assert_eq!(
+            context.constant("BuildLevel"),
+            Some(&ConstantValue::Integer(7))
+        );
+        assert_eq!(
+            context.constant("Flavor"),
+            Some(&ConstantValue::String("desktop".to_string()))
+        );
+        assert_eq!(
+            context.constant("Enabled"),
+            Some(&ConstantValue::Boolean(true))
+        );
+
+        let invalid = super::parse_runtime_options(&json!({
+            "compilerVersion": "not-a-version"
+        }));
+        assert!(
+            invalid.is_ok(),
+            "invalid runtime values are retained as warnings"
+        );
+        assert!(matches!(
+            invalid.expect("runtime option update").conditional_context,
+            super::RuntimeOption::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn context_keys_separate_same_source_conditional_contexts() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let source = root.join("Shared.pas");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let mut first_context =
+            ConditionalContext::default().with_compiler_version(CompilerVersion::new(23, 0));
+        first_context.set_define("FEATURE", ConditionalFact::True);
+        let mut second_context =
+            ConditionalContext::default().with_compiler_version(CompilerVersion::new(24, 0));
+        second_context.set_define("FEATURE", ConditionalFact::False);
+        let first = ProjectContext {
+            conditional_context: first_context,
+            ..ProjectContext::default()
+        };
+        let second = ProjectContext {
+            conditional_context: second_context,
+            ..ProjectContext::default()
+        };
+
+        let first_key = workspace.context_key_for_path(&source, Some(&first));
+        let second_key = workspace.context_key_for_path(&source, Some(&second));
+        assert_ne!(first_key, second_key);
+        assert_ne!(
+            first_key.conditional_context,
+            second_key.conditional_context
+        );
     }
 
     #[cfg(unix)]
@@ -9307,6 +9614,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let mut owner = super::KnownDocumentOwner {
@@ -9340,6 +9648,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let owner = super::KnownDocumentOwner {
@@ -9887,6 +10196,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let context = ProjectContext {
@@ -9947,6 +10257,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides {
                 path_mappings: vec![PathMapping {
                     from: "c:/sdk".to_owned(),
@@ -10026,6 +10337,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides {
                 path_mappings: vec![PathMapping {
                     from: "c:/sdk".to_owned(),

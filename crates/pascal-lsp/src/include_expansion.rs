@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use pascal_core::conditional::{self, DirectiveKind, Truth};
+use pascal_project::ConditionalContext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PhysicalSpan {
@@ -436,6 +437,18 @@ pub(crate) fn expand_source<R: IncludeResolver>(
     limits: ExpansionLimits,
     cancel: &AtomicBool,
 ) -> Result<ExpansionResult, String> {
+    let context = ConditionalContext::from_defines(defines);
+    expand_source_with_context(root_uri, source, &context, resolver, limits, cancel)
+}
+
+pub(crate) fn expand_source_with_context<R: IncludeResolver>(
+    root_uri: Url,
+    source: &str,
+    context: &ConditionalContext,
+    resolver: &mut R,
+    limits: ExpansionLimits,
+    cancel: &AtomicBool,
+) -> Result<ExpansionResult, String> {
     let mut state = ExpansionState {
         result: ExpansionResult {
             expanded: ExpandedSource::new(),
@@ -453,7 +466,7 @@ pub(crate) fn expand_source<R: IncludeResolver>(
         active: HashSet::new(),
         cancel,
     };
-    let mut environment = conditional::ConditionalEnvironment::from_defines(defines);
+    let mut environment = conditional::ConditionalEnvironment::from_context(context);
     let (complete, expanded) =
         expand_file(&mut state, root_uri, source, &mut environment, resolver, 0)?;
     state.result.expanded = expanded;

@@ -6,8 +6,8 @@
 //! [`Truth::Unknown`].
 
 use crate::resolver::{CancellationToken, NoCancellation};
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::ops::Range;
@@ -21,42 +21,8 @@ const MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
 const MAX_ENVIRONMENT_WORK: usize = 1_000_000;
 const MAX_ENVIRONMENT_BYTE_WORK: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Truth {
-    True,
-    False,
-    Unknown,
-}
-
-impl Truth {
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::False, _) | (_, Self::False) => Self::False,
-            (Self::True, value) | (value, Self::True) => value,
-            (Self::Unknown, Self::Unknown) => Self::Unknown,
-        }
-    }
-
-    fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::True, _) | (_, Self::True) => Self::True,
-            (Self::False, value) | (value, Self::False) => value,
-            (Self::Unknown, Self::Unknown) => Self::Unknown,
-        }
-    }
-
-    fn not(self) -> Self {
-        match self {
-            Self::True => Self::False,
-            Self::False => Self::True,
-            Self::Unknown => Self::Unknown,
-        }
-    }
-
-    fn merge(self, other: Self) -> Self {
-        if self == other { self } else { Self::Unknown }
-    }
-}
+pub use pascal_project::ConditionalFact as Truth;
+pub use pascal_project::{CompilerVersion, ConditionalContext, ConstantValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveKind {
@@ -251,6 +217,9 @@ struct LexResult {
 #[derive(Debug, Clone, Default)]
 pub struct ConditionalEnvironment {
     values: HashMap<String, Truth>,
+    options: HashMap<String, Truth>,
+    constants: BTreeMap<String, ConstantValue>,
+    compiler_version: Option<CompilerVersion>,
     bytes: usize,
 }
 
@@ -260,18 +229,68 @@ impl ConditionalEnvironment {
     }
 
     pub fn from_defines(defines: &[String]) -> Self {
+        Self::from_context(&ConditionalContext::from_defines(defines))
+    }
+
+    pub fn from_context(context: &ConditionalContext) -> Self {
         let mut environment = Self::new();
-        for define in defines {
-            if let Some(symbol) = canonical_symbol(define) {
-                environment.insert(symbol, Truth::True);
-            }
+        environment.compiler_version = context.compiler_version;
+        for (symbol, value) in &context.defines {
+            environment.insert_value(symbol.clone(), *value);
+        }
+        for (option, value) in &context.options {
+            environment.insert_option(option.clone(), *value);
+        }
+        for (name, value) in &context.constants {
+            environment.insert_constant(name.clone(), value.clone());
         }
         environment
+    }
+
+    pub fn to_context(&self) -> ConditionalContext {
+        ConditionalContext {
+            compiler_version: self.compiler_version,
+            defines: self
+                .values
+                .iter()
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            options: self
+                .options
+                .iter()
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            constants: self.constants.clone(),
+        }
+    }
+
+    fn insert_value(&mut self, key: String, value: Truth) {
+        self.account_key(&key);
+        self.values.insert(key, value);
+    }
+
+    fn insert_option(&mut self, key: String, value: Truth) {
+        self.account_key(&key);
+        self.options.insert(key, value);
+    }
+
+    fn insert_constant(&mut self, key: String, value: ConstantValue) {
+        self.account_key(&key);
+        self.constants.insert(key, value);
+    }
+
+    fn account_key(&mut self, key: &str) {
+        self.bytes = self
+            .bytes
+            .saturating_add(key.len().saturating_add(size_of::<Truth>()));
     }
 
     /// Whether this environment carries any inherited DEFINE/UNDEF facts.
     pub fn has_facts(&self) -> bool {
         !self.values.is_empty()
+            || !self.options.is_empty()
+            || !self.constants.is_empty()
+            || self.compiler_version.is_some()
     }
 
     /// Return a stable identity for the currently established facts.
@@ -287,17 +306,40 @@ impl ConditionalEnvironment {
             symbol.hash(&mut hasher);
             value.hash(&mut hasher);
         }
+        let mut options = self.options.iter().collect::<Vec<_>>();
+        options.sort_by(|left, right| left.0.cmp(right.0));
+        for (option, value) in options {
+            option.hash(&mut hasher);
+            value.hash(&mut hasher);
+        }
+        for (name, value) in &self.constants {
+            name.hash(&mut hasher);
+            value.hash(&mut hasher);
+        }
+        self.compiler_version.hash(&mut hasher);
         hasher.finish()
     }
 
     fn len(&self) -> usize {
-        self.values.len()
+        self.values
+            .len()
+            .saturating_add(self.options.len())
+            .saturating_add(self.constants.len())
+            .saturating_add(usize::from(self.compiler_version.is_some()))
     }
     fn contains_key(&self, key: &str) -> bool {
         self.values.contains_key(key)
     }
     fn get(&self, key: &str) -> Option<&Truth> {
         self.values.get(key)
+    }
+
+    fn option(&self, key: &str) -> Truth {
+        self.options.get(key).copied().unwrap_or(Truth::Unknown)
+    }
+
+    fn constant(&self, key: &str) -> Option<&ConstantValue> {
+        self.constants.get(key)
     }
     fn keys(&self) -> impl Iterator<Item = &String> {
         self.values.keys()
@@ -308,16 +350,30 @@ impl ConditionalEnvironment {
 
     fn clear(&mut self) {
         self.values.clear();
+        self.options.clear();
+        self.constants.clear();
         self.bytes = 0;
     }
 
     fn insert(&mut self, key: String, value: Truth) {
         if !self.values.contains_key(&key) {
-            self.bytes = self
-                .bytes
-                .saturating_add(key.len().saturating_add(size_of::<Truth>()));
+            self.account_key(&key);
         }
         self.values.insert(key, value);
+    }
+
+    fn insert_option_value(&mut self, key: String, value: Truth) {
+        if !self.options.contains_key(&key) {
+            self.account_key(&key);
+        }
+        self.options.insert(key, value);
+    }
+
+    fn insert_constant_value(&mut self, key: String, value: ConstantValue) {
+        if !self.constants.contains_key(&key) {
+            self.account_key(&key);
+        }
+        self.constants.insert(key, value);
     }
 }
 
@@ -345,6 +401,15 @@ pub fn analyze(source: &str, project_defines: &[String]) -> ConditionalAnalysis 
     analyze_with_cancel(source, project_defines, &NoCancellation)
 }
 
+/// Analyze a source buffer with an explicit compiler/option/constant context.
+///
+/// The context is copied into the request-local environment.  DEFINE/UNDEF,
+/// option switches, include transitions, and proven constants therefore flow
+/// in source order without mutating the caller's project metadata.
+pub fn analyze_with_context(source: &str, context: &ConditionalContext) -> ConditionalAnalysis {
+    analyze_with_context_and_cancel(source, context, &NoCancellation)
+}
+
 /// Analyze a source buffer while polling a caller-owned cancellation token.
 ///
 /// Cancellation is represented as an incomplete analysis because callers must
@@ -354,7 +419,17 @@ pub fn analyze_with_cancel(
     project_defines: &[String],
     cancel: &dyn CancellationToken,
 ) -> ConditionalAnalysis {
-    analyze_inner(source, project_defines, Some(cancel))
+    let context = ConditionalContext::from_defines(project_defines);
+    analyze_with_context_and_cancel(source, &context, cancel)
+}
+
+/// Context-aware variant of [`analyze_with_context`] that polls cancellation.
+pub fn analyze_with_context_and_cancel(
+    source: &str,
+    context: &ConditionalContext,
+    cancel: &dyn CancellationToken,
+) -> ConditionalAnalysis {
+    analyze_inner(source, context, Some(cancel))
 }
 
 struct AnalysisBudget<'a> {
@@ -420,7 +495,7 @@ impl AnalysisBudget<'_> {
 
 fn analyze_inner(
     source: &str,
-    project_defines: &[String],
+    context: &ConditionalContext,
     cancel: Option<&dyn CancellationToken>,
 ) -> ConditionalAnalysis {
     let lexed = lex_directives(source, cancel);
@@ -431,7 +506,7 @@ fn analyze_inner(
         exhausted: false,
     };
     let mut complete = lexed.complete;
-    let mut environment = match initial_environment(project_defines, &mut budget) {
+    let mut environment = match initial_environment(context, &mut budget) {
         Some(environment) => environment,
         None => {
             complete = false;
@@ -461,6 +536,21 @@ pub fn analyze_with_include_callback(
     )
 }
 
+/// Context-aware include callback variant used by source expansion and audit
+/// workers.  The mutable environment still carries inherited state between
+/// adjacent include occurrences.
+pub fn analyze_with_include_callback_context(
+    source: &str,
+    environment: &mut ConditionalEnvironment,
+    cancel: &dyn CancellationToken,
+    include: &mut dyn FnMut(
+        &ConditionalDirective,
+        &mut ConditionalEnvironment,
+    ) -> IncludeTransition,
+) -> ConditionalAnalysis {
+    analyze_with_include_callback(source, environment, cancel, include)
+}
+
 fn analyze_lexed(
     source: &str,
     lexed: LexResult,
@@ -488,6 +578,16 @@ fn analyze_lexed(
         if !budget.poll() {
             complete = false;
             break;
+        }
+        if !observe_source_constants(
+            source,
+            cursor..raw.start,
+            active,
+            environment,
+            &mut complete,
+            &mut budget,
+        ) {
+            complete = false;
         }
         add_activity_span(
             &mut inactive_spans,
@@ -633,9 +733,29 @@ fn analyze_lexed(
                     environment.clear();
                 }
             }
-            DirectiveKind::MethodInfo | DirectiveKind::Harmless | DirectiveKind::Other => {}
+            DirectiveKind::MethodInfo | DirectiveKind::Harmless | DirectiveKind::Other => {
+                if active != Truth::False
+                    && is_option_directive(&raw.body)
+                    && !apply_option_directive(environment, &raw.body, active, &mut budget)
+                {
+                    complete = false;
+                }
+            }
         }
         cursor = raw.end;
+    }
+
+    if cursor < source.len()
+        && !observe_source_constants(
+            source,
+            cursor..source.len(),
+            active,
+            environment,
+            &mut complete,
+            &mut budget,
+        )
+    {
+        complete = false;
     }
 
     add_activity_span(
@@ -669,33 +789,38 @@ fn analyze_lexed(
 }
 
 fn initial_environment(
-    project_defines: &[String],
+    context: &ConditionalContext,
     budget: &mut AnalysisBudget<'_>,
 ) -> Option<ConditionalEnvironment> {
-    let mut environment = ConditionalEnvironment::new();
-    for define in project_defines {
+    let environment = ConditionalEnvironment::from_context(context);
+    for define in context.defines.keys() {
         if !budget.charge(1) {
             return None;
         }
-        if let Some(symbol) = canonical_symbol(define) {
-            if !budget.charge_bytes(symbol.len()) {
-                return None;
-            }
-            if !environment.contains_key(&symbol) && environment.len() >= MAX_ENVIRONMENT_ENTRIES {
-                budget.exhausted = true;
-                return None;
-            }
-            if !environment.contains_key(&symbol)
-                && !budget.check_environment_bytes(
-                    environment
-                        .bytes()
-                        .saturating_add(symbol.len().saturating_add(size_of::<Truth>())),
-                )
-            {
-                return None;
-            }
-            environment.insert(symbol, Truth::True);
+        if !budget.charge_bytes(define.len()) {
+            return None;
         }
+    }
+    for option in context.options.keys() {
+        if !budget.charge(1) || !budget.charge_bytes(option.len()) {
+            return None;
+        }
+    }
+    for (name, value) in &context.constants {
+        if !budget.charge(1)
+            || !budget.charge_bytes(name.len().saturating_add(constant_size(value)))
+        {
+            return None;
+        }
+    }
+    if context.compiler_version.is_some() && !budget.charge(1) {
+        return None;
+    }
+    if !budget.check_environment_bytes(environment.bytes())
+        || environment.len() > MAX_ENVIRONMENT_ENTRIES
+    {
+        budget.exhausted = true;
+        return None;
     }
     Some(environment)
 }
@@ -771,6 +896,323 @@ fn apply_fact(
     true
 }
 
+fn apply_option_fact(
+    environment: &mut ConditionalEnvironment,
+    option: &str,
+    value: Truth,
+    activity: Truth,
+    budget: &mut AnalysisBudget<'_>,
+) -> bool {
+    if !budget.charge(1) {
+        return false;
+    }
+    let key = match canonical_symbol(option) {
+        Some(key) => key,
+        None => return false,
+    };
+    let previous = environment.option(&key);
+    let next = match activity {
+        Truth::True => value,
+        Truth::False => previous,
+        Truth::Unknown => previous.merge(value),
+    };
+    if !budget.charge_bytes(key.len()) {
+        return false;
+    }
+    if !environment.options.contains_key(&key) && environment.len() >= MAX_ENVIRONMENT_ENTRIES {
+        budget.exhausted = true;
+        return false;
+    }
+    let bytes = environment
+        .bytes()
+        .saturating_add(key.len().saturating_add(size_of::<Truth>()));
+    if !environment.options.contains_key(&key) && !budget.check_environment_bytes(bytes) {
+        return false;
+    }
+    environment.insert_option_value(key, next);
+    true
+}
+
+fn constant_size(value: &ConstantValue) -> usize {
+    match value {
+        ConstantValue::Boolean(_) => 1,
+        ConstantValue::Integer(_) => size_of::<i64>(),
+        ConstantValue::String(value) => value.len(),
+        ConstantValue::Version(_) => size_of::<CompilerVersion>(),
+    }
+}
+
+fn is_option_directive(body: &str) -> bool {
+    let Some(keyword) = directive_keyword(body) else {
+        return false;
+    };
+    let keyword = keyword.to_ascii_lowercase();
+    if matches!(
+        keyword.as_str(),
+        "if" | "ifdef" | "ifndef" | "ifopt" | "else" | "elseif" | "elif" | "endif"
+    ) {
+        return false;
+    }
+    let base = keyword.trim_end_matches(['+', '-']);
+    is_harmless_keyword(base)
+        || matches!(
+            base,
+            "b" | "booleval"
+                | "c"
+                | "codepage"
+                | "hints"
+                | "i"
+                | "ioerrors"
+                | "optimization"
+                | "overflowchecks"
+                | "q"
+                | "rangechecks"
+                | "r"
+                | "referenceinfo"
+                | "runtimechecks"
+                | "typedaddress"
+                | "u"
+                | "x"
+        )
+}
+
+fn apply_option_directive(
+    environment: &mut ConditionalEnvironment,
+    body: &str,
+    activity: Truth,
+    budget: &mut AnalysisBudget<'_>,
+) -> bool {
+    let Some(keyword) = directive_keyword(body) else {
+        return false;
+    };
+    let argument = directive_arguments(body).trim();
+    let (name, suffix_value) = keyword
+        .strip_suffix('+')
+        .map(|name| (name, Some(Truth::True)))
+        .or_else(|| {
+            keyword
+                .strip_suffix('-')
+                .map(|name| (name, Some(Truth::False)))
+        })
+        .unwrap_or((keyword, None));
+    let value = suffix_value.or_else(|| {
+        match argument
+            .split_ascii_whitespace()
+            .next()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("on" | "true" | "+" | "yes") => Some(Truth::True),
+            Some("off" | "false" | "-" | "no") => Some(Truth::False),
+            None => None,
+            _ => None,
+        }
+    });
+    let Some(value) = value else {
+        // Many harmless compiler directives carry a directive-specific value
+        // rather than an on/off switch (for example `WARN SYMBOL_DEPRECATED
+        // OFF`, `MESSAGE ERROR 'text'`, or `APPTYPE CONSOLE`).  They do not
+        // establish a fact consumed by the conditional evaluator, so an
+        // unsupported value on one of these directives must not make an
+        // otherwise well-formed analysis incomplete.
+        return is_harmless_keyword(&name.trim_end_matches(['+', '-']).to_ascii_lowercase());
+    };
+    apply_option_fact(environment, name, value, activity, budget)
+}
+
+fn observe_source_constants(
+    source: &str,
+    range: Range<usize>,
+    activity: Truth,
+    environment: &mut ConditionalEnvironment,
+    complete: &mut bool,
+    budget: &mut AnalysisBudget<'_>,
+) -> bool {
+    if activity != Truth::True || range.start >= range.end {
+        return true;
+    }
+    let Some(text) = source.get(range.clone()) else {
+        *complete = false;
+        return false;
+    };
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if !budget.charge(1) {
+            return false;
+        }
+        let Some((keyword_start, keyword_end)) = next_source_identifier(bytes, cursor) else {
+            break;
+        };
+        cursor = keyword_end;
+        if !text[keyword_start..keyword_end].eq_ignore_ascii_case("const") {
+            continue;
+        }
+        if !source_constant_is_provably_global(source, range.start.saturating_add(keyword_start)) {
+            continue;
+        }
+        let mut declaration = keyword_end;
+        loop {
+            skip_source_space_and_comments(bytes, &mut declaration);
+            let Some((name_start, name_end)) = next_source_identifier(bytes, declaration) else {
+                break;
+            };
+            declaration = name_end;
+            skip_source_space_and_comments(bytes, &mut declaration);
+            if bytes.get(declaration) == Some(&b':') {
+                // Typed declarations without an initializer do not prove a
+                // value; stop this const block rather than guessing its extent.
+                break;
+            }
+            if bytes.get(declaration) != Some(&b'=') {
+                break;
+            }
+            declaration += 1;
+            let Some(end) = find_source_semicolon(bytes, declaration) else {
+                *complete = false;
+                return false;
+            };
+            let expression = &text[declaration..end];
+            let mut expression_complete = true;
+            let value =
+                evaluate_typed_expression(expression, environment, &mut expression_complete);
+            // An unsupported source-constant initializer is simply not an
+            // admitted fact.  It is not a malformed conditional directive,
+            // so it must not invalidate otherwise usable parser projection
+            // for the entire source buffer.  Stop this conservative const
+            // block as well: after an unsupported initializer we no longer
+            // have enough grammar context to distinguish another constant
+            // declarator from a recovered Pascal declaration.
+            if !expression_complete {
+                break;
+            }
+            if let Some(value) = value.to_constant() {
+                let Some(name) = canonical_symbol(&text[name_start..name_end]) else {
+                    *complete = false;
+                    return false;
+                };
+                if !budget.charge_bytes(name.len().saturating_add(constant_size(&value))) {
+                    return false;
+                }
+                if !environment.constants.contains_key(&name)
+                    && environment.len() >= MAX_ENVIRONMENT_ENTRIES
+                {
+                    budget.exhausted = true;
+                    return false;
+                }
+                if !environment.constants.contains_key(&name)
+                    && !budget.check_environment_bytes(
+                        environment
+                            .bytes()
+                            .saturating_add(name.len().saturating_add(constant_size(&value))),
+                    )
+                {
+                    return false;
+                }
+                environment.insert_constant_value(name, value);
+            }
+            declaration = end.saturating_add(1);
+        }
+    }
+    true
+}
+
+/// Source constants are only admitted when the declaration is in the
+/// conservative unit/program-level subset. A full Pascal scope resolver does
+/// not belong in this bounded directive evaluator: once a routine or block
+/// introducer has appeared, a later `const` may be local and must not be
+/// treated as a compiler-wide fact.
+fn source_constant_is_provably_global(source: &str, keyword_start: usize) -> bool {
+    let Some(prefix) = source.get(..keyword_start) else {
+        return false;
+    };
+    let bytes = prefix.as_bytes();
+    let mut cursor = 0;
+    while let Some((start, end)) = next_source_identifier(bytes, cursor) {
+        cursor = end;
+        let identifier = &prefix[start..end];
+        if identifier.eq_ignore_ascii_case("procedure")
+            || identifier.eq_ignore_ascii_case("function")
+            || identifier.eq_ignore_ascii_case("constructor")
+            || identifier.eq_ignore_ascii_case("destructor")
+            || identifier.eq_ignore_ascii_case("operator")
+            || identifier.eq_ignore_ascii_case("begin")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn next_source_identifier(bytes: &[u8], mut cursor: usize) -> Option<(usize, usize)> {
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\'' => cursor = skip_string(bytes, cursor)?,
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                cursor = skip_line_comment(bytes, cursor)
+            }
+            b'{' => cursor = find_byte(bytes, cursor + 1, b'}')?.saturating_add(1),
+            b'(' if bytes.get(cursor + 1) == Some(&b'*') => {
+                cursor = find_sequence(bytes, cursor + 2, b"*)")?.saturating_add(2)
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = cursor;
+                cursor += 1;
+                while cursor < bytes.len()
+                    && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+                {
+                    cursor += 1;
+                }
+                return Some((start, cursor));
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn skip_source_space_and_comments(bytes: &[u8], cursor: &mut usize) {
+    while *cursor < bytes.len() {
+        if bytes[*cursor].is_ascii_whitespace() {
+            *cursor += 1;
+        } else if bytes[*cursor] == b'/' && bytes.get(*cursor + 1) == Some(&b'/') {
+            *cursor = skip_line_comment(bytes, *cursor);
+        } else if bytes[*cursor] == b'{' {
+            let Some(close) = find_byte(bytes, *cursor + 1, b'}') else {
+                *cursor = bytes.len();
+                break;
+            };
+            *cursor = close + 1;
+        } else if bytes[*cursor] == b'(' && bytes.get(*cursor + 1) == Some(&b'*') {
+            let Some(close) = find_sequence(bytes, *cursor + 2, b"*)") else {
+                *cursor = bytes.len();
+                break;
+            };
+            *cursor = close + 2;
+        } else {
+            break;
+        }
+    }
+}
+
+fn find_source_semicolon(bytes: &[u8], mut cursor: usize) -> Option<usize> {
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\'' => cursor = skip_string(bytes, cursor)?,
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                cursor = skip_line_comment(bytes, cursor)
+            }
+            b'{' => cursor = find_byte(bytes, cursor + 1, b'}')?.saturating_add(1),
+            b'(' if bytes.get(cursor + 1) == Some(&b'*') => {
+                cursor = find_sequence(bytes, cursor + 2, b"*)")?.saturating_add(2)
+            }
+            b';' => return Some(cursor),
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
 fn merge_conditional_environment(
     frame: &mut ConditionalFrame,
     current_environment: &ConditionalEnvironment,
@@ -812,6 +1254,20 @@ fn merge_environment(
         .keys()
         .filter(|key| !current.contains_key(key.as_str()))
         .map(|key| key.len().saturating_add(size_of::<Truth>()))
+        .chain(
+            incoming
+                .options
+                .keys()
+                .filter(|key| !current.options.contains_key(key.as_str()))
+                .map(|key| key.len().saturating_add(size_of::<Truth>())),
+        )
+        .chain(
+            incoming
+                .constants
+                .keys()
+                .filter(|key| !current.constants.contains_key(key.as_str()))
+                .map(|key| key.len().saturating_add(size_of::<ConstantValue>())),
+        )
         .try_fold(0usize, |total, bytes| total.checked_add(bytes));
     let Some(additional_bytes) = additional_bytes else {
         budget.exhausted = true;
@@ -840,6 +1296,39 @@ fn merge_environment(
         let right = incoming.get(&key).copied().unwrap_or(Truth::Unknown);
         current.insert(key, left.merge(right));
     }
+    let mut option_keys = current.options.keys().cloned().collect::<Vec<_>>();
+    option_keys.extend(incoming.options.keys().cloned());
+    option_keys.sort();
+    option_keys.dedup();
+    for key in option_keys {
+        let left = current.options.get(&key).copied().unwrap_or(Truth::Unknown);
+        let right = incoming
+            .options
+            .get(&key)
+            .copied()
+            .unwrap_or(Truth::Unknown);
+        current.insert_option_value(key, left.merge(right));
+    }
+    let mut constant_keys = current.constants.keys().cloned().collect::<Vec<_>>();
+    constant_keys.extend(incoming.constants.keys().cloned());
+    constant_keys.sort();
+    constant_keys.dedup();
+    for key in constant_keys {
+        let value = match (current.constants.get(&key), incoming.constants.get(&key)) {
+            (Some(left), Some(right)) if left == right => Some(left.clone()),
+            _ => None,
+        };
+        if let Some(value) = value {
+            current.insert_constant_value(key, value);
+        } else {
+            current.constants.remove(&key);
+        }
+    }
+    current.compiler_version = if current.compiler_version == incoming.compiler_version {
+        current.compiler_version
+    } else {
+        None
+    };
     if current.len() > MAX_ENVIRONMENT_ENTRIES || current.bytes() > MAX_ENVIRONMENT_BYTES {
         budget.exhausted = true;
         return false;
@@ -1088,7 +1577,23 @@ fn evaluate_condition(
                 Truth::Unknown
             }),
         "if" | "elseif" | "elif" => evaluate_expression(arguments, environment, complete),
-        "ifopt" => Truth::Unknown,
+        "ifopt" => {
+            let option = arguments.trim().trim_end_matches(['+', '-']);
+            if option.is_empty() {
+                *complete = false;
+                Truth::Unknown
+            } else {
+                let value = environment.option(option);
+                match arguments.trim().chars().last() {
+                    Some('+') => value,
+                    Some('-') => value.not(),
+                    _ => {
+                        *complete = false;
+                        Truth::Unknown
+                    }
+                }
+            }
+        }
         _ => {
             *complete = false;
             Truth::Unknown
@@ -1101,26 +1606,36 @@ fn evaluate_expression(
     environment: &ConditionalEnvironment,
     complete: &mut bool,
 ) -> Truth {
+    evaluate_typed_expression(expression, environment, complete).as_truth()
+}
+
+fn evaluate_typed_expression(
+    expression: &str,
+    environment: &ConditionalEnvironment,
+    complete: &mut bool,
+) -> Value {
     if expression.len() > MAX_EXPRESSION_BYTES {
         *complete = false;
-        return Truth::Unknown;
+        return Value::Unknown;
     }
     let tokens = tokenize_expression(expression);
     if tokens.len() > MAX_EXPRESSION_TOKENS {
         *complete = false;
-        return Truth::Unknown;
+        return Value::Unknown;
     }
     let mut parser = ExpressionParser {
         tokens,
         index: 0,
         environment,
         malformed: false,
+        depth: 0,
+        work: 0,
     };
-    let result = parser.parse_comparison().as_truth();
+    let result = parser.parse_comparison();
     if !matches!(parser.peek(), ExprToken::End) {
         parser.malformed = true;
     }
-    if parser.malformed {
+    if parser.malformed || parser.work > MAX_EXPRESSION_TOKENS {
         *complete = false;
     }
     result
@@ -1130,9 +1645,16 @@ fn evaluate_expression(
 enum ExprToken {
     Identifier(String),
     Number(i64),
+    Version(CompilerVersion),
     String(String),
     LParen,
     RParen,
+    Comma,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
     Equal,
     NotEqual,
     Less,
@@ -1159,6 +1681,30 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
             }
             b')' => {
                 tokens.push(ExprToken::RParen);
+                index += 1;
+            }
+            b',' => {
+                tokens.push(ExprToken::Comma);
+                index += 1;
+            }
+            b'+' => {
+                tokens.push(ExprToken::Plus);
+                index += 1;
+            }
+            b'-' => {
+                tokens.push(ExprToken::Minus);
+                index += 1;
+            }
+            b'*' => {
+                tokens.push(ExprToken::Star);
+                index += 1;
+            }
+            b'/' => {
+                tokens.push(ExprToken::Slash);
+                index += 1;
+            }
+            b'%' => {
+                tokens.push(ExprToken::Percent);
                 index += 1;
             }
             b'=' => {
@@ -1235,8 +1781,21 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
                 while index < bytes.len() && bytes[index].is_ascii_digit() {
                     index += 1;
                 }
-                let value = expression[start..index].parse::<i64>().ok();
-                tokens.push(value.map_or(ExprToken::Invalid, ExprToken::Number));
+                if bytes.get(index) == Some(&b'.')
+                    && bytes
+                        .get(index + 1)
+                        .is_some_and(|byte| byte.is_ascii_digit())
+                {
+                    index += 1;
+                    while index < bytes.len() && bytes[index].is_ascii_digit() {
+                        index += 1;
+                    }
+                    let value = CompilerVersion::parse(&expression[start..index]);
+                    tokens.push(value.map_or(ExprToken::Invalid, ExprToken::Version));
+                } else {
+                    let value = expression[start..index].parse::<i64>().ok();
+                    tokens.push(value.map_or(ExprToken::Invalid, ExprToken::Number));
+                }
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'&' => {
                 let start = index;
@@ -1267,6 +1826,8 @@ struct ExpressionParser<'a> {
     index: usize,
     environment: &'a ConditionalEnvironment,
     malformed: bool,
+    depth: usize,
+    work: usize,
 }
 
 impl ExpressionParser<'_> {
@@ -1277,6 +1838,7 @@ impl ExpressionParser<'_> {
     fn take(&mut self) -> ExprToken {
         let token = self.peek().clone();
         self.index = self.index.saturating_add(1);
+        self.work = self.work.saturating_add(1);
         token
     }
 
@@ -1290,25 +1852,78 @@ impl ExpressionParser<'_> {
         }
     }
 
-    fn parse_or(&mut self) -> Value {
-        let mut value = self.parse_and();
-        while self.consume_identifier("or") {
-            value = value.or(self.parse_and());
+    fn parse_additive(&mut self) -> Value {
+        let mut value = self.parse_multiplicative();
+        loop {
+            let operator = match self.peek() {
+                ExprToken::Plus => Some(BinaryAdditive::Add),
+                ExprToken::Minus => Some(BinaryAdditive::Subtract),
+                ExprToken::Identifier(name) if name.eq_ignore_ascii_case("or") => {
+                    Some(BinaryAdditive::Or)
+                }
+                ExprToken::Identifier(name) if name.eq_ignore_ascii_case("xor") => {
+                    Some(BinaryAdditive::Xor)
+                }
+                _ => None,
+            };
+            let Some(operator) = operator else {
+                break;
+            };
+            self.take();
+            let right = self.parse_multiplicative();
+            value = match operator {
+                BinaryAdditive::Add => value.add(right),
+                BinaryAdditive::Subtract => value.subtract(right),
+                BinaryAdditive::Or => value.or(right),
+                BinaryAdditive::Xor => value.xor(right),
+            };
         }
         value
     }
 
-    fn parse_and(&mut self) -> Value {
-        let mut value = self.parse_not();
-        while self.consume_identifier("and") {
-            value = value.and(self.parse_not());
+    fn parse_multiplicative(&mut self) -> Value {
+        let mut value = self.parse_unary();
+        loop {
+            let operator = match self.peek() {
+                ExprToken::Star => Some(BinaryArithmetic::Multiply),
+                ExprToken::Slash => Some(BinaryArithmetic::RealDivide),
+                ExprToken::Percent => Some(BinaryArithmetic::Remainder),
+                ExprToken::Identifier(name) if name.eq_ignore_ascii_case("div") => {
+                    Some(BinaryArithmetic::Divide)
+                }
+                ExprToken::Identifier(name) if name.eq_ignore_ascii_case("mod") => {
+                    Some(BinaryArithmetic::Remainder)
+                }
+                ExprToken::Identifier(name) if name.eq_ignore_ascii_case("and") => {
+                    Some(BinaryArithmetic::And)
+                }
+                ExprToken::Identifier(name) if name.eq_ignore_ascii_case("shl") => {
+                    Some(BinaryArithmetic::ShiftLeft)
+                }
+                ExprToken::Identifier(name) if name.eq_ignore_ascii_case("shr") => {
+                    Some(BinaryArithmetic::ShiftRight)
+                }
+                _ => None,
+            };
+            let Some(operator) = operator else {
+                break;
+            };
+            self.take();
+            let right = self.parse_unary();
+            value = value.arithmetic(right, operator);
         }
         value
     }
 
-    fn parse_not(&mut self) -> Value {
+    fn parse_unary(&mut self) -> Value {
         if self.consume_identifier("not") {
-            self.parse_not().not()
+            self.parse_unary().not()
+        } else if matches!(self.peek(), ExprToken::Plus) {
+            self.take();
+            self.parse_unary()
+        } else if matches!(self.peek(), ExprToken::Minus) {
+            self.take();
+            self.parse_unary().negate()
         } else {
             self.parse_primary()
         }
@@ -1316,6 +1931,11 @@ impl ExpressionParser<'_> {
 
     fn parse_primary(&mut self) -> Value {
         if matches!(self.peek(), ExprToken::LParen) {
+            self.depth = self.depth.saturating_add(1);
+            if self.depth > MAX_CONDITIONAL_DEPTH {
+                self.malformed = true;
+                return Value::Unknown;
+            }
             self.take();
             let value = self.parse_comparison();
             if !matches!(self.peek(), ExprToken::RParen) {
@@ -1323,6 +1943,7 @@ impl ExpressionParser<'_> {
             } else {
                 self.take();
             }
+            self.depth = self.depth.saturating_sub(1);
             value
         } else {
             self.parse_value()
@@ -1330,7 +1951,11 @@ impl ExpressionParser<'_> {
     }
 
     fn parse_comparison(&mut self) -> Value {
-        let left = self.parse_or();
+        let mut left = self.parse_additive();
+        if self.consume_identifier("is") || self.consume_identifier("as") {
+            let _ = self.parse_additive();
+            return Value::Unknown;
+        }
         let operator = match self.peek() {
             ExprToken::Equal => Some(Comparison::Equal),
             ExprToken::NotEqual => Some(Comparison::NotEqual),
@@ -1344,8 +1969,9 @@ impl ExpressionParser<'_> {
             return left;
         };
         self.take();
-        let right = self.parse_or();
-        Value::Truth(compare_values(left, right, operator))
+        let right = self.parse_additive();
+        left = Value::Truth(compare_values(left, right, operator));
+        left
     }
 
     fn parse_value(&mut self) -> Value {
@@ -1376,14 +2002,109 @@ impl ExpressionParser<'_> {
                         Value::Unknown
                     })
             }
+            ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("declared") => {
+                let symbol = self.parse_function_identifier();
+                symbol
+                    .map(|symbol| {
+                        Value::Truth(
+                            if self.environment.constant(&symbol).is_some()
+                                || self.environment.values.contains_key(&symbol)
+                            {
+                                Truth::True
+                            } else {
+                                Truth::Unknown
+                            },
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        self.malformed = true;
+                        Value::Unknown
+                    })
+            }
+            ExprToken::Identifier(identifier)
+                if identifier.eq_ignore_ascii_case("compilerVersion") =>
+            {
+                self.environment
+                    .compiler_version
+                    .map(Value::Version)
+                    .unwrap_or(Value::Unknown)
+            }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("true") => {
                 Value::Truth(Truth::True)
             }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("false") => {
                 Value::Truth(Truth::False)
             }
-            ExprToken::Identifier(_) => Value::Unknown,
+            ExprToken::Identifier(identifier) => {
+                if matches!(self.peek(), ExprToken::LParen) {
+                    self.take();
+                    let mut argument = None;
+                    if !matches!(self.peek(), ExprToken::RParen) {
+                        argument = Some(self.parse_comparison());
+                        while matches!(self.peek(), ExprToken::Comma) {
+                            self.take();
+                            let _ = self.parse_comparison();
+                        }
+                    }
+                    if !matches!(self.peek(), ExprToken::RParen) {
+                        self.malformed = true;
+                    } else {
+                        self.take();
+                    }
+                    match identifier.to_ascii_lowercase().as_str() {
+                        "length" => argument
+                            .and_then(|value| match value {
+                                Value::String(value) => {
+                                    i64::try_from(value.chars().count()).ok().map(Value::Number)
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(Value::Unknown),
+                        "ord" => argument
+                            .and_then(|value| match value {
+                                Value::String(value) => {
+                                    let mut chars = value.chars();
+                                    let character = chars.next()?;
+                                    (chars.next().is_none())
+                                        .then(|| Value::Number(i64::from(u32::from(character))))
+                                }
+                                Value::Truth(value) => match value {
+                                    Truth::True => Some(Value::Number(1)),
+                                    Truth::False => Some(Value::Number(0)),
+                                    Truth::Unknown => None,
+                                },
+                                _ => None,
+                            })
+                            .unwrap_or(Value::Unknown),
+                        "sizeof" => argument
+                            .and_then(|value| match value {
+                                Value::String(value) => {
+                                    i64::try_from(value.len()).ok().map(Value::Number)
+                                }
+                                Value::Number(_) | Value::Truth(_) | Value::Version(_) => {
+                                    Some(Value::Number(1))
+                                }
+                                Value::Unknown => None,
+                            })
+                            .unwrap_or(Value::Unknown),
+                        _ => Value::Unknown,
+                    }
+                } else {
+                    let key = canonical_symbol(&identifier);
+                    key.and_then(|key| {
+                        self.environment
+                            .constant(&key)
+                            .cloned()
+                            .map(Value::from_constant)
+                            .or_else(|| {
+                                self.environment.values.get(&key).copied().map(Value::Truth)
+                            })
+                    })
+                    .unwrap_or(Value::Unknown)
+                }
+            }
             ExprToken::Number(value) => Value::Number(value),
+            ExprToken::Version(value) => Value::Version(value),
             ExprToken::String(value) => Value::String(value),
             ExprToken::Invalid | ExprToken::End => {
                 self.malformed = true;
@@ -1391,6 +2112,12 @@ impl ExpressionParser<'_> {
             }
             ExprToken::LParen
             | ExprToken::RParen
+            | ExprToken::Comma
+            | ExprToken::Plus
+            | ExprToken::Minus
+            | ExprToken::Star
+            | ExprToken::Slash
+            | ExprToken::Percent
             | ExprToken::Equal
             | ExprToken::NotEqual
             | ExprToken::Less
@@ -1402,6 +2129,27 @@ impl ExpressionParser<'_> {
             }
         }
     }
+
+    fn parse_function_identifier(&mut self) -> Option<String> {
+        if matches!(self.peek(), ExprToken::LParen) {
+            self.take();
+            let value = match self.take() {
+                ExprToken::Identifier(value) => Some(canonical_symbol(&value)?),
+                _ => None,
+            };
+            if !matches!(self.peek(), ExprToken::RParen) {
+                self.malformed = true;
+            } else {
+                self.take();
+            }
+            value
+        } else {
+            match self.take() {
+                ExprToken::Identifier(value) => canonical_symbol(&value),
+                _ => None,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1409,14 +2157,37 @@ enum Value {
     Truth(Truth),
     Number(i64),
     String(String),
+    Version(CompilerVersion),
     Unknown,
 }
 
 impl Value {
+    fn from_constant(value: ConstantValue) -> Self {
+        match value {
+            ConstantValue::Boolean(value) => {
+                Self::Truth(if value { Truth::True } else { Truth::False })
+            }
+            ConstantValue::Integer(value) => Self::Number(value),
+            ConstantValue::String(value) => Self::String(value),
+            ConstantValue::Version(value) => Self::Version(value),
+        }
+    }
+
+    fn to_constant(&self) -> Option<ConstantValue> {
+        match self {
+            Self::Truth(Truth::True) => Some(ConstantValue::Boolean(true)),
+            Self::Truth(Truth::False) => Some(ConstantValue::Boolean(false)),
+            Self::Truth(Truth::Unknown) | Self::Unknown => None,
+            Self::Number(value) => Some(ConstantValue::Integer(*value)),
+            Self::String(value) => Some(ConstantValue::String(value.clone())),
+            Self::Version(value) => Some(ConstantValue::Version(*value)),
+        }
+    }
+
     fn as_truth(&self) -> Truth {
         match self {
             Self::Truth(value) => *value,
-            Self::Number(_) | Self::String(_) | Self::Unknown => Truth::Unknown,
+            Self::Number(_) | Self::String(_) | Self::Version(_) | Self::Unknown => Truth::Unknown,
         }
     }
 
@@ -1424,7 +2195,7 @@ impl Value {
         match self {
             Self::Truth(value) => Some(*value),
             Self::Unknown => Some(Truth::Unknown),
-            Self::Number(_) | Self::String(_) => None,
+            Self::Number(_) | Self::String(_) | Self::Version(_) => None,
         }
     }
 
@@ -1450,13 +2221,129 @@ impl Value {
         }
     }
 
+    fn xor(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => Self::Number(left ^ right),
+            (Self::Truth(left), Self::Truth(right)) => Self::Truth(match (left, right) {
+                (Truth::True, Truth::False) | (Truth::False, Truth::True) => Truth::True,
+                (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+                _ => Truth::False,
+            }),
+            _ => Self::Unknown,
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => left
+                .checked_add(right)
+                .map(Self::Number)
+                .unwrap_or(Self::Unknown),
+            (Self::String(left), Self::String(right)) => {
+                if left.len().saturating_add(right.len()) > MAX_EXPRESSION_BYTES {
+                    Self::Unknown
+                } else {
+                    Self::String(format!("{left}{right}"))
+                }
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    fn subtract(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => left
+                .checked_sub(right)
+                .map(Self::Number)
+                .unwrap_or(Self::Unknown),
+            _ => Self::Unknown,
+        }
+    }
+
+    fn negate(self) -> Self {
+        match self {
+            Self::Number(value) => value
+                .checked_neg()
+                .map(Self::Number)
+                .unwrap_or(Self::Unknown),
+            _ => Self::Unknown,
+        }
+    }
+
+    fn arithmetic(self, other: Self, operator: BinaryArithmetic) -> Self {
+        if matches!(operator, BinaryArithmetic::And) {
+            return self.and(other);
+        }
+        let (Self::Number(left), Self::Number(right)) = (self, other) else {
+            return Self::Unknown;
+        };
+        match operator {
+            BinaryArithmetic::And => unreachable!("logical and is handled before arithmetic"),
+            BinaryArithmetic::Multiply => left
+                .checked_mul(right)
+                .map(Self::Number)
+                .unwrap_or(Self::Unknown),
+            BinaryArithmetic::Divide => {
+                if right == 0 {
+                    Self::Unknown
+                } else {
+                    left.checked_div(right)
+                        .map(Self::Number)
+                        .unwrap_or(Self::Unknown)
+                }
+            }
+            // Delphi's `/` operator is real division. Real values are outside
+            // this evaluator's admitted constant subset, so never coerce it
+            // to integer division.
+            BinaryArithmetic::RealDivide => Self::Unknown,
+            BinaryArithmetic::Remainder => {
+                if right == 0 {
+                    Self::Unknown
+                } else {
+                    left.checked_rem(right)
+                        .map(Self::Number)
+                        .unwrap_or(Self::Unknown)
+                }
+            }
+            BinaryArithmetic::ShiftLeft => u32::try_from(right)
+                .ok()
+                .and_then(|shift| left.checked_shl(shift))
+                .map(Self::Number)
+                .unwrap_or(Self::Unknown),
+            BinaryArithmetic::ShiftRight => u32::try_from(right)
+                .ok()
+                .filter(|shift| *shift < 64)
+                .map(|shift| Self::Number(left >> shift))
+                .unwrap_or(Self::Unknown),
+        }
+    }
+
     fn not(self) -> Self {
         match self {
             Self::Truth(value) => Self::Truth(value.not()),
             Self::Number(value) => Self::Number(!value),
-            Self::String(_) | Self::Unknown => Self::Unknown,
+            Self::String(_) | Self::Version(_) | Self::Unknown => Self::Unknown,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BinaryAdditive {
+    Add,
+    Subtract,
+    Or,
+    Xor,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BinaryArithmetic {
+    Multiply,
+    Divide,
+    RealDivide,
+    Remainder,
+    And,
+    ShiftLeft,
+    ShiftRight,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1473,6 +2360,13 @@ fn compare_values(left: Value, right: Value, comparison: Comparison) -> Truth {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => compare_order(left, right, comparison),
         (Value::String(left), Value::String(right)) => compare_order(left, right, comparison),
+        (Value::Version(left), Value::Version(right)) => compare_order(left, right, comparison),
+        (Value::Version(left), Value::Number(right)) if right >= 0 => {
+            compare_order(left, CompilerVersion::new(right as u32, 0), comparison)
+        }
+        (Value::Number(left), Value::Version(right)) if left >= 0 => {
+            compare_order(CompilerVersion::new(left as u32, 0), right, comparison)
+        }
         (Value::Truth(left), Value::Truth(right)) => compare_truths(left, right, comparison),
         _ => Truth::Unknown,
     }

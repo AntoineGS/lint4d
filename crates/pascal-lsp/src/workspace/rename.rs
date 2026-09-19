@@ -33,8 +33,9 @@ use pascal_core::resolver::{
 };
 use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::{
-    MetadataObservation, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
-    ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
+    ConditionalContext, MetadataObservation, ProjectCandidateMembership, ProjectContext,
+    ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
+    has_invalid_project_selection,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -2051,11 +2052,11 @@ fn binding_classification_for_input(
     // An incomplete project context cannot establish conditional branch facts.
     // Self-contained classification must therefore prove the local binding
     // without inheriting defines from an ambiguous or partially read project.
-    let defines: &[String] =
+    let conditional_context =
         if !context.discovery_complete && !matches!(self_contained_mode, SelfContainedMode::None) {
-            &[]
+            ConditionalContext::default()
         } else {
-            &context.defines
+            context.effective_conditional_context()
         };
     let expanded_info = expanded_binding_info_for_input(
         input,
@@ -2070,7 +2071,7 @@ fn binding_classification_for_input(
         &source,
         position,
         additional_names,
-        defines,
+        &conditional_context,
         self_contained_mode,
         cancel,
     )?);
@@ -2317,14 +2318,19 @@ fn binding_info_for_source(
     source: &str,
     position: Position,
     additional_names: &[String],
-    defines: &[String],
+    conditional_context: &ConditionalContext,
     self_contained_mode: SelfContainedMode,
     cancel: &AtomicBool,
 ) -> Result<(Option<(crate::navigation::RenameBindingInfo, bool)>, bool), String> {
     let uri = canonical_file_uri(uri);
     let mut index = NavigationIndex::new();
     index
-        .update_with_defines_with_cancel(uri.clone(), source.to_owned(), defines, cancel)
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            conditional_context,
+            cancel,
+        )
         .map_err(|error| format!("could not index rename source {uri}: {error}"))?;
     let ignored_or_empty = index.position_is_ignored_or_empty(&uri, position)?;
     let info = if ignored_or_empty {
@@ -3957,18 +3963,18 @@ pub(crate) fn build_snapshot(
         let may_contain_include = may_contain_include_directive(source.as_bytes());
         let mut indexed_source = source.clone();
         if mode != SnapshotMode::WorkspaceSymbols && may_contain_include {
-            let expansion_defines = loader
+            let expansion_context = loader
                 .contexts
                 .get(&source_context_key)
-                .map(|state| state.context.defines.clone())
+                .map(|state| state.context.effective_conditional_context())
                 .unwrap_or_default();
             match loader.expand_source_with_cancel(&uri, &source, &source_context_key, Some(cancel))
             {
                 Ok(expansion) => {
                     let mut expansion = expansion;
-                    let conditional = conditional::analyze_with_cancel(
+                    let conditional = conditional::analyze_with_context_and_cancel(
                         expansion.expanded.text(),
-                        &expansion_defines,
+                        &expansion_context,
                         cancel,
                     );
                     include_expansion::reconcile_conditional_completeness(
@@ -3993,7 +3999,7 @@ pub(crate) fn build_snapshot(
                     // buffer would erase the information needed to fail
                     // closed for conditional references and edits.
                     indexed_source = expansion.expanded.text().to_owned();
-                    loader.store_expansion(&uri, source.clone(), expansion);
+                    loader.store_expansion(&uri, &source_context_key, source.clone(), expansion);
                     let expanded_source_contains_candidate = candidate_names.is_empty()
                         || contains_any_identifier(&indexed_source, candidate_names)
                         || (mode == SnapshotMode::Assistance
@@ -4174,7 +4180,7 @@ pub(crate) fn build_snapshot(
                 });
             }
         }
-        let defines = contexts
+        let conditional_context = contexts
             .get(&uri)
             .and_then(|context_key| loader.contexts.get(context_key))
             .map(|state| {
@@ -4183,9 +4189,9 @@ pub(crate) fn build_snapshot(
                     .any(|allowed_uri| allowed_uri == &uri)
                     && !state.context.discovery_complete
                 {
-                    Vec::new()
+                    ConditionalContext::default()
                 } else {
-                    state.context.defines.clone()
+                    state.context.effective_conditional_context()
                 }
             })
             .unwrap_or_default();
@@ -4200,10 +4206,10 @@ pub(crate) fn build_snapshot(
             })
             .map(|cached| cached.parsed.clone());
         index
-            .update_with_defines_and_cached_with_cancel(
+            .update_with_context_and_cached_with_cancel(
                 uri.clone(),
                 indexed_source.clone(),
-                &defines,
+                &conditional_context,
                 cached,
                 cancel,
             )
@@ -5814,7 +5820,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         let Some(source) = auditor.sources.get(&uri).cloned() else {
             continue;
         };
-        let defines = context
+        let conditional_context = context
             .as_ref()
             .map(|(_, context)| {
                 if !context.discovery_complete
@@ -5823,12 +5829,12 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                         .iter()
                         .any(|allowed_uri| allowed_uri == &uri)
                 {
-                    Vec::new()
+                    ConditionalContext::default()
                 } else {
-                    context.defines.clone()
+                    context.effective_conditional_context()
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or_else(ConditionalContext::default);
         let cancel = auditor.cancel;
         #[cfg(test)]
         if TEST_CANCEL_INCLUDE_ANALYSIS.with(Cell::get) {
@@ -5841,7 +5847,8 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             .allow_incomplete_context_for
             .iter()
             .any(|allowed_uri| allowed_uri == &uri);
-        let preliminary = conditional::analyze_with_cancel(&source, &defines, cancel);
+        let preliminary =
+            conditional::analyze_with_context_and_cancel(&source, &conditional_context, cancel);
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
@@ -5863,7 +5870,8 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             auditor.stopped = true;
             break;
         };
-        let mut environment = conditional::ConditionalEnvironment::from_defines(&defines);
+        let mut environment =
+            conditional::ConditionalEnvironment::from_context(&conditional_context);
         let mut callback_error = None;
         let mut include =
             |directive: &ConditionalDirective,
@@ -7212,10 +7220,11 @@ pub(super) fn expand_source_with_workspace(
         max_total_bytes: workspace.options.limits.max_total_bytes,
         legacy_authorizations: HashMap::new(),
     };
-    include_expansion::expand_source(
+    let conditional_context = context.effective_conditional_context();
+    include_expansion::expand_source_with_context(
         root_uri.clone(),
         source,
-        &context.defines,
+        &conditional_context,
         &mut resolver,
         limits,
         cancel,
@@ -8287,6 +8296,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let b_owner = ContextKey {
@@ -8312,6 +8322,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let old = ContextState {
@@ -8462,6 +8473,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
@@ -8796,6 +8808,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let state = ContextState {
@@ -8868,6 +8881,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         for index in (0..SOURCES).rev() {
@@ -8959,6 +8973,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            conditional_context: Default::default(),
             overrides: EffectiveOverrides::default(),
         };
         let membership = ProjectCandidateMembership {

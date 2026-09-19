@@ -1008,16 +1008,9 @@ struct SharedLintRequest<'a> {
     cancel: &'a AtomicBool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedLintCoordinateSpace {
-    Expanded,
-    Root,
-}
-
 #[derive(Debug)]
 struct SharedLintResult {
     diagnostics: Vec<pascal_core::Diagnostic>,
-    coordinate_space: SharedLintCoordinateSpace,
 }
 
 impl Workspace {
@@ -6862,20 +6855,7 @@ impl Workspace {
             cancel,
         })?;
         check_workspace_cancel(Some(cancel))?;
-        let root_normalized = (lint_result.coordinate_space == SharedLintCoordinateSpace::Root)
-            .then(|| normalize_line_endings_with_offsets(&source));
-        let line_index_source = root_normalized
-            .as_ref()
-            .map_or(normalized.text.as_str(), |source| source.text.as_str());
-        let line_index = DiagnosticLineIndex::new(line_index_source);
-        let root_conditional = root_normalized.as_ref().map(|_| {
-            pascal_core::conditional::analyze_with_cancel(&source, &context.defines, cancel)
-        });
-        let unknown_spans = root_conditional
-            .as_ref()
-            .map_or(&conditional.unknown_spans, |conditional| {
-                &conditional.unknown_spans
-            });
+        let line_index = DiagnosticLineIndex::new(&normalized.text);
         let expansion = self
             .expansions
             .get(uri)
@@ -6896,19 +6876,17 @@ impl Workspace {
             ) else {
                 continue;
             };
-            let raw_offsets = root_normalized
-                .as_ref()
-                .map_or(&normalized.raw_offsets, |source| &source.raw_offsets);
-            let Some(&start) = raw_offsets.get(normalized_range.start) else {
+            let Some(&start) = normalized.raw_offsets.get(normalized_range.start) else {
                 continue;
             };
-            let Some(&end) = raw_offsets.get(normalized_range.end) else {
+            let Some(&end) = normalized.raw_offsets.get(normalized_range.end) else {
                 continue;
             };
             if start >= end {
                 continue;
             }
-            if unknown_spans
+            if conditional
+                .unknown_spans
                 .iter()
                 .any(|unknown| unknown.start < end && start < unknown.end)
             {
@@ -6917,32 +6895,6 @@ impl Workspace {
                 // fail-closed policy used by navigation and edits: withhold
                 // the uncertain item rather than publishing a confident
                 // warning for one speculative branch.
-                continue;
-            }
-            if lint_result.coordinate_space == SharedLintCoordinateSpace::Root {
-                let Some(start) = text::offset_to_position(&source, start) else {
-                    continue;
-                };
-                let Some(end) = text::offset_to_position(&source, end) else {
-                    continue;
-                };
-                let severity = match diagnostic.severity {
-                    Severity::Error => DiagnosticSeverity::ERROR,
-                    Severity::Warning => DiagnosticSeverity::WARNING,
-                    Severity::Hint => DiagnosticSeverity::HINT,
-                };
-                mapped
-                    .entry(uri.clone())
-                    .or_default()
-                    .push(LspDiagnostic::new(
-                        Range::new(start, end),
-                        Some(severity),
-                        Some(NumberOrString::String(diagnostic.rule_id)),
-                        Some("lint4d".to_string()),
-                        diagnostic.message,
-                        None,
-                        None,
-                    ));
                 continue;
             }
             let span = match expansion
@@ -7006,33 +6958,31 @@ impl Workspace {
         } = request;
         check_workspace_cancel(Some(cancel))?;
         let input = self.analysis_input();
-        let run_file_local = |lint_source: &[u8], coordinate_space| SharedLintResult {
-            diagnostics: lint4d::engine::run_lint_with_cfg_project(
-                &FileInfo::new(path.to_path_buf()),
-                lint_source,
-                config,
-                None,
-                None,
-                &lint4d::rules::RuleRegistry::new(),
-            ),
-            coordinate_space,
+        let run_file_local = |lint_source: &[u8], run_cfg_rules| {
+            let diagnostics = if run_cfg_rules {
+                lint4d::engine::run_lint_with_cfg_project(
+                    &FileInfo::new(path.to_path_buf()),
+                    lint_source,
+                    config,
+                    None,
+                    None,
+                    &lint4d::rules::RuleRegistry::new(),
+                )
+            } else {
+                lint4d::engine::run_lint_file_local_rules(
+                    &FileInfo::new(path.to_path_buf()),
+                    lint_source,
+                    config,
+                    &lint4d::rules::RuleRegistry::new(),
+                )
+            };
+            SharedLintResult { diagnostics }
         };
         let source_text = match std::str::from_utf8(source) {
             Ok(source_text) => source_text,
             Err(_) => {
-                return Ok(run_file_local(
-                    lint_source,
-                    SharedLintCoordinateSpace::Expanded,
-                ));
+                return Ok(run_file_local(lint_source, true));
             }
-        };
-        let root_lint_source = || {
-            let root_conditional = pascal_core::conditional::analyze_with_cancel(
-                source_text,
-                &context.defines,
-                cancel,
-            );
-            normalize_line_endings(&root_conditional.projected_source).into_bytes()
         };
         let mut source_index = NavigationIndex::new();
         match source_index.update_with_defines_with_cancel(
@@ -7043,33 +6993,17 @@ impl Workspace {
         ) {
             Ok(()) => {}
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-            Err(_) => {
-                let root_lint_source = root_lint_source();
-                return Ok(run_file_local(
-                    &root_lint_source,
-                    SharedLintCoordinateSpace::Root,
-                ));
-            }
+            Err(_) => return Ok(run_file_local(lint_source, false)),
         }
         let (source_tree, _) = match parser::parse_file(&FileInfo::new(path.to_path_buf()), source)
         {
             Ok(parsed) => parsed,
-            Err(_) => {
-                let root_lint_source = root_lint_source();
-                return Ok(run_file_local(
-                    &root_lint_source,
-                    SharedLintCoordinateSpace::Root,
-                ));
-            }
+            Err(_) => return Ok(run_file_local(lint_source, false)),
         };
         let Some(unit_name) =
             lint4d::rules::helpers::extract_unit_name(source_tree.root_node(), source)
         else {
-            let root_lint_source = root_lint_source();
-            return Ok(run_file_local(
-                &root_lint_source,
-                SharedLintCoordinateSpace::Root,
-            ));
+            return Ok(run_file_local(lint_source, false));
         };
         let mut resolver =
             resolver::resolver_for_context(context.clone(), input.roots.clone(), &input, cancel);
@@ -7100,11 +7034,7 @@ impl Workspace {
                 self.warn(format!(
                     "could not resolve project CFG for {uri}: {error}; using file-local CFG"
                 ));
-                let root_lint_source = root_lint_source();
-                return Ok(run_file_local(
-                    &root_lint_source,
-                    SharedLintCoordinateSpace::Root,
-                ));
+                return Ok(run_file_local(lint_source, false));
             }
         };
         check_workspace_cancel(Some(cancel))?;
@@ -7127,34 +7057,23 @@ impl Workspace {
                 self.warn(format!(
                     "could not build project CFG for {uri}: {error}; using file-local CFG"
                 ));
-                let root_lint_source = root_lint_source();
-                return Ok(run_file_local(
-                    &root_lint_source,
-                    SharedLintCoordinateSpace::Root,
-                ));
+                return Ok(run_file_local(lint_source, false));
             }
         };
         check_workspace_cancel(Some(cancel))?;
         if !project_complete {
-            // An incomplete dependency walk cannot support trustworthy
-            // project-CFG diagnostics. Keep only file-local diagnostics from
-            // the physical source rather than linting expanded includes with
-            // guessed project facts.
-            let root_lint_source = root_lint_source();
-            return Ok(run_file_local(
-                &root_lint_source,
-                SharedLintCoordinateSpace::Root,
-            ));
+            // Keep local rules on the proven expanded physical source, but do
+            // not invent file-local CFG facts when project resolution is
+            // incomplete. The normal expanded mapping preserves include URI
+            // and range provenance for independent diagnostics.
+            return Ok(run_file_local(lint_source, false));
         }
         if source != lint_source {
             // Keep resolver coordinates and CFG snapshot bytes identical. The
             // expanded representation is still used for the conservative
             // file-local fallback so include diagnostics can be mapped to
             // their physical sources.
-            return Ok(run_file_local(
-                lint_source,
-                SharedLintCoordinateSpace::Expanded,
-            ));
+            return Ok(run_file_local(lint_source, true));
         }
         Ok(SharedLintResult {
             diagnostics: lint4d::engine::run_lint_with_cfg_project(
@@ -7165,7 +7084,6 @@ impl Workspace {
                 Some(&snapshot),
                 &lint4d::rules::RuleRegistry::new(),
             ),
-            coordinate_space: SharedLintCoordinateSpace::Expanded,
         })
     }
 }

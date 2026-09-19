@@ -7,6 +7,8 @@
 
 use crate::resolver::{CancellationToken, NoCancellation};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::ops::Range;
 
@@ -19,7 +21,7 @@ const MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
 const MAX_ENVIRONMENT_WORK: usize = 1_000_000;
 const MAX_ENVIRONMENT_BYTE_WORK: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Truth {
     True,
     False,
@@ -265,6 +267,27 @@ impl ConditionalEnvironment {
             }
         }
         environment
+    }
+
+    /// Whether this environment carries any inherited DEFINE/UNDEF facts.
+    pub fn has_facts(&self) -> bool {
+        !self.values.is_empty()
+    }
+
+    /// Return a stable identity for the currently established facts.
+    ///
+    /// Consumers that cache stateful include analysis must include this value
+    /// in their cache key: the same physical include can be reached with
+    /// different inherited DEFINE/UNDEF environments.
+    pub fn fingerprint(&self) -> u64 {
+        let mut facts = self.values.iter().collect::<Vec<_>>();
+        facts.sort_by(|left, right| left.0.cmp(right.0));
+        let mut hasher = DefaultHasher::new();
+        for (symbol, value) in facts {
+            symbol.hash(&mut hasher);
+            value.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     fn len(&self) -> usize {

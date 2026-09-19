@@ -66,6 +66,32 @@ pub fn run_lint_with_cfg_project(
     cfg_project: Option<&CfgProjectSnapshot>,
     registry: &RuleRegistry,
 ) -> Vec<Diagnostic> {
+    run_lint_with_cfg_project_mode(file, source, config, project, cfg_project, registry, true)
+}
+
+/// Run only rules whose results do not depend on a project CFG.
+///
+/// The source may still be a proven include-expanded buffer.  This mode keeps
+/// physical-source local rules available while withholding CFG conclusions
+/// when project resolution is incomplete or otherwise untrusted.
+pub fn run_lint_file_local_rules(
+    file: &FileInfo,
+    source: &[u8],
+    config: &Config,
+    registry: &RuleRegistry,
+) -> Vec<Diagnostic> {
+    run_lint_with_cfg_project_mode(file, source, config, None, None, registry, false)
+}
+
+fn run_lint_with_cfg_project_mode(
+    file: &FileInfo,
+    source: &[u8],
+    config: &Config,
+    project: Option<&crate::dcu::ProjectContext>,
+    cfg_project: Option<&CfgProjectSnapshot>,
+    registry: &RuleRegistry,
+    run_cfg_rules: bool,
+) -> Vec<Diagnostic> {
     let (tree, mut diagnostics) = match parse_file(file, source) {
         Ok(result) => result,
         Err(e) => {
@@ -80,28 +106,33 @@ pub fn run_lint_with_cfg_project(
             Err(error) => return vec![error_diagnostic(error)],
         };
 
-    // Build per-method CFGs from either the selected immutable project input or
-    // the legacy parsed file.  Project build failures are surfaced as one
-    // bounded engine diagnostic rather than being converted into guessed CFGs.
-    let file_cfgs = match file_cfgs {
-        CfgInputs::FileLocal { tree, source } => build_file_cfgs(&tree, &source),
-        CfgInputs::Project {
-            snapshot,
-            target_unit,
-        } => match build_file_cfgs_in_project(&snapshot, &target_unit) {
-            Ok(cfgs) => cfgs,
-            Err(error) => return vec![error_diagnostic(error.to_string())],
-        },
-    };
     let unit_name =
         extract_unit_name(analysis_tree.root_node(), &analysis_source).unwrap_or_default();
-    let cfg_map: HashMap<ProcId, _> = file_cfgs
-        .into_iter()
-        .map(|cfg| {
-            let proc_id = ProcId::new(&unit_name, &cfg.proc_name);
-            (proc_id, cfg)
-        })
-        .collect();
+    // Build per-method CFGs only when a CFG rule will consume them.  Project
+    // build failures in that mode are surfaced as one bounded engine
+    // diagnostic; file-local-only mode must not manufacture a CFG diagnostic
+    // while deliberately withholding uncertain flow conclusions.
+    let cfg_map = if run_cfg_rules {
+        let file_cfgs = match file_cfgs {
+            CfgInputs::FileLocal { tree, source } => build_file_cfgs(&tree, &source),
+            CfgInputs::Project {
+                snapshot,
+                target_unit,
+            } => match build_file_cfgs_in_project(&snapshot, &target_unit) {
+                Ok(cfgs) => cfgs,
+                Err(error) => return vec![error_diagnostic(error.to_string())],
+            },
+        };
+        file_cfgs
+            .into_iter()
+            .map(|cfg| {
+                let proc_id = ProcId::new(&unit_name, &cfg.proc_name);
+                (proc_id, cfg)
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     let default_project = ProjectContext::from_units(vec![]);
     let proj_ref = project.unwrap_or(&default_project);
@@ -130,6 +161,9 @@ pub fn run_lint_with_cfg_project(
         }
 
         if rule.requires_cfg() {
+            if !run_cfg_rules {
+                continue;
+            }
             rule.check_cfg(
                 file,
                 &analysis_tree,
@@ -195,7 +229,15 @@ pub fn run_lint_with_cfg_project(
     // different source reruns through the raw file-local path.
     if let Some(map) = prepared_map {
         if !map_diagnostics_to_original(&mut ctx.diagnostics, &map, source) {
-            return run_lint_with_cfg_project(file, source, config, project, None, registry);
+            return run_lint_with_cfg_project_mode(
+                file,
+                source,
+                config,
+                project,
+                None,
+                registry,
+                run_cfg_rules,
+            );
         }
     }
 

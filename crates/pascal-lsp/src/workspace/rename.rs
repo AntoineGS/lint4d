@@ -2349,7 +2349,34 @@ fn binding_info_for_source(
     Ok((info.map(|info| (info, self_contained)), ignored_or_empty))
 }
 
-fn conditional_branch_contains_identifier(
+fn contains_any_identifier(source: &str, names: &[String]) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        if start == index {
+            continue;
+        }
+        let Some(identifier) = source.get(start..index) else {
+            continue;
+        };
+        if names
+            .iter()
+            .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&')))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn inherited_conditional_branch_contains_identifier(
     source: &str,
     analysis: &conditional::ConditionalAnalysis,
     names: &[String],
@@ -2400,33 +2427,6 @@ fn conditional_branch_contains_identifier(
             && conditional_ranges
                 .iter()
                 .any(|range| start >= range.start && index <= range.end)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn contains_any_identifier(source: &str, names: &[String]) -> bool {
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        let start = index;
-        while index < bytes.len() && is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        if start == index {
-            continue;
-        }
-        let Some(identifier) = source.get(start..index) else {
-            continue;
-        };
-        if names
-            .iter()
-            .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&')))
         {
             return true;
         }
@@ -5733,14 +5733,19 @@ struct IncludeAnalysis {
     safe: bool,
     relevant: bool,
     reason: Option<String>,
+    environment: Option<conditional::ConditionalEnvironment>,
 }
 
 impl IncludeAnalysis {
-    fn safe(relevant: bool) -> Self {
+    fn safe_with_environment(
+        relevant: bool,
+        environment: Option<conditional::ConditionalEnvironment>,
+    ) -> Self {
         Self {
             safe: true,
             relevant,
             reason: None,
+            environment,
         }
     }
 
@@ -5749,6 +5754,7 @@ impl IncludeAnalysis {
             safe: false,
             relevant,
             reason: Some(reason.into()),
+            environment: None,
         }
     }
 }
@@ -5787,37 +5793,6 @@ struct IncludeInspection<'a> {
     conditional_environment: Option<conditional::ConditionalEnvironment>,
 }
 
-fn include_boundary_environments(
-    source: &str,
-    defines: &[String],
-    cancel: &AtomicBool,
-) -> HashMap<usize, Option<conditional::ConditionalEnvironment>> {
-    let mut environment = conditional::ConditionalEnvironment::from_defines(defines);
-    let mut boundaries = HashMap::new();
-    let mut previous_include = false;
-    let mut include =
-        |directive: &ConditionalDirective,
-         environment: &mut conditional::ConditionalEnvironment| {
-            let boundary = if previous_include {
-                None
-            } else {
-                Some(environment.clone())
-            };
-            boundaries.insert(directive.start, boundary);
-            previous_include = true;
-            // The auditor still walks nested includes separately.  Clearing
-            // the environment here prevents facts from before an unmodeled
-            // include from being reused after its boundary.
-            conditional::IncludeTransition {
-                complete: true,
-                environment_known: false,
-            }
-        };
-    let _ =
-        conditional::analyze_with_include_callback(source, &mut environment, cancel, &mut include);
-    boundaries
-}
-
 fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult, String> {
     let mut uris = auditor.sources.keys().cloned().collect::<Vec<_>>();
     uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -5826,9 +5801,8 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             break;
         }
         // Expansion already audited this physical include through each owning
-        // virtual root.  Auditing it again as a standalone document loses the
-        // owner's legacy route (which is intentionally scoped to the source's
-        // sibling directory) and can falsely report a nested include as
+        // virtual root. Auditing it again as a standalone document loses the
+        // owner's legacy route and can falsely report a nested include as
         // unresolved.
         if auditor.loader.include_parents.contains_key(&uri) {
             continue;
@@ -5837,7 +5811,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         let context = auditor.context_for_source(&uri)?;
-        let Some(source) = auditor.sources.get(&uri) else {
+        let Some(source) = auditor.sources.get(&uri).cloned() else {
             continue;
         };
         let defines = context
@@ -5855,18 +5829,118 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                 }
             })
             .unwrap_or_default();
+        let cancel = auditor.cancel;
         #[cfg(test)]
         if TEST_CANCEL_INCLUDE_ANALYSIS.with(Cell::get) {
-            auditor.cancel.store(true, Ordering::Relaxed);
+            cancel.store(true, Ordering::Relaxed);
         }
-        let conditional = conditional::analyze_with_cancel(source, &defines, auditor.cancel);
-        if is_cancelled(auditor.cancel) {
+        let incomplete_context = context
+            .as_ref()
+            .is_none_or(|(_, context)| !context.discovery_complete);
+        let allow_incomplete_context = auditor
+            .allow_incomplete_context_for
+            .iter()
+            .any(|allowed_uri| allowed_uri == &uri);
+        let preliminary = conditional::analyze_with_cancel(&source, &defines, cancel);
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let has_potentially_active_include = preliminary.directives.iter().any(|directive| {
+            directive.kind == ConditionalDirectiveKind::Include && directive.potentially_active()
+        });
+        if incomplete_context && allow_incomplete_context && has_potentially_active_include {
+            auditor.record_error(format!(
+                "rename cannot prove completeness because potentially active include in {uri} depends on incomplete project search paths"
+            ));
+            auditor.stopped = true;
+            break;
+        }
+
+        let Some((context_key, context)) = context else {
+            auditor.record_error(format!(
+                "rename cannot prove completeness because include owner {uri} has no project context"
+            ));
+            auditor.stopped = true;
+            break;
+        };
+        let mut environment = conditional::ConditionalEnvironment::from_defines(&defines);
+        let mut callback_error = None;
+        let mut include =
+            |directive: &ConditionalDirective,
+             environment: &mut conditional::ConditionalEnvironment| {
+                if auditor.stopped {
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                }
+                if is_cancelled(cancel) {
+                    callback_error = Some(CANCELLATION_MESSAGE.to_string());
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                }
+                if !auditor.take_directive_budget() {
+                    auditor.record_error(format!(
+                    "rename cannot prove completeness because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
+                ));
+                    auditor.stopped = true;
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                }
+                let directive = legacy_directive(directive);
+                let analysis = match auditor.inspect_top_level(
+                    &uri,
+                    &directive,
+                    &context_key,
+                    &context,
+                    Some(environment.clone()),
+                ) {
+                    Ok(analysis) => analysis,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return conditional::IncludeTransition {
+                            complete: false,
+                            environment_known: false,
+                        };
+                    }
+                };
+                if let Some(next_environment) = analysis.environment {
+                    *environment = next_environment;
+                    conditional::IncludeTransition {
+                        complete: analysis.safe,
+                        environment_known: analysis.safe,
+                    }
+                } else {
+                    conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    }
+                }
+            };
+        let conditional = conditional::analyze_with_include_callback(
+            &source,
+            &mut environment,
+            cancel,
+            &mut include,
+        );
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
+        if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         if !conditional.complete {
             auditor.result.incomplete_reason.get_or_insert_with(|| {
                 format!("conditional analysis is incomplete for include owner {uri}")
             });
+            if auditor.stopped {
+                break;
+            }
+            continue;
         }
         if conditional.directives.iter().any(|directive| {
             directive.potentially_active() && directive.kind == ConditionalDirectiveKind::Other
@@ -5876,68 +5950,6 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             ));
             auditor.stopped = true;
             break;
-        }
-        let include_directives = conditional
-            .directives
-            .into_iter()
-            .filter(|directive| {
-                directive.kind == ConditionalDirectiveKind::Include
-                    && directive.potentially_active()
-            })
-            .map(|directive| legacy_directive(&directive))
-            .collect::<Vec<_>>();
-        if include_directives.is_empty() {
-            continue;
-        }
-
-        let incomplete_context = context
-            .as_ref()
-            .is_none_or(|(_, context)| !context.discovery_complete);
-        let allow_incomplete_context = auditor
-            .allow_incomplete_context_for
-            .iter()
-            .any(|allowed_uri| allowed_uri == &uri);
-        if incomplete_context && allow_incomplete_context {
-            auditor.record_error(format!(
-                "rename cannot prove completeness because potentially active include in {uri} depends on incomplete project search paths"
-            ));
-            auditor.stopped = true;
-            break;
-        }
-
-        let context = auditor.context_for_source(&uri)?;
-        let boundary_environments = include_boundary_environments(source, &defines, auditor.cancel);
-        for directive in include_directives {
-            if auditor.stopped {
-                break;
-            }
-            if is_cancelled(auditor.cancel) {
-                return Err(CANCELLATION_MESSAGE.to_string());
-            }
-            if !auditor.take_directive_budget() {
-                auditor.record_error(format!(
-                    "rename cannot prove completeness because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
-                ));
-                auditor.stopped = true;
-                break;
-            }
-            let Some((context_key, context)) = context.as_ref() else {
-                auditor.record_error(format!(
-                    "rename cannot prove completeness because include owner {uri} has no project context"
-                ));
-                auditor.stopped = true;
-                break;
-            };
-            auditor.inspect_top_level(
-                &uri,
-                &directive,
-                context_key,
-                context,
-                boundary_environments
-                    .get(&directive.start)
-                    .cloned()
-                    .flatten(),
-            )?;
         }
     }
 
@@ -6195,13 +6207,16 @@ impl IncludeAuditor<'_> {
         context_key: &ContextKey,
         context: &ProjectContext,
         conditional_environment: Option<conditional::ConditionalEnvironment>,
-    ) -> Result<(), String> {
+    ) -> Result<IncludeAnalysis, String> {
         let Some(owner_path) = uri.to_file_path().ok().map(absolute_path) else {
             self.record_error(format!(
                 "rename cannot prove completeness because an include path in {uri} is unresolved"
             ));
             self.stopped = true;
-            return Ok(());
+            return Ok(IncludeAnalysis::unsafe_with_reason(
+                format!("include path in {uri} is unresolved"),
+                false,
+            ));
         };
         let legacy_route = self.top_level_legacy_route(&owner_path, context_key, context);
         let resolution = self.resolve_include(
@@ -6218,7 +6233,10 @@ impl IncludeAuditor<'_> {
                     "rename cannot prove completeness because an include path in {uri} is unresolved"
                 ));
                 self.stopped = true;
-                return Ok(());
+                return Ok(IncludeAnalysis::unsafe_with_reason(
+                    format!("include path in {uri} is unresolved"),
+                    false,
+                ));
             }
             Resolution::Ambiguous { candidates } => {
                 self.record_error(format!(
@@ -6226,14 +6244,20 @@ impl IncludeAuditor<'_> {
                     candidates.len()
                 ));
                 self.stopped = true;
-                return Ok(());
+                return Ok(IncludeAnalysis::unsafe_with_reason(
+                    format!("include in {uri} is ambiguous ({})", candidates.len()),
+                    false,
+                ));
             }
             Resolution::Incomplete { reason, .. } => {
                 self.record_error(format!(
                     "rename cannot prove completeness because include in {uri} could not be read: {reason}"
                 ));
                 self.stopped = true;
-                return Ok(());
+                return Ok(IncludeAnalysis::unsafe_with_reason(
+                    format!("include in {uri} could not be read: {reason}"),
+                    false,
+                ));
             }
         };
         let legacy_route =
@@ -6249,11 +6273,12 @@ impl IncludeAuditor<'_> {
         if !analysis.safe || (analysis.relevant && self.name_free_assistance) {
             let reason = analysis
                 .reason
+                .clone()
                 .unwrap_or_else(|| format!("include {:?} contains source content", source.path));
             self.record_error(format!("rename cannot prove completeness because {reason}"));
             self.stopped = true;
         }
-        Ok(())
+        Ok(analysis)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6264,6 +6289,7 @@ impl IncludeAuditor<'_> {
         context_key: &ContextKey,
         context: &ProjectContext,
         inherited_route: Option<LegacyRoute>,
+        conditional_environment: conditional::ConditionalEnvironment,
         depth: usize,
     ) -> Result<IncludeAnalysis, String> {
         if depth >= MAX_RENAME_INCLUDE_DEPTH {
@@ -6310,7 +6336,7 @@ impl IncludeAuditor<'_> {
             context,
             owner_path,
             legacy_route,
-            conditional_environment: None,
+            conditional_environment: Some(conditional_environment),
         };
         self.inspect_include_file(&source, inspection, depth + 1)
     }
@@ -6348,6 +6374,7 @@ impl IncludeAuditor<'_> {
             inspection.context_key,
             inspection.owner_path,
             inspection.legacy_route.as_ref(),
+            inspection.conditional_environment.as_ref(),
         );
         if let Some(analysis) = self.cache.get(&cache_key) {
             return Ok(analysis.clone());
@@ -6411,21 +6438,96 @@ impl IncludeAuditor<'_> {
         // boundary is unknown, the empty environment intentionally makes
         // conditional facts unknown; it must not resurrect project defines.
         let include_text = shared_resolver::decode_source_bytes(&source.bytes);
+        let inherited_facts = inspection
+            .conditional_environment
+            .as_ref()
+            .is_some_and(conditional::ConditionalEnvironment::has_facts);
         let mut environment = inspection.conditional_environment.unwrap_or_default();
+        self.active.insert(active_key.clone());
+        let cancel = self.cancel;
+        let mut callback_error = None;
+        let mut nested_failure = None;
         let mut nested_include =
-            |_directive: &ConditionalDirective,
-             _environment: &mut conditional::ConditionalEnvironment| {
+            |directive: &ConditionalDirective,
+             environment: &mut conditional::ConditionalEnvironment| {
+                if is_cancelled(cancel) {
+                    callback_error = Some(CANCELLATION_MESSAGE.to_string());
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                }
+                if self.stopped {
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                }
+                if !self.take_directive_budget() {
+                    self.stopped = true;
+                    nested_failure = Some(format!(
+                        "include {path:?} could not be audited because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
+                    ));
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                }
+                let directive = legacy_directive(directive);
+                let child = match self.inspect_nested(
+                    path,
+                    &directive,
+                    inspection.context_key,
+                    inspection.context,
+                    inspection.legacy_route.clone(),
+                    environment.clone(),
+                    depth,
+                ) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return conditional::IncludeTransition {
+                            complete: false,
+                            environment_known: false,
+                        };
+                    }
+                };
+                if !child.safe {
+                    self.stopped = true;
+                    nested_failure = Some(child.reason.unwrap_or_else(|| {
+                        format!("include {path:?} contains unsafe nested source")
+                    }));
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                }
+                let Some(next_environment) = child.environment else {
+                    self.stopped = true;
+                    nested_failure = Some(format!(
+                        "include {path:?} did not yield a known conditional environment"
+                    ));
+                    return conditional::IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    };
+                };
+                *environment = next_environment;
                 conditional::IncludeTransition {
                     complete: true,
-                    environment_known: false,
+                    environment_known: true,
                 }
             };
         let conditional = conditional::analyze_with_include_callback(
             &include_text,
             &mut environment,
-            self.cancel,
+            cancel,
             &mut nested_include,
         );
+        self.active.remove(&active_key);
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
         if is_cancelled(self.cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
@@ -6435,6 +6537,25 @@ impl IncludeAuditor<'_> {
             conditional.potentially_active_contains_identifier(&include_text, self.candidate_names)
                 || conditional.pascal_condition_contains_identifier(self.candidate_names)
         };
+        let include_establishes_facts = conditional.directives.iter().any(|directive| {
+            matches!(
+                directive.kind,
+                ConditionalDirectiveKind::Define | ConditionalDirectiveKind::Undef
+            )
+        });
+        // A candidate reference inside a conditional block whose activity is
+        // supplied only by inherited project/owner facts is not a portable
+        // physical edit proof.  An include that establishes its own facts is
+        // analyzed from that local state instead; known-active self-defined
+        // conditional declarations/references remain valid.
+        let inherited_conditional_candidate = !self.name_free_assistance
+            && inherited_facts
+            && !include_establishes_facts
+            && inherited_conditional_branch_contains_identifier(
+                &include_text,
+                &conditional,
+                self.candidate_names,
+            );
         let conditional_candidate_is_uncertain = !self.name_free_assistance
             && relevant
             && (self
@@ -6442,20 +6563,7 @@ impl IncludeAuditor<'_> {
                 .iter()
                 .any(|name| conditional.unknown_contains_identifier(&include_text, name))
                 || conditional.pascal_condition_contains_identifier(self.candidate_names)
-                || conditional_branch_contains_identifier(
-                    &include_text,
-                    &conditional,
-                    self.candidate_names,
-                ));
-        let include_directives = conditional
-            .directives
-            .iter()
-            .filter(|directive| {
-                directive.kind == ConditionalDirectiveKind::Include
-                    && directive.potentially_active()
-            })
-            .map(legacy_directive)
-            .collect::<Vec<_>>();
+                || inherited_conditional_candidate);
         let analysis = if self.bytes_read >= MAX_RENAME_INCLUDE_BYTES {
             self.stopped = true;
             IncludeAnalysis::unsafe_with_reason(
@@ -6464,6 +6572,8 @@ impl IncludeAuditor<'_> {
                 ),
                 relevant,
             )
+        } else if let Some(reason) = nested_failure {
+            IncludeAnalysis::unsafe_with_reason(reason, relevant)
         } else if !conditional.complete {
             IncludeAnalysis::unsafe_with_reason(
                 format!("include {path:?} has malformed or incomplete conditional directives"),
@@ -6486,57 +6596,13 @@ impl IncludeAuditor<'_> {
                 format!("include {path:?} contains an unsupported directive"),
                 relevant,
             )
+        } else if self.name_free_assistance && relevant {
+            IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} contains source content"),
+                true,
+            )
         } else {
-            self.active.insert(active_key.clone());
-            let mut nested = None;
-            for directive in include_directives {
-                if is_cancelled(self.cancel) {
-                    self.active.remove(&active_key);
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
-                if !self.take_directive_budget() {
-                    self.stopped = true;
-                    nested = Some(IncludeAnalysis::unsafe_with_reason(
-                        format!(
-                            "include {path:?} could not be audited because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
-                        ),
-                        relevant,
-                    ));
-                    break;
-                }
-                if directive.kind != DirectiveKind::Include {
-                    continue;
-                }
-                let child = self.inspect_nested(
-                    path,
-                    &directive,
-                    inspection.context_key,
-                    inspection.context,
-                    inspection.legacy_route.clone(),
-                    depth,
-                )?;
-                if !child.safe || (child.relevant && self.name_free_assistance) {
-                    self.stopped = true;
-                    nested = Some(IncludeAnalysis::unsafe_with_reason(
-                        child
-                            .reason
-                            .unwrap_or_else(|| format!("include {path:?} contains source content")),
-                        child.relevant,
-                    ));
-                    break;
-                }
-            }
-            self.active.remove(&active_key);
-            nested.unwrap_or_else(|| {
-                if self.name_free_assistance && relevant {
-                    IncludeAnalysis::unsafe_with_reason(
-                        format!("include {path:?} contains source content"),
-                        true,
-                    )
-                } else {
-                    IncludeAnalysis::safe(false)
-                }
-            })
+            IncludeAnalysis::safe_with_environment(relevant, Some(environment))
         };
         self.cache.insert(cache_key, analysis.clone());
         Ok(analysis)
@@ -6772,12 +6838,16 @@ fn include_cache_key(
     context_key: &ContextKey,
     owner_path: &Path,
     legacy_route: Option<&LegacyRoute>,
+    environment: Option<&conditional::ConditionalEnvironment>,
 ) -> String {
     let mut hasher = DefaultHasher::new();
     path_key(path).hash(&mut hasher);
     context_key.hash(&mut hasher);
     path_key(owner_path).hash(&mut hasher);
     legacy_route.hash(&mut hasher);
+    environment
+        .map(conditional::ConditionalEnvironment::fingerprint)
+        .hash(&mut hasher);
     format!("include:{:016x}", hasher.finish())
 }
 

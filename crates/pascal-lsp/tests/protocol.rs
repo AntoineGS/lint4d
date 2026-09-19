@@ -12443,6 +12443,108 @@ fn incomplete_project_dependencies_keep_file_local_lint_diagnostics() {
 }
 
 #[test]
+fn incomplete_project_include_expansion_does_not_invent_cfg_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("app");
+    let main = root.join("Main.pas");
+    let include = root.join("reset.inc");
+    let project = root.join("App.dproj");
+    let source = "unit Main;\ninterface\nuses MissingUnit;\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  {$I reset.inc}\n  X.Foo;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(&include, "X := TObject.Create;\n");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .is_empty(),
+        "known include reinitialization must not be erased by the incomplete-project fallback: {diagnostics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn incomplete_project_preserves_naming_diagnostics_from_a_proven_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("app");
+    let main = root.join("Main.pas");
+    let include = root.join("decls.inc");
+    let project = root.join("App.dproj");
+    let source = "unit Main;\ninterface\nuses MissingUnit;\n{$I decls.inc}\nimplementation\nend.\n";
+    let include_source = "const BadConst = 1;\n";
+    write_file(&main, source);
+    write_file(&include, include_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &temp.path().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"projectFile": "app/App.dproj"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+
+    let root_diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        root_diagnostics["diagnostics"]
+            .as_array()
+            .expect("root diagnostics array")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "constant-naming"),
+        "the incomplete project must not relocate the include diagnostic onto the root: {root_diagnostics}"
+    );
+    let diagnostics = server
+        .diagnostic_with_timeout(&uri(&include), Duration::from_secs(2))
+        .expect("proven include must publish its physical diagnostics");
+    let naming = diagnostics["diagnostics"]
+        .as_array()
+        .expect("include diagnostics array")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "constant-naming")
+        .expect("proven include naming diagnostic");
+    assert_eq!(
+        naming["range"],
+        json!({
+            "start": {"line": 0, "character": 6},
+            "end": {"line": 0, "character": 14}
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
 fn shared_include_diagnostics_survive_closing_one_root() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let a = temp.path().join("A.pas");

@@ -2878,6 +2878,163 @@ fn unknown_owner_include_state_still_blocks_rename() {
 }
 
 #[test]
+fn later_owner_define_after_a_harmless_include_reuses_known_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let harmless_path = temp.path().join("harmless.inc");
+    let include_path = temp.path().join("defs.inc");
+    let source = "unit Main;\ninterface\n{$I harmless.inc}\n{$DEFINE ENABLED}\n{$I defs.inc}\nconst BadConst = 1;\nimplementation\nend.\n";
+    let harmless = "// no source content\n";
+    let include = "{$IFDEF ENABLED}\nconst Other = 2;\n{$ENDIF}\n";
+    fs::write(&source_path, source).expect("root source");
+    fs::write(&harmless_path, harmless).expect("harmless include");
+    fs::write(&include_path, include).expect("conditional include");
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open owner source");
+    let edit = workspace
+        .rename_edits(
+            &source_uri,
+            position_of(source, "BadConst", 0),
+            "GOOD_CONST",
+            false,
+        )
+        .expect("later owner define must remain known after a harmless include");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![(
+            source_uri,
+            range_of(source, "BadConst", 0),
+            "GOOD_CONST".to_owned(),
+        )],
+    );
+}
+
+#[test]
+fn later_owner_undef_after_a_harmless_include_reuses_known_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let harmless_path = temp.path().join("harmless.inc");
+    let include_path = temp.path().join("defs.inc");
+    let source = "unit Main;\ninterface\n{$I harmless.inc}\n{$UNDEF ENABLED}\n{$I defs.inc}\nconst BadConst = 1;\nimplementation\nend.\n";
+    let harmless = "// no source content\n";
+    let include = "{$IFDEF ENABLED}\nconst Other = 2;\n{$ENDIF}\n";
+    fs::write(&source_path, source).expect("root source");
+    fs::write(&harmless_path, harmless).expect("harmless include");
+    fs::write(&include_path, include).expect("conditional include");
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open owner source");
+    let edit = workspace
+        .rename_edits(
+            &source_uri,
+            position_of(source, "BadConst", 0),
+            "GOOD_CONST",
+            false,
+        )
+        .expect("later owner undef must remain known after a harmless include");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![(
+            source_uri,
+            range_of(source, "BadConst", 0),
+            "GOOD_CONST".to_owned(),
+        )],
+    );
+}
+
+#[test]
+fn nested_owner_define_reaches_a_known_conditional_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let wrapper_path = temp.path().join("wrapper.inc");
+    let include_path = temp.path().join("defs.inc");
+    let source = "unit Main;\ninterface\n{$DEFINE ENABLED}\n{$I wrapper.inc}\nconst BadConst = 1;\nimplementation\nend.\n";
+    let wrapper = "{$I defs.inc}\n";
+    let include = "{$IFDEF ENABLED}\nconst Other = 2;\n{$ENDIF}\n";
+    fs::write(&source_path, source).expect("root source");
+    fs::write(&wrapper_path, wrapper).expect("wrapper include");
+    fs::write(&include_path, include).expect("conditional include");
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open owner source");
+    let edit = workspace
+        .rename_edits(
+            &source_uri,
+            position_of(source, "BadConst", 0),
+            "GOOD_CONST",
+            false,
+        )
+        .expect("nested include must inherit the proven owner define state");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![(
+            source_uri,
+            range_of(source, "BadConst", 0),
+            "GOOD_CONST".to_owned(),
+        )],
+    );
+}
+
+#[test]
+fn self_defined_conditional_include_preserves_physical_rename_edits() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let include_path = temp.path().join("defs.inc");
+    let source = "unit Main;\ninterface\n{$I defs.inc}\nimplementation\nprocedure Run; begin WriteLn(SharedValue); end;\nend.\n";
+    let include = "{$DEFINE ENABLED}\n{$IFDEF ENABLED}\nconst SharedValue = 1;\n{$ENDIF}\n";
+    fs::write(&source_path, source).expect("root source");
+    fs::write(&include_path, include).expect("conditional include");
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+    let include_uri = Url::from_file_path(&include_path).expect("include URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open owner source");
+    let edit = workspace
+        .rename_edits(
+            &source_uri,
+            position_of(source, "SharedValue", 0),
+            "RenamedShared",
+            false,
+        )
+        .expect("known active conditional include should support physical rename");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![
+            (
+                source_uri,
+                range_of(source, "SharedValue", 0),
+                "RenamedShared".to_owned(),
+            ),
+            (
+                include_uri,
+                range_of(include, "SharedValue", 0),
+                "RenamedShared".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
 fn resolved_source_bearing_include_supports_physical_rename_edits() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root_path = temp.path().join("Main.pas");

@@ -3034,7 +3034,7 @@ fn merge_project_conditional_context(
         ("dcc_optimization", "O"),
         ("dcc_assertions", "C"),
         ("dcc_runtimechecks", "RUNTIME_CHECKS"),
-        ("dcc_debuginformation", "DEBUG_INFORMATION"),
+        ("dcc_debuginformation", "D"),
     ];
     for (property, canonical) in OPTION_PROPERTIES {
         let Some(raw) = builder.property(property) else {

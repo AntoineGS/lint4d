@@ -1,7 +1,53 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
 use pascal_core::conditional::{
     self, CompilerVersion, ConditionalContext, ConstantValue, IncludeTransition, Truth,
 };
 use pascal_core::resolver::NoCancellation;
+
+struct CountingAllocator;
+
+thread_local! {
+    static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocated_bytes(bytes: usize) {
+    COUNT_ALLOCATIONS.with(|enabled| {
+        if enabled.get() {
+            ALLOCATED_BYTES.with(|total| {
+                total.set(total.get().saturating_add(bytes));
+            });
+        }
+    });
+}
+
+// SAFETY: Each operation delegates to the system allocator.  The counter is
+// an independent thread-local observation used only by the bounded-admission
+// test.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_allocated_bytes(layout.size());
+        // SAFETY: The system allocator receives the original layout unchanged.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: The pointer/layout pair was returned by this allocator.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        record_allocated_bytes(new_size);
+        // SAFETY: The system allocator receives the original pointer/layout and
+        // requested size unchanged.
+        unsafe { System.realloc(pointer, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn directive_activity(source: &str, needle: &str, context: &ConditionalContext) -> Truth {
     let analysis = conditional::analyze_with_context(source, context);
@@ -343,6 +389,64 @@ fn malformed_option_suffix_does_not_retain_the_old_fact() {
 }
 
 #[test]
+fn typed_address_alias_uses_delphis_t_short_option() {
+    let context = ConditionalContext::default().with_option("T", Truth::True);
+    assert_eq!(
+        directive_activity(
+            "{$TYPEDADDRESS OFF}{$IFOPT T+}{$DEFINE WRONG}{$ELSE}{$DEFINE HIT}{$ENDIF}",
+            "DEFINE HIT",
+            &context,
+        ),
+        Truth::True
+    );
+    assert_eq!(
+        directive_activity(
+            "{$TYPEDADDRESS OFF}{$IFOPT T+}{$DEFINE WRONG}{$ELSE}{$DEFINE HIT}{$ENDIF}",
+            "DEFINE WRONG",
+            &context,
+        ),
+        Truth::False
+    );
+}
+
+#[test]
+fn supported_delphi_option_aliases_map_to_their_real_short_switches() {
+    for (long_name, short_name) in [
+        ("RANGECHECKS", "R"),
+        ("OVERFLOWCHECKS", "Q"),
+        ("OPTIMIZATION", "O"),
+        ("ASSERTIONS", "C"),
+        ("BOOLEVAL", "B"),
+        ("IOCHECKS", "I"),
+        ("EXTENDEDSYNTAX", "X"),
+        ("TYPEDADDRESS", "T"),
+        ("DEBUGINFO", "D"),
+        ("REFERENCEINFO", "Y"),
+    ] {
+        let context = ConditionalContext::default().with_option(short_name, Truth::True);
+        let source = format!(
+            "{{${long_name} OFF}}{{$IFOPT {short_name}+}}{{$DEFINE WRONG}}{{$ELSE}}{{$DEFINE HIT}}{{$ENDIF}}"
+        );
+        assert_eq!(
+            directive_activity(&source, "DEFINE HIT", &context),
+            Truth::True,
+            "{long_name} must canonicalize to {short_name}"
+        );
+    }
+}
+
+#[test]
+fn conflicting_option_aliases_are_unknown_in_one_context() {
+    let context = ConditionalContext::default()
+        .with_option("R", Truth::True)
+        .with_option("RangeChecks", Truth::False);
+    assert_eq!(
+        directive_activity("{$IFOPT R+}{$DEFINE HIT}{$ENDIF}", "DEFINE HIT", &context,),
+        Truth::Unknown
+    );
+}
+
+#[test]
 fn state_changing_option_directives_require_a_complete_operand() {
     let context = ConditionalContext::default().with_option("R", Truth::True);
     assert_eq!(
@@ -397,6 +501,42 @@ fn local_source_constant_shadows_invalidate_the_global_fact() {
     );
     assert_eq!(
         directive_activity(local_shadow, "DEFINE HIT", &ConditionalContext::default()),
+        Truth::Unknown
+    );
+}
+
+#[test]
+fn parameter_and_variable_shadowing_invalidate_global_source_constants() {
+    for source in [
+        concat!(
+            "unit X; interface const Limit = 1; implementation ",
+            "procedure P(Limit: Integer); ",
+            "{$IF Limit = 1}{$DEFINE HIT}{$ENDIF} begin end; end."
+        ),
+        concat!(
+            "unit X; interface const Limit = 1; implementation ",
+            "procedure P; var Limit: Integer; ",
+            "{$IF Limit = 1}{$DEFINE HIT}{$ENDIF} begin end; end."
+        ),
+    ] {
+        assert_eq!(
+            directive_activity(source, "DEFINE HIT", &ConditionalContext::default()),
+            Truth::Unknown,
+            "unsupported local binding must not retain a global constant"
+        );
+    }
+}
+
+#[test]
+fn local_shadowing_invalidates_explicit_constant_context() {
+    let context = ConditionalContext::default().with_constant("Limit", ConstantValue::Integer(1));
+    let source = concat!(
+        "unit X; interface implementation ",
+        "procedure P; const Limit = 2; ",
+        "{$IF Limit = 1}{$DEFINE HIT}{$ENDIF} begin end; end."
+    );
+    assert_eq!(
+        directive_activity(source, "DEFINE HIT", &context),
         Truth::Unknown
     );
 }
@@ -524,6 +664,36 @@ fn expression_errors_do_not_collapse_inside_boolean_composition() {
 }
 
 #[test]
+fn invalid_typed_comparisons_do_not_collapse_inside_boolean_composition() {
+    let invalid_version =
+        ConditionalContext::default().with_compiler_version(CompilerVersion::with_patch(24, 0, 1));
+    for (source, context) in [
+        (
+            "{$IF true or (Length(1) = 0)}{$DEFINE HIT}{$ENDIF}",
+            ConditionalContext::default(),
+        ),
+        (
+            "{$IF true or (1 = 'a')}{$DEFINE HIT}{$ENDIF}",
+            ConditionalContext::default(),
+        ),
+        (
+            "{$IF true or (SizeOf(65536) = 1)}{$DEFINE HIT}{$ENDIF}",
+            ConditionalContext::default(),
+        ),
+        (
+            "{$IF true or (CompilerVersion = 24)}{$DEFINE HIT}{$ENDIF}",
+            invalid_version,
+        ),
+    ] {
+        assert_eq!(
+            directive_activity(source, "DEFINE HIT", &context),
+            Truth::Unknown,
+            "invalid comparison must remain unknown: {source}"
+        );
+    }
+}
+
+#[test]
 fn oversized_constant_payload_is_rejected_before_analysis() {
     let context = ConditionalContext::default()
         .with_constant("Blob", ConstantValue::String("a".repeat(2 * 1024 * 1024)));
@@ -563,6 +733,24 @@ fn oversized_constant_payload_is_rejected_for_include_callback_environments() {
         &mut include,
     );
     assert!(!analysis.complete);
+}
+
+#[test]
+fn oversized_constant_names_are_rejected_before_key_allocation() {
+    let mut context = ConditionalContext::default();
+    context
+        .constants
+        .insert("N".repeat(2 * 1024 * 1024), ConstantValue::Integer(1));
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+    ALLOCATED_BYTES.with(|total| total.set(0));
+    let rejected = conditional::ConditionalEnvironment::try_from_context(&context).is_none();
+    let allocated = ALLOCATED_BYTES.with(Cell::get);
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+    assert!(rejected);
+    assert!(
+        allocated < 1024 * 1024,
+        "oversized key admission allocated {allocated} bytes before rejection"
+    );
 }
 
 #[test]
@@ -610,4 +798,99 @@ fn environment_fingerprint_tags_fact_namespaces() {
     let right = conditional::ConditionalEnvironment::from_context(&option);
     assert_ne!(left.fingerprint(), right.fingerprint());
     assert_eq!(left.fingerprint(), left.fingerprint());
+}
+
+#[test]
+fn environment_fingerprint_includes_source_constant_provenance() {
+    let context = ConditionalContext::default().with_constant("Limit", ConstantValue::Integer(1));
+    let explicit = conditional::ConditionalEnvironment::from_context(&context);
+    let mut source_derived = explicit.clone();
+    let analysis = conditional::analyze_with_include_callback(
+        "const Limit = 1;",
+        &mut source_derived,
+        &NoCancellation,
+        &mut |_directive, _environment| IncludeTransition {
+            complete: true,
+            environment_known: true,
+        },
+    );
+    assert!(analysis.complete);
+    assert_ne!(
+        explicit.fingerprint(),
+        source_derived.fingerprint(),
+        "source-derived binding provenance changes conditional semantics"
+    );
+}
+
+#[test]
+fn source_constant_provenance_changes_include_exit_semantics() {
+    let context = ConditionalContext::default().with_constant("Limit", ConstantValue::Integer(1));
+    let mut explicit = conditional::ConditionalEnvironment::from_context(&context);
+    let mut source_derived = explicit.clone();
+    let mut no_includes =
+        |_directive: &conditional::ConditionalDirective,
+         _environment: &mut conditional::ConditionalEnvironment| {
+            IncludeTransition {
+                complete: true,
+                environment_known: true,
+            }
+        };
+    let source_analysis = conditional::analyze_with_include_callback(
+        "const Limit = 1;",
+        &mut source_derived,
+        &NoCancellation,
+        &mut no_includes,
+    );
+    assert!(source_analysis.complete);
+
+    let after_include = |environment: &mut conditional::ConditionalEnvironment| {
+        let mut include =
+            |_directive: &conditional::ConditionalDirective,
+             child_environment: &mut conditional::ConditionalEnvironment| {
+                let mut nested_noop = |_nested_directive: &conditional::ConditionalDirective,
+                                   _nested_environment: &mut conditional::ConditionalEnvironment| {
+                IncludeTransition {
+                    complete: true,
+                    environment_known: true,
+                }
+            };
+                let analysis = conditional::analyze_with_include_callback(
+                    "const Other = 2;",
+                    child_environment,
+                    &NoCancellation,
+                    &mut nested_noop,
+                );
+                IncludeTransition {
+                    complete: analysis.complete,
+                    environment_known: analysis.complete,
+                }
+            };
+        let source = "{$I child.inc}{$IF Limit = 1}{$DEFINE HIT}{$ENDIF}";
+        conditional::analyze_with_include_callback(
+            source,
+            environment,
+            &NoCancellation,
+            &mut include,
+        )
+    };
+    let explicit_analysis = after_include(&mut explicit);
+    let source_analysis = after_include(&mut source_derived);
+    assert_eq!(
+        explicit_analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE HIT"))
+            .expect("explicit constant branch")
+            .activity,
+        Truth::True
+    );
+    assert_eq!(
+        source_analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE HIT"))
+            .expect("source-derived constant branch")
+            .activity,
+        Truth::Unknown
+    );
 }

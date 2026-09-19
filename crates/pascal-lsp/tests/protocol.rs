@@ -2143,6 +2143,75 @@ fn numeric_compiler_version_rename_edits_only_the_active_branch() {
     server.shutdown();
 }
 
+#[test]
+fn typed_address_alias_rename_edits_only_the_active_branch() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Probe.pas");
+    let source = concat!(
+        "unit Probe;\n",
+        "interface\n",
+        "var Counter: Integer;\n",
+        "implementation\n",
+        "procedure P;\n",
+        "begin\n",
+        "{$TYPEDADDRESS OFF}\n",
+        "{$IFOPT T+}\n",
+        "  Counter := 1;\n",
+        "{$ELSE}\n",
+        "  Counter := 2;\n",
+        "{$ENDIF}\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({"compilerOptions": {"T": true}}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let request_id = RequestId::from("typed-address-alias-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": {"line": 2, "character": 4},
+            "newName": "Updated"
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "rename failed: {response:?}");
+    let edit = response.result.expect("rename edit");
+    assert_exact_workspace_edit(
+        &edit,
+        vec![
+            (
+                uri(&source_path).to_string(),
+                Position::new(2, 4),
+                Position::new(2, 11),
+                "Updated".to_string(),
+            ),
+            (
+                uri(&source_path).to_string(),
+                Position::new(10, 2),
+                Position::new(10, 9),
+                "Updated".to_string(),
+            ),
+        ],
+    );
+    assert!(!edit.to_string().contains("\"line\":8"));
+    server.shutdown();
+}
+
 #[cfg(unix)]
 #[test]
 fn delphi_overrides_user_config_navigates_to_native_source() {

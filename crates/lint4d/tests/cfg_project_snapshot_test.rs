@@ -333,3 +333,181 @@ fn adapter_projects_compiler_context_in_cross_unit_cfg_inputs() {
         "enabled cross-unit procedure should have a CFG"
     );
 }
+
+#[test]
+fn adapter_projects_root_define_into_the_include_cfg_context() {
+    let root_bytes = b"unit App; interface {$DEFINE ENABLED}{$I condition.inc} implementation end.";
+    let include_bytes =
+        b"{$IF Defined(ENABLED)}const CorrectBranch = 1;{$ELSE}const WrongBranch = 1;{$ENDIF}";
+    let root_id = SourceId::new("source:/workspace/App.pas");
+    let include_id = SourceId::new("source:/workspace/condition.inc");
+    let directive = b"{$I condition.inc}";
+    let directive_start = root_bytes
+        .windows(directive.len())
+        .position(|window| window == directive)
+        .expect("include directive");
+    let project = ResolvedProject {
+        root: ResolvedUnit {
+            requested_name: "App".to_string(),
+            declared_name: "App".to_string(),
+            source: source(root_id.as_str(), "/workspace/App.pas", root_bytes),
+        },
+        units: Vec::new(),
+        imports: Vec::new(),
+        includes: vec![ResolvedInclude {
+            including_source_id: root_id.clone(),
+            byte_range: directive_start..directive_start + directive.len(),
+            requested_name: "condition.inc".to_string(),
+            target: ResolutionTarget::Found(include_id.clone()),
+        }],
+        include_sources: vec![source(
+            include_id.as_str(),
+            "/workspace/condition.inc",
+            include_bytes,
+        )],
+        complete: true,
+        report: report(true),
+    };
+    let mut conditional_context = ConditionalContext::default();
+    conditional_context.set_define("ENABLED", pascal_project::ConditionalFact::False);
+    let options = CfgSnapshotOptions {
+        prepare_configured_sources: true,
+        configuration_id: Some("debug".to_string()),
+        conditional_context,
+        ..raw_snapshot_options()
+    };
+
+    let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
+    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    let target = snapshot.snapshot.units().first().expect("prepared root");
+    assert!(
+        target
+            .source()
+            .windows(b"CorrectBranch".len())
+            .any(|window| window == b"CorrectBranch"),
+        "root DEFINE must make the active include branch available to CFG"
+    );
+    assert!(
+        !target
+            .source()
+            .windows(b"WrongBranch".len())
+            .any(|window| window == b"WrongBranch"),
+        "inactive include branch must not survive prepared CFG source"
+    );
+}
+
+#[test]
+fn adapter_projects_root_option_transition_into_the_include_cfg_context() {
+    let root_bytes = b"unit App; interface {$R-}{$I condition.inc} implementation end.";
+    let include_bytes = b"{$IFOPT R+}const WrongBranch = 1;{$ELSE}const CorrectBranch = 1;{$ENDIF}";
+    let root_id = SourceId::new("source:/workspace/App.pas");
+    let include_id = SourceId::new("source:/workspace/condition.inc");
+    let directive = b"{$I condition.inc}";
+    let directive_start = root_bytes
+        .windows(directive.len())
+        .position(|window| window == directive)
+        .expect("include directive");
+    let project = ResolvedProject {
+        root: ResolvedUnit {
+            requested_name: "App".to_string(),
+            declared_name: "App".to_string(),
+            source: source(root_id.as_str(), "/workspace/App.pas", root_bytes),
+        },
+        units: Vec::new(),
+        imports: Vec::new(),
+        includes: vec![ResolvedInclude {
+            including_source_id: root_id.clone(),
+            byte_range: directive_start..directive_start + directive.len(),
+            requested_name: "condition.inc".to_string(),
+            target: ResolutionTarget::Found(include_id.clone()),
+        }],
+        include_sources: vec![source(
+            include_id.as_str(),
+            "/workspace/condition.inc",
+            include_bytes,
+        )],
+        complete: true,
+        report: report(true),
+    };
+    let options = CfgSnapshotOptions {
+        prepare_configured_sources: true,
+        configuration_id: Some("debug".to_string()),
+        conditional_context: ConditionalContext::default()
+            .with_option("R", pascal_project::ConditionalFact::True),
+        ..raw_snapshot_options()
+    };
+
+    let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
+    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    let target = snapshot.snapshot.units().first().expect("prepared root");
+    assert!(
+        target
+            .source()
+            .windows(b"CorrectBranch".len())
+            .any(|window| window == b"CorrectBranch")
+    );
+    assert!(
+        !target
+            .source()
+            .windows(b"WrongBranch".len())
+            .any(|window| window == b"WrongBranch")
+    );
+}
+
+#[test]
+fn adapter_rejects_one_physical_include_reached_with_two_entry_contexts() {
+    let root_bytes = concat!(
+        "unit App; interface {$DEFINE ENABLED}{$I condition.inc}",
+        "{$UNDEF ENABLED}{$I condition.inc} implementation end."
+    )
+    .as_bytes();
+    let include_bytes =
+        b"{$IFDEF ENABLED}const EnabledBranch = 1;{$ELSE}const DisabledBranch = 1;{$ENDIF}";
+    let root_id = SourceId::new("source:/workspace/App.pas");
+    let include_id = SourceId::new("source:/workspace/condition.inc");
+    let directive = b"{$I condition.inc}";
+    let ranges = root_bytes
+        .windows(directive.len())
+        .enumerate()
+        .filter_map(|(index, window)| {
+            (window == directive).then_some(index..index + directive.len())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ranges.len(), 2);
+    let project = ResolvedProject {
+        root: ResolvedUnit {
+            requested_name: "App".to_string(),
+            declared_name: "App".to_string(),
+            source: source(root_id.as_str(), "/workspace/App.pas", root_bytes),
+        },
+        units: Vec::new(),
+        imports: Vec::new(),
+        includes: ranges
+            .into_iter()
+            .map(|byte_range| ResolvedInclude {
+                including_source_id: root_id.clone(),
+                byte_range,
+                requested_name: "condition.inc".to_string(),
+                target: ResolutionTarget::Found(include_id.clone()),
+            })
+            .collect(),
+        include_sources: vec![source(
+            include_id.as_str(),
+            "/workspace/condition.inc",
+            include_bytes,
+        )],
+        complete: true,
+        report: report(true),
+    };
+    let options = CfgSnapshotOptions {
+        prepare_configured_sources: true,
+        configuration_id: Some("debug".to_string()),
+        ..raw_snapshot_options()
+    };
+
+    let snapshot = to_cfg_project_snapshot(project, options).expect("raw fallback snapshot");
+    assert!(matches!(
+        snapshot.status,
+        CfgSnapshotStatus::Incomplete { .. }
+    ));
+}

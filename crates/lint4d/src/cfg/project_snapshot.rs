@@ -4,9 +4,13 @@
 //! does not rediscover files or infer import targets: it copies the resolver's
 //! explicit decisions into `cfg-pascal`'s caller-owned snapshot contract.
 
-use pascal_core::conditional::{DirectiveKind, Truth};
+use pascal_core::conditional::{
+    ConditionalAnalysis, ConditionalEnvironment, DirectiveKind, IncludeTransition, Truth,
+    is_option_directive,
+};
 use pascal_core::resolver::{
-    LoadedSource, ResolutionReport, ResolutionTarget, ResolvedImport, ResolvedProject, SourceId,
+    LoadedSource, NoCancellation, ResolutionReport, ResolutionTarget, ResolvedImport,
+    ResolvedInclude, ResolvedProject, ResolvedUnit, SourceId,
 };
 use pascal_project::ConditionalContext;
 use std::collections::{HashMap, HashSet};
@@ -193,22 +197,26 @@ pub fn to_cfg_project_snapshot(
     }
 
     let snapshots = source_snapshots(&units, &project.include_sources);
-    let projected_snapshots =
-        match project_conditional_snapshots(&snapshots, &options.conditional_context) {
-            Ok(snapshots) => snapshots,
-            Err(reason) => {
-                status = incomplete_status(status, reason);
-                return Ok(CfgProjectSnapshot {
-                    snapshot: raw_snapshot,
-                    target_unit: root_unit,
-                    status,
-                    resolution,
-                    target_path: root_source.path,
-                    target_source_id: root_source.id,
-                    target_analysis_bytes: root_analysis_bytes.clone(),
-                });
-            }
-        };
+    let projected_snapshots = match project_conditional_snapshots(
+        &snapshots,
+        &units,
+        &project.includes,
+        &options.conditional_context,
+    ) {
+        Ok(snapshots) => snapshots,
+        Err(reason) => {
+            status = incomplete_status(status, reason);
+            return Ok(CfgProjectSnapshot {
+                snapshot: raw_snapshot,
+                target_unit: root_unit,
+                status,
+                resolution,
+                target_path: root_source.path,
+                target_source_id: root_source.id,
+                target_analysis_bytes: root_analysis_bytes.clone(),
+            });
+        }
+    };
     let include_bindings = match preparation_include_bindings(&project, &snapshots) {
         Ok(bindings) => bindings,
         Err(reason) => {
@@ -431,86 +439,259 @@ fn source_snapshots(
     snapshots
 }
 
-/// Rewrite only conditions proved by the shared evaluator into the strict
-/// `cfg-pascal` expression subset.  Every replacement is byte-length-preserving
-/// so source-map ranges still identify the original source coordinates.  An
-/// unsupported or unknown condition is left intact and consequently keeps
-/// configured CFG preparation incomplete rather than inventing a branch.
+/// Project each root/include occurrence with one stateful shared environment.
+/// A physical include reached with a different entry state cannot be encoded by
+/// cfg-pascal's one immutable snapshot, so preparation fails closed instead of
+/// freezing it under whichever root happened to be visited first.
+#[derive(Debug)]
+struct ProjectedSource {
+    entry_fingerprint: u64,
+    exit_environment: ConditionalEnvironment,
+    bytes: Vec<u8>,
+}
+
 fn project_conditional_snapshots(
     snapshots: &[cfg_pascal::SourceSnapshot],
+    units: &[ResolvedUnit],
+    includes: &[ResolvedInclude],
     context: &ConditionalContext,
 ) -> Result<Vec<cfg_pascal::SourceSnapshot>, String> {
+    let mut source_bytes = HashMap::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        source_bytes.insert(
+            snapshot.source_id().as_str().to_string(),
+            snapshot.bytes().to_vec(),
+        );
+    }
+    let mut include_targets = HashMap::with_capacity(includes.len());
+    for include in includes {
+        if let ResolutionTarget::Found(target) = &include.target {
+            include_targets.insert(
+                (
+                    include.including_source_id.as_str().to_string(),
+                    include.byte_range.start,
+                    include.byte_range.end,
+                ),
+                target.as_str().to_string(),
+            );
+        }
+    }
+
+    let mut projections = HashMap::with_capacity(snapshots.len());
+    for unit in units {
+        let mut environment = ConditionalEnvironment::try_from_context(context)
+            .ok_or_else(|| "conditional context exceeded its admission bounds".to_string())?;
+        project_source_occurrence(
+            unit.source.id.as_str(),
+            &mut environment,
+            &source_bytes,
+            &include_targets,
+            &mut projections,
+            &mut Vec::new(),
+        )?;
+    }
+
     snapshots
         .iter()
         .map(|snapshot| {
-            let source = std::str::from_utf8(snapshot.bytes()).map_err(|_| {
-                format!(
-                    "conditional CFG projection requires UTF-8 source {}",
-                    snapshot.source_id().as_str()
-                )
-            })?;
-            let analysis = pascal_core::conditional::analyze_with_context(source, context);
-            if !analysis.complete {
-                return Err(format!(
-                    "conditional analysis incomplete for {}",
-                    snapshot.source_id().as_str()
+            let bytes = projections
+                .get(snapshot.source_id().as_str())
+                .map(|projection| projection.bytes.clone())
+                .unwrap_or_else(|| snapshot.bytes().to_vec());
+            Ok(cfg_pascal::SourceSnapshot::new(
+                snapshot.source_id().clone(),
+                bytes,
+            ))
+        })
+        .collect()
+}
+
+fn project_source_occurrence(
+    source_id: &str,
+    environment: &mut ConditionalEnvironment,
+    source_bytes: &HashMap<String, Vec<u8>>,
+    include_targets: &HashMap<(String, usize, usize), String>,
+    projections: &mut HashMap<String, ProjectedSource>,
+    active_sources: &mut Vec<String>,
+) -> Result<(), String> {
+    let entry_fingerprint = environment.fingerprint();
+    if active_sources.iter().any(|active| active == source_id) {
+        return Err(format!("conditional CFG include cycle at {source_id}"));
+    }
+    if let Some(existing) = projections.get(source_id) {
+        if existing.entry_fingerprint != entry_fingerprint {
+            return Err(format!(
+                "conditional CFG source {source_id} was reached with multiple entry contexts"
+            ));
+        }
+        *environment = existing.exit_environment.clone();
+        return Ok(());
+    }
+
+    let bytes = source_bytes
+        .get(source_id)
+        .ok_or_else(|| format!("conditional CFG source {source_id} was not loaded"))?;
+    let source = std::str::from_utf8(bytes)
+        .map_err(|_| format!("conditional CFG projection requires UTF-8 source {source_id}"))?;
+    active_sources.push(source_id.to_string());
+    let mut callback_error = None;
+    let analysis = pascal_core::conditional::analyze_with_include_callback(
+        source,
+        environment,
+        &NoCancellation,
+        &mut |directive, child_environment| {
+            let key = (source_id.to_string(), directive.start, directive.end);
+            let Some(target_id) = include_targets.get(&key) else {
+                callback_error = Some(format!(
+                    "active CFG include in {source_id} has no resolved target"
                 ));
+                return IncludeTransition {
+                    complete: false,
+                    environment_known: false,
+                };
+            };
+            match project_source_occurrence(
+                target_id,
+                child_environment,
+                source_bytes,
+                include_targets,
+                projections,
+                active_sources,
+            ) {
+                Ok(()) => IncludeTransition {
+                    complete: true,
+                    environment_known: true,
+                },
+                Err(error) => {
+                    callback_error = Some(error);
+                    IncludeTransition {
+                        complete: false,
+                        environment_known: false,
+                    }
+                }
             }
-            let mut projected = source.as_bytes().to_vec();
-            for directive in &analysis.directives {
+        },
+    );
+    active_sources.pop();
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    if !analysis.complete {
+        return Err(format!(
+            "conditional analysis incomplete for CFG source {source_id}"
+        ));
+    }
+    let projected = project_conditional_source(source, &analysis)?;
+    let exit_environment = environment.clone();
+    projections.insert(
+        source_id.to_string(),
+        ProjectedSource {
+            entry_fingerprint,
+            exit_environment,
+            bytes: projected,
+        },
+    );
+    Ok(())
+}
+
+fn project_conditional_source(
+    source: &str,
+    analysis: &ConditionalAnalysis,
+) -> Result<Vec<u8>, String> {
+    let mut projected = source.as_bytes().to_vec();
+    for directive in &analysis.directives {
+        match directive.kind {
+            DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle => {
                 let Some(condition) = directive.condition else {
                     continue;
                 };
-                if !matches!(
-                    directive.kind,
-                    DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
-                ) {
-                    continue;
-                }
                 let keyword = directive
                     .body
                     .split_ascii_whitespace()
                     .next()
                     .unwrap_or_default();
                 let replacement_keyword = match keyword.to_ascii_lowercase().as_str() {
-                    "if" => "IF",
+                    "if" | "ifdef" | "ifndef" | "ifopt" => "IF",
                     "elseif" | "elif" => "ELSEIF",
-                    "ifopt" => "IF",
                     _ => continue,
                 };
                 let literal = match condition {
                     Truth::True => "TRUE",
                     Truth::False => "FALSE",
-                    Truth::Unknown => continue,
+                    Truth::Unknown if directive.activity == Truth::False => "FALSE",
+                    Truth::Unknown => {
+                        return Err(format!(
+                            "active CFG condition remains unknown at byte {}",
+                            directive.start
+                        ));
+                    }
                 };
-                let replacement = format!("{replacement_keyword} {literal}");
-                let body_start = if source.as_bytes().get(directive.start + 1) == Some(&b'$') {
-                    directive.start + 2
-                } else {
-                    directive.start + 3
-                };
-                let body_end =
-                    if source.as_bytes().get(directive.end.saturating_sub(2)) == Some(&b'*') {
-                        directive.end.saturating_sub(2)
-                    } else {
-                        directive.end.saturating_sub(1)
-                    };
-                if body_start > body_end
-                    || body_end > projected.len()
-                    || replacement.len() > body_end - body_start
-                {
-                    continue;
-                }
-                projected[body_start..body_end].fill(b' ');
-                projected[body_start..body_start + replacement.len()]
-                    .copy_from_slice(replacement.as_bytes());
+                replace_directive_body(
+                    source,
+                    &mut projected,
+                    directive,
+                    &format!("{replacement_keyword} {literal}"),
+                )?;
             }
-            Ok(cfg_pascal::SourceSnapshot::new(
-                snapshot.source_id().clone(),
-                projected,
-            ))
-        })
-        .collect()
+            DirectiveKind::Include | DirectiveKind::Define | DirectiveKind::Undef => {}
+            DirectiveKind::MethodInfo | DirectiveKind::Harmless => {
+                mask_directive(&mut projected, directive);
+            }
+            DirectiveKind::Other if is_option_directive(&directive.body) => {
+                mask_directive(&mut projected, directive);
+            }
+            DirectiveKind::Other if directive.activity == Truth::False => {
+                mask_directive(&mut projected, directive);
+            }
+            DirectiveKind::Other => {
+                return Err(format!(
+                    "unsupported active CFG directive at byte {}",
+                    directive.start
+                ));
+            }
+            DirectiveKind::ConditionalEnd => {}
+        }
+    }
+    Ok(projected)
+}
+
+fn replace_directive_body(
+    source: &str,
+    projected: &mut [u8],
+    directive: &pascal_core::conditional::ConditionalDirective,
+    replacement: &str,
+) -> Result<(), String> {
+    let body_start = if source.as_bytes().get(directive.start + 1) == Some(&b'$') {
+        directive.start + 2
+    } else {
+        directive.start + 3
+    };
+    let body_end = if source.as_bytes().get(directive.end.saturating_sub(2)) == Some(&b'*') {
+        directive.end.saturating_sub(2)
+    } else {
+        directive.end.saturating_sub(1)
+    };
+    if body_start > body_end
+        || body_end > projected.len()
+        || replacement.len() > body_end - body_start
+    {
+        return Err(format!(
+            "conditional CFG projection cannot preserve directive length at byte {}",
+            directive.start
+        ));
+    }
+    projected[body_start..body_end].fill(b' ');
+    projected[body_start..body_start + replacement.len()].copy_from_slice(replacement.as_bytes());
+    Ok(())
+}
+
+fn mask_directive(
+    projected: &mut [u8],
+    directive: &pascal_core::conditional::ConditionalDirective,
+) {
+    if directive.end <= projected.len() && directive.start < directive.end {
+        projected[directive.start..directive.end].fill(b' ');
+    }
 }
 
 fn analysis_bytes(source: &LoadedSource) -> Arc<[u8]> {

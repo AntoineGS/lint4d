@@ -8766,6 +8766,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_conditional_option_alias_conflicts_become_unknown() {
+        let update = super::parse_runtime_options(&json!({
+            "compilerOptions": {"R": false, "RangeChecks": true}
+        }))
+        .expect("runtime option update");
+        let super::RuntimeOption::Value(options) = update.conditional_context.options else {
+            panic!("compiler options were not parsed");
+        };
+        assert_eq!(options.get("R"), Some(&ConditionalFact::Unknown));
+    }
+
+    #[test]
     fn runtime_conditional_fields_keep_initialization_fallback_independently() {
         let base = WorkspaceOptions {
             conditional_context: ConditionalContext::default()

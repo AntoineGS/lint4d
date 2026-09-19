@@ -303,6 +303,11 @@ impl ConditionalContext {
 
     pub fn set_option(&mut self, name: impl AsRef<str>, value: ConditionalFact) {
         if let Some(name) = canonical_option_name(name.as_ref()) {
+            let value = self
+                .options
+                .get(&name)
+                .copied()
+                .map_or(value, |previous| previous.merge(value));
             self.options.insert(name, value);
         }
     }
@@ -378,12 +383,13 @@ pub fn canonical_option_name(name: &str) -> Option<String> {
         "Q" | "OVERFLOWCHECKS" | "OVERFLOW_CHECKS" => "Q",
         "C" | "ASSERTIONS" => "C",
         "B" | "BOOLEVAL" => "B",
-        "I" | "IOERRORS" => "I",
+        "I" | "IOCHECKS" | "IOERRORS" => "I",
         "X" | "EXTENDEDSYNTAX" => "X",
-        "U" | "TYPEDADDRESS" => "U",
+        "T" | "TYPEDADDRESS" => "T",
+        "D" | "DEBUGINFO" | "DEBUG_INFORMATION" => "D",
         "RUNTIMECHECKS" | "RUNTIME_CHECKS" => "RUNTIME_CHECKS",
-        "DEBUGINFORMATION" | "DEBUG_INFORMATION" => "DEBUG_INFORMATION",
-        "REFERENCEINFO" | "REFERENCE_INFO" => "REFERENCE_INFO",
+        "DEBUGINFORMATION" => "D",
+        "Y" | "REFERENCEINFO" | "REFERENCE_INFO" | "DEFINITIONINFO" => "Y",
         other => other,
     };
     Some(canonical.to_string())

@@ -2610,6 +2610,8 @@ impl Workspace {
                             Some(NumberOrString::String(code))
                                 if code == "pascal-unresolved-identifier"
                                     || code == "pascal-missing-member"
+                                    || code == "pascal-type-mismatch"
+                                    || code == "pascal-incompatible-argument"
                         )
                     })
             })
@@ -7459,6 +7461,8 @@ impl Workspace {
             let code = match diagnostic.kind {
                 SemanticDiagnosticKind::UnresolvedIdentifier => "pascal-unresolved-identifier",
                 SemanticDiagnosticKind::MissingMember => "pascal-missing-member",
+                SemanticDiagnosticKind::TypeMismatch => "pascal-type-mismatch",
+                SemanticDiagnosticKind::IncompatibleArgument => "pascal-incompatible-argument",
             };
             mapped.entry(span.uri).or_default().push(LspDiagnostic::new(
                 Range::new(start, end),

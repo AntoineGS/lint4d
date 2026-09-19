@@ -2205,6 +2205,93 @@ fn diagnostics_report_a_missing_member_with_utf16_and_crlf_coordinates() {
 }
 
 #[test]
+fn diagnostics_report_type_and_argument_mismatches_with_utf16_ranges() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Main.pas");
+    let source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "procedure Take(Value: Boolean);\r\n",
+        "implementation\r\n",
+        "procedure Take(Value: Boolean);\r\n",
+        "begin\r\n",
+        "end;\r\n",
+        "procedure Run;\r\n",
+        "var I: Integer; B: Boolean;\r\n",
+        "begin\r\n",
+        "  Writeln('😀'); B := I; Take(I);\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publication = diagnostics_for_uri(&mut server, &uri(&source_path));
+    let diagnostics = publication["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let assignment_start = position_of(source, "I;", 0);
+    let assignment_end = Position::new(assignment_start.line, assignment_start.character + 1);
+    let argument_start = position_of(source, "I);", 0);
+    let argument_end = Position::new(argument_start.line, argument_start.character + 1);
+    let assignment = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-type-mismatch")
+        .expect("type mismatch diagnostic");
+    assert_eq!(
+        assignment["message"],
+        "type mismatch: cannot assign 'Integer' to 'Boolean'"
+    );
+    assert_eq!(
+        assignment["range"],
+        json!({
+            "start": assignment_start,
+            "end": assignment_end,
+        })
+    );
+
+    let argument = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-incompatible-argument")
+        .expect("incompatible argument diagnostic");
+    assert_eq!(
+        argument["message"],
+        "incompatible argument: expected 'Boolean', found 'Integer'"
+    );
+    assert_eq!(
+        argument["range"],
+        json!({
+            "start": argument_start,
+            "end": argument_end,
+        })
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic["code"] == "pascal-type-mismatch"
+                    || diagnostic["code"] == "pascal-incompatible-argument"
+            })
+            .count(),
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
 fn diagnostics_map_missing_members_in_includes_to_the_physical_document() {
     let root = tempfile::tempdir().expect("workspace");
     let main = root.path().join("Main.pas");
@@ -2259,6 +2346,76 @@ fn diagnostics_map_missing_members_in_includes_to_the_physical_document() {
         json!({
             "start": {"line": 3, "character": 6},
             "end": {"line": 3, "character": 13},
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_map_type_mismatches_in_includes_to_physical_utf16_ranges() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    let include = root.path().join("Shared.inc");
+    let main_source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "procedure Take(Value: Boolean);\r\n",
+        "implementation\r\n",
+        "{$I Shared.inc}\r\n",
+        "procedure Take(Value: Boolean);\r\n",
+        "begin\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    let include_source = concat!(
+        "procedure Run;\r\n",
+        "begin\r\n",
+        "  Writeln('😀'); Take(1);\r\n",
+        "end;\r\n",
+    );
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+
+    let root_publication = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        root_publication["diagnostics"]
+            .as_array()
+            .expect("root diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-incompatible-argument")
+    );
+    let include_publication = diagnostics_for_uri(&mut server, &uri(&include));
+    let diagnostics = include_publication["diagnostics"]
+        .as_array()
+        .expect("include diagnostics");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-incompatible-argument")
+        .expect("physical include argument diagnostic");
+    assert_eq!(
+        diagnostic["message"],
+        "incompatible argument: expected 'Boolean', found 'integer literal'"
+    );
+    let start = position_of(include_source, "1)", 0);
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": start,
+            "end": Position::new(start.line, start.character + 1),
         })
     );
     server.shutdown();
@@ -2406,6 +2563,91 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
             .iter()
             .all(|diagnostic| diagnostic["message"] != "missing member 'Missing'"),
         "provider overlay should remove the consumer diagnostic: {refreshed}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_refresh_when_an_unsaved_provider_changes_argument_type() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    let provider_disk = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure Take(Value: Boolean);\n",
+        "implementation\n",
+        "procedure Take(Value: Boolean);\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    let provider_overlay = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure Take(Value: Integer);\n",
+        "implementation\n",
+        "procedure Take(Value: Integer);\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Provider;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var I: Integer;\n",
+        "begin\n",
+        "  Take(I);\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_disk);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .expect("initial diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "pascal-incompatible-argument")
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_overlay,
+            }
+        }),
+    );
+    let refreshed = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        refreshed["diagnostics"]
+            .as_array()
+            .expect("refreshed diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-incompatible-argument"),
+        "provider overlay should retract the argument diagnostic: {refreshed}"
     );
     server.shutdown();
 }
@@ -4979,7 +5221,17 @@ fn cancelling_server_diagnostic_progress_discards_old_result_and_retries() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
     let source = root.join("Main.pas");
-    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    let text = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var I: Integer; B: Boolean;\n",
+        "begin\n",
+        "  B := I;\n",
+        "end;\n",
+        "end.\n",
+    );
     write_file(&source, text);
 
     let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
@@ -5036,6 +5288,14 @@ fn cancelling_server_diagnostic_progress_discards_old_result_and_retries() {
         .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
         .expect("fresh diagnostic retry must publish once");
     assert_eq!(diagnostics["uri"], uri(&source).to_string());
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("fresh diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "pascal-type-mismatch"),
+        "the retried computation must retain the type diagnostic: {diagnostics}"
+    );
     let second_begin = server.notification("$/progress");
     assert_eq!(second_begin["token"], second_token);
     assert_eq!(second_begin["value"]["kind"], "begin");
@@ -29761,6 +30021,63 @@ fn diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
     assert!(
         diagnostics["diagnostics"].as_array().unwrap().is_empty(),
         "stale diagnostics from version 1 were published: {diagnostics}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn type_diagnostics_drop_a_stale_blocked_result_after_a_newer_document_version() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let first_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var I: Integer; B: Boolean;\n",
+        "begin\n",
+        "  B := I;\n",
+        "end;\n",
+        "end.\n",
+    );
+    let changed_source = first_source.replace("B := I", "B := True");
+    write_file(&main, first_source);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_source,
+            }
+        }),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": changed_source}],
+        }),
+    );
+    barrier.release();
+
+    let publication = diagnostics_for_uri(&mut server, &uri(&main));
+    assert_eq!(publication["version"], 2);
+    assert!(
+        publication["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-type-mismatch"),
+        "stale type diagnostics from version 1 were published: {publication}"
     );
     server.shutdown();
 }

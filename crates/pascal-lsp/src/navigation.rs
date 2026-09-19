@@ -212,6 +212,17 @@ pub(crate) enum SemanticProofStatus {
 pub(crate) enum SemanticDiagnosticKind {
     UnresolvedIdentifier,
     MissingMember,
+    TypeMismatch,
+    IncompatibleArgument,
+}
+
+fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
+    match kind {
+        SemanticDiagnosticKind::UnresolvedIdentifier => 0,
+        SemanticDiagnosticKind::MissingMember => 1,
+        SemanticDiagnosticKind::TypeMismatch => 2,
+        SemanticDiagnosticKind::IncompatibleArgument => 3,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -860,8 +871,15 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
 
+        let mut budget = AssistanceBudget::new(
+            MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            MAX_SEMANTIC_DIAGNOSTIC_BYTES,
+            "semantic diagnostics",
+        );
         let mut pending = vec![document.tree.root_node()];
         let mut identifiers = Vec::new();
+        let mut assignments = Vec::new();
+        let mut calls = Vec::new();
         let mut visited = 0usize;
         while let Some(node) = pending.pop() {
             if cancel.load(Ordering::Relaxed) {
@@ -871,9 +889,19 @@ impl NavigationIndex {
             if visited > MAX_SEMANTIC_DIAGNOSTIC_NODES {
                 return Ok(Vec::new());
             }
+            match budget.require_work(1, cancel) {
+                Ok(()) => {}
+                Err(error) if error == "request cancelled" => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            }
             if node.kind() == "identifier" {
                 identifiers.push(node);
                 continue;
+            }
+            if node.kind() == "assignment" {
+                assignments.push(node);
+            } else if node.kind() == "exprCall" {
+                calls.push(node);
             }
             let mut cursor = node.walk();
             pending.extend(
@@ -884,11 +912,6 @@ impl NavigationIndex {
             );
         }
 
-        let mut budget = AssistanceBudget::new(
-            MAX_SEMANTIC_DIAGNOSTIC_WORK,
-            MAX_SEMANTIC_DIAGNOSTIC_BYTES,
-            "semantic diagnostics",
-        );
         let mut diagnostics = Vec::new();
         for identifier in identifiers {
             if cancel.load(Ordering::Relaxed) {
@@ -931,6 +954,8 @@ impl NavigationIndex {
                 SemanticDiagnosticKind::MissingMember => {
                     format!("missing member '{name}'")
                 }
+                SemanticDiagnosticKind::TypeMismatch
+                | SemanticDiagnosticKind::IncompatibleArgument => continue,
             };
             diagnostics.push(SemanticDiagnostic {
                 kind,
@@ -941,7 +966,192 @@ impl NavigationIndex {
                 message,
             });
         }
+        for assignment in assignments {
+            if document.conditionals.is_unknown_at(assignment.start_byte())
+                || document
+                    .opaque_ranges
+                    .iter()
+                    .any(|range| range.contains(Span::from_node(assignment)))
+            {
+                continue;
+            }
+            let Some(operator) = assignment.child_by_field_name("operator") else {
+                continue;
+            };
+            if node_text_with_budget(operator, &document.source, cancel, &mut budget)? != ":=" {
+                continue;
+            }
+            let (Some(lhs), Some(rhs)) = (
+                assignment.child_by_field_name("lhs"),
+                assignment.child_by_field_name("rhs"),
+            ) else {
+                continue;
+            };
+            let mut state = ResolutionState::new();
+            let analysis = match overload::analyze_assignment(
+                self,
+                uri,
+                document,
+                lhs,
+                rhs,
+                &mut state,
+                0,
+                cancel,
+                &mut budget,
+            ) {
+                Ok(analysis) => analysis,
+                Err(error) if error == "request cancelled" => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            };
+            let overload::AssignmentAnalysis::Incompatible { expected, actual } = analysis else {
+                continue;
+            };
+            if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
+                return Ok(Vec::new());
+            }
+            diagnostics.push(SemanticDiagnostic {
+                kind: SemanticDiagnosticKind::TypeMismatch,
+                span: SourceSpan {
+                    start: rhs.start_byte(),
+                    end: rhs.end_byte(),
+                },
+                message: format!("type mismatch: cannot assign '{actual}' to '{expected}'"),
+            });
+        }
+        for call in calls {
+            if document.conditionals.is_unknown_at(call.start_byte())
+                || document
+                    .opaque_ranges
+                    .iter()
+                    .any(|range| range.contains(Span::from_node(call)))
+            {
+                continue;
+            }
+            let analysis = match self.semantic_call_analysis_with_budget(
+                uri,
+                document,
+                call,
+                cancel,
+                &mut budget,
+            ) {
+                Ok(analysis) => analysis,
+                Err(error) if error == "request cancelled" => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            };
+            let overload::CallAnalysis::Incompatible(mismatches) = analysis else {
+                continue;
+            };
+            for mismatch in mismatches {
+                if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
+                    return Ok(Vec::new());
+                }
+                diagnostics.push(SemanticDiagnostic {
+                    kind: SemanticDiagnosticKind::IncompatibleArgument,
+                    span: SourceSpan {
+                        start: mismatch.span.start,
+                        end: mismatch.span.end,
+                    },
+                    message: format!(
+                        "incompatible argument: expected '{}', found '{}'",
+                        mismatch.expected, mismatch.actual
+                    ),
+                });
+            }
+        }
+        diagnostics.sort_by_key(|diagnostic| {
+            (
+                diagnostic.span.start,
+                diagnostic.span.end,
+                semantic_diagnostic_kind_rank(diagnostic.kind),
+            )
+        });
         Ok(diagnostics)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn semantic_call_analysis_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        call: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<overload::CallAnalysis, String> {
+        let Some(entity) = call.child_by_field_name("entity") else {
+            return Ok(overload::CallAnalysis::Unsupported);
+        };
+        let lookup_identifier = callable_lookup_identifier(entity);
+        let mut state = ResolutionState::new();
+        let mut candidates = self.resolve_candidates_at_with_state_and_budget(
+            uri,
+            document,
+            lookup_identifier.start_byte(),
+            lookup_identifier,
+            &mut state,
+            0,
+            cancel,
+            budget,
+        )?;
+        if candidates
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Ok(overload::CallAnalysis::Incomplete);
+        }
+        if overload::state_has_uncertainty(&state) {
+            return Ok(overload::CallAnalysis::Incomplete);
+        }
+        candidates.retain(|candidate| {
+            self.symbol(candidate).is_some_and(|symbol| {
+                symbol.kind == SymbolKind::Routine && !symbol.unresolved_abbreviated
+            })
+        });
+        if candidates.is_empty() {
+            return Ok(overload::CallAnalysis::Unsupported);
+        }
+        let owner_receivers = callable_owner_node(entity)
+            .map(|owner| {
+                self.resolve_receivers_with_state_and_budget(
+                    uri,
+                    document,
+                    entity.start_byte(),
+                    owner,
+                    owner,
+                    &mut state,
+                    cancel,
+                    budget,
+                    0,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let owner_instances = owner_receivers
+            .into_iter()
+            .filter_map(|receiver| match receiver {
+                Receiver::Type(instance) => Some(instance),
+                Receiver::Unit(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if overload::state_has_uncertainty(&state) {
+            return Ok(overload::CallAnalysis::Incomplete);
+        }
+        let analysis = overload::analyze_call(
+            self,
+            uri,
+            document,
+            call,
+            &candidates,
+            &GenericSubstitution::empty(),
+            &owner_instances,
+            &mut state,
+            0,
+            cancel,
+            budget,
+        )?;
+        if overload::state_has_uncertainty(&state) {
+            return Ok(overload::CallAnalysis::Incomplete);
+        }
+        Ok(analysis)
     }
 
     /// Classify one source identifier using the same conservative proof model
@@ -13055,11 +13265,13 @@ mod tests {
         let source = concat!(
             "unit SemanticDiagnosticsConditional;\n",
             "interface\n",
+            "var I: Integer; B: Boolean;\n",
             "implementation\n",
             "{$IFDEF UNKNOWN_FEATURE}\n",
             "procedure Run;\n",
             "begin\n",
             "  Missing := 1;\n",
+            "  B := I;\n",
             "end;\n",
             "{$ENDIF}\n",
             "end.\n",
@@ -13544,6 +13756,435 @@ mod tests {
                 )
                 .expect("missing proof status"),
             SemanticProofStatus::ProvenAbsent
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_a_known_incompatible_assignment() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-type-assignment.pas")
+            .expect("assignment URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsTypeAssignment;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer; B: Boolean;\n",
+            "begin\n",
+            "  B := I;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("assignment fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("assignment diagnostics complete");
+        let expected_start = source.rfind("I;").expect("assignment actual");
+
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message == "type mismatch: cannot assign 'Integer' to 'Boolean'"
+                    && diagnostic.span
+                        == SourceSpan {
+                            start: expected_start,
+                            end: expected_start + 1,
+                        }
+            }),
+            "known assignment mismatch must be reported at the actual expression: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_an_incompatible_bound_argument() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-type-argument.pas").expect("argument URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsTypeArgument;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Take(Value: Boolean);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Run;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  Take(I);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("argument fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("argument diagnostics complete");
+        let expected_start = source.rfind("I);").expect("argument actual");
+
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message == "incompatible argument: expected 'Boolean', found 'Integer'"
+                    && diagnostic.span
+                        == SourceSpan {
+                            start: expected_start,
+                            end: expected_start + 1,
+                        }
+            }),
+            "known argument mismatch must be reported at the actual expression: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_an_extra_argument_without_panicking() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-extra-argument.pas")
+            .expect("extra argument URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsExtraArgument;\n",
+            "interface\n",
+            "procedure Take(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Take(Value: Boolean);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  Take(True, 1);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("extra argument fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("extra argument diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["incompatible argument: expected 'no parameter', found 'integer literal'"]
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_preserve_safe_widening_nil_and_defaulted_arguments() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-type-controls.pas")
+            .expect("type controls URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsTypeControls;\n",
+            "interface\n",
+            "type TInt = Integer; TBase = class end; TObj = class(TBase) end;\n",
+            "implementation\n",
+            "procedure TakeBool(Value: Boolean);\n",
+            "begin\n",
+            "end;\n",
+            "procedure TakeObject(Value: TObj);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Mutate(var Value: Integer);\n",
+            "begin\n",
+            "end;\n",
+            "procedure MutateOut(out Value: Integer);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Defaults(A, B: Integer; C: Boolean = True);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Run;\n",
+            "var I: Integer; R: Real; B: Boolean; Alias: TInt; Obj: TObj; Base: TBase;\n",
+            "begin\n",
+            "  R := I;\n",
+            "  B := I;\n",
+            "  B := UnknownValue;\n",
+            "  B := Alias;\n",
+            "  Base := Obj;\n",
+            "  Obj := Base;\n",
+            "  Obj := nil;\n",
+            "  TakeBool(nil);\n",
+            "  TakeObject(nil);\n",
+            "  Mutate(1);\n",
+            "  Mutate(B);\n",
+            "  MutateOut(B);\n",
+            "  Defaults(1, 2);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("type controls fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("type controls diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "type mismatch: cannot assign 'Integer' to 'Boolean'",
+                "type mismatch: cannot assign 'tbase' to 'tobj'",
+                "incompatible argument: expected 'Boolean', found 'nil'",
+                "incompatible argument: expected 'Integer', found 'non-writable expression'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_require_all_overloads_to_be_incompatible() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-overload-controls.pas")
+            .expect("overload controls URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsOverloadControls;\n",
+            "interface\n",
+            "type TUnknown = MissingType;\n",
+            "procedure Choice(Value: Integer); overload;\n",
+            "procedure Choice(Value: Boolean); overload;\n",
+            "procedure OneUnknown(Value: Integer); overload;\n",
+            "procedure OneUnknown(Value: TUnknown); overload;\n",
+            "procedure AllBad(Value: Integer); overload;\n",
+            "procedure AllBad(Value: Boolean); overload;\n",
+            "implementation\n",
+            "procedure Choice(Value: Integer);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Choice(Value: Boolean);\n",
+            "begin\n",
+            "end;\n",
+            "procedure OneUnknown(Value: Integer);\n",
+            "begin\n",
+            "end;\n",
+            "procedure OneUnknown(Value: TUnknown);\n",
+            "begin\n",
+            "end;\n",
+            "procedure AllBad(Value: Integer);\n",
+            "begin\n",
+            "end;\n",
+            "procedure AllBad(Value: Boolean);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Run;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  Choice(I);\n",
+            "  OneUnknown(I);\n",
+            "  AllBad('text');\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("overload controls fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("overload controls diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "incompatible argument: expected 'a compatible overload parameter', found 'String'"
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_fail_closed_when_overload_groups_exceed_the_bound() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-overload-bound.pas")
+            .expect("overload bound URI");
+        let mut source = String::from("unit SemanticDiagnosticsOverloadBound;\ninterface\ntype\n");
+        for index in 0..129 {
+            source.push_str(&format!("  T{index} = record end;\n"));
+        }
+        for index in 0..129 {
+            source.push_str(&format!("procedure Choice(Value: T{index}); overload;\n"));
+        }
+        source.push_str("implementation\nprocedure Run;\nbegin\n  Choice('text');\nend;\nend.\n");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("overload bound fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("overload bound diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "an overload set beyond the supported bound must not publish a partial mismatch: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_reuse_known_generic_substitutions_and_suppress_unknown_ones() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-generic-types.pas")
+            .expect("generic types URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsGenericTypes;\n",
+            "interface\n",
+            "function Pair<T>(Value: T; Flag: Boolean): Integer;\n",
+            "implementation\n",
+            "function Pair<T>(Value: T; Flag: Boolean): Integer;\n",
+            "begin\n",
+            "  Result := 0;\n",
+            "end;\n",
+            "procedure Run;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  Pair(I, I);\n",
+            "  Pair(UnknownValue, I);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("generic types fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("generic types diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec!["incompatible argument: expected 'Boolean', found 'Integer'"]
+        );
+        let actual_start =
+            source.find("Pair(I, I)").expect("known generic call") + "Pair(I, ".len();
+        assert_eq!(
+            diagnostics[0].span,
+            SourceSpan {
+                start: actual_start,
+                end: actual_start + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_follow_inherited_and_helper_call_bindings() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-inherited-helper.pas")
+            .expect("inherited/helper URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsInheritedHelper;\n",
+            "interface\n",
+            "type\n",
+            "  TBase = class\n",
+            "    procedure Take(Value: Boolean);\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "  end;\n",
+            "  TChildHelper = class helper for TChild\n",
+            "    procedure Help(Value: Boolean);\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Take(Value: Boolean);\n",
+            "begin\n",
+            "end;\n",
+            "procedure TChildHelper.Help(Value: Boolean);\n",
+            "begin\n",
+            "end;\n",
+            "procedure Run;\n",
+            "var I: Integer; Child: TChild;\n",
+            "begin\n",
+            "  Child.Take(I);\n",
+            "  Child.Help(I);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("inherited/helper fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("inherited/helper diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "incompatible argument: expected 'Boolean', found 'Integer'",
+                "incompatible argument: expected 'Boolean', found 'Integer'",
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_calls_with_ambiguous_member_receivers() {
+        let first_uri = Url::parse("file:///tmp/semantic-diagnostics-ambiguous-call-a.pas")
+            .expect("first provider URI");
+        let second_uri = Url::parse("file:///tmp/semantic-diagnostics-ambiguous-call-b.pas")
+            .expect("second provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-diagnostics-ambiguous-call.pas")
+            .expect("consumer URI");
+        let provider = |unit| {
+            format!(
+                "unit {unit};\ninterface\ntype TBox = class\n  procedure Take(Value: Boolean);\nend;\nimplementation\nend.\n"
+            )
+        };
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses A, B;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer; Box: TBox;\n",
+            "begin\n",
+            "  Box.Take(I);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(first_uri.clone(), provider("A"))
+            .expect("first provider parses");
+        index
+            .update(second_uri.clone(), provider("B"))
+            .expect("second provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("ambiguous call consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("A".to_owned(), first_uri), ("B".to_owned(), second_uri)],
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("ambiguous call diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::IncompatibleArgument),
+            "ambiguous receiver types must suppress argument claims: {diagnostics:?}"
         );
     }
 

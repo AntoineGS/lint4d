@@ -11,8 +11,46 @@ It is not a replacement for Delphi's compiler or its complete type system.
 
 ### Source-semantic diagnostics
 
-In addition to lint4d rules, diagnostics report `pascal-unresolved-identifier`
-and `pascal-missing-member` only when the bounded source model proves absence.
+In addition to lint4d rules, diagnostics report
+`pascal-unresolved-identifier` and `pascal-missing-member` only when the
+bounded source model proves absence. It also reports
+`pascal-type-mismatch` for a proven incompatible assignment and
+`pascal-incompatible-argument` for a proven incompatible argument to a
+source-declared routine. These are error diagnostics with stable messages:
+
+```text
+type mismatch: cannot assign '<actual>' to '<expected>'
+incompatible argument: expected '<expected>', found '<actual>'
+```
+
+The type/argument pass is deliberately a small extension of the existing
+overload model, not a parallel compiler. It covers assignments and bound
+routine-call arguments whose types are proven from source, built-in literals,
+safe numeric widening, character/string conversion, `nil` to class/interface
+references, class/interface upcasts with known ancestry, and exact writable
+`var`/`out` arguments. Grouped parameters and omitted defaults are honored.
+An overload call is diagnosed only when every applicable retained candidate is
+proven incompatible; one compatible, ambiguous, unsupported, or uncertain
+candidate suppresses the claim. When all invalid candidates disagree about an
+expected type, the argument message uses `a compatible overload parameter`.
+
+Ranges cover exactly the offending right-hand expression or argument and are
+mapped back to physical include files just like the existing semantic
+diagnostics. The new codes are:
+
+| Diagnostic | Code |
+| --- | --- |
+| Type mismatch | `pascal-type-mismatch` |
+| Incompatible argument | `pascal-incompatible-argument` |
+
+Aliases whose target type is not proven, pointers/variants/anonymous callable
+types, enum/record compatibility beyond retained identity, compiler-dependent
+conversions, conditional or parser-recovery states, unresolved values, and
+incomplete imports/receivers/helpers/ancestry remain silent. A mismatch is not
+published merely because an unresolved implicit `System` lookup occurred when
+both assignment types were independently proven; the unresolved value itself
+still remains incomplete.
+
 The resolver reuses lexical bindings, selected imports, receiver/member lookup,
 helper and `with` precedence, ancestry, accessibility, and conditional state.
 Unknown or ambiguous imports/receivers, incomplete `with`/helper/owner lookup,
@@ -34,8 +72,8 @@ named-argument syntax, units, strings, and comments are not treated as value
 uses. Generic-provider symbol scans are charged to the same semantic work and
 byte budgets; exhaustion discards the whole semantic result rather than
 publishing a partial scan. These diagnostics are source-based and do not
-attempt compiler-only type inference, interface/override checking, type
-mismatches, or quick fixes.
+attempt compiler-only type inference, interface/override checking, general
+type checking, or quick fixes.
 
 Semantic diagnostics mapped from a physical include are retained only when
 the include's root-specific binding context is unambiguous. Equal project or
@@ -1089,6 +1127,11 @@ Implemented and covered by tests:
 - Specialized generic results feed source-based navigation, completion, hover,
   signature help, type definitions, and overload selection, including primitive
   literal substitutions.
+- Conservative source-semantic type diagnostics cover proven assignment
+  mismatches and bound routine-call argument mismatches, including overload
+  exclusion, grouped/default parameters, writable `var`/`out` checks, generic
+  substitutions, inherited/helper calls, physical include ranges, overlays,
+  cancellation, stale publication, and fail-closed diagnostic budgets.
 - Bounded, conservative conditional analysis recognizes `IFDEF`, `IFNDEF`,
   `IF`, `IFOPT`, `ELSEIF`/`ELIF`, `ELSE`, `ENDIF`, local `DEFINE`/`UNDEF`, and
   `DEFINED(...)`. Known-inactive source is omitted from the index; unknown
@@ -1112,8 +1155,9 @@ Not implemented or incomplete:
   imports, conditionals, receivers, or parser state are unknown; snippets are
   limited to source-proven named routines and do not model anonymous or
   compiler-only variadic callables.
-- A general Delphi type checker is not implemented; semantic-token precision is
-  limited to bindings proven by the source index.
+- A general Delphi type checker is not implemented; type diagnostics are
+  limited to the proven assignment/argument subset described above, and
+  semantic-token precision is limited to bindings proven by the source index.
 
 Unsupported expressions can return no location. Results should be evaluated
 against your own projects before treating navigation as compiler-equivalent.
@@ -1197,6 +1241,22 @@ environment operations, and 16 MiB of aggregate environment copy/merge byte
 work. Exceeding a bound marks the source unknown rather than returning a
 partial proof. Includes used by rename are separately bounded by 4,096 files,
 256 MiB, 16,384 directives, and 256 nested include levels.
+
+Source-semantic diagnostics have additional per-request bounds:
+
+| Semantic diagnostic limit | Value |
+| --- | ---: |
+| Syntax-tree nodes visited | 100,000 |
+| Resolver/overload work units | 100,000 |
+| Source bytes charged | 8 MiB |
+| Published semantic diagnostics | 256 |
+| Overload groups considered per call | 128 |
+| Arguments considered per call | 256 |
+
+Cancellation or exhaustion discards the complete semantic result; it never
+publishes a partial type or argument analysis. These bounds are shared with
+the existing binding, import, receiver, generic-substitution, ancestry, and
+overload work performed for the document.
 
 Assistance has fixed per-request bounds: at most 256 completion items, 100,000
 scanned completion symbols, 100,000 syntax-tree nodes while locating completion

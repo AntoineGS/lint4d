@@ -27,6 +27,7 @@ pub(super) struct Selection {
 
 #[derive(Debug, Clone)]
 struct ArgumentInfo {
+    span: Span,
     ty: Option<TypeIdentity>,
     assignable: bool,
     nil_literal: bool,
@@ -44,6 +45,30 @@ enum Conversion {
     Cost(u32),
     Unknown,
     Incompatible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ArgumentTypeMismatch {
+    pub(super) span: Span,
+    pub(super) expected: String,
+    pub(super) actual: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CallAnalysis {
+    Compatible,
+    Incompatible(Vec<ArgumentTypeMismatch>),
+    Ambiguous,
+    Unsupported,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AssignmentAnalysis {
+    Compatible,
+    Incompatible { expected: String, actual: String },
+    Unsupported,
+    Incomplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,13 +329,66 @@ fn score_group(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<GroupScore>, String> {
+    Ok(
+        match score_group_detailed(
+            index,
+            candidate,
+            symbol,
+            arguments,
+            call,
+            current_uri,
+            current_document,
+            receiver_substitution,
+            owner_instances,
+            state,
+            ancestry,
+            cancel,
+            budget,
+        )? {
+            GroupOutcome::Compatible(score) => Some(score),
+            GroupOutcome::Incompatible(_) | GroupOutcome::Incomplete => None,
+        },
+    )
+}
+
+enum GroupOutcome {
+    Compatible(GroupScore),
+    Incompatible(Vec<ArgumentTypeMismatch>),
+    Incomplete,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_group_detailed(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    symbol: &Symbol,
+    arguments: &[ArgumentInfo],
+    call: Node<'_>,
+    current_uri: &Url,
+    current_document: &Document,
+    receiver_substitution: &GenericSubstitution,
+    owner_instances: &[TypeInstance],
+    state: &mut ResolutionState,
+    ancestry: &mut AncestryResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<GroupOutcome, String> {
     let parameters = &symbol.routine_parameters;
     if arguments.len() > parameters.len()
         || parameters[arguments.len()..]
             .iter()
             .any(|parameter| !parameter.has_default)
     {
-        return Ok(None);
+        let mismatches = arguments
+            .iter()
+            .skip(parameters.len())
+            .map(|argument| ArgumentTypeMismatch {
+                span: argument_span(argument),
+                expected: "no parameter".to_owned(),
+                actual: argument_actual_label(argument),
+            })
+            .collect();
+        return Ok(GroupOutcome::Incompatible(mismatches));
     }
 
     let Some((substitution, generic_uncertain)) = generic_substitution_for_group(
@@ -329,17 +407,14 @@ fn score_group(
         budget,
     )?
     else {
-        return Ok(None);
+        return Ok(GroupOutcome::Incomplete);
     };
     let mut cost: u32 = 0;
     let mut uncertain = generic_uncertain;
+    let mut mismatches = Vec::new();
     for (argument, parameter) in arguments.iter().zip(parameters) {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out) && !argument.assignable
-        {
-            return Ok(None);
-        }
         let expected = parameter_type(
             index,
             candidate,
@@ -350,8 +425,23 @@ fn score_group(
             cancel,
             budget,
         )?;
+        if matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out) && !argument.assignable
+        {
+            if uncertain {
+                return Ok(GroupOutcome::Incomplete);
+            }
+            let Some(expected) = expected.as_ref() else {
+                return Ok(GroupOutcome::Incomplete);
+            };
+            mismatches.push(ArgumentTypeMismatch {
+                span: argument_span(argument),
+                expected: type_identity_label(expected),
+                actual: "non-writable expression".to_owned(),
+            });
+            continue;
+        }
         if argument.nil_literal {
-            match expected {
+            match expected.as_ref() {
                 Some(TypeIdentity::Named {
                     kind: TypeKind::Class | TypeKind::Interface,
                     ..
@@ -359,35 +449,343 @@ fn score_group(
                     cost = cost.saturating_add(1);
                     continue;
                 }
-                Some(_) => return Ok(None),
+                Some(expected) => {
+                    if uncertain {
+                        return Ok(GroupOutcome::Incomplete);
+                    }
+                    mismatches.push(ArgumentTypeMismatch {
+                        span: argument_span(argument),
+                        expected: type_identity_label(expected),
+                        actual: "nil".to_owned(),
+                    });
+                    continue;
+                }
                 None => {
                     uncertain = true;
                     continue;
                 }
             }
         }
-        match (&argument.ty, expected) {
+        match (&argument.ty, expected.as_ref()) {
             (None, _) | (_, None) => uncertain = true,
             (Some(actual), Some(expected)) => {
                 if matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out) {
-                    if !exact_type_match(actual, &expected) {
-                        return Ok(None);
+                    if !exact_type_match(actual, expected) {
+                        if uncertain {
+                            return Ok(GroupOutcome::Incomplete);
+                        }
+                        mismatches.push(ArgumentTypeMismatch {
+                            span: argument_span(argument),
+                            expected: type_identity_label(expected),
+                            actual: type_identity_label(actual),
+                        });
                     }
                 } else {
-                    match conversion(index, actual, &expected, state, ancestry, cancel, budget)? {
+                    match conversion(index, actual, expected, state, ancestry, cancel, budget)? {
                         Conversion::Cost(value) => cost = cost.saturating_add(value),
                         Conversion::Unknown => uncertain = true,
-                        Conversion::Incompatible => return Ok(None),
+                        Conversion::Incompatible => {
+                            if uncertain {
+                                return Ok(GroupOutcome::Incomplete);
+                            }
+                            mismatches.push(ArgumentTypeMismatch {
+                                span: argument_span(argument),
+                                expected: type_identity_label(expected),
+                                actual: type_identity_label(actual),
+                            });
+                        }
                     }
                 }
             }
         }
     }
-    Ok(Some(GroupScore {
-        cost,
-        uncertain,
-        substitution,
-    }))
+    if uncertain {
+        Ok(GroupOutcome::Compatible(GroupScore {
+            cost,
+            uncertain,
+            substitution,
+        }))
+    } else if mismatches.is_empty() {
+        Ok(GroupOutcome::Compatible(GroupScore {
+            cost,
+            uncertain: false,
+            substitution,
+        }))
+    } else {
+        Ok(GroupOutcome::Incompatible(mismatches))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn analyze_call(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    current_document: &Document,
+    call: Node<'_>,
+    candidates: &[Candidate],
+    receiver_substitution: &GenericSubstitution,
+    owner_instances: &[TypeInstance],
+    state: &mut ResolutionState,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<CallAnalysis, String> {
+    let groups = routine_groups(index, candidates, cancel, budget)?;
+    if groups.is_empty() {
+        return Ok(CallAnalysis::Unsupported);
+    }
+    if groups.len() > MAX_OVERLOAD_GROUPS {
+        return Err(format!(
+            "overload selection exceeds the {MAX_OVERLOAD_GROUPS}-group limit"
+        ));
+    }
+    let arguments = call_arguments(call, cancel, budget)?;
+    if arguments.len() > MAX_OVERLOAD_ARGUMENTS {
+        return Err(format!(
+            "overload selection exceeds the {MAX_OVERLOAD_ARGUMENTS}-argument limit"
+        ));
+    }
+    let mut argument_info = Vec::with_capacity(arguments.len());
+    for argument in &arguments {
+        check_navigation_cancel(cancel)?;
+        argument_info.push(infer_argument(
+            index,
+            current_uri,
+            current_document,
+            *argument,
+            state,
+            depth,
+            cancel,
+            budget,
+        )?);
+    }
+
+    let mut ancestry = AncestryResolutionState::new();
+    let mut possible = Vec::new();
+    let mut incompatible = Vec::new();
+    let mut incomplete = false;
+    for group in groups {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&group.representative) else {
+            incomplete = true;
+            continue;
+        };
+        match score_group_detailed(
+            index,
+            &group.representative,
+            symbol,
+            &argument_info,
+            call,
+            current_uri,
+            current_document,
+            receiver_substitution,
+            owner_instances,
+            state,
+            &mut ancestry,
+            cancel,
+            budget,
+        )? {
+            GroupOutcome::Compatible(score) => possible.push((group, score)),
+            GroupOutcome::Incompatible(mismatches) => incompatible.push(mismatches),
+            GroupOutcome::Incomplete => incomplete = true,
+        }
+    }
+
+    if incomplete || possible.iter().any(|(_, score)| score.uncertain) {
+        return Ok(CallAnalysis::Incomplete);
+    }
+    if !possible.is_empty() {
+        let best_cost = possible
+            .iter()
+            .map(|(_, score)| score.cost)
+            .min()
+            .expect("non-empty overload scores");
+        let best_count = possible
+            .iter()
+            .filter(|(_, score)| score.cost == best_cost)
+            .count();
+        return Ok(if best_count == 1 {
+            CallAnalysis::Compatible
+        } else {
+            CallAnalysis::Ambiguous
+        });
+    }
+    let Some(first_mismatches) = incompatible.first() else {
+        return Ok(CallAnalysis::Incomplete);
+    };
+    let mut common = Vec::new();
+    for mismatch in first_mismatches {
+        let matching = incompatible.iter().filter_map(|mismatches| {
+            mismatches.iter().find(|candidate| {
+                candidate.span == mismatch.span && candidate.actual == mismatch.actual
+            })
+        });
+        let matching = matching.collect::<Vec<_>>();
+        if matching.len() != incompatible.len() {
+            continue;
+        }
+        let expected = if matching
+            .iter()
+            .all(|candidate| candidate.expected == mismatch.expected)
+        {
+            mismatch.expected.clone()
+        } else {
+            "a compatible overload parameter".to_owned()
+        };
+        common.push(ArgumentTypeMismatch {
+            span: mismatch.span,
+            expected,
+            actual: mismatch.actual.clone(),
+        });
+    }
+    Ok(CallAnalysis::Incompatible(common))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn analyze_assignment(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    current_document: &Document,
+    lhs: Node<'_>,
+    rhs: Node<'_>,
+    state: &mut ResolutionState,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<AssignmentAnalysis, String> {
+    let lhs_info = infer_argument(
+        index,
+        current_uri,
+        current_document,
+        lhs,
+        state,
+        depth,
+        cancel,
+        budget,
+    )?;
+    if !lhs_info.assignable {
+        return Ok(AssignmentAnalysis::Unsupported);
+    }
+    let Some(expected) = lhs_info.ty else {
+        return Ok(AssignmentAnalysis::Incomplete);
+    };
+    let rhs_info = infer_argument(
+        index,
+        current_uri,
+        current_document,
+        rhs,
+        state,
+        depth,
+        cancel,
+        budget,
+    )?;
+    if state_has_uncertainty(state) {
+        return Ok(AssignmentAnalysis::Incomplete);
+    }
+    if rhs_info.nil_literal {
+        return Ok(
+            if matches!(
+                expected,
+                TypeIdentity::Named {
+                    kind: TypeKind::Class | TypeKind::Interface,
+                    ..
+                }
+            ) {
+                AssignmentAnalysis::Compatible
+            } else {
+                AssignmentAnalysis::Incompatible {
+                    expected: type_identity_label(&expected),
+                    actual: "nil".to_owned(),
+                }
+            },
+        );
+    }
+    let Some(actual) = rhs_info.ty else {
+        return Ok(AssignmentAnalysis::Incomplete);
+    };
+    let mut ancestry = AncestryResolutionState::new();
+    Ok(
+        match conversion(
+            index,
+            &actual,
+            &expected,
+            state,
+            &mut ancestry,
+            cancel,
+            budget,
+        )? {
+            Conversion::Cost(_) => AssignmentAnalysis::Compatible,
+            Conversion::Incompatible => AssignmentAnalysis::Incompatible {
+                expected: type_identity_label(&expected),
+                actual: type_identity_label(&actual),
+            },
+            Conversion::Unknown => AssignmentAnalysis::Incomplete,
+        },
+    )
+}
+
+pub(super) fn state_has_uncertainty(state: &ResolutionState) -> bool {
+    state.receiver_resolution_uncertain()
+        || state.member_lookup_incomplete
+        || state.inaccessible_candidate
+        || state.ambiguous
+}
+
+fn argument_span(argument: &ArgumentInfo) -> Span {
+    argument.span
+}
+
+fn argument_actual_label(argument: &ArgumentInfo) -> String {
+    if argument.nil_literal {
+        "nil".to_owned()
+    } else {
+        argument
+            .ty
+            .as_ref()
+            .map(type_identity_label)
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+}
+
+fn type_identity_label(identity: &TypeIdentity) -> String {
+    match identity {
+        TypeIdentity::Builtin(builtin) => match builtin {
+            BuiltinType::Integer(kind) => match kind {
+                IntegerKind::Literal => "integer literal".to_owned(),
+                IntegerKind::ShortInt => "ShortInt".to_owned(),
+                IntegerKind::SmallInt => "SmallInt".to_owned(),
+                IntegerKind::Integer => "Integer".to_owned(),
+                IntegerKind::Byte => "Byte".to_owned(),
+                IntegerKind::Word => "Word".to_owned(),
+                IntegerKind::Cardinal => "Cardinal".to_owned(),
+                IntegerKind::LongWord => "LongWord".to_owned(),
+                IntegerKind::Int64 => "Int64".to_owned(),
+                IntegerKind::UInt64 => "UInt64".to_owned(),
+                IntegerKind::NativeInt => "NativeInt".to_owned(),
+                IntegerKind::NativeUInt => "NativeUInt".to_owned(),
+            },
+            BuiltinType::Real => "Real".to_owned(),
+            BuiltinType::String => "String".to_owned(),
+            BuiltinType::Character => "Char".to_owned(),
+            BuiltinType::Boolean => "Boolean".to_owned(),
+        },
+        TypeIdentity::IntegerLiteral(_) => "integer literal".to_owned(),
+        TypeIdentity::Named { key, args, .. } => {
+            if args.is_empty() {
+                key.clone()
+            } else {
+                format!(
+                    "{}<{}>",
+                    key,
+                    args.iter()
+                        .map(type_identity_label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -881,13 +1279,14 @@ fn infer_argument(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<ArgumentInfo, String> {
+    let argument_span = Span::from_node(node);
     let mut node = node;
     let mut force_non_assignable = false;
     loop {
         check_navigation_cancel(cancel)?;
         if node.kind() == "exprParens" {
             let Some(operand) = node.named_child(0) else {
-                return Ok(unknown_argument());
+                return Ok(unknown_argument(argument_span));
             };
             budget.require_work(1, cancel)?;
             node = operand;
@@ -895,7 +1294,7 @@ fn infer_argument(
         }
         if node.kind() == "exprUnary" {
             let Some(operand) = node.named_child(0) else {
-                return Ok(unknown_argument());
+                return Ok(unknown_argument(argument_span));
             };
             budget.require_work(1, cancel)?;
             force_non_assignable = true;
@@ -909,6 +1308,7 @@ fn infer_argument(
         let text = node_text(index, current_document, node, cancel, budget)?;
         let ty = infer_numeric_literal(&text);
         return Ok(ArgumentInfo {
+            span: argument_span,
             ty: Some(ty),
             assignable: false,
             nil_literal: false,
@@ -920,11 +1320,12 @@ fn infer_argument(
             true
         } else {
             let Some(is_character) = classify_literal_fragments(&text) else {
-                return Ok(unknown_argument());
+                return Ok(unknown_argument(argument_span));
             };
             is_character
         };
         return Ok(ArgumentInfo {
+            span: argument_span,
             ty: Some(TypeIdentity::Builtin(if is_character {
                 BuiltinType::Character
             } else {
@@ -936,6 +1337,7 @@ fn infer_argument(
     }
     if kind == "kTrue" || kind == "kFalse" {
         return Ok(ArgumentInfo {
+            span: argument_span,
             ty: Some(TypeIdentity::Builtin(BuiltinType::Boolean)),
             assignable: false,
             nil_literal: false,
@@ -943,6 +1345,7 @@ fn infer_argument(
     }
     if kind == "kNil" {
         return Ok(ArgumentInfo {
+            span: argument_span,
             ty: None,
             assignable: false,
             nil_literal: true,
@@ -961,6 +1364,7 @@ fn infer_argument(
             depth.saturating_add(1),
         )?;
         return Ok(ArgumentInfo {
+            span: argument_span,
             ty: receiver_type(index, receivers)?,
             assignable: false,
             nil_literal: false,
@@ -969,6 +1373,7 @@ fn infer_argument(
 
     let Some(identifier) = expression_identifier(node) else {
         return Ok(ArgumentInfo {
+            span: argument_span,
             ty: None,
             assignable: false,
             nil_literal: false,
@@ -996,6 +1401,7 @@ fn infer_argument(
         .any(|candidate| index.candidate_is_conditionally_unknown(candidate))
     {
         return Ok(ArgumentInfo {
+            span: argument_span,
             ty: None,
             assignable,
             nil_literal: false,
@@ -1034,6 +1440,7 @@ fn infer_argument(
         }
     }
     Ok(ArgumentInfo {
+        span: argument_span,
         ty: if !unknown && identities.len() == 1 {
             identities.into_iter().next()
         } else {
@@ -1044,8 +1451,9 @@ fn infer_argument(
     })
 }
 
-fn unknown_argument() -> ArgumentInfo {
+fn unknown_argument(span: Span) -> ArgumentInfo {
     ArgumentInfo {
+        span,
         ty: None,
         assignable: false,
         nil_literal: false,

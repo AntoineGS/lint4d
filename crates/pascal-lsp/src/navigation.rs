@@ -4100,16 +4100,19 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
-        if self.proven_unique_unit_receiver_with_budget(
-            current_uri,
-            current_document,
-            offset,
-            &urls,
-            state,
-            cancel,
-            budget,
-        )? {
-            state.complete_receiver_lookup_as_unit(receiver_lookup_scope);
+        if matches!(
+            self.proven_unique_unit_receiver_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &urls,
+                state,
+                cancel,
+                budget,
+            )?,
+            Some(UnitExportDomain::Closed),
+        ) {
+            state.complete_receiver_lookup_as_closed_unit(receiver_lookup_scope);
         }
         Ok(urls.into_iter().map(Receiver::Unit).collect())
     }
@@ -5581,12 +5584,12 @@ impl NavigationIndex {
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<UnitExportDomain>, String> {
         let Some(unit_uri) = unit_urls.first().filter(|_| unit_urls.len() == 1) else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(unit_document) = self.documents.get(unit_uri) else {
-            return Ok(false);
+            return Ok(None);
         };
         budget.require_work(
             unit_document
@@ -5598,14 +5601,14 @@ impl NavigationIndex {
         if !unit_document.parser_recovery_spans.is_empty()
             || !unit_document.conditionals.unknown_spans.is_empty()
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         let Some(indices) = unit_document
             .symbol_indices_by_scope_key
             .get(&(ROOT_SCOPE, unit_document.unit_name.clone()))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         budget.require_work(indices.len(), cancel)?;
         let mut unit_candidate = None;
@@ -5618,7 +5621,7 @@ impl NavigationIndex {
                 continue;
             }
             if unit_candidate.is_some() {
-                return Ok(false);
+                return Ok(None);
             }
             unit_candidate = Some(Candidate {
                 uri: unit_uri.clone(),
@@ -5626,10 +5629,10 @@ impl NavigationIndex {
             });
         }
         let Some(candidate) = unit_candidate else {
-            return Ok(false);
+            return Ok(None);
         };
         if self.candidate_is_conditionally_unknown(&candidate) {
-            return Ok(false);
+            return Ok(None);
         }
         Ok(
             match self.candidate_access_decision_with_budget(
@@ -5641,17 +5644,29 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )? {
-                AccessDecision::Visible => true,
+                AccessDecision::Visible => Some(self.unit_export_domain_for_uri(unit_uri)),
                 AccessDecision::Unknown => {
                     state.mark_receiver_uncertain();
-                    false
+                    None
                 }
                 AccessDecision::Inaccessible => {
                     state.mark_inaccessible_candidate();
-                    false
+                    None
                 }
             },
         )
+    }
+
+    fn unit_export_domain_for_uri(&self, unit_uri: &Url) -> UnitExportDomain {
+        match self.implicit_system_namespace_status() {
+            ImplicitSystemNamespaceStatus::SourceBacked { uri } if &uri == unit_uri => {
+                // A source-backed System proves the selected unit identity
+                // and its source exports, but not the compiler/runtime export
+                // surface that is absent from that source catalogue.
+                UnitExportDomain::OpenImplicitSystem
+            }
+            _ => UnitExportDomain::Closed,
+        }
     }
 
     fn visible_unit_urls_for_path_with_budget(
@@ -8914,6 +8929,12 @@ struct ReceiverLookupScope {
     implicit_system_namespace_incomplete: bool,
 }
 
+#[derive(Clone, Copy)]
+enum UnitExportDomain {
+    Closed,
+    OpenImplicitSystem,
+}
+
 impl ResolutionState {
     fn new() -> Self {
         Self {
@@ -8952,12 +8973,14 @@ impl ResolutionState {
         }
     }
 
-    fn complete_receiver_lookup_as_unit(&mut self, scope: ReceiverLookupScope) {
+    fn complete_receiver_lookup_as_closed_unit(&mut self, scope: ReceiverLookupScope) {
         // A failed unqualified probe may inspect the open implicit System
         // namespace.  That uncertainty belongs to the probe, not to a
-        // subsequently proven unit receiver.  Other uncertainty flags are
-        // deliberately retained, so unknown with/receiver/helper state cannot
-        // be cleared by a unit-shaped fallback.
+        // subsequently proven ordinary unit receiver with a closed export
+        // domain.  A source-backed System is deliberately not closed by its
+        // unit identity alone.  Other uncertainty flags are deliberately
+        // retained, so unknown with/receiver/helper state cannot be cleared
+        // by a unit-shaped fallback.
         self.implicit_system_namespace_incomplete = scope.implicit_system_namespace_incomplete;
     }
 
@@ -13309,6 +13332,69 @@ mod tests {
                     &AtomicBool::new(false),
                 )
                 .expect("shadowed System proof status"),
+            SemanticProofStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_qualified_source_backed_system_exports_incomplete() {
+        let system_uri = Url::parse("file:///tmp/semantic-diagnostics-qualified-system.pas")
+            .expect("System URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-qualified-system-consumer.pas")
+                .expect("consumer URI");
+        let system = concat!(
+            "unit System;\n",
+            "interface\n",
+            "const KnownSystem = 1;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses System;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  ExitCode := 0;\n",
+            "  I := Round(1.2);\n",
+            "  System.ExitCode := 0;\n",
+            "  I := System.Round(1.2);\n",
+            "  I := System.KnownSystem;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(system_uri.clone(), system.to_owned())
+            .expect("source-backed System parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("qualified System consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("System".to_owned(), system_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "source-backed System does not close compiler exports: {diagnostics:?}"
+        );
+        let known_offset = consumer.find("KnownSystem").expect("known System export");
+        assert_eq!(
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &consumer_uri,
+                    text::offset_to_position(consumer, known_offset).expect("known position"),
+                    &AtomicBool::new(false),
+                )
+                .expect("known System proof status"),
             SemanticProofStatus::Resolved
         );
     }

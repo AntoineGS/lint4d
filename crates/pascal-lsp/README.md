@@ -4,8 +4,9 @@ A native, source-based Delphi/Object Pascal language server. Runs on Linux
 without Windows, Wine, RAD Studio, or `DelphiLSP.exe`. This slice provides
 declaration/definition navigation, source-based hover and type definitions,
 document and workspace symbols, semantic references, document highlights,
-semantic completion and signature help, conservative symbol-aware rename,
-naming quick fixes, and reuses lint4d and fmt4d for diagnostics and formatting.
+semantic completion and signature help, syntax folding ranges, conservative
+structural selection ranges, conservative symbol-aware rename, naming quick
+fixes, and reuses lint4d and fmt4d for diagnostics and formatting.
 It is not a replacement for Delphi's compiler or its complete type system.
 
 ## Build and Run
@@ -104,6 +105,54 @@ clients. Cancelling a client request releases its recipient slot immediately,
 while the shared computation may remain queued or running for its other
 recipients.
 
+Stdio output is nonblocking and ordered. The writer-facing queue keeps a
+16-message partial-result-data reserve and a 260-message control reserve,
+with 16 MiB total pending bytes and an 8 MiB per-message/aggregate pending
+control-byte bound. When a valid ordinary response temporarily cannot fit,
+it is retained in a separate FIFO deferred queue rather than terminating the
+session: deferred results are capped at 260 messages and 64 MiB, deferred
+lifecycle/control output at 260 messages and 8 MiB, and the combined deferred
+queue at 520 messages and 72 MiB. A result is retired from analysis/admission
+accounting only after its response (or a bounded request-scoped fallback) has
+been accepted by one of those queues. Individual control/result messages still
+must fit the 8 MiB bound; an oversized ordinary result receives `-32803`
+without closing the session. Partial data is not accumulated in the deferred
+queue, so a paused client cannot create an unbounded retry loop. Shutdown
+abandons undrainable output only after the existing bounded teardown deadline.
+
+### Work-done progress and cancellation
+
+The server advertises work-done progress for supported long-running providers,
+including document/workspace symbols, references, semantic tokens, navigation,
+formatting, rename, and code actions. A request may supply the standard
+`workDoneToken` as a string or integer; this is separate from
+`partialResultToken` and the JSON-RPC request ID. Accepted request work begins
+with one `$/progress` `begin`, reports bounded queued/started stages without
+invented percentages, and ends exactly once after success, an error, a stale
+result, or cancellation. Reports are operation-level rather than one per
+scanned file.
+
+Server-initiated indexing/diagnostic progress is used only when the client
+advertises `window.workDoneProgress: true`. The server first sends
+`window/workDoneProgress/create` and withholds progress notifications until a
+successful response. Failed, duplicate, unknown, or late create responses are
+ignored without delaying analysis. Terminal work retires an unacknowledged
+create's active token immediately and retains only a bounded response
+tombstone, so a late acknowledgement cannot revive `begin`/`report` activity.
+At most 32 create requests/tombstones and 128 progress tokens are retained;
+once the create bound is saturated by ignored requests, further diagnostics
+continue without server-initiated progress until a response or shutdown
+releases a slot. Create IDs use a separate `pascal-lsp-progress-create-`
+namespace from configuration request IDs.
+
+`$/cancelRequest` cancels the exact request recipient. The server also accepts
+`window/workDoneProgress/cancel` for an active progress token; unknown or
+finished tokens are harmless. Coalesced requests retain independent progress
+tokens, so cancelling one recipient does not cancel the shared computation
+while another recipient remains. Cancelling server-initiated indexing cancels
+the diagnostic snapshot and permits a later fresh retry; worker snapshots are
+never published as a partially built complete index.
+
 Diagnostics stay debounced and coalesced per document; if both worker slots are
 occupied, the diagnostic request is retried rather than spawning an unbounded
 worker. Identical observational requests share a computation only when their
@@ -120,10 +169,14 @@ verify the open-document version. Hover, completion, signature help,
 declaration/definition/implementation/type-definition navigation, document
 symbols, document highlights, formatting, and diagnostics can survive an
 unrelated open-file or configuration change when their recorded source,
-provider, project metadata, lint/fmt configuration, and negative membership
-observations are unchanged. Empty results retain the same dependency and
-absence checks. Requested sources, imported providers, consumed configuration,
+provider, project metadata, lint/fmt configuration, and negative membership or
+recursive provider-absence scope observations are unchanged. Empty results
+retain the same dependency and absence checks. Requested sources, imported
+providers, consumed configuration,
 project selection, and workspace-folder changes invalidate the result.
+An incomplete recursive filename catalogue records potential provider scopes
+for conservative live revalidation and logs its bounded-entry warning instead
+of silently claiming complete absence.
 
 Workspace symbols, references, prepare/rename, code actions, and code-action
 resolution remain conservative: any source/configuration generation change
@@ -179,13 +232,40 @@ with the same spelling.
 
 Completion is case-insensitive and uses the nearest lexical locals and
 parameters, visible class members, current-unit declarations, and resolved
-imported declarations. It preserves declaration casing and returns plain
-identifier `TextEdit`s; it does not insert snippets, imports, or additional
-edits. Imported private/protected members and unrelated workspace names are not
-offered. Conditional uncertainty, ambiguous receivers, and bounded candidate
-truncation are reported conservatively with `CompletionList.isIncomplete` rather
-than as a falsely complete result. Expression receivers are resolved source-first
-as well: calls such as `MakeValue().Member`, constructors such as
+imported declarations. It preserves declaration casing and normally returns
+plain identifier `TextEdit`s. Clients that advertise
+`textDocument.completion.completionItem.snippetSupport` also receive
+source-derived routine-call snippets at an unambiguous callable expression
+site, such as `Run(${1:Value})$0`; zero-argument routines use `Run()$0`.
+Grouped, default, and optional parameters become ordinary placeholders in
+declaration order, while escaped Pascal identifier text and LSP snippet
+metacharacters are preserved safely. Snippets remain plain in existing calls,
+address-of/procedure-reference expressions, expected procedural-value
+assignments or arguments, declarations, type contexts, ambiguous or unknown
+signatures, non-expression/qualification positions, and uncertain syntax. A
+typed generic suffix and an unresolved routine generic also remain plain; the
+server does not invent parameters or statement terminators. For an unqualified
+identifier, it
+can also offer a unique exported declaration from an authorized project source
+unit that is not already imported. Routine auto-import items retain their safe
+`additionalTextEdit` for the interface or implementation `uses` clause; the
+import edit remains separate from the primary snippet replacement. The edit
+preserves CRLF/LF style, existing comments, dotted names, and explicit
+`in 'path'` entries. The proposed import spelling is checked through the
+requesting project's actual unit resolver, including namespaces, search paths,
+and aliases; candidates are omitted when it cannot bind uniquely to the
+selected provider. Absent clauses are inserted only after a clean section
+header, never through comments, directives, or same-line routine headers.
+Auto-import discovery is bounded to 512 provider source units and reports
+`CompletionList.isIncomplete` when the authorized filename catalogue is
+incomplete; cancellation and read-policy failures fail closed. Ambiguous
+units/symbols, conditional or private declarations, the current unit,
+compiled-library-only symbols, malformed/conditionally enclosed `uses` clauses,
+and unsafe insertion points are omitted. Conditional uncertainty, ambiguous
+receivers, and bounded candidate truncation are reported conservatively with
+`CompletionList.isIncomplete` rather than as a falsely complete result.
+Expression receivers are resolved source-first as well: calls such as
+`MakeValue().Member`, constructors such as
 `TWidget.Create.Member`, casts such as `TWidget(Value).Member` and
 `(Value as TWidget).Member`, and nested result chains are supported when their
 named types are unambiguous. The receiver's declaring unit is retained when a
@@ -198,6 +278,19 @@ cyclic, or conditionally uncertain ancestry does not justify guessing a member
 from an unrelated type or global declaration. Rename remains conservative and
 rejects inherited class-member references until the complete override model is
 available.
+
+The server advertises `completionProvider.resolveProvider`. Completion metadata
+is negotiated independently: `documentation` and `detail` are deferred only
+when the client lists the corresponding property in
+`completionItem.resolveSupport.properties`; unsupported properties are computed
+eagerly for compatibility. Deferred `completionItem/resolve` runs in the
+analysis worker and returns the negotiated documentation format. The server
+issues bounded opaque, session-local data and resolves the exact declaration
+URI/index captured for the item. It restores the original label, kind, edits,
+`insertText`, filtering, and sorting fields instead of trusting presentation
+changes made by the client; resolution never adds or changes edits. Missing,
+tampered, foreign, evicted, stale, or ambiguous identities fail conservatively
+so the client can request completion again.
 
 Signature help reports every supported source declaration, including overloads.
 When source-resolved argument types identify one exact, safe widening, or safe
@@ -390,6 +483,29 @@ references still do. Project defines are used as positive conditional facts;
 `buildConfig` and `platform` select the project context but do not synthesize
 compiler-version or host-environment facts.
 
+### Source-bearing Pascal includes
+
+The LSP expands resolvable `{$I ...}`/`{$INCLUDE ...}` files into bounded,
+virtual source buffers for navigation, references, document highlights, and
+open-buffer diagnostics. Include declarations, definitions, and diagnostics
+are mapped back to their physical `.inc` (or Pascal) URI and source range;
+repeated and nested includes retain every physical occurrence. Unsaved open
+buffers take precedence over disk files, including when an included file is
+opened only as an overlay. Include content carries the requester project's
+read authorization and mapping provenance through nested resolution, and
+changes to an include invalidate its indexed parents and published diagnostics.
+
+Expansion is deliberately conservative. Active includes must resolve within
+the effective readable roots; cycles, unknown or incomplete conditional
+activity, stale dependency content, and expansion depth/file/directive/byte/
+source-map/work limits fail closed rather than producing partial locations or
+edits. Project and local `DEFINE`/`UNDEF` facts are shared across expanded
+source in the bounded analyzer, but compiler-version, `IFOPT`, environment,
+and Pascal-dependent conditional expressions remain unknown unless proven by
+the source. `.inc` files are analyzable source dependencies, but formatting is
+restricted to `.pas`, `.dpr`, and `.dpk` files so the formatter never edits a
+virtual or include fragment implicitly.
+
 In the MultidevComponents example, `MDIBDatabase.pas` is genuinely shared by
 multiple packages, so automatic project selection still refuses to guess.
 Explicit `MDDatabaseXE3.dproj` with Debug/Win32 now evaluates successfully.
@@ -407,6 +523,9 @@ not apply to source discovery. The initialization `exclude` option controls
 source discovery. `.fmt4d.toml` controls formatting; this slice does not
 translate LSP indentation options into formatter settings. Formatting is
 explicit and returns an edit to the client: the server does not write files.
+Include files (`.inc`) participate in source analysis but are rejected as
+direct formatting targets; only `.pas`, `.dpr`, and `.dpk` buffers are
+formatted.
 DCU-dependent lint rules are not enabled through a project context in this
 slice, and the CLI's baseline filtering is not applied.
 
@@ -466,9 +585,78 @@ registrations are retried up to three times; paths
 that remain rejected enter that degraded mode and no longer consume the bounded
 explicit-watcher allowance.
 
-`workspace/didChangeConfiguration` and general runtime settings overrides are
-not supported. Change sidecar files or restart the client after changing
-`initializationOptions`.
+### Runtime configuration (LSP)
+
+The canonical runtime settings section is `pascalLsp`. It uses the same
+supported fields as `initializationOptions`; it does not introduce a second
+configuration schema:
+
+```json
+{
+  "pascalLsp": {
+    "projectFile": "src/Shop.dproj",
+    "buildConfig": "Debug",
+    "platform": "Win32",
+    "sourcePaths": ["../shared", "/opt/delphi/rtl"],
+    "exclude": ["**/__history/**"],
+    "maxFiles": 10000,
+    "maxFileBytes": 2097152,
+    "maxTotalBytes": 268435456
+  }
+}
+```
+
+Clients that advertise `workspace.configuration: true` receive a standard
+`workspace/configuration` request for section `pascalLsp` after the server has
+received `initialized`. A single-root workspace request includes that root's
+`scopeUri`. Runtime settings are global in this server: a multi-root request
+omits `scopeUri`, and one returned setting set applies to every workspace root.
+Adding or removing workspace folders refreshes this scope decision.
+The pull response must contain one array item for this one requested section;
+`null` is the explicit reset value, while malformed or wrong-length array
+responses leave the last valid runtime state unchanged.
+
+Clients without pull capability do not receive a server request. They can
+push the same object in `workspace/didChangeConfiguration`, for example:
+
+```json
+{
+  "settings": {
+    "pascalLsp": { "buildConfig": "Release" }
+  }
+}
+```
+
+Runtime values override the corresponding initialization option for the
+session. Existing project ownership and explicit session-local project
+selections remain authoritative, and the existing project metadata, sidecar,
+read-policy, and open-buffer precedence is unchanged. A `null` value or an
+omitted field resets that field to its initialization fallback; a `null`
+section (or an empty section) resets all runtime overrides. A malformed whole
+section is ignored. A malformed individual field is retained at its previous
+valid value while valid unrelated fields still apply. Unknown fields are
+ignored. Runtime changes that alter effective values bump source/configuration
+generations, invalidate affected indexes and contexts, and reschedule open
+document diagnostics; identical effective settings do not rebuild state.
+Expensive reads and rebuilds remain in the bounded analysis workers, and
+runtime settings never grant filesystem access beyond the existing read
+policy.
+
+While a runtime configuration rebuild is in progress, configuration-dependent
+requests and state-changing notifications share a bounded FIFO of 64 messages.
+At most 63 retryable requests are admitted initially, leaving room for an
+authoritative notification; if later notifications need more room, the newest
+deferred request is rejected with a retryable `-32802` response rather than
+dropped edits. The queue remains count-bounded, and each retained LSP payload
+is subject to the server's 8 MiB input limit. Cancellation and shutdown still
+drain deferred requests with explicit responses.
+
+The coordinator coalesces refresh notifications, keeps at most one pull in
+flight, and discards obsolete or duplicate replies. Pull errors preserve the
+last valid runtime state. Runtime lists are capped at 256 entries and strings
+at 4 KiB; numeric limits are clamped to the safe caps in the Limits table.
+The historical `pascal-lsp` spelling is accepted as a compatibility alias,
+but new client configurations should use `pascalLsp`.
 
 ### Project selection protocol and Neovim picker
 
@@ -593,6 +781,49 @@ location list. Unsupported or ambiguous bindings are rejected rather than
 guessed; inherited or `with`-dependent lookup, unknown class ancestors, and unsupported
 overload relationships can therefore make a reference request fail.
 
+### Partial results
+
+`workspace/symbol` and `textDocument/references` accept the standard
+`partialResultToken` in either its string or integer form. When supplied, the
+server first computes and validates the complete bounded snapshot, then sends
+ordered result-array chunks as `$/progress` notifications using that token. A
+chunk contains at most 128 items and 64 KiB of encoded JSON (an individual item
+may not exceed the same byte bound); delivery sends at most one chunk per
+protocol turn and uses the bounded outbound writer queue without blocking the
+protocol thread. Workspace-symbol results retain their 10,000-entry limit.
+
+References are never streamed as soon as plausible matches are discovered:
+workspace membership, imports, binding identity, declaration inclusion, and
+all other completeness checks must succeed before the first reference chunk is
+published. This prevents a partial location list from being mistaken for a
+complete safe result. A source or configuration change during delivery stops
+the stream and returns a stale-result error; cancellation likewise stops future
+chunks and returns the request-cancelled error.
+
+Partial delivery is also subject to the global 33-recipient client-analysis
+admission bound: queued, running, coalesced, and already-delivering recipients
+all count, so a request beyond the bound receives a retryable queue-capacity
+error rather than creating unbounded retained work. Retained staged payloads
+are bounded to 64 MiB as well; a cancelled freshness validator continues to
+consume its bounded worker slot and retained-byte charge until it actually
+retires.
+An individual item larger than 64 KiB fails only its own partial request with a
+request-failed error; it does not terminate the LSP session or affect ordinary
+requests. Partial-result data uses nonblocking bounded output with reserved
+capacity for responses, cancellation, and progress control messages. Session
+shutdown performs a bounded output drain instead of waiting indefinitely for a
+client that stopped reading.
+
+After all chunks, the successful final response is an empty array so items are
+not duplicated. Empty results use only that final empty response. Without a
+`partialResultToken`, the ordinary complete array response is unchanged when it
+fits the bounded outbound control budget; an otherwise valid encoded response
+larger than 8 MiB returns a request-scoped error rather than terminating the
+session. Partial tokens are independent of work-done progress tokens, request
+IDs, and server IDs; active collisions are rejected and finished tokens may be
+reused. Coalesced recipients retain separate partial tokens and cancellation
+lifecycles.
+
 ### Document highlights
 
 `textDocument/documentHighlight` is restricted to the requested document and,
@@ -625,10 +856,81 @@ text, and open-buffer overlays are used in preference to disk content. Semantic
 token requests use the same bounded snapshots, cancellation, and stale-result
 checks as the other analysis queries.
 
+### Folding ranges
+
+The server advertises `textDocument/foldingRange` and returns sorted,
+deduplicated ranges for multiline Pascal declarations and implementations,
+classes, records, interfaces, begin/end and control-flow blocks, unit sections,
+multiline comments, and balanced `REGION`/`ENDREGION` directives. Single-line
+constructs and directive-looking text inside strings or comments are ignored.
+Conditional, parser-recovery, opaque, and unmatched regions are handled
+conservatively so a range does not hide source whose extent is uncertain.
+
+Ranges use the original source offsets and UTF-16 positions, including CRLF and
+non-BMP text. Open-buffer overlays take precedence over disk content. The
+request honors the client's `rangeLimit`, `lineFoldingOnly`, and
+`foldingRangeKind.valueSet` capabilities. Structural ranges are untagged;
+comments, imports, and explicit regions use the standard `comment`, `imports`,
+and `region` kinds. A zero range limit returns an empty list, and bounded
+analysis returns an explicit request failure rather than traversing without a
+limit. Folding is syntax-based and does not require imported units to resolve.
+
 All analysis queries run in bounded analysis workers. `$/cancelRequest` is honored,
 and source/configuration generations plus the observed read set are revalidated
 before delivery. A changed input produces a stale-result error for the client
 to retry rather than returning data computed from an older snapshot.
+
+### Selection ranges
+
+`textDocument/selectionRange` returns one range per requested cursor position.
+Each result is a strict inner-to-outer chain of syntax ranges, ending at the
+document range when necessary. Request order and duplicate positions are
+preserved. The query uses the original source snapshot, including open-buffer
+overlays, and reports UTF-16 positions correctly across CRLF and non-BMP text.
+
+Selection ranges are syntax-based and do not require imported units to resolve.
+Invalid UTF-16 boundaries, batches larger than 256 positions, excessive syntax
+depth, and excessive traversal work fail the request without partial results.
+Empty documents return a valid zero-length document range. Selection requests
+also honor cancellation and the same generation/read-set stale-result checks as
+the other bounded analysis queries.
+
+### Source documentation comments
+
+Hover, completion items, and signature help include source documentation when a
+documented comment is attached to the resolved declaration. A standalone
+Delphi `///` comment immediately before a declaration is attached; consecutive
+`///` lines may be joined across one line break. Block comments are attached
+only when they contain a supported documentation tag and are also standalone.
+Trailing comments, blank-line-separated comments, compiler directives,
+license/file-header comments, and comments belonging to another declaration do
+not attach. For a uniquely proven routine declaration/implementation pair,
+documentation on the visible declaration is preferred and implementation
+documentation is used only when the declaration has none. Overloads, helpers,
+generic specializations, and cross-unit declarations retain their resolved
+symbol identity.
+
+The supported XML-style subset includes `summary`, `remarks`, `param` (matched
+case-insensitively by name, including grouped parameters), `returns`, `code`/`c`,
+`paramref`, and `see`/`cref`. Basic XML entities are decoded; malformed or
+unsupported markup degrades to safe text, without external entity, file, or
+network access. Markdown and plaintext are selected independently for hover,
+completion documentation, and signature documentation according to the
+client's advertised formats, with plaintext as the fallback. Signature help
+also exposes the matching parameter's documentation separately.
+
+Documentation processing is bounded and cancellable:
+
+| Documentation limit | Value |
+| --- | ---: |
+| Source scan | 2 MiB |
+| Scanned comments | 8,192 |
+| Individual comment body | 64 KiB |
+| Individual XML tag | 4 KiB |
+| XML nesting depth | 64 levels |
+| Aggregate parsed documentation storage | 128 KiB |
+| Aggregate parser expansion work | 256 KiB |
+| Rendered documentation | 64 KiB |
 
 Disk discovery excludes descendants named `.git`, `.worktrees`, `target`,
 `node_modules`, `build`, `dist`, and similar generated directories. An explicit
@@ -674,6 +976,11 @@ Implemented and covered by tests:
 - Document/workspace symbols, semantic references, document-local highlights,
   and semantic tokens use the standard LSP requests and preserve UTF-16 source
   ranges.
+- Syntax folding covers multiline declarations, implementations, control-flow
+  blocks, unit sections, comments, and balanced regions with conservative
+  conditional/recovery handling.
+- Structural selection ranges return bounded, cancellable inner-to-outer syntax
+  chains while preserving request order and duplicate positions.
 - Generic type and routine substitution/inference covers explicit and inferred
   calls, nested and inherited specializations, constructor results, consistent
   multi-parameter inference, cross-unit type identity, and method/formal
@@ -691,16 +998,18 @@ Not implemented or incomplete:
 
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
-- Full compiler-equivalent conditional evaluation and include-file expansion.
-  The bounded analyzer does not infer `CompilerVersion`, `IFOPT`, or other host
-  compiler state. Unknown alternatives and relevant Pascal-dependent include
-  content can therefore produce no navigation result or block rename.
+- Full compiler-equivalent conditional evaluation is not implemented. The
+  bounded include expander does not infer `CompilerVersion`, `IFOPT`, or other
+  host compiler state. Unknown alternatives and Pascal-dependent include
+  expressions therefore produce no navigation result, withhold diagnostics,
+  or block rename rather than being guessed.
 - Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
   compiler-equivalent search-path/configuration loading.
-- Compiler-equivalent overload selection, auto-imports, snippets, and anonymous
-  callable inference are not implemented. Completion and signature help remain
-  conservative when imports, conditionals, receivers, or parser state are
-  unknown.
+- Compiler-equivalent overload selection and anonymous callable inference are
+  not implemented. Completion and signature help remain conservative when
+  imports, conditionals, receivers, or parser state are unknown; snippets are
+  limited to source-proven named routines and do not model anonymous or
+  compiler-only variadic callables.
 - A general Delphi type checker is not implemented; semantic-token precision is
   limited to bindings proven by the source index.
 
@@ -732,12 +1041,15 @@ directory, evaluated `DCC_IncludePath`, then ordered unit/client source paths.
 Nested includes are audited within depth, file, directive, and byte limits;
 lookup observations and content hashes participate in stale-input checks.
 Comments and recognized compiler-only directives, including conditional compiler
-flags, do not by themselves block a rename. Known-inactive unresolved includes
-are skipped; active or unknown unresolved includes still block. Pascal-dependent
-conditional expressions and relevant source-bearing includes remain unsupported;
-missing or unreadable includes cannot be treated as evidence that no reference
-exists. Source conditional compilation is projected for analysis rather than
-textually expanded. Unit/module renames (which require
+flags, do not by themselves block a rename. Fully resolved and audited active
+source-bearing includes may contribute physical edits in their `.inc` or Pascal
+sources; the planner maps virtual edits back to those files and rejects
+synthetic, cross-segment, external, stale, or incomplete edits. Known-inactive
+unresolved includes are skipped; active or unknown unresolved includes still
+block. Pascal-dependent conditional expressions and incomplete include audits
+remain unsupported; missing or unreadable includes cannot be treated as
+evidence that no reference exists. Source conditional compilation is projected
+for analysis rather than textually expanded. Unit/module renames (which require
 `RenameFile`), inherited or `with`-dependent lookup, overloaded/override relationships,
 compiled-only consumers, and other unsupported bindings are also rejected by
 the shared planner. Name collisions and reference capture are rejected before
@@ -788,7 +1100,11 @@ parameters, and 256 KiB of aggregate signature metadata. Completion reports
 item truncation as `isIncomplete` and fails closed when context traversal cannot
 finish; typed `with` context traversal is capped at 64 nested contexts and also
 reports incomplete rather than guessing. Signature help fails closed when its
-bounded parser or output limit is exceeded.
+bounded parser or output limit is exceeded. Deferred completion state retains
+at most 2,048 items and 8 MiB in one server session, with compact dependency
+observations capped at 1,024 records and 2 MiB. Resolve data is capped at 512
+bytes per item and retained completion items at 64 KiB; oldest entries are
+evicted to stay within the bounds.
 
 Linting and formatting reject syntax trees deeper than 256 levels to protect
 their recursive analysis pipelines. Navigation uses iterative tree walks. LSP

@@ -1,17 +1,19 @@
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, Origin,
-    ROOT_SCOPE, Region, RoutineKind, Span, Symbol, SymbolKind, canonical_name, location_for_span,
-    node_text, symbol_is_available_at, symbol_visible_in_region,
+    ROOT_SCOPE, Receiver, Region, RoutineKind, Span, Symbol, SymbolKind, TypeKind, canonical_name,
+    documentation, location_for_span, node_text, symbol_is_available_at, symbol_visible_in_region,
 };
 use crate::text;
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionList, CompletionTextEdit, Hover, HoverContents,
-    Location, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, Position, Range,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionTextEdit,
+    Documentation as LspDocumentation, Hover, HoverContents, InsertTextFormat, Location,
+    MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, Position, Range,
     SignatureHelp, SignatureInformation, TextEdit, Url,
 };
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +34,7 @@ const MAX_SIGNATURE_LABEL_BYTES: usize = 128 * 1024;
 const MAX_SIGNATURE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_SIGNATURE_PARAMETERS: usize = 4096;
 const MAX_TRAILING_MEMBER_DOT_GAP_BYTES: usize = 256;
+const MAX_INDEXED_TERMINAL_ALIAS_DEPTH: usize = 32;
 
 #[cfg(test)]
 static COMPLETION_SYMBOL_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -51,9 +54,10 @@ fn record_assistance_helper_entry(counter: &'static std::thread::LocalKey<Cell<u
 struct CompletionAccumulator<'a> {
     prefix: String,
     completion_is_declaration: bool,
-    candidates: HashMap<String, (Candidate, usize)>,
+    candidates: HashMap<String, (CompletionCandidate, usize)>,
     inaccessible: HashMap<String, usize>,
     uncertain: HashMap<String, usize>,
+    ambiguous_signatures: HashSet<String>,
     scanned: usize,
     exhausted: bool,
     is_incomplete: bool,
@@ -86,6 +90,7 @@ impl<'a> CompletionAccumulator<'a> {
             candidates: HashMap::new(),
             inaccessible: HashMap::new(),
             uncertain: HashMap::new(),
+            ambiguous_signatures: HashSet::new(),
             scanned: 0,
             exhausted: false,
             is_incomplete: false,
@@ -109,7 +114,14 @@ impl<'a> CompletionAccumulator<'a> {
         Ok(true)
     }
 
-    fn insert(&mut self, candidate: Candidate, symbol: &Symbol, precedence: usize) {
+    fn insert(
+        &mut self,
+        candidate: Candidate,
+        substitution: Option<&GenericSubstitution>,
+        symbol: &Symbol,
+        precedence: usize,
+        auto_import: Option<AutoImportCandidate>,
+    ) {
         if let Some(inaccessible_precedence) = self.inaccessible.get(&symbol.key).copied() {
             if inaccessible_precedence < precedence {
                 return;
@@ -122,13 +134,51 @@ impl<'a> CompletionAccumulator<'a> {
             }
             self.uncertain.remove(&symbol.key);
         }
-        let replace = self
-            .candidates
-            .get(&symbol.key)
-            .is_none_or(|(_, current_precedence)| precedence < *current_precedence);
+        let Some((current, current_precedence)) = self.candidates.get(&symbol.key) else {
+            self.candidates.insert(
+                symbol.key.clone(),
+                (
+                    CompletionCandidate {
+                        candidate,
+                        substitution: substitution.cloned(),
+                        auto_import,
+                        routine_key: symbol.routine_key.clone(),
+                        signature_ambiguous: false,
+                    },
+                    precedence,
+                ),
+            );
+            return;
+        };
+        if precedence > *current_precedence {
+            return;
+        }
+        if precedence == *current_precedence
+            && current
+                .routine_key
+                .as_ref()
+                .zip(symbol.routine_key.as_ref())
+                .is_some_and(|(current, incoming)| current != incoming)
+        {
+            self.ambiguous_signatures.insert(symbol.key.clone());
+            return;
+        }
+        let replace = precedence < *current_precedence;
         if replace {
-            self.candidates
-                .insert(symbol.key.clone(), (candidate, precedence));
+            self.ambiguous_signatures.remove(&symbol.key);
+            self.candidates.insert(
+                symbol.key.clone(),
+                (
+                    CompletionCandidate {
+                        candidate,
+                        substitution: substitution.cloned(),
+                        auto_import,
+                        routine_key: symbol.routine_key.clone(),
+                        signature_ambiguous: false,
+                    },
+                    precedence,
+                ),
+            );
         }
     }
 
@@ -183,6 +233,73 @@ pub(crate) struct DeclarationDisplay {
     pub(crate) excerpt: String,
     pub(crate) source_uri: Url,
     pub(crate) source_start: usize,
+    pub(crate) documentation: Option<Arc<documentation::Documentation>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionOptions {
+    pub(crate) format: MarkupKind,
+    pub(crate) defer_documentation: bool,
+    pub(crate) defer_detail: bool,
+    pub(crate) snippet_support: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionResult {
+    pub(crate) list: CompletionList,
+    pub(crate) seeds: Vec<CompletionResolutionSeed>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionResolutionSeed {
+    candidate: Candidate,
+    substitution: Option<GenericSubstitution>,
+    auto_import: Option<AutoImportCandidate>,
+}
+
+impl CompletionResolutionSeed {
+    #[cfg(test)]
+    pub(crate) fn test_new(uri: Url, index: usize) -> Self {
+        Self {
+            candidate: Candidate { uri, index },
+            substitution: None,
+            auto_import: None,
+        }
+    }
+
+    pub(crate) fn candidate_uri(&self) -> &Url {
+        &self.candidate.uri
+    }
+
+    pub(crate) fn candidate_index(&self) -> usize {
+        self.candidate.index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_substitution(&self) -> bool {
+        self.substitution.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionMetadata {
+    pub(crate) detail: Option<String>,
+    pub(crate) documentation: Option<LspDocumentation>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionCandidate {
+    candidate: Candidate,
+    substitution: Option<GenericSubstitution>,
+    auto_import: Option<AutoImportCandidate>,
+    routine_key: Option<String>,
+    signature_ambiguous: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AutoImportCandidate {
+    unit_name: String,
+    additional_text_edits: Vec<TextEdit>,
 }
 
 struct SpecializedRoutineSignature {
@@ -191,20 +308,64 @@ struct SpecializedRoutineSignature {
     parameter_spans: Vec<Span>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionCallContext {
+    Callable,
+    ExistingCall,
+    Conservative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedCompletionValue {
+    Callable,
+    NonCallable,
+    Unknown,
+}
+
+fn empty_completion_result() -> CompletionResult {
+    CompletionResult {
+        list: CompletionList::default(),
+        seeds: Vec::new(),
+    }
+}
+
 impl NavigationIndex {
     /// Return bounded, source-based completion items for the identifier or
     /// member expression at `position`.
     pub fn completion(&self, uri: &Url, position: Position) -> Result<CompletionList, String> {
         let cancel = AtomicBool::new(false);
-        self.completion_with_cancel(uri, position, &cancel)
+        self.completion_with_cancel(uri, position, MarkupKind::Markdown, &cancel)
     }
 
     pub(crate) fn completion_with_cancel(
         &self,
         uri: &Url,
         position: Position,
+        format: MarkupKind,
         cancel: &AtomicBool,
     ) -> Result<CompletionList, String> {
+        Ok(self
+            .completion_with_cancel_and_options(
+                uri,
+                position,
+                CompletionOptions {
+                    format,
+                    defer_documentation: false,
+                    defer_detail: false,
+                    snippet_support: false,
+                },
+                cancel,
+            )?
+            .list)
+    }
+
+    pub(crate) fn completion_with_cancel_and_options(
+        &self,
+        uri: &Url,
+        position: Position,
+        options: CompletionOptions,
+        cancel: &AtomicBool,
+    ) -> Result<CompletionResult, String> {
         check_cancel(cancel)?;
         let mut budget = AssistanceBudget::new(
             MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
@@ -212,16 +373,19 @@ impl NavigationIndex {
             "completion",
         );
         let Some(document) = self.documents.get(uri) else {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         };
         let Some(offset) = text::position_to_offset(&document.source, position) else {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         };
         let anchor = offset.saturating_sub(1);
         if completion_position_is_conditionally_unknown(document, offset, anchor) {
-            return Ok(CompletionList {
-                is_incomplete: true,
-                items: Vec::new(),
+            return Ok(CompletionResult {
+                list: CompletionList {
+                    is_incomplete: true,
+                    items: Vec::new(),
+                },
+                seeds: Vec::new(),
             });
         }
         if completion_position_is_ignored_with_budget(
@@ -231,7 +395,7 @@ impl NavigationIndex {
             cancel,
             &mut budget,
         )? {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         }
         if unsupported_context_at(
             document,
@@ -241,7 +405,7 @@ impl NavigationIndex {
             MAX_COMPLETION_CONTEXT_NODES,
             "completion",
         )? {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         }
 
         let prefix_start =
@@ -271,7 +435,7 @@ impl NavigationIndex {
             .map_or(offset, |identifier| identifier.end_byte());
         if let Some(identifier) = identifier {
             if unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)? {
-                return Ok(CompletionList::default());
+                return Ok(empty_completion_result());
             }
         }
         let member = member_expression_for_completion(
@@ -283,8 +447,24 @@ impl NavigationIndex {
             &mut budget,
         )?;
         if matches!(member, CompletionMember::Unsupported) {
-            return Ok(CompletionList::default());
+            return Ok(empty_completion_result());
         }
+        let call_context = if options.snippet_support {
+            completion_call_context(
+                self,
+                uri,
+                document,
+                offset,
+                prefix_start,
+                replacement_end,
+                identifier,
+                &member,
+                cancel,
+                &mut budget,
+            )?
+        } else {
+            CompletionCallContext::Conservative
+        };
         let (candidates, mut is_incomplete) = self.completion_candidates(
             uri,
             document,
@@ -303,28 +483,227 @@ impl NavigationIndex {
         };
         let response_truncated = candidates.len() > MAX_COMPLETION_ITEMS;
         let mut items = Vec::with_capacity(candidates.len().min(MAX_COMPLETION_ITEMS));
-        for candidate in candidates.into_iter().take(MAX_COMPLETION_ITEMS) {
+        let mut seeds = Vec::with_capacity(candidates.len().min(MAX_COMPLETION_ITEMS));
+        for completion_candidate in candidates.into_iter().take(MAX_COMPLETION_ITEMS) {
             check_cancel(cancel)?;
-            let Some(symbol) = self.symbol(&candidate) else {
+            let candidate = &completion_candidate.candidate;
+            let Some(symbol) = self.symbol(candidate) else {
                 continue;
             };
             budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
+            let display = if !options.defer_detail {
+                self.declaration_display(
+                    candidate,
+                    completion_candidate.substitution.as_ref(),
+                    cancel,
+                    &mut budget,
+                )?
+            } else {
+                None
+            };
+            let documentation = if options.defer_documentation {
+                None
+            } else {
+                let documentation = self
+                    .documents
+                    .get(&candidate.uri)
+                    .and_then(|document| document.documentation.get(candidate.index))
+                    .and_then(Option::as_ref);
+                render_lsp_documentation(documentation, options.format.clone(), cancel)?
+            };
+            budget.require_bytes(documentation.as_ref().map_or(0, documentation_size), cancel)?;
+            budget.require_bytes(
+                display.as_ref().map_or(0, |display| display.excerpt.len()),
+                cancel,
+            )?;
+            let auto_import = completion_candidate.auto_import.clone();
+            let detail =
+                completion_detail(display.map(|display| display.excerpt), auto_import.as_ref());
+            budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
+            let snippet = if matches!(call_context, CompletionCallContext::Callable)
+                && symbol.kind == SymbolKind::Routine
+                && !completion_candidate.signature_ambiguous
+            {
+                routine_call_snippet(
+                    self,
+                    candidate,
+                    symbol,
+                    completion_candidate.substitution.as_ref(),
+                    cancel,
+                    &mut budget,
+                )?
+            } else {
+                None
+            };
+            budget.require_bytes(snippet.as_ref().map_or(0, String::len), cancel)?;
+            let insertion_text = snippet.as_deref().unwrap_or(&symbol.name);
             items.push(CompletionItem {
                 label: symbol.name.clone(),
                 kind: Some(completion_kind(symbol.kind)),
+                detail,
+                documentation,
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                     range,
-                    symbol.name.clone(),
+                    insertion_text.to_owned(),
                 ))),
+                additional_text_edits: auto_import
+                    .as_ref()
+                    .map(|auto_import| auto_import.additional_text_edits.clone()),
+                insert_text_format: snippet.map(|_| InsertTextFormat::SNIPPET),
                 ..CompletionItem::default()
+            });
+            seeds.push(CompletionResolutionSeed {
+                candidate: candidate.clone(),
+                substitution: completion_candidate.substitution,
+                auto_import,
             });
         }
         if response_truncated {
             is_incomplete = true;
         }
-        Ok(CompletionList {
-            is_incomplete,
-            items,
+        Ok(CompletionResult {
+            list: CompletionList {
+                is_incomplete,
+                items,
+            },
+            seeds,
+        })
+    }
+
+    /// Determine whether the completion context can produce an unqualified
+    /// auto-import candidate.
+    ///
+    /// This deliberately reuses the same syntax-aware context checks as the
+    /// completion path. The workspace snapshot uses the result only to
+    /// decide whether bounded provider observations must be retained for
+    /// deferred-resolution freshness; it must never use a less accurate raw
+    /// source-text approximation for that decision.
+    pub(crate) fn completion_context_may_auto_import(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        check_cancel(cancel)?;
+        let mut budget = AssistanceBudget::new(
+            MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
+            MAX_HOVER_VALUE_BYTES,
+            "completion context",
+        );
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(true);
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(true);
+        };
+        let anchor = offset.saturating_sub(1);
+        if completion_position_is_conditionally_unknown(document, offset, anchor)
+            || completion_position_is_ignored_with_budget(
+                document,
+                offset,
+                anchor,
+                cancel,
+                &mut budget,
+            )?
+            || unsupported_context_at(
+                document,
+                offset,
+                cancel,
+                &mut budget,
+                MAX_COMPLETION_CONTEXT_NODES,
+                "completion context",
+            )?
+        {
+            return Ok(false);
+        }
+
+        let prefix_start =
+            identifier_prefix_start_with_budget(&document.source, offset, cancel, &mut budget)?;
+        if document
+            .source
+            .get(prefix_start..offset)
+            .is_none_or(|prefix| prefix.is_empty())
+        {
+            return Ok(false);
+        }
+        let identifier = identifier_at_with_budget(
+            document.tree.root_node(),
+            anchor,
+            cancel,
+            &mut budget,
+            "completion context",
+        )?
+        .or(identifier_at_with_budget(
+            document.tree.root_node(),
+            offset,
+            cancel,
+            &mut budget,
+            "completion context",
+        )?);
+        if let Some(identifier) = identifier {
+            if unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)? {
+                return Ok(false);
+            }
+        }
+        let member = member_expression_for_completion(
+            document,
+            offset,
+            prefix_start,
+            identifier,
+            cancel,
+            &mut budget,
+        )?;
+        Ok(matches!(member, CompletionMember::Unqualified))
+    }
+
+    pub(crate) fn completion_metadata_for_seed(
+        &self,
+        seed: &CompletionResolutionSeed,
+        format: MarkupKind,
+        resolve_documentation: bool,
+        resolve_detail: bool,
+        cancel: &AtomicBool,
+    ) -> Result<CompletionMetadata, String> {
+        check_cancel(cancel)?;
+        let mut budget = AssistanceBudget::new(
+            MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
+            MAX_HOVER_VALUE_BYTES,
+            "completion resolve",
+        );
+        let Some(symbol) = self.symbol(&seed.candidate) else {
+            return Err(
+                "completion declaration disappeared while resolving; retry the request".to_string(),
+            );
+        };
+        budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
+        let detail = if resolve_detail {
+            let declaration = self
+                .declaration_display(
+                    &seed.candidate,
+                    seed.substitution.as_ref(),
+                    cancel,
+                    &mut budget,
+                )?
+                .map(|display| display.excerpt);
+            completion_detail(declaration, seed.auto_import.as_ref())
+        } else {
+            None
+        };
+        let documentation = if resolve_documentation {
+            let documentation = self
+                .documents
+                .get(&seed.candidate.uri)
+                .and_then(|document| document.documentation.get(seed.candidate.index))
+                .and_then(Option::as_ref);
+            render_lsp_documentation(documentation, format, cancel)?
+        } else {
+            None
+        };
+        budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
+        budget.require_bytes(documentation.as_ref().map_or(0, documentation_size), cancel)?;
+        Ok(CompletionMetadata {
+            detail,
+            documentation,
         })
     }
 
@@ -338,13 +717,14 @@ impl NavigationIndex {
         position: Position,
     ) -> Result<Option<SignatureHelp>, String> {
         let cancel = AtomicBool::new(false);
-        self.signature_help_with_cancel(uri, position, &cancel)
+        self.signature_help_with_cancel(uri, position, MarkupKind::Markdown, &cancel)
     }
 
     pub(crate) fn signature_help_with_cancel(
         &self,
         uri: &Url,
         position: Position,
+        format: MarkupKind,
         cancel: &AtomicBool,
     ) -> Result<Option<SignatureHelp>, String> {
         check_cancel(cancel)?;
@@ -551,7 +931,7 @@ impl NavigationIndex {
                 ));
             }
             budget.require_bytes(signature_bytes, cancel)?;
-            let Some(parameters) = parameter_information_for_spans_with_budget(
+            let Some(mut parameters) = parameter_information_for_spans_with_budget(
                 &signature.parameter_spans,
                 &signature.label,
                 signature.label_start,
@@ -567,11 +947,50 @@ impl NavigationIndex {
                     "signature help exceeds the {MAX_SIGNATURE_PARAMETERS}-parameter limit"
                 ));
             }
+            let documentation = document
+                .documentation
+                .get(candidate.index)
+                .and_then(|documentation| documentation.as_ref());
+            let signature_documentation =
+                render_lsp_signature_documentation(documentation, format.clone(), cancel)?;
+            if let Some(documentation) = documentation {
+                for (index, parameter) in parameters.iter_mut().enumerate() {
+                    check_cancel(cancel)?;
+                    let Some(name) = symbol.routine_parameters.get(index).and_then(|parameter| {
+                        document
+                            .source
+                            .get(parameter.span.start..parameter.span.end)
+                    }) else {
+                        continue;
+                    };
+                    let Some(value) = documentation.parameter(name, format.clone(), cancel)? else {
+                        continue;
+                    };
+                    parameter.documentation = Some(lsp_documentation(value, format.clone()));
+                }
+            }
+            let documentation_bytes = signature_documentation
+                .as_ref()
+                .map_or(0, documentation_size)
+                .saturating_add(
+                    parameters
+                        .iter()
+                        .filter_map(|parameter| parameter.documentation.as_ref())
+                        .map(documentation_size)
+                        .sum::<usize>(),
+                );
+            response_bytes = response_bytes.saturating_add(documentation_bytes);
+            if response_bytes > MAX_SIGNATURE_RESPONSE_BYTES {
+                return Err(format!(
+                    "signature help exceeds the {MAX_SIGNATURE_RESPONSE_BYTES}-byte response limit"
+                ));
+            }
+            budget.require_bytes(documentation_bytes, cancel)?;
             signatures.push((
                 super::overload::key_for_candidate(self, &candidate),
                 SignatureInformation {
                     label: signature.label,
-                    documentation: None,
+                    documentation: signature_documentation,
                     parameters: Some(parameters),
                     active_parameter: None,
                 },
@@ -608,13 +1027,16 @@ impl NavigationIndex {
         lookup_identifier: Option<Node<'_>>,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<(Vec<Candidate>, bool), String> {
+    ) -> Result<(Vec<CompletionCandidate>, bool), String> {
         let completion_is_declaration = current_document.symbols.iter().any(|current| {
             current.declaration_ordered
                 && current.span.start <= offset
                 && offset <= current.span.end
         });
         let mut accumulator = CompletionAccumulator::new(prefix, completion_is_declaration, budget);
+        if self.auto_import_discovery_complete == Some(false) {
+            accumulator.is_incomplete = true;
+        }
         let mut private_spans = HashMap::new();
         let unqualified = matches!(&member, CompletionMember::Unqualified);
         let member_receivers = match member {
@@ -918,18 +1340,38 @@ impl NavigationIndex {
                     }
                 }
             }
+
+            if unqualified
+                && !suppress_unqualified_globals
+                && !accumulator.prefix.is_empty()
+                && self.auto_import_discovery_complete == Some(true)
+            {
+                self.add_auto_import_completion_candidates(
+                    &mut accumulator,
+                    current_uri,
+                    current_document,
+                    offset,
+                    &mut private_spans,
+                    precedence.saturating_add(1),
+                    cancel,
+                )?;
+            }
         }
 
         if !accumulator.uncertain.is_empty() {
             accumulator.is_incomplete = true;
         }
+        let ambiguous_signatures = accumulator.ambiguous_signatures;
         let mut candidates = std::mem::take(&mut accumulator.candidates)
-            .into_values()
-            .map(|(candidate, _)| candidate)
-            .collect::<Vec<_>>();
+            .into_iter()
+            .map(|(key, (mut candidate, _))| {
+                candidate.signature_ambiguous = ambiguous_signatures.contains(&key);
+                candidate
+            })
+            .collect::<Vec<CompletionCandidate>>();
         candidates.sort_by(|left, right| {
-            let left_symbol = self.symbol(left);
-            let right_symbol = self.symbol(right);
+            let left_symbol = self.symbol(&left.candidate);
+            let right_symbol = self.symbol(&right.candidate);
             left_symbol
                 .map(|symbol| canonical_name(&symbol.name))
                 .cmp(&right_symbol.map(|symbol| canonical_name(&symbol.name)))
@@ -938,8 +1380,13 @@ impl NavigationIndex {
                         .map(|symbol| symbol.name.as_str())
                         .cmp(&right_symbol.map(|symbol| symbol.name.as_str()))
                 })
-                .then_with(|| left.uri.as_str().cmp(right.uri.as_str()))
-                .then_with(|| left.index.cmp(&right.index))
+                .then_with(|| {
+                    left.candidate
+                        .uri
+                        .as_str()
+                        .cmp(right.candidate.uri.as_str())
+                })
+                .then_with(|| left.candidate.index.cmp(&right.candidate.index))
         });
         Ok((candidates, accumulator.is_incomplete))
     }
@@ -1247,6 +1694,221 @@ impl NavigationIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn add_auto_import_completion_candidates(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        private_spans: &mut HashMap<Url, HashSet<super::Span>>,
+        precedence: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let region = current_document.region_at(offset);
+        if !matches!(region, Region::Interface | Region::Implementation) {
+            return Ok(());
+        }
+        let active_uses =
+            current_document.active_uses_with_budget(region, cancel, accumulator.budget)?;
+        if active_uses
+            .iter()
+            .any(|unit| current_document.unknown_imports.contains(unit.as_str()))
+        {
+            return Ok(());
+        }
+        let active_units = active_uses
+            .into_iter()
+            .map(|unit| canonical_name(unit))
+            .collect::<HashSet<_>>();
+        let imported_provider_uris = current_document
+            .active_uses(region)
+            .into_iter()
+            .flat_map(|unit| self.unit_urls_for_import(current_document, unit))
+            .collect::<HashSet<_>>();
+
+        let mut unit_providers = HashMap::<String, Vec<Url>>::new();
+        for (unit_name, providers) in &self.auto_import_unit_providers {
+            let unit_name = unit_import_key(unit_name);
+            if unit_name.is_empty()
+                || active_units.contains(&unit_name)
+                || unit_name == unit_import_key(&current_document.unit_name)
+            {
+                continue;
+            }
+            for uri in providers {
+                if uri != current_uri && !imported_provider_uris.contains(uri) {
+                    unit_providers
+                        .entry(unit_name.clone())
+                        .or_default()
+                        .push(uri.clone());
+                }
+            }
+        }
+        for (uri, document) in &self.documents {
+            check_cancel(cancel)?;
+            if !self
+                .auto_import_unit_providers
+                .get(&unit_import_key(&document.unit_name))
+                .is_some_and(|providers| providers.iter().any(|provider| provider == uri))
+            {
+                continue;
+            }
+            if uri == current_uri
+                || imported_provider_uris.contains(uri)
+                || active_units.contains(&document.unit_name)
+                || document.unit_name == current_document.unit_name
+                || document.unit_name.is_empty()
+            {
+                continue;
+            }
+            unit_providers
+                .entry(unit_import_key(&document.unit_name))
+                .or_default()
+                .push(uri.clone());
+        }
+        for providers in unit_providers.values_mut() {
+            providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            providers.dedup();
+        }
+
+        let mut by_symbol = HashMap::<String, Vec<(Candidate, String, Url)>>::new();
+        for (uri, document) in &self.documents {
+            let Some(providers) = unit_providers.get(&unit_import_key(&document.unit_name)) else {
+                continue;
+            };
+            if providers.len() != 1 || providers[0] != *uri {
+                continue;
+            }
+            for index in &document.exported_symbol_indices {
+                check_cancel(cancel)?;
+                if !accumulator.take_scan_slot(cancel)? {
+                    return Ok(());
+                }
+                let Some(symbol) = document.symbols.get(*index) else {
+                    continue;
+                };
+                if symbol.owner_type.is_some()
+                    || symbol.kind == SymbolKind::Unit
+                    || symbol.local_only
+                    || symbol.region != Region::Interface
+                    || symbol.origin != Origin::Declaration
+                    || symbol.unresolved_abbreviated
+                    || !completion_symbol_kind_supported(symbol.kind)
+                    || document.interface_range.is_none()
+                    || document
+                        .interface_range
+                        .is_some_and(|range| document.has_parser_recovery_near(range))
+                    || !accumulator.matches(symbol)
+                    || self.candidate_is_conditionally_unavailable(&Candidate {
+                        uri: uri.clone(),
+                        index: *index,
+                    })
+                {
+                    continue;
+                }
+                by_symbol.entry(symbol.key.clone()).or_default().push((
+                    Candidate {
+                        uri: uri.clone(),
+                        index: *index,
+                    },
+                    document.unit_display_name.clone(),
+                    uri.clone(),
+                ));
+            }
+        }
+
+        for candidates in by_symbol.into_values() {
+            check_cancel(cancel)?;
+            let mut provider_uris = candidates
+                .iter()
+                .map(|(_, _, uri)| uri.clone())
+                .collect::<Vec<_>>();
+            provider_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            provider_uris.dedup();
+            if provider_uris.len() != 1 || candidates.len() != 1 {
+                continue;
+            }
+            let (candidate, unit_name, _) = candidates
+                .into_iter()
+                .next()
+                .expect("candidate count checked above");
+            let mut state = super::ResolutionState::new();
+            match self.candidate_access_decision_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                &candidate,
+                &mut state,
+                cancel,
+                accumulator.budget,
+            )? {
+                super::AccessDecision::Visible => {}
+                super::AccessDecision::Unknown => {
+                    accumulator.is_incomplete = true;
+                    continue;
+                }
+                super::AccessDecision::Inaccessible => continue,
+            }
+            let Some(edit) = auto_import_edit(
+                current_document,
+                region,
+                &unit_name,
+                &self.uses_clause_spans(current_document, region),
+                offset,
+                cancel,
+                accumulator.budget,
+            )?
+            else {
+                continue;
+            };
+            self.add_completion_candidate_with_substitution_and_import(
+                accumulator,
+                candidate,
+                None,
+                current_uri,
+                private_spans,
+                precedence,
+                offset,
+                cancel,
+                Some(AutoImportCandidate {
+                    unit_name,
+                    additional_text_edits: vec![edit],
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn candidate_is_conditionally_unavailable(&self, candidate: &Candidate) -> bool {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return true;
+        };
+        let Some(symbol) = document.symbols.get(candidate.index) else {
+            return true;
+        };
+        document
+            .conditional_unknown_symbols
+            .get(candidate.index)
+            .copied()
+            .unwrap_or(true)
+            || document
+                .conditionals
+                .inactive_spans
+                .iter()
+                .any(|span| span.start <= symbol.span.start && symbol.span.end <= span.end)
+    }
+
+    fn uses_clause_spans(&self, document: &Document, region: Region) -> Vec<Span> {
+        let mut spans = Vec::new();
+        super::collect_nodes(document.tree.root_node(), &mut |node| {
+            if node.kind() == "declUses" && super::region_for_node(node) == region {
+                spans.push(Span::from_node(node));
+            }
+        });
+        spans
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn add_member_completion_candidates(
         &self,
         accumulator: &mut CompletionAccumulator,
@@ -1304,12 +1966,13 @@ impl NavigationIndex {
                     routine_keys.insert(key.clone());
                 }
             }
-            self.add_completion_candidate(
+            self.add_completion_candidate_with_substitution(
                 accumulator,
                 Candidate {
                     uri: candidate.uri.clone(),
                     index: candidate.index,
                 },
+                Some(substitution),
                 current_uri,
                 candidate.uri != *current_uri,
                 private_spans,
@@ -1332,6 +1995,58 @@ impl NavigationIndex {
         precedence: usize,
         offset: usize,
         cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.add_completion_candidate_with_substitution(
+            accumulator,
+            candidate,
+            None,
+            current_uri,
+            _member_access,
+            _private_spans,
+            precedence,
+            offset,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_completion_candidate_with_substitution(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        candidate: Candidate,
+        substitution: Option<&GenericSubstitution>,
+        current_uri: &Url,
+        _member_access: bool,
+        _private_spans: &mut HashMap<Url, HashSet<super::Span>>,
+        precedence: usize,
+        offset: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.add_completion_candidate_with_substitution_and_import(
+            accumulator,
+            candidate,
+            substitution,
+            current_uri,
+            _private_spans,
+            precedence,
+            offset,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_completion_candidate_with_substitution_and_import(
+        &self,
+        accumulator: &mut CompletionAccumulator,
+        candidate: Candidate,
+        substitution: Option<&GenericSubstitution>,
+        current_uri: &Url,
+        _private_spans: &mut HashMap<Url, HashSet<super::Span>>,
+        precedence: usize,
+        offset: usize,
+        cancel: &AtomicBool,
+        auto_import: Option<AutoImportCandidate>,
     ) -> Result<(), String> {
         check_cancel(cancel)?;
         let Some(symbol) = self.symbol(&candidate) else {
@@ -1389,7 +2104,7 @@ impl NavigationIndex {
                 return Ok(());
             }
         }
-        accumulator.insert(candidate, symbol, precedence);
+        accumulator.insert(candidate, substitution, symbol, precedence, auto_import);
         Ok(())
     }
 
@@ -2343,6 +3058,11 @@ impl NavigationIndex {
             excerpt,
             source_uri: candidate.uri.clone(),
             source_start: symbol.declaration_span.start,
+            documentation: document
+                .documentation
+                .get(candidate.index)
+                .cloned()
+                .flatten(),
         }))
     }
 }
@@ -2425,6 +3145,24 @@ fn identifier_prefix_start_with_budget(
         start -= 1;
     }
     Ok(start)
+}
+
+pub(crate) fn completion_prefix_at_position(source: &str, position: Position) -> Option<String> {
+    let offset = text::position_to_offset(source, position)?;
+    let mut start = offset;
+    while start > 0 {
+        let (candidate, character) = source[..start].char_indices().next_back()?;
+        if is_identifier_continue(character) {
+            start = candidate;
+        } else {
+            break;
+        }
+    }
+    if start > 0 && source.as_bytes().get(start - 1) == Some(&b'&') {
+        start -= 1;
+    }
+    let prefix = source.get(start..offset)?;
+    (!prefix.is_empty()).then(|| prefix.to_owned())
 }
 
 fn is_identifier_continue(character: char) -> bool {
@@ -2533,6 +3271,1280 @@ fn member_expression_for_completion<'a>(
     Ok(result.unwrap_or(CompletionMember::Unsupported))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn completion_call_context(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    document: &Document,
+    offset: usize,
+    prefix_start: usize,
+    replacement_end: usize,
+    identifier: Option<Node<'_>>,
+    member: &CompletionMember<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<CompletionCallContext, String> {
+    let target = identifier.or(match member {
+        CompletionMember::Node(node) | CompletionMember::Expression(node) => Some(*node),
+        CompletionMember::Bare { end, .. } => node_at_offset(
+            document.tree.root_node(),
+            end.saturating_sub(1),
+            cancel,
+            budget,
+            MAX_COMPLETION_CONTEXT_NODES,
+            "completion",
+        )?,
+        CompletionMember::Unqualified | CompletionMember::Unsupported => None,
+    });
+    let target = if let Some(target) = target {
+        target
+    } else {
+        let Some(target) = node_at_offset(
+            document.tree.root_node(),
+            offset,
+            cancel,
+            budget,
+            MAX_COMPLETION_CONTEXT_NODES,
+            "completion",
+        )?
+        else {
+            return Ok(CompletionCallContext::Conservative);
+        };
+        target
+    };
+    let target_span = Span::from_node(target);
+    let mut expression_role = false;
+    let mut expected_value = None;
+
+    budget.require_work(document.parser_recovery_spans.len(), cancel)?;
+
+    for ancestor in std::iter::once(target).chain(Ancestors::new(target)) {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let ancestor_span = Span::from_node(ancestor);
+        if matches!(
+            ancestor.kind(),
+            "statement"
+                | "assignment"
+                | "exprCall"
+                | "exprArgs"
+                | "exprDot"
+                | "exprTpl"
+                | "exprBinary"
+                | "exprUnary"
+                | "exprParens"
+                | "exprSubscript"
+                | "exprBrackets"
+                | "exprAs"
+                | "exprConditional"
+                | "caseLabel"
+        ) && !matches!(member, CompletionMember::Bare { .. })
+            && document.parser_recovery_spans.iter().any(|recovery| {
+                recovery.start <= ancestor_span.end && recovery.end >= ancestor_span.start
+            })
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if (ancestor.is_error() || ancestor.is_missing())
+            && !matches!(member, CompletionMember::Bare { .. })
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if ancestor.kind() == "exprCall"
+            && ancestor
+                .child_by_field_name("entity")
+                .is_some_and(|entity| {
+                    Span::from_node(entity).contains(target_span)
+                        || Span::from_node(entity).contains_offset(target_span.start)
+                })
+        {
+            if let Some(entity) = ancestor.child_by_field_name("entity") {
+                if source_open_paren(document, entity, ancestor, cancel, budget)?
+                    .is_some_and(|open| open >= replacement_end)
+                {
+                    return Ok(CompletionCallContext::ExistingCall);
+                }
+            }
+        }
+        if ancestor.kind() == "assignment" {
+            let Some(lhs) = ancestor.child_by_field_name("lhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            let Some(rhs) = ancestor.child_by_field_name("rhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(lhs).contains(target_span) {
+                return Ok(CompletionCallContext::Conservative);
+            }
+            if !Span::from_node(rhs).contains(target_span) {
+                return Ok(CompletionCallContext::Conservative);
+            }
+            expression_role = true;
+            // Ancestors are visited from the cursor outward.  The innermost
+            // applicable expression owns the expected value; retain Unknown
+            // too, so an outer context cannot turn an unresolved inner value
+            // into an unsafe snippet call.
+            if expected_value.is_none() {
+                expected_value = Some(expected_value_for_assignment(
+                    index,
+                    current_uri,
+                    document,
+                    lhs,
+                    offset,
+                    cancel,
+                    budget,
+                )?);
+            }
+        }
+        if ancestor.kind() == "exprCall" {
+            let Some(args) = ancestor.child_by_field_name("args") else {
+                continue;
+            };
+            if !Span::from_node(args).contains(target_span) {
+                continue;
+            }
+            expression_role = true;
+            let Some(argument_index) = argument_index_containing(args, target_span) else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            // See the assignment case above: an inner argument expectation,
+            // including an unknown one, must not be overwritten by an outer
+            // call's parameter type.
+            if expected_value.is_none() {
+                expected_value = Some(expected_value_for_argument(
+                    index,
+                    current_uri,
+                    document,
+                    ancestor,
+                    argument_index,
+                    offset,
+                    cancel,
+                    budget,
+                )?);
+            }
+        }
+        if ancestor.kind() == "exprUnary" {
+            let mut cursor = ancestor.walk();
+            if ancestor
+                .children(&mut cursor)
+                .any(|child| child.kind() == "kAt" && child.end_byte() <= target_span.start)
+            {
+                return Ok(CompletionCallContext::Conservative);
+            }
+        }
+        if ancestor.kind() == "exprDot" {
+            let Some(lhs) = ancestor.child_by_field_name("lhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(lhs).contains(target_span) {
+                if prefix_start <= lhs.end_byte() {
+                    return Ok(CompletionCallContext::Conservative);
+                }
+                expression_role = true;
+                continue;
+            }
+            let Some(rhs) = ancestor.child_by_field_name("rhs") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(rhs).contains(target_span) {
+                expression_role = true;
+            }
+        }
+        if ancestor.kind() == "exprTpl" {
+            let Some(entity) = ancestor.child_by_field_name("entity") else {
+                return Ok(CompletionCallContext::Conservative);
+            };
+            if Span::from_node(entity).contains(target_span)
+                && generic_suffix_follows_completion(document, entity, ancestor, replacement_end)
+            {
+                return Ok(CompletionCallContext::Conservative);
+            }
+            expression_role = true;
+        }
+        if ancestor.kind().starts_with("decl")
+            || matches!(
+                ancestor.kind(),
+                "type" | "typeref" | "typerefDot" | "genericArgs"
+            )
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if ancestor.kind() == "defProc"
+            && ancestor
+                .child_by_field_name("header")
+                .is_some_and(|header| Span::from_node(header).contains(target_span))
+        {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if matches!(ancestor.kind(), "goto" | "label" | "caseLabel") {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        if matches!(ancestor.kind(), "varDef" | "varAssignDef") {
+            return Ok(CompletionCallContext::Conservative);
+        }
+        match ancestor.kind() {
+            "for" => {
+                if ancestor
+                    .child_by_field_name("end")
+                    .is_some_and(|end| Span::from_node(end).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "foreach" => {
+                if ancestor
+                    .child_by_field_name("iterator")
+                    .is_some_and(|iterator| Span::from_node(iterator).contains(target_span))
+                {
+                    return Ok(CompletionCallContext::Conservative);
+                }
+                if ancestor
+                    .child_by_field_name("iterable")
+                    .is_some_and(|iterable| Span::from_node(iterable).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "if" | "ifElse" | "while" => {
+                if ancestor
+                    .child_by_field_name("condition")
+                    .is_some_and(|condition| Span::from_node(condition).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "repeat" => {
+                if ancestor
+                    .child_by_field_name("condition")
+                    .is_some_and(|condition| Span::from_node(condition).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "with" => {
+                if ancestor
+                    .child_by_field_name("entity")
+                    .is_some_and(|entity| Span::from_node(entity).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "raise" => {
+                if ancestor
+                    .child_by_field_name("exception")
+                    .is_some_and(|exception| Span::from_node(exception).contains(target_span))
+                {
+                    expression_role = true;
+                }
+            }
+            "case" => {
+                let mut cursor = ancestor.walk();
+                let first_case = ancestor
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "caseCase");
+                if first_case.is_none_or(|case_case| target_span.end <= case_case.start_byte()) {
+                    expression_role = true;
+                }
+            }
+            _ => {}
+        }
+        if matches!(
+            ancestor.kind(),
+            "statement"
+                | "exprBinary"
+                | "exprUnary"
+                | "exprParens"
+                | "exprSubscript"
+                | "exprBrackets"
+                | "exprAs"
+                | "exprConditional"
+                | "exprArgs"
+        ) {
+            expression_role = true;
+        }
+    }
+
+    // A completion token is only a call site when a positively recognized
+    // expression role contains it.  Unknown/recovered syntax remains plain;
+    // merely being attached to a broad parser ancestor is not enough proof.
+    if !expression_role || prefix_start > replacement_end || target_span.start > offset {
+        return Ok(CompletionCallContext::Conservative);
+    }
+    if expected_value.is_some_and(|value| value != ExpectedCompletionValue::NonCallable) {
+        return Ok(CompletionCallContext::Conservative);
+    }
+    Ok(CompletionCallContext::Callable)
+}
+
+fn argument_index_containing(args: Node<'_>, target: Span) -> Option<usize> {
+    let mut index = 0usize;
+    let mut cursor = args.walk();
+    for argument in args.named_children(&mut cursor) {
+        if argument.is_extra() {
+            continue;
+        }
+        if Span::from_node(argument).contains(target) {
+            return Some(index);
+        }
+        index = index.saturating_add(1);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_assignment(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    document: &Document,
+    lhs: Node<'_>,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    if lhs.kind() == "exprSubscript" {
+        return expected_value_for_indexed_assignment(
+            index,
+            current_uri,
+            document,
+            lhs,
+            offset,
+            cancel,
+            budget,
+        );
+    }
+    let Some(identifier) = assignment_target_identifier(lhs, cancel, budget)? else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let mut state = super::ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        document,
+        offset.min(identifier.start_byte()),
+        identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let expected = expected_value_for_symbols(index, candidates, cancel, budget)?;
+    if expected == ExpectedCompletionValue::Unknown
+        && is_implicit_result_reference_with_budget(document, identifier, cancel, budget)?
+    {
+        let scope = document.scope_at(identifier.start_byte());
+        if let Some(annotation) = document.result_type_annotation_for_body_scope(scope) {
+            return expected_value_for_type_ref_in_document(
+                index,
+                current_uri,
+                document,
+                &annotation.type_ref,
+                Some(annotation.scope),
+                cancel,
+                budget,
+            );
+        }
+    }
+    Ok(expected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_indexed_assignment(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    document: &Document,
+    lhs: Node<'_>,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    // Resolve the container expression itself.  In particular, do not use
+    // the last identifier in `Container[Index]`: that is the index expression
+    // and says nothing about the destination element type.
+    let Some((entity, dimensions)) = indexed_entity_and_dimensions(lhs, document, cancel, budget)?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let lookup_identifier = super::callable_lookup_identifier(entity);
+    if lookup_identifier.kind() != "identifier" {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    let mut state = super::ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        document,
+        offset.min(lookup_identifier.start_byte()),
+        lookup_identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let mut expected = Vec::new();
+    for candidate in candidates {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&candidate) else {
+            continue;
+        };
+        expected.push(expected_value_for_indexed_symbol(
+            index, &candidate, symbol, dimensions, cancel, budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn indexed_entity_and_dimensions<'a>(
+    mut expression: Node<'a>,
+    document: &Document,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Node<'a>, usize)>, String> {
+    // Count every subscript argument, whether it is comma-separated or a
+    // chained bracket.  The count is consumed against the declared array
+    // ranks below; one AST subscript node is not necessarily one dimension.
+    let mut dimensions = 0usize;
+    loop {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if expression.kind() != "exprSubscript" {
+            break;
+        }
+        let Some(args) = expression.child_by_field_name("args") else {
+            return Ok(None);
+        };
+        let Some(count) = indexed_argument_count(args, &document.source, cancel, budget)? else {
+            return Ok(None);
+        };
+        dimensions = dimensions.checked_add(count).ok_or_else(|| {
+            "completion indexed destination dimension count overflowed".to_string()
+        })?;
+        let Some(entity) = expression.child_by_field_name("entity") else {
+            return Ok(None);
+        };
+        expression = entity;
+    }
+    if dimensions == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((expression, dimensions)))
+    }
+}
+
+fn indexed_argument_count(
+    args: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<usize>, String> {
+    let mut count = 0usize;
+    let mut cursor = args.walk();
+    for argument in args.named_children(&mut cursor) {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if argument.is_extra()
+            || argument.is_missing()
+            || argument.kind() == "ERROR"
+            || argument.start_byte() == argument.end_byte()
+            || source
+                .get(argument.start_byte()..argument.end_byte())
+                .is_none_or(str::is_empty)
+        {
+            return Ok(None);
+        }
+        count = count.checked_add(1).ok_or_else(|| {
+            "completion indexed destination dimension count overflowed".to_string()
+        })?;
+    }
+    if count == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(count))
+    }
+}
+
+fn expected_value_for_indexed_symbol(
+    index: &NavigationIndex,
+    candidate: &super::Candidate,
+    symbol: &Symbol,
+    dimensions: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(type_ref) = symbol.type_ref.as_ref() else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(lookup_identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let mut state = super::ResolutionState::new();
+    let receivers = index.type_receivers_for_type_ref_with_budget(
+        &candidate.uri,
+        document,
+        type_ref.span.start,
+        type_ref,
+        lookup_identifier,
+        Some(symbol.scope),
+        &GenericSubstitution::empty(),
+        &mut state,
+        cancel,
+        budget,
+    )?;
+    let mut expected = Vec::new();
+    for receiver in receivers {
+        let Receiver::Type(instance) = receiver else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        let Some((element_uri, element_type_ref, element_scope)) =
+            array_element_type_ref(index, &instance, dimensions, cancel, budget)?
+        else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        let Some(element_document) = index.documents.get(&element_uri) else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        expected.push(expected_value_for_indexed_type_ref_in_document(
+            index,
+            &element_uri,
+            element_document,
+            &element_type_ref,
+            Some(element_scope),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn array_element_type_ref(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    dimensions: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Url, super::TypeRef, usize)>, String> {
+    if dimensions == 0 {
+        return Ok(None);
+    }
+    let mut visited = HashSet::new();
+    array_element_type_ref_at_depth(index, instance, dimensions, &mut visited, 0, cancel, budget)
+}
+
+fn array_element_type_ref_at_depth(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    dimensions: usize,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Url, super::TypeRef, usize)>, String> {
+    const MAX_ARRAY_TYPE_DEPTH: usize = 32;
+    if dimensions == 0
+        || depth >= MAX_ARRAY_TYPE_DEPTH
+        || !visited.insert((instance.uri.clone(), instance.key.clone()))
+    {
+        return Ok(None);
+    }
+    let Some((rank, element_uri, element_type_ref, element_scope)) =
+        array_type_metadata(index, instance, visited, depth, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    if dimensions < rank {
+        return Ok(None);
+    }
+    if dimensions == rank {
+        return Ok(Some((element_uri, element_type_ref, element_scope)));
+    }
+    let Some(element_document) = index.documents.get(&element_uri) else {
+        return Ok(None);
+    };
+    let Some(lookup_identifier) = identifier_at_with_budget(
+        element_document.tree.root_node(),
+        element_type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(None);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index,
+        &element_uri,
+        element_document,
+        &element_type_ref,
+        lookup_identifier,
+        Some(element_scope),
+        cancel,
+        budget,
+    )?;
+    let mut next_instance = None;
+    for receiver in receivers {
+        let Receiver::Type(receiver) = receiver else {
+            return Ok(None);
+        };
+        if next_instance.replace(receiver).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(next_instance) = next_instance else {
+        return Ok(None);
+    };
+    array_element_type_ref_at_depth(
+        index,
+        &next_instance,
+        dimensions.saturating_sub(rank),
+        visited,
+        depth.saturating_add(1),
+        cancel,
+        budget,
+    )
+}
+
+fn array_type_metadata(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(usize, Url, super::TypeRef, usize)>, String> {
+    const MAX_ARRAY_TYPE_DEPTH: usize = 32;
+    if depth >= MAX_ARRAY_TYPE_DEPTH {
+        return Ok(None);
+    }
+    let candidates = index.type_candidates_in_unit_with_budget(
+        &instance.uri,
+        &instance.key,
+        true,
+        cancel,
+        budget,
+    )?;
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let candidate = &candidates[0];
+    let Some(symbol) = index.symbol(candidate) else {
+        return Ok(None);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(None);
+    };
+    if let Some(type_node) = type_declaration_type_node(document, symbol, cancel, budget)? {
+        let mut declaration_type = type_node;
+        while matches!(declaration_type.kind(), "type" | "typeref") {
+            let Some(child) = first_named_child(declaration_type) else {
+                return Ok(None);
+            };
+            declaration_type = child;
+        }
+        if declaration_type.kind() == "declArray" {
+            let Some(element_node) = last_named_child(declaration_type) else {
+                return Ok(None);
+            };
+            let Some(element_type_ref) = super::type_ref_from_node(element_node, &document.source)
+            else {
+                return Ok(None);
+            };
+            let dimensions = array_dimensions(declaration_type, element_node);
+            return Ok(Some((
+                dimensions,
+                candidate.uri.clone(),
+                element_type_ref,
+                symbol.scope,
+            )));
+        }
+    }
+
+    let Some(alias_type_ref) = symbol.type_ref.as_ref() else {
+        return Ok(None);
+    };
+    let Some(lookup_identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        alias_type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(None);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index,
+        &candidate.uri,
+        document,
+        alias_type_ref,
+        lookup_identifier,
+        Some(symbol.scope),
+        cancel,
+        budget,
+    )?;
+    let mut array_instance = None;
+    for receiver in receivers {
+        let Receiver::Type(receiver) = receiver else {
+            return Ok(None);
+        };
+        if array_instance.replace(receiver).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(array_instance) = array_instance else {
+        return Ok(None);
+    };
+    if !visited.insert((array_instance.uri.clone(), array_instance.key.clone())) {
+        return Ok(None);
+    }
+    array_type_metadata(
+        index,
+        &array_instance,
+        visited,
+        depth.saturating_add(1),
+        cancel,
+        budget,
+    )
+}
+
+fn array_dimensions(declaration_type: Node<'_>, element_node: Node<'_>) -> usize {
+    // A Pascal `array[a, b] of T` has rank two even though it is one
+    // declaration node.  Dynamic `array of T` still has one index dimension.
+    let element_index = (0..declaration_type.named_child_count())
+        .find(|index| {
+            declaration_type
+                .named_child(*index)
+                .is_some_and(|child| Span::from_node(child) == Span::from_node(element_node))
+        })
+        .unwrap_or(declaration_type.named_child_count());
+    let dimensions = (0..element_index)
+        .filter_map(|index| declaration_type.named_child(index))
+        .filter(|child| !matches!(child.kind(), "kArray" | "kPacked" | "kOf"))
+        .count();
+    dimensions.max(1)
+}
+
+fn type_declaration_type_node<'a>(
+    document: &'a Document,
+    symbol: &Symbol,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let Some(mut current) = node_at_offset(
+        document.tree.root_node(),
+        symbol.declaration_span.start,
+        cancel,
+        budget,
+        MAX_COMPLETION_CONTEXT_NODES,
+        "completion",
+    )?
+    else {
+        return Ok(None);
+    };
+    loop {
+        if current.kind() == "declType" {
+            return Ok(current.child_by_field_name("type"));
+        }
+        let Some(parent) = current.parent() else {
+            return Ok(None);
+        };
+        current = parent;
+    }
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    (0..node.named_child_count()).find_map(|index| node.named_child(index))
+}
+
+fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    (0..node.named_child_count())
+        .rev()
+        .find_map(|index| node.named_child(index))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_argument(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    document: &Document,
+    call: Node<'_>,
+    argument_index: usize,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(entity) = call.child_by_field_name("entity") else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let lookup_identifier = super::callable_lookup_identifier(entity);
+    let mut state = super::ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        document,
+        offset.min(lookup_identifier.start_byte()),
+        lookup_identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let mut expected = Vec::new();
+    for candidate in candidates {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&candidate) else {
+            continue;
+        };
+        if symbol.kind != SymbolKind::Routine {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        }
+        let Some(parameter) = symbol.routine_parameters.get(argument_index) else {
+            expected.push(ExpectedCompletionValue::Unknown);
+            continue;
+        };
+        expected.push(expected_value_for_type_ref(
+            index,
+            &candidate,
+            symbol,
+            parameter.type_ref.as_ref(),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn expected_value_for_symbols(
+    index: &NavigationIndex,
+    candidates: Vec<super::Candidate>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let mut expected = Vec::new();
+    for candidate in candidates {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&candidate) else {
+            continue;
+        };
+        expected.push(expected_value_for_type_ref(
+            index,
+            &candidate,
+            symbol,
+            symbol.type_ref.as_ref(),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(expected)
+}
+
+fn combine_expected_values(
+    values: Vec<ExpectedCompletionValue>,
+) -> Result<ExpectedCompletionValue, String> {
+    if values.is_empty() {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    if values.contains(&ExpectedCompletionValue::Unknown) {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    if values.contains(&ExpectedCompletionValue::Callable) {
+        if values
+            .iter()
+            .all(|value| *value == ExpectedCompletionValue::Callable)
+        {
+            return Ok(ExpectedCompletionValue::Callable);
+        }
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    Ok(ExpectedCompletionValue::NonCallable)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_type_ref(
+    index: &NavigationIndex,
+    candidate: &super::Candidate,
+    symbol: &Symbol,
+    type_ref: Option<&super::TypeRef>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(type_ref) = type_ref else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    expected_value_for_type_ref_in_document(
+        index,
+        &candidate.uri,
+        document,
+        type_ref,
+        Some(symbol.scope),
+        cancel,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_type_ref_in_document(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    type_ref: &super::TypeRef,
+    scope: Option<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index, uri, document, type_ref, identifier, scope, cancel, budget,
+    )?;
+    expected_value_from_receivers(receivers, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_value_for_indexed_type_ref_in_document(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    type_ref: &super::TypeRef,
+    scope: Option<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let Some(identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index, uri, document, type_ref, identifier, scope, cancel, budget,
+    )?;
+    expected_value_from_indexed_receivers(index, receivers, cancel, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_ref_receivers_in_document(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    type_ref: &super::TypeRef,
+    lookup_identifier: Node<'_>,
+    scope: Option<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<Receiver>, String> {
+    let mut state = super::ResolutionState::new();
+    index.type_receivers_for_type_ref_with_budget(
+        uri,
+        document,
+        type_ref.span.start,
+        type_ref,
+        lookup_identifier,
+        scope,
+        &GenericSubstitution::empty(),
+        &mut state,
+        cancel,
+        budget,
+    )
+}
+
+fn expected_value_from_receivers(
+    receivers: Vec<Receiver>,
+    arrays_unknown: bool,
+) -> Result<ExpectedCompletionValue, String> {
+    if receivers.is_empty() {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    let mut callable = false;
+    let mut non_callable = false;
+    let mut unknown = false;
+    for receiver in receivers {
+        match receiver {
+            Receiver::Type(instance) if instance.kind == TypeKind::Callable => callable = true,
+            // A residual array is an intermediate/unsupported destination,
+            // not proof that a scalar call is valid.
+            Receiver::Type(instance) if arrays_unknown && instance.kind == TypeKind::Array => {
+                unknown = true;
+            }
+            Receiver::Type(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
+                non_callable = true;
+            }
+            Receiver::Unit(_) => unknown = true,
+        }
+    }
+    Ok(if unknown || (callable && non_callable) {
+        ExpectedCompletionValue::Unknown
+    } else if callable {
+        ExpectedCompletionValue::Callable
+    } else {
+        ExpectedCompletionValue::NonCallable
+    })
+}
+
+fn expected_value_from_indexed_receivers(
+    index: &NavigationIndex,
+    receivers: Vec<Receiver>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    let mut values = Vec::with_capacity(receivers.len());
+    for receiver in receivers {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        values.push(expected_value_from_indexed_receiver(
+            index,
+            receiver,
+            &mut HashSet::new(),
+            0,
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(values)
+}
+
+fn expected_value_from_indexed_receiver(
+    index: &NavigationIndex,
+    receiver: Receiver,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    match receiver {
+        Receiver::Type(instance) => match instance.kind {
+            TypeKind::Callable => Ok(ExpectedCompletionValue::Callable),
+            // A fully indexed destination must not retain an array, and a
+            // residual array is not evidence of a scalar call target.
+            TypeKind::Array => Ok(ExpectedCompletionValue::Unknown),
+            // Type aliases are indexed as their declaration kind (Other), so
+            // resolve only this terminal alias before classifying it.  An
+            // absent/ambiguous target remains Unknown rather than becoming a
+            // proved scalar through the catch-all Type receiver branch.
+            TypeKind::Other => expected_value_from_indexed_terminal_alias(
+                index, &instance, visited, depth, cancel, budget,
+            ),
+            TypeKind::Class
+            | TypeKind::Record
+            | TypeKind::Interface
+            | TypeKind::Enum
+            | TypeKind::String
+            | TypeKind::File => Ok(ExpectedCompletionValue::NonCallable),
+        },
+        Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
+            Ok(ExpectedCompletionValue::NonCallable)
+        }
+        Receiver::Unit(_) => Ok(ExpectedCompletionValue::Unknown),
+    }
+}
+
+fn expected_value_from_indexed_terminal_alias(
+    index: &NavigationIndex,
+    instance: &super::TypeInstance,
+    visited: &mut HashSet<(Url, String)>,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ExpectedCompletionValue, String> {
+    if depth >= MAX_INDEXED_TERMINAL_ALIAS_DEPTH
+        || !visited.insert((instance.uri.clone(), instance.key.clone()))
+    {
+        return Ok(ExpectedCompletionValue::Unknown);
+    }
+    check_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+
+    let Some(candidate) = index.type_symbol_candidate(instance) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(symbol) = index.symbol(&candidate) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(type_ref) = symbol.type_ref.as_ref() else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let Some(identifier) = identifier_at_with_budget(
+        document.tree.root_node(),
+        type_ref.span.start,
+        cancel,
+        budget,
+        "completion",
+    )?
+    else {
+        return Ok(ExpectedCompletionValue::Unknown);
+    };
+    let receivers = type_ref_receivers_in_document(
+        index,
+        &candidate.uri,
+        document,
+        type_ref,
+        identifier,
+        Some(symbol.scope),
+        cancel,
+        budget,
+    )?;
+    let mut values = Vec::with_capacity(receivers.len());
+    for receiver in receivers {
+        check_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        values.push(expected_value_from_indexed_receiver(
+            index,
+            receiver,
+            visited,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )?);
+    }
+    combine_expected_values(values)
+}
+
+fn assignment_target_identifier<'a>(
+    node: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    check_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    match node.kind() {
+        "identifier" => Ok(Some(node)),
+        "exprDot" | "genericDot" | "exprTpl" => {
+            let field = if matches!(node.kind(), "exprDot" | "genericDot") {
+                "rhs"
+            } else {
+                "entity"
+            };
+            let Some(child) = node.child_by_field_name(field) else {
+                return Ok(None);
+            };
+            assignment_target_identifier(child, cancel, budget)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn generic_suffix_follows_completion(
+    document: &Document,
+    entity: Node<'_>,
+    template: Node<'_>,
+    replacement_end: usize,
+) -> bool {
+    let suffix_start = entity.end_byte().max(replacement_end);
+    document
+        .source
+        .get(suffix_start..template.end_byte())
+        .is_some_and(|suffix| suffix.trim_start().starts_with('<'))
+}
+
+fn routine_call_snippet(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    symbol: &Symbol,
+    substitution: Option<&GenericSubstitution>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    if symbol.kind != SymbolKind::Routine {
+        return Ok(None);
+    }
+    if !symbol.generic_parameters.is_empty()
+        && symbol.generic_parameters.iter().any(|parameter| {
+            substitution.is_none_or(|substitution| substitution.get(&parameter.name).is_none())
+        })
+    {
+        return Ok(None);
+    }
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(None);
+    };
+    let Some(signature) =
+        specialized_routine_signature_label(index, document, symbol, substitution, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    // The declaration projection is the shared exact-signature proof.  If a
+    // malformed/recovered header cannot provide one parameter span per
+    // indexed parameter, do not invent a call shape.
+    if signature.parameter_spans.len() != symbol.routine_parameters.len() {
+        return Ok(None);
+    }
+
+    let mut snippet = String::new();
+    append_snippet_literal(&mut snippet, &symbol.name, budget, cancel)?;
+    snippet.push('(');
+    for (index, parameter) in symbol.routine_parameters.iter().enumerate() {
+        if index > 0 {
+            snippet.push_str(", ");
+        }
+        let Some(name) = document
+            .source
+            .get(parameter.span.start..parameter.span.end)
+        else {
+            return Ok(None);
+        };
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let tabstop = index.saturating_add(1);
+        snippet.push_str("${");
+        snippet.push_str(&tabstop.to_string());
+        snippet.push(':');
+        append_snippet_literal(&mut snippet, name, budget, cancel)?;
+        snippet.push('}');
+    }
+    snippet.push(')');
+    // `$0` is always the final cursor, including for zero-argument routines.
+    snippet.push_str("$0");
+    budget.require_bytes(snippet.len(), cancel)?;
+    Ok(Some(snippet))
+}
+
+fn append_snippet_literal(
+    output: &mut String,
+    value: &str,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    budget.require_bytes(value.len(), cancel)?;
+    for character in value.chars() {
+        if matches!(character, '\\' | '$' | '}') {
+            output.push('\\');
+        }
+        output.push(character);
+    }
+    Ok(())
+}
+
 fn trailing_member_dot_with_budget(
     source: &str,
     offset: usize,
@@ -2597,6 +4609,395 @@ fn bare_member_path_with_budget<'a>(
 
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn completion_detail(
+    declaration: Option<String>,
+    auto_import: Option<&AutoImportCandidate>,
+) -> Option<String> {
+    match (declaration, auto_import) {
+        (Some(declaration), Some(auto_import)) => {
+            Some(format!("{declaration} — unit {}", auto_import.unit_name))
+        }
+        (None, Some(auto_import)) => Some(format!("unit {}", auto_import.unit_name)),
+        (declaration, None) => declaration,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn auto_import_edit(
+    document: &Document,
+    region: Region,
+    unit_name: &str,
+    clause_spans: &[Span],
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TextEdit>, String> {
+    check_cancel(cancel)?;
+    if unit_name.is_empty() || clause_spans.len() > 1 {
+        return Ok(None);
+    }
+    let imported_key = unit_import_key(unit_name);
+    let already_imported = match region {
+        Region::Interface => document
+            .interface_uses
+            .iter()
+            .any(|name| unit_import_key(name) == imported_key),
+        Region::Implementation => document
+            .interface_uses
+            .iter()
+            .chain(document.implementation_uses.iter())
+            .any(|name| unit_import_key(name) == imported_key),
+        Region::Other => true,
+    };
+    if already_imported {
+        return Ok(None);
+    }
+    let newline = source_newline(&document.source);
+    let section = match region {
+        Region::Interface => document.interface_range,
+        Region::Implementation => document.implementation_range,
+        Region::Other => None,
+    };
+    let Some(section) = section else {
+        return Ok(None);
+    };
+    if let Some(clause) = clause_spans.first().copied() {
+        if clause.contains_offset(offset) {
+            return Ok(None);
+        }
+        if uses_clause_is_conditionally_enclosed(document, clause) {
+            return Ok(None);
+        }
+        if document
+            .conditionals
+            .directives
+            .iter()
+            .any(|directive| directive.start < clause.end && directive.end > clause.start)
+        {
+            return Ok(None);
+        }
+        let source = document.source.as_ref();
+        let mut semicolon = clause.end.min(source.len());
+        while semicolon > clause.start
+            && source
+                .as_bytes()
+                .get(semicolon - 1)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            semicolon -= 1;
+        }
+        if semicolon == clause.start || source.as_bytes().get(semicolon - 1) != Some(&b';') {
+            return Ok(None);
+        }
+        semicolon -= 1;
+        if !uses_clause_syntax_is_safe(source, clause, semicolon, &document.imports) {
+            return Ok(None);
+        }
+        let last_import_end = document
+            .imports
+            .iter()
+            .filter(|import| {
+                import.span.start >= clause.start
+                    && import.span.end <= semicolon
+                    && import.span.end > clause.start
+            })
+            .map(|import| import.span.end)
+            .max();
+        if last_import_end.is_none_or(|end| contains_comment(&source[end..semicolon])) {
+            return Ok(None);
+        }
+        let multiline = source[clause.start..semicolon].contains(['\r', '\n']);
+        let insertion = if multiline {
+            let indent = indentation_for_import(source, semicolon, clause.start);
+            format!(",{newline}{indent}{unit_name}")
+        } else {
+            format!(", {unit_name}")
+        };
+        return text_edit_at_offset(source, semicolon, &insertion, cancel, budget);
+    }
+
+    let keyword = match region {
+        Region::Interface => "interface",
+        Region::Implementation => "implementation",
+        Region::Other => return Ok(None),
+    };
+    let keyword_end = section.start.saturating_add(keyword.len());
+    let Some(actual_keyword) = document.source.get(section.start..keyword_end) else {
+        return Ok(None);
+    };
+    if !actual_keyword.eq_ignore_ascii_case(keyword) {
+        return Ok(None);
+    }
+    if document.has_parser_recovery_near(section)
+        || document
+            .conditionals
+            .directives
+            .iter()
+            .any(|directive| directive.start >= section.start && directive.end <= section.end)
+    {
+        return Ok(None);
+    }
+    let section_end = section.end.min(document.source.len());
+    let Some(insertion_offset) =
+        safe_absent_uses_insertion_offset(&document.source, keyword_end, section_end)
+    else {
+        return Ok(None);
+    };
+    if document.has_parser_recovery_near(Span {
+        start: insertion_offset,
+        end: insertion_offset,
+    }) {
+        return Ok(None);
+    }
+    let insertion = format!("uses {unit_name};{newline}");
+    text_edit_at_offset(
+        document.source.as_ref(),
+        insertion_offset,
+        &insertion,
+        cancel,
+        budget,
+    )
+}
+
+fn text_edit_at_offset(
+    source: &str,
+    offset: usize,
+    new_text: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TextEdit>, String> {
+    check_cancel(cancel)?;
+    budget.require_bytes(new_text.len(), cancel)?;
+    let position = text::offset_to_position(source, offset)
+        .ok_or_else(|| "auto-import insertion is not a UTF-16 boundary".to_string())?;
+    Ok(Some(TextEdit::new(
+        Range::new(position, position),
+        new_text.to_owned(),
+    )))
+}
+
+fn source_newline(source: &str) -> &'static str {
+    if source.contains("\r\n") {
+        "\r\n"
+    } else if source.contains('\n') {
+        "\n"
+    } else if source.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    }
+}
+
+fn unit_import_key(name: &str) -> String {
+    name.split('.')
+        .map(canonical_name)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn contains_comment(source: &str) -> bool {
+    source.contains("//") || source.contains('{') || source.contains("(*")
+}
+
+fn uses_clause_is_conditionally_enclosed(document: &Document, span: Span) -> bool {
+    if !document.conditionals.complete {
+        return true;
+    }
+    let mut starts = Vec::new();
+    for directive in &document.conditionals.directives {
+        match directive.kind {
+            pascal_core::conditional::DirectiveKind::ConditionalStart => {
+                starts.push(directive.start)
+            }
+            pascal_core::conditional::DirectiveKind::ConditionalEnd => {
+                let Some(start) = starts.pop() else {
+                    return true;
+                };
+                if start <= span.start && span.end <= directive.end {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    !starts.is_empty()
+}
+
+fn indentation_for_import(source: &str, offset: usize, lower_bound: usize) -> String {
+    let line_start = source[..offset]
+        .rfind(['\r', '\n'])
+        .map_or(lower_bound, |index| index + 1);
+    let current = source
+        .get(line_start..offset)
+        .unwrap_or_default()
+        .chars()
+        .take_while(|character| {
+            character.is_whitespace() && *character != '\r' && *character != '\n'
+        })
+        .collect::<String>();
+    if !current.is_empty() {
+        return current;
+    }
+    source[lower_bound..offset]
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let indentation = line
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .collect::<String>();
+            (!indentation.is_empty()).then_some(indentation)
+        })
+        .unwrap_or_default()
+}
+
+fn safe_absent_uses_insertion_offset(
+    source: &str,
+    keyword_end: usize,
+    section_end: usize,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut cursor = keyword_end;
+    while cursor < section_end {
+        match bytes[cursor] {
+            b' ' | b'\t' | 0x0b | 0x0c => cursor += 1,
+            b'\r' => {
+                return Some(if bytes.get(cursor + 1) == Some(&b'\n') {
+                    cursor + 2
+                } else {
+                    cursor + 1
+                });
+            }
+            b'\n' => return Some(cursor + 1),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn uses_clause_syntax_is_safe(
+    source: &str,
+    clause: Span,
+    semicolon: usize,
+    imports: &[super::ImportMetadata],
+) -> bool {
+    let mut import_spans = imports
+        .iter()
+        .filter_map(|import| {
+            (import.span.start >= clause.start
+                && import.span.end <= semicolon
+                && import.span.start < import.span.end)
+                .then_some((import.span.start, import.span.end))
+        })
+        .collect::<Vec<_>>();
+    import_spans.sort_unstable();
+
+    let mut cursor = clause.start;
+    let mut import_index = 0;
+    let mut expect_entry = true;
+    let mut expect_path = false;
+    let mut saw_import = false;
+    let mut saw_uses = false;
+    while cursor < semicolon {
+        if import_index < import_spans.len() && cursor == import_spans[import_index].0 {
+            if !expect_entry || expect_path {
+                return false;
+            }
+            cursor = import_spans[import_index].1;
+            import_index += 1;
+            expect_entry = false;
+            saw_import = true;
+            continue;
+        }
+        let Some(byte) = source.as_bytes().get(cursor).copied() else {
+            return false;
+        };
+        if byte.is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if byte == b',' {
+            if expect_entry || expect_path || !saw_import {
+                return false;
+            }
+            expect_entry = true;
+            cursor += 1;
+            continue;
+        }
+        if source[cursor..].starts_with("//") {
+            let Some(relative_end) = source[cursor + 2..].find(['\r', '\n']) else {
+                return false;
+            };
+            cursor = cursor + 2 + relative_end;
+            continue;
+        }
+        if byte == b'{' {
+            let Some(relative_end) = source[cursor + 1..].find('}') else {
+                return false;
+            };
+            cursor = cursor + 1 + relative_end + 1;
+            continue;
+        }
+        if source[cursor..].starts_with("(*") {
+            let Some(relative_end) = source[cursor + 2..].find("*)") else {
+                return false;
+            };
+            cursor = cursor + 2 + relative_end + 2;
+            continue;
+        }
+        if byte == b'\'' {
+            if !expect_path {
+                return false;
+            }
+            cursor += 1;
+            while cursor < semicolon {
+                if source.as_bytes()[cursor] != b'\'' {
+                    cursor += 1;
+                    continue;
+                }
+                if source.as_bytes().get(cursor + 1) == Some(&b'\'') {
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                    expect_path = false;
+                    break;
+                }
+            }
+            if expect_path {
+                return false;
+            }
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'&' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < semicolon && is_identifier_byte(source.as_bytes()[cursor]) {
+                cursor += 1;
+            }
+            let Some(identifier) = source.get(start..cursor) else {
+                return false;
+            };
+            if identifier.eq_ignore_ascii_case("uses") {
+                if saw_uses || saw_import {
+                    return false;
+                }
+                saw_uses = true;
+                continue;
+            }
+            if identifier.eq_ignore_ascii_case("in") {
+                if !saw_import || expect_entry || expect_path {
+                    return false;
+                }
+                expect_path = true;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    !expect_entry && !expect_path && saw_import && import_index == import_spans.len()
 }
 
 fn completion_kind(kind: SymbolKind) -> CompletionItemKind {
@@ -3769,6 +6170,51 @@ fn bounded_string(value: String) -> Option<String> {
     (value.len() <= MAX_HOVER_EXCERPT_BYTES).then_some(value)
 }
 
+fn render_lsp_documentation(
+    documentation: Option<&Arc<documentation::Documentation>>,
+    format: MarkupKind,
+    cancel: &AtomicBool,
+) -> Result<Option<LspDocumentation>, String> {
+    let Some(documentation) = documentation else {
+        return Ok(None);
+    };
+    let Some(value) = documentation.render(format.clone(), cancel)? else {
+        return Ok(None);
+    };
+    Ok(Some(lsp_documentation(value, format)))
+}
+
+fn render_lsp_signature_documentation(
+    documentation: Option<&Arc<documentation::Documentation>>,
+    format: MarkupKind,
+    cancel: &AtomicBool,
+) -> Result<Option<LspDocumentation>, String> {
+    let Some(documentation) = documentation else {
+        return Ok(None);
+    };
+    let Some(value) = documentation.render_signature(format.clone(), cancel)? else {
+        return Ok(None);
+    };
+    Ok(Some(lsp_documentation(value, format)))
+}
+
+fn lsp_documentation(value: String, format: MarkupKind) -> LspDocumentation {
+    match format {
+        MarkupKind::Markdown => LspDocumentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        MarkupKind::PlainText => LspDocumentation::String(value),
+    }
+}
+
+fn documentation_size(documentation: &LspDocumentation) -> usize {
+    match documentation {
+        LspDocumentation::String(value) => value.len(),
+        LspDocumentation::MarkupContent(value) => value.value.len(),
+    }
+}
+
 #[cfg(test)]
 fn render_displays(displays: &[DeclarationDisplay], format: MarkupKind) -> Result<String, String> {
     let mut value = String::new();
@@ -3834,6 +6280,14 @@ fn render_displays_with_budget(
                 rendered.push_str(&display.excerpt);
             }
         }
+        if let Some(documentation) = display.documentation.as_ref() {
+            if let Some(documentation) = documentation.render(format.clone(), cancel)? {
+                if !rendered.is_empty() {
+                    rendered.push_str("\n\n");
+                }
+                rendered.push_str(&documentation);
+            }
+        }
         budget.require_bytes(rendered.len(), cancel)?;
         value.push_str(&rendered);
         if value.len() > MAX_HOVER_VALUE_BYTES {
@@ -3874,11 +6328,12 @@ fn display_unit_name(document: &Document) -> String {
 mod tests {
     use super::{
         AssistanceBudget, COMPLETION_SYMBOL_VISITS, Candidate, CompletionAccumulator,
-        DeclarationDisplay, MAX_COMPLETION_SCANNED_SYMBOLS, MAX_HOVER_VALUE_BYTES, MarkupKind,
-        NavigationIndex, Origin, PARAMETER_INFORMATION_HELPER_ENTRIES, PARAMETER_UTF16_SCAN_PASSES,
-        ParameterLabel, Region, SOURCE_SCAN_HELPER_ENTRIES, Span, Symbol, SymbolKind,
-        identifier_at_with_budget, named_type_path_for_symbol, parameter_information_with_budget,
-        render_displays, routine_signature_label,
+        CompletionOptions, DeclarationDisplay, MAX_COMPLETION_SCANNED_SYMBOLS,
+        MAX_HOVER_VALUE_BYTES, MarkupKind, NavigationIndex, Origin,
+        PARAMETER_INFORMATION_HELPER_ENTRIES, PARAMETER_UTF16_SCAN_PASSES, ParameterLabel, Region,
+        SOURCE_SCAN_HELPER_ENTRIES, Span, Symbol, SymbolKind, identifier_at_with_budget,
+        named_type_path_for_symbol, parameter_information_with_budget, render_displays,
+        routine_signature_label,
     };
     use crate::navigation::{
         ROOT_SCOPE, RoutineKind, TEST_EXPORTED_INDEX_VECTOR_MATERIALIZATIONS,
@@ -3897,7 +6352,51 @@ mod tests {
             excerpt,
             source_uri: Url::parse("file:///U.pas").expect("test URI"),
             source_start: 0,
+            documentation: None,
         }
+    }
+
+    #[test]
+    fn deferred_completion_omits_requested_metadata_before_resolution() {
+        let source = "unit DeferredCompletion;\ninterface\n/// <summary>Returns the value.</summary>\n/// <param name=\"Name\">Lookup name.</param>\nfunction Documented(Name: string): Integer;\nimplementation\nfunction Documented(Name: string): Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  Doc\nend;\nend.\n";
+        let uri = Url::parse("file:///DeferredCompletion.pas").expect("source URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("completion source parses");
+        let position = text::offset_to_position(
+            source,
+            source.find("  Doc").expect("completion prefix") + "  Doc".len(),
+        )
+        .expect("completion position");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let result = index
+            .completion_with_cancel_and_options(
+                &uri,
+                position,
+                CompletionOptions {
+                    format: MarkupKind::Markdown,
+                    defer_documentation: true,
+                    defer_detail: true,
+                    snippet_support: false,
+                },
+                &cancel,
+            )
+            .expect("deferred completion");
+        let item = result
+            .list
+            .items
+            .iter()
+            .find(|item| item.label == "Documented")
+            .expect("documented completion item");
+        assert!(item.documentation.is_none());
+        assert!(item.detail.is_none());
+        assert!(item.text_edit.is_some());
+        assert_eq!(result.seeds.len(), result.list.items.len());
+        let seed = &result.seeds[0];
+        assert_eq!(seed.candidate_uri(), &uri);
+        assert!(seed.candidate_index() < index.documents[&uri].symbols.len());
+        assert!(!seed.has_substitution());
     }
 
     #[test]
@@ -4445,13 +6944,13 @@ mod tests {
         let mut same_scope_budget = AssistanceBudget::new(16, 16, "test");
         let mut same_scope = CompletionAccumulator::new("same", false, &mut same_scope_budget);
         same_scope.mark_uncertain(&symbol.key, 2);
-        same_scope.insert(candidate.clone(), &symbol, 2);
+        same_scope.insert(candidate.clone(), None, &symbol, 2, None);
         assert!(same_scope.candidates.is_empty());
         assert_eq!(same_scope.uncertain.get(&symbol.key), Some(&2));
 
         let mut shadowed_budget = AssistanceBudget::new(16, 16, "test");
         let mut shadowed = CompletionAccumulator::new("same", false, &mut shadowed_budget);
-        shadowed.insert(candidate, &symbol, 0);
+        shadowed.insert(candidate, None, &symbol, 0, None);
         shadowed.mark_uncertain(&symbol.key, 1);
         assert!(shadowed.candidates.contains_key(&symbol.key));
         assert!(shadowed.uncertain.is_empty());

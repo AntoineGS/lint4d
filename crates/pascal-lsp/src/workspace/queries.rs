@@ -1,16 +1,22 @@
+use super::KnownDocumentOwner;
 use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
-    WorkspaceInput, build_snapshot, input_source_is_readable_with_owner, is_cancelled,
-    owner_for_input, project_context_and_metadata_for_input,
-    project_context_and_metadata_for_owner, query_binding_info_for_input,
-    reference_binding_info_for_input, snapshot_records, source_for_input_with_cancel,
-    source_for_input_with_owner,
+    WorkspaceInput, auto_import_source_is_relevant, build_snapshot,
+    input_source_is_readable_with_owner, is_cancelled, owner_for_input,
+    project_context_and_metadata_for_input, project_context_and_metadata_for_owner,
+    query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
+    snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
-use crate::navigation::SemanticTokenResolutionMode;
+use crate::navigation::{
+    CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions,
+    SemanticTokenResolutionMode, completion_prefix_at_position,
+};
 use crate::{NavigationIndex, NavigationTarget};
+#[cfg(test)]
+use lsp_types::CompletionList;
 use lsp_types::{
-    CompletionList, DocumentHighlight, DocumentSymbol, Hover, Location, MarkupKind, Position,
-    Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
+    DocumentHighlight, DocumentSymbol, FoldingRange, Hover, Location, MarkupKind, Position, Range,
+    SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
 use pascal_project::has_invalid_project_selection;
 use std::sync::atomic::AtomicBool;
@@ -21,6 +27,13 @@ pub(crate) struct NavigationResult {
 }
 
 pub(crate) struct DiagnosticsResult {
+    pub(crate) uri: Url,
+    pub(crate) version: Option<i32>,
+    pub(crate) publications: Vec<DiagnosticPublication>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DiagnosticPublication {
     pub(crate) uri: Url,
     pub(crate) version: Option<i32>,
     pub(crate) diagnostics: Vec<lsp_types::Diagnostic>,
@@ -90,12 +103,51 @@ pub(crate) fn hover_from_input(
     with_records(source_generation, configuration_generation, value, records)
 }
 
+#[cfg(test)]
 pub(crate) fn completion_from_input(
     input: WorkspaceInput,
     uri: &Url,
     position: Position,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionList> {
+    completion_from_input_with_format(input, uri, position, MarkupKind::Markdown, cancel)
+}
+
+#[cfg(test)]
+pub(crate) fn completion_from_input_with_format(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    format: MarkupKind,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionList> {
+    let computed = completion_from_input_with_options(
+        input,
+        uri,
+        position,
+        CompletionOptions {
+            format,
+            defer_documentation: false,
+            defer_detail: false,
+            snippet_support: false,
+        },
+        cancel,
+    );
+    super::rename::Computed {
+        source_generation: computed.source_generation,
+        configuration_generation: computed.configuration_generation,
+        value: computed.value.map(|result| result.list),
+        records: computed.records,
+    }
+}
+
+pub(crate) fn completion_from_input_with_options(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    options: CompletionOptions,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionResult> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = super::canonical_file_uri(uri);
@@ -114,7 +166,7 @@ pub(crate) fn completion_from_input(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -132,17 +184,154 @@ pub(crate) fn completion_from_input(
     }
     let value = snapshot
         .index
-        .completion_with_cancel(&uri, position, cancel);
+        .completion_with_cancel_and_options(&uri, position, options, cancel);
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     with_records(source_generation, configuration_generation, value, records)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn completion_metadata_from_input(
+    input: WorkspaceInput,
+    source_uri: &Url,
+    position: Position,
+    expected_source_generation: u64,
+    expected_configuration_generation: u64,
+    candidate_uri: &Url,
+    candidate_index: usize,
+    format: MarkupKind,
+    resolve_documentation: bool,
+    resolve_detail: bool,
+    snippet_support: bool,
+    original_records: &[super::rename::SourceRecord],
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionMetadata> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    if source_generation < expected_source_generation
+        || configuration_generation < expected_configuration_generation
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "completion resolution snapshot predates the retained completion identity; retry the request"
+                .to_string(),
+        );
+    }
+    if let Err(error) = revalidate_input(&input, original_records, cancel) {
+        return failed(source_generation, configuration_generation, error);
+    }
+    let source_uri = super::canonical_file_uri(source_uri);
+    let candidate_uri = super::canonical_file_uri(candidate_uri);
+    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), cancel) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let snapshot_records = snapshot_records(&snapshot);
+    if let Err(error) = ensure_assistance_ready(&snapshot, &source_uri) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            snapshot_records,
+        );
+    }
+    if let Err(error) = completion_observations_match(&input, original_records, &snapshot_records) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            snapshot_records,
+        );
+    }
+    if let Err(error) = revalidate_input(&input, original_records, cancel) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            snapshot_records,
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let completion = match snapshot.index.completion_with_cancel_and_options(
+        &source_uri,
+        position,
+        CompletionOptions {
+            format: format.clone(),
+            defer_documentation: true,
+            defer_detail: true,
+            snippet_support,
+        },
+        cancel,
+    ) {
+        Ok(completion) => completion,
+        Err(error) => {
+            return with_records(
+                source_generation,
+                configuration_generation,
+                Err(error),
+                snapshot_records,
+            );
+        }
+    };
+    let mut matching = completion.seeds.iter().filter(|seed| {
+        seed.candidate_uri() == &candidate_uri && seed.candidate_index() == candidate_index
+    });
+    let Some(seed) = matching.next() else {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(
+                "completion declaration is no longer an exact candidate; request completion again"
+                    .to_string(),
+            ),
+            snapshot_records,
+        );
+    };
+    if matching.next().is_some() {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err("completion declaration became ambiguous; request completion again".to_string()),
+            snapshot_records,
+        );
+    }
+    let value = snapshot.index.completion_metadata_for_seed(
+        seed,
+        format,
+        resolve_documentation,
+        resolve_detail,
+        cancel,
+    );
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let mut records = snapshot_records;
+    records.extend(original_records.iter().cloned());
+    with_records(source_generation, configuration_generation, value, records)
+}
+
+#[cfg(test)]
 pub(crate) fn signature_help_from_input(
     input: WorkspaceInput,
     uri: &Url,
     position: Position,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Option<SignatureHelp>> {
+    signature_help_from_input_with_format(input, uri, position, MarkupKind::Markdown, cancel)
+}
+
+pub(crate) fn signature_help_from_input_with_format(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    format: MarkupKind,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<Option<SignatureHelp>> {
     let source_generation = input.source_generation;
@@ -163,7 +352,7 @@ pub(crate) fn signature_help_from_input(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -181,7 +370,7 @@ pub(crate) fn signature_help_from_input(
     }
     let value = snapshot
         .index
-        .signature_help_with_cancel(&uri, position, cancel);
+        .signature_help_with_cancel(&uri, position, format, cancel);
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -212,7 +401,7 @@ pub(crate) fn semantic_tokens_from_input(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -240,6 +429,60 @@ pub(crate) fn semantic_tokens_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
+    with_records(source_generation, configuration_generation, value, records)
+}
+
+pub(crate) fn folding_ranges_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    options: FoldingRangeOptions,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<FoldingRange>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("document is outside configured workspace roots or source paths: {uri}"),
+        );
+    }
+    let (source, record) = match source_for_input_with_owner(&input, &uri, &owner, Some(cancel)) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let (context, metadata_records) = match project_context_and_metadata_for_owner(&owner, cancel) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let mut index = NavigationIndex::new();
+    if let Err(error) =
+        index.update_with_defines_with_cancel(uri.clone(), source, &context.defines, cancel)
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("could not index folding ranges for {uri}: {error}"),
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let value = index.folding_ranges_with_cancel(&uri, options, cancel);
+    let mut records = vec![record];
+    records.extend(metadata_records);
     with_records(source_generation, configuration_generation, value, records)
 }
 
@@ -379,10 +622,7 @@ pub(crate) fn references_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let value =
-        snapshot
-            .index
-            .binding_locations_with_cancel(&uri, position, include_declaration, cancel);
+    let value = snapshot.binding_locations(&uri, position, include_declaration, cancel);
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -461,10 +701,7 @@ pub(crate) fn highlights_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let locations = match snapshot
-        .index
-        .binding_locations_in_document_with_cancel(&uri, position, cancel)
-    {
+    let locations = match snapshot.binding_locations_in_document(&uri, position, cancel) {
         Ok(locations) => locations,
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
@@ -491,6 +728,7 @@ pub(crate) fn highlights_from_input(
     }
     let value = locations
         .into_iter()
+        .filter(|location| location.uri == uri)
         .map(|location| DocumentHighlight {
             range: location.range,
             kind: None,
@@ -556,17 +794,26 @@ fn binding_snapshot(
 fn assistance_snapshot(
     input: &WorkspaceInput,
     uri: &Url,
+    completion_position: Option<Position>,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
-    let (_source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
+    let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
+    let candidate_names = completion_position
+        .and_then(|position| completion_prefix_at_position(&source, position))
+        .into_iter()
+        .collect::<Vec<_>>();
     let (_context, consumed_configuration) =
         project_context_and_metadata_for_input(input, uri, cancel)?;
     build_snapshot(
         input,
         std::slice::from_ref(uri),
-        &[],
+        &candidate_names,
         SnapshotMode::Assistance,
-        Some(SnapshotSeed::new(record).with_consumed_configuration(&consumed_configuration)),
+        Some(
+            SnapshotSeed::new(record)
+                .with_consumed_configuration(&consumed_configuration)
+                .with_completion_position(completion_position),
+        ),
         &[],
         cancel,
     )
@@ -655,6 +902,15 @@ fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), St
             .incomplete_reason
             .as_deref()
             .unwrap_or("bounded source discovery did not finish");
+        if snapshot
+            .sources
+            .get(uri)
+            .is_some_and(|source| super::rename::may_contain_include_directive(source.as_bytes()))
+        {
+            return Err(format!(
+                "reference workspace scan incomplete: include dependency analysis is incomplete: {reason}"
+            ));
+        }
         return Err(format!("reference workspace scan incomplete: {reason}"));
     }
     Ok(())
@@ -733,6 +989,70 @@ fn ensure_semantic_tokens_ready(
     Ok(SemanticTokenResolutionMode::Full)
 }
 
+struct SyntaxDocument {
+    source: String,
+    context: pascal_project::ProjectContext,
+    records: Vec<super::rename::SourceRecord>,
+}
+
+fn syntax_owner_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<KnownDocumentOwner, String> {
+    let owner = owner_for_input(input, uri, cancel)?;
+    if !input_source_is_readable_with_owner(input, uri, &owner) {
+        return Err(format!(
+            "document is outside configured workspace roots or source paths: {uri}"
+        ));
+    }
+    Ok(owner)
+}
+
+fn syntax_document_for_owner(
+    input: &WorkspaceInput,
+    uri: &Url,
+    owner: &KnownDocumentOwner,
+    cancel: &AtomicBool,
+) -> Result<SyntaxDocument, String> {
+    let (source, record) = source_for_input_with_owner(input, uri, owner, Some(cancel))?;
+    let (context, metadata_records) = project_context_and_metadata_for_owner(owner, cancel)?;
+    let mut records = Vec::with_capacity(metadata_records.len().saturating_add(1));
+    records.push(record);
+    records.extend(metadata_records);
+    Ok(SyntaxDocument {
+        source,
+        context,
+        records,
+    })
+}
+
+fn syntax_index_for_document(
+    input: &WorkspaceInput,
+    uri: &Url,
+    document: SyntaxDocument,
+    cancel: &AtomicBool,
+    operation: &str,
+) -> Result<(NavigationIndex, Vec<super::rename::SourceRecord>), String> {
+    let cached = input
+        .cached_documents
+        .get(uri)
+        .filter(|cached| cached.context == document.context)
+        .map(|cached| cached.parsed.clone());
+    let defines = document.context.defines;
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_defines_and_cached_with_cancel(
+            uri.clone(),
+            document.source,
+            &defines,
+            cached,
+            cancel,
+        )
+        .map_err(|error| format!("could not index {operation} for {uri}: {error}"))?;
+    Ok((index, document.records))
+}
+
 pub(crate) fn document_symbols_from_input(
     input: WorkspaceInput,
     uri: &Url,
@@ -744,51 +1064,84 @@ pub(crate) fn document_symbols_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let owner = match owner_for_input(&input, &uri, cancel) {
+    let owner = match syntax_owner_for_input(&input, &uri, cancel) {
         Ok(owner) => owner,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
-        return failed(
-            source_generation,
-            configuration_generation,
-            format!("document is outside configured workspace roots or source paths: {uri}"),
-        );
-    }
-    let (source, record) = match source_for_input_with_owner(&input, &uri, &owner, Some(cancel)) {
-        Ok(result) => result,
-        Err(error) => return failed(source_generation, configuration_generation, error),
-    };
-    let (context, metadata_records) = match project_context_and_metadata_for_owner(&owner, cancel) {
-        Ok(result) => result,
+    let document = match syntax_document_for_owner(&input, &uri, &owner, cancel) {
+        Ok(document) => document,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
 
-    let mut index = NavigationIndex::new();
-    let defines = context.defines;
-    if let Err(error) = index.update_with_defines_with_cancel(uri.clone(), source, &defines, cancel)
-    {
-        return failed(
-            source_generation,
-            configuration_generation,
-            format!("could not index document symbols for {uri}: {error}"),
-        );
-    }
+    let (index, records) =
+        match syntax_index_for_document(&input, &uri, document, cancel, "document symbols") {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     let value = index.document_symbols_with_cancel(&uri, cancel);
-    let mut records = vec![record];
-    records.extend(metadata_records);
     super::rename::Computed {
         source_generation,
         configuration_generation,
         value,
         records,
     }
+}
+
+pub(crate) fn selection_ranges_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    positions: Vec<Position>,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<SelectionRange>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let owner = match syntax_owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    if let Err(error) = crate::navigation::validate_selection_position_count(&positions) {
+        return failed(source_generation, configuration_generation, error);
+    }
+    if positions.is_empty() {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Ok(Vec::new()),
+            Vec::new(),
+        );
+    }
+    let document = match syntax_document_for_owner(&input, &uri, &owner, cancel) {
+        Ok(document) => document,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let (index, records) =
+        match syntax_index_for_document(&input, &uri, document, cancel, "selection ranges") {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let value = index.selection_ranges_with_cancel(&uri, &positions, cancel);
+    with_records(source_generation, configuration_generation, value, records)
 }
 
 pub(crate) fn navigation_from_input(
@@ -877,7 +1230,7 @@ pub(crate) fn diagnostics_from_input(
         Ok(diagnostics) => Ok(DiagnosticsResult {
             uri,
             version,
-            diagnostics,
+            publications: diagnostics,
         }),
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
@@ -991,16 +1344,101 @@ fn with_records<T>(
     }
 }
 
+fn completion_observations_match(
+    input: &super::rename::WorkspaceInput,
+    original: &[super::rename::SourceRecord],
+    rebuilt: &[super::rename::SourceRecord],
+) -> Result<(), String> {
+    let mut matched = vec![false; rebuilt.len()];
+    for original_record in original {
+        let Some(index) = rebuilt
+            .iter()
+            .enumerate()
+            .position(|(index, rebuilt_record)| {
+                !matched[index] && completion_observations_equal(original_record, rebuilt_record)
+            })
+        else {
+            if completion_observation_is_superseded_by_irrelevant_overlay(
+                input,
+                original_record,
+                original,
+            ) {
+                continue;
+            }
+            return Err(
+                "completion dependency observations changed while resolving; retry the request"
+                    .to_string(),
+            );
+        };
+        matched[index] = true;
+    }
+    Ok(())
+}
+
+fn completion_observation_is_superseded_by_irrelevant_overlay(
+    input: &super::rename::WorkspaceInput,
+    record: &super::rename::SourceRecord,
+    original: &[super::rename::SourceRecord],
+) -> bool {
+    if !record.auto_import_provider_observation {
+        return false;
+    }
+    let Some(path) = record.path.as_deref() else {
+        return false;
+    };
+    let Some(overlay) = input.overlays.get(&super::canonical_file_uri(&record.uri)) else {
+        return false;
+    };
+    let scopes = original
+        .iter()
+        .flat_map(|record| record.auto_import_scopes.iter())
+        .collect::<Vec<_>>();
+    scopes.is_empty()
+        || scopes.iter().all(|scope| {
+            !scope.matches_path(path) || !auto_import_source_is_relevant(&overlay.text, scope)
+        })
+}
+
+fn completion_observations_equal(
+    left: &super::rename::SourceRecord,
+    right: &super::rename::SourceRecord,
+) -> bool {
+    super::canonical_file_uri(&left.uri) == super::canonical_file_uri(&right.uri)
+        && (left.text.is_empty() || right.text.is_empty() || left.text == right.text)
+        && left.version == right.version
+        && left.stamp == right.stamp
+        && left.open == right.open
+        && left.path == right.path
+        && left.path_stamp == right.path_stamp
+        && (left.open || left.content_hash == right.content_hash)
+        && left.parsed_text_hash == right.parsed_text_hash
+        && left.candidate_membership == right.candidate_membership
+        && left.read_policy == right.read_policy
+        && left.path_entry == right.path_entry
+        && left.include_payload == right.include_payload
+        && left.missing_provider_candidate == right.missing_provider_candidate
+        && left.missing_provider_scope == right.missing_provider_scope
+        && left.auto_import_provider_observation == right.auto_import_provider_observation
+        && left.auto_import_scopes == right.auto_import_scopes
+        && match (&left.content_bytes, &right.content_bytes) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_from_input, document_symbols_from_input, highlights_from_input,
-        hover_from_input, references_from_input, semantic_tokens_from_input,
+        completion_from_input, completion_from_input_with_options, completion_metadata_from_input,
+        document_symbols_from_input, highlights_from_input, hover_from_input,
+        references_from_input, selection_ranges_from_input, semantic_tokens_from_input,
         signature_help_from_input, type_definitions_from_input,
     };
+    use crate::navigation::CompletionOptions;
     use crate::workspace::rename::{
-        CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input, owner_for_input,
-        project_context_and_metadata_for_input, revalidate_input,
+        CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input,
+        install_snapshot_priority_barrier, owner_for_input, project_context_and_metadata_for_input,
+        revalidate_input,
     };
     use crate::workspace::{Workspace, WorkspaceOptions, content_hash_bytes};
     use lsp_types::{MarkupKind, Position, Url};
@@ -1016,6 +1454,8 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::thread;
     use tempfile::TempDir;
 
     fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
@@ -1346,6 +1786,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn selection_reuses_context_valid_documents_and_skips_empty_or_oversized_parses() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("SelectionCache.pas");
+        let source = "unit SelectionCache;\ninterface\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&source_path, source).expect("source");
+        let uri = source_uri(&source_path);
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("open source");
+        let input = workspace.analysis_input();
+        assert!(
+            input.cached_documents.contains_key(&uri),
+            "the fixture must provide a reusable parsed document"
+        );
+        let cancel = AtomicBool::new(false);
+
+        crate::navigation::test_reset_document_parse_count();
+        let computed =
+            selection_ranges_from_input(input.clone(), &uri, vec![Position::new(0, 0)], &cancel);
+        assert!(
+            computed.value.is_ok(),
+            "cached selection failed: {computed:?}"
+        );
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "an unchanged cached document must be reused"
+        );
+
+        let mut changed_context = input.clone();
+        changed_context
+            .cached_documents
+            .get_mut(&uri)
+            .expect("cached document")
+            .context
+            .defines
+            .push("CONTEXT_CHANGED".to_owned());
+        crate::navigation::test_reset_document_parse_count();
+        let computed =
+            selection_ranges_from_input(changed_context, &uri, vec![Position::new(0, 0)], &cancel);
+        assert!(
+            computed.value.is_ok(),
+            "changed-context selection failed: {computed:?}"
+        );
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            1,
+            "a context mismatch must not reuse the cached document"
+        );
+
+        crate::navigation::test_reset_document_parse_count();
+        let computed = selection_ranges_from_input(input.clone(), &uri, Vec::new(), &cancel);
+        assert_eq!(computed.value, Ok(Vec::new()));
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "an empty selection request must not parse the source"
+        );
+
+        crate::navigation::test_reset_document_parse_count();
+        let computed =
+            selection_ranges_from_input(input, &uri, vec![Position::new(0, 0); 257], &cancel);
+        let error = computed.value.expect_err("oversized selection request");
+        assert!(error.contains("more than 256 positions"), "{error}");
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "an oversized selection request must not parse the source"
+        );
+    }
+
     struct AssistanceFixture {
         _temp: TempDir,
         root: PathBuf,
@@ -1600,6 +2115,160 @@ mod tests {
         assert_assistance_read_set(&fixture, &signature.records);
         revalidate_input(&fixture.input, &signature.records, &cancel)
             .expect("unchanged populated signature read set must revalidate");
+    }
+
+    struct ClosedCompletionFixture {
+        _temp: TempDir,
+        main: PathBuf,
+        provider: PathBuf,
+        main_source: String,
+        provider_source: String,
+        input: WorkspaceInput,
+    }
+
+    fn closed_completion_fixture() -> ClosedCompletionFixture {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let main = temp.path().join("Main.pas");
+        let provider = temp.path().join("Provider.pas");
+        let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nbegin\n  Doc\nend;\nend.\n".to_string();
+        let provider_source = "unit Provider;\ninterface\n/// <summary>OLD DOCUMENTATION.</summary>\nfunction DocOld: Integer;\nimplementation\nfunction DocOld: Integer;\nbegin\n  Result := 1;\nend;\nend.\n".to_string();
+        fs::write(&main, &main_source).expect("main source");
+        fs::write(&provider, &provider_source).expect("provider source");
+        let workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        ClosedCompletionFixture {
+            _temp: temp,
+            main,
+            provider,
+            main_source,
+            provider_source,
+            input: workspace.analysis_input(),
+        }
+    }
+
+    #[test]
+    fn completion_resolution_rejects_provider_change_after_original_validation() {
+        let fixture = closed_completion_fixture();
+        let main_uri = source_uri(&fixture.main);
+        let provider_uri = source_uri(&fixture.provider);
+        let position = position_after(&fixture.main_source, "  Doc");
+        let cancel = AtomicBool::new(false);
+        let completion = completion_from_input_with_options(
+            fixture.input.clone(),
+            &main_uri,
+            position,
+            CompletionOptions {
+                format: MarkupKind::Markdown,
+                defer_documentation: true,
+                defer_detail: true,
+                snippet_support: false,
+            },
+            &cancel,
+        );
+        let completion_result = completion.value.expect("completion result");
+        let seed = completion_result
+            .seeds
+            .iter()
+            .find(|seed| seed.candidate_uri() == &provider_uri)
+            .expect("provider completion seed");
+        let candidate_index = seed.candidate_index();
+        let original_records = completion.records.clone();
+        let expected_source_generation = fixture.input.source_generation;
+        let expected_configuration_generation = fixture.input.configuration_generation;
+        let (ready_sender, ready_receiver) = channel();
+        let (release_sender, release_receiver) = channel();
+        install_snapshot_priority_barrier(main_uri.clone(), ready_sender, release_receiver);
+
+        let input = fixture.input.clone();
+        let worker = thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            completion_metadata_from_input(
+                input,
+                &main_uri,
+                position,
+                expected_source_generation,
+                expected_configuration_generation,
+                &provider_uri,
+                candidate_index,
+                MarkupKind::Markdown,
+                true,
+                true,
+                false,
+                &original_records,
+                &cancel,
+            )
+        });
+        ready_receiver
+            .recv()
+            .expect("resolve snapshot barrier entered");
+        let changed_provider = fixture
+            .provider_source
+            .replace("DocOld", "DocNew")
+            .replace("OLD DOCUMENTATION", "NEW DOCUMENTATION");
+        fs::write(&fixture.provider, changed_provider).expect("changed provider source");
+        release_sender
+            .send(())
+            .expect("release resolve snapshot barrier");
+        let computed = worker.join().expect("resolve worker");
+        assert!(
+            computed.value.is_err(),
+            "provider revision changed after original validation: {computed:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_source_revalidation_rejects_inconsistent_parsed_text_and_hash() {
+        let fixture = closed_completion_fixture();
+        let main_uri = source_uri(&fixture.main);
+        let provider_uri = source_uri(&fixture.provider);
+        let cancel = AtomicBool::new(false);
+        let completion = completion_from_input(
+            fixture.input.clone(),
+            &main_uri,
+            position_after(&fixture.main_source, "  Doc"),
+            &cancel,
+        );
+        assert!(
+            completion.value.is_ok(),
+            "completion result: {completion:?}"
+        );
+        let provider_record = completion
+            .records
+            .iter()
+            .find(|record| record.uri == provider_uri && record.path.is_none())
+            .cloned()
+            .expect("full provider source record");
+        let changed_provider = fixture
+            .provider_source
+            .replace("DocOld", "DocNew")
+            .replace("OLD DOCUMENTATION", "NEW DOCUMENTATION");
+        let before = fs::metadata(&fixture.provider).expect("provider metadata");
+        fs::write(&fixture.provider, &changed_provider).expect("changed provider source");
+        restore_mtime(&fixture.provider, &before);
+
+        let mut inconsistent = provider_record;
+        inconsistent.content_hash = Some(content_hash_bytes(changed_provider.as_bytes()));
+        let workspace = test_workspace(
+            vec![
+                fixture
+                    .provider
+                    .parent()
+                    .expect("fixture root")
+                    .to_path_buf(),
+            ],
+            WorkspaceOptions::default(),
+        );
+        workspace
+            .revalidate_records(std::slice::from_ref(&inconsistent))
+            .expect_err("shared validation must retain parsed-source equality");
+        let validation = revalidate_input(&fixture.input, &[inconsistent], &cancel);
+        let error =
+            validation.expect_err("parsed source equality must not be replaced by a later hash");
+        assert!(
+            error.contains("changed") || error.contains("resolving"),
+            "{error}"
+        );
     }
 
     #[test]

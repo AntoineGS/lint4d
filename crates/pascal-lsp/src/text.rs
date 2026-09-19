@@ -249,6 +249,17 @@ impl PositionIndex {
         }
         None
     }
+
+    pub(crate) fn position_to_offset(&self, source: &str, position: Position) -> Option<usize> {
+        if source.len() != self.source_len {
+            return None;
+        }
+        let line_index = usize::try_from(position.line).ok()?;
+        let character = usize::try_from(position.character).ok()?;
+        let line = self.lines.get(line_index)?;
+        let offset_index = line.utf16_offsets.binary_search(&character).ok()?;
+        Some(line.start + line.byte_offsets[offset_index])
+    }
 }
 
 fn build_line(

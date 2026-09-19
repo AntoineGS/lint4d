@@ -735,6 +735,7 @@ fn lint_configuration_for_input(
                 path: Some(path.clone()),
                 path_stamp: content_bytes.as_ref().and_then(|_| path_stamp(path)),
                 content_hash: None,
+                parsed_text_hash: None,
                 content_bytes: content_bytes.clone(),
                 candidate_membership: None,
                 read_policy: Some(context.read_policy.clone()),
@@ -742,6 +743,9 @@ fn lint_configuration_for_input(
                 include_payload: false,
                 missing_provider_candidate: false,
                 directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
             })
         })
         .collect();

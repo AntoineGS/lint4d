@@ -4,6 +4,12 @@ use std::path::PathBuf;
 const TEST_NAVIGATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_NAVIGATION_BARRIER";
 const TEST_FORMATTING_BARRIER_ENV: &str = "PASCAL_LSP_TEST_FORMATTING_BARRIER";
 const TEST_DIAGNOSTICS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER";
+const TEST_SELECTION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_SELECTION_BARRIER";
+const TEST_COMPLETION_RESOLUTION_BARRIER_ENV: &str =
+    "PASCAL_LSP_TEST_COMPLETION_RESOLUTION_BARRIER";
+const TEST_WORKSPACE_SYMBOLS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER";
+const TEST_REFERENCES_BARRIER_ENV: &str = "PASCAL_LSP_TEST_REFERENCES_BARRIER";
+const TEST_PARTIAL_VALIDATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_PARTIAL_VALIDATION_BARRIER";
 const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
 
 fn barrier_from_environment(variable: &str) -> Result<Option<(PathBuf, PathBuf)>, String> {
@@ -23,6 +29,17 @@ fn test_barrier_config() -> Result<TestBarrierConfig, String> {
         barrier_from_environment(TEST_FORMATTING_BARRIER_ENV)?,
         barrier_from_environment(TEST_DIAGNOSTICS_BARRIER_ENV)?,
     )
+    .with_selection(barrier_from_environment(TEST_SELECTION_BARRIER_ENV)?)
+    .with_completion_resolution(barrier_from_environment(
+        TEST_COMPLETION_RESOLUTION_BARRIER_ENV,
+    )?)
+    .with_workspace_symbols(barrier_from_environment(
+        TEST_WORKSPACE_SYMBOLS_BARRIER_ENV,
+    )?)
+    .with_references(barrier_from_environment(TEST_REFERENCES_BARRIER_ENV)?)
+    .with_partial_validation(barrier_from_environment(
+        TEST_PARTIAL_VALIDATION_BARRIER_ENV,
+    )?)
     .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from)))
 }
 

@@ -417,6 +417,7 @@ pub(crate) fn source_record_for_loaded(
         .decoded_text
         .as_deref()
         .map_or_else(|| decode_source_bytes(&source.bytes), ToOwned::to_owned);
+    let parsed_text_hash = super::rename::text_content_hash(&text);
     match &source.revision {
         SourceRevision::Overlay {
             version,
@@ -435,6 +436,7 @@ pub(crate) fn source_record_for_loaded(
             // overlay record must not fail revalidation merely because the
             // two hash implementations differ.
             content_hash: None,
+            parsed_text_hash: Some(parsed_text_hash),
             content_bytes: None,
             candidate_membership: None,
             read_policy: Some(context.read_policy.clone()),
@@ -442,6 +444,9 @@ pub(crate) fn source_record_for_loaded(
             include_payload,
             missing_provider_candidate: false,
             directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
         }),
         SourceRevision::Disk {
             stamp,
@@ -460,6 +465,7 @@ pub(crate) fn source_record_for_loaded(
             path: Some(source.path.clone()),
             path_stamp: Some(stamp.clone()),
             content_hash: Some(*content_hash),
+            parsed_text_hash: Some(parsed_text_hash),
             content_bytes: None,
             candidate_membership: None,
             read_policy: Some(read_policy.clone()),
@@ -467,6 +473,9 @@ pub(crate) fn source_record_for_loaded(
             include_payload,
             missing_provider_candidate: false,
             directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
         }),
     }
 }
@@ -495,6 +504,7 @@ fn payload_record(
             path: Some(path.to_path_buf()),
             path_stamp: Some(stamp.clone()),
             content_hash: Some(*content_hash),
+            parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
             read_policy: Some(read_policy.clone()),
@@ -502,6 +512,9 @@ fn payload_record(
             include_payload: false,
             missing_provider_candidate: false,
             directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
         }),
         SourceRevision::Overlay {
             version,
@@ -517,6 +530,7 @@ fn payload_record(
             // This record has no decoded payload.  The revalidator recognizes
             // an empty open record as a byte-hash-only overlay observation.
             content_hash: Some(*content_hash),
+            parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
             read_policy: Some(context.read_policy.clone()),
@@ -524,6 +538,9 @@ fn payload_record(
             include_payload: false,
             missing_provider_candidate: false,
             directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
         }),
     }
 }
@@ -555,6 +572,7 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
         path: Some(path.clone()),
         path_stamp: stamp,
         content_hash: None,
+        parsed_text_hash: None,
         content_bytes: None,
         candidate_membership: None,
         read_policy: None,
@@ -562,6 +580,9 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
         include_payload: false,
         missing_provider_candidate,
         directory_observation,
+        missing_provider_scope: None,
+        auto_import_provider_observation: false,
+        auto_import_scopes: Vec::new(),
     })
 }
 
@@ -656,6 +677,7 @@ pub(crate) fn report_records(
             path: Some(path),
             path_stamp,
             content_hash,
+            parsed_text_hash: None,
             content_bytes,
             candidate_membership: None,
             read_policy,
@@ -663,6 +685,9 @@ pub(crate) fn report_records(
             include_payload: false,
             missing_provider_candidate: false,
             directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
         };
         if let Some(existing) = records.get_mut(&uri) {
             if existing.path_stamp.is_none() {

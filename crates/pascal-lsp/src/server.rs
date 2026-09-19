@@ -1,33 +1,49 @@
 //! Synchronous stdio LSP protocol loop for the Pascal navigation workspace.
 
+#[cfg(test)]
+use crate::navigation::CompletionResolutionSeed;
+use crate::navigation::{
+    CompletionMetadata, CompletionOptions, CompletionResult, FOLDING_KIND_COMMENT,
+    FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
+};
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
-    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, Workspace, WorkspaceOptions,
-    canonical_file_uri,
+    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, PreparedWorkspaceOptions,
+    RuntimeOptionsOverride, RuntimeOptionsUpdate, Workspace, WorkspaceOptions, canonical_file_uri,
+    parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded, unbounded,
+};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionParams,
-    CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionItem,
+    CompletionList, CompletionParams, CompletionResponse, ConfigurationItem, ConfigurationParams,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
-    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
-    MarkupKind, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
-    Registration, RegistrationParams, RelativePattern, ServerInfo, SignatureHelpParams,
-    TextDocumentIdentifier, Url, WatchKind, WorkspaceEdit, WorkspaceFolder,
+    FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
+    InitializeParams, Location, MarkupKind, OneOf, Position, PrepareRenameResponse, ProgressToken,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
+    SelectionRangeParams, ServerInfo, SignatureHelpParams, SymbolInformation,
+    TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams, WorkspaceEdit,
+    WorkspaceFolder,
 };
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::hash::{BuildHasher, Hash, Hasher};
 #[cfg(feature = "test-support")]
 use std::io::Write;
 use std::io::{self, BufRead, Read};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -55,9 +71,426 @@ const MAX_INTERACTIVE_BURST: usize = 3;
 const MAX_DIAGNOSTIC_BURST: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+const OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
+const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
+// Keep one slot available for an authoritative state-changing notification
+// even when only retryable feature requests are arriving.
+const MAX_CONFIGURATION_DEFERRED_REQUESTS: usize =
+    MAX_CONFIGURATION_DEFERRED_MESSAGES.saturating_sub(1);
+const CONFIGURATION_REQUEST_RETRY_MESSAGE: &str =
+    "configuration update is still being prepared; retry the request";
+const MAX_COMPLETION_RESOLUTION_ENTRIES: usize = 2_048;
+const MAX_COMPLETION_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COMPLETION_RESOLUTION_DATA_BYTES: usize = 512;
+const MAX_COMPLETION_RESOLUTION_RECORDS: usize = 1_024;
+const MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COMPLETION_RESOLUTION_ITEM_BYTES: usize = 64 * 1024;
+const COMPLETION_RESOLUTION_DATA_VERSION: u8 = 1;
+/// Progress is deliberately smaller than the analysis recipient bound.  A
+/// client can attach many request recipients to one computation, but progress
+/// state must not become an alternate unbounded queue.
+const MAX_PROGRESS_ENTRIES: usize = 128;
+const MAX_PROGRESS_CREATES: usize = 32;
+const PROGRESS_CREATE_REQUEST_PREFIX: &str = "pascal-lsp-progress-create-";
+const PROGRESS_TOKEN_PREFIX: &str = "pascal-lsp-progress-";
+/// Partial results are delivered one bounded notification at a time.  Keeping
+/// this separate from work-done progress prevents a large result from becoming
+/// an unbounded protocol-loop operation or from being confused with lifecycle
+/// progress reports.
+const MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK: usize = 128;
+const MAX_PARTIAL_RESULT_BYTES_PER_CHUNK: usize = 64 * 1024;
+const MAX_PARTIAL_RESULT_ITEM_BYTES: usize = MAX_PARTIAL_RESULT_BYTES_PER_CHUNK;
+const MAX_PARTIAL_RESULT_CHUNKS_PER_TURN: usize = 1;
+// A client recipient can require begin, started-report, terminal response,
+// and end output while stdout is paused.  Keep enough bounded control slots
+// for every admitted recipient, with a small allowance for diagnostics,
+// watcher, and configuration traffic.  Data chunks have their own reserve.
+const MAX_CLIENT_CONTROL_MESSAGES_PER_RECIPIENT: usize = 4;
+const MAX_PENDING_OUTBOUND_CONTROL_MESSAGES: usize = MAX_CLIENT_ANALYSIS_RECIPIENTS
+    * MAX_CLIENT_CONTROL_MESSAGES_PER_RECIPIENT
+    + MAX_PROGRESS_ENTRIES;
+const MAX_PENDING_OUTBOUND_DATA_MESSAGES: usize = 16;
+const MAX_PENDING_OUTBOUND_MESSAGES: usize =
+    MAX_PENDING_OUTBOUND_CONTROL_MESSAGES + MAX_PENDING_OUTBOUND_DATA_MESSAGES;
+const MAX_OUTBOUND_MESSAGES: usize = 32;
+/// Messages accepted by the protocol loop but not yet accepted by the
+/// transport writer are retained here.  Partial-result data is deliberately
+/// limited to a small prefix of this queue so terminal responses and
+/// cancellation/progress control messages always have reserved capacity.
+const MAX_PENDING_OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_OUTBOUND_CONTROL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PARTIAL_DELIVERY_BYTES: usize = 64 * 1024 * 1024;
+// Temporary control pressure is retained separately from the normal writer
+// queue.  Result payloads and lifecycle/control messages have independent
+// bounded budgets so a large result cannot consume the terminal-message
+// reserve.  The deferred queue is FIFO and is drained whenever writer space
+// returns; it is not an unbounded retry buffer.
+const MAX_DEFERRED_OUTBOUND_RESULT_BYTES: usize = MAX_PARTIAL_DELIVERY_BYTES;
+const MAX_DEFERRED_OUTBOUND_CONTROL_BYTES: usize = MAX_PENDING_OUTBOUND_CONTROL_BYTES;
+const MAX_DEFERRED_OUTBOUND_BYTES: usize =
+    MAX_DEFERRED_OUTBOUND_RESULT_BYTES + MAX_DEFERRED_OUTBOUND_CONTROL_BYTES;
+const MAX_DEFERRED_OUTBOUND_RESULT_MESSAGES: usize = MAX_PENDING_OUTBOUND_CONTROL_MESSAGES;
+const MAX_DEFERRED_OUTBOUND_CONTROL_MESSAGES: usize = MAX_PENDING_OUTBOUND_CONTROL_MESSAGES;
+const MAX_DEFERRED_OUTBOUND_MESSAGES: usize =
+    MAX_DEFERRED_OUTBOUND_RESULT_MESSAGES + MAX_DEFERRED_OUTBOUND_CONTROL_MESSAGES;
+const MAX_PARTIAL_VALIDATION_RETIREMENTS: usize = MAX_CLIENT_ANALYSIS_RECIPIENTS;
+
+#[derive(Debug)]
+enum OutputError {
+    Disconnected,
+    Backpressure,
+    ResultBackpressure,
+    MessageTooLarge,
+    Encoding(String),
+}
+
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => formatter.write_str("LSP writer disconnected"),
+            Self::Backpressure => formatter
+                .write_str("LSP output queue is full; the client did not drain the connection"),
+            Self::ResultBackpressure => formatter.write_str(
+                "deferred LSP result output is full; the client did not drain the connection",
+            ),
+            Self::MessageTooLarge => formatter
+                .write_str("LSP output message exceeds the bounded control/output message budget"),
+            Self::Encoding(error) => {
+                write!(formatter, "could not encode outbound LSP message: {error}")
+            }
+        }
+    }
+}
+
+impl Error for OutputError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundClass {
+    Data,
+    Control,
+    Result,
+}
+
+impl OutboundClass {
+    fn is_control(self) -> bool {
+        matches!(self, Self::Control | Self::Result)
+    }
+
+    fn is_result(self) -> bool {
+        matches!(self, Self::Result)
+    }
+}
+
+#[derive(Debug)]
+struct PendingOutboundMessage {
+    message: Message,
+    bytes: usize,
+    class: OutboundClass,
+}
+
+#[derive(Debug, Default)]
+struct OutboundQueue {
+    pending: VecDeque<PendingOutboundMessage>,
+    pending_bytes: usize,
+    pending_data_messages: usize,
+    pending_control_messages: usize,
+    pending_control_bytes: usize,
+    deferred: VecDeque<PendingOutboundMessage>,
+    deferred_bytes: usize,
+    deferred_control_messages: usize,
+    deferred_result_messages: usize,
+    deferred_control_bytes: usize,
+    deferred_result_bytes: usize,
+}
+
+impl OutboundQueue {
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty() || !self.deferred.is_empty()
+    }
+
+    fn flush(&mut self, sender: &Sender<Message>) -> Result<(), OutputError> {
+        loop {
+            while let Some(pending) = self.pending.front() {
+                match sender.try_send(pending.message.clone()) {
+                    Ok(()) => {
+                        let pending = self.pending.pop_front().expect("pending message exists");
+                        self.pending_bytes = self.pending_bytes.saturating_sub(pending.bytes);
+                        match pending.class {
+                            OutboundClass::Data => {
+                                self.pending_data_messages =
+                                    self.pending_data_messages.saturating_sub(1);
+                            }
+                            OutboundClass::Control | OutboundClass::Result => {
+                                self.pending_control_messages =
+                                    self.pending_control_messages.saturating_sub(1);
+                                self.pending_control_bytes =
+                                    self.pending_control_bytes.saturating_sub(pending.bytes);
+                            }
+                        }
+                    }
+                    Err(TrySendError::Full(_)) => return Ok(()),
+                    Err(TrySendError::Disconnected(_)) => return Err(OutputError::Disconnected),
+                }
+            }
+
+            let Some(deferred) = self.deferred.front() else {
+                return Ok(());
+            };
+            if !self.can_fit_pending(deferred.bytes, deferred.class) {
+                return Ok(());
+            }
+            let deferred = self.deferred.pop_front().expect("deferred message exists");
+            self.deferred_bytes = self.deferred_bytes.saturating_sub(deferred.bytes);
+            if deferred.class.is_result() {
+                self.deferred_result_messages = self.deferred_result_messages.saturating_sub(1);
+                self.deferred_result_bytes =
+                    self.deferred_result_bytes.saturating_sub(deferred.bytes);
+            } else {
+                self.deferred_control_messages = self.deferred_control_messages.saturating_sub(1);
+                self.deferred_control_bytes =
+                    self.deferred_control_bytes.saturating_sub(deferred.bytes);
+            }
+            self.push_pending(deferred);
+        }
+    }
+
+    fn can_fit_pending(&self, bytes: usize, class: OutboundClass) -> bool {
+        let total_messages = self
+            .pending_data_messages
+            .saturating_add(self.pending_control_messages);
+        if total_messages >= MAX_PENDING_OUTBOUND_MESSAGES
+            || self.pending_bytes.saturating_add(bytes) > MAX_PENDING_OUTBOUND_BYTES
+        {
+            return false;
+        }
+        match class {
+            OutboundClass::Data => self.pending_data_messages < MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+            OutboundClass::Control | OutboundClass::Result => {
+                self.pending_control_messages < MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
+                    && self.pending_control_bytes.saturating_add(bytes)
+                        <= MAX_PENDING_OUTBOUND_CONTROL_BYTES
+            }
+        }
+    }
+
+    fn push_pending(&mut self, pending: PendingOutboundMessage) {
+        self.pending_bytes = self.pending_bytes.saturating_add(pending.bytes);
+        match pending.class {
+            OutboundClass::Data => self.pending_data_messages += 1,
+            OutboundClass::Control | OutboundClass::Result => {
+                self.pending_control_messages += 1;
+                self.pending_control_bytes =
+                    self.pending_control_bytes.saturating_add(pending.bytes);
+            }
+        }
+        self.pending.push_back(pending);
+    }
+
+    fn defer(&mut self, pending: PendingOutboundMessage) -> Result<bool, OutputError> {
+        // A successful deferral is output admission: the message is now
+        // owned by this bounded queue, so the producer may retire its
+        // request/result state without retrying or duplicating it.  Results
+        // and lifecycle controls have separate count/byte budgets so a
+        // result burst cannot consume all control capacity.
+        let (deferred_messages, max_deferred_messages, deferred_bytes, max_deferred_bytes) =
+            if pending.class.is_result() {
+                (
+                    &mut self.deferred_result_messages,
+                    MAX_DEFERRED_OUTBOUND_RESULT_MESSAGES,
+                    &mut self.deferred_result_bytes,
+                    MAX_DEFERRED_OUTBOUND_RESULT_BYTES,
+                )
+            } else {
+                (
+                    &mut self.deferred_control_messages,
+                    MAX_DEFERRED_OUTBOUND_CONTROL_MESSAGES,
+                    &mut self.deferred_control_bytes,
+                    MAX_DEFERRED_OUTBOUND_CONTROL_BYTES,
+                )
+            };
+        if *deferred_messages >= max_deferred_messages
+            || deferred_bytes.saturating_add(pending.bytes) > max_deferred_bytes
+            || self.deferred.len() >= MAX_DEFERRED_OUTBOUND_MESSAGES
+            || self.deferred_bytes.saturating_add(pending.bytes) > MAX_DEFERRED_OUTBOUND_BYTES
+        {
+            return Err(if pending.class.is_result() {
+                OutputError::ResultBackpressure
+            } else {
+                OutputError::Backpressure
+            });
+        }
+        *deferred_messages += 1;
+        *deferred_bytes = deferred_bytes.saturating_add(pending.bytes);
+        self.deferred_bytes = self.deferred_bytes.saturating_add(pending.bytes);
+        self.deferred.push_back(pending);
+        Ok(true)
+    }
+
+    fn enqueue(
+        &mut self,
+        sender: &Sender<Message>,
+        message: Message,
+        class: OutboundClass,
+    ) -> Result<bool, OutputError> {
+        self.flush(sender)?;
+        let bytes = serde_json::to_vec(&message)
+            .map_err(|error| OutputError::Encoding(error.to_string()))?
+            .len();
+        if bytes > MAX_PENDING_OUTBOUND_BYTES
+            || (class.is_control() && bytes > MAX_PENDING_OUTBOUND_CONTROL_BYTES)
+        {
+            return Err(OutputError::MessageTooLarge);
+        }
+        let pending = PendingOutboundMessage {
+            message,
+            bytes,
+            class,
+        };
+        if !self.deferred.is_empty() {
+            return match class {
+                OutboundClass::Data => Ok(false),
+                OutboundClass::Control | OutboundClass::Result => self.defer(pending),
+            };
+        }
+        if !self.can_fit_pending(bytes, class) {
+            return match class {
+                OutboundClass::Data => Ok(false),
+                OutboundClass::Control | OutboundClass::Result => self.defer(pending),
+            };
+        }
+        self.push_pending(pending);
+        self.flush(sender)?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn deferred_result_bytes(&self) -> usize {
+        self.deferred_result_bytes
+    }
+}
+
+/// Protocol output is accepted without blocking the event loop.  The
+/// production wrapper retains a bounded, ordered queue in front of the
+/// transport channel; the plain `Connection` implementation keeps the
+/// memory-connection unit tests lightweight.
+trait ProtocolSender {
+    fn send_control(&self, message: Message) -> Result<(), OutputError>;
+    fn send_result(&self, message: Message) -> Result<(), OutputError>;
+    fn send_data(&self, message: Message) -> Result<bool, OutputError>;
+}
+
+impl ProtocolSender for Connection {
+    fn send_control(&self, message: Message) -> Result<(), OutputError> {
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(OutputError::Backpressure),
+            Err(TrySendError::Disconnected(_)) => Err(OutputError::Disconnected),
+        }
+    }
+
+    fn send_result(&self, message: Message) -> Result<(), OutputError> {
+        self.send_control(message)
+    }
+
+    fn send_data(&self, message: Message) -> Result<bool, OutputError> {
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(OutputError::Disconnected),
+        }
+    }
+}
+
+struct ProtocolConnection {
+    connection: Connection,
+    outbound: RefCell<OutboundQueue>,
+}
+
+impl ProtocolConnection {
+    fn new(connection: Connection) -> Self {
+        Self {
+            connection,
+            outbound: RefCell::new(OutboundQueue::default()),
+        }
+    }
+
+    fn initialize_start(&self) -> Result<(RequestId, Value), lsp_server::ProtocolError> {
+        self.connection.initialize_start()
+    }
+
+    fn initialize_finish(
+        &self,
+        initialize_id: RequestId,
+        initialize_result: Value,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_control(Message::Response(Response::new_ok(
+            initialize_id,
+            initialize_result,
+        )))
+        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        match self.receiver().recv() {
+            Ok(Message::Notification(notification)) if notification.method == "initialized" => {
+                Ok(())
+            }
+            Ok(message) => {
+                Err(format!("expected initialized notification, got: {message:?}").into())
+            }
+            Err(_) => Err("LSP client disconnected during initialization".into()),
+        }
+    }
+
+    fn receiver(&self) -> &Receiver<Message> {
+        &self.connection.receiver
+    }
+
+    fn flush(&self) -> Result<(), OutputError> {
+        self.outbound.borrow_mut().flush(&self.connection.sender)
+    }
+
+    fn has_pending_output(&self) -> bool {
+        self.outbound.borrow().has_pending()
+    }
+
+    fn drain_until(&self, deadline: Instant) -> Result<(), OutputError> {
+        while self.has_pending_output() {
+            self.flush()?;
+            if !self.has_pending_output() || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
+        }
+        self.flush()
+    }
+}
+
+impl ProtocolSender for ProtocolConnection {
+    fn send_control(&self, message: Message) -> Result<(), OutputError> {
+        self.outbound.borrow_mut().enqueue(
+            &self.connection.sender,
+            message,
+            OutboundClass::Control,
+        )?;
+        Ok(())
+    }
+
+    fn send_result(&self, message: Message) -> Result<(), OutputError> {
+        self.outbound.borrow_mut().enqueue(
+            &self.connection.sender,
+            message,
+            OutboundClass::Result,
+        )?;
+        Ok(())
+    }
+
+    fn send_data(&self, message: Message) -> Result<bool, OutputError> {
+        self.outbound
+            .borrow_mut()
+            .enqueue(&self.connection.sender, message, OutboundClass::Data)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalysisPriority {
@@ -77,14 +510,17 @@ impl AnalysisPriority {
             | AnalysisRequest::Prepare { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
-            | AnalysisRequest::DocumentHighlights { .. } => Self::Interactive,
+            | AnalysisRequest::ResolveCompletion(_)
+            | AnalysisRequest::DocumentHighlights { .. }
+            | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
             AnalysisRequest::Diagnostics { .. } => Self::Diagnostics,
             AnalysisRequest::Formatting { .. }
             | AnalysisRequest::DocumentSymbols { .. }
             | AnalysisRequest::WorkspaceSymbols { .. }
             | AnalysisRequest::References { .. }
             | AnalysisRequest::Rename { .. }
-            | AnalysisRequest::SemanticTokens { .. } => Self::Bulk,
+            | AnalysisRequest::SemanticTokens { .. }
+            | AnalysisRequest::FoldingRanges { .. } => Self::Bulk,
         }
     }
 }
@@ -220,6 +656,11 @@ enum TestBarrier {
     Navigation,
     Formatting,
     Diagnostics,
+    Selection,
+    CompletionResolution,
+    WorkspaceSymbols,
+    References,
+    PartialValidation,
 }
 
 #[cfg(feature = "test-support")]
@@ -228,6 +669,11 @@ pub struct TestBarrierConfig {
     navigation: Option<TestBarrierPaths>,
     formatting: Option<TestBarrierPaths>,
     diagnostics: Option<TestBarrierPaths>,
+    selection: Option<TestBarrierPaths>,
+    completion_resolution: Option<TestBarrierPaths>,
+    workspace_symbols: Option<TestBarrierPaths>,
+    references: Option<TestBarrierPaths>,
+    partial_validation: Option<TestBarrierPaths>,
     dispatch: Option<PathBuf>,
 }
 
@@ -250,8 +696,48 @@ impl TestBarrierConfig {
             formatting: formatting.map(|(entered, release)| TestBarrierPaths { entered, release }),
             diagnostics: diagnostics
                 .map(|(entered, release)| TestBarrierPaths { entered, release }),
+            selection: None,
+            completion_resolution: None,
+            workspace_symbols: None,
+            references: None,
+            partial_validation: None,
             dispatch: None,
         }
+    }
+
+    pub fn with_selection(mut self, selection: Option<(PathBuf, PathBuf)>) -> Self {
+        self.selection = selection.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_completion_resolution(
+        mut self,
+        completion_resolution: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.completion_resolution =
+            completion_resolution.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_workspace_symbols(mut self, workspace_symbols: Option<(PathBuf, PathBuf)>) -> Self {
+        self.workspace_symbols =
+            workspace_symbols.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_references(mut self, references: Option<(PathBuf, PathBuf)>) -> Self {
+        self.references =
+            references.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_partial_validation(
+        mut self,
+        partial_validation: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.partial_validation =
+            partial_validation.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
     }
 
     pub fn with_dispatch(mut self, path: Option<PathBuf>) -> Self {
@@ -285,6 +771,11 @@ impl TestBarrierConfig {
             TestBarrier::Navigation => self.navigation.as_ref(),
             TestBarrier::Formatting => self.formatting.as_ref(),
             TestBarrier::Diagnostics => self.diagnostics.as_ref(),
+            TestBarrier::Selection => self.selection.as_ref(),
+            TestBarrier::CompletionResolution => self.completion_resolution.as_ref(),
+            TestBarrier::WorkspaceSymbols => self.workspace_symbols.as_ref(),
+            TestBarrier::References => self.references.as_ref(),
+            TestBarrier::PartialValidation => self.partial_validation.as_ref(),
         }
     }
 }
@@ -340,6 +831,37 @@ fn wait_at_test_barrier(
     }
 }
 
+#[cfg(feature = "test-support")]
+fn wait_at_uninterruptible_test_barrier(
+    barrier: TestBarrier,
+    config: &TestBarrierConfig,
+) -> Result<(), String> {
+    let Some(paths) = config.paths(barrier) else {
+        return Ok(());
+    };
+    let mut marker = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&paths.entered)
+        .map_err(|error| format!("could not enter test barrier: {error}"))?;
+    marker
+        .write_all(b"x")
+        .map_err(|error| format!("could not record test barrier entry: {error}"))?;
+    drop(marker);
+    while !paths.release.exists() {
+        thread::sleep(ANALYSIS_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+fn wait_at_uninterruptible_test_barrier(
+    _barrier: TestBarrier,
+    _config: &TestBarrierConfig,
+) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(not(feature = "test-support"))]
 fn wait_at_test_barrier(
     _barrier: TestBarrier,
@@ -355,7 +877,531 @@ struct ClientFeatures {
     action_disabled: bool,
     document_changes: bool,
     hierarchical_document_symbols: bool,
-    hover_markdown: bool,
+    hover_format: DocumentationFormat,
+    completion_format: DocumentationFormat,
+    completion_snippet_support: bool,
+    completion_resolve_documentation: bool,
+    completion_resolve_detail: bool,
+    signature_help_format: DocumentationFormat,
+    folding_range_limit: Option<usize>,
+    line_folding_only: bool,
+    folding_range_kind_value_set: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionResolutionContext {
+    source_uri: Url,
+    position: Position,
+    source_generation: u64,
+    configuration_generation: u64,
+    format: MarkupKind,
+    snippet_support: bool,
+    resolve_documentation: bool,
+    resolve_detail: bool,
+    records: Vec<SourceRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionResolutionRequest {
+    token: String,
+    context: Arc<CompletionResolutionContext>,
+    candidate_uri: Url,
+    candidate_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionAnalysis {
+    uri: Url,
+    position: Position,
+    format: MarkupKind,
+    snippet_support: bool,
+    resolve_documentation: bool,
+    resolve_detail: bool,
+    value: Result<CompletionResult, String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionResolutionAnalysis {
+    token: String,
+    value: Result<CompletionMetadata, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct CompletionResolveData {
+    version: u8,
+    token: String,
+    proof: String,
+}
+
+#[derive(Debug)]
+struct CompletionResolutionEntry {
+    context_id: u64,
+    candidate_uri: Url,
+    candidate_index: usize,
+    proof: String,
+    item: CompletionItem,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct StoredCompletionResolutionContext {
+    context: Arc<CompletionResolutionContext>,
+    references: usize,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct CompletionResolutionStore {
+    hasher: RandomState,
+    next_context_id: u64,
+    entries: HashMap<String, CompletionResolutionEntry>,
+    order: VecDeque<String>,
+    contexts: HashMap<u64, StoredCompletionResolutionContext>,
+    retained_bytes: usize,
+}
+
+impl CompletionResolutionStore {
+    fn new() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            next_context_id: 0,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            contexts: HashMap::new(),
+            retained_bytes: 0,
+        }
+    }
+
+    fn issue_digest(&self, context_id: u64, item_index: usize, discriminator: u8) -> u64 {
+        let mut hasher = self.hasher.build_hasher();
+        discriminator.hash(&mut hasher);
+        context_id.hash(&mut hasher);
+        item_index.hash(&mut hasher);
+        self.entries.len().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn token_and_proof(&self, context_id: u64, item_index: usize) -> (String, String) {
+        let token = format!(
+            "{:016x}{:016x}",
+            self.issue_digest(context_id, item_index, 1),
+            self.issue_digest(context_id, item_index, 2)
+        );
+        let mut hasher = self.hasher.build_hasher();
+        token.hash(&mut hasher);
+        context_id.hash(&mut hasher);
+        item_index.hash(&mut hasher);
+        let proof = format!("{:016x}", hasher.finish());
+        (token, proof)
+    }
+
+    fn register(
+        &mut self,
+        analysis: CompletionAnalysis,
+        source_generation: u64,
+        configuration_generation: u64,
+        records: &[SourceRecord],
+    ) -> Result<CompletionList, String> {
+        let CompletionAnalysis {
+            uri,
+            position,
+            format,
+            snippet_support,
+            resolve_documentation,
+            resolve_detail,
+            value,
+        } = analysis;
+        let result = value?;
+        if !resolve_documentation && !resolve_detail {
+            return Ok(result.list);
+        }
+        if result.list.items.is_empty() {
+            return Ok(result.list);
+        }
+        if result.list.items.len() != result.seeds.len() {
+            return Err("completion result lost its exact resolution identities".to_string());
+        }
+        if result.list.items.len() > MAX_COMPLETION_RESOLUTION_ENTRIES {
+            return Err("completion result exceeds the bounded resolution entry limit".to_string());
+        }
+
+        let (compact_records, context_bytes) = compact_completion_records(records)?;
+        if compact_records.len() > MAX_COMPLETION_RESOLUTION_RECORDS {
+            return Err("completion dependency observations exceed the bounded limit".to_string());
+        }
+        if context_bytes > MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES {
+            return Err(
+                "completion dependency observations exceed the bounded byte limit".to_string(),
+            );
+        }
+        let context_id = self
+            .next_context_id
+            .checked_add(1)
+            .ok_or_else(|| "completion resolution context ID space exhausted".to_string())?;
+        let context = Arc::new(CompletionResolutionContext {
+            source_uri: canonical_file_uri(&uri),
+            position,
+            source_generation,
+            configuration_generation,
+            format,
+            snippet_support,
+            resolve_documentation,
+            resolve_detail,
+            records: compact_records,
+        });
+
+        let mut pending = Vec::with_capacity(result.list.items.len());
+        let mut output = result.list;
+        let mut new_bytes = context_bytes.saturating_add(size_of::<CompletionResolutionContext>());
+        for (index, (item, seed)) in output.items.iter_mut().zip(result.seeds).enumerate() {
+            let mut stored_item = item.clone();
+            stored_item.data = None;
+            let item_bytes = serde_json::to_vec(&stored_item)
+                .map_err(|error| format!("could not size completion resolve item: {error}"))?
+                .len();
+            if item_bytes > MAX_COMPLETION_RESOLUTION_ITEM_BYTES {
+                return Err("completion resolve item exceeds its bounded size".to_string());
+            }
+            let (token, proof) = self.token_and_proof(context_id, index);
+            let data = CompletionResolveData {
+                version: COMPLETION_RESOLUTION_DATA_VERSION,
+                token: token.clone(),
+                proof: proof.clone(),
+            };
+            let data_value = serde_json::to_value(&data)
+                .map_err(|error| format!("could not encode completion resolve data: {error}"))?;
+            let data_bytes = serde_json::to_vec(&data_value)
+                .map_err(|error| format!("could not size completion resolve data: {error}"))?
+                .len();
+            if data_bytes > MAX_COMPLETION_RESOLUTION_DATA_BYTES {
+                return Err("completion resolve data exceeds its bounded size".to_string());
+            }
+            let candidate_uri = canonical_file_uri(seed.candidate_uri());
+            if self.entries.contains_key(&token)
+                || pending.iter().any(|(existing, _)| existing == &token)
+            {
+                return Err("completion resolution token collision".to_string());
+            }
+            let token_storage = size_of::<String>().saturating_add(token.capacity());
+            let entry_bytes = size_of::<CompletionResolutionEntry>()
+                .saturating_add(item_bytes)
+                .saturating_add(data_bytes)
+                .saturating_add(token_storage.saturating_mul(2))
+                .saturating_add(proof.capacity())
+                .saturating_add(candidate_uri.as_str().len());
+            new_bytes = new_bytes.saturating_add(entry_bytes);
+            stored_item.data = Some(data_value);
+            *item = stored_item.clone();
+            pending.push((
+                token,
+                CompletionResolutionEntry {
+                    context_id,
+                    candidate_uri,
+                    candidate_index: seed.candidate_index(),
+                    proof,
+                    item: stored_item,
+                    bytes: entry_bytes,
+                },
+            ));
+        }
+        if new_bytes > MAX_COMPLETION_RESOLUTION_BYTES {
+            return Err("completion resolution state exceeds its bounded byte limit".to_string());
+        }
+        while self.entries.len().saturating_add(pending.len()) > MAX_COMPLETION_RESOLUTION_ENTRIES
+            || self.retained_bytes.saturating_add(new_bytes) > MAX_COMPLETION_RESOLUTION_BYTES
+        {
+            let Some(victim) = self.order.pop_front() else {
+                return Err("completion resolution state could not make room".to_string());
+            };
+            self.remove(&victim);
+        }
+        self.next_context_id = context_id;
+        self.retained_bytes = self.retained_bytes.saturating_add(new_bytes);
+        self.contexts.insert(
+            context_id,
+            StoredCompletionResolutionContext {
+                context,
+                references: pending.len(),
+                bytes: context_bytes.saturating_add(size_of::<CompletionResolutionContext>()),
+            },
+        );
+        for (token, entry) in pending {
+            self.order.push_back(token.clone());
+            self.entries.insert(token, entry);
+        }
+        Ok(output)
+    }
+
+    fn remove(&mut self, token: &str) {
+        let Some(entry) = self.entries.remove(token) else {
+            return;
+        };
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.bytes);
+        if let Some(context) = self.contexts.get_mut(&entry.context_id) {
+            context.references = context.references.saturating_sub(1);
+            if context.references == 0 {
+                let context = self
+                    .contexts
+                    .remove(&entry.context_id)
+                    .expect("completion context exists while removing its final entry");
+                self.retained_bytes = self.retained_bytes.saturating_sub(context.bytes);
+            }
+        }
+    }
+
+    fn request(&self, item: &CompletionItem) -> Result<CompletionResolutionRequest, String> {
+        let value = item
+            .data
+            .as_ref()
+            .ok_or_else(|| "completion item has no resolve data".to_string())?;
+        let data_bytes = serde_json::to_vec(value)
+            .map_err(|error| format!("invalid completion resolve data: {error}"))?
+            .len();
+        if data_bytes > MAX_COMPLETION_RESOLUTION_DATA_BYTES {
+            return Err("completion resolve data exceeds its bounded size".to_string());
+        }
+        let data: CompletionResolveData = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid completion resolve data: {error}"))?;
+        if data.version != COMPLETION_RESOLUTION_DATA_VERSION
+            || data.token.len() > 64
+            || data.proof.len() > 32
+        {
+            return Err("completion resolve data is stale or tampered".to_string());
+        }
+        let entry = self
+            .entries
+            .get(&data.token)
+            .ok_or_else(|| "completion resolve data is stale, foreign, or evicted".to_string())?;
+        if entry.proof != data.proof {
+            return Err("completion resolve data is stale or tampered".to_string());
+        }
+        let context = self
+            .contexts
+            .get(&entry.context_id)
+            .ok_or_else(|| "completion resolve context was evicted".to_string())?;
+        Ok(CompletionResolutionRequest {
+            token: data.token,
+            context: Arc::clone(&context.context),
+            candidate_uri: entry.candidate_uri.clone(),
+            candidate_index: entry.candidate_index,
+        })
+    }
+
+    fn finish(&self, token: &str, metadata: CompletionMetadata) -> Result<CompletionItem, String> {
+        let entry = self
+            .entries
+            .get(token)
+            .ok_or_else(|| "completion resolve data was evicted while resolving".to_string())?;
+        let mut item = entry.item.clone();
+        let context = self
+            .contexts
+            .get(&entry.context_id)
+            .ok_or_else(|| "completion resolve context was evicted while resolving".to_string())?;
+        if context.context.resolve_documentation {
+            item.documentation = metadata.documentation;
+        }
+        if context.context.resolve_detail {
+            item.detail = metadata.detail;
+        }
+        Ok(item)
+    }
+}
+
+impl Default for CompletionResolutionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn compact_completion_records(
+    records: &[SourceRecord],
+) -> Result<(Vec<SourceRecord>, usize), String> {
+    let mut compact = Vec::with_capacity(records.len());
+    let mut bytes = 0usize;
+    for record in records {
+        let content_hash = record.content_hash.or_else(|| {
+            if record.open {
+                // The compact observation below intentionally drops the full
+                // overlay text.  Revalidation therefore interprets this as a
+                // raw-byte hash, while parsed_text_hash retains the decoded
+                // LSP-text identity for parser freshness.
+                Some(crate::workspace::content_hash_bytes(record.text.as_bytes()))
+            } else {
+                record
+                    .content_bytes
+                    .as_deref()
+                    .map(crate::workspace::content_hash_bytes)
+                    .or_else(|| {
+                        (!record.text.is_empty())
+                            .then(|| crate::workspace::content_hash_bytes(record.text.as_bytes()))
+                    })
+            }
+        });
+        if !record.open && record.path.is_none() && content_hash.is_none() {
+            return Err(format!(
+                "completion dependency {} has no bounded content observation",
+                record.uri
+            ));
+        }
+        let observation = SourceRecord {
+            uri: record.uri.clone(),
+            text: String::new(),
+            version: record.version,
+            stamp: record.stamp.clone(),
+            open: record.open,
+            path: record.path.clone(),
+            path_stamp: record.path_stamp.clone(),
+            content_hash,
+            parsed_text_hash: record.parsed_text_hash.or_else(|| {
+                (!record.text.is_empty())
+                    .then(|| crate::workspace::rename::text_content_hash(&record.text))
+            }),
+            content_bytes: None,
+            candidate_membership: record.candidate_membership.clone(),
+            read_policy: record.read_policy.clone(),
+            path_entry: record.path_entry.clone(),
+            include_payload: record.include_payload,
+            missing_provider_candidate: record.missing_provider_candidate,
+            directory_observation: record.directory_observation,
+            missing_provider_scope: record.missing_provider_scope.clone(),
+            auto_import_provider_observation: record.auto_import_provider_observation,
+            auto_import_scopes: record.auto_import_scopes.clone(),
+        };
+        let observation_bytes = compact_completion_record_bytes(&observation);
+        bytes = bytes.saturating_add(observation_bytes);
+        compact.push(observation);
+        if compact.len() > MAX_COMPLETION_RESOLUTION_RECORDS
+            || bytes > MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES
+        {
+            return Err("completion dependency observations exceed the bounded limit".to_string());
+        }
+    }
+    Ok((compact, bytes))
+}
+
+fn path_storage_bytes(path: &PathBuf) -> usize {
+    size_of::<PathBuf>().saturating_add(path.capacity())
+}
+
+fn path_entry_storage_bytes(entry: &pascal_project::ProjectPathEntry) -> usize {
+    size_of::<pascal_project::ProjectPathEntry>()
+        .saturating_add(path_storage_bytes(&entry.path))
+        .saturating_add(match &entry.provenance {
+            pascal_project::ProjectPathProvenance::Mapped { root } => path_storage_bytes(root),
+            pascal_project::ProjectPathProvenance::LegacyNative
+            | pascal_project::ProjectPathProvenance::Configured => 0,
+        })
+}
+
+fn candidate_membership_storage_bytes(
+    membership: &pascal_project::ProjectCandidateMembership,
+) -> usize {
+    size_of::<pascal_project::ProjectCandidateMembership>().saturating_add(
+        membership
+            .paths
+            .iter()
+            .map(path_storage_bytes)
+            .sum::<usize>(),
+    )
+}
+
+fn missing_provider_scope_storage_bytes(
+    scope: &crate::workspace::rename::MissingProviderScope,
+) -> usize {
+    size_of::<crate::workspace::rename::MissingProviderScope>()
+        .saturating_add(path_storage_bytes(&scope.root))
+        .saturating_add(
+            scope
+                .names
+                .iter()
+                .map(|name| size_of::<String>().saturating_add(name.capacity()))
+                .sum::<usize>(),
+        )
+        .saturating_add(scope.read_policy.retained_size_hint())
+        .saturating_add(path_entry_storage_bytes(&scope.path_entry))
+}
+
+fn auto_import_scope_storage_bytes(
+    scope: &crate::workspace::rename::AutoImportProviderScope,
+) -> usize {
+    size_of::<crate::workspace::rename::AutoImportProviderScope>()
+        .saturating_add(path_storage_bytes(&scope.root))
+        .saturating_add(
+            scope
+                .provider_units
+                .iter()
+                .chain(scope.candidate_prefixes.iter())
+                .map(|value| size_of::<String>().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        )
+        .saturating_add(scope.read_policy.retained_size_hint())
+        .saturating_add(path_entry_storage_bytes(&scope.path_entry))
+}
+
+fn compact_completion_record_bytes(record: &SourceRecord) -> usize {
+    size_of::<SourceRecord>()
+        .saturating_add(record.uri.as_str().len())
+        .saturating_add(
+            record
+                .text
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u8>()),
+        )
+        .saturating_add(record.path.as_ref().map_or(0, path_storage_bytes))
+        .saturating_add(
+            record
+                .content_bytes
+                .as_ref()
+                .map_or(0, |bytes| bytes.capacity()),
+        )
+        .saturating_add(
+            record
+                .candidate_membership
+                .as_ref()
+                .map_or(0, candidate_membership_storage_bytes),
+        )
+        .saturating_add(
+            record
+                .read_policy
+                .as_ref()
+                .map_or(0, pascal_project::ReadPolicy::retained_size_hint),
+        )
+        .saturating_add(
+            record
+                .path_entry
+                .as_ref()
+                .map_or(0, path_entry_storage_bytes),
+        )
+        .saturating_add(
+            record
+                .missing_provider_scope
+                .as_ref()
+                .map_or(0, missing_provider_scope_storage_bytes),
+        )
+        .saturating_add(
+            record
+                .auto_import_scopes
+                .iter()
+                .map(auto_import_scope_storage_bytes)
+                .sum::<usize>(),
+        )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentationFormat {
+    PlainText,
+    Markdown,
+}
+
+impl DocumentationFormat {
+    fn markup_kind(self) -> MarkupKind {
+        match self {
+            Self::PlainText => MarkupKind::PlainText,
+            Self::Markdown => MarkupKind::Markdown,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,10 +1442,15 @@ enum AnalysisRequest {
     Completion {
         uri: Url,
         position: Position,
+        format: MarkupKind,
+        snippet_support: bool,
+        resolve_documentation: bool,
+        resolve_detail: bool,
     },
     SignatureHelp {
         uri: Url,
         position: Position,
+        format: MarkupKind,
     },
     Navigation {
         uri: Url,
@@ -427,6 +1478,7 @@ enum AnalysisRequest {
     },
     CodeActions(CodeActionParams),
     Resolve(CodeAction),
+    ResolveCompletion(CompletionResolutionRequest),
     DocumentSymbols {
         uri: Url,
         hierarchical: bool,
@@ -443,16 +1495,47 @@ enum AnalysisRequest {
         uri: Url,
         position: Position,
     },
+    SelectionRanges {
+        uri: Url,
+        positions: Vec<Position>,
+    },
     SemanticTokens {
         uri: Url,
         range: Option<lsp_types::Range>,
     },
+    FoldingRanges {
+        uri: Url,
+    },
+}
+
+fn progress_title(request: &AnalysisRequest) -> &'static str {
+    match request {
+        AnalysisRequest::Diagnostics { .. } => "Indexing workspace",
+        AnalysisRequest::WorkspaceSymbols { .. } => "Searching workspace symbols",
+        AnalysisRequest::References { .. } => "Searching workspace references",
+        AnalysisRequest::Rename { .. } => "Preparing rename",
+        AnalysisRequest::CodeActions(_) | AnalysisRequest::Resolve(_) => "Preparing code actions",
+        AnalysisRequest::Formatting { .. } => "Formatting document",
+        AnalysisRequest::DocumentSymbols { .. } => "Indexing document symbols",
+        AnalysisRequest::SemanticTokens { .. } => "Computing semantic tokens",
+        AnalysisRequest::FoldingRanges { .. } => "Computing folding ranges",
+        AnalysisRequest::Hover { .. }
+        | AnalysisRequest::Completion { .. }
+        | AnalysisRequest::SignatureHelp { .. }
+        | AnalysisRequest::Navigation { .. }
+        | AnalysisRequest::TypeDefinitions { .. }
+        | AnalysisRequest::Prepare { .. }
+        | AnalysisRequest::ResolveCompletion(_)
+        | AnalysisRequest::DocumentHighlights { .. }
+        | AnalysisRequest::SelectionRanges { .. } => "Analyzing document",
+    }
 }
 
 #[derive(Clone)]
 enum AnalysisResultValue {
     Hover(Result<Option<lsp_types::Hover>, String>),
-    Completion(Result<lsp_types::CompletionList, String>),
+    Completion(CompletionAnalysis),
+    ResolveCompletion(CompletionResolutionAnalysis),
     SignatureHelp(Result<Option<lsp_types::SignatureHelp>, String>),
     Navigation(NavigationAnalysis),
     Formatting(Result<Option<lsp_types::TextEdit>, String>),
@@ -470,7 +1553,9 @@ enum AnalysisResultValue {
     WorkspaceSymbols(Result<Vec<lsp_types::SymbolInformation>, String>),
     References(Result<Vec<lsp_types::Location>, String>),
     DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
+    SelectionRanges(Result<Vec<lsp_types::SelectionRange>, String>),
     SemanticTokens(Result<lsp_types::SemanticTokens, String>),
+    FoldingRanges(Result<Vec<lsp_types::FoldingRange>, String>),
 }
 
 #[derive(Clone)]
@@ -483,7 +1568,7 @@ struct NavigationAnalysis {
 struct DiagnosticsAnalysis {
     uri: Url,
     version: Option<i32>,
-    value: Result<Vec<lsp_types::Diagnostic>, String>,
+    value: Result<Vec<queries::DiagnosticPublication>, String>,
     discard: bool,
 }
 
@@ -506,11 +1591,576 @@ impl DiagnosticNotificationEffect {
         }
     }
 
-    fn refresh_dependents(&mut self, workspace: &Workspace, changed_uri: &Url) {
-        for uri in workspace.diagnostic_dependents_for_change(changed_uri) {
+    fn refresh_dependents(
+        &mut self,
+        workspace: &Workspace,
+        changed_uri: &Url,
+        include_parent: bool,
+    ) {
+        for uri in workspace.diagnostic_dependents_for_change(changed_uri, include_parent) {
             self.refresh_uri(uri);
         }
     }
+}
+
+const RUNTIME_CONFIGURATION_SECTION: &str = "pascalLsp";
+const CONFIGURATION_REQUEST_PREFIX: &str = "pascal-lsp-configuration-";
+const MAX_RETIRED_CONFIGURATION_REQUESTS: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigurationScope {
+    Global,
+    Scoped(Url),
+}
+
+impl ConfigurationScope {
+    fn from_uri(uri: Option<Url>) -> Self {
+        uri.map_or(Self::Global, Self::Scoped)
+    }
+
+    fn is_compatible_with(&self, scope_uri: Option<&Url>) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Scoped(scope) => scope_uri.is_some_and(|current| current == scope),
+        }
+    }
+}
+
+struct ConfigurationPreparationRequest {
+    revision: u64,
+    options: WorkspaceOptions,
+    root_paths: Vec<PathBuf>,
+}
+
+struct ConfigurationPreparationResult {
+    revision: u64,
+    options: WorkspaceOptions,
+    root_paths: Vec<PathBuf>,
+    prepared: Result<PreparedWorkspaceOptions, String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeferredDocumentIdentity {
+    uri: Url,
+    version: Option<i32>,
+    generation: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DeferredConfigurationRequest {
+    request: Request,
+    configuration_revision: u64,
+    document: Option<DeferredDocumentIdentity>,
+    preceding_document_notification: bool,
+    preceding_configuration_notification: bool,
+}
+
+#[derive(Debug)]
+enum DeferredConfigurationMessage {
+    Request(DeferredConfigurationRequest),
+    Notification(Notification),
+}
+
+struct PendingConfigurationPreparation {
+    cancellation: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+struct ConfigurationPreparationJobs {
+    sender: Sender<ConfigurationPreparationResult>,
+    receiver: Receiver<ConfigurationPreparationResult>,
+    pending: Option<PendingConfigurationPreparation>,
+    queued: Option<ConfigurationPreparationRequest>,
+    shutting_down: bool,
+}
+
+impl ConfigurationPreparationJobs {
+    fn new() -> Self {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        Self {
+            sender,
+            receiver,
+            pending: None,
+            queued: None,
+            shutting_down: false,
+        }
+    }
+
+    fn request(&mut self, request: ConfigurationPreparationRequest) -> Result<(), String> {
+        if self.shutting_down {
+            return Err("configuration preparation is shutting down".to_string());
+        }
+        if let Some(pending) = &self.pending {
+            pending
+                .cancellation
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.queued = Some(request);
+            return Ok(());
+        }
+        self.spawn(request)
+    }
+
+    fn spawn(&mut self, request: ConfigurationPreparationRequest) -> Result<(), String> {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let sender = self.sender.clone();
+        let revision = request.revision;
+        let options = request.options;
+        let root_paths = request.root_paths;
+        let worker_options = options.clone();
+        let worker_root_paths = root_paths.clone();
+        let handle = thread::Builder::new()
+            .name("PascalLspConfiguration".to_string())
+            .spawn(move || {
+                let prepared = Workspace::prepare_runtime_options_for_roots(
+                    worker_root_paths.clone(),
+                    worker_options,
+                    &worker_cancellation,
+                );
+                let _ = sender.send(ConfigurationPreparationResult {
+                    revision,
+                    options,
+                    root_paths: worker_root_paths,
+                    prepared,
+                });
+            })
+            .map_err(|error| format!("could not start configuration worker: {error}"))?;
+        self.pending = Some(PendingConfigurationPreparation {
+            cancellation,
+            handle,
+        });
+        Ok(())
+    }
+
+    fn cancel_pending(&mut self) {
+        self.queued = None;
+        if let Some(pending) = &self.pending {
+            pending
+                .cancellation
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn poll(&mut self) -> Option<ConfigurationPreparationResult> {
+        let result = self.receiver.try_recv().ok()?;
+        if let Some(pending) = self.pending.take() {
+            let _ = pending.handle.join();
+        }
+        if let Some(request) = self.queued.take() {
+            if let Err(error) = self.spawn(request) {
+                eprintln!("pascal-lsp: configuration worker failed to start: {error}");
+            }
+        }
+        Some(result)
+    }
+
+    fn is_busy(&self) -> bool {
+        self.pending.is_some() || self.queued.is_some()
+    }
+
+    fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        self.queued = None;
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        pending
+            .cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
+        let mut pending = Some(pending);
+        while let Some(job) = pending.take() {
+            if job.handle.is_finished() {
+                let _ = job.handle.join();
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            pending = Some(job);
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingConfigurationRequest {
+    id: RequestId,
+    revision: u64,
+    scope: ConfigurationScope,
+}
+
+struct ConfigurationCoordinator {
+    base_options: WorkspaceOptions,
+    runtime_options: RuntimeOptionsOverride,
+    applied_options: WorkspaceOptions,
+    pull_supported: bool,
+    initialized: bool,
+    scope_uri: Option<Url>,
+    accepted_scope: Option<ConfigurationScope>,
+    next_request_id: u64,
+    revision: u64,
+    apply_revision: u64,
+    refresh_pending: bool,
+    pending: Option<PendingConfigurationRequest>,
+    retired: VecDeque<RequestId>,
+    preparation: ConfigurationPreparationJobs,
+}
+
+impl ConfigurationCoordinator {
+    fn new(scope_uri: Option<Url>, options: WorkspaceOptions, pull_supported: bool) -> Self {
+        Self {
+            base_options: options.clone(),
+            runtime_options: RuntimeOptionsOverride::default(),
+            applied_options: options.clone(),
+            pull_supported,
+            initialized: false,
+            scope_uri,
+            accepted_scope: None,
+            next_request_id: 0,
+            revision: 0,
+            apply_revision: 0,
+            refresh_pending: false,
+            pending: None,
+            retired: VecDeque::new(),
+            preparation: ConfigurationPreparationJobs::new(),
+        }
+    }
+
+    fn update_scope(
+        &mut self,
+        scope_uri: Option<Url>,
+        workspace: &Workspace,
+    ) -> Result<(), String> {
+        let changed = self.scope_uri != scope_uri;
+        self.scope_uri = scope_uri;
+        if changed
+            && self
+                .accepted_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.is_compatible_with(self.scope_uri.as_ref()))
+        {
+            self.runtime_options = RuntimeOptionsOverride::default();
+            self.accepted_scope = None;
+            self.schedule_effective_options(workspace)?;
+        }
+        Ok(())
+    }
+
+    fn on_initialized(
+        &mut self,
+        connection: &dyn ProtocolSender,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.initialized = true;
+        self.request_refresh(connection)
+    }
+
+    fn handle_notification(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        workspace: &mut Workspace,
+        notification: &Notification,
+    ) -> Result<DiagnosticNotificationEffect, Box<dyn Error + Send + Sync>> {
+        let params: DidChangeConfigurationParams =
+            serde_json::from_value(notification.params.clone()).map_err(|error| {
+                format!("invalid parameters for workspace/didChangeConfiguration: {error}")
+            })?;
+        if !self.initialized {
+            return Ok(DiagnosticNotificationEffect::default());
+        }
+        if self.pull_supported {
+            self.request_refresh(connection)?;
+            return Ok(DiagnosticNotificationEffect::default());
+        }
+
+        let settings = runtime_settings_section(&params.settings)?;
+        self.apply_value(settings.as_ref(), workspace, ConfigurationScope::Global)
+            .map_err(|error| error.into())
+    }
+
+    fn request_refresh(
+        &mut self,
+        connection: &dyn ProtocolSender,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.pull_supported || !self.initialized {
+            return Ok(());
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "configuration revision space exhausted".to_string())?;
+        self.refresh_pending = true;
+        self.send_pending(connection)
+    }
+
+    fn send_pending(
+        &mut self,
+        connection: &dyn ProtocolSender,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.pull_supported
+            || !self.initialized
+            || !self.refresh_pending
+            || self.pending.is_some()
+        {
+            return Ok(());
+        }
+        let request_number = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| "configuration request ID space exhausted".to_string())?;
+        self.next_request_id = request_number;
+        let id = RequestId::from(format!("{CONFIGURATION_REQUEST_PREFIX}{request_number}"));
+        let params = ConfigurationParams {
+            items: vec![ConfigurationItem {
+                scope_uri: self.scope_uri.clone(),
+                section: Some(RUNTIME_CONFIGURATION_SECTION.to_string()),
+            }],
+        };
+        connection.send_control(Message::Request(Request::new(
+            id.clone(),
+            "workspace/configuration".to_string(),
+            serde_json::to_value(params)?,
+        )))?;
+        self.refresh_pending = false;
+        self.pending = Some(PendingConfigurationRequest {
+            id,
+            revision: self.revision,
+            scope: ConfigurationScope::from_uri(self.scope_uri.clone()),
+        });
+        Ok(())
+    }
+
+    fn handle_response(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        workspace: &mut Workspace,
+        response: &Response,
+    ) -> Result<Option<DiagnosticNotificationEffect>, Box<dyn Error + Send + Sync>> {
+        if self.retired.iter().any(|id| id == &response.id) {
+            eprintln!(
+                "pascal-lsp: ignored duplicate workspace/configuration response {}",
+                response.id
+            );
+            return Ok(Some(DiagnosticNotificationEffect::default()));
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(None);
+        };
+        if pending.id != response.id {
+            return Ok(None);
+        }
+
+        let pending = self.pending.take().expect("pending configuration request");
+        self.retired.push_back(pending.id.clone());
+        while self.retired.len() > MAX_RETIRED_CONFIGURATION_REQUESTS {
+            self.retired.pop_front();
+        }
+
+        if pending.revision == self.revision {
+            if let Some(error) = &response.error {
+                eprintln!(
+                    "pascal-lsp: workspace/configuration request failed ({}): {}",
+                    error.code, error.message
+                );
+            } else if let Some(result) = response.result.as_ref() {
+                self.apply_pull_result(result, workspace, pending.scope)?;
+            } else {
+                eprintln!(
+                    "pascal-lsp: ignored malformed workspace/configuration response {}",
+                    response.id
+                );
+            }
+        }
+        self.send_pending(connection)?;
+        Ok(Some(DiagnosticNotificationEffect::default()))
+    }
+
+    fn apply_pull_result(
+        &mut self,
+        result: &Value,
+        workspace: &mut Workspace,
+        scope: ConfigurationScope,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match runtime_pull_value(result) {
+            Ok(value) => self
+                .apply_value(Some(&value), workspace, scope)
+                .map(|_| ())
+                .map_err(|error| error.into()),
+            Err(error) => {
+                eprintln!("pascal-lsp: ignored workspace/configuration response: {error}");
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_value(
+        &mut self,
+        value: Option<&Value>,
+        workspace: &mut Workspace,
+        scope: ConfigurationScope,
+    ) -> Result<DiagnosticNotificationEffect, String> {
+        let before = self.runtime_options.effective(&self.base_options);
+        let previous_runtime_options = self.runtime_options.clone();
+        let previous_scope = self.accepted_scope.clone();
+        let warnings = match value {
+            None | Some(Value::Null) => self.runtime_options.apply(RuntimeOptionsUpdate::reset()),
+            Some(value) => match parse_runtime_options(value) {
+                Ok(update) => self.runtime_options.apply(update),
+                Err(error) => {
+                    eprintln!("pascal-lsp: ignored runtime configuration: {error}");
+                    return Ok(DiagnosticNotificationEffect::default());
+                }
+            },
+        };
+        for warning in warnings {
+            eprintln!("pascal-lsp: warning: {warning}");
+        }
+        let after = self.runtime_options.effective(&self.base_options);
+        self.accepted_scope = Some(scope);
+        if before != after {
+            if let Err(error) = self.schedule_effective_options(workspace) {
+                self.runtime_options = previous_runtime_options;
+                self.accepted_scope = previous_scope;
+                return Err(error);
+            }
+        } else {
+            self.schedule_effective_options(workspace)?;
+        }
+        Ok(DiagnosticNotificationEffect::default())
+    }
+
+    fn schedule_effective_options(&mut self, workspace: &Workspace) -> Result<(), String> {
+        self.apply_revision = self
+            .apply_revision
+            .checked_add(1)
+            .ok_or_else(|| "configuration application revision space exhausted".to_string())?;
+        let options = self.runtime_options.effective(&self.base_options);
+        if options == self.applied_options {
+            self.preparation.cancel_pending();
+            return Ok(());
+        }
+        self.preparation.request(ConfigurationPreparationRequest {
+            revision: self.apply_revision,
+            options,
+            root_paths: workspace.configuration_root_paths(),
+        })
+    }
+
+    fn poll(
+        &mut self,
+        workspace: &mut Workspace,
+    ) -> Result<Option<DiagnosticNotificationEffect>, Box<dyn Error + Send + Sync>> {
+        let Some(result) = self.preparation.poll() else {
+            return Ok(None);
+        };
+        let desired = self.runtime_options.effective(&self.base_options);
+        if result.revision != self.apply_revision || result.options != desired {
+            return Ok(None);
+        }
+        if result.root_paths != workspace.configuration_root_paths() {
+            self.schedule_effective_options(workspace)?;
+            return Ok(None);
+        }
+        let prepared = match result.prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!("pascal-lsp: configuration preparation failed: {error}");
+                return Ok(None);
+            }
+        };
+        if workspace.apply_prepared_runtime_options(prepared) {
+            self.applied_options = result.options;
+            let mut effect = DiagnosticNotificationEffect::default();
+            for uri in workspace.open_document_uris() {
+                effect.cancel_uri(uri.clone());
+                effect.refresh_uri(uri);
+            }
+            return Ok(Some(effect));
+        }
+        if self.applied_options != result.options {
+            self.schedule_effective_options(workspace)?;
+        }
+        Ok(None)
+    }
+
+    fn is_preparing(&self) -> bool {
+        self.preparation.is_busy()
+    }
+
+    fn can_coalesce_configuration_notifications(&self) -> bool {
+        self.pull_supported
+    }
+
+    fn deferred_request_revision(&self) -> u64 {
+        self.apply_revision
+    }
+
+    fn shutdown(&mut self) {
+        self.initialized = false;
+        self.refresh_pending = false;
+        self.pending = None;
+        self.retired.clear();
+        self.preparation.shutdown();
+    }
+}
+
+fn runtime_settings_section(settings: &Value) -> Result<Option<Value>, String> {
+    if settings.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = settings.as_object() else {
+        return Err("settings must be an object or null".to_string());
+    };
+    if let Some(value) = object.get(RUNTIME_CONFIGURATION_SECTION) {
+        return Ok(Some(value.clone()));
+    }
+    if let Some(value) = object.get("pascal-lsp") {
+        return Ok(Some(value.clone()));
+    }
+    if [
+        "sourcePaths",
+        "exclude",
+        "projectFile",
+        "buildConfig",
+        "platform",
+        "maxFiles",
+        "maxFileBytes",
+        "maxTotalBytes",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        return Ok(Some(settings.clone()));
+    }
+    Ok(None)
+}
+
+fn runtime_pull_value(result: &Value) -> Result<Value, String> {
+    if result.is_null() {
+        return Ok(Value::Null);
+    }
+    let Some(values) = result.as_array() else {
+        return Err("result must be an array for the requested configuration item".to_string());
+    };
+    if values.len() != 1 {
+        return Err("result must contain exactly one configuration item".to_string());
+    }
+    let value = &values[0];
+    if let Some(object) = value.as_object() {
+        if let Some(section) = object.get(RUNTIME_CONFIGURATION_SECTION) {
+            return Ok(section.clone());
+        }
+        if let Some(section) = object.get("pascal-lsp") {
+            return Ok(section.clone());
+        }
+    }
+    Ok(value.clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -522,6 +2172,680 @@ enum AnalysisJobId {
     Diagnostic(AnalysisComputationId),
 }
 
+#[derive(Debug, Clone)]
+struct ClientRecipient {
+    id: RequestId,
+    work_done_token: Option<ProgressToken>,
+    partial_result_token: Option<ProgressToken>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnalysisProgressTokens {
+    work_done: Option<ProgressToken>,
+    partial_result: Option<ProgressToken>,
+}
+
+#[derive(Debug, Clone)]
+enum PartialResultPayload {
+    WorkspaceSymbols(Arc<Vec<SymbolInformation>>),
+    References(Arc<Vec<Location>>),
+}
+
+impl PartialResultPayload {
+    fn len(&self) -> usize {
+        match self {
+            Self::WorkspaceSymbols(items) => items.len(),
+            Self::References(items) => items.len(),
+        }
+    }
+
+    fn item_json_len(&self, index: usize) -> Result<usize, String> {
+        let bytes = match self {
+            Self::WorkspaceSymbols(items) => serde_json::to_vec(&items[index]),
+            Self::References(items) => serde_json::to_vec(&items[index]),
+        }
+        .map_err(|error| format!("could not encode partial result item: {error}"))?
+        .len();
+        if bytes > MAX_PARTIAL_RESULT_ITEM_BYTES {
+            return Err(format!(
+                "partial result item exceeds the {MAX_PARTIAL_RESULT_ITEM_BYTES}-byte limit"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn retained_bytes(&self) -> Result<usize, String> {
+        let mut bytes = size_of::<Self>();
+        for index in 0..self.len() {
+            bytes = bytes.saturating_add(self.item_json_len(index)?);
+        }
+        Ok(bytes)
+    }
+
+    fn chunk(&self, start: usize) -> Result<Option<(usize, Value)>, String> {
+        if start >= self.len() {
+            return Ok(None);
+        }
+        let mut end = start;
+        let mut encoded_bytes: usize = 2; // The enclosing JSON array brackets.
+        while end < self.len() && end.saturating_sub(start) < MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK {
+            let item_bytes = self.item_json_len(end)?;
+            let comma_bytes = usize::from(end > start);
+            let candidate = encoded_bytes
+                .saturating_add(comma_bytes)
+                .saturating_add(item_bytes);
+            if end > start && candidate > MAX_PARTIAL_RESULT_BYTES_PER_CHUNK {
+                break;
+            }
+            if end == start && candidate > MAX_PARTIAL_RESULT_BYTES_PER_CHUNK {
+                return Err(format!(
+                    "partial result item exceeds the {MAX_PARTIAL_RESULT_BYTES_PER_CHUNK}-byte chunk limit"
+                ));
+            }
+            encoded_bytes = candidate;
+            end = end.saturating_add(1);
+        }
+
+        let value = match self {
+            Self::WorkspaceSymbols(items) => serde_json::to_value(&items[start..end]),
+            Self::References(items) => serde_json::to_value(&items[start..end]),
+        }
+        .map_err(|error| format!("could not encode partial result chunk: {error}"))?;
+        Ok(Some((end, value)))
+    }
+
+    fn empty_result(&self) -> Value {
+        match self {
+            Self::WorkspaceSymbols(_) | Self::References(_) => Value::Array(Vec::new()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PartialDeliveryRecipient {
+    id: RequestId,
+    token: ProgressToken,
+    next_item: usize,
+}
+
+#[derive(Debug)]
+struct PartialDeliveryValidation {
+    input: Arc<rename::RevalidationInput>,
+    records: Arc<Vec<SourceRecord>>,
+    test_barriers: TestBarrierConfig,
+    cancellation: Arc<AtomicBool>,
+    receiver: Option<Receiver<Result<(), String>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PartialDeliveryValidation {
+    fn new(
+        input: Arc<rename::RevalidationInput>,
+        records: Arc<Vec<SourceRecord>>,
+        test_barriers: TestBarrierConfig,
+    ) -> Result<Self, String> {
+        let mut validation = Self {
+            input,
+            records,
+            test_barriers,
+            cancellation: Arc::new(AtomicBool::new(false)),
+            receiver: None,
+            handle: None,
+        };
+        validation.request()?;
+        Ok(validation)
+    }
+
+    fn request(&mut self) -> Result<(), String> {
+        if self.receiver.is_some() || self.handle.is_some() {
+            return Err("partial result freshness validation is already running".to_string());
+        }
+        let (sender, receiver) = bounded(1);
+        let input = Arc::clone(&self.input);
+        let records = Arc::clone(&self.records);
+        let cancellation = Arc::clone(&self.cancellation);
+        let test_barriers = self.test_barriers.clone();
+        let handle = thread::Builder::new()
+            .name("PascalLspPartialValidation".to_string())
+            .spawn(move || {
+                let result = match wait_at_uninterruptible_test_barrier(
+                    TestBarrier::PartialValidation,
+                    &test_barriers,
+                ) {
+                    Ok(()) => rename::revalidate_revalidation_input(
+                        &input,
+                        records.as_slice(),
+                        &cancellation,
+                    ),
+                    Err(error) => Err(error),
+                };
+                let _ = sender.send(result);
+            })
+            .map_err(|error| format!("could not start partial result validation: {error}"))?;
+        self.receiver = Some(receiver);
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<Result<(), String>> {
+        let receiver = self.receiver.as_ref()?;
+        let result = match receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(
+                "partial result freshness validation worker disconnected".to_string(),
+            )),
+        }?;
+        self.receiver = None;
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                return Some(Err(
+                    "partial result freshness validation worker panicked".to_string()
+                ));
+            }
+        }
+        Some(result)
+    }
+
+    fn cancel(&self) {
+        self.cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_running(&self) -> bool {
+        self.receiver.is_some() || self.handle.is_some()
+    }
+}
+
+impl Drop for PartialDeliveryValidation {
+    fn drop(&mut self) {
+        self.cancellation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct PartialDelivery {
+    job_id: AnalysisComputationId,
+    source_generation: u64,
+    configuration_generation: u64,
+    payload: PartialResultPayload,
+    recipients: Vec<PartialDeliveryRecipient>,
+    next_recipient: usize,
+    retained_bytes: usize,
+    validation: PartialDeliveryValidation,
+}
+
+#[derive(Debug)]
+struct RetiredPartialValidation {
+    validation: PartialDeliveryValidation,
+    retained_bytes: usize,
+}
+
+fn partial_payload_from_result(
+    value: AnalysisResultValue,
+) -> Option<Result<PartialResultPayload, String>> {
+    match value {
+        AnalysisResultValue::WorkspaceSymbols(value) => {
+            Some(value.map(|value| PartialResultPayload::WorkspaceSymbols(Arc::new(value))))
+        }
+        AnalysisResultValue::References(value) => {
+            Some(value.map(|value| PartialResultPayload::References(Arc::new(value))))
+        }
+        _ => None,
+    }
+}
+
+fn is_partial_result_value(value: &AnalysisResultValue) -> bool {
+    matches!(
+        value,
+        AnalysisResultValue::WorkspaceSymbols(_) | AnalysisResultValue::References(_)
+    )
+}
+
+fn source_records_retained_bytes(records: &[SourceRecord]) -> usize {
+    records
+        .iter()
+        .fold(size_of::<SourceRecord>(), |total, record| {
+            total
+                .saturating_add(record.uri.as_str().len())
+                .saturating_add(record.text.len())
+                .saturating_add(
+                    record
+                        .path
+                        .as_ref()
+                        .map_or(0, |path| path.as_os_str().len()),
+                )
+                .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::len))
+                .saturating_add(
+                    record
+                        .auto_import_scopes
+                        .iter()
+                        .map(|scope| {
+                            scope.root.as_os_str().len()
+                                + scope.provider_units.iter().map(String::len).sum::<usize>()
+                                + scope
+                                    .candidate_prefixes
+                                    .iter()
+                                    .map(String::len)
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>(),
+                )
+        })
+}
+
+#[derive(Debug, Clone)]
+enum ProgressTarget {
+    Client {
+        job_id: AnalysisJobId,
+        request_id: RequestId,
+    },
+    Diagnostic {
+        job_id: AnalysisJobId,
+    },
+}
+
+#[derive(Debug)]
+struct ProgressEntry {
+    token: ProgressToken,
+    target: ProgressTarget,
+    title: String,
+    create_id: Option<RequestId>,
+    begun: bool,
+}
+
+/// Tracks work-done progress independently from request/response routing.
+///
+/// Request-associated tokens begin as soon as their bounded recipient is
+/// admitted, including while the computation is queued.  Server-initiated
+/// tokens are not visible to the client until the client acknowledges the
+/// corresponding `window/workDoneProgress/create` request.  Keeping those two
+/// lifecycles separate prevents a late create response from being mistaken
+/// for a configuration response or from reviving a finished operation.
+/// Terminal, unacknowledged create IDs retain only bounded response tombstones;
+/// their cancellation targets and progress entries are retired immediately.
+#[derive(Debug)]
+struct ProgressTracker {
+    server_supported: bool,
+    next_create_id: u64,
+    next_token: u64,
+    entries: HashMap<AnalysisJobId, Vec<ProgressEntry>>,
+    tokens: HashMap<ProgressToken, ProgressTarget>,
+    creates: HashMap<RequestId, (AnalysisJobId, ProgressToken)>,
+    retired_creates: HashSet<RequestId>,
+}
+
+impl ProgressTracker {
+    fn new(server_supported: bool) -> Self {
+        Self {
+            server_supported,
+            next_create_id: 0,
+            next_token: 0,
+            entries: HashMap::new(),
+            tokens: HashMap::new(),
+            creates: HashMap::new(),
+            retired_creates: HashSet::new(),
+        }
+    }
+
+    fn begin_client(
+        &mut self,
+        connection: Option<&dyn ProtocolSender>,
+        job_id: AnalysisJobId,
+        recipient: &ClientRecipient,
+        title: &str,
+    ) -> Result<(), String> {
+        let (Some(connection), Some(token)) = (connection, recipient.work_done_token.as_ref())
+        else {
+            return Ok(());
+        };
+        if self.tokens.len() >= MAX_PROGRESS_ENTRIES || self.tokens.contains_key(token) {
+            // A reused token cannot safely identify two concurrent operations.
+            // The request itself remains valid; only its optional progress is
+            // omitted until the earlier owner finishes.
+            return Ok(());
+        }
+        let target = ProgressTarget::Client {
+            job_id,
+            request_id: recipient.id.clone(),
+        };
+        self.tokens.insert(token.clone(), target.clone());
+        self.entries.entry(job_id).or_default().push(ProgressEntry {
+            token: token.clone(),
+            target,
+            title: title.to_string(),
+            create_id: None,
+            begun: true,
+        });
+        if let Err(error) = send_progress_begin(connection, token, title, "Queued for analysis") {
+            self.remove_token(token);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn start_server(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        job_id: AnalysisJobId,
+        title: &str,
+        partial_tokens: &HashMap<ProgressToken, (AnalysisComputationId, RequestId)>,
+    ) -> Result<(), String> {
+        if !self.server_supported
+            || self
+                .creates
+                .len()
+                .saturating_add(self.retired_creates.len())
+                >= MAX_PROGRESS_CREATES
+            || self.tokens.len() >= MAX_PROGRESS_ENTRIES
+        {
+            return Ok(());
+        }
+        let token = loop {
+            let token_number = self
+                .next_token
+                .checked_add(1)
+                .ok_or_else(|| "progress token space exhausted".to_string())?;
+            self.next_token = token_number;
+            let token = ProgressToken::String(format!("{PROGRESS_TOKEN_PREFIX}{token_number}"));
+            if partial_tokens.contains_key(&token) {
+                continue;
+            }
+            if self.tokens.contains_key(&token) {
+                return Ok(());
+            }
+            break token;
+        };
+        let request_number = self
+            .next_create_id
+            .checked_add(1)
+            .ok_or_else(|| "progress create request ID space exhausted".to_string())?;
+        self.next_create_id = request_number;
+        let create_id =
+            RequestId::from(format!("{PROGRESS_CREATE_REQUEST_PREFIX}{request_number}"));
+        let target = ProgressTarget::Diagnostic { job_id };
+        self.tokens.insert(token.clone(), target.clone());
+        self.creates
+            .insert(create_id.clone(), (job_id, token.clone()));
+        self.entries.entry(job_id).or_default().push(ProgressEntry {
+            token: token.clone(),
+            target,
+            title: title.to_string(),
+            create_id: Some(create_id.clone()),
+            begun: false,
+        });
+        let request = Request::new(
+            create_id.clone(),
+            "window/workDoneProgress/create".to_string(),
+            serde_json::json!({"token": token}),
+        );
+        if let Err(error) = connection.send_control(Message::Request(request)) {
+            self.creates.remove(&create_id);
+            self.remove_token(&token);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn report_started(
+        &self,
+        connection: &dyn ProtocolSender,
+        job_id: AnalysisJobId,
+    ) -> Result<(), String> {
+        let tokens = self
+            .entries
+            .get(&job_id)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.begun)
+            .map(|entry| entry.token.clone())
+            .collect::<Vec<_>>();
+        for token in tokens {
+            send_progress_report(connection, &token, "Analysis started")?;
+        }
+        Ok(())
+    }
+
+    fn report_started_recipient(
+        &self,
+        connection: &dyn ProtocolSender,
+        job_id: AnalysisJobId,
+        request_id: &RequestId,
+    ) -> Result<(), String> {
+        let Some(entry) = self
+            .entries
+            .get(&job_id)
+            .into_iter()
+            .flatten()
+            .find(|entry| {
+                entry.begun
+                    && matches!(
+                        &entry.target,
+                        ProgressTarget::Client {
+                            request_id: entry_request_id,
+                            ..
+                        } if entry_request_id == request_id
+                    )
+            })
+        else {
+            return Ok(());
+        };
+        send_progress_report(connection, &entry.token, "Analysis started")
+    }
+
+    fn target(&self, token: &ProgressToken) -> Option<ProgressTarget> {
+        self.tokens.get(token).cloned()
+    }
+
+    fn handle_create_response(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        response: &Response,
+    ) -> Result<bool, String> {
+        let Some((job_id, token)) = self.creates.remove(&response.id) else {
+            if self.retired_creates.remove(&response.id) {
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        let Some(entries) = self.entries.get_mut(&job_id) else {
+            self.tokens.remove(&token);
+            return Ok(true);
+        };
+        let Some(entry) = entries.iter_mut().find(|entry| entry.token == token) else {
+            self.tokens.remove(&token);
+            return Ok(true);
+        };
+        if response.error.is_some() {
+            self.remove_token(&token);
+            return Ok(true);
+        }
+        entry.begun = true;
+        entry.create_id = None;
+        let title = entry.title.clone();
+        send_progress_begin(connection, &token, &title, "Indexing workspace")?;
+        send_progress_report(connection, &token, "Indexing workspace")?;
+        Ok(true)
+    }
+
+    fn finish_recipient(
+        &mut self,
+        connection: Option<&dyn ProtocolSender>,
+        job_id: AnalysisJobId,
+        request_id: &RequestId,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(entries) = self.entries.get_mut(&job_id) else {
+            return Ok(());
+        };
+        let Some(index) = entries.iter().position(|entry| {
+            matches!(&entry.target, ProgressTarget::Client { request_id: id, .. } if id == request_id)
+        }) else {
+            return Ok(());
+        };
+        let entry = entries.remove(index);
+        if let (Some(connection), true) = (connection, entry.begun) {
+            send_progress_end(connection, &entry.token, message)?;
+        }
+        self.tokens.remove(&entry.token);
+        if entries.is_empty() {
+            self.entries.remove(&job_id);
+        }
+        Ok(())
+    }
+
+    fn finish_job(
+        &mut self,
+        connection: Option<&dyn ProtocolSender>,
+        job_id: AnalysisJobId,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(entries) = self.entries.remove(&job_id) else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        for entry in entries {
+            if entry.begun {
+                if let Some(connection) = connection {
+                    if let Err(error) = send_progress_end(connection, &entry.token, message) {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(create_id) = entry.create_id {
+                self.creates.remove(&create_id);
+                self.retired_creates.insert(create_id);
+            }
+            self.tokens.remove(&entry.token);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn finish_target(
+        &mut self,
+        connection: Option<&dyn ProtocolSender>,
+        job_id: AnalysisJobId,
+        token: &ProgressToken,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(entries) = self.entries.get_mut(&job_id) else {
+            self.tokens.remove(token);
+            return Ok(());
+        };
+        let Some(index) = entries.iter().position(|entry| &entry.token == token) else {
+            self.tokens.remove(token);
+            return Ok(());
+        };
+        let entry = entries.remove(index);
+        if let (Some(connection), true) = (connection, entry.begun) {
+            send_progress_end(connection, &entry.token, message)?;
+        }
+        if let Some(create_id) = entry.create_id {
+            self.creates.remove(&create_id);
+            self.retired_creates.insert(create_id);
+        }
+        self.tokens.remove(token);
+        if entries.is_empty() {
+            self.entries.remove(&job_id);
+        }
+        Ok(())
+    }
+
+    fn remove_token(&mut self, token: &ProgressToken) {
+        let Some(target) = self.tokens.remove(token) else {
+            return;
+        };
+        let job_id = match target {
+            ProgressTarget::Client { job_id, .. } | ProgressTarget::Diagnostic { job_id } => job_id,
+        };
+        if let Some(entries) = self.entries.get_mut(&job_id) {
+            if let Some(index) = entries.iter().position(|entry| &entry.token == token) {
+                if let Some(create_id) = entries[index].create_id.clone() {
+                    self.creates.remove(&create_id);
+                }
+                entries.remove(index);
+            }
+            if entries.is_empty() {
+                self.entries.remove(&job_id);
+            }
+        }
+    }
+
+    fn shutdown(&mut self, connection: Option<&dyn ProtocolSender>) -> Result<(), String> {
+        let jobs = self.entries.keys().copied().collect::<Vec<_>>();
+        for job_id in jobs {
+            self.finish_job(connection, job_id, Some("Cancelled"))?;
+        }
+        // An unacknowledged create has no begun progress to close.  Drop its
+        // registry entry so a late response is harmless after shutdown.
+        self.entries.clear();
+        self.tokens.clear();
+        self.creates.clear();
+        self.retired_creates.clear();
+        Ok(())
+    }
+}
+
+fn send_progress_begin(
+    connection: &dyn ProtocolSender,
+    token: &ProgressToken,
+    title: &str,
+    message: &str,
+) -> Result<(), String> {
+    connection
+        .send_control(Message::Notification(Notification::new(
+            "$/progress".to_string(),
+            serde_json::json!({
+                "token": token,
+                "value": {
+                    "kind": "begin",
+                    "title": title,
+                    "cancellable": true,
+                    "message": message
+                }
+            }),
+        )))
+        .map_err(|error| error.to_string())
+}
+
+fn send_progress_report(
+    connection: &dyn ProtocolSender,
+    token: &ProgressToken,
+    message: &str,
+) -> Result<(), String> {
+    connection
+        .send_control(Message::Notification(Notification::new(
+            "$/progress".to_string(),
+            serde_json::json!({
+                "token": token,
+                "value": {
+                    "kind": "report",
+                    "cancellable": true,
+                    "message": message
+                }
+            }),
+        )))
+        .map_err(|error| error.to_string())
+}
+
+fn send_progress_end(
+    connection: &dyn ProtocolSender,
+    token: &ProgressToken,
+    message: Option<&str>,
+) -> Result<(), String> {
+    let value = match message {
+        Some(message) => serde_json::json!({"kind": "end", "message": message}),
+        None => serde_json::json!({"kind": "end"}),
+    };
+    connection
+        .send_control(Message::Notification(Notification::new(
+            "$/progress".to_string(),
+            serde_json::json!({"token": token, "value": value}),
+        )))
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum NavigationObservationTarget {
     Declaration,
@@ -531,17 +2855,34 @@ enum NavigationObservationTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ObservationMethod {
-    Hover { markdown: bool },
-    Completion,
-    SignatureHelp,
+    Hover {
+        markdown: bool,
+    },
+    Completion {
+        markdown: bool,
+        snippet_support: bool,
+        resolve_documentation: bool,
+        resolve_detail: bool,
+    },
+    SignatureHelp {
+        markdown: bool,
+    },
     Navigation(NavigationObservationTarget),
     TypeDefinitions,
     Prepare,
-    DocumentSymbols { hierarchical: bool },
+    DocumentSymbols {
+        hierarchical: bool,
+    },
     WorkspaceSymbols,
-    References { include_declaration: bool },
+    References {
+        include_declaration: bool,
+    },
     DocumentHighlights,
-    SemanticTokens { range: Option<ObservationRange> },
+    SelectionRanges,
+    SemanticTokens {
+        range: Option<ObservationRange>,
+    },
+    FoldingRanges,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -561,6 +2902,7 @@ struct ObservationKey {
     method: ObservationMethod,
     uri: Option<Url>,
     position: Option<ObservationPosition>,
+    positions: Option<Vec<ObservationPosition>>,
     query: Option<String>,
     version: Option<i32>,
     source_generation: u64,
@@ -569,7 +2911,7 @@ struct ObservationKey {
 
 impl ObservationKey {
     fn for_request(request: &AnalysisRequest, workspace: &Workspace) -> Option<Self> {
-        let (method, uri, position, query) = match request {
+        let (method, uri, position, positions, query) = match request {
             AnalysisRequest::Hover {
                 uri,
                 position,
@@ -584,23 +2926,44 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
-            AnalysisRequest::Completion { uri, position } => (
-                ObservationMethod::Completion,
+            AnalysisRequest::Completion {
+                uri,
+                position,
+                format,
+                snippet_support,
+                resolve_documentation,
+                resolve_detail,
+            } => (
+                ObservationMethod::Completion {
+                    markdown: matches!(format, MarkupKind::Markdown),
+                    snippet_support: *snippet_support,
+                    resolve_documentation: *resolve_documentation,
+                    resolve_detail: *resolve_detail,
+                },
                 Some(uri.clone()),
                 Some(ObservationPosition {
                     line: position.line,
                     character: position.character,
                 }),
                 None,
+                None,
             ),
-            AnalysisRequest::SignatureHelp { uri, position } => (
-                ObservationMethod::SignatureHelp,
+            AnalysisRequest::SignatureHelp {
+                uri,
+                position,
+                format,
+            } => (
+                ObservationMethod::SignatureHelp {
+                    markdown: matches!(format, MarkupKind::Markdown),
+                },
                 Some(uri.clone()),
                 Some(ObservationPosition {
                     line: position.line,
                     character: position.character,
                 }),
+                None,
                 None,
             ),
             AnalysisRequest::Navigation {
@@ -619,6 +2982,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::TypeDefinitions { uri, position } => (
                 ObservationMethod::TypeDefinitions,
@@ -627,6 +2991,7 @@ impl ObservationKey {
                     line: position.line,
                     character: position.character,
                 }),
+                None,
                 None,
             ),
             AnalysisRequest::Prepare { uri, position } => (
@@ -637,6 +3002,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::DocumentSymbols { uri, hierarchical } => (
                 ObservationMethod::DocumentSymbols {
@@ -645,9 +3011,11 @@ impl ObservationKey {
                 Some(uri.clone()),
                 None,
                 None,
+                None,
             ),
             AnalysisRequest::WorkspaceSymbols { query } => (
                 ObservationMethod::WorkspaceSymbols,
+                None,
                 None,
                 None,
                 Some(query.clone()),
@@ -666,6 +3034,7 @@ impl ObservationKey {
                     character: position.character,
                 }),
                 None,
+                None,
             ),
             AnalysisRequest::DocumentHighlights { uri, position } => (
                 ObservationMethod::DocumentHighlights,
@@ -674,6 +3043,7 @@ impl ObservationKey {
                     line: position.line,
                     character: position.character,
                 }),
+                None,
                 None,
             ),
             AnalysisRequest::SemanticTokens { uri, range } => (
@@ -692,18 +3062,43 @@ impl ObservationKey {
                 Some(uri.clone()),
                 None,
                 None,
+                None,
+            ),
+            AnalysisRequest::FoldingRanges { uri } => (
+                ObservationMethod::FoldingRanges,
+                Some(uri.clone()),
+                None,
+                None,
+                None,
+            ),
+            AnalysisRequest::SelectionRanges { uri, positions } => (
+                ObservationMethod::SelectionRanges,
+                Some(uri.clone()),
+                None,
+                Some(
+                    positions
+                        .iter()
+                        .map(|position| ObservationPosition {
+                            line: position.line,
+                            character: position.character,
+                        })
+                        .collect(),
+                ),
+                None,
             ),
             AnalysisRequest::Formatting { .. }
             | AnalysisRequest::Diagnostics { .. }
             | AnalysisRequest::Rename { .. }
             | AnalysisRequest::CodeActions(_)
-            | AnalysisRequest::Resolve(_) => return None,
+            | AnalysisRequest::Resolve(_)
+            | AnalysisRequest::ResolveCompletion(_) => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
         Some(Self {
             method,
             uri,
             position,
+            positions,
             query,
             version,
             source_generation: workspace.source_generation(),
@@ -715,6 +3110,7 @@ impl ObservationKey {
         self.method == other.method
             && self.uri == other.uri
             && self.position == other.position
+            && self.positions == other.positions
             && self.query == other.query
     }
 
@@ -729,8 +3125,14 @@ struct QueuedClientAnalysis {
     id: AnalysisComputationId,
     request: AnalysisRequest,
     features: ClientFeatures,
-    client_ids: Vec<RequestId>,
+    recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientAnalysisState {
+    Queued,
+    Running,
 }
 
 #[derive(Debug)]
@@ -757,7 +3159,7 @@ struct AnalysisResult {
 struct PendingAnalysis {
     cancellation: Arc<AtomicBool>,
     handle: JoinHandle<()>,
-    client_ids: Vec<RequestId>,
+    recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
 }
 
@@ -767,7 +3169,8 @@ struct PendingDiagnostic {
 }
 
 struct DispatchFailure {
-    client_ids: Vec<RequestId>,
+    recipients: Vec<ClientRecipient>,
+    client_job: Option<AnalysisComputationId>,
     diagnostic: Option<QueuedDiagnostic>,
     message: String,
 }
@@ -873,10 +3276,15 @@ struct AnalysisJobs {
     receiver: Receiver<AnalysisResult>,
     pending: std::collections::HashMap<AnalysisComputationId, PendingAnalysis>,
     diagnostics: HashMap<AnalysisComputationId, PendingDiagnostic>,
+    partial_deliveries: VecDeque<PartialDelivery>,
+    retired_partial_validations: VecDeque<RetiredPartialValidation>,
+    partial_tokens: HashMap<ProgressToken, (AnalysisComputationId, RequestId)>,
     queue: PriorityQueue<QueuedAnalysis>,
     request_to_job: HashMap<RequestId, AnalysisComputationId>,
     observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
     diagnostic_jobs: HashMap<Url, AnalysisComputationId>,
+    completion_resolutions: CompletionResolutionStore,
+    progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
     shutting_down: bool,
@@ -885,20 +3293,28 @@ struct AnalysisJobs {
 impl AnalysisJobs {
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_test_barriers(TestBarrierConfig::disabled())
+        Self::with_test_barriers_and_progress(TestBarrierConfig::disabled(), false)
     }
 
-    fn with_test_barriers(test_barriers: TestBarrierConfig) -> Self {
+    fn with_test_barriers_and_progress(
+        test_barriers: TestBarrierConfig,
+        server_progress_supported: bool,
+    ) -> Self {
         let (sender, receiver) = unbounded();
         Self {
             sender,
             receiver,
             pending: std::collections::HashMap::new(),
             diagnostics: HashMap::new(),
+            partial_deliveries: VecDeque::new(),
+            retired_partial_validations: VecDeque::new(),
+            partial_tokens: HashMap::new(),
             queue: PriorityQueue::new(),
             request_to_job: HashMap::new(),
             observation_jobs: HashMap::new(),
             diagnostic_jobs: HashMap::new(),
+            completion_resolutions: CompletionResolutionStore::new(),
+            progress: ProgressTracker::new(server_progress_supported),
             test_barriers,
             next_computation_id: 0,
             shutting_down: false,
@@ -925,9 +3341,22 @@ impl AnalysisJobs {
             AnalysisRequest::Hover { .. } => AnalysisResultValue::Hover(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
-            AnalysisRequest::Completion { .. } => AnalysisResultValue::Completion(Err(
-                "analysis worker failed without changing workspace state".to_string(),
-            )),
+            AnalysisRequest::Completion {
+                uri,
+                position,
+                format,
+                snippet_support,
+                resolve_documentation,
+                resolve_detail,
+            } => AnalysisResultValue::Completion(CompletionAnalysis {
+                uri: uri.clone(),
+                position: *position,
+                format: format.clone(),
+                snippet_support: *snippet_support,
+                resolve_documentation: *resolve_documentation,
+                resolve_detail: *resolve_detail,
+                value: Err("analysis worker failed without changing workspace state".to_string()),
+            }),
             AnalysisRequest::SignatureHelp { .. } => AnalysisResultValue::SignatureHelp(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
@@ -967,6 +3396,14 @@ impl AnalysisJobs {
             AnalysisRequest::Resolve(_) => AnalysisResultValue::Resolve(Box::new(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             ))),
+            AnalysisRequest::ResolveCompletion(request) => {
+                AnalysisResultValue::ResolveCompletion(CompletionResolutionAnalysis {
+                    token: request.token.clone(),
+                    value: Err(
+                        "analysis worker failed without changing workspace state".to_string()
+                    ),
+                })
+            }
             AnalysisRequest::DocumentSymbols { uri, hierarchical } => {
                 AnalysisResultValue::DocumentSymbols {
                     uri: uri.clone(),
@@ -985,7 +3422,13 @@ impl AnalysisJobs {
             AnalysisRequest::DocumentHighlights { .. } => AnalysisResultValue::DocumentHighlights(
                 Err("analysis worker failed without changing workspace state".to_string()),
             ),
+            AnalysisRequest::SelectionRanges { .. } => AnalysisResultValue::SelectionRanges(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
             AnalysisRequest::SemanticTokens { .. } => AnalysisResultValue::SemanticTokens(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::FoldingRanges { .. } => AnalysisResultValue::FoldingRanges(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
         };
@@ -1015,11 +3458,24 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::Hover(computed.value),
                             }
                         }
-                        AnalysisRequest::Completion { uri, position } => {
-                            let computed = queries::completion_from_input(
+                        AnalysisRequest::Completion {
+                            uri,
+                            position,
+                            format,
+                            snippet_support,
+                            resolve_documentation,
+                            resolve_detail,
+                        } => {
+                            let computed = queries::completion_from_input_with_options(
                                 input,
                                 &uri,
                                 position,
+                                CompletionOptions {
+                                    format: format.clone(),
+                                    defer_documentation: resolve_documentation,
+                                    defer_detail: resolve_detail,
+                                    snippet_support,
+                                },
                                 &worker_cancellation,
                             );
                             AnalysisResult {
@@ -1027,14 +3483,27 @@ impl AnalysisJobs {
                                 source_generation: computed.source_generation,
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
-                                value: AnalysisResultValue::Completion(computed.value),
+                                value: AnalysisResultValue::Completion(CompletionAnalysis {
+                                    uri,
+                                    position,
+                                    format,
+                                    snippet_support,
+                                    resolve_documentation,
+                                    resolve_detail,
+                                    value: computed.value,
+                                }),
                             }
                         }
-                        AnalysisRequest::SignatureHelp { uri, position } => {
-                            let computed = queries::signature_help_from_input(
+                        AnalysisRequest::SignatureHelp {
+                            uri,
+                            position,
+                            format,
+                        } => {
+                            let computed = queries::signature_help_from_input_with_format(
                                 input,
                                 &uri,
                                 position,
+                                format,
                                 &worker_cancellation,
                             );
                             AnalysisResult {
@@ -1145,7 +3614,7 @@ impl AnalysisJobs {
                                 let value = computed.value.map(|result| DiagnosticsAnalysis {
                                     uri: result.uri,
                                     version: result.version,
-                                    value: Ok(result.diagnostics),
+                                    value: Ok(result.publications),
                                     discard: false,
                                 });
                                 AnalysisResult {
@@ -1183,18 +3652,32 @@ impl AnalysisJobs {
                             }
                         }
                         AnalysisRequest::Prepare { uri, position } => {
-                            let computed = rename::prepare_from_input(
-                                input,
-                                &uri,
-                                position,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Navigation,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::Prepare(computed.value),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::Prepare(Err(error)),
+                                }
+                            } else {
+                                let computed = rename::prepare_from_input(
+                                    input,
+                                    &uri,
+                                    position,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::Prepare(computed.value),
+                                }
                             }
                         }
                         AnalysisRequest::Rename {
@@ -1202,20 +3685,34 @@ impl AnalysisJobs {
                             position,
                             new_name,
                         } => {
-                            let computed = rename::rename_from_input(
-                                input,
-                                &uri,
-                                position,
-                                &new_name,
-                                features.document_changes,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Navigation,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::Rename(Box::new(computed.value)),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::Rename(Box::new(Err(error))),
+                                }
+                            } else {
+                                let computed = rename::rename_from_input(
+                                    input,
+                                    &uri,
+                                    position,
+                                    &new_name,
+                                    features.document_changes,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::Rename(Box::new(computed.value)),
+                                }
                             }
                         }
                         AnalysisRequest::CodeActions(params) => {
@@ -1256,6 +3753,68 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::Resolve(Box::new(computed.value)),
                             }
                         }
+                        AnalysisRequest::ResolveCompletion(request) => {
+                            let CompletionResolutionRequest {
+                                token,
+                                context,
+                                candidate_uri,
+                                candidate_index,
+                            } = request;
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::CompletionResolution,
+                                &test_barriers,
+                                &worker_cancellation,
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: context.source_generation,
+                                    configuration_generation: context.configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::ResolveCompletion(
+                                        CompletionResolutionAnalysis {
+                                            token,
+                                            value: Err(error),
+                                        },
+                                    ),
+                                }
+                            } else {
+                                let mut computed = queries::completion_metadata_from_input(
+                                    input,
+                                    &context.source_uri,
+                                    context.position,
+                                    context.source_generation,
+                                    context.configuration_generation,
+                                    &candidate_uri,
+                                    candidate_index,
+                                    context.format.clone(),
+                                    context.resolve_documentation,
+                                    context.resolve_detail,
+                                    context.snippet_support,
+                                    &context.records,
+                                    &worker_cancellation,
+                                );
+                                // Keep the identity's original generation as the
+                                // delivery baseline.  Dependency validation can
+                                // still admit unrelated overlay changes, while
+                                // a project/context switch remains stale even if
+                                // this worker starts after that switch.
+                                computed.source_generation = context.source_generation;
+                                computed.configuration_generation =
+                                    context.configuration_generation;
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::ResolveCompletion(
+                                        CompletionResolutionAnalysis {
+                                            token,
+                                            value: computed.value,
+                                        },
+                                    ),
+                                }
+                            }
+                        }
                         AnalysisRequest::DocumentSymbols { uri, hierarchical } => {
                             let computed = queries::document_symbols_from_input(
                                 input,
@@ -1275,17 +3834,31 @@ impl AnalysisJobs {
                             }
                         }
                         AnalysisRequest::WorkspaceSymbols { query } => {
-                            let computed = queries::workspace_symbols_from_input(
-                                input,
-                                &query,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::WorkspaceSymbols,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::WorkspaceSymbols(computed.value),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::WorkspaceSymbols(Err(error)),
+                                }
+                            } else {
+                                let computed = queries::workspace_symbols_from_input(
+                                    input,
+                                    &query,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::WorkspaceSymbols(computed.value),
+                                }
                             }
                         }
                         AnalysisRequest::References {
@@ -1293,19 +3866,33 @@ impl AnalysisJobs {
                             position,
                             include_declaration,
                         } => {
-                            let computed = queries::references_from_input(
-                                input,
-                                &uri,
-                                position,
-                                include_declaration,
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::References,
+                                &test_barriers,
                                 &worker_cancellation,
-                            );
-                            AnalysisResult {
-                                id: worker_id,
-                                source_generation: computed.source_generation,
-                                configuration_generation: computed.configuration_generation,
-                                records: computed.records,
-                                value: AnalysisResultValue::References(computed.value),
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::References(Err(error)),
+                                }
+                            } else {
+                                let computed = queries::references_from_input(
+                                    input,
+                                    &uri,
+                                    position,
+                                    include_declaration,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::References(computed.value),
+                                }
                             }
                         }
                         AnalysisRequest::DocumentHighlights { uri, position } => {
@@ -1323,6 +3910,35 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::DocumentHighlights(computed.value),
                             }
                         }
+                        AnalysisRequest::SelectionRanges { uri, positions } => {
+                            if let Err(error) = wait_at_test_barrier(
+                                TestBarrier::Selection,
+                                &test_barriers,
+                                &worker_cancellation,
+                            ) {
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation,
+                                    configuration_generation,
+                                    records: Vec::new(),
+                                    value: AnalysisResultValue::SelectionRanges(Err(error)),
+                                }
+                            } else {
+                                let computed = queries::selection_ranges_from_input(
+                                    input,
+                                    &uri,
+                                    positions,
+                                    &worker_cancellation,
+                                );
+                                AnalysisResult {
+                                    id: worker_id,
+                                    source_generation: computed.source_generation,
+                                    configuration_generation: computed.configuration_generation,
+                                    records: computed.records,
+                                    value: AnalysisResultValue::SelectionRanges(computed.value),
+                                }
+                            }
+                        }
                         AnalysisRequest::SemanticTokens { uri, range } => {
                             let computed = queries::semantic_tokens_from_input(
                                 input,
@@ -1336,6 +3952,25 @@ impl AnalysisJobs {
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
                                 value: AnalysisResultValue::SemanticTokens(computed.value),
+                            }
+                        }
+                        AnalysisRequest::FoldingRanges { uri } => {
+                            let computed = queries::folding_ranges_from_input(
+                                input,
+                                &uri,
+                                FoldingRangeOptions {
+                                    range_limit: features.folding_range_limit,
+                                    line_folding_only: features.line_folding_only,
+                                    kind_value_set: features.folding_range_kind_value_set,
+                                },
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::FoldingRanges(computed.value),
                             }
                         }
                     }));
@@ -1359,7 +3994,7 @@ impl AnalysisJobs {
         Ok(PendingAnalysis {
             cancellation,
             handle,
-            client_ids: Vec::new(),
+            recipients: Vec::new(),
             key: None,
         })
     }
@@ -1372,7 +4007,7 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
     ) -> Result<(), String> {
-        self.enqueue_client(id, request, workspace, features, None)
+        self.enqueue_client(id, request, workspace, features, None, None)
     }
 
     fn next_computation_id(&mut self) -> Result<AnalysisComputationId, String> {
@@ -1388,17 +4023,69 @@ impl AnalysisJobs {
         let running = self
             .pending
             .values()
-            .map(|job| job.client_ids.len())
+            .map(|job| job.recipients.len())
             .sum::<usize>();
         let queued = self
             .queue
             .iter()
             .map(|job| match job {
-                QueuedAnalysis::Client(job) => job.client_ids.len(),
+                QueuedAnalysis::Client(job) => job.recipients.len(),
                 QueuedAnalysis::Diagnostic(_) => 0,
             })
             .sum::<usize>();
-        running.saturating_add(queued)
+        let delivering = self
+            .partial_deliveries
+            .iter()
+            .map(|delivery| delivery.recipients.len())
+            .sum::<usize>();
+        running
+            .saturating_add(queued)
+            .saturating_add(delivering)
+            .saturating_add(self.retired_partial_validations.len())
+    }
+
+    fn partial_delivery_bytes(&self) -> usize {
+        let delivering = self
+            .partial_deliveries
+            .iter()
+            .map(|delivery| delivery.retained_bytes)
+            .sum::<usize>();
+        let retiring = self
+            .retired_partial_validations
+            .iter()
+            .map(|validation| validation.retained_bytes)
+            .sum::<usize>();
+        delivering.saturating_add(retiring)
+    }
+
+    fn reap_retired_partial_validations(&mut self) {
+        let mut remaining = VecDeque::new();
+        while let Some(mut retired) = self.retired_partial_validations.pop_front() {
+            if retired.validation.poll().is_none() {
+                remaining.push_back(retired);
+            }
+        }
+        self.retired_partial_validations = remaining;
+    }
+
+    fn retire_partial_validation(
+        &mut self,
+        validation: PartialDeliveryValidation,
+        retained_bytes: usize,
+    ) {
+        if !validation.is_running() {
+            return;
+        }
+        validation.cancel();
+        debug_assert!(
+            self.retired_partial_validations.len() < MAX_PARTIAL_VALIDATION_RETIREMENTS,
+            "retiring partial validation bound must be checked before removal"
+        );
+        self.retired_partial_validations
+            .push_back(RetiredPartialValidation {
+                validation,
+                retained_bytes,
+            });
     }
 
     fn start_diagnostics(&mut self, uri: Url, _workspace: &Workspace) -> Result<(), String> {
@@ -1417,21 +4104,75 @@ impl AnalysisJobs {
         Ok(())
     }
 
+    #[cfg(test)]
     fn enqueue_client(
         &mut self,
         id: RequestId,
         request: AnalysisRequest,
         workspace: &Workspace,
         features: ClientFeatures,
-        connection: Option<&Connection>,
+        work_done_token: Option<ProgressToken>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
+        self.enqueue_client_with_partial(
+            id,
+            request,
+            workspace,
+            features,
+            AnalysisProgressTokens {
+                work_done: work_done_token,
+                partial_result: None,
+            },
+            connection,
+        )
+    }
+
+    fn enqueue_client_with_partial(
+        &mut self,
+        id: RequestId,
+        request: AnalysisRequest,
+        workspace: &Workspace,
+        features: ClientFeatures,
+        tokens: AnalysisProgressTokens,
+        connection: Option<&dyn ProtocolSender>,
+    ) -> Result<(), String> {
+        self.reap_retired_partial_validations();
         if self.shutting_down {
             return Err("analysis server is shutting down".to_string());
         }
         if self.request_to_job.contains_key(&id) {
             return Err("analysis request ID is already in use".to_string());
         }
+        if tokens.partial_result.is_some()
+            && !matches!(
+                &request,
+                AnalysisRequest::WorkspaceSymbols { .. } | AnalysisRequest::References { .. }
+            )
+        {
+            return Err("partialResultToken is unsupported for this request".to_string());
+        }
+        if tokens.partial_result.as_ref() == tokens.work_done.as_ref()
+            && tokens.partial_result.is_some()
+        {
+            return Err("workDoneToken and partialResultToken must be distinct".to_string());
+        }
+        if tokens
+            .partial_result
+            .as_ref()
+            .is_some_and(|token| self.partial_tokens.contains_key(token))
+            || tokens
+                .partial_result
+                .as_ref()
+                .is_some_and(|token| self.progress.target(token).is_some())
+            || tokens
+                .work_done
+                .as_ref()
+                .is_some_and(|token| self.partial_tokens.contains_key(token))
+        {
+            return Err("progress token is already in use by another operation".to_string());
+        }
 
+        let title = progress_title(&request).to_string();
         let key = ObservationKey::for_request(&request, workspace);
         if let Some(key) = key.as_ref() {
             let superseded = self
@@ -1445,11 +4186,34 @@ impl AnalysisJobs {
             }
 
             if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
-                if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS {
+                if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+                    || self.partial_tokens.len() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+                {
                     return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
                 }
-                if self.attach_client(&primary_id, id.clone()) {
+                let recipient = ClientRecipient {
+                    id: id.clone(),
+                    work_done_token: tokens.work_done.clone(),
+                    partial_result_token: tokens.partial_result.clone(),
+                };
+                if let Some(state) = self.attach_client(&primary_id, recipient.clone()) {
                     self.request_to_job.insert(id, primary_id);
+                    self.register_partial_token(&recipient, primary_id);
+                    self.progress.begin_client(
+                        connection,
+                        AnalysisJobId::Client(primary_id),
+                        &recipient,
+                        &title,
+                    )?;
+                    if state == ClientAnalysisState::Running {
+                        if let Some(connection) = connection {
+                            self.progress.report_started_recipient(
+                                connection,
+                                AnalysisJobId::Client(primary_id),
+                                &recipient.id,
+                            )?;
+                        }
+                    }
                     return Ok(());
                 }
                 self.observation_jobs.remove(key);
@@ -1457,6 +4221,7 @@ impl AnalysisJobs {
         }
 
         if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+            || self.partial_tokens.len() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
             || self.queue.len() >= MAX_CLIENT_ANALYSIS_QUEUE
         {
             return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
@@ -1464,6 +4229,11 @@ impl AnalysisJobs {
 
         let primary_id = self.next_computation_id()?;
         self.request_to_job.insert(id.clone(), primary_id);
+        let recipient = ClientRecipient {
+            id,
+            work_done_token: tokens.work_done,
+            partial_result_token: tokens.partial_result,
+        };
         if let Some(key) = key.clone() {
             self.observation_jobs.insert(key, primary_id);
         }
@@ -1473,28 +4243,75 @@ impl AnalysisJobs {
                 id: primary_id,
                 request,
                 features,
-                client_ids: vec![id],
+                recipients: vec![recipient.clone()],
                 key,
             }),
         );
-        let failures = self.pump(workspace);
+        self.register_partial_token(&recipient, primary_id);
+        self.progress.begin_client(
+            connection,
+            AnalysisJobId::Client(primary_id),
+            &recipient,
+            &title,
+        )?;
+        let failures = self.pump(workspace, connection);
         self.handle_dispatch_failures(failures, connection)
     }
 
-    fn attach_client(&mut self, primary_id: &AnalysisComputationId, id: RequestId) -> bool {
+    fn completion_resolution_request(
+        &self,
+        item: &CompletionItem,
+    ) -> Result<CompletionResolutionRequest, String> {
+        self.completion_resolutions.request(item)
+    }
+
+    fn attach_client(
+        &mut self,
+        primary_id: &AnalysisComputationId,
+        recipient: ClientRecipient,
+    ) -> Option<ClientAnalysisState> {
         if let Some(job) = self.pending.get_mut(primary_id) {
             if !job.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                job.client_ids.push(id);
-                return true;
+                job.recipients.push(recipient);
+                return Some(ClientAnalysisState::Running);
             }
         }
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
         ) {
-            job.client_ids.push(id);
-            return true;
+            job.recipients.push(recipient);
+            return Some(ClientAnalysisState::Queued);
         }
-        false
+        None
+    }
+
+    fn register_partial_token(
+        &mut self,
+        recipient: &ClientRecipient,
+        primary_id: AnalysisComputationId,
+    ) {
+        if let Some(token) = recipient.partial_result_token.as_ref() {
+            let previous = self
+                .partial_tokens
+                .insert(token.clone(), (primary_id, recipient.id.clone()));
+            debug_assert!(
+                previous.is_none(),
+                "partial token was checked before admission"
+            );
+        }
+    }
+
+    fn release_partial_token(&mut self, recipient: &ClientRecipient) {
+        let Some(token) = recipient.partial_result_token.as_ref() else {
+            return;
+        };
+        if self
+            .partial_tokens
+            .get(token)
+            .is_some_and(|(_, request_id)| request_id == &recipient.id)
+        {
+            self.partial_tokens.remove(token);
+        }
     }
 
     fn remove_client_mapping(&mut self, id: &RequestId, primary_id: &AnalysisComputationId) {
@@ -1524,7 +4341,7 @@ impl AnalysisJobs {
     }
 
     fn send_client_error(
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
         ids: impl IntoIterator<Item = RequestId>,
         code: ErrorCode,
         message: &str,
@@ -1542,21 +4359,36 @@ impl AnalysisJobs {
     fn supersede_client(
         &mut self,
         primary_id: &AnalysisComputationId,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
         if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
         ) {
             self.remove_observation(job.key.as_ref(), primary_id);
-            for id in &job.client_ids {
+            let request_ids = job
+                .recipients
+                .iter()
+                .map(|recipient| recipient.id.clone())
+                .collect::<Vec<_>>();
+            for id in &request_ids {
                 self.remove_client_mapping(id, primary_id);
             }
-            return Self::send_client_error(
+            Self::send_client_error(
                 connection,
-                job.client_ids,
+                request_ids,
                 ErrorCode::RequestCanceled,
                 ANALYSIS_SUPERSEDED_MESSAGE,
-            );
+            )?;
+            for recipient in job.recipients {
+                self.release_partial_token(&recipient);
+                self.progress.finish_recipient(
+                    connection,
+                    AnalysisJobId::Client(*primary_id),
+                    &recipient.id,
+                    Some("Superseded"),
+                )?;
+            }
+            return Ok(());
         }
 
         let Some(job) = self.pending.get_mut(primary_id) else {
@@ -1565,32 +4397,53 @@ impl AnalysisJobs {
         job.cancellation
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let key = job.key.clone();
-        let client_ids = std::mem::take(&mut job.client_ids);
+        let recipients = std::mem::take(&mut job.recipients);
         self.remove_observation(key.as_ref(), primary_id);
-        for id in &client_ids {
+        let request_ids = recipients
+            .iter()
+            .map(|recipient| recipient.id.clone())
+            .collect::<Vec<_>>();
+        for id in &request_ids {
             self.remove_client_mapping(id, primary_id);
         }
         Self::send_client_error(
             connection,
-            client_ids,
+            request_ids,
             ErrorCode::RequestCanceled,
             ANALYSIS_SUPERSEDED_MESSAGE,
-        )
+        )?;
+        for recipient in recipients {
+            self.release_partial_token(&recipient);
+            self.progress.finish_recipient(
+                connection,
+                AnalysisJobId::Client(*primary_id),
+                &recipient.id,
+                Some("Superseded"),
+            )?;
+        }
+        Ok(())
     }
 
-    fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<(), String> {
+    fn cancel(&mut self, connection: &dyn ProtocolSender, id: &RequestId) -> Result<(), String> {
+        self.reap_retired_partial_validations();
         let Some(primary_id) = self.request_to_job.get(id).cloned() else {
             return Ok(());
         };
 
         let mut queued_empty = false;
         let mut found_queued = false;
+        let mut cancelled_recipient = None;
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
         ) {
-            if let Some(position) = job.client_ids.iter().position(|client_id| client_id == id) {
-                job.client_ids.remove(position);
-                queued_empty = job.client_ids.is_empty();
+            if let Some(position) = job
+                .recipients
+                .iter()
+                .position(|recipient| &recipient.id == id)
+            {
+                cancelled_recipient = job.recipients.get(position).cloned();
+                job.recipients.remove(position);
+                queued_empty = job.recipients.is_empty();
                 found_queued = true;
             }
         }
@@ -1602,6 +4455,15 @@ impl AnalysisJobs {
                 ErrorCode::RequestCanceled,
                 rename::CANCELLATION_MESSAGE,
             )?;
+            self.progress.finish_recipient(
+                Some(connection),
+                AnalysisJobId::Client(primary_id),
+                id,
+                Some("Cancelled"),
+            )?;
+            if let Some(recipient) = cancelled_recipient.as_ref() {
+                self.release_partial_token(recipient);
+            }
             if queued_empty {
                 if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
                     |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
@@ -1615,10 +4477,16 @@ impl AnalysisJobs {
         let mut found_running = false;
         let mut cancel_worker = false;
         let mut key = None;
+        let mut cancelled_recipient = None;
         if let Some(job) = self.pending.get_mut(&primary_id) {
-            if let Some(position) = job.client_ids.iter().position(|client_id| client_id == id) {
-                job.client_ids.remove(position);
-                cancel_worker = job.client_ids.is_empty();
+            if let Some(position) = job
+                .recipients
+                .iter()
+                .position(|recipient| &recipient.id == id)
+            {
+                cancelled_recipient = job.recipients.get(position).cloned();
+                job.recipients.remove(position);
+                cancel_worker = job.recipients.is_empty();
                 key = job.key.clone();
                 found_running = true;
                 if cancel_worker {
@@ -1638,13 +4506,123 @@ impl AnalysisJobs {
                 ErrorCode::RequestCanceled,
                 rename::CANCELLATION_MESSAGE,
             )?;
-        } else {
-            self.request_to_job.remove(id);
+            self.progress.finish_recipient(
+                Some(connection),
+                AnalysisJobId::Client(primary_id),
+                id,
+                Some("Cancelled"),
+            )?;
+            if let Some(recipient) = cancelled_recipient.as_ref() {
+                self.release_partial_token(recipient);
+            }
+            return Ok(());
         }
+
+        if let Some(index) = self.partial_deliveries.iter().position(|delivery| {
+            delivery
+                .recipients
+                .iter()
+                .any(|recipient| &recipient.id == id)
+        }) {
+            let mut delivery = self
+                .partial_deliveries
+                .remove(index)
+                .expect("partial delivery selected for cancellation");
+            let recipient_index = delivery
+                .recipients
+                .iter()
+                .position(|recipient| &recipient.id == id)
+                .expect("partial recipient selected for cancellation");
+            let recipient = delivery.recipients.remove(recipient_index);
+            self.remove_client_mapping(id, &primary_id);
+            let delivery_job_id = delivery.job_id;
+            if delivery.recipients.is_empty() {
+                let PartialDelivery {
+                    validation,
+                    retained_bytes,
+                    ..
+                } = delivery;
+                self.retire_partial_validation(validation, retained_bytes);
+                send_error(
+                    connection,
+                    id.clone(),
+                    ErrorCode::RequestCanceled,
+                    rename::CANCELLATION_MESSAGE,
+                )
+                .map_err(|error| error.to_string())?;
+                self.finish_partial_recipient(connection, delivery_job_id, &recipient)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                send_error(
+                    connection,
+                    id.clone(),
+                    ErrorCode::RequestCanceled,
+                    rename::CANCELLATION_MESSAGE,
+                )
+                .map_err(|error| error.to_string())?;
+                self.finish_partial_recipient(connection, delivery_job_id, &recipient)
+                    .map_err(|error| error.to_string())?;
+                delivery.next_recipient %= delivery.recipients.len();
+                self.partial_deliveries.insert(index, delivery);
+            }
+            return Ok(());
+        }
+        self.request_to_job.remove(id);
         Ok(())
     }
 
-    fn cancel_diagnostics_for(&mut self, uris: &[Url]) {
+    fn cancel_progress(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        token: &ProgressToken,
+    ) -> Result<(), String> {
+        let Some(target) = self.progress.target(token) else {
+            return Ok(());
+        };
+        match target {
+            ProgressTarget::Client { request_id, .. } => self.cancel(connection, &request_id),
+            ProgressTarget::Diagnostic { job_id } => {
+                if let AnalysisJobId::Diagnostic(id) = job_id {
+                    if let Some(QueuedAnalysis::Diagnostic(job)) = self.queue.remove_first(
+                        |queued| matches!(queued, QueuedAnalysis::Diagnostic(job) if job.id == id),
+                    ) {
+                        if self
+                            .diagnostic_jobs
+                            .get(&job.uri)
+                            .is_some_and(|job_id| *job_id == id)
+                        {
+                            self.diagnostic_jobs.remove(&job.uri);
+                        }
+                    } else if let Some(job) = self.diagnostics.get(&id) {
+                        job.analysis
+                            .cancellation
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.progress.finish_target(
+                        Some(connection),
+                        job_id,
+                        token,
+                        Some("Cancelled"),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_progress_response(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        response: &Response,
+    ) -> Result<bool, String> {
+        self.progress.handle_create_response(connection, response)
+    }
+
+    fn cancel_diagnostics_for_with_connection(
+        &mut self,
+        connection: Option<&dyn ProtocolSender>,
+        uris: &[Url],
+    ) -> Result<(), String> {
         loop {
             let Some(QueuedAnalysis::Diagnostic(job)) = self.queue.remove_first(|queued| {
                 matches!(queued, QueuedAnalysis::Diagnostic(job) if uris.contains(&job.uri))
@@ -1659,24 +4637,46 @@ impl AnalysisJobs {
                 self.diagnostic_jobs.remove(&job.uri);
             }
         }
-        for diagnostic in self.diagnostics.values() {
-            if uris.contains(&diagnostic.uri) {
+        let running = self
+            .diagnostics
+            .iter()
+            .filter(|(_, diagnostic)| uris.contains(&diagnostic.uri))
+            .map(|(id, diagnostic)| {
                 diagnostic
                     .analysis
                     .cancellation
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+                *id
+            })
+            .collect::<Vec<_>>();
+        for id in running {
+            self.progress.finish_job(
+                connection,
+                AnalysisJobId::Diagnostic(id),
+                Some("Invalidated"),
+            )?;
         }
+        Ok(())
     }
 
-    fn refresh_diagnostics(&mut self, workspace: &mut Workspace, uris: &[Url]) {
-        self.cancel_diagnostics_for(uris);
+    fn refresh_diagnostics_with_connection(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        workspace: &mut Workspace,
+        uris: &[Url],
+    ) -> Result<(), String> {
+        self.cancel_diagnostics_for_with_connection(Some(connection), uris)?;
         for uri in uris {
             workspace.reschedule_diagnostics(uri.clone());
         }
+        Ok(())
     }
 
-    fn pump(&mut self, workspace: &Workspace) -> Vec<DispatchFailure> {
+    fn pump(
+        &mut self,
+        workspace: &Workspace,
+        connection: Option<&dyn ProtocolSender>,
+    ) -> Vec<DispatchFailure> {
         if self.shutting_down {
             return Vec::new();
         }
@@ -1697,17 +4697,31 @@ impl AnalysisJobs {
                         job.features,
                     ) {
                         Ok(mut analysis) => {
-                            analysis.client_ids = job.client_ids;
+                            analysis.recipients = job.recipients;
                             analysis.key = job.key;
                             self.pending.insert(primary_id, analysis);
+                            if let Some(connection) = connection {
+                                if let Err(error) = self
+                                    .progress
+                                    .report_started(connection, AnalysisJobId::Client(primary_id))
+                                {
+                                    failures.push(DispatchFailure {
+                                        recipients: Vec::new(),
+                                        client_job: Some(primary_id),
+                                        diagnostic: None,
+                                        message: error,
+                                    });
+                                }
+                            }
                         }
                         Err(message) => {
                             self.remove_observation(job.key.as_ref(), &primary_id);
-                            for id in &job.client_ids {
-                                self.remove_client_mapping(id, &primary_id);
+                            for recipient in &job.recipients {
+                                self.remove_client_mapping(&recipient.id, &primary_id);
                             }
                             failures.push(DispatchFailure {
-                                client_ids: job.client_ids,
+                                recipients: job.recipients,
+                                client_job: Some(primary_id),
                                 diagnostic: None,
                                 message,
                             });
@@ -1726,13 +4740,29 @@ impl AnalysisJobs {
                         diagnostic_features(),
                     ) {
                         Ok(analysis) => {
+                            if let Some(connection) = connection {
+                                if let Err(error) = self.progress.start_server(
+                                    connection,
+                                    AnalysisJobId::Diagnostic(id),
+                                    "Indexing workspace",
+                                    &self.partial_tokens,
+                                ) {
+                                    failures.push(DispatchFailure {
+                                        recipients: Vec::new(),
+                                        client_job: None,
+                                        diagnostic: None,
+                                        message: error,
+                                    });
+                                }
+                            }
                             self.diagnostics
                                 .insert(id, PendingDiagnostic { uri, analysis });
                         }
                         Err(message) => {
                             self.diagnostic_jobs.remove(&uri);
                             failures.push(DispatchFailure {
-                                client_ids: Vec::new(),
+                                recipients: Vec::new(),
+                                client_job: None,
                                 diagnostic: Some(QueuedDiagnostic { id, uri }),
                                 message,
                             });
@@ -1747,7 +4777,7 @@ impl AnalysisJobs {
     fn handle_dispatch_failures(
         &mut self,
         failures: Vec<DispatchFailure>,
-        connection: Option<&Connection>,
+        connection: Option<&dyn ProtocolSender>,
     ) -> Result<(), String> {
         let mut first_error = None;
         for failure in failures {
@@ -1762,25 +4792,413 @@ impl AnalysisJobs {
                 }
             }
             if let Some(connection) = connection {
-                for id in failure.client_ids {
-                    if let Err(error) =
-                        send_error(connection, id, ErrorCode::RequestFailed, &failure.message)
-                    {
+                for recipient in &failure.recipients {
+                    if let Err(error) = send_error(
+                        connection,
+                        recipient.id.clone(),
+                        ErrorCode::RequestFailed,
+                        &failure.message,
+                    ) {
                         first_error.get_or_insert_with(|| error.to_string());
                     }
+                    if let Some(client_job) = failure.client_job {
+                        self.remove_client_mapping(&recipient.id, &client_job);
+                        self.release_partial_token(recipient);
+                        if let Err(error) = self.progress.finish_recipient(
+                            Some(connection),
+                            AnalysisJobId::Client(client_job),
+                            &recipient.id,
+                            Some("Failed"),
+                        ) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
                 }
-            } else if first_error.is_none() && !failure.client_ids.is_empty() {
+            } else if first_error.is_none() && !failure.recipients.is_empty() {
                 first_error = Some(failure.message);
             }
         }
         first_error.map_or(Ok(()), Err)
     }
 
+    fn finish_partial_recipient(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        job_id: AnalysisComputationId,
+        recipient: &PartialDeliveryRecipient,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.remove_client_mapping(&recipient.id, &job_id);
+        self.release_partial_token(&ClientRecipient {
+            id: recipient.id.clone(),
+            work_done_token: None,
+            partial_result_token: Some(recipient.token.clone()),
+        });
+        self.progress
+            .finish_recipient(
+                Some(connection),
+                AnalysisJobId::Client(job_id),
+                &recipient.id,
+                None,
+            )
+            .map_err(|error| error.into())
+    }
+
+    fn fail_client_recipients(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        job_id: AnalysisComputationId,
+        recipients: Vec<ClientRecipient>,
+        code: ErrorCode,
+        message: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for recipient in recipients {
+            self.remove_client_mapping(&recipient.id, &job_id);
+            send_error(connection, recipient.id.clone(), code, message)?;
+            self.release_partial_token(&recipient);
+            self.progress
+                .finish_recipient(
+                    Some(connection),
+                    AnalysisJobId::Client(job_id),
+                    &recipient.id,
+                    Some("Failed"),
+                )
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        }
+        Ok(())
+    }
+
+    fn fail_partial_delivery(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        delivery: PartialDelivery,
+        code: ErrorCode,
+        message: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let PartialDelivery {
+            job_id,
+            recipients,
+            retained_bytes,
+            validation,
+            ..
+        } = delivery;
+        self.retire_partial_validation(validation, retained_bytes);
+        let recipients = recipients
+            .into_iter()
+            .map(|recipient| ClientRecipient {
+                id: recipient.id,
+                work_done_token: None,
+                partial_result_token: Some(recipient.token),
+            })
+            .collect();
+        self.fail_client_recipients(connection, job_id, recipients, code, message)
+    }
+
+    fn send_bulk_result(
+        connection: &dyn ProtocolSender,
+        id: RequestId,
+        payload: &PartialResultPayload,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match payload {
+            PartialResultPayload::WorkspaceSymbols(items) => send_ok(connection, id, &**items),
+            PartialResultPayload::References(items) => send_ok(connection, id, &**items),
+        }
+    }
+
+    fn start_partial_delivery(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        workspace: &Workspace,
+        result: AnalysisResult,
+        recipients: Vec<ClientRecipient>,
+        primary_id: AnalysisComputationId,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if analysis_result_is_stale(workspace, &result) {
+            return self.fail_client_recipients(
+                connection,
+                primary_id,
+                recipients,
+                ErrorCode::RequestFailed,
+                "analysis result became stale; retry the request",
+            );
+        }
+
+        let AnalysisResult {
+            source_generation,
+            configuration_generation,
+            records,
+            value,
+            ..
+        } = result;
+        let Some(payload) = partial_payload_from_result(value) else {
+            return self.fail_client_recipients(
+                connection,
+                primary_id,
+                recipients,
+                ErrorCode::RequestFailed,
+                "partial result was attached to an unsupported analysis",
+            );
+        };
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(error) => {
+                for recipient in recipients {
+                    self.remove_client_mapping(&recipient.id, &primary_id);
+                    send_analysis_error(connection, recipient.id.clone(), error.clone())?;
+                    self.release_partial_token(&recipient);
+                    self.progress
+                        .finish_recipient(
+                            Some(connection),
+                            AnalysisJobId::Client(primary_id),
+                            &recipient.id,
+                            Some("Failed"),
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                }
+                return Ok(());
+            }
+        };
+
+        let mut partial_recipients = Vec::new();
+        let mut ordinary_recipients = Vec::new();
+        for recipient in recipients {
+            if let Some(token) = recipient.partial_result_token.clone() {
+                if payload.len() == 0 {
+                    send_ok(connection, recipient.id.clone(), payload.empty_result())?;
+                    self.remove_client_mapping(&recipient.id, &primary_id);
+                    self.release_partial_token(&recipient);
+                    self.progress
+                        .finish_recipient(
+                            Some(connection),
+                            AnalysisJobId::Client(primary_id),
+                            &recipient.id,
+                            None,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                } else {
+                    partial_recipients.push(PartialDeliveryRecipient {
+                        id: recipient.id,
+                        token,
+                        next_item: 0,
+                    });
+                }
+            } else {
+                ordinary_recipients.push(recipient);
+            }
+        }
+
+        for recipient in ordinary_recipients {
+            Self::send_bulk_result(connection, recipient.id.clone(), &payload)?;
+            self.remove_client_mapping(&recipient.id, &primary_id);
+            self.release_partial_token(&recipient);
+            self.progress
+                .finish_recipient(
+                    Some(connection),
+                    AnalysisJobId::Client(primary_id),
+                    &recipient.id,
+                    None,
+                )
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        }
+
+        if !partial_recipients.is_empty() {
+            let revalidation_input = Arc::new(workspace.revalidation_input());
+            let partial_failure = payload.retained_bytes().map(|payload_bytes| {
+                payload_bytes
+                    .saturating_add(source_records_retained_bytes(&records))
+                    .saturating_add(revalidation_input.retained_bytes())
+            });
+            let retained_bytes = match partial_failure {
+                Ok(retained_bytes) => retained_bytes,
+                Err(error) => {
+                    let recipients = partial_recipients
+                        .into_iter()
+                        .map(|recipient| ClientRecipient {
+                            id: recipient.id,
+                            work_done_token: None,
+                            partial_result_token: Some(recipient.token),
+                        })
+                        .collect();
+                    return self.fail_client_recipients(
+                        connection,
+                        primary_id,
+                        recipients,
+                        ErrorCode::RequestFailed,
+                        &error,
+                    );
+                }
+            };
+            if self
+                .partial_deliveries
+                .len()
+                .saturating_add(self.retired_partial_validations.len())
+                >= MAX_PARTIAL_VALIDATION_RETIREMENTS
+            {
+                let recipients = partial_recipients
+                    .into_iter()
+                    .map(|recipient| ClientRecipient {
+                        id: recipient.id,
+                        work_done_token: None,
+                        partial_result_token: Some(recipient.token),
+                    })
+                    .collect();
+                return self.fail_client_recipients(
+                    connection,
+                    primary_id,
+                    recipients,
+                    ErrorCode::RequestFailed,
+                    "partial result validation capacity is full; retry the request",
+                );
+            }
+            if self.partial_delivery_bytes().saturating_add(retained_bytes)
+                > MAX_PARTIAL_DELIVERY_BYTES
+            {
+                let recipients = partial_recipients
+                    .into_iter()
+                    .map(|recipient| ClientRecipient {
+                        id: recipient.id,
+                        work_done_token: None,
+                        partial_result_token: Some(recipient.token),
+                    })
+                    .collect();
+                return self.fail_client_recipients(
+                    connection,
+                    primary_id,
+                    recipients,
+                    ErrorCode::RequestFailed,
+                    "partial result delivery capacity is full; retry the request",
+                );
+            }
+            let records = Arc::new(records);
+            let validation = match PartialDeliveryValidation::new(
+                revalidation_input,
+                records,
+                self.test_barriers.clone(),
+            ) {
+                Ok(validation) => validation,
+                Err(error) => {
+                    let recipients = partial_recipients
+                        .into_iter()
+                        .map(|recipient| ClientRecipient {
+                            id: recipient.id,
+                            work_done_token: None,
+                            partial_result_token: Some(recipient.token),
+                        })
+                        .collect();
+                    return self.fail_client_recipients(
+                        connection,
+                        primary_id,
+                        recipients,
+                        ErrorCode::RequestFailed,
+                        &error,
+                    );
+                }
+            };
+            self.partial_deliveries.push_back(PartialDelivery {
+                job_id: primary_id,
+                source_generation,
+                configuration_generation,
+                payload,
+                recipients: partial_recipients,
+                next_recipient: 0,
+                retained_bytes,
+                validation,
+            });
+        }
+        Ok(())
+    }
+
+    fn pump_partial_deliveries(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        workspace: &Workspace,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.reap_retired_partial_validations();
+        for _ in 0..MAX_PARTIAL_RESULT_CHUNKS_PER_TURN {
+            let Some(mut delivery) = self.partial_deliveries.pop_front() else {
+                return Ok(());
+            };
+            if delivery.source_generation != workspace.source_generation()
+                || delivery.configuration_generation != workspace.configuration_generation()
+            {
+                self.fail_partial_delivery(
+                    connection,
+                    delivery,
+                    ErrorCode::RequestFailed,
+                    "analysis result became stale during partial delivery; retry the request",
+                )?;
+                continue;
+            }
+            if delivery.recipients.is_empty() {
+                continue;
+            }
+            match delivery.validation.poll() {
+                None => {
+                    self.partial_deliveries.push_front(delivery);
+                    return Ok(());
+                }
+                Some(Err(error)) => {
+                    self.fail_partial_delivery(
+                        connection,
+                        delivery,
+                        ErrorCode::RequestFailed,
+                        &format!("analysis result became stale during partial delivery: {error}"),
+                    )?;
+                    continue;
+                }
+                Some(Ok(())) => {}
+            }
+            let recipient_index = delivery.next_recipient % delivery.recipients.len();
+            let next_item = delivery.recipients[recipient_index].next_item;
+            if next_item >= delivery.payload.len() {
+                let recipient = delivery.recipients.remove(recipient_index);
+                send_ok(
+                    connection,
+                    recipient.id.clone(),
+                    delivery.payload.empty_result(),
+                )?;
+                self.finish_partial_recipient(connection, delivery.job_id, &recipient)?;
+                if !delivery.recipients.is_empty() {
+                    delivery.next_recipient %= delivery.recipients.len();
+                    delivery.validation.request()?;
+                    self.partial_deliveries.push_back(delivery);
+                }
+                continue;
+            }
+            let (end, value) = match delivery.payload.chunk(next_item) {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => unreachable!("partial result cursor checked above"),
+                Err(error) => {
+                    self.fail_partial_delivery(
+                        connection,
+                        delivery,
+                        ErrorCode::RequestFailed,
+                        &error,
+                    )?;
+                    continue;
+                }
+            };
+            let token = delivery.recipients[recipient_index].token.clone();
+            if !send_partial_result_chunk(connection, &token, value)? {
+                delivery.validation.request()?;
+                self.partial_deliveries.push_front(delivery);
+                return Ok(());
+            }
+            delivery.recipients[recipient_index].next_item = end;
+            if !delivery.recipients.is_empty() {
+                delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
+                delivery.validation.request()?;
+                self.partial_deliveries.push_back(delivery);
+            }
+        }
+        Ok(())
+    }
+
     fn poll(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.reap_retired_partial_validations();
         while let Ok(result) = self.receiver.try_recv() {
             match result.id {
                 AnalysisJobId::Diagnostic(id) => {
@@ -1800,9 +5218,25 @@ impl AnalysisJobs {
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let _ = job.analysis.handle.join();
                     if cancelled {
+                        self.progress
+                            .finish_job(
+                                Some(connection),
+                                AnalysisJobId::Diagnostic(id),
+                                Some("Cancelled"),
+                            )
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         workspace.reschedule_diagnostics(job.uri);
                     } else {
-                        deliver_analysis_result(connection, workspace, result, None)?;
+                        deliver_analysis_result_with_store(
+                            connection,
+                            workspace,
+                            &mut self.completion_resolutions,
+                            result,
+                            None,
+                        )?;
+                        self.progress
+                            .finish_job(Some(connection), AnalysisJobId::Diagnostic(id), None)
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
                 }
                 AnalysisJobId::Client(primary_id) => {
@@ -1810,42 +5244,82 @@ impl AnalysisJobs {
                         continue;
                     };
                     let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
-                    let client_ids = job.client_ids;
+                    let recipients = job.recipients;
                     let key = job.key;
                     let _ = job.handle.join();
                     self.remove_observation(key.as_ref(), &primary_id);
-                    for id in &client_ids {
-                        self.remove_client_mapping(id, &primary_id);
-                    }
                     if cancelled {
+                        for recipient in &recipients {
+                            self.remove_client_mapping(&recipient.id, &primary_id);
+                        }
                         Self::send_client_error(
                             Some(connection),
-                            client_ids,
+                            recipients.iter().map(|recipient| recipient.id.clone()),
                             ErrorCode::RequestCanceled,
                             rename::CANCELLATION_MESSAGE,
                         )
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                    } else if !client_ids.is_empty() {
-                        for id in client_ids {
-                            deliver_analysis_result(
-                                connection,
-                                workspace,
-                                result.clone(),
-                                Some(id),
+                        for recipient in &recipients {
+                            self.release_partial_token(recipient);
+                            self.progress
+                                .finish_recipient(
+                                    Some(connection),
+                                    AnalysisJobId::Client(primary_id),
+                                    &recipient.id,
+                                    Some("Cancelled"),
+                                )
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
+                        }
+                    } else if !recipients.is_empty() {
+                        if recipients
+                            .iter()
+                            .any(|recipient| recipient.partial_result_token.is_some())
+                            && is_partial_result_value(&result.value)
+                        {
+                            self.start_partial_delivery(
+                                connection, workspace, result, recipients, primary_id,
                             )?;
+                        } else {
+                            for recipient in &recipients {
+                                deliver_analysis_result_with_store(
+                                    connection,
+                                    workspace,
+                                    &mut self.completion_resolutions,
+                                    result.clone(),
+                                    Some(recipient.id.clone()),
+                                )?;
+                                self.remove_client_mapping(&recipient.id, &primary_id);
+                                self.release_partial_token(recipient);
+                                self.progress
+                                    .finish_recipient(
+                                        Some(connection),
+                                        AnalysisJobId::Client(primary_id),
+                                        &recipient.id,
+                                        None,
+                                    )
+                                    .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                        error.into()
+                                    })?;
+                            }
                         }
                     }
                 }
             }
         }
-        let failures = self.pump(workspace);
+        let failures = self.pump(workspace, Some(connection));
         self.handle_dispatch_failures(failures, Some(connection))
             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
         Ok(())
     }
 
     fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.diagnostics.is_empty() && self.queue.is_empty()
+        self.pending.is_empty()
+            && self.diagnostics.is_empty()
+            && self.queue.is_empty()
+            && self.partial_deliveries.is_empty()
+            && self.retired_partial_validations.is_empty()
     }
 
     fn shutdown(&mut self) {
@@ -1854,13 +5328,13 @@ impl AnalysisJobs {
 
     fn shutdown_with_connection(
         &mut self,
-        connection: &Connection,
+        connection: &dyn ProtocolSender,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.shutdown_inner(Some(connection))
             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })
     }
 
-    fn shutdown_inner(&mut self, connection: Option<&Connection>) -> Result<(), String> {
+    fn shutdown_inner(&mut self, connection: Option<&dyn ProtocolSender>) -> Result<(), String> {
         if self.shutting_down {
             return Ok(());
         }
@@ -1868,11 +5342,60 @@ impl AnalysisJobs {
         let mut queued = std::mem::take(&mut self.queue);
         while let Some(job) = queued.pop() {
             if let QueuedAnalysis::Client(job) = job {
+                let request_ids = job
+                    .recipients
+                    .iter()
+                    .map(|recipient| recipient.id.clone())
+                    .collect::<Vec<_>>();
                 Self::send_client_error(
                     connection,
-                    job.client_ids.clone(),
+                    request_ids,
                     ErrorCode::RequestCanceled,
                     rename::CANCELLATION_MESSAGE,
+                )?;
+                for recipient in job.recipients {
+                    self.release_partial_token(&recipient);
+                    self.progress.finish_recipient(
+                        connection,
+                        AnalysisJobId::Client(job.id),
+                        &recipient.id,
+                        Some("Cancelled"),
+                    )?;
+                }
+            }
+        }
+        let partial_deliveries = std::mem::take(&mut self.partial_deliveries);
+        for delivery in partial_deliveries {
+            let PartialDelivery {
+                job_id,
+                recipients,
+                retained_bytes,
+                validation,
+                ..
+            } = delivery;
+            self.retire_partial_validation(validation, retained_bytes);
+            for recipient in recipients {
+                let request_id = recipient.id.clone();
+                if let Some(connection) = connection {
+                    send_error(
+                        connection,
+                        request_id.clone(),
+                        ErrorCode::RequestCanceled,
+                        rename::CANCELLATION_MESSAGE,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                self.remove_client_mapping(&request_id, &job_id);
+                self.release_partial_token(&ClientRecipient {
+                    id: request_id.clone(),
+                    work_done_token: None,
+                    partial_result_token: Some(recipient.token),
+                });
+                self.progress.finish_recipient(
+                    connection,
+                    AnalysisJobId::Client(job_id),
+                    &request_id,
+                    Some("Cancelled"),
                 )?;
             }
         }
@@ -1891,13 +5414,24 @@ impl AnalysisJobs {
         for job in &pending {
             job.cancellation
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            let request_ids = job
+                .recipients
+                .iter()
+                .map(|recipient| recipient.id.clone())
+                .collect::<Vec<_>>();
             Self::send_client_error(
                 connection,
-                job.client_ids.clone(),
+                request_ids,
                 ErrorCode::RequestCanceled,
                 rename::CANCELLATION_MESSAGE,
             )?;
+            for recipient in &job.recipients {
+                self.release_partial_token(recipient);
+            }
         }
+
+        self.progress.shutdown(connection)?;
+        self.partial_tokens.clear();
 
         let deadline = Instant::now() + ANALYSIS_SHUTDOWN_TIMEOUT;
         while !pending.is_empty() {
@@ -1920,6 +5454,13 @@ impl AnalysisJobs {
             pending = remaining;
             thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
+        while !self.retired_partial_validations.is_empty() {
+            self.reap_retired_partial_validations();
+            if self.retired_partial_validations.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
+        }
         Ok(())
     }
 }
@@ -1930,7 +5471,15 @@ fn diagnostic_features() -> ClientFeatures {
         action_disabled: false,
         document_changes: false,
         hierarchical_document_symbols: false,
-        hover_markdown: false,
+        hover_format: DocumentationFormat::PlainText,
+        completion_format: DocumentationFormat::PlainText,
+        completion_snippet_support: false,
+        completion_resolve_documentation: false,
+        completion_resolve_detail: false,
+        signature_help_format: DocumentationFormat::PlainText,
+        folding_range_limit: None,
+        line_folding_only: false,
+        folding_range_kind_value_set: None,
     }
 }
 
@@ -1940,6 +5489,7 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
             value,
             AnalysisResultValue::Hover(_)
                 | AnalysisResultValue::Completion(_)
+                | AnalysisResultValue::ResolveCompletion(_)
                 | AnalysisResultValue::SignatureHelp(_)
                 | AnalysisResultValue::Navigation(_)
                 | AnalysisResultValue::Formatting(_)
@@ -1947,17 +5497,14 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::TypeDefinitions(_)
                 | AnalysisResultValue::DocumentSymbols { .. }
                 | AnalysisResultValue::DocumentHighlights(_)
+                | AnalysisResultValue::SelectionRanges(_)
                 | AnalysisResultValue::SemanticTokens(_)
+                | AnalysisResultValue::FoldingRanges(_)
         )
 }
 
-fn deliver_analysis_result(
-    connection: &Connection,
-    workspace: &mut Workspace,
-    result: AnalysisResult,
-    client_id: Option<RequestId>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let stale = if is_dependency_scoped_result(&result.value, &result.records) {
+fn analysis_result_is_stale(workspace: &Workspace, result: &AnalysisResult) -> bool {
+    if is_dependency_scoped_result(&result.value, &result.records) {
         workspace
             .dependency_scoped_result_is_fresh(
                 result.source_generation,
@@ -1968,7 +5515,48 @@ fn deliver_analysis_result(
     } else {
         result.source_generation != workspace.source_generation()
             || result.configuration_generation != workspace.configuration_generation()
-    };
+    }
+}
+
+fn send_partial_result_chunk(
+    connection: &dyn ProtocolSender,
+    token: &ProgressToken,
+    value: Value,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let message = Message::Notification(Notification::new(
+        "$/progress".to_string(),
+        serde_json::json!({"token": token, "value": value}),
+    ));
+    connection
+        .send_data(message)
+        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })
+}
+
+#[cfg(test)]
+fn deliver_analysis_result(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    result: AnalysisResult,
+    client_id: Option<RequestId>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut completion_resolutions = CompletionResolutionStore::new();
+    deliver_analysis_result_with_store(
+        connection,
+        workspace,
+        &mut completion_resolutions,
+        result,
+        client_id,
+    )
+}
+
+fn deliver_analysis_result_with_store(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    completion_resolutions: &mut CompletionResolutionStore,
+    result: AnalysisResult,
+    client_id: Option<RequestId>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let stale = analysis_result_is_stale(workspace, &result);
     if stale {
         if let AnalysisResultValue::Diagnostics(diagnostics) = &result.value {
             workspace.reschedule_diagnostics(diagnostics.uri.clone());
@@ -2005,12 +5593,35 @@ fn deliver_analysis_result(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-        AnalysisResultValue::Completion(value) => match value {
-            Ok(value) => send_ok(
-                connection,
-                client_id.clone().expect("client result"),
-                CompletionResponse::List(value),
-            ),
+        AnalysisResultValue::Completion(analysis) => {
+            let value = completion_resolutions.register(
+                analysis,
+                result.source_generation,
+                result.configuration_generation,
+                &result.records,
+            );
+            match value {
+                Ok(value) => send_ok(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    CompletionResponse::List(value),
+                ),
+                Err(error) => send_analysis_error(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    error,
+                ),
+            }
+        }
+        AnalysisResultValue::ResolveCompletion(analysis) => match analysis.value {
+            Ok(metadata) => match completion_resolutions.finish(&analysis.token, metadata) {
+                Ok(item) => send_ok(connection, client_id.clone().expect("client result"), item),
+                Err(error) => send_analysis_error(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    error,
+                ),
+            },
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
@@ -2053,20 +5664,32 @@ fn deliver_analysis_result(
             ),
         },
         AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
-            Ok(value) => send_diagnostics(connection, &diagnostics.uri, diagnostics.version, value),
+            Ok(publications) => {
+                send_diagnostic_publications(connection, workspace, &diagnostics.uri, publications)
+            }
             Err(error) if error == rename::CANCELLATION_MESSAGE => {
                 workspace.reschedule_diagnostics(diagnostics.uri);
                 Ok(())
             }
-            Err(error) => send_diagnostics(
-                connection,
-                &diagnostics.uri,
-                diagnostics.version,
-                vec![crate::workspace::server_diagnostic(
-                    &error,
-                    lsp_types::DiagnosticSeverity::ERROR,
-                )],
-            ),
+            Err(error) => {
+                let uri = diagnostics.uri;
+                let version = diagnostics.version;
+                let updates = workspace.replace_diagnostic_publications(
+                    &uri,
+                    std::iter::once(queries::DiagnosticPublication {
+                        uri: uri.clone(),
+                        version,
+                        diagnostics: vec![crate::workspace::server_diagnostic(
+                            &error,
+                            lsp_types::DiagnosticSeverity::ERROR,
+                        )],
+                    }),
+                );
+                for update in updates {
+                    send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
+                }
+                Ok(())
+            }
         },
         AnalysisResultValue::TypeDefinitions(value) => match value {
             Ok(value) => send_ok(
@@ -2137,7 +5760,19 @@ fn deliver_analysis_result(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
+        AnalysisResultValue::SelectionRanges(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
         AnalysisResultValue::SemanticTokens(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::FoldingRanges(value) => match value {
             Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
@@ -2149,7 +5784,8 @@ fn deliver_analysis_result(
 fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
     match &mut result.value {
         AnalysisResultValue::Hover(value) => *value = Err(error),
-        AnalysisResultValue::Completion(value) => *value = Err(error),
+        AnalysisResultValue::Completion(analysis) => analysis.value = Err(error),
+        AnalysisResultValue::ResolveCompletion(analysis) => analysis.value = Err(error),
         AnalysisResultValue::SignatureHelp(value) => *value = Err(error),
         AnalysisResultValue::Navigation(navigation) => {
             navigation.state = None;
@@ -2169,12 +5805,14 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::WorkspaceSymbols(value) => *value = Err(error),
         AnalysisResultValue::References(value) => *value = Err(error),
         AnalysisResultValue::DocumentHighlights(value) => *value = Err(error),
+        AnalysisResultValue::SelectionRanges(value) => *value = Err(error),
         AnalysisResultValue::SemanticTokens(value) => *value = Err(error),
+        AnalysisResultValue::FoldingRanges(value) => *value = Err(error),
     }
 }
 
 fn send_analysis_error(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     id: RequestId,
     error: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -2203,11 +5841,24 @@ fn run_stdio_with_config(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let (connection, io_threads) = bounded_stdio();
+    let connection = ProtocolConnection::new(connection);
     let outcome = run_connection(&connection, test_barriers);
+    let shutdown_deadline = Instant::now() + OUTPUT_SHUTDOWN_TIMEOUT;
+    let drain_result = connection.drain_until(shutdown_deadline);
     drop(connection);
-    let success = outcome?;
-    io_threads.join()?;
-    Ok(success)
+    let join_result = io_threads.join_until(shutdown_deadline);
+    match outcome {
+        Ok(success) => {
+            drain_result?;
+            join_result?;
+            Ok(success)
+        }
+        Err(error) => {
+            let _ = join_result;
+            let _ = drain_result;
+            Err(error)
+        }
+    }
 }
 
 struct StdioThreads {
@@ -2216,20 +5867,48 @@ struct StdioThreads {
 }
 
 impl StdioThreads {
-    fn join(self) -> io::Result<()> {
-        match self.reader.join() {
-            Ok(result) => result?,
-            Err(error) => std::panic::panic_any(error),
+    fn join_until(self, deadline: Instant) -> io::Result<()> {
+        let mut reader = Some(self.reader);
+        let mut writer = Some(self.writer);
+        while reader.is_some() || writer.is_some() {
+            if reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                let handle = reader.take().expect("reader handle");
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(error) => std::panic::panic_any(error),
+                }
+            }
+            if writer
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                let handle = writer.take().expect("writer handle");
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(error) => std::panic::panic_any(error),
+                }
+            }
+            if reader.is_none() && writer.is_none() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                // A peer that does not drain stdout must not keep the process
+                // alive indefinitely. Dropping an unfinished JoinHandle
+                // detaches the blocked transport thread; process teardown
+                // then closes the descriptors and bounds shutdown time.
+                return Ok(());
+            }
+            thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
-        match self.writer.join() {
-            Ok(result) => result,
-            Err(error) => std::panic::panic_any(error),
-        }
+        Ok(())
     }
 }
 
 fn bounded_stdio() -> (Connection, StdioThreads) {
-    let (writer_sender, writer_receiver) = bounded::<Message>(0);
+    let (writer_sender, writer_receiver) = bounded::<Message>(MAX_OUTBOUND_MESSAGES);
     let writer = thread::Builder::new()
         .name("PascalLspWriter".to_string())
         .spawn(move || {
@@ -2407,7 +6086,7 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
 }
 
 fn run_connection(
-    connection: &Connection,
+    connection: &ProtocolConnection,
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let (initialize_id, initialize, options) = loop {
@@ -2435,10 +6114,17 @@ fn run_connection(
     };
     let roots = workspace_roots(&initialize);
     let workspace_folders_supported = supports_workspace_folders(&initialize.capabilities);
+    let configuration_pull_supported = supports_configuration(&initialize.capabilities);
     let watcher_registration_supported =
         supports_watched_file_registration(&initialize.capabilities);
     let relative_pattern_support = supports_relative_pattern(&initialize.capabilities);
     let client_features = client_features(&initialize.capabilities);
+    let work_done_progress_supported = initialize
+        .capabilities
+        .window
+        .as_ref()
+        .and_then(|window| window.work_done_progress)
+        .unwrap_or(false);
     let capabilities = server_capabilities(&initialize.capabilities);
 
     connection.initialize_finish(
@@ -2452,61 +6138,136 @@ fn run_connection(
         }),
     )?;
 
-    let mut workspace = Workspace::new(roots, options);
+    let mut workspace = Workspace::new(roots, options.clone());
+    let mut configuration = ConfigurationCoordinator::new(
+        workspace.configuration_scope_uri(),
+        options,
+        configuration_pull_supported,
+    );
+    configuration.on_initialized(connection)?;
     let watcher_registration = watcher_registration_supported
         .then(|| register_file_watcher(connection, &workspace, relative_pattern_support))
         .transpose()?;
+    let jobs =
+        AnalysisJobs::with_test_barriers_and_progress(test_barriers, work_done_progress_supported);
 
     event_loop(
         connection,
         &mut workspace,
         workspace_folders_supported,
         client_features,
+        &mut configuration,
         watcher_registration,
-        test_barriers,
+        jobs,
     )
 }
 
 fn event_loop(
-    connection: &Connection,
+    connection: &ProtocolConnection,
     workspace: &mut Workspace,
     workspace_folders_supported: bool,
     client_features: ClientFeatures,
+    configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
-    test_barriers: TestBarrierConfig,
+    mut jobs: AnalysisJobs,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
-    let mut jobs = AnalysisJobs::with_test_barriers(test_barriers);
+    let mut deferred_configuration_messages = VecDeque::new();
     loop {
+        connection.flush()?;
+        if let Some(effect) = configuration.poll(workspace)? {
+            if let Some(registration) = watcher_registration.as_mut() {
+                sync_file_watcher(connection, workspace, registration)?;
+            }
+            jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+            jobs.refresh_diagnostics_with_connection(connection, workspace, &effect.refresh)
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        }
         if !shutdown_received {
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
         }
         jobs.poll(connection, workspace)?;
+        let output_pending = connection.has_pending_output();
         let timeout = workspace
             .next_diagnostic_timeout()
             .unwrap_or(Duration::from_secs(86_400))
-            .min(if jobs.is_empty() {
+            .min(if jobs.is_empty() && !output_pending {
                 Duration::from_secs(86_400)
             } else {
                 ANALYSIS_POLL_INTERVAL
+            })
+            .min(if configuration.is_preparing() {
+                ANALYSIS_POLL_INTERVAL
+            } else {
+                Duration::from_secs(86_400)
             });
-        let message = match connection.receiver.recv_timeout(timeout) {
-            Ok(message) => message,
-            Err(RecvTimeoutError::Timeout) => {
-                if !shutdown_received {
-                    publish_due_diagnostics(connection, workspace, &mut jobs)?;
+        let message = if !configuration.is_preparing() {
+            match deferred_configuration_messages.pop_front() {
+                Some(DeferredConfigurationMessage::Request(deferred)) => {
+                    if !deferred_request_is_current(workspace, configuration, &deferred) {
+                        send_error(
+                            connection,
+                            deferred.request.id,
+                            ErrorCode::RequestFailed,
+                            "request became stale while configuration was prepared; retry the request",
+                        )?;
+                        jobs.pump_partial_deliveries(connection, workspace)?;
+                        continue;
+                    }
+                    Message::Request(deferred.request)
                 }
-                continue;
+                Some(DeferredConfigurationMessage::Notification(notification)) => {
+                    Message::Notification(notification)
+                }
+                None => match connection.receiver().recv_timeout(timeout) {
+                    Ok(message) => message,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if !shutdown_received {
+                            publish_due_diagnostics(connection, workspace, &mut jobs)?;
+                        }
+                        jobs.pump_partial_deliveries(connection, workspace)?;
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        jobs.shutdown();
+                        configuration.shutdown();
+                        return Ok(true);
+                    }
+                },
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                jobs.shutdown();
-                return Ok(true);
+        } else {
+            match connection.receiver().recv_timeout(timeout) {
+                Ok(message) => message,
+                Err(RecvTimeoutError::Timeout) => {
+                    if !shutdown_received {
+                        publish_due_diagnostics(connection, workspace, &mut jobs)?;
+                    }
+                    jobs.pump_partial_deliveries(connection, workspace)?;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    jobs.shutdown();
+                    configuration.shutdown();
+                    return Ok(true);
+                }
             }
         };
 
         match message {
             Message::Request(request) if request.method == "shutdown" => {
                 jobs.shutdown_with_connection(connection)?;
+                configuration.shutdown();
+                for deferred in deferred_configuration_messages.drain(..) {
+                    if let DeferredConfigurationMessage::Request(deferred) = deferred {
+                        send_error(
+                            connection,
+                            deferred.request.id,
+                            ErrorCode::RequestCanceled,
+                            rename::CANCELLATION_MESSAGE,
+                        )?;
+                    }
+                }
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
             }
@@ -2518,6 +6279,66 @@ fn event_loop(
                         ErrorCode::InvalidRequest,
                         "request received after shutdown",
                     )?;
+                } else if configuration.is_preparing()
+                    && request_requires_configuration(&request.method)
+                {
+                    let deferred_request_count = deferred_configuration_messages
+                        .iter()
+                        .filter(|deferred| {
+                            matches!(deferred, DeferredConfigurationMessage::Request(_))
+                        })
+                        .count();
+                    if deferred_configuration_messages.len() >= MAX_CONFIGURATION_DEFERRED_MESSAGES
+                        || deferred_request_count >= MAX_CONFIGURATION_DEFERRED_REQUESTS
+                    {
+                        send_error(
+                            connection,
+                            request.id,
+                            ErrorCode::ServerCancelled,
+                            CONFIGURATION_REQUEST_RETRY_MESSAGE,
+                        )?;
+                    } else if deferred_configuration_messages.iter().any(|deferred| {
+                        matches!(
+                            deferred,
+                            DeferredConfigurationMessage::Request(deferred)
+                                if deferred.request.id == request.id
+                        )
+                    }) {
+                        send_error(
+                            connection,
+                            request.id,
+                            ErrorCode::InvalidRequest,
+                            "analysis request ID is already in use",
+                        )?;
+                    } else {
+                        let preceding_document_notification =
+                            deferred_configuration_messages.iter().any(|deferred| {
+                                matches!(
+                                    deferred,
+                                    DeferredConfigurationMessage::Notification(notification)
+                                        if notification_may_change_document(&notification.method)
+                                )
+                            });
+                        let preceding_configuration_notification =
+                            deferred_configuration_messages.iter().any(|deferred| {
+                                matches!(
+                                    deferred,
+                                    DeferredConfigurationMessage::Notification(notification)
+                                        if notification_may_change_configuration(
+                                            &notification.method
+                                        )
+                                )
+                            });
+                        deferred_configuration_messages.push_back(
+                            DeferredConfigurationMessage::Request(deferred_configuration_request(
+                                request,
+                                workspace,
+                                configuration,
+                                preceding_document_notification,
+                                preceding_configuration_notification,
+                            )),
+                        );
+                    }
                 } else {
                     let source_generation = workspace.source_generation();
                     let configuration_generation = workspace.configuration_generation();
@@ -2526,7 +6347,12 @@ fn event_loop(
                         || configuration_generation != workspace.configuration_generation()
                     {
                         let open_documents = workspace.open_document_uris();
-                        jobs.refresh_diagnostics(workspace, &open_documents);
+                        jobs.refresh_diagnostics_with_connection(
+                            connection,
+                            workspace,
+                            &open_documents,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
@@ -2534,10 +6360,49 @@ fn event_loop(
                 }
             }
             Message::Notification(notification) if notification.method == "exit" => {
-                jobs.shutdown();
+                jobs.shutdown_with_connection(connection)?;
+                configuration.shutdown();
                 return Ok(shutdown_received);
             }
+            Message::Notification(notification)
+                if configuration.is_preparing()
+                    && notification_requires_configuration_ordering(&notification.method) =>
+            {
+                let coalesce = configuration.can_coalesce_configuration_notifications()
+                    && notification.method == "workspace/didChangeConfiguration"
+                    && matches!(
+                        deferred_configuration_messages.back(),
+                        Some(DeferredConfigurationMessage::Notification(previous))
+                            if previous.method == "workspace/didChangeConfiguration"
+                    );
+                if coalesce {
+                    deferred_configuration_messages.pop_back();
+                } else if deferred_configuration_messages.len()
+                    >= MAX_CONFIGURATION_DEFERRED_MESSAGES
+                    && !reject_deferred_configuration_request(
+                        connection,
+                        &mut deferred_configuration_messages,
+                    )?
+                {
+                    return Err(
+                        "configuration transition queue is full; cannot safely defer a state-changing notification"
+                            .into(),
+                    );
+                }
+                deferred_configuration_messages
+                    .push_back(DeferredConfigurationMessage::Notification(notification));
+            }
             Message::Notification(notification) => {
+                if notification.method == "window/workDoneProgress/cancel" {
+                    if let Ok(params) =
+                        serde_json::from_value::<WorkDoneProgressCancelParams>(notification.params)
+                    {
+                        jobs.cancel_progress(connection, &params.token)
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                    }
+                    jobs.pump_partial_deliveries(connection, workspace)?;
+                    continue;
+                }
                 if notification.method == "$/cancelRequest" {
                     if let Ok(id) = serde_json::from_value::<RequestId>(
                         notification
@@ -2546,23 +6411,79 @@ fn event_loop(
                             .cloned()
                             .unwrap_or(Value::Null),
                     ) {
-                        jobs.cancel(connection, &id)
-                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                        if let Some(index) =
+                            deferred_configuration_messages.iter().position(|deferred| {
+                                matches!(
+                                    deferred,
+                                    DeferredConfigurationMessage::Request(request)
+                                        if request.request.id == id
+                                )
+                            })
+                        {
+                            let request = deferred_configuration_messages
+                                .remove(index)
+                                .expect("deferred configuration request");
+                            let DeferredConfigurationMessage::Request(request) = request else {
+                                unreachable!("deferred request predicate");
+                            };
+                            send_error(
+                                connection,
+                                request.request.id,
+                                ErrorCode::RequestCanceled,
+                                rename::CANCELLATION_MESSAGE,
+                            )?;
+                        } else {
+                            jobs.cancel(connection, &id).map_err(
+                                |error| -> Box<dyn Error + Send + Sync> { error.into() },
+                            )?;
+                        }
                     }
+                    jobs.pump_partial_deliveries(connection, workspace)?;
                     continue;
                 }
-                match handle_notification(
-                    connection,
-                    workspace,
-                    notification,
-                    workspace_folders_supported,
-                ) {
+                let notification_method = notification.method.clone();
+                let result = if notification_method == "initialized" {
+                    configuration.on_initialized(connection)?;
+                    Ok(DiagnosticNotificationEffect::default())
+                } else if notification_method == "workspace/didChangeConfiguration" {
+                    configuration
+                        .handle_notification(connection, workspace, &notification)
+                        .map_err(|error| error.to_string())
+                } else {
+                    let refresh_configuration =
+                        notification_method == "workspace/didChangeWorkspaceFolders";
+                    let result = handle_notification(
+                        connection,
+                        workspace,
+                        notification,
+                        workspace_folders_supported,
+                    );
+                    if refresh_configuration && result.is_ok() {
+                        configuration
+                            .update_scope(workspace.configuration_scope_uri(), workspace)
+                            .map_err(|error| error.to_string())?;
+                        configuration
+                            .request_refresh(connection)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    result
+                };
+                match result {
                     Ok(effect) => {
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
                         }
-                        jobs.cancel_diagnostics_for(&effect.cancel);
-                        jobs.refresh_diagnostics(workspace, &effect.refresh);
+                        jobs.cancel_diagnostics_for_with_connection(
+                            Some(connection),
+                            &effect.cancel,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                        jobs.refresh_diagnostics_with_connection(
+                            connection,
+                            workspace,
+                            &effect.refresh,
+                        )
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
                     Err(error) => {
                         eprintln!("pascal-lsp: notification handling failed: {error}");
@@ -2570,55 +6491,295 @@ fn event_loop(
                 }
             }
             Message::Response(response) => {
-                let watcher_response = watcher_registration
-                    .as_mut()
-                    .and_then(|registration| registration.handle_response(&response));
-                if let Some(accepted) = watcher_response {
-                    if !accepted {
-                        if let Some(error) = &response.error {
-                            eprintln!(
-                                "pascal-lsp: watcher registration {} rejected ({}): {}",
-                                response.id, error.code, error.message
-                            );
-                        }
-                    }
+                if let Some(effect) =
+                    configuration.handle_response(connection, workspace, &response)?
+                {
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
                     }
-                } else if let Some(error) = response.error {
-                    eprintln!(
-                        "pascal-lsp: client request {} failed ({}): {}",
-                        response.id, error.code, error.message
-                    );
+                    jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                    jobs.refresh_diagnostics_with_connection(
+                        connection,
+                        workspace,
+                        &effect.refresh,
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                } else if jobs
+                    .handle_progress_response(connection, &response)
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?
+                {
+                    // Progress-create responses are intentionally handled
+                    // before watcher/error logging.  Their IDs use a
+                    // disjoint prefix from Task20 configuration IDs.
+                } else {
+                    let watcher_response = watcher_registration
+                        .as_mut()
+                        .and_then(|registration| registration.handle_response(&response));
+                    if let Some(accepted) = watcher_response {
+                        if !accepted {
+                            if let Some(error) = &response.error {
+                                eprintln!(
+                                    "pascal-lsp: watcher registration {} rejected ({}): {}",
+                                    response.id, error.code, error.message
+                                );
+                            }
+                        }
+                        if let Some(registration) = watcher_registration.as_mut() {
+                            sync_file_watcher(connection, workspace, registration)?;
+                        }
+                    } else if let Some(error) = response.error {
+                        eprintln!(
+                            "pascal-lsp: client request {} failed ({}): {}",
+                            response.id, error.code, error.message
+                        );
+                    }
                 }
             }
         }
+        jobs.pump_partial_deliveries(connection, workspace)?;
     }
 }
 
 fn start_analysis(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     jobs: &mut AnalysisJobs,
     id: RequestId,
     request: AnalysisRequest,
     features: ClientFeatures,
+    work_done_token: Option<ProgressToken>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if let Err(error) =
-        jobs.enqueue_client(id.clone(), request, workspace, features, Some(connection))
-    {
+    start_analysis_with_partial(
+        connection,
+        workspace,
+        jobs,
+        id,
+        request,
+        features,
+        AnalysisProgressTokens {
+            work_done: work_done_token,
+            partial_result: None,
+        },
+    )
+}
+
+fn start_analysis_with_partial(
+    connection: &dyn ProtocolSender,
+    workspace: &Workspace,
+    jobs: &mut AnalysisJobs,
+    id: RequestId,
+    request: AnalysisRequest,
+    features: ClientFeatures,
+    tokens: AnalysisProgressTokens,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if let Err(error) = jobs.enqueue_client_with_partial(
+        id.clone(),
+        request,
+        workspace,
+        features,
+        tokens,
+        Some(connection),
+    ) {
         send_error(connection, id, ErrorCode::RequestFailed, error)?;
     }
     Ok(())
 }
 
+fn request_work_done_token(request: &Request) -> Result<Option<ProgressToken>, String> {
+    let Some(value) = request.params.get("workDoneToken") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| format!("workDoneToken must be a string or integer: {error}"))
+}
+
+fn request_partial_result_token(request: &Request) -> Result<Option<ProgressToken>, String> {
+    let Some(value) = request.params.get("partialResultToken") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| format!("partialResultToken must be a string or integer: {error}"))
+}
+
+fn request_requires_configuration(method: &str) -> bool {
+    matches!(
+        method,
+        "pascal/projectContext"
+            | "pascal/selectProject"
+            | "textDocument/hover"
+            | "textDocument/completion"
+            | "completionItem/resolve"
+            | "textDocument/signatureHelp"
+            | "textDocument/typeDefinition"
+            | "textDocument/documentSymbol"
+            | "workspace/symbol"
+            | "textDocument/references"
+            | "textDocument/documentHighlight"
+            | "textDocument/selectionRange"
+            | "textDocument/semanticTokens/full"
+            | "textDocument/semanticTokens/range"
+            | "textDocument/foldingRange"
+            | "textDocument/prepareRename"
+            | "textDocument/rename"
+            | "textDocument/codeAction"
+            | "codeAction/resolve"
+            | "textDocument/declaration"
+            | "textDocument/definition"
+            | "textDocument/implementation"
+            | "textDocument/formatting"
+    )
+}
+
+fn notification_requires_configuration_ordering(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/didChangeConfiguration"
+            | "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+            | "workspace/didChangeWatchedFiles"
+            | "workspace/didChangeWorkspaceFolders"
+    )
+}
+
+fn notification_may_change_document(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+            | "workspace/didChangeWatchedFiles"
+            | "workspace/didChangeWorkspaceFolders"
+    )
+}
+
+fn notification_may_change_configuration(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/didChangeConfiguration" | "workspace/didChangeWorkspaceFolders"
+    )
+}
+
+fn reject_deferred_configuration_request(
+    connection: &dyn ProtocolSender,
+    messages: &mut VecDeque<DeferredConfigurationMessage>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let Some(index) = messages
+        .iter()
+        .rposition(|message| matches!(message, DeferredConfigurationMessage::Request(_)))
+    else {
+        return Ok(false);
+    };
+    let Some(DeferredConfigurationMessage::Request(deferred)) = messages.remove(index) else {
+        unreachable!("deferred request predicate");
+    };
+    send_error(
+        connection,
+        deferred.request.id,
+        ErrorCode::ServerCancelled,
+        CONFIGURATION_REQUEST_RETRY_MESSAGE,
+    )?;
+    Ok(true)
+}
+
+fn request_document_uri(request: &Request) -> Option<Url> {
+    request
+        .params
+        .get("textDocument")
+        .and_then(|document| document.get("uri"))
+        .and_then(Value::as_str)
+        .and_then(|uri| uri.parse().ok())
+}
+
+fn deferred_configuration_request(
+    request: Request,
+    workspace: &Workspace,
+    configuration: &ConfigurationCoordinator,
+    preceding_document_notification: bool,
+    preceding_configuration_notification: bool,
+) -> DeferredConfigurationRequest {
+    let document = request_document_uri(&request).map(|uri| {
+        let (version, generation) = workspace.document_identity(&uri);
+        DeferredDocumentIdentity {
+            version,
+            generation,
+            uri,
+        }
+    });
+    DeferredConfigurationRequest {
+        request,
+        configuration_revision: configuration.deferred_request_revision(),
+        document,
+        preceding_document_notification,
+        preceding_configuration_notification,
+    }
+}
+
+fn deferred_request_is_current(
+    workspace: &Workspace,
+    configuration: &ConfigurationCoordinator,
+    deferred: &DeferredConfigurationRequest,
+) -> bool {
+    let configuration_current = configuration.deferred_request_revision()
+        == deferred.configuration_revision
+        || deferred.preceding_configuration_notification;
+    let document_current = deferred.document.as_ref().is_none_or(|document| {
+        let current = workspace.document_identity(&document.uri);
+        current == (document.version, document.generation)
+            || deferred.preceding_document_notification
+    });
+    configuration_current && document_current
+}
+
 fn handle_request(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     request: Request,
     client_features: ClientFeatures,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let work_done_token = match request_work_done_token(&request) {
+        Ok(token) => token,
+        Err(error) => {
+            send_error(
+                connection,
+                request.id.clone(),
+                ErrorCode::InvalidParams,
+                error,
+            )?;
+            return Ok(());
+        }
+    };
+    let partial_result_token = if matches!(
+        request.method.as_str(),
+        "workspace/symbol" | "textDocument/references"
+    ) {
+        match request_partial_result_token(&request) {
+            Ok(token) => token,
+            Err(error) => {
+                send_error(
+                    connection,
+                    request.id.clone(),
+                    ErrorCode::InvalidParams,
+                    error,
+                )?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     match request.method.as_str() {
         "pascal/projectContext" => {
             let id = request.id.clone();
@@ -2683,13 +6844,10 @@ fn handle_request(
                         &params.text_document_position_params.text_document.uri,
                     ),
                     position: params.text_document_position_params.position,
-                    format: if client_features.hover_markdown {
-                        MarkupKind::Markdown
-                    } else {
-                        MarkupKind::PlainText
-                    },
+                    format: client_features.hover_format.markup_kind(),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/completion" => {
@@ -2709,8 +6867,39 @@ fn handle_request(
                 AnalysisRequest::Completion {
                     uri: canonical_file_uri(&params.text_document_position.text_document.uri),
                     position: params.text_document_position.position,
+                    format: client_features.completion_format.markup_kind(),
+                    snippet_support: client_features.completion_snippet_support,
+                    resolve_documentation: client_features.completion_resolve_documentation,
+                    resolve_detail: client_features.completion_resolve_detail,
                 },
                 client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "completionItem/resolve" => {
+            let id = request.id.clone();
+            let item: CompletionItem = match parse_params(&request) {
+                Ok(item) => item,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            let resolve_request = match jobs.completion_resolution_request(&item) {
+                Ok(resolve_request) => resolve_request,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::RequestFailed, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::ResolveCompletion(resolve_request),
+                client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/signatureHelp" => {
@@ -2732,8 +6921,10 @@ fn handle_request(
                         &params.text_document_position_params.text_document.uri,
                     ),
                     position: params.text_document_position_params.position,
+                    format: client_features.signature_help_format.markup_kind(),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/typeDefinition" => {
@@ -2757,6 +6948,7 @@ fn handle_request(
                     position: params.text_document_position_params.position,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/documentSymbol" => {
@@ -2778,6 +6970,7 @@ fn handle_request(
                     hierarchical: client_features.hierarchical_document_symbols,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "workspace/symbol" => {
@@ -2789,7 +6982,7 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            start_analysis(
+            start_analysis_with_partial(
                 connection,
                 workspace,
                 jobs,
@@ -2798,6 +6991,10 @@ fn handle_request(
                     query: params.query,
                 },
                 client_features,
+                AnalysisProgressTokens {
+                    work_done: work_done_token.clone(),
+                    partial_result: partial_result_token.clone(),
+                },
             )?;
         }
         "textDocument/references" => {
@@ -2809,7 +7006,7 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            start_analysis(
+            start_analysis_with_partial(
                 connection,
                 workspace,
                 jobs,
@@ -2820,6 +7017,10 @@ fn handle_request(
                     include_declaration: params.context.include_declaration,
                 },
                 client_features,
+                AnalysisProgressTokens {
+                    work_done: work_done_token.clone(),
+                    partial_result: partial_result_token.clone(),
+                },
             )?;
         }
         "textDocument/documentHighlight" => {
@@ -2843,6 +7044,29 @@ fn handle_request(
                     position: params.text_document_position_params.position,
                 },
                 client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "textDocument/selectionRange" => {
+            let id = request.id.clone();
+            let params: SelectionRangeParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::SelectionRanges {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    positions: params.positions,
+                },
+                client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/semanticTokens/full" => {
@@ -2864,6 +7088,7 @@ fn handle_request(
                     range: None,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/semanticTokens/range" => {
@@ -2885,6 +7110,28 @@ fn handle_request(
                     range: Some(params.range),
                 },
                 client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "textDocument/foldingRange" => {
+            let id = request.id.clone();
+            let params: FoldingRangeParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::FoldingRanges {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                },
+                client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/prepareRename" => {
@@ -2906,6 +7153,7 @@ fn handle_request(
                     position: params.position,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/rename" => {
@@ -2928,6 +7176,7 @@ fn handle_request(
                     new_name: params.new_name,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/codeAction" => {
@@ -2947,6 +7196,7 @@ fn handle_request(
                 request.id,
                 AnalysisRequest::CodeActions(params),
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "codeAction/resolve" => {
@@ -2965,6 +7215,7 @@ fn handle_request(
                 request.id,
                 AnalysisRequest::Resolve(action),
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/declaration" | "textDocument/definition" | "textDocument/implementation" => {
@@ -2994,6 +7245,7 @@ fn handle_request(
                     target,
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         "textDocument/formatting" => {
@@ -3014,6 +7266,7 @@ fn handle_request(
                     uri: canonical_file_uri(&params.text_document.uri),
                 },
                 client_features,
+                work_done_token.clone(),
             )?;
         }
         _ => send_error(
@@ -3027,7 +7280,7 @@ fn handle_request(
 }
 
 fn handle_notification(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     notification: Notification,
     workspace_folders_supported: bool,
@@ -3049,7 +7302,7 @@ fn handle_notification(
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri(uri.clone());
-            effect.refresh_dependents(workspace, &uri);
+            effect.refresh_dependents(workspace, &uri, false);
             Ok(effect)
         }
         "textDocument/didChange" => {
@@ -3065,7 +7318,7 @@ fn handle_notification(
                             let mut effect = DiagnosticNotificationEffect::default();
                             effect.cancel_uri(uri.clone());
                             effect.refresh_uri(uri.clone());
-                            effect.refresh_dependents(workspace, &uri);
+                            effect.refresh_dependents(workspace, &uri, false);
                             return Ok(effect);
                         }
                     }
@@ -3085,7 +7338,7 @@ fn handle_notification(
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri(uri.clone());
-            effect.refresh_dependents(workspace, &uri);
+            effect.refresh_dependents(workspace, &uri, false);
             Ok(effect)
         }
         "textDocument/didSave" => {
@@ -3099,7 +7352,7 @@ fn handle_notification(
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri(uri.clone());
-            effect.refresh_dependents(workspace, &uri);
+            effect.refresh_dependents(workspace, &uri, true);
             Ok(effect)
         }
         "textDocument/didClose" => {
@@ -3107,13 +7360,22 @@ fn handle_notification(
             let uri = params.text_document.uri;
             let closed = workspace.close_document(&uri);
             if closed {
-                send_diagnostics(connection, &uri, None, Vec::new())
-                    .map_err(|error| error.to_string())?;
+                let updates = workspace.clear_diagnostic_publications(&uri);
+                let mut root_was_updated = false;
+                for update in updates {
+                    root_was_updated |= update.uri == uri;
+                    send_diagnostics(connection, &update.uri, update.version, update.diagnostics)
+                        .map_err(|error| error.to_string())?;
+                }
+                if !root_was_updated {
+                    send_diagnostics(connection, &uri, None, Vec::new())
+                        .map_err(|error| error.to_string())?;
+                }
             }
             let mut effect = DiagnosticNotificationEffect::default();
             effect.cancel_uri(uri.clone());
             if closed {
-                effect.refresh_dependents(workspace, &uri);
+                effect.refresh_dependents(workspace, &uri, true);
             }
             Ok(effect)
         }
@@ -3131,7 +7393,7 @@ fn handle_notification(
                 for uri in workspace.file_event(&change.uri, kind) {
                     effect.refresh_uri(uri);
                 }
-                effect.refresh_dependents(workspace, &change.uri);
+                effect.refresh_dependents(workspace, &change.uri, true);
             }
             Ok(effect)
         }
@@ -3166,7 +7428,7 @@ fn handle_notification(
 }
 
 fn publish_due_diagnostics(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -3191,26 +7453,37 @@ fn publish_due_diagnostics(
 }
 
 fn send_diagnostics(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     uri: &Url,
     version: Option<i32>,
     diagnostics: Vec<lsp_types::Diagnostic>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection
-        .sender
-        .send(Message::Notification(Notification::new(
-            "textDocument/publishDiagnostics".to_string(),
-            PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics,
-                version,
-            },
-        )))?;
+    connection.send_control(Message::Notification(Notification::new(
+        "textDocument/publishDiagnostics".to_string(),
+        PublishDiagnosticsParams {
+            uri: uri.clone(),
+            diagnostics,
+            version,
+        },
+    )))?;
+    Ok(())
+}
+
+fn send_diagnostic_publications(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    root_uri: &Url,
+    publications: Vec<queries::DiagnosticPublication>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let updates = workspace.replace_diagnostic_publications(root_uri, publications);
+    for update in updates {
+        send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
+    }
     Ok(())
 }
 
 fn register_file_watcher(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     relative_pattern_support: bool,
 ) -> Result<FileWatcherRegistration, Box<dyn Error + Send + Sync>> {
@@ -3239,7 +7512,7 @@ fn register_file_watcher(
 }
 
 fn sync_file_watcher(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     registration: &mut FileWatcherRegistration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -3284,7 +7557,7 @@ fn configuration_watcher(path: &Path) -> FileSystemWatcher {
 }
 
 fn send_file_watcher_registration(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     registration_id: &str,
     request_id: &str,
     watchers: Vec<FileSystemWatcher>,
@@ -3303,7 +7576,7 @@ fn send_file_watcher_registration(
             registrations: vec![registration],
         },
     );
-    connection.sender.send(Message::Request(request))?;
+    connection.send_control(Message::Request(request))?;
     Ok(())
 }
 
@@ -3337,23 +7610,40 @@ fn malformed_did_change_attribution(notification: &Notification) -> Option<(Url,
 }
 
 fn send_ok<T: serde::Serialize>(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     id: RequestId,
     value: T,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection
-        .sender
-        .send(Message::Response(Response::new_ok(id, value)))?;
-    Ok(())
+    let fallback_id = id.clone();
+    // `send_result` accepts either the writer queue or the bounded deferred
+    // queue.  Only an individually oversized message, or exhaustion of the
+    // bounded result budget, becomes a request-scoped error; temporary
+    // occupancy of the ordinary control budget is not session-fatal.
+    match connection.send_result(Message::Response(Response::new_ok(id, value))) {
+        Ok(()) => Ok(()),
+        Err(OutputError::MessageTooLarge) => send_error(
+            connection,
+            fallback_id,
+            ErrorCode::RequestFailed,
+            "analysis result exceeds the bounded LSP output size; retry with a narrower request",
+        ),
+        Err(OutputError::ResultBackpressure) => send_error(
+            connection,
+            fallback_id,
+            ErrorCode::RequestFailed,
+            "temporary LSP output capacity is full; retry the request after the client drains",
+        ),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn send_error(
-    connection: &Connection,
+    connection: &dyn ProtocolSender,
     id: RequestId,
     code: ErrorCode,
     message: impl Into<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection.sender.send(Message::Response(Response::new_err(
+    connection.send_control(Message::Response(Response::new_err(
         id,
         code as i32,
         message.into(),
@@ -3369,27 +7659,31 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
             "change": 2,
             "save": true
         },
-        "hoverProvider": true,
-        "completionProvider": {"triggerCharacters": ["."]},
-        "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
-        "typeDefinitionProvider": true,
-        "declarationProvider": true,
-        "definitionProvider": true,
-        "implementationProvider": true,
-        "documentSymbolProvider": true,
-        "workspaceSymbolProvider": true,
-        "referencesProvider": true,
-        "documentHighlightProvider": true,
+        "hoverProvider": {"workDoneProgress": true},
+        "completionProvider": {"triggerCharacters": ["."], "resolveProvider": true, "workDoneProgress": true},
+        "signatureHelpProvider": {"triggerCharacters": ["(", ","], "workDoneProgress": true},
+        "typeDefinitionProvider": {"workDoneProgress": true},
+        "declarationProvider": {"workDoneProgress": true},
+        "definitionProvider": {"workDoneProgress": true},
+        "implementationProvider": {"workDoneProgress": true},
+        "documentSymbolProvider": {"workDoneProgress": true},
+        "workspaceSymbolProvider": {"workDoneProgress": true},
+        "referencesProvider": {"workDoneProgress": true},
+        "documentHighlightProvider": {"workDoneProgress": true},
+        "selectionRangeProvider": {"workDoneProgress": true},
+        "foldingRangeProvider": {"workDoneProgress": true},
         "semanticTokensProvider": {
             "legend": crate::NavigationIndex::semantic_tokens_legend(),
             "range": true,
-            "full": true
+            "full": true,
+            "workDoneProgress": true
         },
-        "documentFormattingProvider": true,
-        "renameProvider": {"prepareProvider": true},
+        "documentFormattingProvider": {"workDoneProgress": true},
+        "renameProvider": {"prepareProvider": true, "workDoneProgress": true},
         "codeActionProvider": {
             "codeActionKinds": ["quickfix"],
-            "resolveProvider": true
+            "resolveProvider": true,
+            "workDoneProgress": true
         },
         "experimental": {
             "projectSelection": true
@@ -3425,20 +7719,99 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
         value["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"]
             .as_bool()
             .unwrap_or(false);
-    let hover_markdown = value["textDocument"]["hover"]["contentFormat"]
-        .as_array()
-        .is_some_and(|formats| {
-            formats
-                .iter()
-                .any(|format| format.as_str() == Some("markdown"))
-        });
+    let hover_format =
+        preferred_documentation_format(&value, &["textDocument", "hover", "contentFormat"]);
+    let completion_format = preferred_documentation_format(
+        &value,
+        &[
+            "textDocument",
+            "completion",
+            "completionItem",
+            "documentationFormat",
+        ],
+    );
+    let completion_snippet_support =
+        value["textDocument"]["completion"]["completionItem"]["snippetSupport"]
+            .as_bool()
+            .unwrap_or(false);
+    let completion_resolve_properties =
+        &value["textDocument"]["completion"]["completionItem"]["resolveSupport"]["properties"];
+    let completion_resolve_documentation =
+        completion_resolve_properties
+            .as_array()
+            .is_some_and(|properties| {
+                properties
+                    .iter()
+                    .any(|property| property.as_str() == Some("documentation"))
+            });
+    let completion_resolve_detail =
+        completion_resolve_properties
+            .as_array()
+            .is_some_and(|properties| {
+                properties
+                    .iter()
+                    .any(|property| property.as_str() == Some("detail"))
+            });
+    let signature_help_format = preferred_documentation_format(
+        &value,
+        &[
+            "textDocument",
+            "signatureHelp",
+            "signatureInformation",
+            "documentationFormat",
+        ],
+    );
+    let folding = &value["textDocument"]["foldingRange"];
+    let folding_range_limit = folding["rangeLimit"]
+        .as_u64()
+        .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+    let line_folding_only = folding["lineFoldingOnly"].as_bool().unwrap_or(false);
+    let folding_range_kind_value_set =
+        folding["foldingRangeKind"]["valueSet"]
+            .as_array()
+            .map(|kinds| {
+                kinds.iter().fold(0, |mask, kind| {
+                    mask | match kind.as_str() {
+                        Some("comment") => FOLDING_KIND_COMMENT,
+                        Some("imports") => FOLDING_KIND_IMPORTS,
+                        Some("region") => FOLDING_KIND_REGION,
+                        _ => 0,
+                    }
+                })
+            });
     ClientFeatures {
         action_resolve,
         action_disabled,
         document_changes,
         hierarchical_document_symbols,
-        hover_markdown,
+        hover_format,
+        completion_format,
+        completion_snippet_support,
+        completion_resolve_documentation,
+        completion_resolve_detail,
+        signature_help_format,
+        folding_range_limit,
+        line_folding_only,
+        folding_range_kind_value_set,
     }
+}
+
+fn preferred_documentation_format(value: &Value, path: &[&str]) -> DocumentationFormat {
+    let mut current = value;
+    for key in path {
+        current = &current[*key];
+    }
+    let Some(formats) = current.as_array() else {
+        return DocumentationFormat::PlainText;
+    };
+    for format in formats {
+        match format.as_str() {
+            Some("plaintext") => return DocumentationFormat::PlainText,
+            Some("markdown") => return DocumentationFormat::Markdown,
+            _ => {}
+        }
+    }
+    DocumentationFormat::PlainText
 }
 
 fn supports_workspace_folders(client: &ClientCapabilities) -> bool {
@@ -3447,6 +7820,15 @@ fn supports_workspace_folders(client: &ClientCapabilities) -> bool {
         .as_ref()
         .and_then(|workspace| workspace.workspace_folders)
         .unwrap_or(false)
+}
+
+fn supports_configuration(client: &ClientCapabilities) -> bool {
+    let supported = client
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.configuration)
+        .unwrap_or(false);
+    supported
 }
 
 fn supports_watched_file_registration(client: &ClientCapabilities) -> bool {
@@ -3495,17 +7877,26 @@ fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
 mod tests {
     use super::{
         ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
-        AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisRequest, AnalysisResult,
-        AnalysisResultValue, BoundedReader, ClientFeatures, FileWatcherRegistration,
-        MAX_ANALYSIS_QUEUE, MAX_CONFIGURATION_WATCH_PATHS, MAX_PAYLOAD_BYTES,
-        MAX_WATCHER_REGISTRATION_RETRIES, PendingAnalysis, PriorityQueue, deliver_analysis_result,
-        invalidate_analysis_result,
+        AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisProgressTokens, AnalysisRequest,
+        AnalysisResult, AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
+        CompletionResolutionSeed, CompletionResolutionStore, CompletionResult, DocumentationFormat,
+        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
+        MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
+        MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
+        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, PartialDelivery,
+        PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload, PendingAnalysis,
+        PriorityQueue, TestBarrierConfig, deliver_analysis_result, invalidate_analysis_result,
     };
     use crate::workspace::Workspace;
-    use crate::workspace::rename::install_snapshot_priority_barrier;
-    use crossbeam_channel::RecvTimeoutError;
-    use lsp_server::{Connection, Message, RequestId, Response};
-    use lsp_types::{MarkupKind, Position, PrepareRenameResponse, Range, Url};
+    use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
+    use crossbeam_channel::{RecvTimeoutError, bounded};
+    use lsp_server::{Connection, Message, Notification, RequestId, Response};
+    use lsp_types::{
+        ClientCapabilities, CompletionItem, CompletionList, Location, MarkupKind, Position,
+        PrepareRenameResponse, Range, SymbolInformation, SymbolKind, Url,
+    };
     use pascal_project::delphi_overrides::OverrideSession;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
@@ -3529,8 +7920,210 @@ mod tests {
             action_disabled: false,
             document_changes: false,
             hierarchical_document_symbols: false,
-            hover_markdown: false,
+            hover_format: DocumentationFormat::PlainText,
+            completion_format: DocumentationFormat::PlainText,
+            completion_snippet_support: false,
+            completion_resolve_documentation: false,
+            completion_resolve_detail: false,
+            signature_help_format: DocumentationFormat::PlainText,
+            folding_range_limit: None,
+            line_folding_only: false,
+            folding_range_kind_value_set: None,
         }
+    }
+
+    #[test]
+    fn documentation_formats_are_negotiated_independently() {
+        let capabilities: ClientCapabilities = serde_json::from_value(serde_json::json!({
+            "textDocument": {
+                "hover": {"contentFormat": ["plaintext", "markdown"]},
+                "completion": {
+                    "completionItem": {"documentationFormat": ["markdown"]}
+                },
+                "signatureHelp": {
+                    "signatureInformation": {
+                        "documentationFormat": ["markdown", "plaintext"]
+                    }
+                }
+            }
+        }))
+        .expect("documentation capabilities");
+
+        let features = super::client_features(&capabilities);
+        assert_eq!(features.hover_format, DocumentationFormat::PlainText);
+        assert_eq!(features.completion_format, DocumentationFormat::Markdown);
+        assert_eq!(
+            features.signature_help_format,
+            DocumentationFormat::Markdown
+        );
+    }
+
+    fn test_completion_analysis(uri: &Url, index: usize) -> CompletionAnalysis {
+        CompletionAnalysis {
+            uri: uri.clone(),
+            position: Position::new(0, 0),
+            format: MarkupKind::PlainText,
+            snippet_support: false,
+            resolve_documentation: true,
+            resolve_detail: true,
+            value: Ok(CompletionResult {
+                list: CompletionList {
+                    is_incomplete: false,
+                    items: vec![CompletionItem {
+                        label: format!("Candidate{index}"),
+                        ..CompletionItem::default()
+                    }],
+                },
+                seeds: vec![CompletionResolutionSeed::test_new(uri.clone(), index)],
+            }),
+        }
+    }
+
+    #[test]
+    fn completion_resolution_store_rejects_tampering_and_foreign_entries() {
+        let uri = Url::parse("file:///completion-store.pas").expect("completion URI");
+        let mut owner = CompletionResolutionStore::new();
+        let item = owner
+            .register(test_completion_analysis(&uri, 0), 1, 1, &[])
+            .expect("store registration")
+            .items
+            .into_iter()
+            .next()
+            .expect("stored item");
+
+        let mut tampered = item.clone();
+        tampered.data = Some(serde_json::json!({
+            "version": 1,
+            "token": "not-the-issued-token",
+            "proof": "not-the-issued-proof"
+        }));
+        let error = owner
+            .request(&tampered)
+            .expect_err("tampered resolve data must be rejected");
+        assert!(error.contains("stale") || error.contains("tampered"));
+
+        let foreign = CompletionResolutionStore::new();
+        let error = foreign
+            .request(&item)
+            .expect_err("foreign resolve data must be rejected");
+        assert!(error.contains("foreign") || error.contains("evicted"));
+
+        let oversized = CompletionItem {
+            data: Some(serde_json::json!({
+                "version": 1,
+                "token": "x".repeat(MAX_COMPLETION_RESOLUTION_DATA_BYTES),
+                "proof": "x"
+            })),
+            ..CompletionItem::default()
+        };
+        let error = owner
+            .request(&oversized)
+            .expect_err("oversized resolve data must be rejected");
+        assert!(error.contains("bounded size"));
+    }
+
+    #[test]
+    fn completion_resolution_store_evicts_the_oldest_entry() {
+        let uri = Url::parse("file:///completion-store-eviction.pas").expect("completion URI");
+        let mut store = CompletionResolutionStore::new();
+        let mut first = None;
+        let mut last = None;
+        for index in 0..=super::MAX_COMPLETION_RESOLUTION_ENTRIES {
+            let output = store
+                .register(test_completion_analysis(&uri, index), 1, 1, &[])
+                .expect("bounded store registration");
+            if index == 0 {
+                first = output.items.first().cloned();
+            }
+            last = output.items.first().cloned();
+        }
+        let first = first.expect("first stored item");
+        let last = last.expect("last stored item");
+        assert!(
+            store.request(&first).is_err(),
+            "oldest completion entry must be evicted"
+        );
+        assert!(
+            store.request(&last).is_ok(),
+            "newest entry must remain usable"
+        );
+    }
+
+    fn test_completion_record(uri: Url) -> SourceRecord {
+        SourceRecord {
+            uri,
+            text: String::new(),
+            version: Some(1),
+            stamp: None,
+            open: true,
+            path: None,
+            path_stamp: None,
+            content_hash: None,
+            parsed_text_hash: None,
+            content_bytes: None,
+            candidate_membership: None,
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
+            missing_provider_candidate: false,
+            directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn completion_resolution_store_enforces_context_record_and_byte_bounds() {
+        let base_uri = Url::parse("file:///completion-store-bounds.pas").expect("completion URI");
+        let at_limit = (0..MAX_COMPLETION_RESOLUTION_RECORDS)
+            .map(|index| {
+                test_completion_record(
+                    Url::parse(&format!("file:///completion-record-{index}.pas"))
+                        .expect("record URI"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut records_store = CompletionResolutionStore::new();
+        records_store
+            .register(test_completion_analysis(&base_uri, 0), 1, 1, &at_limit)
+            .expect("the exact retained-record limit must be accepted");
+
+        let too_many = (0..=MAX_COMPLETION_RESOLUTION_RECORDS)
+            .map(|index| {
+                test_completion_record(
+                    Url::parse(&format!("file:///completion-too-many-{index}.pas"))
+                        .expect("record URI"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut count_store = CompletionResolutionStore::new();
+        let error = count_store
+            .register(test_completion_analysis(&base_uri, 0), 1, 1, &too_many)
+            .expect_err("the retained-record limit must be enforced");
+        assert!(
+            error.contains("observations") || error.contains("bounded"),
+            "{error}"
+        );
+
+        let huge_uri = Url::parse(&format!(
+            "file:///{}",
+            "x".repeat(MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES)
+        ))
+        .expect("large completion URI");
+        let mut byte_store = CompletionResolutionStore::new();
+        let error = byte_store
+            .register(
+                test_completion_analysis(&huge_uri, 0),
+                1,
+                1,
+                &[test_completion_record(huge_uri)],
+            )
+            .expect_err("the retained context byte limit must be enforced");
+        assert!(
+            error.contains("byte") || error.contains("bounded"),
+            "{error}"
+        );
     }
 
     fn receive_analysis_result(jobs: &mut AnalysisJobs, id: &RequestId) -> AnalysisResult {
@@ -3610,13 +8203,18 @@ mod tests {
 
     fn assert_completion_was_computed(result: &AnalysisResult) {
         match &result.value {
-            AnalysisResultValue::Completion(Ok(completion)) => {
+            AnalysisResultValue::Completion(CompletionAnalysis {
+                value: Ok(completion),
+                ..
+            }) => {
                 assert!(
-                    !completion.items.is_empty(),
+                    !completion.list.items.is_empty(),
                     "the computed completion result must not be empty"
                 );
             }
-            AnalysisResultValue::Completion(Err(error)) => {
+            AnalysisResultValue::Completion(CompletionAnalysis {
+                value: Err(error), ..
+            }) => {
                 panic!("completion worker failed before delivery: {error}");
             }
             _ => panic!("expected a completion result"),
@@ -3665,6 +8263,25 @@ mod tests {
         assert!(
             !result.records.is_empty(),
             "the computed semantic-token result must carry its source read set"
+        );
+    }
+
+    fn assert_folding_ranges_were_computed(result: &AnalysisResult) {
+        match &result.value {
+            AnalysisResultValue::FoldingRanges(Ok(ranges)) => {
+                assert!(
+                    !ranges.is_empty(),
+                    "the computed folding-range result must not be empty"
+                );
+            }
+            AnalysisResultValue::FoldingRanges(Err(error)) => {
+                panic!("folding-range worker failed before delivery: {error}");
+            }
+            _ => panic!("expected a folding-range result"),
+        }
+        assert!(
+            !result.records.is_empty(),
+            "the computed folding-range result must carry its source read set"
         );
     }
 
@@ -3730,10 +8347,15 @@ mod tests {
             AssistanceRequestKind::Completion => AnalysisRequest::Completion {
                 uri: main_uri,
                 position,
+                format: MarkupKind::Markdown,
+                snippet_support: false,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             AssistanceRequestKind::SignatureHelp => AnalysisRequest::SignatureHelp {
                 uri: main_uri,
                 position,
+                format: MarkupKind::Markdown,
             },
         }
     }
@@ -3841,6 +8463,355 @@ mod tests {
             ANALYSIS_SUPERSEDED_MESSAGE,
             "request superseded by a newer document version"
         );
+    }
+
+    #[allow(deprecated)]
+    fn boundary_symbol(name_length: usize) -> SymbolInformation {
+        SymbolInformation {
+            name: "x".repeat(name_length),
+            kind: SymbolKind::VARIABLE,
+            tags: None,
+            deprecated: None,
+            location: Location {
+                uri: Url::parse("file:///boundary.pas").expect("boundary URI"),
+                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            },
+            container_name: None,
+        }
+    }
+
+    #[test]
+    fn partial_chunk_accepts_the_exact_encoded_limit_and_rejects_one_byte_over() {
+        let mut name_length = 0;
+        while serde_json::to_vec(&boundary_symbol(name_length))
+            .expect("symbol encoding")
+            .len()
+            + 2
+            <= MAX_PARTIAL_RESULT_BYTES_PER_CHUNK
+        {
+            name_length += 1;
+        }
+        let at_limit = PartialResultPayload::WorkspaceSymbols(Arc::new(vec![boundary_symbol(
+            name_length.saturating_sub(1),
+        )]));
+        let (_, value) = at_limit
+            .chunk(0)
+            .expect("boundary chunk encoding")
+            .expect("boundary chunk");
+        assert_eq!(
+            serde_json::to_vec(&value)
+                .expect("boundary array encoding")
+                .len(),
+            MAX_PARTIAL_RESULT_BYTES_PER_CHUNK
+        );
+
+        let over_limit =
+            PartialResultPayload::WorkspaceSymbols(Arc::new(vec![boundary_symbol(name_length)]));
+        let error = over_limit
+            .chunk(0)
+            .expect_err("one byte over the encoded chunk limit must fail");
+        assert!(error.contains("chunk limit"));
+    }
+
+    #[test]
+    fn bounded_outbound_queue_reserves_control_capacity_when_data_is_full() {
+        let (sender, receiver) = bounded(1);
+        let mut queue = OutboundQueue::default();
+        let data = || {
+            Message::Notification(Notification::new(
+                "$/progress".to_string(),
+                serde_json::json!({"token": "data", "value": [1]}),
+            ))
+        };
+        for _ in 0..=MAX_PENDING_OUTBOUND_DATA_MESSAGES {
+            assert!(
+                queue
+                    .enqueue(&sender, data(), OutboundClass::Data)
+                    .expect("data enqueue")
+            );
+        }
+        assert_eq!(
+            queue.pending_data_messages,
+            MAX_PENDING_OUTBOUND_DATA_MESSAGES
+        );
+        let control = Message::Response(Response::new_ok(
+            RequestId::from("cancel".to_string()),
+            serde_json::Value::Null,
+        ));
+        assert!(
+            queue
+                .enqueue(&sender, control, OutboundClass::Control)
+                .expect("reserved control enqueue")
+        );
+        assert_eq!(queue.pending_control_messages, 1);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn deferred_result_byte_boundary_accepts_exact_limit_and_defers_one_byte_over() {
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(Message::Notification(Notification::new(
+                "$/occupied".to_string(),
+                serde_json::Value::Null,
+            )))
+            .expect("occupy writer queue");
+        let mut queue = OutboundQueue::default();
+        let result = |id: &str, value| {
+            Message::Response(Response::new_ok(RequestId::from(id.to_string()), value))
+        };
+        let first = result(
+            "deferred-first",
+            serde_json::Value::String("x".repeat(MAX_PENDING_OUTBOUND_CONTROL_BYTES / 2)),
+        );
+        let first_bytes = serde_json::to_vec(&first)
+            .expect("first result encoding")
+            .len();
+        let second_overhead = serde_json::to_vec(&result(
+            "deferred-second",
+            serde_json::Value::String(String::new()),
+        ))
+        .expect("empty second result encoding")
+        .len();
+        let second = result(
+            "deferred-second",
+            serde_json::Value::String(
+                "x".repeat(MAX_PENDING_OUTBOUND_CONTROL_BYTES - first_bytes - second_overhead),
+            ),
+        );
+        let second_bytes = serde_json::to_vec(&second)
+            .expect("second result encoding")
+            .len();
+        assert!(first_bytes < MAX_PENDING_OUTBOUND_CONTROL_BYTES);
+        assert!(second_bytes < MAX_PENDING_OUTBOUND_CONTROL_BYTES);
+        assert_eq!(
+            first_bytes.saturating_add(second_bytes),
+            MAX_PENDING_OUTBOUND_CONTROL_BYTES
+        );
+
+        let over = result("deferred-over", serde_json::Value::Null);
+        let over_bytes = serde_json::to_vec(&over)
+            .expect("over-limit result encoding")
+            .len();
+        assert!(
+            first_bytes
+                .saturating_add(second_bytes)
+                .saturating_add(over_bytes)
+                > MAX_PENDING_OUTBOUND_CONTROL_BYTES,
+            "the third individually valid result must cross the aggregate pending boundary"
+        );
+
+        assert!(
+            queue
+                .enqueue(&sender, first, OutboundClass::Result)
+                .expect("first result enqueue")
+        );
+        assert!(
+            queue
+                .enqueue(&sender, second, OutboundClass::Result)
+                .expect("exact-boundary result enqueue")
+        );
+        assert_eq!(
+            queue.pending_control_bytes,
+            MAX_PENDING_OUTBOUND_CONTROL_BYTES
+        );
+        assert_eq!(queue.deferred_result_bytes(), 0);
+        assert!(
+            queue
+                .enqueue(&sender, over, OutboundClass::Result)
+                .expect("one-byte-over result deferral")
+        );
+        assert_eq!(queue.deferred_result_bytes(), over_bytes);
+        assert!(queue.has_pending());
+
+        assert!(matches!(
+            receiver.recv().expect("occupied message"),
+            Message::Notification(_)
+        ));
+        queue.flush(&sender).expect("flush first result");
+        let first = receiver.recv().expect("first deferred-boundary result");
+        match first {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::from("deferred-first".to_string()))
+            }
+            message => panic!("unexpected first deferred-boundary message: {message:?}"),
+        }
+        queue.flush(&sender).expect("flush exact-boundary result");
+        let second = receiver.recv().expect("second deferred-boundary result");
+        match second {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::from("deferred-second".to_string()))
+            }
+            message => panic!("unexpected second deferred-boundary message: {message:?}"),
+        }
+        queue.flush(&sender).expect("flush deferred result");
+        let over = receiver.recv().expect("one-byte-over deferred result");
+        match over {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::from("deferred-over".to_string()))
+            }
+            message => panic!("unexpected one-byte-over deferred message: {message:?}"),
+        }
+        assert_eq!(queue.deferred_result_bytes(), 0);
+        assert!(!queue.has_pending());
+    }
+
+    #[test]
+    fn deferred_output_keeps_result_and_control_count_reserves_separate() {
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(Message::Notification(Notification::new(
+                "$/occupied".to_string(),
+                serde_json::Value::Null,
+            )))
+            .expect("occupy writer queue");
+        let mut queue = OutboundQueue::default();
+        let control = || {
+            Message::Notification(Notification::new(
+                "$/control".to_string(),
+                serde_json::Value::Null,
+            ))
+        };
+        for _ in 0..MAX_PENDING_OUTBOUND_CONTROL_MESSAGES {
+            assert!(
+                queue
+                    .enqueue(&sender, control(), OutboundClass::Control)
+                    .expect("control enqueue")
+            );
+        }
+        assert_eq!(
+            queue.pending_control_messages,
+            MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
+        );
+
+        let result = Message::Response(Response::new_ok(
+            RequestId::from("deferred-count-result".to_string()),
+            serde_json::Value::Null,
+        ));
+        assert!(
+            queue
+                .enqueue(&sender, result, OutboundClass::Result)
+                .expect("result deferral")
+        );
+        assert_eq!(queue.deferred_result_messages, 1);
+
+        assert!(
+            queue
+                .enqueue(&sender, control(), OutboundClass::Control)
+                .expect("control deferral")
+        );
+        assert_eq!(queue.deferred_control_messages, 1);
+
+        let mut received = 0;
+        while queue.has_pending() {
+            queue.flush(&sender).expect("flush bounded count burst");
+            if queue.has_pending() {
+                receiver.recv().expect("receive bounded count burst");
+                received += 1;
+            }
+        }
+        while receiver.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES + 3);
+    }
+
+    #[test]
+    fn delivering_recipients_consume_the_global_admission_bound() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let source = root.join("Main.pas");
+        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
+        let workspace = test_workspace(vec![root], Default::default());
+        let records = Arc::new(Vec::new());
+        let validation = PartialDeliveryValidation::new(
+            Arc::new(workspace.revalidation_input()),
+            Arc::clone(&records),
+            TestBarrierConfig::disabled(),
+        )
+        .expect("validation worker");
+        let recipients = (0..MAX_CLIENT_ANALYSIS_RECIPIENTS)
+            .map(|index| PartialDeliveryRecipient {
+                id: RequestId::from(format!("delivering-{index}")),
+                token: lsp_types::ProgressToken::String(format!("partial-{index}")),
+                next_item: 0,
+            })
+            .collect();
+        let mut jobs = AnalysisJobs::new();
+        jobs.partial_deliveries.push_back(PartialDelivery {
+            job_id: AnalysisComputationId(0),
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            payload: PartialResultPayload::References(Arc::new(Vec::new())),
+            recipients,
+            next_recipient: 0,
+            retained_bytes: 1,
+            validation,
+        });
+        assert_eq!(
+            jobs.client_recipient_count(),
+            MAX_CLIENT_ANALYSIS_RECIPIENTS
+        );
+        let error = jobs
+            .enqueue_client_with_partial(
+                RequestId::from("after-delivery-bound".to_string()),
+                AnalysisRequest::WorkspaceSymbols {
+                    query: "Main".to_string(),
+                },
+                &workspace,
+                symbol_client_features(),
+                AnalysisProgressTokens::default(),
+                None,
+            )
+            .expect_err("delivering recipients must count toward admission");
+        assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn retired_partial_validation_keeps_worker_and_bytes_until_reaped() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let barrier_directory = temp.path().join("partial-validation-barrier");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let entered = barrier_directory.join("entered");
+        let release = barrier_directory.join("release");
+        let validation = PartialDeliveryValidation::new(
+            Arc::new(workspace.revalidation_input()),
+            Arc::new(Vec::new()),
+            TestBarrierConfig::default()
+                .with_partial_validation(Some((entered.clone(), release.clone()))),
+        )
+        .expect("validation worker");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "validation worker must reach the held test barrier"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut jobs = AnalysisJobs::new();
+        jobs.retire_partial_validation(validation, 1234);
+        assert_eq!(jobs.client_recipient_count(), 1);
+        assert_eq!(jobs.partial_delivery_bytes(), 1234);
+        assert_eq!(jobs.retired_partial_validations.len(), 1);
+
+        fs::write(&release, b"release").expect("release validation barrier");
+        while !jobs.retired_partial_validations.is_empty() {
+            jobs.reap_retired_partial_validations();
+            assert!(
+                Instant::now() < deadline,
+                "retired validation worker must be reaped after release"
+            );
+            if !jobs.retired_partial_validations.is_empty() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(jobs.client_recipient_count(), 0);
+        assert_eq!(jobs.partial_delivery_bytes(), 0);
     }
 
     #[test]
@@ -4195,7 +9166,10 @@ mod tests {
             jobs.pending
                 .get(&computation_id)
                 .expect("shared pending computation")
-                .client_ids,
+                .recipients
+                .iter()
+                .map(|recipient| recipient.id.clone())
+                .collect::<Vec<_>>(),
             vec![first_id.clone(), second_id]
         );
 
@@ -4338,6 +9312,68 @@ mod tests {
             response
                 .error
                 .expect("changed overlay must reject result")
+                .code,
+            -32803
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_computed_folding_result_after_an_overlay_change() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        let original = "unit Main;\ninterface\nprocedure VisibleThing;\nimplementation\nprocedure VisibleThing;\nbegin\nend;\nend.\n";
+        let changed = "unit Main;\ninterface\nprocedure ChangedThing;\nimplementation\nprocedure ChangedThing;\nbegin\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&main, original).expect("source");
+
+        let main_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = test_workspace(vec![root], Default::default());
+        workspace
+            .open_document(main_uri.clone(), original.to_string(), 1)
+            .expect("open overlay");
+        let mut jobs = AnalysisJobs::new();
+
+        let control_id = RequestId::from("folding-overlay-control".to_string());
+        jobs.start(
+            control_id.clone(),
+            AnalysisRequest::FoldingRanges {
+                uri: main_uri.clone(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start folding control request");
+        let control = receive_analysis_result(&mut jobs, &control_id);
+        assert_folding_ranges_were_computed(&control);
+        deliver_successfully(&mut workspace, control_id, control);
+
+        let stale_id = RequestId::from("folding-overlay-stale".to_string());
+        jobs.start(
+            stale_id.clone(),
+            AnalysisRequest::FoldingRanges {
+                uri: main_uri.clone(),
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("start stale folding request");
+        let stale = receive_analysis_result(&mut jobs, &stale_id);
+        assert_folding_ranges_were_computed(&stale);
+
+        workspace
+            .change_document(main_uri, changed.to_string(), 2)
+            .expect("change overlay");
+        let (server, client) = Connection::memory();
+        deliver_analysis_result(&server, &mut workspace, stale, Some(stale_id.clone()))
+            .expect("deliver stale folding result");
+        let Message::Response(response) = client.receiver.recv().expect("stale response") else {
+            panic!("expected a stale response");
+        };
+        assert_eq!(
+            response
+                .error
+                .expect("changed overlay must reject folding result")
                 .code,
             -32803
         );
@@ -4502,6 +9538,10 @@ mod tests {
             AnalysisRequest::Completion {
                 uri: main_uri.clone(),
                 position: Position::new(7, 5),
+                format: MarkupKind::Markdown,
+                snippet_support: false,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             &workspace,
             symbol_client_features(),
@@ -4517,6 +9557,10 @@ mod tests {
             AnalysisRequest::Completion {
                 uri: main_uri.clone(),
                 position: Position::new(7, 5),
+                format: MarkupKind::Markdown,
+                snippet_support: false,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             &workspace,
             symbol_client_features(),
@@ -4566,6 +9610,7 @@ mod tests {
             AnalysisRequest::SignatureHelp {
                 uri: main_uri.clone(),
                 position: Position::new(9, 6),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),
@@ -4581,6 +9626,7 @@ mod tests {
             AnalysisRequest::SignatureHelp {
                 uri: main_uri.clone(),
                 position: Position::new(9, 6),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),
@@ -5179,7 +10225,7 @@ mod tests {
             PendingAnalysis {
                 cancellation: Arc::clone(&cancellation),
                 handle,
-                client_ids: Vec::new(),
+                recipients: Vec::new(),
                 key: None,
             },
         );
@@ -5372,6 +10418,10 @@ mod tests {
             AnalysisRequest::Completion {
                 uri: main_uri.clone(),
                 position: Position::new(5, 24),
+                format: MarkupKind::Markdown,
+                snippet_support: false,
+                resolve_documentation: false,
+                resolve_detail: false,
             },
             &workspace,
             symbol_client_features(),
@@ -5380,7 +10430,10 @@ mod tests {
         let completion = jobs.receiver.recv().expect("computed completion result");
         assert!(matches!(
             &completion.value,
-            AnalysisResultValue::Completion(Ok(value)) if value.items.is_empty()
+            AnalysisResultValue::Completion(CompletionAnalysis {
+                value: Ok(CompletionResult { list, .. }),
+                ..
+            }) if list.items.is_empty()
         ));
         jobs.sender
             .send(completion)
@@ -5414,6 +10467,7 @@ mod tests {
             AnalysisRequest::SignatureHelp {
                 uri: main_uri,
                 position: Position::new(5, 24),
+                format: MarkupKind::Markdown,
             },
             &workspace,
             symbol_client_features(),

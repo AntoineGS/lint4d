@@ -14,15 +14,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
 mod assistance;
+mod documentation;
+mod folding;
 mod overload;
 mod rename;
+pub(crate) use rename::BindingWorkBudget;
+mod selection;
 mod semantic_tokens;
 mod symbols;
+#[cfg(test)]
+pub(crate) use assistance::CompletionResolutionSeed;
+pub(crate) use assistance::completion_prefix_at_position;
+pub(crate) use assistance::{CompletionMetadata, CompletionOptions, CompletionResult};
+pub(crate) use folding::{
+    FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
+};
 pub(crate) use rename::RenameBindingInfo;
 #[cfg(test)]
 pub(crate) use rename::test_cancel_after_checks;
 #[cfg(test)]
 pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
+pub(crate) use selection::validate_selection_position_count;
 
 #[cfg(test)]
 thread_local! {
@@ -41,6 +53,7 @@ thread_local! {
     static TEST_SEMANTIC_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_SHADOW_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static TEST_DOCUMENT_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -92,6 +105,16 @@ pub(super) fn test_semantic_token_work_counters()
 #[cfg(test)]
 pub(super) fn test_record_semantic_node_visit() {
     TEST_SEMANTIC_NODE_VISITS.with(|value| value.set(value.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub(super) fn test_reset_document_parse_count() {
+    TEST_DOCUMENT_PARSE_CALLS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn test_document_parse_count() -> usize {
+    TEST_DOCUMENT_PARSE_CALLS.with(Cell::get)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,6 +170,8 @@ pub(crate) enum SemanticTokenResolutionMode {
 pub struct NavigationIndex {
     documents: HashMap<Url, Document>,
     units: HashMap<String, Vec<Url>>,
+    auto_import_discovery_complete: Option<bool>,
+    auto_import_unit_providers: HashMap<String, Vec<Url>>,
 }
 
 /// A byte span in a parsed Pascal source document.
@@ -169,9 +194,49 @@ impl NavigationIndex {
         Self::default()
     }
 
+    pub(crate) fn set_auto_import_discovery_complete(&mut self, complete: bool) {
+        self.auto_import_discovery_complete = Some(complete);
+    }
+
+    pub(crate) fn set_auto_import_unit_providers(&mut self, providers: HashMap<String, Vec<Url>>) {
+        self.auto_import_unit_providers = providers;
+    }
+
     /// Return the source-accurate outline for one indexed document.
     pub fn document_symbols(&self, uri: &Url) -> Result<Vec<lsp_types::DocumentSymbol>, String> {
         symbols::document_symbols(self, uri)
+    }
+
+    /// Return source-accurate syntax folding ranges for one indexed document.
+    pub fn folding_ranges(&self, uri: &Url) -> Result<Vec<lsp_types::FoldingRange>, String> {
+        folding::folding_ranges(self, uri)
+    }
+
+    /// Return syntax-structural selection ranges for each requested position.
+    pub fn selection_ranges(
+        &self,
+        uri: &Url,
+        positions: &[Position],
+    ) -> Result<Vec<lsp_types::SelectionRange>, String> {
+        selection::selection_ranges(self, uri, positions)
+    }
+
+    pub(crate) fn selection_ranges_with_cancel(
+        &self,
+        uri: &Url,
+        positions: &[Position],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<lsp_types::SelectionRange>, String> {
+        selection::selection_ranges_with_cancel(self, uri, positions, cancel)
+    }
+
+    pub(crate) fn folding_ranges_with_cancel(
+        &self,
+        uri: &Url,
+        options: FoldingRangeOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<lsp_types::FoldingRange>, String> {
+        folding::folding_ranges_with_cancel(self, uri, options, cancel)
     }
 
     pub(crate) fn document_symbols_with_cancel(
@@ -8226,6 +8291,7 @@ pub(crate) struct ParsedDocument {
     generic_parameter_contexts: Vec<GenericParameterContext>,
     generic_parameter_intervals: SourceIntervalIndex,
     helpers: Vec<HelperDefinition>,
+    documentation: Vec<Option<Arc<documentation::Documentation>>>,
 }
 
 struct Document {
@@ -8260,6 +8326,8 @@ impl Document {
                 });
             }
         }
+        #[cfg(test)]
+        TEST_DOCUMENT_PARSE_CALLS.with(|value| value.set(value.get().saturating_add(1)));
         let path = uri
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));
@@ -8361,7 +8429,7 @@ impl Document {
                 continue;
             }
             let name = canonical_path(&identifier_texts(*module_name, &source));
-            if name.is_empty() {
+            if name.is_empty() || name.eq_ignore_ascii_case("in") {
                 continue;
             }
             imports.push(ImportMetadata {
@@ -8454,7 +8522,9 @@ impl Document {
         }
 
         collect_symbols(root, &source, &scopes, &scope_by_span, &mut symbols);
+        pair_omitted_generic_constraints(&mut symbols);
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
+        let documentation = documentation::collect(&source, &symbols, cancel)?;
         inherit_member_routine_visibility(&mut symbols);
         let conditional_unknown_symbols =
             conditional_unknown_symbols(root, &conditionals, &symbols);
@@ -8633,6 +8703,7 @@ impl Document {
             generic_parameter_contexts,
             generic_parameter_intervals,
             helpers,
+            documentation,
         });
         Ok(Self {
             parsed,
@@ -9152,6 +9223,123 @@ fn collect_symbols(
     });
 }
 
+/// Pair a definition that omits generic constraints with one unique declaration.
+///
+/// The exact routine key keeps constraint shape so distinct constrained overloads
+/// remain separate.  This pass only supplies the declaration's exact key when the
+/// rest of the identity and generic arity select one declaration unambiguously.
+fn pair_omitted_generic_constraints(symbols: &mut [Symbol]) {
+    let declaration_indices: Vec<usize> = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| {
+            (symbol.kind == SymbolKind::Routine && symbol.origin == Origin::Declaration)
+                .then_some(index)
+        })
+        .collect();
+    let definition_indices: Vec<usize> = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| {
+            (symbol.kind == SymbolKind::Routine && symbol.origin == Origin::Definition)
+                .then_some(index)
+        })
+        .collect();
+
+    let mut generic_parameter_key_replacements = HashMap::new();
+    for definition_index in definition_indices {
+        let definition = &symbols[definition_index];
+        if definition.generic_parameters.is_empty()
+            || definition
+                .generic_parameters
+                .iter()
+                .all(|parameter| parameter.constraint.is_some() || parameter.constraint_unsupported)
+        {
+            continue;
+        }
+        let matching_declarations: Vec<usize> = declaration_indices
+            .iter()
+            .copied()
+            .filter(|&declaration_index| {
+                let declaration = &symbols[declaration_index];
+                declaration.scope == definition.scope
+                    && declaration.owner_type == definition.owner_type
+                    && declaration.key == definition.key
+                    && declaration.routine_signature == definition.routine_signature
+                    && generic_parameters_match_with_omissions(
+                        &definition.generic_parameters,
+                        &declaration.generic_parameters,
+                    )
+            })
+            .collect();
+        let Some(&declaration_index) = matching_declarations
+            .first()
+            .filter(|_| matching_declarations.len() == 1)
+        else {
+            continue;
+        };
+
+        let Some(routine_key) = symbols[declaration_index].routine_key.clone() else {
+            continue;
+        };
+        let old_routine_key = definition.routine_key.clone();
+        symbols[definition_index].routine_key = Some(routine_key.clone());
+        symbols[definition_index].generic_parameters =
+            symbols[declaration_index].generic_parameters.clone();
+        symbols[definition_index].routine_directives =
+            symbols[declaration_index].routine_directives;
+        symbols[definition_index].result_type_name =
+            symbols[declaration_index].result_type_name.clone();
+        symbols[definition_index].result_type_ref =
+            symbols[declaration_index].result_type_ref.clone();
+        symbols[definition_index].result_type_span = symbols[declaration_index].result_type_span;
+
+        if let Some(old_routine_key) = old_routine_key {
+            match generic_parameter_key_replacements.entry(old_routine_key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(routine_key));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get().as_ref() != Some(&routine_key) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+    for symbol in symbols.iter_mut() {
+        if symbol.kind != SymbolKind::Type || symbol.generic_parameter.is_none() {
+            continue;
+        }
+        let Some(routine_key) = symbol
+            .routine_key
+            .as_ref()
+            .and_then(|key| generic_parameter_key_replacements.get(key))
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        symbol.routine_key = Some(routine_key.clone());
+    }
+}
+
+fn generic_parameters_match_with_omissions(
+    definition: &[GenericParameter],
+    declaration: &[GenericParameter],
+) -> bool {
+    definition.len() == declaration.len()
+        && definition
+            .iter()
+            .zip(declaration)
+            .all(|(definition, declaration)| {
+                if definition.constraint.is_none() && !definition.constraint_unsupported {
+                    true
+                } else {
+                    generic_parameter_shape(definition) == generic_parameter_shape(declaration)
+                }
+            })
+}
+
 fn pair_abbreviated_definitions(
     root: Node<'_>,
     source: &str,
@@ -9174,10 +9362,12 @@ fn pair_abbreviated_definitions(
             continue;
         };
         let signature = routine_signature(node, source);
+        let generic_parameters = generic_parameters_for_node(node, source);
         let routine_key = routine_key_with_owner(
             owner_type.as_deref(),
             &name,
             &signature,
+            &generic_parameters,
             scope_for_declaration(node, scope_by_span),
         );
         declaration_nodes_by_key
@@ -9397,7 +9587,13 @@ fn add_definition_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let generic_parameters = generic_parameters_for_node(header, source);
     let routine_parameters = direct_routine_parameters(header, source);
-    let routine_key = routine_key_with_owner(owner_type.as_deref(), &name, &signature, scope);
+    let routine_key = routine_key_with_owner(
+        owner_type.as_deref(),
+        &name,
+        &signature,
+        &generic_parameters,
+        scope,
+    );
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -9465,7 +9661,13 @@ fn add_routine_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let generic_parameters = generic_parameters_for_node(node, source);
     let routine_parameters = direct_routine_parameters(node, source);
-    let routine_key = routine_key_with_owner(owner_type.as_deref(), &name, &signature, scope);
+    let routine_key = routine_key_with_owner(
+        owner_type.as_deref(),
+        &name,
+        &signature,
+        &generic_parameters,
+        scope,
+    );
     symbols.push(Symbol {
         span,
         declaration_span: Span::from_node(node),
@@ -10299,15 +10501,39 @@ fn routine_key_with_owner(
     owner_type: Option<&str>,
     name: &str,
     signature: &str,
+    generic_parameters: &[GenericParameter],
     scope: usize,
 ) -> String {
     format!(
-        "{}::{}({})@{}",
+        "{}::{}<{}>({})@{}",
         owner_type.unwrap_or_default(),
         canonical_name(name),
+        generic_shape(generic_parameters),
         signature,
         scope,
     )
+}
+
+fn generic_shape(parameters: &[GenericParameter]) -> String {
+    if parameters.is_empty() {
+        return "0".to_owned();
+    }
+    parameters
+        .iter()
+        .map(generic_parameter_shape)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn generic_parameter_shape(parameter: &GenericParameter) -> String {
+    if parameter.constraint_unsupported {
+        "!".to_owned()
+    } else {
+        parameter
+            .constraint
+            .as_ref()
+            .map_or_else(|| "?".to_owned(), TypeRef::display)
+    }
 }
 
 fn enclosing_type(node: Node<'_>, source: &str) -> Option<String> {
@@ -11599,6 +11825,75 @@ mod tests {
             !index.contains(&uri),
             "cancelled work must not publish a document"
         );
+    }
+
+    #[test]
+    fn auto_import_context_uses_syntax_not_raw_text_qualification() {
+        let cases = [
+            (
+                "ordinary",
+                "unit Context;\ninterface\nimplementation\nvar Value: TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "line-comment-dot",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n// .\n  TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "brace-comment-dot",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n{ .\n}\n  TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "paren-comment-dot",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n(* .\n*)\n  TTarget;\nend.\n",
+                &[][..],
+                true,
+            ),
+            (
+                "active-directive",
+                "unit Context;\ninterface\nimplementation\nvar Value:\n{$IFDEF ENABLED}\n  TTarget;\n{$ENDIF}\nend.\n",
+                &["ENABLED".to_owned()][..],
+                true,
+            ),
+            (
+                "string-dot",
+                "unit Context;\ninterface\nimplementation\nconst Text = 'Provider.Target';\nend.\n",
+                &[][..],
+                false,
+            ),
+            (
+                "qualified-receiver",
+                "unit Context;\ninterface\ntype TBox = class\nend;\nimplementation\nprocedure Run;\nvar Value: TBox;\nbegin\n  Value.Target\nend;\nend.\n",
+                &[][..],
+                false,
+            ),
+        ];
+
+        for (name, source, defines, expected) in cases {
+            let uri = Url::parse(&format!("file:///tmp/auto-import-{name}.pas"))
+                .expect("context fixture URI");
+            let position = text::offset_to_position(
+                source,
+                source.rfind("Target").expect("context fixture target") + "Target".len(),
+            )
+            .expect("context fixture position");
+            let mut index = NavigationIndex::new();
+            index
+                .update_with_defines(uri.clone(), source.to_owned(), defines)
+                .expect("context fixture parses");
+            let actual = index
+                .completion_context_may_auto_import(&uri, position, &AtomicBool::new(false))
+                .expect("context classification");
+            assert_eq!(
+                actual, expected,
+                "unexpected auto-import context for {name}"
+            );
+        }
     }
 
     #[test]

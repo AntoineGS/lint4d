@@ -9,23 +9,29 @@
 use super::resolver as shared_resolver;
 use super::{
     ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
-    WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_configuration_file,
-    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, path_starts_with_native,
-    paths_equal_ci, read_disk_source,
+    WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_analyzable_source_path,
+    is_configuration_file, is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci,
+    path_starts_with_native, paths_equal_ci, read_disk_source,
 };
 use crate::NavigationIndex;
+use crate::include_expansion::{
+    self, ExpansionLimits, ExpansionResult, IncludeObservation as ExpansionIncludeObservation,
+    IncludeResolver, ResolvedInclude,
+};
 use crate::navigation::ParsedDocument;
 use crate::text;
 use lsp_types::{
-    DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
-    PrepareRenameResponse, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    DocumentChanges, Location, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
+    PrepareRenameResponse, Range, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::conditional::{
     self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind,
 };
+use pascal_core::decode_bytes;
 use pascal_core::resolver::{
     IncludeResolveRequest, LegacyRoute, LoadedSource, Resolution, ResolverLimits,
 };
+use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::{
     MetadataObservation, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
     ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
@@ -36,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
@@ -61,7 +67,14 @@ const MAX_RENAME_INCLUDE_DIRECTIVES: usize = 16_384;
 const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
 const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
+const MAX_RENAME_INCLUDE_OWNER_DISCOVERY: usize = 256;
+const MAX_SNAPSHOT_PHYSICAL_LOCATIONS: usize = 10_000;
+const MAX_SNAPSHOT_MAPPING_WORK: usize = 1_000_000;
 const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AUTO_IMPORT_PROVIDER_SOURCES: usize = 512;
+const INCLUDE_BYTE_BUDGET_ERROR: &str =
+    "include byte limit would be exceeded before reading the file";
+
 #[cfg(test)]
 thread_local! {
     static TEST_CANCEL_INCLUDE_ANALYSIS: Cell<bool> = const { Cell::new(false) };
@@ -116,6 +129,47 @@ pub(crate) struct WorkspaceInput {
     pub(crate) configuration_generation: u64,
 }
 
+/// The small portion of a workspace snapshot needed to revalidate a retained
+/// result after its worker has completed.  Full analysis inputs also retain
+/// parsed documents, ownership maps, and project metadata; keeping those
+/// structures alive for every backpressured partial delivery would defeat the
+/// delivery memory bound.
+#[derive(Debug, Clone)]
+pub(crate) struct RevalidationInput {
+    pub(crate) options: WorkspaceOptions,
+    pub(crate) overlays: HashMap<Url, OverlayInput>,
+}
+
+impl RevalidationInput {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let option_bytes = self
+            .options
+            .source_paths
+            .iter()
+            .map(String::len)
+            .chain(self.options.exclude.iter().map(String::len))
+            .sum::<usize>()
+            .saturating_add(
+                self.options
+                    .project_file
+                    .as_ref()
+                    .map_or(0, |path| path.to_string_lossy().len()),
+            )
+            .saturating_add(self.options.build_config.as_ref().map_or(0, String::len))
+            .saturating_add(self.options.platform.as_ref().map_or(0, String::len));
+        let overlay_bytes = self.overlays.iter().fold(0usize, |total, (uri, overlay)| {
+            total
+                .saturating_add(uri.as_str().len())
+                .saturating_add(overlay.text.len())
+                .saturating_add(std::mem::size_of::<OverlayInput>())
+        });
+        std::mem::size_of::<Self>()
+            .saturating_add(std::mem::size_of::<WorkspaceOptions>())
+            .saturating_add(option_bytes)
+            .saturating_add(overlay_bytes)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SourceRecord {
     pub(crate) uri: Url,
@@ -126,6 +180,11 @@ pub(crate) struct SourceRecord {
     pub(crate) path: Option<PathBuf>,
     pub(crate) path_stamp: Option<PathStamp>,
     pub(crate) content_hash: Option<u64>,
+    /// Hash of the decoded source text that was actually parsed.  This is
+    /// retained separately from `content_hash`: a full source record may have
+    /// received a later raw-byte fingerprint, and that fingerprint must not
+    /// replace equality with the parsed source.
+    pub(crate) parsed_text_hash: Option<u64>,
     pub(crate) content_bytes: Option<Vec<u8>>,
     pub(crate) candidate_membership: Option<ProjectCandidateMembership>,
     /// The requester-scoped authorization used to read this closed source.
@@ -142,6 +201,85 @@ pub(crate) struct SourceRecord {
     /// A child create/delete/rename invalidates this record, but unrelated
     /// source records remain exact-path dependencies.
     pub(crate) directory_observation: bool,
+    /// A complete projectless recursive filename lookup found no provider with
+    /// any of these names below this root.  The scope is retained separately
+    /// from the synthetic direct candidate so live validation can notice a
+    /// provider overlay in an existing nested directory without rescanning.
+    pub(crate) missing_provider_scope: Option<MissingProviderScope>,
+    /// This path was read as part of bounded auto-import provider discovery.
+    /// It distinguishes provider-source evidence from unrelated configuration
+    /// and directory observations when an overlay supersedes the disk path.
+    pub(crate) auto_import_provider_observation: bool,
+    /// Bounded semantic observations used to prove that auto-import provider
+    /// uniqueness remains fresh without invalidating on unrelated comments.
+    pub(crate) auto_import_scopes: Vec<AutoImportProviderScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingProviderScope {
+    pub(crate) root: PathBuf,
+    pub(crate) names: Vec<String>,
+    pub(crate) read_policy: ReadPolicy,
+    pub(crate) path_entry: ProjectPathEntry,
+}
+
+impl MissingProviderScope {
+    pub(crate) fn matches(&self, path: &Path) -> bool {
+        path_starts_with_ci(path, &self.root)
+            && path.file_name().is_some_and(|file_name| {
+                self.names.iter().any(|name| {
+                    file_name
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(name.as_str())
+                })
+            })
+    }
+
+    pub(crate) fn allows_without_filesystem(&self, path: &Path) -> bool {
+        self.read_policy
+            .allows_path_without_filesystem(path, &self.path_entry.provenance)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoImportProviderScope {
+    pub(crate) root: PathBuf,
+    pub(crate) provider_units: Vec<String>,
+    pub(crate) candidate_prefixes: Vec<String>,
+    pub(crate) read_policy: ReadPolicy,
+    pub(crate) path_entry: ProjectPathEntry,
+}
+
+impl AutoImportProviderScope {
+    pub(crate) fn matches_path(&self, path: &Path) -> bool {
+        path_starts_with_ci(path, &self.root)
+            && self
+                .read_policy
+                .allows_path_without_filesystem(path, &self.path_entry.provenance)
+    }
+
+    pub(crate) fn path_is_accepted(&self, workspace: &Workspace, path: &Path) -> bool {
+        workspace.scope_path_is_accepted_for_auto_import(path, self)
+    }
+}
+
+pub(crate) fn auto_import_source_is_relevant(
+    source: &str,
+    scope: &AutoImportProviderScope,
+) -> bool {
+    let cancel = AtomicBool::new(false);
+    match source_unit_name(source, &cancel) {
+        Ok(Some(unit_name))
+            if scope
+                .provider_units
+                .iter()
+                .any(|provider| provider.eq_ignore_ascii_case(&unit_name)) =>
+        {
+            true
+        }
+        Err(_) => true,
+        _ => contains_any_identifier_prefix(source, &scope.candidate_prefixes),
+    }
 }
 
 impl SourceRecord {
@@ -157,6 +295,7 @@ impl SourceRecord {
 pub(crate) struct SnapshotSeed {
     pub(crate) record: SourceRecord,
     pub(crate) consumed_configuration: Vec<SourceRecord>,
+    pub(crate) completion_position: Option<Position>,
 }
 
 impl SnapshotSeed {
@@ -164,11 +303,17 @@ impl SnapshotSeed {
         Self {
             record,
             consumed_configuration: Vec::new(),
+            completion_position: None,
         }
     }
 
     pub(crate) fn with_consumed_configuration(mut self, records: &[SourceRecord]) -> Self {
         self.consumed_configuration = records.to_vec();
+        self
+    }
+
+    pub(crate) fn with_completion_position(mut self, position: Option<Position>) -> Self {
+        self.completion_position = position;
         self
     }
 }
@@ -185,6 +330,7 @@ pub(crate) struct RenameSnapshot {
     pub(crate) index: NavigationIndex,
     pub(crate) sources: HashMap<Url, String>,
     pub(crate) records: HashMap<Url, SourceRecord>,
+    pub(crate) expansions: HashMap<Url, super::ExpansionRecord>,
     pub(crate) readable: HashSet<Url>,
     pub(crate) editable: HashSet<Url>,
     pub(crate) complete: bool,
@@ -192,6 +338,451 @@ pub(crate) struct RenameSnapshot {
     pub(crate) include_errors: Vec<String>,
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
+}
+
+fn cached_position_index<'a>(
+    cache: &'a mut HashMap<Url, text::PositionIndex>,
+    uri: &Url,
+    source: &str,
+    budget: &include_expansion::MappingBudget<'_>,
+) -> Result<&'a text::PositionIndex, String> {
+    if !cache.contains_key(uri) {
+        let index = text::PositionIndex::new_with_cancel(source, budget.cancellation())
+            .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
+        cache.insert(uri.clone(), index);
+    }
+    Ok(cache.get(uri).expect("position index was inserted"))
+}
+
+impl RenameSnapshot {
+    fn virtual_query_positions_with_budget(
+        &self,
+        uri: &Url,
+        position: Position,
+        budget: &mut include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<(Url, Position)>, String> {
+        let Some(source) = self
+            .sources
+            .get(uri)
+            .or_else(|| self.records.get(uri).map(|record| &record.text))
+        else {
+            return Ok(vec![(uri.clone(), position)]);
+        };
+        let Some(offset) = text::position_to_offset(source, position) else {
+            return Ok(Vec::new());
+        };
+        if offset >= source.len() {
+            return Ok(vec![(uri.clone(), position)]);
+        }
+        let width = source[offset..].chars().next().map_or(1, char::len_utf8);
+        let physical_range = offset..offset.saturating_add(width);
+        let mut positions = Vec::new();
+        let mut mapped_by_expansion = false;
+        for (root_uri, expansion) in &self.expansions {
+            let virtual_ranges = expansion.expanded.reverse_range_with_budget(
+                uri,
+                physical_range.clone(),
+                budget,
+            )?;
+            if !virtual_ranges.is_empty() {
+                mapped_by_expansion = true;
+            }
+            if !expansion.complete {
+                continue;
+            }
+            for virtual_range in virtual_ranges {
+                if let Some(virtual_position) =
+                    text::offset_to_position(expansion.expanded.text(), virtual_range.start)
+                {
+                    positions.push((root_uri.clone(), virtual_position));
+                }
+            }
+        }
+        if positions.is_empty() && !mapped_by_expansion && self.index.contains(uri) {
+            positions.push((uri.clone(), position));
+        }
+        positions.sort_by(|left, right| {
+            left.0
+                .as_str()
+                .cmp(right.0.as_str())
+                .then_with(|| left.1.line.cmp(&right.1.line))
+                .then_with(|| left.1.character.cmp(&right.1.character))
+        });
+        positions.dedup();
+        Ok(positions)
+    }
+
+    fn map_location_with_budget(
+        &self,
+        location: Location,
+        budget: &mut include_expansion::MappingBudget<'_>,
+        virtual_indexes: &mut HashMap<Url, text::PositionIndex>,
+        physical_indexes: &mut HashMap<Url, text::PositionIndex>,
+    ) -> Result<Vec<Location>, String> {
+        let Some(expansion) = self.expansions.get(&location.uri) else {
+            return Ok(vec![location]);
+        };
+        if !expansion.complete {
+            return Ok(Vec::new());
+        }
+        let virtual_index = cached_position_index(
+            virtual_indexes,
+            &location.uri,
+            expansion.expanded.text(),
+            budget,
+        )?;
+        let Some(start) =
+            virtual_index.position_to_offset(expansion.expanded.text(), location.range.start)
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(end) =
+            virtual_index.position_to_offset(expansion.expanded.text(), location.range.end)
+        else {
+            return Ok(Vec::new());
+        };
+        let spans = match expansion
+            .expanded
+            .map_range_with_budget(start..end, budget)?
+        {
+            crate::include_expansion::VirtualMapping::Exact(span) => vec![span],
+            crate::include_expansion::VirtualMapping::Many(spans) => spans,
+            crate::include_expansion::VirtualMapping::Unmapped => return Ok(Vec::new()),
+        };
+        let mut mapped = Vec::new();
+        for span in spans {
+            let Some(source) = expansion
+                .source_texts
+                .get(&span.uri)
+                .or_else(|| self.sources.get(&span.uri))
+            else {
+                continue;
+            };
+            let physical_index =
+                cached_position_index(physical_indexes, &span.uri, source, budget)?;
+            let Some(start) = physical_index.offset_to_position(source, span.range.start) else {
+                continue;
+            };
+            let Some(end) = physical_index.offset_to_position(source, span.range.end) else {
+                continue;
+            };
+            mapped.push(Location::new(span.uri, Range::new(start, end)));
+        }
+        Ok(mapped)
+    }
+
+    fn map_locations_with_budget(
+        &self,
+        locations: Vec<Location>,
+        budget: &mut include_expansion::MappingBudget<'_>,
+        virtual_indexes: &mut HashMap<Url, text::PositionIndex>,
+        physical_indexes: &mut HashMap<Url, text::PositionIndex>,
+    ) -> Result<Vec<Location>, String> {
+        let mut mapped = locations
+            .into_iter()
+            .map(|location| {
+                self.map_location_with_budget(location, budget, virtual_indexes, physical_indexes)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        mapped.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+        });
+        mapped.dedup();
+        Ok(mapped)
+    }
+
+    fn physical_span_is_contextually_repeated(
+        &self,
+        uri: &Url,
+        range: &std::ops::Range<usize>,
+        budget: &mut include_expansion::MappingBudget<'_>,
+    ) -> Result<bool, String> {
+        let mut owners = 0usize;
+        for expansion in self
+            .expansions
+            .values()
+            .filter(|expansion| expansion.complete)
+        {
+            let occurrences =
+                expansion
+                    .expanded
+                    .reverse_range_with_budget(uri, range.clone(), budget)?;
+            if occurrences.len() > 1 {
+                return Ok(true);
+            }
+            if !occurrences.is_empty() {
+                owners = owners.saturating_add(1);
+                if owners > 1 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn prepare_rename(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<PrepareRenameResponse, String> {
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
+        let mut ranges = Vec::new();
+        for (query_uri, query_position) in
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?
+        {
+            let response = self.index.prepare_rename(&query_uri, query_position)?;
+            let PrepareRenameResponse::Range(range) = response else {
+                return Err("rename target has unsupported placeholder metadata".to_string());
+            };
+            let locations = self.map_location_with_budget(
+                Location::new(query_uri, range),
+                &mut budget,
+                &mut virtual_indexes,
+                &mut physical_indexes,
+            )?;
+            if locations.len() != 1 {
+                return Err("rename target does not map to one physical source range".to_string());
+            }
+            ranges.push(locations[0].range);
+        }
+        ranges.sort_by_key(|range| {
+            (
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character,
+            )
+        });
+        ranges.dedup();
+        ranges
+            .into_iter()
+            .next()
+            .map(PrepareRenameResponse::Range)
+            .ok_or_else(|| "rename target is unresolved or ambiguous".to_string())
+    }
+
+    fn rename_edits(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+        cancel: &AtomicBool,
+    ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
+        let mut edits = HashMap::new();
+        let query_positions =
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        for (query_uri, query_position) in query_positions {
+            let raw = self
+                .index
+                .rename_edits(&query_uri, query_position, new_name)?;
+            for (edit_uri, document_edits) in raw {
+                for edit in document_edits {
+                    let Some(expansion) = self.expansions.get(&edit_uri) else {
+                        edits
+                            .entry(edit_uri.clone())
+                            .or_insert_with(Vec::new)
+                            .push(edit);
+                        continue;
+                    };
+                    if !expansion.complete {
+                        return Err("rename include expansion is incomplete".to_string());
+                    }
+                    let virtual_index = cached_position_index(
+                        &mut virtual_indexes,
+                        &edit_uri,
+                        expansion.expanded.text(),
+                        &budget,
+                    )?;
+                    let Some(start) = virtual_index
+                        .position_to_offset(expansion.expanded.text(), edit.range.start)
+                    else {
+                        return Err("rename edit starts outside the expanded source".to_string());
+                    };
+                    let Some(end) =
+                        virtual_index.position_to_offset(expansion.expanded.text(), edit.range.end)
+                    else {
+                        return Err("rename edit ends outside the expanded source".to_string());
+                    };
+                    let span = match expansion
+                        .expanded
+                        .map_range_with_budget(start..end, &mut budget)?
+                    {
+                        crate::include_expansion::VirtualMapping::Exact(span) => span,
+                        crate::include_expansion::VirtualMapping::Many(_) => {
+                            return Err("rename edit crosses physical include segments".to_string());
+                        }
+                        crate::include_expansion::VirtualMapping::Unmapped => {
+                            return Err("rename edit maps to synthetic include text".to_string());
+                        }
+                    };
+                    if self.physical_span_is_contextually_repeated(
+                        &span.uri,
+                        &span.range,
+                        &mut budget,
+                    )? {
+                        return Err(
+                            "rename edit has multiple contextual physical owners; refusing an ambiguous include edit"
+                                .to_string(),
+                        );
+                    }
+                    let source = expansion
+                        .source_texts
+                        .get(&span.uri)
+                        .or_else(|| self.sources.get(&span.uri))
+                        .ok_or_else(|| format!("rename source was not retained: {}", span.uri))?;
+                    let physical_index =
+                        cached_position_index(&mut physical_indexes, &span.uri, source, &budget)?;
+                    let start = physical_index
+                        .offset_to_position(source, span.range.start)
+                        .ok_or_else(|| "rename edit has an invalid physical start".to_string())?;
+                    let end = physical_index
+                        .offset_to_position(source, span.range.end)
+                        .ok_or_else(|| "rename edit has an invalid physical end".to_string())?;
+                    let mapped = TextEdit::new(Range::new(start, end), edit.new_text);
+                    let target = edits.entry(span.uri).or_insert_with(Vec::new);
+                    if let Some(existing) = target
+                        .iter()
+                        .find(|existing| existing.range == mapped.range)
+                    {
+                        if existing.new_text != mapped.new_text {
+                            return Err("rename produced conflicting physical edits".to_string());
+                        }
+                    } else {
+                        target.push(mapped);
+                    }
+                }
+            }
+        }
+        for document_edits in edits.values_mut() {
+            document_edits.sort_by_key(|edit| {
+                (
+                    edit.range.start.line,
+                    edit.range.start.character,
+                    edit.range.end.line,
+                    edit.range.end.character,
+                )
+            });
+        }
+        Ok(edits)
+    }
+
+    pub(crate) fn binding_locations(
+        &self,
+        uri: &Url,
+        position: Position,
+        include_declaration: bool,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Location>, String> {
+        let mut locations = Vec::new();
+        let mut seen = HashSet::new();
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
+        let mut resolution_budget =
+            crate::navigation::BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
+        let query_positions =
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        for (query_uri, query_position) in query_positions {
+            resolution_budget.charge()?;
+            let query_locations = self.index.binding_locations_with_cancel_and_work_budget(
+                &query_uri,
+                query_position,
+                include_declaration,
+                cancel,
+                &mut resolution_budget,
+            )?;
+            for location in query_locations {
+                for mapped in self.map_location_with_budget(
+                    location,
+                    &mut budget,
+                    &mut virtual_indexes,
+                    &mut physical_indexes,
+                )? {
+                    if is_cancelled(cancel) {
+                        return Err(CANCELLATION_MESSAGE.to_string());
+                    }
+                    let key = (
+                        mapped.uri.as_str().to_owned(),
+                        mapped.range.start.line,
+                        mapped.range.start.character,
+                        mapped.range.end.line,
+                        mapped.range.end.character,
+                    );
+                    if seen.insert(key) {
+                        if locations.len() >= MAX_SNAPSHOT_PHYSICAL_LOCATIONS {
+                            return Err(format!(
+                                "binding reference result exceeds the {MAX_SNAPSHOT_PHYSICAL_LOCATIONS}-entry limit"
+                            ));
+                        }
+                        locations.push(mapped);
+                    }
+                }
+            }
+        }
+        locations.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+        });
+        Ok(locations)
+    }
+
+    pub(crate) fn binding_locations_in_document(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Location>, String> {
+        let mut locations = Vec::new();
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
+        let mut resolution_budget =
+            crate::navigation::BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
+        let query_positions =
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        for (query_uri, query_position) in query_positions {
+            resolution_budget.charge()?;
+            let query_locations = self
+                .index
+                .binding_locations_in_document_with_cancel_and_work_budget(
+                    &query_uri,
+                    query_position,
+                    cancel,
+                    &mut resolution_budget,
+                )?;
+            locations.extend(query_locations);
+        }
+        let locations = self.map_locations_with_budget(
+            locations,
+            &mut budget,
+            &mut virtual_indexes,
+            &mut physical_indexes,
+        )?;
+        // This is deliberately after physical mapping/deduplication: one
+        // source occurrence can be visited by several virtual include roots.
+        if locations.len() > MAX_SNAPSHOT_PHYSICAL_LOCATIONS {
+            return Err(format!(
+                "binding reference result exceeds the {MAX_SNAPSHOT_PHYSICAL_LOCATIONS}-entry limit"
+            ));
+        }
+        Ok(locations)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +863,8 @@ struct Enumeration {
     complete: bool,
     reason: Option<String>,
     visited_entries: usize,
+    auto_import_complete: bool,
+    auto_import_unit_providers: HashMap<String, Vec<Url>>,
 }
 
 #[derive(Debug, Clone)]
@@ -578,6 +1171,27 @@ impl BaselineAccumulator {
 }
 
 impl Workspace {
+    pub(crate) fn revalidation_input(&self) -> RevalidationInput {
+        let overlays = self
+            .open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                let text = document.text.as_ref()?.clone();
+                Some((
+                    canonical_file_uri(uri),
+                    OverlayInput {
+                        text,
+                        version: document.version,
+                    },
+                ))
+            })
+            .collect();
+        RevalidationInput {
+            options: self.options.clone(),
+            overlays,
+        }
+    }
+
     pub(crate) fn analysis_input(&self) -> WorkspaceInput {
         let overlays = self
             .open_documents
@@ -688,6 +1302,27 @@ impl Workspace {
         let cancel = AtomicBool::new(false);
         for record in records {
             if let Some(path) = &record.path {
+                if record.missing_provider_candidate {
+                    let uri = Url::from_file_path(absolute_path(path.clone()))
+                        .ok()
+                        .map(|uri| canonical_file_uri(&uri));
+                    if uri
+                        .as_ref()
+                        .and_then(|uri| self.open_documents.get(uri))
+                        .is_some_and(|document| document.text.is_some())
+                    {
+                        return Err(format!(
+                            "include provider appeared as an overlay while resolving {}; retry the request",
+                            path.display()
+                        ));
+                    }
+                    if record.path_stamp.is_none() && path_stamp(path).is_some() {
+                        return Err(format!(
+                            "include provider appeared on disk while resolving {}; retry the request",
+                            path.display()
+                        ));
+                    }
+                }
                 revalidate_path_record(path, record, &cancel)?;
                 continue;
             }
@@ -709,7 +1344,10 @@ impl Workspace {
                             }
                         })
                     },
-                );
+                ) || document
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| parsed_source_changed(record, text));
                 if document.version != record.version.unwrap_or_default() || text_changed {
                     return Err(format!(
                         "source changed while resolving {}; retry the request",
@@ -751,11 +1389,11 @@ impl Workspace {
                     record.uri
                 )
             })?;
-            if current.text != record.text
-                || record
-                    .content_hash
-                    .is_some_and(|expected| expected != current.content_hash)
-            {
+            let content_changed = record.content_hash.map_or_else(
+                || current.text != record.text,
+                |expected| expected != current.content_hash,
+            ) || parsed_source_changed(record, &current.text);
+            if content_changed {
                 return Err(format!(
                     "closed source changed while resolving {}; retry the request",
                     record.uri
@@ -771,6 +1409,23 @@ pub(crate) fn revalidate_input(
     records: &[SourceRecord],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    revalidate_records(&input.options, &input.overlays, records, cancel)
+}
+
+pub(crate) fn revalidate_revalidation_input(
+    input: &RevalidationInput,
+    records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    revalidate_records(&input.options, &input.overlays, records, cancel)
+}
+
+fn revalidate_records(
+    options: &WorkspaceOptions,
+    overlays: &HashMap<Url, OverlayInput>,
+    records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     for record in records {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -780,7 +1435,7 @@ pub(crate) fn revalidate_input(
             continue;
         }
         if record.open {
-            let Some(overlay) = input.overlays.get(&record.uri) else {
+            let Some(overlay) = overlays.get(&record.uri) else {
                 return Err(format!(
                     "open document disappeared while resolving {}; retry the request",
                     record.uri
@@ -795,7 +1450,7 @@ pub(crate) fn revalidate_input(
                         text_content_hash(&overlay.text) != expected
                     }
                 },
-            );
+            ) || parsed_source_changed(record, &overlay.text);
             if overlay.version != record.version.unwrap_or_default() || text_changed {
                 return Err(format!(
                     "source changed while resolving {}; retry the request",
@@ -820,7 +1475,7 @@ pub(crate) fn revalidate_input(
             matches!(&path_entry.provenance, ProjectPathProvenance::LegacyNative);
         let current = read_disk_source(
             &path,
-            input.options.limits.max_file_bytes,
+            options.limits.max_file_bytes,
             read_policy,
             path_entry,
             allow_legacy_payload,
@@ -831,12 +1486,14 @@ pub(crate) fn revalidate_input(
                 record.uri
             )
         })?;
-        if disk_stamp(&path) != record.stamp
-            || current.text != record.text
-            || record
-                .content_hash
-                .is_some_and(|expected| expected != current.content_hash)
-        {
+        let content_changed = record.content_hash.map_or_else(
+            || current.text != record.text,
+            |expected| expected != current.content_hash,
+        ) || parsed_source_changed(record, &current.text);
+        let overlay_changed = overlays
+            .get(&record.uri)
+            .is_some_and(|overlay| overlay.text != current.text);
+        if disk_stamp(&path) != record.stamp || content_changed || overlay_changed {
             return Err(format!(
                 "closed source changed while resolving {}; retry the request",
                 record.uri
@@ -971,10 +1628,19 @@ fn file_content_hash(
     Ok(super::content_hash_bytes(&bytes))
 }
 
-fn text_content_hash(source: &str) -> u64 {
+pub(crate) fn text_content_hash(source: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
     hasher.finish()
+}
+
+pub(crate) fn parsed_source_changed(record: &SourceRecord, current_text: &str) -> bool {
+    record
+        .parsed_text_hash
+        .is_some_and(|expected| text_content_hash(current_text) != expected)
+        || (record.parsed_text_hash.is_none()
+            && !record.text.is_empty()
+            && current_text != record.text)
 }
 
 #[derive(Debug)]
@@ -982,6 +1648,14 @@ struct ScannedSource {
     data: Vec<u8>,
     bytes: usize,
     content_hash: u64,
+}
+
+#[derive(Debug)]
+struct AutoImportProviderObservation {
+    path: PathBuf,
+    content_hash: u64,
+    read_policy: ReadPolicy,
+    path_entry: ProjectPathEntry,
 }
 
 fn read_scan_source(
@@ -1046,6 +1720,7 @@ fn path_record_at(
         path: Some(path),
         path_stamp: stamp,
         content_hash,
+        parsed_text_hash: None,
         content_bytes,
         candidate_membership,
         read_policy,
@@ -1053,6 +1728,9 @@ fn path_record_at(
         include_payload,
         missing_provider_candidate: false,
         directory_observation: false,
+        missing_provider_scope: None,
+        auto_import_provider_observation: false,
+        auto_import_scopes: Vec::new(),
     })
 }
 
@@ -1088,6 +1766,7 @@ pub(crate) fn source_for_input_with_cancel(
                 path: None,
                 path_stamp: None,
                 content_hash: None,
+                parsed_text_hash: Some(text_content_hash(&overlay.text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: None,
@@ -1095,6 +1774,9 @@ pub(crate) fn source_for_input_with_cancel(
                 include_payload: false,
                 missing_provider_candidate: false,
                 directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
             },
         ));
     }
@@ -1129,6 +1811,7 @@ pub(crate) fn source_for_input_with_owner(
                 path: None,
                 path_stamp: None,
                 content_hash: None,
+                parsed_text_hash: Some(text_content_hash(&overlay.text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: None,
@@ -1136,6 +1819,9 @@ pub(crate) fn source_for_input_with_owner(
                 include_payload: false,
                 missing_provider_candidate: false,
                 directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
             },
         ));
     }
@@ -1184,6 +1870,7 @@ pub(crate) fn source_for_input_with_owner(
         path: None,
         path_stamp: None,
         content_hash: Some(disk.content_hash),
+        parsed_text_hash: Some(text_content_hash(&disk.text)),
         content_bytes: None,
         candidate_membership: None,
         read_policy: Some(read_policy),
@@ -1191,6 +1878,9 @@ pub(crate) fn source_for_input_with_owner(
         include_payload: false,
         missing_provider_candidate: false,
         directory_observation: false,
+        missing_provider_scope: None,
+        auto_import_provider_observation: false,
+        auto_import_scopes: Vec::new(),
     };
     Ok((disk.text, record))
 }
@@ -1235,6 +1925,8 @@ pub(crate) fn owner_for_input(
         key: key.clone(),
         state,
         origin: owner_origin.unwrap_or_else(|| workspace.owner_origin_for_context_key(&key)),
+        needs_revalidation: false,
+        follow_current_project_file: false,
         legacy_route: workspace.document_owners.get(&uri).and_then(|owner| {
             (owner.key == key)
                 .then(|| owner.legacy_route.clone())
@@ -1277,6 +1969,8 @@ pub(crate) struct BindingClassification {
     pub(crate) ignored_or_empty: bool,
     pub(crate) consumed_configuration: Vec<SourceRecord>,
 }
+
+type ExpandedBindingInfo = Option<(Option<(crate::navigation::RenameBindingInfo, bool)>, bool)>;
 
 pub(crate) fn binding_info_for_input(
     input: &WorkspaceInput,
@@ -1347,7 +2041,15 @@ fn binding_classification_for_input(
         } else {
             &context.defines
         };
-    let (info, ignored_or_empty) = binding_info_for_source(
+    let expanded_info = expanded_binding_info_for_input(
+        input,
+        uri,
+        position,
+        additional_names,
+        self_contained_mode,
+        cancel,
+    )?;
+    let (info, ignored_or_empty) = expanded_info.unwrap_or(binding_info_for_source(
         uri,
         &source,
         position,
@@ -1355,7 +2057,7 @@ fn binding_classification_for_input(
         defines,
         self_contained_mode,
         cancel,
-    )?;
+    )?);
     Ok(BindingClassification {
         source,
         record,
@@ -1363,6 +2065,105 @@ fn binding_classification_for_input(
         ignored_or_empty,
         consumed_configuration,
     })
+}
+
+fn expanded_binding_info_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    additional_names: &[String],
+    self_contained_mode: SelfContainedMode,
+    cancel: &AtomicBool,
+) -> Result<ExpandedBindingInfo, String> {
+    let uri = canonical_file_uri(uri);
+    let mut workspace = Workspace::from_analysis_input(input);
+    let context_key = workspace.context_for_uri_with_cancel(&uri, Some(cancel))?;
+    if !workspace.load_source_with_cancel(&uri, &context_key, &HashSet::new(), Some(cancel))? {
+        return Ok(None);
+    }
+    let mut mapping_budget = include_expansion::MappingBudget::new(
+        cancel,
+        workspace.include_expansion_limits().max_work,
+    );
+    let positions =
+        workspace.virtual_query_positions_with_budget(&uri, position, &mut mapping_budget)?;
+    if positions.is_empty() {
+        // An incomplete expansion must not be mistaken for a harmless
+        // whitespace/comment position.  The physical target may be valid,
+        // but refusing to classify it lets the caller's bounded snapshot
+        // report the include/conditional incompleteness instead of silently
+        // returning no references or highlights.
+        let incomplete_mapping = workspace
+            .source_text_for_mapping(&uri)
+            .and_then(|source| {
+                let offset = text::position_to_offset(&source, position)?;
+                let width = source
+                    .get(offset..)
+                    .and_then(|tail| tail.chars().next())
+                    .map_or(1, char::len_utf8);
+                Some(workspace.expansions.values().any(|expansion| {
+                    let reverse = expansion.expanded.reverse_range_with_budget(
+                        &uri,
+                        offset..offset.saturating_add(width),
+                        &mut mapping_budget,
+                    );
+                    !expansion.complete && reverse.map(|ranges| !ranges.is_empty()).unwrap_or(false)
+                }))
+            })
+            .unwrap_or(false);
+        if incomplete_mapping {
+            return Ok(Some((None, false)));
+        }
+        return Ok(Some((None, true)));
+    }
+
+    let mut selected: Option<(crate::navigation::RenameBindingInfo, bool)> = None;
+    let mut ignored = false;
+    for (query_uri, query_position) in positions {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let query_ignored = workspace
+            .index
+            .position_is_ignored_or_empty(&query_uri, query_position)?;
+        if query_ignored {
+            ignored = true;
+            continue;
+        }
+        let Some(info) = workspace
+            .index
+            .rename_binding_info_with_cancel(&query_uri, query_position, cancel)
+            .ok()
+        else {
+            return Ok(Some((None, false)));
+        };
+        let can_check_self_contained = match self_contained_mode {
+            SelfContainedMode::None => false,
+            SelfContainedMode::AnyBinding => true,
+            SelfContainedMode::LocalBinding => info.local,
+        };
+        let self_contained = can_check_self_contained
+            && workspace.index.self_contained_rename_binding_with_cancel(
+                &query_uri,
+                query_position,
+                additional_names,
+                cancel,
+            );
+        let current = (info, self_contained);
+        if selected.as_ref().is_some_and(|previous| {
+            previous.1 != current.1
+                || previous.0.local != current.0.local
+                || previous.0.names.iter().collect::<HashSet<_>>()
+                    != current.0.names.iter().collect::<HashSet<_>>()
+        }) {
+            return Ok(Some((None, false)));
+        }
+        selected = Some(current);
+    }
+    if selected.is_none() && ignored {
+        return Ok(Some((None, true)));
+    }
+    Ok(Some((selected, ignored)))
 }
 
 pub(crate) fn project_context_and_metadata_for_input(
@@ -1583,9 +2384,193 @@ fn contains_any_identifier_bytes(source: &[u8], names: &[String]) -> bool {
     false
 }
 
-fn may_contain_include_directive(source: &[u8]) -> bool {
+pub(crate) fn contains_any_identifier_prefix(source: &str, names: &[String]) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        if start == index {
+            continue;
+        }
+        let Some(identifier) = source.get(start..index) else {
+            continue;
+        };
+        if names.iter().any(|name| {
+            let name = name.trim_start_matches('&');
+            !name.is_empty()
+                && identifier.len() >= name.len()
+                && identifier[..name.len()].eq_ignore_ascii_case(name)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_any_identifier_prefix_bytes(source: &[u8], names: &[String]) -> bool {
+    let mut index = 0;
+    while index < source.len() {
+        while index < source.len() && !is_identifier_byte(source[index]) {
+            index += 1;
+        }
+        let start = index;
+        while index < source.len() && is_identifier_byte(source[index]) {
+            index += 1;
+        }
+        if start == index {
+            continue;
+        }
+        let identifier = &source[start..index];
+        if names.iter().any(|name| {
+            let name = name.trim_start_matches('&').as_bytes();
+            !name.is_empty()
+                && identifier.len() >= name.len()
+                && identifier[..name.len()].eq_ignore_ascii_case(name)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn source_unit_name(
+    source: &str,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, String> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0usize;
+    let Some(keyword) = next_source_identifier(source, &mut cursor, cancel)? else {
+        return Ok(None);
+    };
+    if !keyword.eq_ignore_ascii_case("unit") {
+        return Ok(None);
+    }
+    let Some(first) = next_source_identifier(source, &mut cursor, cancel)? else {
+        return Ok(None);
+    };
+    let mut parts = vec![first];
+    loop {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'.') {
+            break;
+        }
+        cursor += 1;
+        let Some(part) = next_source_identifier(source, &mut cursor, cancel)? else {
+            return Ok(None);
+        };
+        parts.push(part);
+    }
+    let name = parts
+        .into_iter()
+        .map(|part| part.trim_start_matches('&').to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    Ok((!name.is_empty()).then_some(name))
+}
+
+fn next_source_identifier(
+    source: &str,
+    cursor: &mut usize,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, String> {
+    let bytes = source.as_bytes();
+    loop {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        while bytes
+            .get(*cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            *cursor += 1;
+        }
+        if bytes.get(*cursor) == Some(&b'/') && bytes.get(*cursor + 1) == Some(&b'/') {
+            *cursor += 2;
+            while *cursor < bytes.len() && bytes[*cursor] != b'\r' && bytes[*cursor] != b'\n' {
+                *cursor += 1;
+            }
+            continue;
+        }
+        if bytes.get(*cursor) == Some(&b'{') {
+            *cursor += 1;
+            while *cursor < bytes.len() && bytes[*cursor] != b'}' {
+                *cursor += 1;
+            }
+            if *cursor == bytes.len() {
+                return Ok(None);
+            }
+            *cursor += 1;
+            continue;
+        }
+        if bytes.get(*cursor) == Some(&b'(') && bytes.get(*cursor + 1) == Some(&b'*') {
+            *cursor += 2;
+            while *cursor + 1 < bytes.len()
+                && !(bytes[*cursor] == b'*' && bytes[*cursor + 1] == b')')
+            {
+                *cursor += 1;
+            }
+            if *cursor + 1 >= bytes.len() {
+                return Ok(None);
+            }
+            *cursor += 2;
+            continue;
+        }
+        if bytes.get(*cursor) == Some(&b'\'') {
+            *cursor += 1;
+            while *cursor < bytes.len() {
+                if bytes[*cursor] == b'\'' {
+                    if bytes.get(*cursor + 1) == Some(&b'\'') {
+                        *cursor += 2;
+                    } else {
+                        *cursor += 1;
+                        break;
+                    }
+                } else {
+                    *cursor += 1;
+                }
+            }
+            continue;
+        }
+        let Some(&byte) = bytes.get(*cursor) else {
+            return Ok(None);
+        };
+        if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'&' {
+            let start = *cursor;
+            *cursor += 1;
+            while bytes
+                .get(*cursor)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                *cursor += 1;
+            }
+            return Ok(source.get(start..*cursor).map(str::to_owned));
+        }
+        return Ok(None);
+    }
+}
+
+pub(crate) fn may_contain_include_directive(source: &[u8]) -> bool {
     source.windows(2).any(|window| window == b"{$")
         || source.windows(3).any(|window| window == b"(*$")
+}
+
+fn source_requires_include_owner_closure(uri: &Url, source: &str) -> bool {
+    uri.to_file_path().ok().is_some_and(|path| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("inc"))
+    }) || may_contain_include_directive(source.as_bytes())
 }
 
 fn is_identifier_byte(byte: u8) -> bool {
@@ -1633,6 +2618,7 @@ pub(crate) fn prepare_from_input(
             "rename target source changed while classifying; retry the request".to_string(),
         );
     }
+    let include_context = source_requires_include_owner_closure(&uri, &planning_source);
     let (mode, candidate_names, self_contained) = match binding_info {
         Some((info, self_contained)) => {
             let mut names = info.names;
@@ -1640,7 +2626,7 @@ pub(crate) fn prepare_from_input(
                 names.push(original_name.clone());
             }
             (
-                if info.local {
+                if info.local && !include_context {
                     SnapshotMode::Local
                 } else {
                     SnapshotMode::Workspace
@@ -1695,7 +2681,7 @@ pub(crate) fn prepare_from_input(
             records: Vec::new(),
         };
     }
-    let value = snapshot.index.prepare_rename(&uri, position);
+    let value = snapshot.prepare_rename(&uri, position, cancel);
     let records = snapshot_records(&snapshot);
     Computed {
         source_generation,
@@ -1720,6 +2706,11 @@ pub(crate) fn rename_from_input(
         Ok(source) => source,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    let initial_disk_stamp = uri
+        .to_file_path()
+        .ok()
+        .map(absolute_path)
+        .and_then(|path| disk_stamp(&path));
     let original_name = match identifier_at_position(&initial_source, position) {
         Some(name) => name,
         None => {
@@ -1734,7 +2725,31 @@ pub(crate) fn rename_from_input(
     let classification =
         match binding_info_for_input(&input, &uri, position, &additional_names, cancel) {
             Ok(result) => result,
-            Err(error) => return failed(source_generation, configuration_generation, error),
+            Err(error) => {
+                // The scope-classification read is deliberately separate from
+                // the initial target read.  If the target changed between
+                // those reads, report the stale-source condition even when
+                // the new contents no longer contain an identifier at the
+                // original position.
+                let stamp_changed = uri
+                    .to_file_path()
+                    .ok()
+                    .map(absolute_path)
+                    .and_then(|path| disk_stamp(&path))
+                    != initial_disk_stamp;
+                if stamp_changed
+                    || error == "no renameable identifier at position"
+                    || source_for_input_with_cancel(&input, &uri, Some(cancel))
+                        .is_ok_and(|(current, _)| current != initial_source)
+                {
+                    return failed(
+                        source_generation,
+                        configuration_generation,
+                        format!("source changed while classifying rename target {uri}"),
+                    );
+                }
+                return failed(source_generation, configuration_generation, error);
+            }
         };
     let BindingClassification {
         source: planning_source,
@@ -1750,6 +2765,7 @@ pub(crate) fn rename_from_input(
             "rename target source changed while classifying; retry the request".to_string(),
         );
     }
+    let include_context = source_requires_include_owner_closure(&uri, &planning_source);
     let (mode, candidate_names, self_contained) = match binding_info {
         Some((info, self_contained)) => {
             let mut names = info.names;
@@ -1758,7 +2774,7 @@ pub(crate) fn rename_from_input(
             }
             names.push(new_name.to_string());
             (
-                if info.local {
+                if info.local && !include_context {
                     SnapshotMode::Local
                 } else {
                     SnapshotMode::Workspace
@@ -1809,9 +2825,32 @@ pub(crate) fn rename_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    let raw_edits = match snapshot.index.rename_edits(&uri, position, new_name) {
+    let raw_edits = match snapshot.rename_edits(&uri, position, new_name, cancel) {
         Ok(edits) => edits,
         Err(error) => {
+            if error == "no renameable identifier at position" {
+                return Computed {
+                    source_generation,
+                    configuration_generation,
+                    value: Err(format!(
+                        "source changed while resolving rename target {uri}"
+                    )),
+                    records: Vec::new(),
+                };
+            }
+            let include_sensitive = snapshot
+                .sources
+                .values()
+                .any(|source| may_contain_include_directive(source.as_bytes()))
+                || snapshot
+                    .expansions
+                    .values()
+                    .any(|expansion| !expansion.dependencies.is_empty());
+            let error = if include_sensitive {
+                format!("include-expanded rename could not resolve a complete binding: {error}")
+            } else {
+                error
+            };
             return Computed {
                 source_generation,
                 configuration_generation,
@@ -2380,7 +3419,7 @@ fn add_priority_sources(
                 legacy_route,
             )
         });
-        if !readable || !is_pascal_path(&path) {
+        if !readable || !is_analyzable_source_path(&path) {
             continue;
         }
         if path.is_file() || input.overlays.contains_key(uri) {
@@ -2433,6 +3472,7 @@ pub(crate) fn build_snapshot(
                 text: Some(overlay.text.clone()),
                 version: overlay.version,
                 rejection: None,
+                identity_generation: input.source_generation,
             },
         );
     }
@@ -2443,6 +3483,7 @@ pub(crate) fn build_snapshot(
                 text: None,
                 version: 0,
                 rejection: Some("open document was rejected by workspace limits".to_string()),
+                identity_generation: input.source_generation,
             },
         );
     }
@@ -2484,13 +3525,29 @@ pub(crate) fn build_snapshot(
                 .get(context_key)
                 .is_some_and(|state| state.context.discovery_complete)
             {
+                let target_has_include = priority_seed
+                    .as_ref()
+                    .is_some_and(|seed| may_contain_include_directive(seed.record.text.as_bytes()));
+                if target_has_include {
+                    return Err(format!(
+                        "rename workspace scan incomplete: include dependency context is ambiguous or incomplete for {uri}"
+                    ));
+                }
                 return Err(format!(
                     "rename workspace scan incomplete: project context is ambiguous or incomplete for {uri}"
                 ));
             }
         }
     }
-    let mut enumeration = enumerate_sources(&loader, input, &priority, mode, cancel)?;
+    let mut enumeration = enumerate_sources(
+        &mut loader,
+        input,
+        &priority,
+        &priority_contexts,
+        candidate_names,
+        mode,
+        cancel,
+    )?;
     let project_contexts = if mode == SnapshotMode::WorkspaceSymbols {
         discover_project_metadata_contexts(&mut loader, &mut enumeration, cancel)?
     } else {
@@ -2547,7 +3604,9 @@ pub(crate) fn build_snapshot(
         cancel,
     )?;
     enumeration.sort_paths(&priority);
+    let auto_import_complete = enumeration.auto_import_complete;
     let paths = enumeration.paths;
+    let mut auto_import_unit_providers = enumeration.auto_import_unit_providers;
     let mut complete = enumeration.complete;
     let mut incomplete_reason = enumeration.reason;
     let mut baseline = enumeration.baseline;
@@ -2591,12 +3650,15 @@ pub(crate) fn build_snapshot(
     let mut editable = HashSet::new();
     let mut contexts = HashMap::new();
     let mut index = NavigationIndex::new();
+    index.set_auto_import_discovery_complete(auto_import_complete);
     let mut indexed_sizes = HashMap::new();
     let mut indexed_stamps = HashMap::new();
     let mut indexed_uris = HashSet::new();
     let mut retained_files = 0usize;
     let mut retained_bytes = 0usize;
     let mut scanned_bytes = 0usize;
+    let mut auto_import_provider_observations = Vec::new();
+    let mut auto_import_observation_paths = HashSet::new();
     let allow_incomplete_context_for: &[Url] = if mode == SnapshotMode::Local {
         skip_imports_for
     } else {
@@ -2674,6 +3736,7 @@ pub(crate) fn build_snapshot(
                     continue;
                 }
             };
+        let mut auto_import_provider_recorded = false;
         let (source, record, source_bytes) = if let Some(seed) =
             priority_seed.as_ref().filter(|seed| seed.record.uri == uri)
         {
@@ -2696,6 +3759,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    parsed_text_hash: Some(text_content_hash(&overlay.text)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: Some(read_policy.clone()),
@@ -2703,6 +3767,9 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     directory_observation: false,
+                    missing_provider_scope: None,
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
                 },
                 overlay.text.len(),
             )
@@ -2724,10 +3791,19 @@ pub(crate) fn build_snapshot(
                 }
             };
             scanned_bytes = scanned_bytes.saturating_add(scan.bytes);
-            baseline_content_hashes
-                .entry(path_key(&path))
-                .or_insert(scan.content_hash);
-            baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            if mode == SnapshotMode::Assistance {
+                auto_import_provider_observations.push(AutoImportProviderObservation {
+                    path: path.clone(),
+                    content_hash: scan.content_hash,
+                    read_policy: read_policy.clone(),
+                    path_entry: path_entry.clone(),
+                });
+            } else {
+                baseline_content_hashes
+                    .entry(path_key(&path))
+                    .or_insert(scan.content_hash);
+                baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            }
             if scanned_bytes > MAX_RENAME_SCANNED_BYTES {
                 complete = false;
                 incomplete_reason.get_or_insert_with(|| {
@@ -2738,10 +3814,23 @@ pub(crate) fn build_snapshot(
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
+            let source = decode_bytes(&scan.data).into_owned();
+            if mode == SnapshotMode::Assistance && !is_priority {
+                auto_import_provider_recorded = true;
+                if let Some(unit_name) = source_unit_name(&source, cancel)? {
+                    auto_import_unit_providers
+                        .entry(unit_name)
+                        .or_default()
+                        .push(uri.clone());
+                }
+            }
             let direct_candidate = candidate_names.is_empty()
                 || !candidate_names_are_ascii
-                || contains_any_identifier_bytes(&scan.data, candidate_names);
-            if !is_priority && !direct_candidate && !may_contain_include_directive(&scan.data) {
+                || contains_any_identifier_bytes(&scan.data, candidate_names)
+                || (mode == SnapshotMode::Assistance
+                    && contains_any_identifier_prefix_bytes(&scan.data, candidate_names));
+            let may_contain_include = may_contain_include_directive(&scan.data);
+            if !is_priority && !direct_candidate && !may_contain_include {
                 continue;
             }
             let source = shared_resolver::decode_source_bytes(&scan.data);
@@ -2751,13 +3840,14 @@ pub(crate) fn build_snapshot(
                 source.clone(),
                 SourceRecord {
                     uri: uri.clone(),
-                    text: source,
+                    text: source.clone(),
                     version: None,
                     stamp: Some(stamp),
                     open: false,
                     path: None,
                     path_stamp: None,
                     content_hash: Some(scan.content_hash),
+                    parsed_text_hash: Some(text_content_hash(&source)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: Some(read_policy.clone()),
@@ -2765,10 +3855,21 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     directory_observation: false,
+                    missing_provider_scope: None,
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
                 },
                 scan.bytes,
             )
         };
+        if mode == SnapshotMode::Assistance && !is_priority && !auto_import_provider_recorded {
+            if let Some(unit_name) = source_unit_name(&source, cancel)? {
+                auto_import_unit_providers
+                    .entry(unit_name)
+                    .or_default()
+                    .push(uri.clone());
+            }
+        }
         if !record.open {
             baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
         }
@@ -2777,9 +3878,87 @@ pub(crate) fn build_snapshot(
                 .entry(path_key(&path))
                 .or_insert(content_hash);
         }
+        let may_contain_include = may_contain_include_directive(source.as_bytes());
+        let mut indexed_source = source.clone();
+        if mode != SnapshotMode::WorkspaceSymbols && may_contain_include {
+            let expansion_defines = loader
+                .contexts
+                .get(&source_context_key)
+                .map(|state| state.context.defines.clone())
+                .unwrap_or_default();
+            match loader.expand_source_with_cancel(&uri, &source, &source_context_key, Some(cancel))
+            {
+                Ok(expansion) => {
+                    let mut expansion = expansion;
+                    let conditional = conditional::analyze_with_cancel(
+                        expansion.expanded.text(),
+                        &expansion_defines,
+                        cancel,
+                    );
+                    include_expansion::reconcile_conditional_completeness(
+                        &mut expansion,
+                        &conditional,
+                    );
+                    if !expansion.complete && mode != SnapshotMode::Assistance {
+                        complete = false;
+                        if let Some(error) = expansion.errors.first() {
+                            incomplete_reason.get_or_insert_with(|| {
+                                format!("include expansion incomplete: {error}")
+                            });
+                        } else {
+                            incomplete_reason.get_or_insert_with(|| {
+                                "include expansion did not complete".to_string()
+                            });
+                        }
+                    }
+                    // Keep the raw expanded buffer here.  NavigationIndex
+                    // owns conditional projection and records the resulting
+                    // unknown/inactive spans; passing an already-projected
+                    // buffer would erase the information needed to fail
+                    // closed for conditional references and edits.
+                    indexed_source = expansion.expanded.text().to_owned();
+                    loader.store_expansion(&uri, source.clone(), expansion);
+                    let expanded_source_contains_candidate = candidate_names.is_empty()
+                        || contains_any_identifier(&indexed_source, candidate_names)
+                        || (mode == SnapshotMode::Assistance
+                            && contains_any_identifier_prefix(&indexed_source, candidate_names));
+                    if expanded_source_contains_candidate {
+                        if let Some(expansion) = loader.expansions.get(&uri).cloned() {
+                            retain_expansion_dependencies(
+                                &mut loader,
+                                input,
+                                &uri,
+                                &source_context_key,
+                                &expansion,
+                                &mut sources,
+                                &mut records,
+                                &mut readable,
+                                &mut editable,
+                                &mut contexts,
+                                &mut baseline,
+                                &mut baseline_content_hashes,
+                                &mut retained_files,
+                                &mut retained_bytes,
+                                &mut complete,
+                                &mut incomplete_reason,
+                                cancel,
+                            )?;
+                        }
+                    }
+                }
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(error) => {
+                    complete = false;
+                    incomplete_reason
+                        .get_or_insert_with(|| format!("include expansion failed: {error}"));
+                }
+            }
+        }
         let should_index = is_priority
             || candidate_names.is_empty()
-            || contains_any_identifier(&source, candidate_names);
+            || contains_any_identifier(&indexed_source, candidate_names)
+            || (mode == SnapshotMode::Assistance
+                && contains_any_identifier_prefix(&indexed_source, candidate_names));
         if !should_index {
             let owner_directives = directives(&source);
             if owner_directives
@@ -2947,7 +4126,7 @@ pub(crate) fn build_snapshot(
         index
             .update_with_defines_and_cached_with_cancel(
                 uri.clone(),
-                source.clone(),
+                indexed_source.clone(),
                 &defines,
                 cached,
                 cancel,
@@ -2956,7 +4135,7 @@ pub(crate) fn build_snapshot(
         retained_files = retained_files.saturating_add(1);
         retained_bytes = retained_bytes.saturating_add(source_bytes);
         indexed_uris.insert(uri.clone());
-        indexed_sizes.insert(uri.clone(), source.len());
+        indexed_sizes.insert(uri.clone(), indexed_source.len());
         if let Some(stamp) = record.stamp.clone() {
             indexed_stamps.insert(uri.clone(), stamp);
         }
@@ -2975,11 +4154,16 @@ pub(crate) fn build_snapshot(
             "rename workspace source scan was empty; no Pascal sources were retained".to_string(),
         );
     }
+    for providers in auto_import_unit_providers.values_mut() {
+        providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        providers.dedup();
+    }
     for (uri, context_key) in &contexts {
         loader
             .document_contexts
             .insert(uri.clone(), context_key.clone());
     }
+    index.set_auto_import_unit_providers(auto_import_unit_providers.clone());
     loader.index = index;
     loader.indexed_files = indexed_uris.clone();
     loader.indexed_sizes = indexed_sizes;
@@ -3028,7 +4212,92 @@ pub(crate) fn build_snapshot(
             });
         }
     }
+    if mode == SnapshotMode::Assistance {
+        if let Some(current_uri) = priority.first() {
+            let Some(context_key) = priority_contexts.get(current_uri).cloned() else {
+                auto_import_unit_providers.clear();
+                loader
+                    .index
+                    .set_auto_import_unit_providers(auto_import_unit_providers.clone());
+                return Err(format!(
+                    "auto-import provider context was not retained for {current_uri}"
+                ));
+            };
+            retain_resolvable_auto_import_providers(
+                &mut loader,
+                current_uri,
+                &context_key,
+                &mut auto_import_unit_providers,
+                &mut pins,
+                candidate_names,
+                cancel,
+            )?;
+            loader
+                .index
+                .set_auto_import_unit_providers(auto_import_unit_providers.clone());
+        }
+    }
+    if mode == SnapshotMode::Assistance {
+        if let Some(current_uri) = priority.first() {
+            if let Some(record) = records.get_mut(current_uri) {
+                record.auto_import_scopes = assistance_auto_import_scopes(
+                    &loader,
+                    &priority_contexts,
+                    &auto_import_unit_providers,
+                    candidate_names,
+                );
+            }
+        }
+    }
+    let auto_import_context = if mode == SnapshotMode::Assistance {
+        match (
+            priority.first(),
+            priority_seed
+                .as_ref()
+                .and_then(|seed| seed.completion_position),
+        ) {
+            (Some(current_uri), Some(position)) => loader
+                .index
+                .completion_context_may_auto_import(current_uri, position, cancel)?,
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let retain_auto_import_observations = auto_import_context
+        && priority.first().is_some_and(|current_uri| {
+            records
+                .get(current_uri)
+                .is_some_and(|record| !record.auto_import_scopes.is_empty())
+        });
+    if retain_auto_import_observations {
+        for observation in auto_import_provider_observations {
+            let key = path_key(&observation.path);
+            baseline_content_hashes
+                .entry(key.clone())
+                .or_insert(observation.content_hash);
+            baseline.set_payload_dependency(
+                &observation.path,
+                observation.read_policy,
+                observation.path_entry,
+            );
+            auto_import_observation_paths.insert(key);
+        }
+    }
+    if mode == SnapshotMode::Assistance && !complete {
+        loader.index.set_auto_import_discovery_complete(false);
+    }
 
+    // A source-bearing include is represented by each owning virtual root.
+    // Keeping the same physical fragment as an additional standalone parsed
+    // document makes strict rename/reference scans treat root-visible names as
+    // unresolved in the fragment's isolated scope.  Retain its physical text
+    // and records for mapping/revalidation, but remove the standalone parser
+    // document whenever an owning expansion proved the dependency.
+    let included_uris = loader.include_parents.keys().cloned().collect::<Vec<_>>();
+    for included_uri in included_uris {
+        loader.index.remove(&included_uri);
+    }
     let indexed_uris = loader.indexed_files.clone();
     for uri in indexed_uris {
         if records.contains_key(&uri) {
@@ -3050,6 +4319,7 @@ pub(crate) fn build_snapshot(
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    parsed_text_hash: Some(text_content_hash(&overlay.text)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: None,
@@ -3057,6 +4327,9 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     directory_observation: false,
+                    missing_provider_scope: None,
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
                 },
             )
         } else {
@@ -3075,13 +4348,14 @@ pub(crate) fn build_snapshot(
                 source.clone(),
                 SourceRecord {
                     uri: uri.clone(),
-                    text: source,
+                    text: source.clone(),
                     version: None,
                     stamp: Some(stamp),
                     open: false,
                     path: None,
                     path_stamp: None,
                     content_hash: None,
+                    parsed_text_hash: Some(text_content_hash(&source)),
                     content_bytes: None,
                     candidate_membership: None,
                     read_policy: None,
@@ -3089,6 +4363,9 @@ pub(crate) fn build_snapshot(
                     include_payload: false,
                     missing_provider_candidate: false,
                     directory_observation: false,
+                    missing_provider_scope: None,
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
                 },
             )
         };
@@ -3107,6 +4384,7 @@ pub(crate) fn build_snapshot(
                 cancel,
                 true,
             )?;
+            record.content_hash = baseline_content_hashes.get(&path_key(&path)).copied();
             record.read_policy = Some(read_policy);
             record.path_entry = Some(path_entry);
         }
@@ -3185,7 +4463,7 @@ pub(crate) fn build_snapshot(
             cancel,
         )?;
     }
-    let baseline_records = baseline
+    let mut baseline_records = baseline
         .paths
         .into_iter()
         .filter_map(|baseline| {
@@ -3204,11 +4482,17 @@ pub(crate) fn build_snapshot(
             )
         })
         .collect::<Vec<_>>();
-
+    for record in &mut baseline_records {
+        record.auto_import_provider_observation = record
+            .path
+            .as_ref()
+            .is_some_and(|path| auto_import_observation_paths.contains(&path_key(path)));
+    }
     Ok(RenameSnapshot {
         index: loader.index,
         sources,
         records,
+        expansions: loader.expansions,
         readable,
         editable,
         complete,
@@ -3217,6 +4501,206 @@ pub(crate) fn build_snapshot(
         baseline_records,
         mode,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_expansion_dependencies(
+    loader: &mut Workspace,
+    input: &WorkspaceInput,
+    root_uri: &Url,
+    context_key: &ContextKey,
+    expansion: &super::ExpansionRecord,
+    sources: &mut HashMap<Url, String>,
+    records: &mut HashMap<Url, SourceRecord>,
+    readable: &mut HashSet<Url>,
+    editable: &mut HashSet<Url>,
+    contexts: &mut HashMap<Url, ContextKey>,
+    baseline: &mut BaselineAccumulator,
+    baseline_content_hashes: &mut HashMap<String, u64>,
+    retained_files: &mut usize,
+    retained_bytes: &mut usize,
+    complete: &mut bool,
+    incomplete_reason: &mut Option<String>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let dependency_entries = expansion.dependency_entries.clone();
+    let mut dependencies = expansion
+        .source_texts
+        .iter()
+        .filter(|(uri, _)| *uri != root_uri)
+        .map(|(uri, source)| (uri.clone(), source.clone()))
+        .collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+
+    for (uri, source) in dependencies {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if records.contains_key(&uri) {
+            if sources
+                .get(&uri)
+                .is_some_and(|existing| existing != &source)
+            {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} was observed under conflicting contexts")
+                });
+            }
+            continue;
+        }
+        let path = uri
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include source is not a file URI: {uri}"))?;
+        let (read_policy, path_entry) = if let Some(path_entry) = dependency_entries.get(&uri) {
+            let Some(context) = loader.contexts.get(context_key).map(|state| &state.context) else {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} has no retained project context")
+                });
+                continue;
+            };
+            (context.read_policy.clone(), path_entry.clone())
+        } else {
+            match snapshot_payload_dependency(loader, context_key, &path) {
+                Ok(value) => value,
+                Err(error) if loader.accepts_path(&path) => {
+                    let Some(context) =
+                        loader.contexts.get(context_key).map(|state| &state.context)
+                    else {
+                        *complete = false;
+                        incomplete_reason.get_or_insert(error);
+                        continue;
+                    };
+                    (
+                        context.read_policy.clone(),
+                        ProjectPathEntry {
+                            path: path.clone(),
+                            provenance: ProjectPathProvenance::LegacyNative,
+                        },
+                    )
+                }
+                Err(error) => {
+                    *complete = false;
+                    incomplete_reason.get_or_insert(error);
+                    continue;
+                }
+            }
+        };
+        contexts.insert(uri.clone(), context_key.clone());
+        loader
+            .document_contexts
+            .insert(uri.clone(), context_key.clone());
+
+        let record = if let Some(document) = loader.open_documents.get(&uri) {
+            let Some(open_source) = document.text.as_ref() else {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} was rejected and cannot be retained")
+                });
+                continue;
+            };
+            if open_source != &source {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} changed during expansion")
+                });
+                continue;
+            }
+            SourceRecord {
+                uri: uri.clone(),
+                text: source.clone(),
+                version: Some(document.version),
+                stamp: None,
+                open: true,
+                path: None,
+                path_stamp: None,
+                content_hash: None,
+                parsed_text_hash: Some(text_content_hash(&source)),
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: Some(read_policy.clone()),
+                path_entry: Some(path_entry.clone()),
+                include_payload: false,
+                missing_provider_candidate: false,
+                directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            }
+        } else {
+            let allow_legacy_payload =
+                matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
+            let disk = match read_disk_source(
+                &path,
+                input.options.limits.max_file_bytes,
+                &read_policy,
+                &path_entry,
+                allow_legacy_payload,
+            ) {
+                Ok(disk) => disk,
+                Err(error) => {
+                    *complete = false;
+                    incomplete_reason.get_or_insert_with(|| {
+                        format!("could not re-read include source {uri}: {error}")
+                    });
+                    continue;
+                }
+            };
+            if disk.text != source {
+                *complete = false;
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("include source {uri} changed during expansion")
+                });
+                continue;
+            }
+            baseline.set_include_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            baseline_content_hashes.insert(path_key(&path), disk.content_hash);
+            SourceRecord {
+                uri: uri.clone(),
+                text: source.clone(),
+                version: None,
+                stamp: Some(disk.stamp),
+                open: false,
+                path: None,
+                path_stamp: None,
+                content_hash: Some(disk.content_hash),
+                parsed_text_hash: Some(text_content_hash(&source)),
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: Some(read_policy.clone()),
+                path_entry: Some(path_entry.clone()),
+                include_payload: true,
+                missing_provider_candidate: false,
+                directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            }
+        };
+
+        if *retained_files >= input.options.limits.max_files
+            || retained_bytes.saturating_add(source.len()) > input.options.limits.max_total_bytes
+        {
+            *complete = false;
+            incomplete_reason.get_or_insert_with(|| {
+                "retained source limits were reached while retaining include dependencies"
+                    .to_string()
+            });
+            continue;
+        }
+        *retained_files = retained_files.saturating_add(1);
+        *retained_bytes = retained_bytes.saturating_add(source.len());
+        if is_readable_source_for_context(loader, &path, Some(context_key)) {
+            readable.insert(uri.clone());
+        }
+        if is_editable_source_path(loader, &path) {
+            editable.insert(uri.clone());
+        }
+        sources.insert(uri.clone(), source);
+        records.insert(uri, record);
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
@@ -3235,26 +4719,177 @@ pub(crate) fn ensure_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), S
             .incomplete_reason
             .as_deref()
             .unwrap_or("bounded source discovery did not finish");
+        if snapshot
+            .sources
+            .get(uri)
+            .is_some_and(|source| may_contain_include_directive(source.as_bytes()))
+        {
+            return Err(format!(
+                "rename workspace scan incomplete: include dependency analysis is incomplete: {reason}"
+            ));
+        }
         return Err(format!("rename workspace scan incomplete: {reason}"));
     }
     Ok(())
 }
 
-fn enumerate_sources(
+fn assistance_auto_import_scopes(
     workspace: &Workspace,
+    priority_contexts: &HashMap<Url, ContextKey>,
+    providers: &HashMap<String, Vec<Url>>,
+    candidate_prefixes: &[String],
+) -> Vec<AutoImportProviderScope> {
+    if providers.is_empty() || candidate_prefixes.is_empty() {
+        return Vec::new();
+    }
+    let mut provider_units = providers
+        .iter()
+        .filter(|(_, candidates)| {
+            candidates.iter().any(|uri| {
+                workspace.index.source_text(uri).is_some_and(|source| {
+                    contains_any_identifier_prefix(source, candidate_prefixes)
+                })
+            })
+        })
+        .map(|(unit, _)| unit.clone())
+        .collect::<Vec<_>>();
+    provider_units.sort();
+    provider_units.dedup();
+    if provider_units.is_empty() {
+        return Vec::new();
+    }
+    let mut contexts = priority_contexts.values().cloned().collect::<Vec<_>>();
+    contexts.sort_by_key(|key| format!("{key:?}"));
+    contexts.dedup();
+    let mut scopes = Vec::new();
+    for context_key in contexts {
+        let Some(context) = workspace
+            .contexts
+            .get(&context_key)
+            .map(|state| &state.context)
+        else {
+            continue;
+        };
+        let mut roots = context.search_paths.clone();
+        roots.extend(
+            context
+                .main_source_entry
+                .iter()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        roots.extend(
+            context
+                .explicit_unit_entries
+                .values()
+                .flatten()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        roots.extend(mapped_source_roots(context));
+        if roots.is_empty() {
+            roots.extend(
+                workspace
+                    .roots
+                    .iter()
+                    .flat_map(|root| root.source_roots.iter().cloned()),
+            );
+        }
+        roots.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        roots.dedup_by(|left, right| paths_equal_ci(left, right));
+        for root in roots {
+            let root = absolute_path(root);
+            let path_entry = context
+                .search_path_entries
+                .iter()
+                .find(|entry| paths_equal_ci(&entry.path, &root))
+                .cloned()
+                .or_else(|| super::context_path_entry(context, &root))
+                .unwrap_or_else(|| ProjectPathEntry {
+                    path: root.clone(),
+                    provenance: ProjectPathProvenance::Configured,
+                });
+            scopes.push(AutoImportProviderScope {
+                root,
+                provider_units: provider_units.clone(),
+                candidate_prefixes: candidate_prefixes.to_vec(),
+                read_policy: context.read_policy.clone(),
+                path_entry,
+            });
+        }
+    }
+    scopes
+}
+
+fn retain_resolvable_auto_import_providers(
+    loader: &mut Workspace,
+    current_uri: &Url,
+    context_key: &ContextKey,
+    providers: &mut HashMap<String, Vec<Url>>,
+    pinned: &mut HashSet<Url>,
+    candidate_names: &[String],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let Some(context) = loader
+        .contexts
+        .get(context_key)
+        .map(|state| state.context.clone())
+    else {
+        providers.clear();
+        return Ok(());
+    };
+    let names = providers.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Some(candidates) = providers.get(&name) else {
+            continue;
+        };
+        if candidates.len() != 1 {
+            providers.remove(&name);
+            continue;
+        }
+        let expected = candidates[0].clone();
+        let has_candidate_prefix = candidates.iter().any(|uri| {
+            loader
+                .index
+                .source_text(uri)
+                .is_some_and(|source| contains_any_identifier_prefix(source, candidate_names))
+        });
+        if !has_candidate_prefix {
+            continue;
+        }
+        let lookup_name = super::aliased_unit_name(&context, &name);
+        let resolved = loader.resolve_unit_with_cancel(
+            current_uri,
+            &name,
+            &lookup_name,
+            &context,
+            context_key,
+            pinned,
+            Some(cancel),
+        )?;
+        if resolved.as_ref() != Some(&expected) {
+            providers.remove(&name);
+        }
+    }
+    Ok(())
+}
+
+fn enumerate_sources(
+    workspace: &mut Workspace,
     input: &WorkspaceInput,
     priority: &[Url],
+    priority_contexts: &HashMap<Url, ContextKey>,
+    candidate_names: &[String],
     mode: SnapshotMode,
     cancel: &AtomicBool,
 ) -> Result<Enumeration, String> {
     let mut result = Enumeration {
         complete: true,
+        auto_import_complete: true,
         ..Enumeration::default()
     };
-    if matches!(
-        mode,
-        SnapshotMode::Local | SnapshotMode::LocalWithImports | SnapshotMode::Assistance
-    ) {
+    if matches!(mode, SnapshotMode::Local | SnapshotMode::LocalWithImports) {
         for uri in priority {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -3275,6 +4910,78 @@ fn enumerate_sources(
                 add_baseline_path(&mut result.baseline, path.clone());
                 result.add_path(path, None);
             }
+        }
+        if priority.iter().any(|uri| {
+            uri.to_file_path().ok().is_some_and(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("inc"))
+            })
+        }) {
+            let root_paths = workspace
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>();
+            for root_path in root_paths {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                let catalogue =
+                    workspace.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
+                if !catalogue.complete {
+                    result.complete = false;
+                    result.reason.get_or_insert_with(|| {
+                        format!(
+                            "include owner discovery was incomplete under {}",
+                            root_path.display()
+                        )
+                    });
+                }
+                for (directory, stamp) in catalogue.directories {
+                    add_baseline_path_with_stamp(&mut result.baseline, directory, stamp);
+                }
+                let mut owner_paths = catalogue
+                    .entries
+                    .into_values()
+                    .flatten()
+                    .map(absolute_path)
+                    .collect::<Vec<_>>();
+                owner_paths.sort_by_key(|path| path_key(path));
+                owner_paths.dedup_by(|left, right| paths_equal_ci(left, right));
+                if owner_paths.len() > MAX_RENAME_INCLUDE_OWNER_DISCOVERY {
+                    result.complete = false;
+                    result.reason.get_or_insert_with(|| {
+                        format!(
+                            "include owner discovery limit ({MAX_RENAME_INCLUDE_OWNER_DISCOVERY}) reached under {}",
+                            root_path.display()
+                        )
+                    });
+                }
+                for path in owner_paths
+                    .into_iter()
+                    .take(MAX_RENAME_INCLUDE_OWNER_DISCOVERY)
+                {
+                    if is_cancelled(cancel) {
+                        return Err(CANCELLATION_MESSAGE.to_string());
+                    }
+                    if workspace.accepts_path(&path) && is_safe_source_path(workspace, &path) {
+                        add_baseline_path(&mut result.baseline, path.clone());
+                        result.add_path(path, None);
+                    }
+                }
+            }
+        }
+        return Ok(result);
+    }
+    if mode == SnapshotMode::Assistance {
+        if !candidate_names.is_empty() {
+            enumerate_assistance_provider_sources(
+                workspace,
+                input,
+                priority_contexts,
+                &mut result,
+                cancel,
+            )?;
         }
         return Ok(result);
     }
@@ -3393,6 +5100,133 @@ fn enumerate_sources(
     result.sort_paths(priority);
 
     Ok(result)
+}
+
+fn enumerate_assistance_provider_sources(
+    workspace: &mut Workspace,
+    input: &WorkspaceInput,
+    priority_contexts: &HashMap<Url, ContextKey>,
+    enumeration: &mut Enumeration,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut contexts = priority_contexts.values().cloned().collect::<Vec<_>>();
+    contexts.sort_by_key(|key| format!("{key:?}"));
+    contexts.dedup();
+
+    for context_key in contexts {
+        let Some(context) = workspace
+            .contexts
+            .get(&context_key)
+            .map(|state| state.context.clone())
+        else {
+            enumeration.auto_import_complete = false;
+            continue;
+        };
+        let mut context_roots = context.search_paths.clone();
+        context_roots.extend(
+            context
+                .main_source_entry
+                .iter()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        context_roots.extend(
+            context
+                .explicit_unit_entries
+                .values()
+                .flatten()
+                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+        );
+        context_roots.extend(mapped_source_roots(&context));
+        if context_roots.is_empty() {
+            context_roots.extend(
+                workspace
+                    .roots
+                    .iter()
+                    .flat_map(|root| root.source_roots.iter().cloned()),
+            );
+        }
+        context_roots.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        context_roots.dedup_by(|left, right| paths_equal_ci(left, right));
+
+        for root in context_roots {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            let root = absolute_path(root);
+            let catalogue = workspace.filename_catalogue_with_cancel(&root, Some(cancel))?;
+            if !catalogue.complete {
+                enumeration.auto_import_complete = false;
+            }
+            for (directory, stamp) in catalogue.directories {
+                add_baseline_path_with_stamp(&mut enumeration.baseline, directory, stamp);
+            }
+            let mut provider_paths = catalogue
+                .entries
+                .into_values()
+                .flatten()
+                .map(absolute_path)
+                .collect::<Vec<_>>();
+            provider_paths.sort_by_key(|left| path_key(left));
+            provider_paths.dedup_by(|left, right| paths_equal_ci(left, right));
+            for path in provider_paths {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                    enumeration.auto_import_complete = false;
+                    return Ok(());
+                }
+                if !is_pascal_path(&path)
+                    || !workspace.ensure_supported_project_context(
+                        &path,
+                        &context,
+                        Some(&context_key),
+                    )
+                {
+                    continue;
+                }
+                enumeration.add_path(path, Some(context_key.clone()));
+            }
+
+            let mut overlay_paths = Vec::new();
+            for (uri, overlay) in &input.overlays {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                let Some(path) = uri.to_file_path().ok() else {
+                    continue;
+                };
+                overlay_paths.push((absolute_path(path), overlay.text.len()));
+            }
+            overlay_paths.sort_by(|left, right| path_key(&left.0).cmp(&path_key(&right.0)));
+            overlay_paths.dedup_by(|left, right| paths_equal_ci(&left.0, &right.0));
+            for (path, overlay_bytes) in overlay_paths {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                if !is_pascal_path(&path)
+                    || !path_starts_with_native(&path, &root)
+                    || !workspace.ensure_supported_project_context(
+                        &path,
+                        &context,
+                        Some(&context_key),
+                    )
+                {
+                    continue;
+                }
+                if overlay_bytes > input.options.limits.max_file_bytes {
+                    enumeration.auto_import_complete = false;
+                    continue;
+                }
+                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                    enumeration.auto_import_complete = false;
+                    return Ok(());
+                }
+                enumeration.add_path(path, Some(context_key.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn add_baseline_path(baseline: &mut BaselineAccumulator, path: PathBuf) {
@@ -3793,6 +5627,27 @@ struct IncludeAuditResult {
     incomplete_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum IncludeRoute {
+    Legacy,
+    Mapped { root: PathBuf },
+}
+
+#[derive(Debug)]
+struct IncludeLookup {
+    observations: Vec<IncludeObservation>,
+    selected: Option<PathBuf>,
+    selected_directory: Option<PathBuf>,
+    selected_route: IncludeRoute,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IncludeObservation {
+    path: PathBuf,
+    stamp: Option<PathStamp>,
+}
+
 #[derive(Debug, Clone)]
 struct IncludeAnalysis {
     safe: bool,
@@ -3857,6 +5712,14 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
     for uri in uris {
         if auditor.stopped {
             break;
+        }
+        // Expansion already audited this physical include through each owning
+        // virtual root.  Auditing it again as a standalone document loses the
+        // owner's legacy route (which is intentionally scoped to the source's
+        // sibling directory) and can falsely report a nested include as
+        // unresolved.
+        if auditor.loader.include_parents.contains_key(&uri) {
+            continue;
         }
         if is_cancelled(auditor.cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -4259,7 +6122,7 @@ impl IncludeAuditor<'_> {
             legacy_route,
         };
         let analysis = self.inspect_include_file(&source, inspection, 0)?;
-        if !analysis.safe || analysis.relevant {
+        if !analysis.safe || (analysis.relevant && self.name_free_assistance) {
             let reason = analysis
                 .reason
                 .unwrap_or_else(|| format!("include {:?} contains source content", source.path));
@@ -4348,12 +6211,6 @@ impl IncludeAuditor<'_> {
             ));
         }
         let path = &source.path;
-        let cache_key = include_cache_key(
-            path,
-            inspection.context_key,
-            inspection.owner_path,
-            inspection.legacy_route.as_ref(),
-        );
         let active_key = canonical_include_key(path);
         if self.active.contains(&active_key) {
             return Ok(IncludeAnalysis::unsafe_with_reason(
@@ -4361,6 +6218,12 @@ impl IncludeAuditor<'_> {
                 false,
             ));
         }
+        let cache_key = include_cache_key(
+            path,
+            inspection.context_key,
+            inspection.owner_path,
+            inspection.legacy_route.as_ref(),
+        );
         if let Some(analysis) = self.cache.get(&cache_key) {
             return Ok(analysis.clone());
         }
@@ -4435,6 +6298,12 @@ impl IncludeAuditor<'_> {
             conditional.potentially_active_contains_identifier(&include_text, self.candidate_names)
                 || conditional.pascal_condition_contains_identifier(self.candidate_names)
         };
+        let conditional_candidate_is_uncertain = !self.name_free_assistance
+            && (self
+                .candidate_names
+                .iter()
+                .any(|name| conditional.unknown_contains_identifier(&include_text, name))
+                || conditional.pascal_condition_contains_identifier(self.candidate_names));
         let include_directives = conditional
             .directives
             .iter()
@@ -4455,6 +6324,16 @@ impl IncludeAuditor<'_> {
         } else if !conditional.complete {
             IncludeAnalysis::unsafe_with_reason(
                 format!("include {path:?} has malformed or incomplete conditional directives"),
+                relevant,
+            )
+        } else if conditional.unknown_activity_requires_fail_closed() {
+            IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has unknown source activity"),
+                relevant,
+            )
+        } else if conditional_candidate_is_uncertain {
+            IncludeAnalysis::unsafe_with_reason(
+                format!("include {path:?} has conditional compilation affecting the rename"),
                 relevant,
             )
         } else if conditional.directives.iter().any(|directive| {
@@ -4493,7 +6372,7 @@ impl IncludeAuditor<'_> {
                     inspection.legacy_route.clone(),
                     depth,
                 )?;
-                if !child.safe || child.relevant {
+                if !child.safe || (child.relevant && self.name_free_assistance) {
                     self.stopped = true;
                     nested = Some(IncludeAnalysis::unsafe_with_reason(
                         child
@@ -4506,7 +6385,7 @@ impl IncludeAuditor<'_> {
             }
             self.active.remove(&active_key);
             nested.unwrap_or_else(|| {
-                if relevant {
+                if self.name_free_assistance && relevant {
                     IncludeAnalysis::unsafe_with_reason(
                         format!("include {path:?} contains source content"),
                         true,
@@ -4609,6 +6488,142 @@ fn projected_source_contains_pascal_tokens(source: &str) -> bool {
     false
 }
 
+fn include_search_directories(owner_path: &Path, context: Option<&ProjectContext>) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(parent) = absolute_path(owner_path.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf)
+    {
+        add_include_directory(&mut directories, parent);
+    }
+    if let Some(context) = context {
+        for path in &context.include_paths {
+            add_include_directory(&mut directories, path.clone());
+        }
+        for path in &context.search_paths {
+            add_include_directory(&mut directories, path.clone());
+        }
+    }
+    directories
+}
+
+fn add_include_directory(directories: &mut Vec<PathBuf>, path: PathBuf) {
+    let path = absolute_path(path);
+    if !directories
+        .iter()
+        .any(|existing| path_key(existing) == path_key(&path))
+    {
+        directories.push(path);
+    }
+}
+
+fn is_readable_include_for_context(
+    workspace: &Workspace,
+    path: &Path,
+    context_key: &ContextKey,
+    context: &ProjectContext,
+    route: &IncludeRoute,
+    legacy_authorized: bool,
+) -> bool {
+    let path = absolute_path(path.to_path_buf());
+    if let IncludeRoute::Mapped { root } = route {
+        return workspace.mapped_path_is_readable_under_root(&path, root, context_key);
+    }
+    let mapped_roots = context_key
+        .overrides
+        .read_roots()
+        .into_iter()
+        .map(|root| super::native_mapping_root(&root))
+        .collect::<Vec<_>>();
+    if mapped_roots
+        .iter()
+        .any(|root| path_starts_with_native(&path, root))
+    {
+        return workspace.mapped_path_is_readable(&path, context_key);
+    }
+
+    workspace.accepts_path(&path)
+        || context.search_path_entries.iter().any(|entry| {
+            if !path_starts_with_native(&path, &entry.path) {
+                return false;
+            }
+            match &entry.provenance {
+                ProjectPathProvenance::Mapped { root } => {
+                    workspace.mapped_path_is_readable_under_root(&path, root, context_key)
+                }
+                ProjectPathProvenance::Configured => false,
+                ProjectPathProvenance::LegacyNative => true,
+            }
+        })
+        || context.include_path_entries.iter().any(|entry| {
+            if !path_starts_with_native(&path, &entry.path) {
+                return false;
+            }
+            match &entry.provenance {
+                ProjectPathProvenance::Mapped { root } => {
+                    workspace.mapped_path_is_readable_under_root(&path, root, context_key)
+                }
+                ProjectPathProvenance::Configured => false,
+                ProjectPathProvenance::LegacyNative => true,
+            }
+        })
+        || legacy_authorized
+}
+
+fn legacy_include_is_authorized(
+    workspace: &Workspace,
+    context: &ProjectContext,
+    owner_path: &Path,
+    selected_directory: Option<&Path>,
+    relative: bool,
+) -> bool {
+    owner_has_legacy_or_workspace_authority(workspace, owner_path, context)
+        && (!relative
+            || selected_directory.is_some_and(|directory| {
+                owner_path
+                    .parent()
+                    .is_some_and(|parent| path_key(parent) == path_key(directory))
+                    || legacy_search_entry_selected(context, Some(directory))
+            }))
+}
+
+fn inherited_legacy_authorization(
+    inherited: bool,
+    owner_path: &Path,
+    directive: &Directive,
+    selected_directory: Option<&Path>,
+    context: &ProjectContext,
+) -> bool {
+    if !inherited {
+        return legacy_search_entry_selected(context, selected_directory);
+    }
+    if !include_name(directive).is_some_and(|raw| Path::new(&raw).is_relative()) {
+        return true;
+    }
+    selected_directory.is_some_and(|directory| {
+        owner_path
+            .parent()
+            .is_some_and(|parent| path_key(parent) == path_key(directory))
+            || legacy_search_entry_selected(context, Some(directory))
+    })
+}
+
+fn legacy_search_entry_selected(
+    context: &ProjectContext,
+    selected_directory: Option<&Path>,
+) -> bool {
+    selected_directory.is_some_and(|directory| {
+        context
+            .search_path_entries
+            .iter()
+            .chain(context.include_path_entries.iter())
+            .any(|entry| {
+                path_key(&entry.path) == path_key(directory)
+                    && matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+            })
+    })
+}
+
 fn include_cache_key(
     path: &Path,
     context_key: &ContextKey,
@@ -4665,6 +6680,243 @@ fn canonical_include_key(path: &Path) -> String {
         .unwrap_or_else(|_| path_key(path))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+fn resolve_include_path(directive: &Directive, directories: &[PathBuf]) -> IncludeLookup {
+    resolve_include_path_with_overrides(directive, directories, &EffectiveOverrides::default())
+}
+
+#[allow(dead_code)]
+fn resolve_include_path_with_overrides(
+    directive: &Directive,
+    directories: &[PathBuf],
+    overrides: &EffectiveOverrides,
+) -> IncludeLookup {
+    resolve_include_path_with_overrides_and_overlay(directive, directories, overrides, |_| false)
+}
+
+fn resolve_include_path_with_overrides_and_overlay(
+    directive: &Directive,
+    directories: &[PathBuf],
+    overrides: &EffectiveOverrides,
+    has_overlay: impl Fn(&Path) -> bool,
+) -> IncludeLookup {
+    let Some(raw) = include_name(directive) else {
+        return IncludeLookup {
+            observations: Vec::new(),
+            selected: None,
+            selected_directory: None,
+            selected_route: IncludeRoute::Legacy,
+            error: None,
+        };
+    };
+
+    let mut observations = Vec::new();
+    let mut selected = None;
+    let mut selected_directory = None;
+    let mut selected_route = IncludeRoute::Legacy;
+    let mut error = None;
+    for directory in directories {
+        observations.push(IncludeObservation {
+            path: directory.clone(),
+            stamp: path_stamp(directory),
+        });
+        let (candidate, route) = match overrides.resolve_path(&raw, directory) {
+            Ok(resolved) => {
+                let route = resolved
+                    .mapping
+                    .as_ref()
+                    .map_or(IncludeRoute::Legacy, |mapping| IncludeRoute::Mapped {
+                        root: super::native_mapping_root(&mapping.to),
+                    });
+                (absolute_path(resolved.path), route)
+            }
+            Err(resolve_error) => {
+                error = Some(resolve_error);
+                break;
+            }
+        };
+        if observations
+            .iter()
+            .any(|observation| path_key(&observation.path) == path_key(&candidate))
+        {
+            continue;
+        }
+        let metadata = fs::metadata(&candidate);
+        let stamp = path_stamp(&candidate);
+        observations.push(IncludeObservation {
+            path: candidate.clone(),
+            stamp,
+        });
+        if has_overlay(&candidate) {
+            selected = Some(candidate);
+            selected_directory = Some(directory.clone());
+            selected_route = route;
+            break;
+        }
+        match metadata {
+            Ok(metadata) if metadata.is_file() => {
+                selected = Some(candidate);
+                selected_directory = Some(directory.clone());
+                selected_route = route;
+                break;
+            }
+            Ok(_) => {}
+            Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
+                let case_lookup = resolve_case_insensitive_include_path(&candidate);
+                observations.extend(case_lookup.observations);
+                if let Some(case_error) = case_lookup.error {
+                    error = Some(case_error);
+                    break;
+                }
+                if let Some(actual) = case_lookup.selected {
+                    let actual_metadata = fs::metadata(&actual);
+                    observations.push(IncludeObservation {
+                        path: actual.clone(),
+                        stamp: path_stamp(&actual),
+                    });
+                    match actual_metadata {
+                        Ok(metadata) if metadata.is_file() => {
+                            selected = Some(actual);
+                            selected_directory = Some(directory.clone());
+                            selected_route = route;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(io_error) => {
+                            error = Some(format!("{}: {io_error}", actual.display()));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(io_error) => {
+                error = Some(format!("{}: {io_error}", candidate.display()));
+                break;
+            }
+        }
+    }
+    IncludeLookup {
+        observations,
+        selected,
+        selected_directory,
+        selected_route,
+        error,
+    }
+}
+
+#[derive(Debug)]
+struct CaseInsensitiveIncludeLookup {
+    observations: Vec<IncludeObservation>,
+    selected: Option<PathBuf>,
+    error: Option<String>,
+}
+
+fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeLookup {
+    let absolute = absolute_path(path.to_path_buf());
+    let mut base = absolute.clone();
+    while !base.exists() {
+        if !base.pop() {
+            base = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+            break;
+        }
+    }
+    let relative = absolute
+        .strip_prefix(&base)
+        .unwrap_or_else(|_| Path::new(""));
+    let mut current = base.clone();
+    let mut observations = Vec::new();
+    observations.push(IncludeObservation {
+        path: current.clone(),
+        stamp: path_stamp(&current),
+    });
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = current.pop();
+            }
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Normal(component) => {
+                let wanted = component.to_string_lossy();
+                let entries = match fs::read_dir(&current) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        return CaseInsensitiveIncludeLookup {
+                            observations,
+                            selected: None,
+                            error: Some(format!(
+                                "could not inspect {} while resolving case-insensitive include: {error}",
+                                current.display()
+                            )),
+                        };
+                    }
+                };
+                let mut matches = entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&wanted)
+                            .then_some(entry.path())
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() > 1 {
+                    return CaseInsensitiveIncludeLookup {
+                        observations,
+                        selected: None,
+                        error: Some(format!(
+                            "ambiguous case-insensitive include path component {wanted:?} under {}",
+                            current.display()
+                        )),
+                    };
+                }
+                let Some(next) = matches.pop() else {
+                    observations.push(IncludeObservation {
+                        path: current.join(component),
+                        stamp: None,
+                    });
+                    return CaseInsensitiveIncludeLookup {
+                        observations,
+                        selected: None,
+                        error: None,
+                    };
+                };
+                let stamp = match next.metadata() {
+                    Ok(_) => path_stamp(&next),
+                    Err(error) => {
+                        observations.push(IncludeObservation {
+                            path: next.clone(),
+                            stamp: None,
+                        });
+                        return CaseInsensitiveIncludeLookup {
+                            observations,
+                            selected: None,
+                            error: Some(format!(
+                                "could not inspect {} while resolving case-insensitive include: {error}",
+                                next.display()
+                            )),
+                        };
+                    }
+                };
+                observations.push(IncludeObservation {
+                    path: next.clone(),
+                    stamp,
+                });
+                current = next;
+            }
+        }
+    }
+    CaseInsensitiveIncludeLookup {
+        observations,
+        selected: Some(current),
+        error: None,
+    }
+}
+
 fn include_name(directive: &Directive) -> Option<String> {
     let raw = directive
         .body
@@ -4716,6 +6968,357 @@ fn directive_keyword(body: &str) -> Option<&str> {
         .split(|character: char| character.is_ascii_whitespace() || character == ':')
         .next()
         .filter(|keyword| !keyword.is_empty())
+}
+
+#[derive(Debug, Clone)]
+struct IncludeSource {
+    text: String,
+    content_hash: u64,
+    #[allow(dead_code)]
+    bytes: usize,
+}
+
+pub(super) fn expand_source_with_workspace(
+    workspace: &Workspace,
+    root_uri: &Url,
+    source: &str,
+    context_key: &ContextKey,
+    limits: ExpansionLimits,
+    cancel: &AtomicBool,
+) -> Result<ExpansionResult, String> {
+    let context = workspace
+        .contexts
+        .get(context_key)
+        .map(|state| state.context.clone())
+        .ok_or_else(|| format!("project context was not retained for {root_uri}"))?;
+    let mut resolver = WorkspaceIncludeResolver {
+        workspace,
+        context: &context,
+        context_key,
+        max_file_bytes: workspace.options.limits.max_file_bytes,
+        max_total_bytes: workspace.options.limits.max_total_bytes,
+        legacy_authorizations: HashMap::new(),
+    };
+    include_expansion::expand_source(
+        root_uri.clone(),
+        source,
+        &context.defines,
+        &mut resolver,
+        limits,
+        cancel,
+    )
+}
+
+struct WorkspaceIncludeResolver<'a> {
+    workspace: &'a Workspace,
+    context: &'a ProjectContext,
+    context_key: &'a ContextKey,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    legacy_authorizations: HashMap<Url, bool>,
+}
+
+impl IncludeResolver for WorkspaceIncludeResolver<'_> {
+    fn resolve_include(
+        &mut self,
+        owner: &Url,
+        body: &str,
+        cancel: &AtomicBool,
+    ) -> Result<ResolvedInclude, String> {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: body.to_owned(),
+            start: 0,
+            end: body.len(),
+        };
+        let owner_path = owner
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include owner is not a file URI: {owner}"))?;
+        let directories = include_search_directories(&owner_path, Some(self.context));
+        let lookup = resolve_include_path_with_overrides_and_overlay(
+            &directive,
+            &directories,
+            &self.context.overrides,
+            |candidate| {
+                Url::from_file_path(candidate)
+                    .ok()
+                    .map(|uri| super::canonical_file_uri(&uri))
+                    .and_then(|uri| self.workspace.open_documents.get(&uri))
+                    .is_some_and(|document| document.text.is_some())
+            },
+        );
+        if let Some(error) = lookup.error.as_ref() {
+            return Err(error.clone());
+        }
+        let path = lookup
+            .selected
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "include path is unresolved".to_string())?;
+        let route = lookup.selected_route.clone();
+        let relative = include_name(&directive).is_some_and(|raw| Path::new(&raw).is_relative());
+        let legacy_authorized = if !matches!(&route, IncludeRoute::Legacy) {
+            false
+        } else if let Some(inherited) = self.legacy_authorizations.get(owner).copied() {
+            inherited_legacy_authorization(
+                inherited,
+                &owner_path,
+                &directive,
+                lookup.selected_directory.as_deref(),
+                self.context,
+            )
+        } else {
+            legacy_include_is_authorized(
+                self.workspace,
+                self.context,
+                &owner_path,
+                lookup.selected_directory.as_deref(),
+                relative,
+            )
+        };
+        if !is_readable_include_for_context(
+            self.workspace,
+            &path,
+            self.context_key,
+            self.context,
+            &route,
+            legacy_authorized,
+        ) {
+            return Err(format!(
+                "include {path:?} is outside the owning project's readable roots"
+            ));
+        }
+        let path_entry = match &route {
+            IncludeRoute::Mapped { root } => ProjectPathEntry {
+                path: path.clone(),
+                provenance: ProjectPathProvenance::Mapped { root: root.clone() },
+            },
+            IncludeRoute::Legacy => super::context_path_entry(self.context, &path)
+                .or_else(|| {
+                    legacy_authorized.then(|| ProjectPathEntry {
+                        path: path.clone(),
+                        provenance: ProjectPathProvenance::LegacyNative,
+                    })
+                })
+                .ok_or_else(|| "include has no requester-scoped read authorization".to_string())?,
+        };
+        let include_uri = Url::from_file_path(&path)
+            .map(|uri| super::canonical_file_uri(&uri))
+            .map_err(|()| format!("could not create a URI for include {path:?}"))?;
+        let mut observations = self.expansion_observations(&lookup);
+        self.legacy_authorizations
+            .insert(include_uri.clone(), legacy_authorized);
+        if let Some(document) = self.workspace.open_documents.get(&include_uri) {
+            if let Some(reason) = &document.rejection {
+                return Err(format!("include {include_uri} was rejected: {reason}"));
+            }
+            if let Some(text) = &document.text {
+                return Ok(ResolvedInclude {
+                    uri: include_uri,
+                    text: text.clone(),
+                    path_entry: Some(path_entry),
+                    observations,
+                });
+            }
+        }
+        let source = match &route {
+            IncludeRoute::Mapped { .. } => read_mapped_include(
+                &self.context.read_policy,
+                &path_entry,
+                self.max_file_bytes,
+                self.max_total_bytes,
+                cancel,
+            )?,
+            IncludeRoute::Legacy => read_include(
+                &path,
+                &self.context.read_policy,
+                &path_entry,
+                self.max_file_bytes,
+                Some(self.max_total_bytes),
+                Some(cancel),
+            )?,
+        };
+        if let Some(observation) = observations
+            .iter_mut()
+            .find(|observation| paths_equal_ci(&observation.path, &path))
+        {
+            observation.content_hash = Some(source.content_hash);
+            observation.present = true;
+        }
+        Ok(ResolvedInclude {
+            uri: include_uri,
+            text: source.text,
+            path_entry: Some(path_entry),
+            observations,
+        })
+    }
+
+    fn include_size_hint(
+        &mut self,
+        owner: &Url,
+        body: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<usize>, String> {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let directive = Directive {
+            kind: DirectiveKind::Include,
+            body: body.to_owned(),
+            start: 0,
+            end: body.len(),
+        };
+        let owner_path = owner
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include owner is not a file URI: {owner}"))?;
+        let directories = include_search_directories(&owner_path, Some(self.context));
+        let lookup = resolve_include_path_with_overrides_and_overlay(
+            &directive,
+            &directories,
+            &self.context.overrides,
+            |candidate| {
+                Url::from_file_path(candidate)
+                    .ok()
+                    .map(|uri| super::canonical_file_uri(&uri))
+                    .and_then(|uri| self.workspace.open_documents.get(&uri))
+                    .is_some_and(|document| document.text.is_some())
+            },
+        );
+        if let Some(error) = lookup.error {
+            return Err(error);
+        }
+        let Some(path) = lookup.selected else {
+            return Ok(None);
+        };
+        let Some(uri) = Url::from_file_path(&path)
+            .ok()
+            .map(|uri| super::canonical_file_uri(&uri))
+        else {
+            return Ok(None);
+        };
+        if let Some(text) = self
+            .workspace
+            .open_documents
+            .get(&uri)
+            .and_then(|document| document.text.as_ref())
+        {
+            return Ok(Some(text.len()));
+        }
+        Ok(fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| usize::try_from(metadata.len()).ok()))
+    }
+}
+
+impl WorkspaceIncludeResolver<'_> {
+    fn expansion_observations(&self, lookup: &IncludeLookup) -> Vec<ExpansionIncludeObservation> {
+        lookup
+            .observations
+            .iter()
+            .map(|observation| {
+                let overlay = Url::from_file_path(&observation.path)
+                    .ok()
+                    .map(|uri| super::canonical_file_uri(&uri))
+                    .and_then(|uri| self.workspace.open_documents.get(&uri))
+                    .and_then(|document| {
+                        document.text.as_ref().map(|text| (document.version, text))
+                    });
+                ExpansionIncludeObservation {
+                    path: observation.path.clone(),
+                    stamp: observation.stamp.clone(),
+                    present: observation.stamp.is_some() || overlay.is_some(),
+                    overlay_version: overlay.map(|(version, _)| version),
+                    content_hash: overlay.map(|(_, text)| text_content_hash(text)),
+                }
+            })
+            .collect()
+    }
+}
+
+fn read_include(
+    path: &Path,
+    read_policy: &ReadPolicy,
+    path_entry: &ProjectPathEntry,
+    max_file_bytes: usize,
+    max_total_bytes: Option<usize>,
+    cancel: Option<&AtomicBool>,
+) -> Result<IncludeSource, String> {
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let legacy_payload = matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
+    if if legacy_payload {
+        !read_policy.allows_legacy_payload_entry(path_entry)
+    } else {
+        !read_policy.allows_entry(path_entry)
+    } {
+        return Err("payload path is not authorized".to_string());
+    }
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("path is not a regular file".to_string());
+    }
+    if metadata.len() > max_file_bytes as u64 {
+        return Err(format!(
+            "file exceeds the configured per-file limit {max_file_bytes}"
+        ));
+    }
+    if max_total_bytes.is_some_and(|limit| metadata.len() > limit as u64) {
+        return Err(INCLUDE_BYTE_BUDGET_ERROR.to_string());
+    }
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let limit = max_total_bytes.map_or(max_file_bytes, |total| max_file_bytes.min(total));
+    let bytes = if legacy_payload {
+        read_policy.read_legacy_payload_bytes(path_entry, limit as u64)
+    } else {
+        read_policy.read_payload_bytes(path_entry, limit as u64)
+    }
+    .map_err(|error| error.to_string())?;
+    let byte_count = bytes.len();
+    if cancel.is_some_and(is_cancelled) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    if let Some(encoding) = unsupported_source_encoding(&bytes) {
+        return Err(format!("unsupported {encoding} source encoding"));
+    }
+    Ok(IncludeSource {
+        text: decode_bytes(&bytes).into_owned(),
+        content_hash: super::content_hash_bytes(&bytes),
+        bytes: byte_count,
+    })
+}
+
+fn read_mapped_include(
+    read_policy: &ReadPolicy,
+    path_entry: &ProjectPathEntry,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    cancel: &AtomicBool,
+) -> Result<IncludeSource, String> {
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let limit = max_file_bytes.min(max_total_bytes);
+    let bytes = read_policy.read_payload_bytes(path_entry, limit as u64)?;
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    if let Some(encoding) = unsupported_source_encoding(&bytes) {
+        return Err(format!("unsupported {encoding} source encoding"));
+    }
+    Ok(IncludeSource {
+        text: decode_bytes(&bytes).into_owned(),
+        content_hash: super::content_hash_bytes(&bytes),
+        bytes: bytes.len(),
+    })
 }
 
 fn read_record_content_bytes(
@@ -6011,6 +8614,8 @@ mod tests {
                 key: key.clone(),
                 state,
                 origin: super::super::OwnerOrigin::Inherited,
+                needs_revalidation: false,
+                follow_current_project_file: false,
                 legacy_route: None,
             },
         );
@@ -6298,6 +8903,49 @@ mod tests {
             &cancel,
         );
         assert_eq!(result.err().as_deref(), Some("request cancelled"));
+    }
+
+    #[test]
+    fn include_payload_content_hashes_reject_changed_snapshot_inputs() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let include = root.join("Body.inc");
+        let provider_source =
+            "unit Provider;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\n{$I Body.inc}\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        fs::write(&include, "{$DEFINE SAFE}\n").expect("include source");
+
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let cancel = AtomicBool::new(false);
+        let snapshot = build_snapshot(
+            &input,
+            std::slice::from_ref(&provider_uri),
+            &["badConst".to_owned(), "GoodConst".to_owned()],
+            SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("include snapshot");
+        let records = snapshot_records(&snapshot);
+        assert!(records.iter().any(|record| {
+            record.path.as_deref().is_some_and(|path| path == include) && record.include_payload
+        }));
+
+        fs::write(&include, "{$DEFINE CHANGED}\n").expect("changed include source");
+        let error = revalidate_input(&input, &records, &cancel)
+            .expect_err("changed include payload must stale the snapshot");
+        assert!(
+            error.contains("Body.inc") || error.contains("changed"),
+            "unexpected include revalidation error: {error}"
+        );
     }
 
     #[test]
@@ -7160,6 +9808,7 @@ mod tests {
             path: Some(include.clone()),
             path_stamp: None,
             content_hash: Some(1),
+            parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
             read_policy: None,
@@ -7167,6 +9816,9 @@ mod tests {
             include_payload: true,
             missing_provider_candidate: false,
             directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
         };
 
         let error = read_record_content_hash(&include, &record, &AtomicBool::new(false))

@@ -2,6 +2,7 @@
 
 use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
+use crate::include_expansion::{ExpandedSource, ExpansionLimits};
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{GlobSet, GlobSetBuilder};
 use lsp_types::{
@@ -14,18 +15,18 @@ use pascal_project::delphi_overrides::{
     EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
 };
 use pascal_project::{
-    MetadataObservation, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
-    ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
-    ProjectReadObservation, ProjectReadStamp, ProjectSelections, discover_with_selections,
-    discover_with_selections_and_observations_with_cancel_and_overrides,
+    MetadataObservation, PackageMetadata, ProjectCandidateMembership, ProjectCandidates,
+    ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
+    ProjectReadObservation, ProjectReadStamp, ProjectSelections, ReadPolicy,
+    discover_with_selections, discover_with_selections_and_observations_with_cancel_and_overrides,
     discover_with_selections_and_observations_with_overrides, has_invalid_project_selection,
     project_candidate_membership, project_candidates, project_candidates_with_cancel,
-    runtime_project_selection, selected_project_is_current,
-    selected_project_is_current_with_cancel,
+    read_package_metadata_with_observations, runtime_project_selection,
+    selected_project_is_current, selected_project_is_current_with_cancel,
 };
 use serde::Deserialize;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -49,6 +50,28 @@ const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
+const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncludeOwnerDiscoveryOutcome {
+    Complete,
+    Incomplete,
+}
+const MAX_DIRECTORY_CATALOGUES: usize = 1024;
+const MAX_FILENAME_CATALOGUE_ENTRIES: usize = 10_000;
+const MAX_FILENAME_CATALOGUES: usize = 256;
+#[cfg(feature = "test-support")]
+const TEST_FILENAME_CATALOGUE_ENTRIES_ENV: &str = "PASCAL_LSP_TEST_FILENAME_CATALOGUE_ENTRIES";
+const MAX_SOURCE_CHANGE_OBSERVATIONS: usize = 4_096;
+// The multidev workspace currently contains 436,705 filesystem entries when
+// counted without following links. Keep a fixed margin for normal growth, but
+// retain a hard stop so a pathological workspace cannot turn package lookup
+// into an unbounded traversal.
+const MAX_PACKAGE_CATALOGUE_ENTRIES: usize = 524_288;
+const MAX_PACKAGE_CATALOGUES: usize = 64;
+const MAX_PACKAGE_LOOKUPS: usize = 256;
+const MAX_PACKAGE_METADATA_CACHE: usize = 512;
+const MAX_PACKAGE_UNIT_CANDIDATES: usize = 1_024;
 const MAX_WORKSPACE_WARNINGS: usize = 256;
 const MAX_DELETED_OVERRIDES: usize = 256;
 const MAX_DOCUMENT_OWNERS: usize = 4_096;
@@ -65,7 +88,57 @@ fn check_workspace_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+fn wait_for_runtime_configuration_preparation(cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(feature = "test-support")]
+    {
+        let Some(spec) = std::env::var_os("PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER")
+        else {
+            return Ok(());
+        };
+        let spec = spec.to_string_lossy();
+        let Some((entered, release)) = spec.split_once('|') else {
+            return Err(
+                "PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER must contain <entered>|<release>"
+                    .to_string(),
+            );
+        };
+        let entered = PathBuf::from(entered);
+        let release = PathBuf::from(release);
+        if let Some(parent) = entered.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("could not create configuration barrier: {error}"))?;
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&entered)
+            .and_then(|mut marker| std::io::Write::write_all(&mut marker, b"x"))
+            .map_err(|error| format!("could not enter configuration barrier: {error}"))?;
+        while !release.exists() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = cancel;
+    Ok(())
+}
+
+fn filename_catalogue_entry_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    if let Some(limit) = std::env::var(TEST_FILENAME_CATALOGUE_ENTRIES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0 && *limit <= MAX_FILENAME_CATALOGUE_ENTRIES)
+    {
+        return limit;
+    }
+    MAX_FILENAME_CATALOGUE_ENTRIES
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
@@ -82,7 +155,7 @@ impl Default for ResourceLimits {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceOptions {
     pub source_paths: Vec<String>,
     pub exclude: Vec<String>,
@@ -90,6 +163,274 @@ pub struct WorkspaceOptions {
     pub build_config: Option<String>,
     pub platform: Option<String>,
     pub limits: ResourceLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeOption<T> {
+    Absent,
+    Reset,
+    Value(T),
+    Invalid(String),
+}
+
+impl<T> Default for RuntimeOption<T> {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeOptionsUpdate {
+    pub(crate) source_paths: RuntimeOption<Vec<String>>,
+    pub(crate) exclude: RuntimeOption<Vec<String>>,
+    pub(crate) project_file: RuntimeOption<PathBuf>,
+    pub(crate) build_config: RuntimeOption<String>,
+    pub(crate) platform: RuntimeOption<String>,
+    pub(crate) max_files: RuntimeOption<usize>,
+    pub(crate) max_file_bytes: RuntimeOption<usize>,
+    pub(crate) max_total_bytes: RuntimeOption<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeOptionsOverride {
+    source_paths: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    project_file: Option<Option<PathBuf>>,
+    build_config: Option<Option<String>>,
+    platform: Option<Option<String>>,
+    max_files: Option<usize>,
+    max_file_bytes: Option<usize>,
+    max_total_bytes: Option<usize>,
+}
+
+const MAX_RUNTIME_LIST_ENTRIES: usize = 256;
+const MAX_RUNTIME_STRING_BYTES: usize = 4 * 1024;
+
+impl RuntimeOptionsUpdate {
+    pub(crate) fn reset() -> Self {
+        Self {
+            source_paths: RuntimeOption::Reset,
+            exclude: RuntimeOption::Reset,
+            project_file: RuntimeOption::Reset,
+            build_config: RuntimeOption::Reset,
+            platform: RuntimeOption::Reset,
+            max_files: RuntimeOption::Reset,
+            max_file_bytes: RuntimeOption::Reset,
+            max_total_bytes: RuntimeOption::Reset,
+        }
+    }
+}
+
+impl RuntimeOptionsOverride {
+    pub(crate) fn effective(&self, base: &WorkspaceOptions) -> WorkspaceOptions {
+        WorkspaceOptions {
+            source_paths: self
+                .source_paths
+                .clone()
+                .unwrap_or_else(|| base.source_paths.clone()),
+            exclude: self.exclude.clone().unwrap_or_else(|| base.exclude.clone()),
+            project_file: self
+                .project_file
+                .as_ref()
+                .and_then(|value| value.clone())
+                .or_else(|| base.project_file.clone()),
+            build_config: self
+                .build_config
+                .as_ref()
+                .and_then(|value| value.clone())
+                .or_else(|| base.build_config.clone()),
+            platform: self
+                .platform
+                .as_ref()
+                .and_then(|value| value.clone())
+                .or_else(|| base.platform.clone()),
+            limits: ResourceLimits {
+                max_files: self.max_files.unwrap_or(base.limits.max_files),
+                max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
+                max_total_bytes: self.max_total_bytes.unwrap_or(base.limits.max_total_bytes),
+            },
+        }
+    }
+
+    pub(crate) fn apply(&mut self, update: RuntimeOptionsUpdate) -> Vec<String> {
+        let mut warnings = Vec::new();
+        apply_runtime_field(
+            &mut self.source_paths,
+            update.source_paths,
+            "sourcePaths",
+            &mut warnings,
+        );
+        apply_runtime_field(&mut self.exclude, update.exclude, "exclude", &mut warnings);
+        apply_runtime_optional_field(
+            &mut self.project_file,
+            update.project_file,
+            "projectFile",
+            &mut warnings,
+        );
+        apply_runtime_optional_field(
+            &mut self.build_config,
+            update.build_config,
+            "buildConfig",
+            &mut warnings,
+        );
+        apply_runtime_optional_field(
+            &mut self.platform,
+            update.platform,
+            "platform",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.max_files,
+            update.max_files,
+            "maxFiles",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.max_file_bytes,
+            update.max_file_bytes,
+            "maxFileBytes",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.max_total_bytes,
+            update.max_total_bytes,
+            "maxTotalBytes",
+            &mut warnings,
+        );
+        warnings
+    }
+}
+
+fn apply_runtime_field<T: Clone>(
+    target: &mut Option<T>,
+    value: RuntimeOption<T>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) {
+    match value {
+        RuntimeOption::Absent | RuntimeOption::Reset => *target = None,
+        RuntimeOption::Value(value) => *target = Some(value),
+        RuntimeOption::Invalid(error) => warnings.push(format!("ignoring runtime {name}: {error}")),
+    }
+}
+
+fn apply_runtime_optional_field<T: Clone>(
+    target: &mut Option<Option<T>>,
+    value: RuntimeOption<T>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) {
+    match value {
+        RuntimeOption::Absent => *target = None,
+        RuntimeOption::Reset => *target = Some(None),
+        RuntimeOption::Value(value) => *target = Some(Some(value)),
+        RuntimeOption::Invalid(error) => warnings.push(format!("ignoring runtime {name}: {error}")),
+    }
+}
+
+pub(crate) fn parse_runtime_options(
+    value: &serde_json::Value,
+) -> Result<RuntimeOptionsUpdate, String> {
+    let Some(object) = value.as_object() else {
+        return Err("runtime pascalLsp settings must be an object or null".to_string());
+    };
+
+    Ok(RuntimeOptionsUpdate {
+        source_paths: parse_runtime_list(object, "sourcePaths"),
+        exclude: parse_runtime_list(object, "exclude"),
+        project_file: parse_runtime_string(object, "projectFile").map_path_buf(),
+        build_config: parse_runtime_string(object, "buildConfig"),
+        platform: parse_runtime_string(object, "platform"),
+        max_files: parse_runtime_limit(object, "maxFiles", DEFAULT_MAX_FILES),
+        max_file_bytes: parse_runtime_limit(object, "maxFileBytes", DEFAULT_MAX_FILE_BYTES),
+        max_total_bytes: parse_runtime_limit(object, "maxTotalBytes", DEFAULT_MAX_TOTAL_BYTES),
+    })
+}
+
+fn parse_runtime_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> RuntimeOption<Vec<String>> {
+    let Some(value) = object.get(name) else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(values) = value.as_array() else {
+        return RuntimeOption::Invalid("must be an array of strings".to_string());
+    };
+    if values.len() > MAX_RUNTIME_LIST_ENTRIES {
+        return RuntimeOption::Invalid(format!(
+            "contains more than {MAX_RUNTIME_LIST_ENTRIES} entries"
+        ));
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return RuntimeOption::Invalid("must contain only strings".to_string());
+        };
+        if value.len() > MAX_RUNTIME_STRING_BYTES {
+            return RuntimeOption::Invalid(format!(
+                "contains a string longer than {MAX_RUNTIME_STRING_BYTES} bytes"
+            ));
+        }
+        parsed.push(value.to_string());
+    }
+    RuntimeOption::Value(parsed)
+}
+
+fn parse_runtime_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> RuntimeOption<String> {
+    let Some(value) = object.get(name) else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(value) = value.as_str() else {
+        return RuntimeOption::Invalid("must be a string or null".to_string());
+    };
+    if value.len() > MAX_RUNTIME_STRING_BYTES {
+        return RuntimeOption::Invalid(format!("is longer than {MAX_RUNTIME_STRING_BYTES} bytes"));
+    }
+    RuntimeOption::Value(value.to_string())
+}
+
+impl RuntimeOption<String> {
+    fn map_path_buf(self) -> RuntimeOption<PathBuf> {
+        match self {
+            RuntimeOption::Absent => RuntimeOption::Absent,
+            RuntimeOption::Reset => RuntimeOption::Reset,
+            RuntimeOption::Value(value) => RuntimeOption::Value(PathBuf::from(value)),
+            RuntimeOption::Invalid(error) => RuntimeOption::Invalid(error),
+        }
+    }
+}
+
+fn parse_runtime_limit(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    maximum: usize,
+) -> RuntimeOption<usize> {
+    let Some(value) = object.get(name) else {
+        return RuntimeOption::Absent;
+    };
+    if value.is_null() {
+        return RuntimeOption::Reset;
+    }
+    let Some(value) = value.as_u64() else {
+        return RuntimeOption::Invalid("must be a positive integer or null".to_string());
+    };
+    let Ok(value) = usize::try_from(value) else {
+        return RuntimeOption::Invalid("is too large for this platform".to_string());
+    };
+    if value == 0 {
+        return RuntimeOption::Invalid("must be at least 1".to_string());
+    }
+    RuntimeOption::Value(value.min(maximum))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -180,6 +521,10 @@ struct OpenDocument {
     text: Option<String>,
     version: i32,
     rejection: Option<String>,
+    /// Source-generation watermark for this particular open-document
+    /// incarnation. A close followed by an open receives a new watermark
+    /// even when the client reuses a version.
+    identity_generation: u64,
 }
 
 struct DiskSource {
@@ -197,6 +542,78 @@ pub(crate) struct DiskStamp {
 
 pub(crate) type PathStamp = pascal_project::ProjectReadStamp;
 
+#[derive(Debug, Clone, Default)]
+struct DirectoryCatalogue {
+    stamp: Option<PathStamp>,
+    entries: Vec<PathBuf>,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FilenameCatalogue {
+    entries: HashMap<String, Vec<PathBuf>>,
+    complete: bool,
+    directories: Vec<(PathBuf, Option<PathStamp>)>,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PackageCatalogue {
+    entries: HashMap<String, Vec<PathBuf>>,
+    requested_names: HashSet<String>,
+    complete: bool,
+    directories: Vec<(PathBuf, Option<PathStamp>)>,
+    validated_epoch: u64,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct PackageDescriptorMatch {
+    path: PathBuf,
+    names: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct PackageDescriptorFiles {
+    has_dpk: bool,
+    dpk: Vec<PackageDescriptorMatch>,
+    dproj: Vec<PackageDescriptorMatch>,
+}
+
+#[derive(Debug, Default)]
+struct PackageCatalogueScan {
+    entries: HashMap<String, Vec<PathBuf>>,
+    directories: Vec<(PathBuf, Option<PathStamp>)>,
+    complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPackageMetadata {
+    metadata_stamps: Vec<(PathBuf, Option<PathStamp>)>,
+    result: Result<PackageMetadata, String>,
+    observations: Vec<ProjectReadObservation>,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackageMetadataKey {
+    descriptor: PathBuf,
+    overrides: EffectiveOverrides,
+    read_policy: pascal_project::ReadPolicy,
+    config: Option<String>,
+    platform: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PackageLookup {
+    candidates: Vec<PathBuf>,
+    metadata_paths: Vec<PathBuf>,
+    observations: Vec<ProjectReadObservation>,
+    metadata_observations: Vec<MetadataObservation>,
+    warnings: Vec<String>,
+    complete: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ContextKey {
     project_file: Option<PathBuf>,
@@ -207,6 +624,18 @@ struct ContextKey {
     config: Option<String>,
     platform: Option<String>,
     overrides: EffectiveOverrides,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackageCatalogueKey {
+    context: ContextKey,
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct SourceChangeObservation {
+    path: PathBuf,
+    generation: u64,
 }
 
 /// A legacy sibling lookup is a per-document fact, not a directory grant.  A
@@ -287,6 +716,8 @@ pub(crate) struct KnownDocumentOwner {
     key: ContextKey,
     state: ContextState,
     origin: OwnerOrigin,
+    needs_revalidation: bool,
+    follow_current_project_file: bool,
     pub(crate) legacy_route: Option<LegacyRouteProof>,
 }
 
@@ -355,9 +786,17 @@ impl LintExcludeMatcher {
 }
 
 fn compile_exclude_patterns(patterns: &[String]) -> Option<GlobSet> {
+    compile_exclude_patterns_with_cancel(patterns, None).unwrap_or_default()
+}
+
+fn compile_exclude_patterns_with_cancel(
+    patterns: &[String],
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<GlobSet>, String> {
     let mut builder = GlobSetBuilder::new();
     let mut valid_pattern_count = 0;
     for pattern in patterns {
+        check_workspace_cancel(cancel)?;
         let normalized = pattern.replace('\\', "/");
         let glob = {
             #[cfg(windows)]
@@ -382,13 +821,14 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<GlobSet> {
         }
     }
     if valid_pattern_count == 0 {
-        return None;
+        return Ok(None);
     }
+    check_workspace_cancel(cancel)?;
     match builder.build() {
-        Ok(set) => Some(set),
+        Ok(set) => Ok(Some(set)),
         Err(error) => {
             eprintln!("pascal-lsp: warning: failed to build exclude globs: {error}");
-            None
+            Ok(None)
         }
     }
 }
@@ -422,15 +862,34 @@ struct WorkspaceRoot {
     excludes: ExcludeMatcher,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExpansionRecord {
+    pub(crate) physical_source: String,
+    pub(crate) expanded: ExpandedSource,
+    pub(crate) source_texts: HashMap<Url, String>,
+    pub(crate) dependency_entries: HashMap<Url, ProjectPathEntry>,
+    pub(crate) include_observations: Vec<crate::include_expansion::IncludeObservation>,
+    pub(crate) dependencies: HashSet<Url>,
+    pub(crate) complete: bool,
+}
+
 impl WorkspaceRoot {
     fn new(path: PathBuf, options: &WorkspaceOptions) -> Self {
+        let patterns = compile_exclude_patterns(&options.exclude);
+        Self::new_with_patterns(path, options, patterns)
+    }
+
+    fn new_with_patterns(
+        path: PathBuf,
+        options: &WorkspaceOptions,
+        patterns: Option<GlobSet>,
+    ) -> Self {
         let path = absolute_path(path);
         // Lint configuration is selected per effective project context at
         // request time. Only explicit client exclusions belong to the root
         // discovery filter; applying one configuration here would hide files
         // owned by another project from navigation and rename completeness.
         let config_root = path.clone();
-        let patterns = options.exclude.clone();
         let mut source_roots = vec![path.clone()];
         for source in &options.source_paths {
             let source_path = PathBuf::from(source);
@@ -447,7 +906,11 @@ impl WorkspaceRoot {
         Self {
             path: path.clone(),
             source_roots,
-            excludes: ExcludeMatcher::new(&path, &config_root, &patterns),
+            excludes: ExcludeMatcher {
+                root: path.clone(),
+                config_root,
+                patterns,
+            },
         }
     }
 
@@ -469,6 +932,12 @@ fn production_override_session() -> (OverrideSession, Vec<String>) {
     }
 }
 
+pub(crate) struct PreparedWorkspaceOptions {
+    pub(crate) options: WorkspaceOptions,
+    pub(crate) root_paths: Vec<PathBuf>,
+    roots: Vec<WorkspaceRoot>,
+}
+
 #[derive(Default)]
 pub struct Workspace {
     options: WorkspaceOptions,
@@ -485,6 +954,7 @@ pub struct Workspace {
     use_clock: u64,
     open_text_bytes: usize,
     pending_diagnostics: HashMap<Url, Instant>,
+    diagnostic_publications: HashMap<Url, HashMap<Url, Vec<LspDiagnostic>>>,
     // Bounded event overrides are needed because some clients report a
     // deletion before the filesystem has caught up. They are cleared by a
     // create/change event or as soon as the observed stamp changes.
@@ -497,16 +967,34 @@ pub struct Workspace {
     document_owners: HashMap<Url, KnownDocumentOwner>,
     owner_last_used: HashMap<Url, u64>,
     project_selections: ProjectSelections,
+    directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
+    filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
+    package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
+    package_catalogue_epoch: u64,
+    package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
     warnings: Vec<String>,
     analysis_records: Option<HashMap<Url, rename::SourceRecord>>,
     diagnostic_dependencies: HashMap<Url, Vec<rename::SourceRecord>>,
     source_generation: u64,
     configuration_generation: u64,
     source_change_generations: HashMap<Url, u64>,
-    source_change_generations_case_insensitive: HashMap<String, u64>,
+    source_change_observations: HashMap<PathBuf, SourceChangeObservation>,
     configuration_change_generations: HashMap<Url, u64>,
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
+    expansions: HashMap<Url, ExpansionRecord>,
+    include_parents: HashMap<Url, HashSet<Url>>,
+}
+
+fn build_workspace_roots(
+    root_paths: Vec<PathBuf>,
+    options: &WorkspaceOptions,
+) -> Vec<WorkspaceRoot> {
+    let patterns = compile_exclude_patterns(&options.exclude);
+    root_paths
+        .into_iter()
+        .map(|root| WorkspaceRoot::new_with_patterns(root, options, patterns.clone()))
+        .collect()
 }
 
 struct SharedLintRequest<'a> {
@@ -538,10 +1026,7 @@ impl Workspace {
         options: WorkspaceOptions,
         overrides: OverrideSession,
     ) -> Self {
-        let roots = roots
-            .into_iter()
-            .map(|root| WorkspaceRoot::new(root, &options))
-            .collect();
+        let roots = build_workspace_roots(roots, &options);
         let mut workspace = Self {
             options,
             overrides,
@@ -564,6 +1049,90 @@ impl Workspace {
         workspace
     }
 
+    pub(crate) fn configuration_root_paths(&self) -> Vec<PathBuf> {
+        self.roots.iter().map(|root| root.path.clone()).collect()
+    }
+
+    pub(crate) fn prepare_runtime_options_for_roots(
+        root_paths: Vec<PathBuf>,
+        options: WorkspaceOptions,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedWorkspaceOptions, String> {
+        wait_for_runtime_configuration_preparation(cancel)?;
+        check_workspace_cancel(Some(cancel))?;
+        let root_paths = root_paths
+            .into_iter()
+            .map(absolute_path)
+            .collect::<Vec<_>>();
+        let patterns = compile_exclude_patterns_with_cancel(&options.exclude, Some(cancel))?;
+        let roots = root_paths
+            .iter()
+            .cloned()
+            .map(|root| WorkspaceRoot::new_with_patterns(root, &options, patterns.clone()))
+            .collect();
+        Ok(PreparedWorkspaceOptions {
+            options,
+            root_paths,
+            roots,
+        })
+    }
+
+    pub(crate) fn apply_prepared_runtime_options(
+        &mut self,
+        prepared: PreparedWorkspaceOptions,
+    ) -> bool {
+        if self.options == prepared.options {
+            return false;
+        }
+        if self.configuration_root_paths() != prepared.root_paths {
+            return false;
+        }
+
+        let project_file_changed = self.options.project_file != prepared.options.project_file;
+        self.options = prepared.options;
+        self.roots = prepared.roots;
+
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.mark_global_change();
+        self.contexts.clear();
+        self.document_contexts.clear();
+        self.open_document_contexts.clear();
+        for owner in self.document_owners.values_mut() {
+            owner.needs_revalidation = true;
+            if project_file_changed && owner.key.selection_scope.is_none() {
+                owner.follow_current_project_file = true;
+            }
+            owner.legacy_route = None;
+        }
+        self.cached_documents.clear();
+        self.directory_catalogues.clear();
+        self.filename_catalogues.clear();
+        self.package_catalogues.clear();
+        self.package_metadata_cache.clear();
+        self.source_change_generations.clear();
+        self.configuration_change_generations.clear();
+        self.source_change_observations.clear();
+        self.expansions.clear();
+        self.include_parents.clear();
+
+        self.index = NavigationIndex::new();
+        self.indexed_files.clear();
+        self.indexed_sizes.clear();
+        self.indexed_bytes = 0;
+        self.disk_stamps.clear();
+        self.last_used.clear();
+        self.file_cap_warning_sent = false;
+        self.total_cap_warning_sent = false;
+        if let Some(records) = self.analysis_records.as_mut() {
+            records.clear();
+        }
+        for uri in self.open_documents.keys().cloned().collect::<Vec<_>>() {
+            self.schedule_diagnostics(uri);
+        }
+        true
+    }
+
     pub(crate) fn from_analysis_input(input: &rename::WorkspaceInput) -> Self {
         let roots = input
             .roots
@@ -581,6 +1150,7 @@ impl Workspace {
                         text: Some(overlay.text.clone()),
                         version: overlay.version,
                         rejection: None,
+                        identity_generation: input.source_generation,
                     },
                 )
             })
@@ -602,6 +1172,7 @@ impl Workspace {
                             .copied()
                             .unwrap_or_default(),
                         rejection: Some(reason),
+                        identity_generation: input.source_generation,
                     },
                 )
             }))
@@ -683,6 +1254,12 @@ impl Workspace {
 
     fn workspace_root_paths(&self) -> Vec<PathBuf> {
         self.roots.iter().map(|root| root.path.clone()).collect()
+    }
+
+    pub(crate) fn configuration_scope_uri(&self) -> Option<Url> {
+        (self.roots.len() == 1)
+            .then(|| Url::from_file_path(&self.roots[0].path).ok())
+            .flatten()
     }
 
     /// Return configuration candidates that may affect any known context.
@@ -807,6 +1384,27 @@ impl Workspace {
         if !supported {
             return Ok(Vec::new());
         }
+        if uri
+            .to_file_path()
+            .ok()
+            .is_some_and(|path| extension_is(&path, "inc"))
+        {
+            if matches!(
+                self.discover_include_owners_with_cancel(uri, cancel)?,
+                IncludeOwnerDiscoveryOutcome::Incomplete
+            ) {
+                return Err(format!(
+                    "include owner discovery was incomplete for {uri}; refusing contextual navigation"
+                ));
+            }
+            if self
+                .include_parents
+                .get(uri)
+                .is_some_and(|parents| parents.len() > 1)
+            {
+                return Err(format!("include source has ambiguous owning roots: {uri}"));
+            }
+        }
         let empty_pins = HashSet::new();
         match self.load_source_with_cancel(uri, &context_key, &empty_pins, Some(cancel)) {
             Ok(true) => {}
@@ -836,6 +1434,99 @@ impl Workspace {
             "navigation source changed repeatedly while resolving {}; result is incomplete",
             uri
         ))
+    }
+
+    fn discover_include_owners_with_cancel(
+        &mut self,
+        include_uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<IncludeOwnerDiscoveryOutcome, String> {
+        if self
+            .include_parents
+            .get(include_uri)
+            .is_some_and(|parents| parents.len() > 1)
+        {
+            return Ok(IncludeOwnerDiscoveryOutcome::Complete);
+        }
+        let include_path = include_uri
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("include URI is not a file URI: {include_uri}"))?;
+        let mut candidates = HashSet::new();
+        let mut open_documents = self
+            .open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                (document.text.is_some()
+                    && uri != include_uri
+                    && uri
+                        .to_file_path()
+                        .ok()
+                        .is_some_and(|path| is_analyzable_source_path(&path)))
+                .then_some(canonical_file_uri(uri))
+            })
+            .collect::<Vec<_>>();
+        open_documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for uri in open_documents {
+            if candidates.insert(uri) && candidates.len() > MAX_INCLUDE_OWNER_DISCOVERY {
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
+            }
+        }
+        let mut root_paths = self
+            .roots
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        root_paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        for root_path in root_paths {
+            check_workspace_cancel(Some(cancel))?;
+            let catalogue = self.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
+            if !catalogue.complete {
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
+            }
+            let mut paths = catalogue
+                .entries
+                .values()
+                .flatten()
+                .map(|path| absolute_path(path.clone()))
+                .collect::<Vec<_>>();
+            paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+            paths.dedup_by(|left, right| paths_equal_ci(left, right));
+            for path in paths {
+                if paths_equal_ci(&path, &include_path) {
+                    continue;
+                }
+                if let Ok(uri) = Url::from_file_path(path) {
+                    if candidates.insert(canonical_file_uri(&uri))
+                        && candidates.len() > MAX_INCLUDE_OWNER_DISCOVERY
+                    {
+                        return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
+                    }
+                }
+            }
+        }
+        let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for owner_uri in candidates {
+            check_workspace_cancel(Some(cancel))?;
+            let owner_context = match self.context_for_uri_with_cancel(&owner_uri, Some(cancel)) {
+                Ok(context) => context,
+                Err(_) => return Ok(IncludeOwnerDiscoveryOutcome::Incomplete),
+            };
+            if !self.ensure_supported_with_context(&owner_uri, &owner_context) {
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
+            }
+            let pins = HashSet::from([include_uri.clone(), owner_uri.clone()]);
+            let loaded =
+                self.load_source_with_cancel(&owner_uri, &owner_context, &pins, Some(cancel))?;
+            if !loaded {
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
+            }
+        }
+        // The requested source is still loaded as an ordinary document below
+        // when no owner was found. Contextual lookup only uses owners proved by
+        // a complete, authorized search.
+        Ok(IncludeOwnerDiscoveryOutcome::Complete)
     }
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
@@ -1105,6 +1796,7 @@ impl Workspace {
     }
 
     pub fn close_document(&mut self, uri: &Url) -> bool {
+        let retained_context = self.document_contexts.get(uri).cloned();
         let was_open = if let Some(document) = self.open_documents.remove(uri) {
             if let Some(text) = document.text {
                 self.open_text_bytes = self.open_text_bytes.saturating_sub(text.len());
@@ -1119,6 +1811,12 @@ impl Workspace {
             self.bump_source_generation();
             self.mark_source_change(uri, true);
             self.open_document_contexts.remove(uri);
+            if let Some(context_key) = retained_context {
+                // Include invalidation removes the indexed document and its
+                // context binding.  Reinstall the binding before reloading
+                // the now-authoritative disk source.
+                self.document_contexts.insert(uri.clone(), context_key);
+            }
             self.disk_stamps.remove(uri);
             self.refresh_loaded_disk(uri);
         }
@@ -1133,7 +1831,7 @@ impl Workspace {
         context_key: ContextKey,
     ) -> Result<(), String> {
         self.bump_source_generation();
-        self.mark_source_change(&uri, true);
+        self.mark_source_change(&uri, false);
         let text_len = text.len();
         let source_for_index = text.clone();
         if let Some(previous) = self.open_documents.get(&uri) {
@@ -1148,6 +1846,7 @@ impl Workspace {
                 text: Some(text),
                 version,
                 rejection: None,
+                identity_generation: self.source_generation,
             },
         );
         self.disk_stamps.remove(&uri);
@@ -1161,7 +1860,7 @@ impl Workspace {
 
     fn reject_open_document(&mut self, uri: Url, version: i32, reason: String) {
         self.bump_source_generation();
-        self.mark_source_change(&uri, true);
+        self.mark_source_change(&uri, false);
         if let Some(previous) = self.open_documents.get(&uri) {
             if let Some(previous_text) = &previous.text {
                 self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
@@ -1178,6 +1877,7 @@ impl Workspace {
                 text: None,
                 version,
                 rejection: Some(message),
+                identity_generation: self.source_generation,
             },
         );
         self.pending_diagnostics.insert(uri, Instant::now());
@@ -1222,7 +1922,7 @@ impl Workspace {
 
     fn advance_document_version(&mut self, uri: &Url, version: i32) {
         self.bump_source_generation();
-        self.mark_source_change(uri, true);
+        self.mark_source_change(uri, false);
         if let Some(document) = self.open_documents.get_mut(uri) {
             document.version = version;
         }
@@ -1261,7 +1961,7 @@ impl Workspace {
             .is_ok_and(|path| is_immutable_override_file(&path));
         if !override_changed {
             self.bump_source_generation();
-            self.mark_source_change(uri, true);
+            diagnostic_uris.extend(self.mark_source_change(uri, true));
         }
         let configuration_changed = is_configuration_path(uri);
         if configuration_changed && !override_changed {
@@ -1348,6 +2048,12 @@ impl Workspace {
         self.document_contexts.clear();
         self.open_document_contexts.clear();
         self.deleted_overrides.clear();
+        self.directory_catalogues.clear();
+        self.filename_catalogues.clear();
+        self.package_catalogues.clear();
+        self.package_metadata_cache.clear();
+        self.expansions.clear();
+        self.include_parents.clear();
     }
 
     pub fn next_diagnostic_timeout(&self) -> Option<Duration> {
@@ -1405,21 +2111,95 @@ impl Workspace {
         self.diagnostic_dependencies.remove(uri);
     }
 
-    pub(crate) fn diagnostic_dependents_for_change(&self, changed_uri: &Url) -> Vec<Url> {
+    pub(crate) fn diagnostic_dependents_for_change(
+        &self,
+        changed_uri: &Url,
+        include_parent: bool,
+    ) -> Vec<Url> {
         self.diagnostic_dependencies
             .iter()
             .filter(|(consumer, _)| self.open_documents.contains_key(*consumer))
             .filter(|(_, records)| {
                 records
                     .iter()
-                    .any(|record| source_record_matches_change(record, changed_uri))
+                    .any(|record| source_record_matches_change(record, changed_uri, include_parent))
             })
             .map(|(consumer, _)| consumer.clone())
-            .collect()
+            .collect::<Vec<_>>()
     }
 
     pub(crate) fn open_document_uris(&self) -> Vec<Url> {
         self.open_documents.keys().cloned().collect()
+    }
+
+    pub(crate) fn replace_diagnostic_publications(
+        &mut self,
+        root_uri: &Url,
+        publications: impl IntoIterator<Item = queries::DiagnosticPublication>,
+    ) -> Vec<queries::DiagnosticPublication> {
+        let current = publications.into_iter().fold(
+            HashMap::<Url, Vec<LspDiagnostic>>::new(),
+            |mut current, publication| {
+                current
+                    .entry(publication.uri)
+                    .or_default()
+                    .extend(publication.diagnostics);
+                current
+            },
+        );
+        let previous = self
+            .diagnostic_publications
+            .insert(root_uri.clone(), current.clone())
+            .unwrap_or_default();
+        let mut affected = previous.keys().cloned().collect::<HashSet<_>>();
+        affected.extend(current.keys().cloned());
+        self.aggregate_diagnostic_publications(affected)
+    }
+
+    pub(crate) fn clear_diagnostic_publications(
+        &mut self,
+        root_uri: &Url,
+    ) -> Vec<queries::DiagnosticPublication> {
+        let previous = self
+            .diagnostic_publications
+            .remove(root_uri)
+            .unwrap_or_default();
+        self.aggregate_diagnostic_publications(previous.keys().cloned().collect())
+    }
+
+    fn aggregate_diagnostic_publications(
+        &self,
+        affected: HashSet<Url>,
+    ) -> Vec<queries::DiagnosticPublication> {
+        let mut affected = affected.into_iter().collect::<Vec<_>>();
+        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected
+            .into_iter()
+            .map(|uri| {
+                let mut roots = self.diagnostic_publications.keys().collect::<Vec<_>>();
+                roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+                let mut diagnostics = Vec::new();
+                for root in roots {
+                    let Some(contribution) = self
+                        .diagnostic_publications
+                        .get(root)
+                        .and_then(|publications| publications.get(&uri))
+                    else {
+                        continue;
+                    };
+                    for diagnostic in contribution {
+                        if !diagnostics.contains(diagnostic) {
+                            diagnostics.push(diagnostic.clone());
+                        }
+                    }
+                }
+                queries::DiagnosticPublication {
+                    version: self.document_version(&uri),
+                    uri,
+                    diagnostics,
+                }
+            })
+            .collect()
     }
 
     pub fn take_due_diagnostics(&mut self) -> Vec<(Url, Option<i32>, Vec<LspDiagnostic>)> {
@@ -1727,7 +2507,7 @@ impl Workspace {
 
         loop {
             check_workspace_cancel(cancel)?;
-            let locations = self.index.navigate(uri, position, target);
+            let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
             if !locations.is_empty() {
                 return Ok(locations);
             }
@@ -1768,7 +2548,29 @@ impl Workspace {
         }
 
         check_workspace_cancel(cancel)?;
-        Ok(self.index.navigate(uri, position, target))
+        self.resolve_virtual_navigation(uri, position, target, cancel)
+    }
+
+    fn resolve_virtual_navigation(
+        &self,
+        uri: &Url,
+        position: Position,
+        target: NavigationTarget,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Location>, String> {
+        let fallback_cancel = AtomicBool::new(false);
+        let cancel = cancel.unwrap_or(&fallback_cancel);
+        let mut budget = crate::include_expansion::MappingBudget::new(
+            cancel,
+            self.include_expansion_limits().max_work,
+        );
+        let mut locations = Vec::new();
+        for (query_uri, query_position) in
+            self.virtual_query_positions_with_budget(uri, position, &mut budget)?
+        {
+            locations.extend(self.index.navigate(&query_uri, query_position, target));
+        }
+        self.map_navigation_locations_with_budget(locations, &mut budget)
     }
 
     fn load_imports_with_cancel(
@@ -1796,6 +2598,32 @@ impl Workspace {
         if imports.is_empty() {
             self.index.bind_imports(uri, bindings);
             return Ok(Vec::new());
+        }
+        if context.project_file.is_none() {
+            let roots = self
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>();
+            for import in &imports {
+                let names = unit_filename_candidates(&import.name, &context.unit_namespaces)
+                    .into_iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                for root in &roots {
+                    let path_entry =
+                        context_path_entry(&context, root).unwrap_or_else(|| ProjectPathEntry {
+                            path: root.clone(),
+                            provenance: ProjectPathProvenance::LegacyNative,
+                        });
+                    self.record_missing_provider_scope(
+                        root,
+                        &names,
+                        &context.read_policy,
+                        &path_entry,
+                    );
+                }
+            }
         }
         let path = uri
             .to_file_path()
@@ -2028,7 +2856,7 @@ impl Workspace {
                 return Ok(false);
             }
         };
-        if !is_pascal_path(&path) {
+        if !is_analyzable_source_path(&path) {
             self.warn(format!(
                 "unsupported Pascal dependency path: {}",
                 path.display()
@@ -2238,6 +3066,36 @@ impl Workspace {
             .get(context_key)
             .map(|state| state.context.defines.clone())
             .unwrap_or_default();
+        let expansion = if rename::may_contain_include_directive(source.as_bytes()) {
+            let mut expansion =
+                self.expand_source_with_cancel(uri, &source, context_key, cancel)?;
+            let fallback_cancel = AtomicBool::new(false);
+            let conditional = pascal_core::conditional::analyze_with_cancel(
+                expansion.expanded.text(),
+                &defines,
+                cancel.unwrap_or(&fallback_cancel),
+            );
+            crate::include_expansion::reconcile_conditional_completeness(
+                &mut expansion,
+                &conditional,
+            );
+            Some(expansion)
+        } else {
+            // Avoid paying for a second full lexical pass on ordinary Pascal
+            // sources.  The navigation parser still performs the normal
+            // conditional analysis below; only source-bearing include roots
+            // need a virtual buffer and reverse map.
+            self.remove_expansion(uri);
+            None
+        };
+        // `NavigationIndex` performs the conditional projection itself.  It
+        // must receive the raw expanded source, not an already-projected
+        // buffer, so conditional metadata remains available for conservative
+        // references and rename decisions.
+        let indexed_source = expansion.as_ref().map_or_else(
+            || source.clone(),
+            |expansion| expansion.expanded.text().to_owned(),
+        );
         let cached = self
             .cached_documents
             .get(uri)
@@ -2250,7 +3108,7 @@ impl Workspace {
         let update = match cancel {
             Some(cancel) => self.index.update_with_defines_and_cached_with_cancel(
                 uri.clone(),
-                source,
+                indexed_source.clone(),
                 &defines,
                 cached,
                 cancel,
@@ -2259,7 +3117,7 @@ impl Workspace {
                 let cancel = AtomicBool::new(false);
                 self.index.update_with_defines_and_cached_with_cancel(
                     uri.clone(),
-                    source,
+                    indexed_source.clone(),
                     &defines,
                     cached,
                     &cancel,
@@ -2276,20 +3134,449 @@ impl Workspace {
         }
         check_workspace_cancel(cancel)?;
 
-        let old_size = self.indexed_sizes.insert(uri.clone(), size);
+        let old_size = self.indexed_sizes.insert(uri.clone(), indexed_source.len());
         if let Some(old_size) = old_size {
             self.indexed_bytes = self.indexed_bytes.saturating_sub(old_size);
         } else {
             self.indexed_files.insert(uri.clone());
         }
-        self.indexed_bytes = self.indexed_bytes.saturating_add(size);
+        self.indexed_bytes = self.indexed_bytes.saturating_add(indexed_source.len());
         if let Err(error) = self.set_document_context(uri, context_key) {
             self.remove_indexed(uri);
             return Err(error);
         }
         self.index.clear_import_bindings(uri);
         self.touch(uri);
+        if let Some(expansion) = expansion {
+            self.store_expansion(uri, source, expansion);
+            let context = self
+                .contexts
+                .get(context_key)
+                .map(|state| state.context.clone())
+                .ok_or_else(|| format!("project context was not retained for {uri}"))?;
+            let fallback_cancel = AtomicBool::new(false);
+            self.record_expansion_analysis_sources(
+                uri,
+                &context,
+                cancel.unwrap_or(&fallback_cancel),
+            )?;
+        }
         Ok(true)
+    }
+
+    fn include_expansion_limits(&self) -> ExpansionLimits {
+        let limits = ExpansionLimits::default();
+        ExpansionLimits {
+            max_sources: limits.max_sources.min(self.options.limits.max_files),
+            max_expanded_bytes: limits
+                .max_expanded_bytes
+                .min(self.options.limits.max_total_bytes),
+            ..limits
+        }
+    }
+
+    fn expand_source_with_cancel(
+        &self,
+        uri: &Url,
+        source: &str,
+        context_key: &ContextKey,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<crate::include_expansion::ExpansionResult, String> {
+        let fallback = AtomicBool::new(false);
+        let cancel = cancel.unwrap_or(&fallback);
+        rename::expand_source_with_workspace(
+            self,
+            uri,
+            source,
+            context_key,
+            self.include_expansion_limits(),
+            cancel,
+        )
+    }
+
+    fn store_expansion(
+        &mut self,
+        uri: &Url,
+        physical_source: String,
+        result: crate::include_expansion::ExpansionResult,
+    ) {
+        if let Some(previous) = self.expansions.remove(uri) {
+            for dependency in previous.dependencies {
+                if let Some(parents) = self.include_parents.get_mut(&dependency) {
+                    parents.remove(uri);
+                    if parents.is_empty() {
+                        self.include_parents.remove(&dependency);
+                    }
+                }
+            }
+        }
+        let mut source_texts = HashMap::from([(uri.clone(), physical_source.clone())]);
+        let mut dependency_entries = HashMap::new();
+        let mut include_observations = Vec::new();
+        let mut dependencies = HashSet::new();
+        for dependency in result.dependencies {
+            dependencies.insert(dependency.uri.clone());
+            source_texts.insert(dependency.uri.clone(), dependency.text);
+            include_observations.extend(dependency.observations);
+            if let Some(path_entry) = dependency.path_entry {
+                dependency_entries.insert(dependency.uri.clone(), path_entry);
+            }
+        }
+        include_observations.sort_by(|left, right| {
+            left.path
+                .to_string_lossy()
+                .cmp(&right.path.to_string_lossy())
+                .then_with(|| left.present.cmp(&right.present))
+                .then_with(|| left.overlay_version.cmp(&right.overlay_version))
+        });
+        include_observations.dedup();
+        for dependency in &dependencies {
+            self.include_parents
+                .entry(dependency.clone())
+                .or_default()
+                .insert(uri.clone());
+        }
+        self.expansions.insert(
+            uri.clone(),
+            ExpansionRecord {
+                physical_source,
+                expanded: result.expanded,
+                source_texts,
+                dependency_entries,
+                include_observations,
+                dependencies,
+                complete: result.complete,
+            },
+        );
+    }
+
+    fn record_expansion_analysis_sources(
+        &mut self,
+        root_uri: &Url,
+        context: &pascal_project::ProjectContext,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let Some(expansion) = self.expansions.get(root_uri).cloned() else {
+            return Err(format!("include expansion was not retained for {root_uri}"));
+        };
+        for observation in &expansion.include_observations {
+            check_workspace_cancel(Some(cancel))?;
+            self.record_include_analysis_observation(observation, context);
+        }
+        if let Some((root_source, root_version)) =
+            self.open_documents.get(root_uri).and_then(|document| {
+                document
+                    .text
+                    .as_ref()
+                    .map(|source| (source.clone(), document.version))
+            })
+        {
+            self.record_open_analysis_source(root_uri, &root_source, root_version);
+        } else {
+            let root_path = root_uri
+                .to_file_path()
+                .map(absolute_path)
+                .map_err(|_| format!("include root is not a file URI: {root_uri}"))?;
+            let root_stamp = disk_stamp(&root_path)
+                .ok_or_else(|| format!("include root disappeared while expanding {root_uri}"))?;
+            self.record_closed_analysis_source(
+                root_uri,
+                &expansion.physical_source,
+                root_stamp,
+                content_hash_bytes(expansion.physical_source.as_bytes()),
+                &root_path,
+                &context.read_policy,
+                &context_path_entry(context, &root_path).unwrap_or_else(|| ProjectPathEntry {
+                    path: root_path.clone(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                }),
+            );
+        }
+
+        let dependency_entries = expansion.dependency_entries.clone();
+        let mut dependencies = expansion
+            .source_texts
+            .into_iter()
+            .filter(|(uri, _)| uri != root_uri)
+            .collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        for (uri, source) in dependencies {
+            check_workspace_cancel(Some(cancel))?;
+            if let Some((open_source, open_version)) =
+                self.open_documents.get(&uri).and_then(|document| {
+                    document
+                        .text
+                        .as_ref()
+                        .map(|source| (source.clone(), document.version))
+                })
+            {
+                if open_source != source {
+                    return Err(format!("include source {uri} changed during diagnostics"));
+                }
+                self.record_open_analysis_source(&uri, &open_source, open_version);
+                continue;
+            }
+            if self.open_documents.contains_key(&uri) {
+                return Err(format!(
+                    "include source {uri} was rejected during diagnostics"
+                ));
+            }
+
+            let path = uri
+                .to_file_path()
+                .map(absolute_path)
+                .map_err(|_| format!("include source is not a file URI: {uri}"))?;
+            let entry = dependency_entries
+                .get(&uri)
+                .cloned()
+                .or_else(|| context_path_entry(context, &path))
+                .unwrap_or_else(|| ProjectPathEntry {
+                    path: path.clone(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                });
+            let allow_legacy_payload =
+                matches!(entry.provenance, ProjectPathProvenance::LegacyNative);
+            let disk = read_disk_source_with_cancel(
+                &path,
+                self.options.limits.max_file_bytes,
+                &context.read_policy,
+                &entry,
+                allow_legacy_payload,
+                Some(cancel),
+            )?;
+            if disk.text != source {
+                return Err(format!("include source {uri} changed during diagnostics"));
+            }
+            self.record_closed_analysis_source(
+                &uri,
+                &disk.text,
+                disk.stamp,
+                disk.content_hash,
+                &path,
+                &context.read_policy,
+                &entry,
+            );
+            if let Some(records) = self.analysis_records.as_mut() {
+                if let Some(record) = records.get_mut(&uri) {
+                    record.include_payload = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_include_analysis_observation(
+        &mut self,
+        observation: &crate::include_expansion::IncludeObservation,
+        context: &pascal_project::ProjectContext,
+    ) {
+        let path = absolute_path(observation.path.clone());
+        let Some(uri) = Url::from_file_path(&path).ok() else {
+            return;
+        };
+        let uri = canonical_file_uri(&uri);
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        if records.contains_key(&uri) {
+            return;
+        }
+        let path_entry = context_path_entry(context, &path).unwrap_or_else(|| ProjectPathEntry {
+            path: path.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        });
+        records.insert(
+            uri.clone(),
+            rename::SourceRecord {
+                uri,
+                text: String::new(),
+                version: None,
+                stamp: None,
+                open: false,
+                path: Some(path),
+                path_stamp: observation.stamp.clone(),
+                content_hash: None,
+                parsed_text_hash: None,
+                content_bytes: None,
+                candidate_membership: None,
+                read_policy: Some(context.read_policy.clone()),
+                path_entry: Some(path_entry),
+                include_payload: false,
+                missing_provider_candidate: !observation.present,
+                directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            },
+        );
+    }
+
+    fn remove_expansion(&mut self, uri: &Url) {
+        let Some(previous) = self.expansions.remove(uri) else {
+            return;
+        };
+        for dependency in previous.dependencies {
+            if let Some(parents) = self.include_parents.get_mut(&dependency) {
+                parents.remove(uri);
+                if parents.is_empty() {
+                    self.include_parents.remove(&dependency);
+                }
+            }
+        }
+    }
+
+    fn invalidate_expansion_dependents(&mut self, uri: &Url) -> Vec<Url> {
+        let uri = canonical_file_uri(uri);
+        let mut queue = vec![uri.clone()];
+        let mut visited = HashSet::new();
+        let mut affected = Vec::new();
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if self.expansions.contains_key(&current) {
+                affected.push(current.clone());
+            }
+            if let Some(parents) = self.include_parents.get(&current).cloned() {
+                queue.extend(parents);
+            }
+        }
+        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for root in &affected {
+            self.remove_indexed(root);
+        }
+        affected
+            .into_iter()
+            .filter(|root| self.open_documents.contains_key(root))
+            .collect()
+    }
+
+    fn source_text_for_mapping(&self, uri: &Url) -> Option<String> {
+        if let Some(document) = self.open_documents.get(uri) {
+            if let Some(text) = &document.text {
+                return Some(text.clone());
+            }
+        }
+        if let Some(expansion) = self.expansions.get(uri) {
+            return Some(expansion.physical_source.clone());
+        }
+        if let Some(text) = self.index.source_text(uri) {
+            return Some(text.to_owned());
+        }
+        self.expansions
+            .values()
+            .find_map(|expansion| expansion.source_texts.get(uri).cloned())
+    }
+
+    fn virtual_query_positions_with_budget(
+        &self,
+        uri: &Url,
+        position: Position,
+        budget: &mut crate::include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<(Url, Position)>, String> {
+        let Some(source) = self.source_text_for_mapping(uri) else {
+            return Ok(vec![(uri.clone(), position)]);
+        };
+        let Some(offset) = text::position_to_offset(&source, position) else {
+            return Ok(Vec::new());
+        };
+        let width = source
+            .get(offset..)
+            .and_then(|tail| tail.chars().next())
+            .map_or(1, char::len_utf8);
+        let physical_range = offset..offset.saturating_add(width);
+        let mut positions = Vec::new();
+        let mut mapped_by_expansion = false;
+        for (root_uri, expansion) in &self.expansions {
+            let virtual_ranges = expansion.expanded.reverse_range_with_budget(
+                uri,
+                physical_range.clone(),
+                budget,
+            )?;
+            if !virtual_ranges.is_empty() {
+                mapped_by_expansion = true;
+            }
+            if !expansion.complete {
+                continue;
+            }
+            for virtual_range in virtual_ranges {
+                if let Some(virtual_position) =
+                    text::offset_to_position(expansion.expanded.text(), virtual_range.start)
+                {
+                    positions.push((root_uri.clone(), virtual_position));
+                }
+            }
+        }
+        if positions.is_empty() && !mapped_by_expansion && self.index.contains(uri) {
+            positions.push((uri.clone(), position));
+        }
+        positions.sort_by(|left, right| {
+            left.0
+                .as_str()
+                .cmp(right.0.as_str())
+                .then_with(|| left.1.line.cmp(&right.1.line))
+                .then_with(|| left.1.character.cmp(&right.1.character))
+        });
+        positions.dedup();
+        Ok(positions)
+    }
+
+    fn map_navigation_location_with_budget(
+        &self,
+        location: Location,
+        budget: &mut crate::include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<Location>, String> {
+        let Some(expansion) = self.expansions.get(&location.uri) else {
+            return Ok(vec![location]);
+        };
+        let Some(start) = text::position_to_offset(expansion.expanded.text(), location.range.start)
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(end) = text::position_to_offset(expansion.expanded.text(), location.range.end)
+        else {
+            return Ok(Vec::new());
+        };
+        let map = expansion
+            .expanded
+            .map_range_with_budget(start..end, budget)?;
+        let spans = match map {
+            crate::include_expansion::VirtualMapping::Exact(span) => vec![span],
+            crate::include_expansion::VirtualMapping::Many(spans) => spans,
+            crate::include_expansion::VirtualMapping::Unmapped => return Ok(Vec::new()),
+        };
+        Ok(spans
+            .into_iter()
+            .filter_map(|span| {
+                let source = expansion.source_texts.get(&span.uri)?;
+                let start = text::offset_to_position(source, span.range.start)?;
+                let end = text::offset_to_position(source, span.range.end)?;
+                Some(Location::new(span.uri, Range::new(start, end)))
+            })
+            .collect())
+    }
+
+    fn map_navigation_locations_with_budget(
+        &self,
+        locations: Vec<Location>,
+        budget: &mut crate::include_expansion::MappingBudget<'_>,
+    ) -> Result<Vec<Location>, String> {
+        let mut mapped = locations
+            .into_iter()
+            .map(|location| self.map_navigation_location_with_budget(location, budget))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        mapped.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+        });
+        mapped.dedup();
+        Ok(mapped)
     }
 
     fn make_room_for(
@@ -2391,6 +3678,7 @@ impl Workspace {
                 path: None,
                 path_stamp: None,
                 content_hash: None,
+                parsed_text_hash: Some(rename::text_content_hash(text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: None,
@@ -2398,6 +3686,9 @@ impl Workspace {
                 include_payload: false,
                 missing_provider_candidate: false,
                 directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
             },
         );
     }
@@ -2427,6 +3718,7 @@ impl Workspace {
                 path: Some(path.to_path_buf()),
                 path_stamp: path_stamp(path),
                 content_hash: Some(content_hash),
+                parsed_text_hash: Some(rename::text_content_hash(text)),
                 content_bytes: None,
                 candidate_membership: None,
                 read_policy: Some(read_policy.clone()),
@@ -2434,6 +3726,9 @@ impl Workspace {
                 include_payload: false,
                 missing_provider_candidate: false,
                 directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
             },
         );
     }
@@ -2584,6 +3879,7 @@ impl Workspace {
                     path: Some(path),
                     path_stamp,
                     content_hash: content.as_ref().map(|bytes| content_hash_bytes(bytes)),
+                    parsed_text_hash: None,
                     content_bytes: content.clone(),
                     candidate_membership: None,
                     read_policy: None,
@@ -2591,6 +3887,9 @@ impl Workspace {
                     include_payload: false,
                     missing_provider_candidate: false,
                     directory_observation: false,
+                    missing_provider_scope: None,
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
                 },
             );
         }
@@ -2610,7 +3909,7 @@ impl Workspace {
             .to_file_path()
             .map(absolute_path)
             .map_err(|_| format!("project context requires a file URI: {uri}"))?;
-        if !is_pascal_path(&path) {
+        if !is_analyzable_source_path(&path) {
             return Err(format!(
                 "unsupported Pascal document path: {}",
                 path.display()
@@ -2657,6 +3956,7 @@ impl Workspace {
         };
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
+                && !owner.follow_current_project_file
                 && self.known_owner_selection_is_current_with_cancel(&path, &owner, cancel)?
             {
                 return self
@@ -2742,7 +4042,9 @@ impl Workspace {
         project_options: &ProjectOptions,
         cancel: Option<&AtomicBool>,
     ) -> Result<ContextKey, String> {
-        if self.context_state_is_fresh_with_open_documents(&owner.state, cancel)? {
+        if !owner.needs_revalidation
+            && self.context_state_is_fresh_with_open_documents(&owner.state, cancel)?
+        {
             self.contexts.insert(owner.key.clone(), owner.state.clone());
             self.select_document_context(uri, &owner.key, owner.origin);
             return Ok(owner.key.clone());
@@ -2919,9 +4221,12 @@ impl Workspace {
     ) -> Result<(ContextKey, ProjectContext), String> {
         if let Some(owner) = self.document_owners.get(uri) {
             if owner.origin != OwnerOrigin::Automatic
+                && !owner.follow_current_project_file
                 && self.known_owner_selection_is_current(path, owner)
             {
-                if self.context_state_is_fresh_with_open_documents(&owner.state, None)? {
+                if !owner.needs_revalidation
+                    && self.context_state_is_fresh_with_open_documents(&owner.state, None)?
+                {
                     return Ok((owner.key.clone(), owner.state.context.clone()));
                 }
                 let discovery =
@@ -3117,6 +4422,8 @@ impl Workspace {
                 key: key.clone(),
                 state,
                 origin,
+                needs_revalidation: false,
+                follow_current_project_file: false,
                 legacy_route,
             },
         );
@@ -3583,7 +4890,7 @@ impl Workspace {
         context_key: Option<&ContextKey>,
         legacy_route: bool,
     ) -> bool {
-        if !is_pascal_path(path) {
+        if !is_analyzable_source_path(path) {
             return false;
         }
         let Some(entry) = context_path_entry(context, path) else {
@@ -3667,8 +4974,1247 @@ impl Workspace {
             .is_some_and(|workspace_root| workspace_root.excludes.is_excluded(path, mapped_root))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_unit_with_cancel(
+        &mut self,
+        current_uri: &Url,
+        requested_name: &str,
+        lookup_name: &str,
+        context: &ProjectContext,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<Url>, String> {
+        check_workspace_cancel(cancel)?;
+        let mut groups: Vec<(Vec<PathBuf>, bool)> = Vec::new();
+        if let Some(explicit) = context.explicit_units.get(lookup_name) {
+            groups.push((explicit.clone(), false));
+        }
+
+        let current_path = current_uri.to_file_path().ok().map(absolute_path);
+        let current_directory = current_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let legacy_current_source = current_path.as_deref().is_some_and(|path| {
+            context.main_source_entry.as_ref().is_some_and(|entry| {
+                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    && native_paths_equal(&entry.path, path)
+            }) || context
+                .explicit_unit_entries
+                .values()
+                .flatten()
+                .any(|entry| {
+                    matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                        && native_paths_equal(&entry.path, path)
+                })
+                || self.legacy_route_is_current(current_uri, path, context_key)
+        });
+        let legacy_sibling_directory = legacy_current_source
+            .then_some(current_directory.clone())
+            .flatten();
+        if let Some(directory) = current_directory {
+            check_workspace_cancel(cancel)?;
+            groups.extend(
+                self.directory_unit_candidate_groups(
+                    &directory,
+                    lookup_name,
+                    &context.unit_namespaces,
+                    context_key,
+                )
+                .into_iter()
+                .map(|paths| (paths, false)),
+            );
+        }
+        for directory in &context.search_paths {
+            check_workspace_cancel(cancel)?;
+            let legacy_search_path = context.search_path_entries.iter().any(|entry| {
+                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                    && native_paths_equal(&entry.path, directory)
+            });
+            groups.extend(
+                self.directory_unit_candidate_groups(
+                    directory,
+                    lookup_name,
+                    &context.unit_namespaces,
+                    context_key,
+                )
+                .into_iter()
+                .map(|paths| (paths, legacy_search_path)),
+            );
+        }
+        if context.project_file.is_none() {
+            check_workspace_cancel(cancel)?;
+            groups.push((
+                self.filename_unit_candidates(lookup_name, context, context_key),
+                false,
+            ));
+        }
+
+        for (candidates, legacy_search_path) in groups {
+            check_workspace_cancel(cancel)?;
+            let mut paths = candidates;
+            let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
+            for path in paths.drain(..) {
+                if !unique_paths
+                    .iter()
+                    .any(|existing| paths_equal_ci(existing, &path))
+                {
+                    unique_paths.push(path);
+                }
+            }
+            let mut valid = Vec::new();
+            for path in unique_paths {
+                check_workspace_cancel(cancel)?;
+                let Ok(candidate_uri) = Url::from_file_path(&path) else {
+                    continue;
+                };
+                if candidate_uri == *current_uri {
+                    continue;
+                }
+                let legacy_search_path_route = legacy_search_path
+                    && context.search_path_entries.iter().any(|entry| {
+                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                            && path_starts_with_native(&path, &entry.path)
+                    });
+                if !self.load_source_with_legacy_sibling_with_cancel(
+                    &candidate_uri,
+                    context_key,
+                    pinned,
+                    legacy_sibling_directory.as_deref(),
+                    legacy_search_path_route,
+                    cancel,
+                )? {
+                    continue;
+                }
+                let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
+                    continue;
+                };
+                if unit_name_matches(&unit_name, requested_name, lookup_name, context) {
+                    valid.push(candidate_uri);
+                }
+            }
+            valid.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            valid.dedup();
+            match valid.len() {
+                0 => {}
+                1 => return Ok(valid.pop()),
+                _ => {
+                    self.warn(format!(
+                        "ambiguous unit {requested_name} in the current project context: {}",
+                        valid
+                            .iter()
+                            .map(Url::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    return Ok(None);
+                }
+            }
+        }
+        check_workspace_cancel(cancel)?;
+        let package_lookup = self.package_unit_candidates(
+            requested_name,
+            lookup_name,
+            context,
+            context_key,
+            cancel,
+        )?;
+        self.retain_package_observations(context_key, package_lookup.observations.clone());
+        self.merge_metadata_observations(context_key, &package_lookup.metadata_observations);
+        for path in &package_lookup.metadata_paths {
+            self.watch_package_path(context_key, path);
+        }
+        if !package_lookup.complete {
+            for warning in package_lookup.warnings {
+                self.warn(warning);
+            }
+            return Ok(None);
+        }
+        let mut valid = Vec::new();
+        for path in package_lookup.candidates {
+            check_workspace_cancel(cancel)?;
+            let Ok(candidate_uri) = Url::from_file_path(&path) else {
+                continue;
+            };
+            if candidate_uri == *current_uri {
+                continue;
+            }
+            if !self.load_source_with_cancel(&candidate_uri, context_key, pinned, cancel)? {
+                continue;
+            }
+            let Some(unit_name) = self.index.unit_name(&candidate_uri) else {
+                continue;
+            };
+            if unit_name_matches(&unit_name, requested_name, lookup_name, context) {
+                valid.push(candidate_uri);
+            }
+        }
+        valid.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        valid.dedup();
+        match valid.len() {
+            0 => {
+                for warning in package_lookup.warnings {
+                    self.warn(warning);
+                }
+            }
+            1 => return Ok(valid.pop()),
+            _ => {
+                self.warn(format!(
+                    "ambiguous unit {requested_name} in the named source packages: {}",
+                    valid
+                        .iter()
+                        .map(Url::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                return Ok(None);
+            }
+        }
+        if context.project_file.is_some()
+            && !context.explicit_units.is_empty()
+            && !context.explicit_units.contains_key(lookup_name)
+        {
+            self.warn(format!(
+                "unsupported unit filename mapping for {requested_name}: no explicit project filename mapping; declaration filename mismatch cannot be inferred safely"
+            ));
+        }
+        Ok(None)
+    }
+
+    fn directory_unit_candidate_groups(
+        &mut self,
+        directory: &Path,
+        unit_name: &str,
+        namespaces: &[String],
+        context_key: &ContextKey,
+    ) -> Vec<Vec<PathBuf>> {
+        let directory = absolute_path(directory.to_path_buf());
+        let mut groups = unit_filename_candidate_tiers(unit_name, namespaces)
+            .into_iter()
+            .map(|names| self.filename_candidates_for_names(&directory, &names, context_key))
+            .collect::<Vec<_>>();
+        let parts: Vec<&str> = unit_name
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() > 1 {
+            let nested = parts[..parts.len() - 1]
+                .iter()
+                .fold(directory.clone(), |path, part| path.join(part));
+            if let Some(nested) = resolve_case_insensitive_path(&nested) {
+                groups.extend(
+                    unit_filename_candidate_tiers(parts.last().copied().unwrap_or_default(), &[])
+                        .into_iter()
+                        .map(|names| {
+                            self.filename_candidates_for_names(&nested, &names, context_key)
+                        }),
+                );
+            }
+        }
+        groups
+    }
+
+    fn package_unit_candidates(
+        &mut self,
+        requested_name: &str,
+        lookup_name: &str,
+        context: &ProjectContext,
+        context_key: &ContextKey,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PackageLookup, String> {
+        check_workspace_cancel(cancel)?;
+        let mut lookup = PackageLookup {
+            complete: true,
+            ..PackageLookup::default()
+        };
+        if context.packages.is_empty() {
+            return Ok(lookup);
+        }
+        if context.packages.len() > MAX_PACKAGE_LOOKUPS {
+            lookup.complete = false;
+            lookup.warnings.push(format!(
+                "named package lookup limit ({MAX_PACKAGE_LOOKUPS}) reached while resolving {requested_name}"
+            ));
+            return Ok(lookup);
+        }
+
+        let package_names = context.packages.to_vec();
+        for package_name in &package_names {
+            check_workspace_cancel(cancel)?;
+            let (descriptors, catalogue_complete) = self.package_descriptors(
+                &package_names,
+                package_name,
+                context,
+                context_key,
+                cancel,
+            )?;
+            if !catalogue_complete {
+                lookup.complete = false;
+                lookup.warnings.push(format!(
+                    "source for package {package_name} was not found because its bounded source catalogue was incomplete; compiled-only package skipped"
+                ));
+                lookup.candidates.clear();
+                return Ok(lookup);
+            }
+            if descriptors.is_empty() {
+                lookup.warnings.push(format!(
+                    "source for package {package_name} was not found under the configured workspace/source roots; compiled-only package skipped"
+                ));
+                continue;
+            }
+            if descriptors.len() > 1 {
+                lookup.warnings.push(format!(
+                    "ambiguous package {package_name}; matching source descriptors were found: {}",
+                    descriptors
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                continue;
+            }
+
+            let descriptor = &descriptors[0];
+            let (metadata, observations) =
+                match self.cached_package_metadata(descriptor, context, cancel) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                    Err(error) => {
+                        lookup.warnings.push(format!(
+                            "source package {package_name} was skipped: {error}"
+                        ));
+                        continue;
+                    }
+                };
+            merge_project_read_observations(&mut lookup.observations, observations);
+            lookup.metadata_paths.push(descriptor.clone());
+            lookup
+                .metadata_paths
+                .extend(metadata.metadata_files.iter().cloned());
+            lookup
+                .metadata_observations
+                .extend(metadata.metadata_observations.iter().cloned());
+            let mut matched_mapping = false;
+            for (unit_name, entries) in &metadata.unit_entries {
+                if !package_unit_name_matches(unit_name, requested_name, lookup_name, context) {
+                    continue;
+                }
+                matched_mapping = true;
+                for entry in entries {
+                    if !context.read_policy.allows_location(entry) {
+                        lookup.warnings.push(format!(
+                            "source package {package_name} maps {requested_name} outside configured workspace/source roots; skipped: {}",
+                            entry.path.display()
+                        ));
+                        continue;
+                    }
+                    let path = &entry.path;
+                    if !lookup
+                        .metadata_paths
+                        .iter()
+                        .any(|existing| package_paths_equal(existing, path))
+                    {
+                        lookup.metadata_paths.push(path.clone());
+                    }
+                    if lookup
+                        .candidates
+                        .iter()
+                        .any(|existing| package_paths_equal(existing, path))
+                    {
+                        continue;
+                    }
+                    if lookup.candidates.len() >= MAX_PACKAGE_UNIT_CANDIDATES {
+                        lookup.complete = false;
+                        lookup.warnings.push(format!(
+                            "package unit candidate limit ({MAX_PACKAGE_UNIT_CANDIDATES}) reached while resolving {requested_name}"
+                        ));
+                        lookup.candidates.clear();
+                        return Ok(lookup);
+                    }
+                    lookup.candidates.push(path.clone());
+                }
+            }
+            if !matched_mapping {
+                lookup.warnings.push(format!(
+                    "source package {package_name} has no contains mapping for {requested_name}"
+                ));
+            }
+            lookup.warnings.extend(metadata.warnings.iter().cloned());
+        }
+        Ok(lookup)
+    }
+
+    fn package_descriptors(
+        &mut self,
+        requested_names: &[String],
+        package_name: &str,
+        context: &ProjectContext,
+        context_key: &ContextKey,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Vec<PathBuf>, bool), String> {
+        check_workspace_cancel(cancel)?;
+        let requested_names: HashSet<String> = requested_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let key = package_name.to_ascii_lowercase();
+        let roots = self.package_catalogue_roots(context, context_key);
+
+        for root in &roots {
+            self.package_catalogue(context_key, root, &requested_names, cancel)?;
+        }
+        check_workspace_cancel(cancel)?;
+        let (mut descriptors, complete) =
+            self.catalogued_package_descriptors(context_key, &roots, &key);
+
+        descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        descriptors.dedup_by(|left, right| package_paths_equal(left, right));
+        Ok((descriptors, complete))
+    }
+
+    fn catalogued_package_descriptors(
+        &self,
+        context_key: &ContextKey,
+        roots: &[PathBuf],
+        package_name: &str,
+    ) -> (Vec<PathBuf>, bool) {
+        let mut descriptors: Vec<PathBuf> = Vec::new();
+        let mut complete = true;
+        for root in roots {
+            let root = absolute_path(root.clone());
+            let key = PackageCatalogueKey {
+                context: context_key.clone(),
+                root,
+            };
+            let Some(catalogue) = self.package_catalogues.get(&key) else {
+                complete = false;
+                continue;
+            };
+            complete &= catalogue.complete;
+            if let Some(paths) = catalogue.entries.get(package_name) {
+                for path in paths {
+                    if !descriptors
+                        .iter()
+                        .any(|existing| package_paths_equal(existing, path))
+                    {
+                        descriptors.push(path.clone());
+                    }
+                }
+            }
+        }
+        (descriptors, complete)
+    }
+
+    fn package_catalogue_roots(
+        &self,
+        context: &ProjectContext,
+        context_key: &ContextKey,
+    ) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for workspace_root in &self.roots {
+            for root in &workspace_root.source_roots {
+                if !roots.iter().any(|existing| existing == root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        for configured_root in context_key.overrides.read_roots() {
+            let configured_root = absolute_path(configured_root);
+            let root = native_mapping_root(&configured_root);
+            if fs::symlink_metadata(&root).is_err()
+                && !context_uses_mapped_root(context, &configured_root, &root)
+            {
+                continue;
+            }
+            if !roots
+                .iter()
+                .any(|existing| package_paths_equal(existing, &root))
+            {
+                roots.push(root);
+            }
+        }
+        roots
+    }
+
+    #[allow(dead_code)]
+    fn package_source_is_configured(&self, path: &Path) -> bool {
+        self.roots.iter().any(|workspace_root| {
+            workspace_root
+                .source_roots
+                .iter()
+                .any(|root| path_starts_with_ci(path, root))
+        })
+    }
+
+    fn cached_package_metadata(
+        &mut self,
+        path: &Path,
+        context: &ProjectContext,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(PackageMetadata, Vec<ProjectReadObservation>), String> {
+        check_workspace_cancel(cancel)?;
+        let key = PackageMetadataKey {
+            descriptor: path.to_path_buf(),
+            overrides: context.overrides.clone(),
+            read_policy: context.read_policy.clone(),
+            config: context.config.clone(),
+            platform: context.platform.clone(),
+        };
+        let stamp = path_stamp(path);
+        if let Some(cached) = self.package_metadata_cache.get(&key) {
+            if cached
+                .metadata_stamps
+                .iter()
+                .all(|(metadata_path, metadata_stamp)| path_stamp(metadata_path) == *metadata_stamp)
+            {
+                let result = cached.result.clone();
+                let observations = cached.observations.clone();
+                self.use_clock = self.use_clock.saturating_add(1);
+                if let Some(cached) = self.package_metadata_cache.get_mut(&key) {
+                    cached.last_used = self.use_clock;
+                }
+                check_workspace_cancel(cancel)?;
+                return result.map(|metadata| (metadata, observations));
+            }
+        }
+        let previous_metadata_paths = self
+            .package_metadata_cache
+            .get(&key)
+            .map(|cached| {
+                cached
+                    .metadata_stamps
+                    .iter()
+                    .map(|(metadata_path, _)| metadata_path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![path.to_path_buf()]);
+        let options = ProjectOptions {
+            build_config: key.config.clone(),
+            platform: key.platform.clone(),
+            ..ProjectOptions::default()
+        };
+        let entry = match context_path_entry(context, path) {
+            Some(entry) => entry,
+            None => {
+                return Err(format!(
+                    "package metadata {} is outside the effective project read roots",
+                    path.display()
+                ));
+            }
+        };
+        let package_read = read_package_metadata_with_observations(
+            path,
+            &options,
+            &key.overrides,
+            &key.read_policy,
+            &entry,
+        );
+        let (result, observations) = match package_read {
+            Ok(read) => (Ok(read.metadata), read.observations),
+            Err(error) => (Err(error), Vec::new()),
+        };
+        check_workspace_cancel(cancel)?;
+        let metadata_paths = result
+            .as_ref()
+            .map(|metadata| metadata.metadata_files.clone())
+            .unwrap_or(previous_metadata_paths);
+        let metadata_stamps = metadata_paths
+            .into_iter()
+            .map(|metadata_path| {
+                let metadata_stamp = if package_paths_equal(&metadata_path, path) {
+                    stamp.clone()
+                } else if let Some(observation) = observations
+                    .iter()
+                    .find(|observation| package_paths_equal(&observation.path, &metadata_path))
+                {
+                    Some(path_stamp_from_project_read(&observation.stamp))
+                } else {
+                    path_stamp(&metadata_path)
+                };
+                (metadata_path, metadata_stamp)
+            })
+            .collect();
+        self.use_clock = self.use_clock.saturating_add(1);
+        self.package_metadata_cache.insert(
+            key,
+            CachedPackageMetadata {
+                metadata_stamps,
+                result: result.clone(),
+                observations: observations.clone(),
+                last_used: self.use_clock,
+            },
+        );
+        self.trim_package_metadata_cache();
+        result.map(|metadata| (metadata, observations))
+    }
+
+    fn trim_package_metadata_cache(&mut self) {
+        while self.package_metadata_cache.len() > MAX_PACKAGE_METADATA_CACHE {
+            let Some(victim) = self
+                .package_metadata_cache
+                .iter()
+                .min_by_key(|(_, metadata)| metadata.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.package_metadata_cache.remove(&victim);
+        }
+    }
+
+    fn watch_package_path(&mut self, context_key: &ContextKey, path: &Path) {
+        if let Some(state) = self.contexts.get_mut(context_key) {
+            if (extension_is(path, "dpk") || extension_is(path, "dproj"))
+                && !state
+                    .context
+                    .metadata_files
+                    .iter()
+                    .any(|existing| paths_equal_ci(existing, path))
+            {
+                state.context.metadata_files.push(path.to_path_buf());
+            }
+            state
+                .watched_paths
+                .entry(path.to_path_buf())
+                .or_insert_with(|| path_stamp(path));
+        }
+    }
+
+    fn retain_package_observations(
+        &mut self,
+        context_key: &ContextKey,
+        observations: Vec<ProjectReadObservation>,
+    ) {
+        if let Some(state) = self.contexts.get_mut(context_key) {
+            merge_project_read_observations(&mut state.project_read_observations, observations);
+        }
+    }
+
+    fn merge_metadata_observations(
+        &mut self,
+        context_key: &ContextKey,
+        observations: &[MetadataObservation],
+    ) {
+        let Some(state) = self.contexts.get_mut(context_key) else {
+            return;
+        };
+        for observation in observations {
+            pascal_project::add_metadata_observation(
+                &mut state.context.metadata_observations,
+                observation.clone(),
+            );
+        }
+    }
+
+    fn package_catalogue(
+        &mut self,
+        context_key: &ContextKey,
+        root: &Path,
+        requested_names: &HashSet<String>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PackageCatalogue, String> {
+        check_workspace_cancel(cancel)?;
+        let root = absolute_path(root.to_path_buf());
+        let key = PackageCatalogueKey {
+            context: context_key.clone(),
+            root: root.clone(),
+        };
+        let requested_names: HashSet<String> = requested_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let fresh = self.package_catalogues.get(&key).is_some_and(|catalogue| {
+            catalogue.complete
+                && package_catalogue_directories_are_readable(&catalogue.directories)
+                && (catalogue.validated_epoch == self.package_catalogue_epoch
+                    || catalogue
+                        .directories
+                        .iter()
+                        .all(|(path, stamp)| path_stamp(path) == *stamp))
+                && requested_names.is_subset(&catalogue.requested_names)
+        });
+        if fresh {
+            self.use_clock = self.use_clock.saturating_add(1);
+            if let Some(catalogue) = self.package_catalogues.get_mut(&key) {
+                catalogue.validated_epoch = self.package_catalogue_epoch;
+                catalogue.last_used = self.use_clock;
+                return Ok(catalogue.clone());
+            }
+        }
+
+        let mut scan_names = requested_names.clone();
+        if let Some(catalogue) = self.package_catalogues.get(&key) {
+            scan_names.extend(catalogue.requested_names.iter().cloned());
+        }
+        let scan = self.scan_package_catalogue(context_key, &root, &scan_names, cancel)?;
+
+        self.use_clock = self.use_clock.saturating_add(1);
+        let catalogue = PackageCatalogue {
+            entries: scan.entries,
+            requested_names: scan_names,
+            complete: scan.complete,
+            directories: scan.directories,
+            validated_epoch: self.package_catalogue_epoch,
+            last_used: self.use_clock,
+        };
+        self.package_catalogues.insert(key, catalogue.clone());
+        self.trim_package_catalogues();
+        Ok(catalogue)
+    }
+
+    fn scan_package_catalogue(
+        &mut self,
+        context_key: &ContextKey,
+        root: &Path,
+        requested_names: &HashSet<String>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PackageCatalogueScan, String> {
+        check_workspace_cancel(cancel)?;
+        let root = absolute_path(root.to_path_buf());
+        let excludes = self
+            .roots
+            .iter()
+            .find(|workspace_root| {
+                context_key
+                    .workspace_root
+                    .as_deref()
+                    .is_some_and(|selected| native_paths_equal(selected, &workspace_root.path))
+            })
+            .map(|workspace_root| workspace_root.excludes.clone())
+            .unwrap_or_else(|| ExcludeMatcher::new(&root, &root, &[]));
+        let mut scan = PackageCatalogueScan {
+            complete: true,
+            directories: vec![(root.clone(), path_stamp(&root))],
+            ..PackageCatalogueScan::default()
+        };
+        if fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            scan.complete = false;
+            return Ok(scan);
+        }
+        let mut pending = VecDeque::from([root.clone()]);
+        let mut visited = 1usize;
+
+        'directories: while let Some(directory) = pending.pop_front() {
+            check_workspace_cancel(cancel)?;
+            let read_dir = match fs::read_dir(&directory) {
+                Ok(read_dir) => read_dir,
+                Err(_) => {
+                    scan.complete = false;
+                    break;
+                }
+            };
+            let mut children = Vec::new();
+            for result in read_dir {
+                check_workspace_cancel(cancel)?;
+                if visited >= MAX_PACKAGE_CATALOGUE_ENTRIES {
+                    scan.complete = false;
+                    break 'directories;
+                }
+                let Ok(entry) = result else {
+                    scan.complete = false;
+                    break 'directories;
+                };
+                visited += 1;
+                children.push(entry);
+            }
+            children.sort_by(|left, right| {
+                left.path()
+                    .to_string_lossy()
+                    .cmp(&right.path().to_string_lossy())
+            });
+
+            let mut descriptors_by_stem: HashMap<String, PackageDescriptorFiles> = HashMap::new();
+            for entry in children {
+                check_workspace_cancel(cancel)?;
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    scan.complete = false;
+                    continue;
+                };
+                let excluded = excludes.is_excluded(&path, &root);
+                if file_type.is_dir() {
+                    scan.directories.push((path.clone(), path_stamp(&path)));
+                    if !file_type.is_symlink() && !excluded {
+                        pending.push_back(path);
+                    }
+                    continue;
+                }
+                if file_type.is_symlink()
+                    || excluded
+                    || !file_type.is_file()
+                    || !(extension_is(&path, "dpk") || extension_is(&path, "dproj"))
+                {
+                    continue;
+                }
+                let Some(stem) = path.file_stem() else {
+                    continue;
+                };
+                let stem = stem.to_string_lossy().to_ascii_lowercase();
+                let mut matched_names = Vec::new();
+                if requested_names.contains(&stem) {
+                    matched_names.push(stem.clone());
+                }
+
+                let files = descriptors_by_stem.entry(stem).or_default();
+                if extension_is(&path, "dpk") {
+                    files.has_dpk = true;
+                    if !matched_names.is_empty() {
+                        files.dpk.push(PackageDescriptorMatch {
+                            path,
+                            names: matched_names,
+                        });
+                    }
+                } else if !matched_names.is_empty() {
+                    files.dproj.push(PackageDescriptorMatch {
+                        path,
+                        names: matched_names,
+                    });
+                }
+            }
+
+            for files in descriptors_by_stem.into_values() {
+                check_workspace_cancel(cancel)?;
+                let selected = if files.has_dpk {
+                    files.dpk
+                } else {
+                    files.dproj
+                };
+                for descriptor in selected {
+                    for name in descriptor.names {
+                        scan.entries
+                            .entry(name)
+                            .or_default()
+                            .push(descriptor.path.clone());
+                    }
+                }
+            }
+        }
+
+        for paths in scan.entries.values_mut() {
+            check_workspace_cancel(cancel)?;
+            paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+            paths.dedup_by(|left, right| package_paths_equal(left, right));
+        }
+        Ok(scan)
+    }
+
+    fn trim_package_catalogues(&mut self) {
+        while self.package_catalogues.len() > MAX_PACKAGE_CATALOGUES {
+            let Some(victim) = self
+                .package_catalogues
+                .iter()
+                .min_by_key(|(_, catalogue)| catalogue.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.package_catalogues.remove(&victim);
+        }
+    }
+
+    fn filename_candidates_for_names(
+        &mut self,
+        directory: &Path,
+        names: &[String],
+        context_key: &ContextKey,
+    ) -> Vec<PathBuf> {
+        let mut entries = self.directory_entries(directory);
+        entries.extend(self.open_document_entries(directory, context_key));
+        self.record_missing_provider_candidates(directory, names, &entries);
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for name in names {
+            for path in &entries {
+                if path
+                    .file_name()
+                    .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
+                    && !candidates
+                        .iter()
+                        .any(|existing| paths_equal_ci(existing, path))
+                {
+                    candidates.push(path.clone());
+                }
+            }
+        }
+        candidates
+    }
+
+    fn record_missing_provider_candidates(
+        &mut self,
+        directory: &Path,
+        names: &[String],
+        entries: &[PathBuf],
+    ) {
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        let directory = absolute_path(directory.to_path_buf());
+        for name in names {
+            if entries.iter().any(|path| {
+                path.file_name()
+                    .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(name))
+            }) {
+                continue;
+            }
+            let path = directory.join(name);
+            let Some(uri) = Url::from_file_path(&path).ok() else {
+                continue;
+            };
+            match records.entry(uri.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(rename::SourceRecord {
+                        uri,
+                        text: String::new(),
+                        version: None,
+                        stamp: None,
+                        open: false,
+                        path: Some(path.clone()),
+                        path_stamp: path_stamp(&path),
+                        content_hash: None,
+                        parsed_text_hash: None,
+                        content_bytes: None,
+                        candidate_membership: None,
+                        read_policy: None,
+                        path_entry: None,
+                        include_payload: false,
+                        missing_provider_candidate: true,
+                        directory_observation: false,
+                        missing_provider_scope: None,
+                        auto_import_provider_observation: false,
+                        auto_import_scopes: Vec::new(),
+                    });
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().missing_provider_candidate = true;
+                }
+            }
+        }
+    }
+
+    fn record_missing_provider_scope(
+        &mut self,
+        root: &Path,
+        names: &[String],
+        read_policy: &ReadPolicy,
+        path_entry: &ProjectPathEntry,
+    ) {
+        let Some(first_name) = names.first() else {
+            return;
+        };
+        let root = absolute_path(root.to_path_buf());
+        let path = root.join(first_name);
+        let Some(uri) = Url::from_file_path(&path).ok() else {
+            return;
+        };
+        let scope = rename::MissingProviderScope {
+            root,
+            names: names.iter().map(|name| name.to_ascii_lowercase()).collect(),
+            read_policy: read_policy.clone(),
+            path_entry: path_entry.clone(),
+        };
+        let Some(records) = self.analysis_records.as_mut() else {
+            return;
+        };
+        match records.entry(uri.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(rename::SourceRecord {
+                    uri,
+                    text: String::new(),
+                    version: None,
+                    stamp: None,
+                    open: false,
+                    path: Some(path.clone()),
+                    path_stamp: path_stamp(&path),
+                    content_hash: None,
+                    parsed_text_hash: None,
+                    content_bytes: None,
+                    candidate_membership: None,
+                    read_policy: None,
+                    path_entry: None,
+                    include_payload: false,
+                    missing_provider_candidate: false,
+                    directory_observation: false,
+                    missing_provider_scope: Some(scope),
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                let record = entry.get_mut();
+                if let Some(existing) = record.missing_provider_scope.as_mut() {
+                    for name in scope.names {
+                        if !existing
+                            .names
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(&name))
+                        {
+                            existing.names.push(name);
+                        }
+                    }
+                } else {
+                    record.missing_provider_scope = Some(scope);
+                }
+            }
+        }
+    }
+
+    fn open_document_entries(&self, directory: &Path, context_key: &ContextKey) -> Vec<PathBuf> {
+        self.open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                document.text.as_ref()?;
+                let path = absolute_path(uri.to_file_path().ok()?);
+                let parent = path.parent()?;
+                (paths_equal_ci(parent, directory)
+                    && self.ensure_supported_with_context(uri, context_key))
+                .then_some(path)
+            })
+            .collect()
+    }
+
+    fn directory_entries(&mut self, directory: &Path) -> Vec<PathBuf> {
+        let directory = absolute_path(directory.to_path_buf());
+        let stamp = path_stamp(&directory);
+        if self
+            .directory_catalogues
+            .get(&directory)
+            .is_some_and(|catalogue| catalogue.stamp == stamp)
+        {
+            if let Some(catalogue) = self.directory_catalogues.get_mut(&directory) {
+                self.use_clock = self.use_clock.saturating_add(1);
+                catalogue.last_used = self.use_clock;
+                return catalogue.entries.clone();
+            }
+        }
+
+        let entries = fs::read_dir(&directory)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                (file_type.is_file() && !file_type.is_symlink()).then_some(entry.path())
+            })
+            .collect::<Vec<_>>();
+        self.use_clock = self.use_clock.saturating_add(1);
+        self.directory_catalogues.insert(
+            directory.clone(),
+            DirectoryCatalogue {
+                stamp,
+                entries: entries.clone(),
+                last_used: self.use_clock,
+            },
+        );
+        self.trim_directory_catalogues();
+        entries
+    }
+
+    fn trim_directory_catalogues(&mut self) {
+        while self.directory_catalogues.len() > MAX_DIRECTORY_CATALOGUES {
+            let Some(victim) = self
+                .directory_catalogues
+                .iter()
+                .min_by_key(|(_, catalogue)| catalogue.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.directory_catalogues.remove(&victim);
+        }
+    }
+
+    fn filename_unit_candidates(
+        &mut self,
+        unit_name: &str,
+        context: &ProjectContext,
+        context_key: &ContextKey,
+    ) -> Vec<PathBuf> {
+        let names = unit_filename_candidates(unit_name, &context.unit_namespaces)
+            .into_iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let roots = if context.search_paths.is_empty() {
+            self.roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>()
+        } else {
+            context.search_paths.clone()
+        };
+        let entry_limit = filename_catalogue_entry_limit();
+        let mut result = Vec::new();
+        for root in &roots {
+            let catalogue = self.filename_catalogue(root);
+            if !catalogue.complete {
+                self.warn(format!(
+                    "projectless filename catalogue reached its bounded entry limit of {entry_limit} under {}",
+                    root.display()
+                ));
+            }
+            let open_entries = self.open_document_entries_under_root(root, context_key);
+            let scope_names = if catalogue.complete {
+                names
+                    .iter()
+                    .filter(|name| {
+                        !catalogue.entries.contains_key(*name)
+                            && !open_entries.iter().any(|path| {
+                                path.file_name().is_some_and(|file_name| {
+                                    file_name.to_string_lossy().eq_ignore_ascii_case(name)
+                                })
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                names.clone()
+            };
+            let path_entry = context
+                .search_path_entries
+                .iter()
+                .find(|entry| paths_equal_ci(&entry.path, root))
+                .cloned()
+                .or_else(|| context_path_entry(context, root))
+                .unwrap_or_else(|| ProjectPathEntry {
+                    path: root.clone(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                });
+            self.record_missing_provider_scope(
+                root,
+                &scope_names,
+                &context.read_policy,
+                &path_entry,
+            );
+            for name in &names {
+                if let Some(paths) = catalogue.entries.get(name) {
+                    result.extend(paths.iter().cloned());
+                }
+                result.extend(open_entries.iter().filter_map(|path| {
+                    path.file_name()
+                        .is_some_and(|file_name| {
+                            file_name.to_string_lossy().eq_ignore_ascii_case(name)
+                        })
+                        .then_some(path.clone())
+                }));
+            }
+        }
+        result
+    }
+
+    fn open_document_entries_under_root(
+        &self,
+        root: &Path,
+        context_key: &ContextKey,
+    ) -> Vec<PathBuf> {
+        self.open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                document.text.as_ref()?;
+                let path = absolute_path(uri.to_file_path().ok()?);
+                (path_starts_with_ci(&path, root)
+                    && self.ensure_supported_with_context(uri, context_key))
+                .then_some(path)
+            })
+            .collect()
+    }
+
+    fn filename_catalogue(&mut self, root: &Path) -> FilenameCatalogue {
+        self.filename_catalogue_with_cancel(root, None)
+            .unwrap_or_default()
+    }
+
+    fn filename_catalogue_with_cancel(
+        &mut self,
+        root: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<FilenameCatalogue, String> {
+        check_workspace_cancel(cancel)?;
+        let root = absolute_path(root.to_path_buf());
+        let entry_limit = filename_catalogue_entry_limit();
+        let fresh = self
+            .filename_catalogues
+            .get(&root)
+            .is_some_and(|catalogue| {
+                catalogue
+                    .directories
+                    .iter()
+                    .all(|(path, stamp)| path_stamp(path) == *stamp)
+            });
+        if fresh {
+            self.use_clock = self.use_clock.saturating_add(1);
+            if let Some(catalogue) = self.filename_catalogues.get_mut(&root) {
+                catalogue.last_used = self.use_clock;
+                return Ok(catalogue.clone());
+            }
+        }
+        let mut entries: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut directories = vec![(root.clone(), path_stamp(&root))];
+        let mut visited = 0;
+        let mut complete = true;
+        let excludes = self
+            .roots
+            .iter()
+            .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
+            .map(|workspace_root| workspace_root.excludes.clone());
+        for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+            check_workspace_cancel(cancel)?;
+            if visited >= entry_limit {
+                complete = false;
+                break;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            visited += 1;
+            if entry.file_type().is_dir() && directories.len() < entry_limit {
+                directories.push((entry.path().to_path_buf(), path_stamp(entry.path())));
+            }
+            if entry.file_type().is_symlink()
+                || excludes
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_excluded(entry.path(), &root))
+            {
+                continue;
+            }
+            if !entry.file_type().is_file() || !extension_is(entry.path(), "pas") {
+                continue;
+            }
+            if let Some(name) = entry.path().file_name() {
+                entries
+                    .entry(name.to_string_lossy().to_ascii_lowercase())
+                    .or_default()
+                    .push(entry.path().to_path_buf());
+            }
+        }
+        self.use_clock = self.use_clock.saturating_add(1);
+        let catalogue = FilenameCatalogue {
+            entries,
+            complete,
+            directories,
+            last_used: self.use_clock,
+        };
+        self.filename_catalogues.insert(root, catalogue.clone());
+        self.trim_filename_catalogues();
+        Ok(catalogue)
+    }
+
+    fn trim_filename_catalogues(&mut self) {
+        while self.filename_catalogues.len() > MAX_FILENAME_CATALOGUES {
+            let Some(victim) = self
+                .filename_catalogues
+                .iter()
+                .min_by_key(|(_, catalogue)| catalogue.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.filename_catalogues.remove(&victim);
+        }
+    }
+
     fn remove_indexed(&mut self, uri: &Url) {
         self.index.remove(uri);
+        self.remove_expansion(uri);
         self.indexed_files.remove(uri);
         self.last_used.remove(uri);
         self.document_contexts.remove(uri);
@@ -3849,6 +6395,14 @@ impl Workspace {
             .map(|document| document.version)
     }
 
+    pub(crate) fn document_identity(&self, uri: &Url) -> (Option<i32>, Option<u64>) {
+        self.open_documents
+            .get(uri)
+            .map_or((None, None), |document| {
+                (Some(document.version), Some(document.identity_generation))
+            })
+    }
+
     /// Check a completed dependency-scoped read-only computation against the
     /// live protocol state without touching the filesystem. Worker-side
     /// revalidation still checks the captured payload; this second pass only
@@ -3872,23 +6426,70 @@ impl Workspace {
             return Err("workspace structure changed while resolving the request".to_string());
         }
 
+        let auto_import_scopes = records
+            .iter()
+            .flat_map(|record| record.auto_import_scopes.iter())
+            .collect::<Vec<_>>();
+
         for record in records {
             let dependency_uri = source_record_dependency_uri(record);
             let missing_provider_candidate_changed = record.missing_provider_candidate
                 && record.path.as_deref().is_some_and(|candidate| {
-                    self.source_change_generations_case_insensitive
-                        .get(&case_insensitive_path_key(candidate))
-                        .is_some_and(|generation| *generation > source_generation)
+                    self.source_change_observations.values().any(|change| {
+                        change.generation > source_generation
+                            && paths_equal_ci(&change.path, candidate)
+                    })
                 });
-            if self
+            let missing_provider_scope_changed =
+                record.missing_provider_scope.as_ref().is_some_and(|scope| {
+                    self.source_change_observations.values().any(|change| {
+                        let path = change.path.as_path();
+                        let matches = scope.matches(path);
+                        let allows = scope.allows_without_filesystem(path);
+                        let accepted = self.scope_path_is_accepted(path, scope);
+                        change.generation > source_generation && matches && allows && accepted
+                    })
+                });
+            let auto_import_scope_changed = record.auto_import_scopes.iter().any(|scope| {
+                self.source_change_observations.values().any(|change| {
+                    if change.generation <= source_generation {
+                        return false;
+                    }
+                    let path = change.path.as_path();
+                    if !scope.matches_path(path) || !scope.path_is_accepted(self, path) {
+                        return false;
+                    }
+                    let Some(uri) = Url::from_file_path(path).ok() else {
+                        return true;
+                    };
+                    let Some(text) = self
+                        .open_documents
+                        .get(&uri)
+                        .and_then(|document| document.text.as_deref())
+                    else {
+                        // A closed source changed in an authorized provider
+                        // scope, but delivery must not perform an unbounded
+                        // filesystem rescan.  Reject conservatively.
+                        return true;
+                    };
+                    rename::auto_import_source_is_relevant(text, scope)
+                })
+            });
+            let dependency_changed = self
                 .source_change_generations
                 .get(&dependency_uri)
                 .is_some_and(|generation| *generation > source_generation)
+                && !self
+                    .path_record_is_superseded_by_irrelevant_overlay(record, &auto_import_scopes);
+            let configuration_changed = self
+                .configuration_change_generations
+                .get(&dependency_uri)
+                .is_some_and(|generation| *generation > configuration_generation);
+            if dependency_changed
                 || missing_provider_candidate_changed
-                || self
-                    .configuration_change_generations
-                    .get(&dependency_uri)
-                    .is_some_and(|generation| *generation > configuration_generation)
+                || missing_provider_scope_changed
+                || auto_import_scope_changed
+                || configuration_changed
             {
                 return Err(format!(
                     "analysis dependency changed while resolving {}; retry the request",
@@ -3909,12 +6510,17 @@ impl Workspace {
                         record.uri
                     ));
                 };
-                if document.version != record.version.unwrap_or_default()
-                    || record
-                        .content_hash
-                        .is_some_and(|expected| content_hash_bytes(text.as_bytes()) != expected)
-                    || record.content_hash.is_none() && text != record.text
-                {
+                let text_changed = record.content_hash.map_or_else(
+                    || text != record.text,
+                    |expected| {
+                        if record.text.is_empty() {
+                            content_hash_bytes(text.as_bytes()) != expected
+                        } else {
+                            rename::text_content_hash(text) != expected
+                        }
+                    },
+                ) || rename::parsed_source_changed(record, text);
+                if document.version != record.version.unwrap_or_default() || text_changed {
                     return Err(format!(
                         "source changed while resolving {}; retry the request",
                         record.uri
@@ -3936,6 +6542,65 @@ impl Workspace {
         Ok(())
     }
 
+    fn path_record_is_superseded_by_irrelevant_overlay(
+        &self,
+        record: &rename::SourceRecord,
+        scopes: &[&rename::AutoImportProviderScope],
+    ) -> bool {
+        if !record.auto_import_provider_observation {
+            return false;
+        }
+        let Some(path) = record.path.as_deref() else {
+            return false;
+        };
+        let Some(uri) = Url::from_file_path(absolute_path(path.to_path_buf())).ok() else {
+            return false;
+        };
+        let Some(text) = self
+            .open_documents
+            .get(&canonical_file_uri(&uri))
+            .and_then(|document| document.text.as_deref())
+        else {
+            return false;
+        };
+        scopes.is_empty()
+            || scopes.iter().all(|scope| {
+                !scope.matches_path(path) || !rename::auto_import_source_is_relevant(text, scope)
+            })
+    }
+
+    fn scope_path_is_accepted(&self, path: &Path, scope: &rename::MissingProviderScope) -> bool {
+        let under_workspace = self.roots.iter().any(|root| {
+            root.source_roots
+                .iter()
+                .any(|source_root| path_starts_with_native(path, source_root))
+        });
+        !under_workspace
+            || self.accepts_path(path)
+            || matches!(
+                scope.path_entry.provenance,
+                ProjectPathProvenance::Mapped { .. }
+            )
+    }
+
+    fn scope_path_is_accepted_for_auto_import(
+        &self,
+        path: &Path,
+        scope: &rename::AutoImportProviderScope,
+    ) -> bool {
+        let under_workspace = self.roots.iter().any(|root| {
+            root.source_roots
+                .iter()
+                .any(|source_root| path_starts_with_native(path, source_root))
+        });
+        !under_workspace
+            || self.accepts_path(path)
+            || matches!(
+                scope.path_entry.provenance,
+                ProjectPathProvenance::Mapped { .. }
+            )
+    }
+
     fn bump_source_generation(&mut self) {
         self.source_generation = self.source_generation.wrapping_add(1);
     }
@@ -3944,19 +6609,50 @@ impl Workspace {
         self.configuration_generation = self.configuration_generation.wrapping_add(1);
     }
 
-    fn mark_source_change(&mut self, uri: &Url, include_parent: bool) {
+    fn mark_source_change(&mut self, uri: &Url, _include_parent: bool) -> Vec<Url> {
+        let dependent_diagnostics = self.invalidate_expansion_dependents(uri);
+        // Worker freshness uses exact source observations and the bounded
+        // provider scopes recorded by the resolver.  Parent-directory entries
+        // here would make an unrelated child stale every directory scan, while
+        // diagnostic refreshes apply their own exact/parent policy at delivery.
         mark_dependency_change(
             &mut self.source_change_generations,
             uri,
             self.source_generation,
-            include_parent,
+            false,
         );
         if let Ok(path) = uri.to_file_path() {
-            self.source_change_generations_case_insensitive.insert(
-                case_insensitive_path_key(&absolute_path(path)),
-                self.source_generation,
+            let path = absolute_path(path);
+            if let Some(change) = self.source_change_observations.get_mut(&path) {
+                change.generation = self.source_generation;
+                for dependent in &dependent_diagnostics {
+                    self.schedule_diagnostics(dependent.clone());
+                }
+                return dependent_diagnostics;
+            }
+            if self.source_change_observations.len() >= MAX_SOURCE_CHANGE_OBSERVATIONS {
+                // Dropping observations without a marker could let an older
+                // worker accept a result after the evicted change. Treat an
+                // overflow as a workspace-wide source change once; requests
+                // captured after this generation can use the fresh bounded
+                // observation set.
+                self.global_source_change_generation = self
+                    .global_source_change_generation
+                    .max(self.source_generation);
+                self.source_change_observations.clear();
+            }
+            self.source_change_observations.insert(
+                path.clone(),
+                SourceChangeObservation {
+                    path,
+                    generation: self.source_generation,
+                },
             );
         }
+        for dependent in &dependent_diagnostics {
+            self.schedule_diagnostics(dependent.clone());
+        }
+        dependent_diagnostics
     }
 
     fn mark_configuration_change(&mut self, uri: &Url, include_parent: bool) {
@@ -4010,7 +6706,10 @@ impl Workspace {
     fn diagnostics_for(&mut self, uri: &Url) -> Vec<LspDiagnostic> {
         let cancel = AtomicBool::new(false);
         match self.diagnostics_for_with_cancel(uri, &cancel) {
-            Ok(diagnostics) => diagnostics,
+            Ok(publications) => publications
+                .into_iter()
+                .find(|publication| &publication.uri == uri)
+                .map_or_else(Vec::new, |publication| publication.diagnostics),
             Err(error) => vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
         }
     }
@@ -4019,16 +6718,18 @@ impl Workspace {
         &mut self,
         uri: &Url,
         cancel: &AtomicBool,
-    ) -> Result<Vec<LspDiagnostic>, String> {
+    ) -> Result<Vec<queries::DiagnosticPublication>, String> {
         check_workspace_cancel(Some(cancel))?;
         let Some(document) = self.open_documents.get(uri) else {
             return Ok(Vec::new());
         };
+        let version = document.version;
         if let Some(rejection) = &document.rejection {
-            return Ok(vec![server_diagnostic(
-                rejection,
-                DiagnosticSeverity::ERROR,
-            )]);
+            return Ok(single_diagnostic_publication(
+                uri,
+                version,
+                vec![server_diagnostic(rejection, DiagnosticSeverity::ERROR)],
+            ));
         }
         let source = document
             .text
@@ -4042,7 +6743,11 @@ impl Workspace {
             Err(()) => return Err("not a file URI".to_string()),
         };
         if let Err(error) = ensure_safe_tree_depth(&path, lint_source.as_bytes()) {
-            return Ok(vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)]);
+            return Ok(single_diagnostic_publication(
+                uri,
+                version,
+                vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
+            ));
         }
         let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
         let context = self
@@ -4051,16 +6756,24 @@ impl Workspace {
             .map(|state| state.context.clone())
             .ok_or_else(|| format!("project context was not retained for {uri}"))?;
         if has_invalid_project_selection(&context) {
-            return Ok(vec![server_diagnostic(
-                "project selection is invalid; select a current project or Automatic",
-                DiagnosticSeverity::ERROR,
-            )]);
+            return Ok(single_diagnostic_publication(
+                uri,
+                version,
+                vec![server_diagnostic(
+                    "project selection is invalid; select a current project or Automatic",
+                    DiagnosticSeverity::ERROR,
+                )],
+            ));
         }
         if let Some(error) = context.override_error.as_deref() {
-            return Ok(vec![server_diagnostic(
-                &format!("project override configuration is invalid for {uri}: {error}"),
-                DiagnosticSeverity::ERROR,
-            )]);
+            return Ok(single_diagnostic_publication(
+                uri,
+                version,
+                vec![server_diagnostic(
+                    &format!("project override configuration is invalid for {uri}: {error}"),
+                    DiagnosticSeverity::ERROR,
+                )],
+            ));
         }
         check_workspace_cancel(Some(cancel))?;
         let roots = self.workspace_root_paths();
@@ -4078,38 +6791,117 @@ impl Workspace {
             resolved_config.path.as_deref(),
             &resolved_config.value.exclude,
         ) {
-            return Ok(Vec::new());
+            return Ok(single_diagnostic_publication(uri, version, Vec::new()));
         }
         let config = resolved_config.value;
         check_workspace_cancel(Some(cancel))?;
+        let mut expansion =
+            self.expand_source_with_cancel(uri, &source, &context_key, Some(cancel))?;
+        let conditional = pascal_core::conditional::analyze_with_cancel(
+            expansion.expanded.text(),
+            &context.defines,
+            cancel,
+        );
+        crate::include_expansion::reconcile_conditional_completeness(&mut expansion, &conditional);
+        let expansion_complete = expansion.complete;
+        self.store_expansion(uri, source.clone(), expansion);
+        self.record_expansion_analysis_sources(uri, &context, cancel)?;
+        if !expansion_complete {
+            return Ok(single_diagnostic_publication(
+                uri,
+                version,
+                vec![server_diagnostic(
+                    "include expansion was incomplete; lint diagnostics were withheld",
+                    DiagnosticSeverity::ERROR,
+                )],
+            ));
+        }
+
+        let normalized = normalize_line_endings_with_offsets(&conditional.projected_source);
+        if let Err(error) = ensure_safe_tree_depth(&path, normalized.text.as_bytes()) {
+            return Ok(single_diagnostic_publication(
+                uri,
+                version,
+                vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
+            ));
+        }
         let raw = self.run_shared_lint_with_cancel(SharedLintRequest {
             uri,
             path: &path,
             source: source.as_bytes(),
-            lint_source: lint_source.as_bytes(),
+            lint_source: normalized.text.as_bytes(),
             config: &config,
             context_key: &context_key,
             context: &context,
             cancel,
         })?;
         check_workspace_cancel(Some(cancel))?;
-        let line_index = DiagnosticLineIndex::new(&lint_source);
-        let mut diagnostics = Vec::with_capacity(raw.len());
+        let line_index = DiagnosticLineIndex::new(&normalized.text);
+        let expansion = self
+            .expansions
+            .get(uri)
+            .cloned()
+            .ok_or_else(|| format!("include expansion was not retained for {uri}"))?;
+        let mut mapping_budget = crate::include_expansion::MappingBudget::new(
+            cancel,
+            self.include_expansion_limits().max_work,
+        );
+        let mut mapped = HashMap::<Url, Vec<LspDiagnostic>>::new();
         for diagnostic in raw {
             check_workspace_cancel(Some(cancel))?;
-            let range = line_index.range(
+            let Some(normalized_range) = line_index.byte_range(
                 diagnostic.line,
                 diagnostic.column,
                 diagnostic.end_line,
                 diagnostic.end_column,
-            );
+            ) else {
+                continue;
+            };
+            let Some(&start) = normalized.raw_offsets.get(normalized_range.start) else {
+                continue;
+            };
+            let Some(&end) = normalized.raw_offsets.get(normalized_range.end) else {
+                continue;
+            };
+            if start >= end {
+                continue;
+            }
+            if conditional
+                .unknown_spans
+                .iter()
+                .any(|unknown| unknown.start < end && start < unknown.end)
+            {
+                // A lint result in a branch whose activity is not known is
+                // not a trustworthy physical diagnostic.  Keep the
+                // fail-closed policy used by navigation and edits: withhold
+                // the uncertain item rather than publishing a confident
+                // warning for one speculative branch.
+                continue;
+            }
+            let span = match expansion
+                .expanded
+                .map_range_with_budget(start..end, &mut mapping_budget)?
+            {
+                crate::include_expansion::VirtualMapping::Exact(span) => span,
+                crate::include_expansion::VirtualMapping::Many(_)
+                | crate::include_expansion::VirtualMapping::Unmapped => continue,
+            };
+            let Some(source) = expansion.source_texts.get(&span.uri) else {
+                continue;
+            };
+            let Some(start) = text::offset_to_position(source, span.range.start) else {
+                continue;
+            };
+            let Some(end) = text::offset_to_position(source, span.range.end) else {
+                continue;
+            };
             let severity = match diagnostic.severity {
                 Severity::Error => DiagnosticSeverity::ERROR,
                 Severity::Warning => DiagnosticSeverity::WARNING,
                 Severity::Hint => DiagnosticSeverity::HINT,
             };
-            diagnostics.push(LspDiagnostic::new(
-                range,
+            mapped.entry(span.uri).or_default().push(LspDiagnostic::new(
+                Range::new(start, end),
                 Some(severity),
                 Some(NumberOrString::String(diagnostic.rule_id)),
                 Some("lint4d".to_string()),
@@ -4118,7 +6910,17 @@ impl Workspace {
                 None,
             ));
         }
-        Ok(diagnostics)
+        mapped.entry(uri.clone()).or_default();
+        let mut publications = mapped
+            .into_iter()
+            .map(|(uri, diagnostics)| queries::DiagnosticPublication {
+                version: self.document_version(&uri),
+                uri,
+                diagnostics,
+            })
+            .collect::<Vec<_>>();
+        publications.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+        Ok(publications)
     }
 
     fn run_shared_lint_with_cancel(
@@ -4217,6 +7019,7 @@ impl Workspace {
             initial_defined_symbols: context.defines.clone(),
             ..Default::default()
         };
+        let project_complete = project.complete;
         let snapshot = match lint4d::cfg::to_cfg_project_snapshot(project, options) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -4227,15 +7030,24 @@ impl Workspace {
             }
         };
         check_workspace_cancel(Some(cancel))?;
+        if !project_complete && context.discovery_complete {
+            // A complete project context with an incomplete dependency walk
+            // cannot support trustworthy project-CFG diagnostics.  Context
+            // discovery itself may still be incomplete (for example while a
+            // selected project is missing its declared main source); retain
+            // the established file-local fallback in that case.
+            return Ok(Vec::new());
+        }
         if source != lint_source {
-            // Keep resolver coordinates and snapshot bytes identical. The
-            // normalized representation is still used for the conservative
-            // file-local fallback so published positions follow line endings.
+            // Keep resolver coordinates and CFG snapshot bytes identical. The
+            // expanded representation is still used for the conservative
+            // file-local fallback so include diagnostics can be mapped to
+            // their physical sources.
             return Ok(run_file_local());
         }
         Ok(lint4d::engine::run_lint_with_cfg_project(
             &FileInfo::new(path.to_path_buf()),
-            source,
+            lint_source,
             config,
             None,
             Some(&snapshot),
@@ -4496,9 +7308,22 @@ pub(crate) fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> 
     )
 }
 
+fn single_diagnostic_publication(
+    uri: &Url,
+    version: i32,
+    diagnostics: Vec<LspDiagnostic>,
+) -> Vec<queries::DiagnosticPublication> {
+    vec![queries::DiagnosticPublication {
+        uri: uri.clone(),
+        version: Some(version),
+        diagnostics,
+    }]
+}
+
 struct DiagnosticLineIndex<'a> {
     source: &'a str,
     lines: Vec<(usize, usize)>,
+    #[allow(dead_code)]
     utf16_prefix: Vec<usize>,
 }
 
@@ -4526,25 +7351,85 @@ impl<'a> DiagnosticLineIndex<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn range(&self, line: usize, column: usize, end_line: usize, end_column: usize) -> Range {
         let start = self.position(line, column).unwrap_or(Position::new(0, 0));
         let end = self.position(end_line, end_column).unwrap_or(start);
         Range::new(start, end)
     }
 
-    fn position(&self, line: usize, column: usize) -> Option<Position> {
+    fn byte_range(
+        &self,
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let start = self.byte_offset(line, column)?;
+        let end = self.byte_offset(end_line, end_column)?.max(start);
+        Some(start..end)
+    }
+
+    fn byte_offset(&self, line: usize, column: usize) -> Option<usize> {
         let line_number = line.checked_sub(1)?;
         let (start, end) = *self.lines.get(line_number)?;
         let mut byte_offset = column.saturating_sub(1).min(end - start);
         while byte_offset > 0 && !self.source.is_char_boundary(start + byte_offset) {
             byte_offset -= 1;
         }
-        let character = self.utf16_prefix[start + byte_offset] - self.utf16_prefix[start];
+        Some(start + byte_offset)
+    }
+
+    #[allow(dead_code)]
+    fn position(&self, line: usize, column: usize) -> Option<Position> {
+        let byte_offset = self.byte_offset(line, column)?;
+        let line_number = line.checked_sub(1)?;
+        let (start, _) = *self.lines.get(line_number)?;
+        let character = self.utf16_prefix[byte_offset] - self.utf16_prefix[start];
         Some(Position::new(
             u32::try_from(line_number).ok()?,
             u32::try_from(character).ok()?,
         ))
     }
+}
+
+struct NormalizedSource {
+    text: String,
+    /// For every byte boundary in `text`, the corresponding byte boundary in
+    /// the original source.  CRLF therefore maps one normalized byte to two
+    /// physical bytes while all other UTF-8 scalars retain their boundaries.
+    raw_offsets: Vec<usize>,
+}
+
+fn normalize_line_endings_with_offsets(source: &str) -> NormalizedSource {
+    let bytes = source.as_bytes();
+    let mut text = String::with_capacity(source.len());
+    let mut raw_offsets = vec![0];
+    let mut raw = 0;
+    while raw < bytes.len() {
+        if bytes[raw] == b'\r' {
+            text.push('\n');
+            raw += 1;
+            if bytes.get(raw) == Some(&b'\n') {
+                raw += 1;
+            }
+            raw_offsets.push(raw);
+            continue;
+        }
+
+        let character = source[raw..]
+            .chars()
+            .next()
+            .expect("raw offset is inside the source");
+        let width = character.len_utf8();
+        text.push(character);
+        for offset in 1..width {
+            raw_offsets.push(raw + offset);
+        }
+        raw += width;
+        raw_offsets.push(raw);
+    }
+    NormalizedSource { text, raw_offsets }
 }
 
 fn normalize_line_endings(source: &str) -> String {
@@ -4717,14 +7602,19 @@ fn source_record_dependency_uri(record: &rename::SourceRecord) -> Url {
         .unwrap_or_else(|| canonical_file_uri(&record.uri))
 }
 
-fn source_record_matches_change(record: &rename::SourceRecord, changed_uri: &Url) -> bool {
+fn source_record_matches_change(
+    record: &rename::SourceRecord,
+    changed_uri: &Url,
+    include_parent: bool,
+) -> bool {
     let changed_uri = canonical_file_uri(changed_uri);
     if source_record_dependency_uri(record) == changed_uri {
         return true;
     }
 
     let observed_directory = record.directory_observation || record.candidate_membership.is_some();
-    if observed_directory
+    if include_parent
+        && observed_directory
         && record
             .path
             .as_deref()
@@ -4809,10 +7699,6 @@ fn paths_equal_ci(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
-fn case_insensitive_path_key(path: &Path) -> String {
-    path.to_string_lossy().to_ascii_lowercase()
-}
-
 fn project_path_entry_for<'a>(
     context: &'a ProjectContext,
     path: &Path,
@@ -4851,6 +7737,44 @@ fn context_path_entry(context: &ProjectContext, path: &Path) -> Option<ProjectPa
 
 fn native_mapping_root(root: &Path) -> PathBuf {
     resolve_case_insensitive_path(root).unwrap_or_else(|| absolute_path(root.to_path_buf()))
+}
+
+fn context_uses_mapped_root(
+    context: &ProjectContext,
+    configured_root: &Path,
+    resolved_root: &Path,
+) -> bool {
+    context
+        .main_source_entry
+        .as_ref()
+        .into_iter()
+        .chain(context.search_path_entries.iter())
+        .chain(context.include_path_entries.iter())
+        .chain(context.explicit_unit_entries.values().flatten())
+        .any(|entry| match &entry.provenance {
+            ProjectPathProvenance::Mapped { root: mapped_root } => {
+                package_paths_equal(mapped_root, resolved_root)
+                    || paths_equal_ci(mapped_root, configured_root)
+            }
+            ProjectPathProvenance::Configured => {
+                path_starts_with_native(&entry.path, resolved_root)
+                    || path_starts_with_native(&entry.path, configured_root)
+                    || (!resolved_root.exists()
+                        && path_starts_with_ci(&entry.path, configured_root))
+            }
+            ProjectPathProvenance::LegacyNative => false,
+        })
+}
+
+fn package_catalogue_directories_are_readable(
+    directories: &[(PathBuf, Option<PathStamp>)],
+) -> bool {
+    directories.iter().all(|(path, stamp)| {
+        !stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.is_dir && !stamp.is_symlink)
+            || fs::read_dir(path).is_ok()
+    })
 }
 
 fn relative_path(base: &Path, path: &Path) -> Option<PathBuf> {
@@ -5034,6 +7958,79 @@ fn resolve_case_insensitive_path(path: &Path) -> Option<PathBuf> {
     Some(current)
 }
 
+fn aliased_unit_name(context: &ProjectContext, name: &str) -> String {
+    context
+        .unit_aliases
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+        .map_or_else(
+            || name.to_ascii_lowercase(),
+            |(_, target)| target.to_ascii_lowercase(),
+        )
+}
+
+fn unit_filename_candidates(unit_name: &str, namespaces: &[String]) -> Vec<String> {
+    unit_filename_candidate_tiers(unit_name, namespaces)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn unit_filename_candidate_tiers(unit_name: &str, namespaces: &[String]) -> Vec<Vec<String>> {
+    let mut tiers = Vec::new();
+    let short_name = unit_name.rsplit('.').next().unwrap_or(unit_name);
+    let mut exact = vec![format!("{unit_name}.pas")];
+    if !short_name.eq_ignore_ascii_case(unit_name) {
+        exact.push(format!("{short_name}.pas"));
+    }
+    tiers.push(exact);
+    if !unit_name.contains('.') {
+        for namespace in namespaces {
+            let namespace = namespace.trim().trim_matches('.');
+            if !namespace.is_empty() {
+                tiers.push(vec![format!("{namespace}.{unit_name}.pas")]);
+            }
+        }
+    }
+    for tier in &mut tiers {
+        tier.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    }
+    tiers
+}
+
+fn unit_name_matches(
+    actual: &str,
+    requested: &str,
+    lookup: &str,
+    context: &ProjectContext,
+) -> bool {
+    if actual.eq_ignore_ascii_case(lookup) || actual.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    if lookup.contains('.') {
+        return false;
+    }
+    context
+        .unit_namespaces
+        .iter()
+        .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual))
+}
+
+fn package_unit_name_matches(
+    actual: &str,
+    requested: &str,
+    lookup: &str,
+    context: &ProjectContext,
+) -> bool {
+    actual.eq_ignore_ascii_case(requested)
+        || actual.eq_ignore_ascii_case(lookup)
+        || (!lookup.contains('.')
+            && context
+                .unit_namespaces
+                .iter()
+                .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual)))
+}
+
 fn is_default_excluded_component(component: Component<'_>) -> bool {
     let Component::Normal(name) = component else {
         return false;
@@ -5076,6 +8073,14 @@ fn is_pascal_path(path: &Path) -> bool {
         })
 }
 
+fn is_analyzable_source_path(path: &Path) -> bool {
+    is_pascal_path(path)
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("inc"))
+}
+
 fn extension_is(path: &Path, extension: &str) -> bool {
     path.extension()
         .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(extension))
@@ -5116,8 +8121,9 @@ fn is_immutable_override_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextState, DiagnosticLineIndex, FileChange, ResourceLimits, Workspace, WorkspaceOptions,
-        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
+        ContextState, DiagnosticLineIndex, FileChange, MAX_SOURCE_CHANGE_OBSERVATIONS,
+        ResourceLimits, Workspace, WorkspaceOptions, context_state_is_fresh_with_cancel,
+        normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
@@ -5258,6 +8264,52 @@ mod tests {
                 version: 7,
                 content_hash: pascal_project::content_hash_bytes(overlay_source.as_bytes()),
             }
+        );
+    }
+
+    #[test]
+    fn dependency_freshness_accepts_hash_only_open_overlay_records() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().to_owned();
+        let path = root.join("Provider.pas");
+        let source = "unit Provider; interface implementation end.\n";
+        fs::write(&path, source).expect("provider source");
+        let uri = Url::from_file_path(&path).expect("provider URI");
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 7)
+            .expect("open provider overlay");
+
+        let record = super::rename::SourceRecord {
+            uri,
+            text: String::new(),
+            version: Some(7),
+            stamp: None,
+            open: true,
+            path: None,
+            path_stamp: None,
+            content_hash: Some(pascal_project::content_hash_bytes(source.as_bytes())),
+            parsed_text_hash: None,
+            content_bytes: None,
+            candidate_membership: None,
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
+            missing_provider_candidate: false,
+            directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
+        };
+
+        assert!(
+            workspace
+                .dependency_scoped_result_is_fresh(
+                    workspace.source_generation(),
+                    workspace.configuration_generation(),
+                    &[record],
+                )
+                .is_ok()
         );
     }
 
@@ -5723,6 +8775,23 @@ mod tests {
         assert_eq!(
             overlay_text(&workspace, &uri).as_deref(),
             Some(updated.as_str())
+        );
+    }
+
+    #[test]
+    fn source_change_observation_overflow_marks_a_global_generation() {
+        let mut workspace = Workspace::default();
+        for index in 0..=MAX_SOURCE_CHANGE_OBSERVATIONS {
+            let path = std::env::temp_dir().join(format!("lint4d-source-observation-{index}.pas"));
+            let uri = Url::from_file_path(path).expect("source URI");
+            workspace.bump_source_generation();
+            workspace.mark_source_change(&uri, false);
+        }
+
+        assert!(workspace.source_change_observations.len() <= MAX_SOURCE_CHANGE_OBSERVATIONS);
+        assert_eq!(
+            workspace.global_source_change_generation,
+            workspace.source_generation
         );
     }
 
@@ -6201,6 +9270,8 @@ mod tests {
             key: key.clone(),
             state: ContextState::default(),
             origin: super::OwnerOrigin::Inherited,
+            needs_revalidation: false,
+            follow_current_project_file: false,
             legacy_route: Some(super::LegacyRouteProof {
                 source: source.clone(),
                 context: key.clone(),
@@ -6232,6 +9303,8 @@ mod tests {
             key: key.clone(),
             state: ContextState::default(),
             origin: super::OwnerOrigin::Inherited,
+            needs_revalidation: false,
+            follow_current_project_file: false,
             legacy_route: Some(super::LegacyRouteProof {
                 source,
                 context: key,

@@ -1,6 +1,10 @@
+#[cfg(feature = "test-support")]
+use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
+#[cfg(target_os = "linux")]
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader};
 #[cfg(target_os = "linux")]
@@ -13,16 +17,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(feature = "test-support")]
+use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
-use lsp_types::{Position, Url};
+use lsp_types::{Position, TextEdit, Url};
 use pascal_core::FileInfo;
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
-use pascal_lsp::{NavigationTarget, ProjectContext};
+use pascal_lsp::{NavigationTarget, ProjectContext, text};
 use pascal_project::delphi_overrides::OverrideSession;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -155,6 +163,8 @@ struct TestServer {
     messages: Receiver<io::Result<Option<Message>>>,
     pending: VecDeque<Message>,
     _environment: Option<TempDir>,
+    #[cfg(feature = "test-support")]
+    stdout_paused: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-support")]
@@ -186,6 +196,126 @@ impl TestServer {
     #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_NAVIGATION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_navigation_barrier_and_configuration(
+        environment: TempDir,
+    ) -> (Self, TestBarrier) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let barrier_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_NAVIGATION_BARRIER"),
+            Some(barrier_value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_configuration_preparation_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let barrier_directory = environment.path().join("configuration-barrier");
+        fs::create_dir_all(&barrier_directory).expect("configuration barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let barrier_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER"),
+            Some(barrier_value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_navigation_and_configuration_preparation_barriers(
+        environment: TempDir,
+    ) -> (Self, TestBarrier, TestBarrier) {
+        let configuration_directory = environment.path().join("configuration-barrier");
+        let navigation_directory = environment.path().join("navigation-barrier");
+        fs::create_dir_all(&configuration_directory).expect("configuration barrier directory");
+        fs::create_dir_all(&navigation_directory).expect("navigation barrier directory");
+        let configuration = TestBarrier {
+            entered: configuration_directory.join("entered"),
+            release: configuration_directory.join("release"),
+        };
+        let navigation = TestBarrier {
+            entered: navigation_directory.join("entered"),
+            release: navigation_directory.join("release"),
+        };
+        let configuration_value = format!(
+            "{}|{}",
+            configuration.entered.display(),
+            configuration.release.display()
+        );
+        let navigation_value = format!(
+            "{}|{}",
+            navigation.entered.display(),
+            navigation.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                (
+                    "PASCAL_LSP_TEST_CONFIGURATION_PREPARATION_BARRIER",
+                    configuration_value.as_str(),
+                ),
+                (
+                    "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                    navigation_value.as_str(),
+                ),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, configuration, navigation)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_navigation_barrier_and_filename_catalogue_limit(
+        environment: TempDir,
+        limit: usize,
+    ) -> (Self, TestBarrier) {
+        let barrier_directory = environment.path().join("analysis-barrier");
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let barrier_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let limit_value = limit.to_string();
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                ("PASCAL_LSP_TEST_NAVIGATION_BARRIER", barrier_value.as_str()),
+                (
+                    "PASCAL_LSP_TEST_FILENAME_CATALOGUE_ENTRIES",
+                    limit_value.as_str(),
+                ),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, barrier)
     }
 
     #[cfg(feature = "test-support")]
@@ -330,6 +460,69 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_selection_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_SELECTION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_completion_resolution_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_COMPLETION_RESOLUTION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_workspace_symbols_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_partial_validation_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_PARTIAL_VALIDATION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_workspace_symbols_and_diagnostics_barriers(
+        environment: TempDir,
+    ) -> (Self, TestBarrier, TestBarrier) {
+        let workspace_directory = environment.path().join("workspace-symbols-barrier");
+        let diagnostics_directory = environment.path().join("diagnostics-barrier");
+        fs::create_dir_all(&workspace_directory).expect("workspace-symbols barrier directory");
+        fs::create_dir_all(&diagnostics_directory).expect("diagnostics barrier directory");
+        let workspace_symbols = TestBarrier {
+            entered: workspace_directory.join("entered"),
+            release: workspace_directory.join("release"),
+        };
+        let diagnostics = TestBarrier {
+            entered: diagnostics_directory.join("entered"),
+            release: diagnostics_directory.join("release"),
+        };
+        let workspace_symbols_value = format!(
+            "{}|{}",
+            workspace_symbols.entered.display(),
+            workspace_symbols.release.display()
+        );
+        let diagnostics_value = format!(
+            "{}|{}",
+            diagnostics.entered.display(),
+            diagnostics.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variables(
+            environment.path(),
+            [
+                (
+                    "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER",
+                    workspace_symbols_value.as_str(),
+                ),
+                (
+                    "PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER",
+                    diagnostics_value.as_str(),
+                ),
+            ],
+        );
+        server._environment = Some(environment);
+        (server, workspace_symbols, diagnostics)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_barrier(environment: TempDir, variable: &str) -> (Self, TestBarrier) {
         let barrier_directory = environment.path().join("analysis-barrier");
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
@@ -404,9 +597,17 @@ impl TestServer {
     fn from_child(mut child: Child) -> Self {
         let stdout = child.stdout.take().expect("child stdout");
         let (sender, receiver) = mpsc::channel();
+        #[cfg(feature = "test-support")]
+        let stdout_paused = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        let reader_pause = Arc::clone(&stdout_paused);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
+                #[cfg(feature = "test-support")]
+                while reader_pause.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 match Message::read(&mut reader) {
                     Ok(message) => {
                         let is_eof = message.is_none();
@@ -427,6 +628,8 @@ impl TestServer {
             messages: receiver,
             pending: VecDeque::new(),
             _environment: None,
+            #[cfg(feature = "test-support")]
+            stdout_paused,
         }
     }
 
@@ -525,6 +728,101 @@ impl TestServer {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    fn pause_stdout(&self) {
+        self.stdout_paused.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "test-support")]
+    fn resume_stdout(&self) {
+        self.stdout_paused.store(false, Ordering::Release);
+    }
+
+    #[cfg(feature = "test-support")]
+    fn assert_no_progress(&mut self) {
+        assert!(
+            !self.pending.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::Notification(notification) if notification.method == "$/progress"
+                )
+            }),
+            "unexpected progress notification in pending messages: {:?}",
+            self.pending
+        );
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(Message::Notification(notification))))
+                    if notification.method == "$/progress" =>
+                {
+                    panic!("unexpected progress notification: {notification:?}");
+                }
+                Ok(Ok(Some(message))) => self.pending.push_back(message),
+                Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => return,
+                Ok(Err(error)) => panic!("failed reading progress check: {error}"),
+                Err(RecvTimeoutError::Timeout) => return,
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn assert_no_notification(&mut self, method: &str) {
+        assert!(
+            !self.pending.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::Notification(notification) if notification.method == method
+                )
+            }),
+            "unexpected {method} notification in pending messages: {:?}",
+            self.pending
+        );
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(Message::Notification(notification))))
+                    if notification.method == method =>
+                {
+                    panic!("unexpected {method} notification: {notification:?}");
+                }
+                Ok(Ok(Some(message))) => self.pending.push_back(message),
+                Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => return,
+                Ok(Err(error)) => panic!("failed reading {method} check: {error}"),
+                Err(RecvTimeoutError::Timeout) => return,
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn pending_request_count(&self, method: &str) -> usize {
+        self.pending
+            .iter()
+            .filter(
+                |message| matches!(message, Message::Request(request) if request.method == method),
+            )
+            .count()
+    }
+
+    #[cfg(feature = "test-support")]
+    fn assert_no_request(&self, method: &str) {
+        let count = self.pending_request_count(method);
+        assert_eq!(
+            count, 0,
+            "unexpected {count} buffered request(s) for {method}: {:?}",
+            self.pending
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    fn next_message(&mut self) -> Message {
+        self.pending
+            .pop_front()
+            .unwrap_or_else(|| self.receive_until(Instant::now() + IO_TIMEOUT))
+    }
+
     fn notification(&mut self, method: &str) -> Value {
         self.notification_with_timeout(method, IO_TIMEOUT)
     }
@@ -548,6 +846,27 @@ impl TestServer {
                 other => self.pending.push_back(other),
             }
         }
+    }
+
+    fn take_partial_items(&mut self, token: &str) -> Vec<Value> {
+        let mut items = Vec::new();
+        let mut retained = VecDeque::new();
+        while let Some(message) = self.pending.pop_front() {
+            match message {
+                Message::Notification(notification)
+                    if notification.method == "$/progress"
+                        && notification.params.get("token").and_then(Value::as_str)
+                            == Some(token) =>
+                {
+                    if let Some(chunk) = notification.params["value"].as_array() {
+                        items.extend(chunk.iter().cloned());
+                    }
+                }
+                other => retained.push_back(other),
+            }
+        }
+        self.pending = retained;
+        items
     }
 
     fn diagnostic_with_timeout(&mut self, expected: &Url, timeout: Duration) -> Option<Value> {
@@ -603,6 +922,31 @@ impl TestServer {
         }
     }
 
+    fn request_with_timeout(&mut self, method: &str, timeout: Duration) -> Option<Request> {
+        if let Some(index) = self.pending.iter().position(
+            |message| matches!(message, Message::Request(request) if request.method == method),
+        ) {
+            return match self.pending.remove(index).expect("pending request") {
+                Message::Request(request) => Some(request),
+                _ => unreachable!("pending request predicate"),
+            };
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(Message::Request(request)))) if request.method == method => {
+                    return Some(request);
+                }
+                Ok(Ok(Some(message))) => self.pending.push_back(message),
+                Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Ok(Err(error)) => panic!("failed reading request: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+            }
+        }
+        None
+    }
+
     fn receive_until(&mut self, deadline: Instant) -> Message {
         let remaining = deadline.saturating_duration_since(Instant::now());
         self.messages
@@ -614,6 +958,48 @@ impl TestServer {
 
     fn initialize(&mut self, root: &Path, initialization_options: Value) -> Value {
         self.initialize_with_watched_registration(root, initialization_options, false)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn initialize_with_progress(&mut self, root: &Path) -> Value {
+        let id = RequestId::from("progress-helper-initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": uri(root),
+                "capabilities": {"window": {"workDoneProgress": true}}
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    fn initialize_with_folding_capabilities(
+        &mut self,
+        root: &Path,
+        folding_capabilities: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {"foldingRange": folding_capabilities}
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
     }
 
     fn initialize_with_workspace_folders(
@@ -760,6 +1146,56 @@ impl TestServer {
         response.result.expect("initialize result")
     }
 
+    fn initialize_with_completion_resolve_properties(
+        &mut self,
+        root: &Path,
+        properties: Value,
+        documentation_formats: Value,
+    ) -> Value {
+        self.initialize_with_completion_capabilities(root, None, properties, documentation_formats)
+    }
+
+    fn initialize_with_completion_capabilities(
+        &mut self,
+        root: &Path,
+        snippet_support: Option<bool>,
+        properties: Value,
+        documentation_formats: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("initialize".to_string());
+        let mut completion_item = json!({
+            "documentationFormat": documentation_formats,
+            "resolveSupport": {"properties": properties}
+        });
+        if let Some(snippet_support) = snippet_support {
+            completion_item["snippetSupport"] = json!(snippet_support);
+        }
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": null,
+                "capabilities": {
+                    "general": {"positionEncodings": ["utf-16"]},
+                    "textDocument": {
+                        "synchronization": {"dynamicRegistration": false, "didSave": true},
+                        "completion": {
+                            "completionItem": completion_item
+                        }
+                    },
+                    "workspace": {"workspaceFolders": true}
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
     fn initialize_without_document_changes(
         &mut self,
         root: &Path,
@@ -853,6 +1289,106 @@ impl TestServer {
                             "relativePatternSupport": relative_pattern_support
                         },
                         "workspaceEdit": {"documentChanges": document_changes}
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    fn initialize_with_configuration_capability(
+        &mut self,
+        root: &Path,
+        configuration: Option<bool>,
+        initialization_options: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("configuration-initialize".to_string());
+        let mut workspace = json!({
+            "workspaceFolders": true,
+        });
+        if let Some(configuration) = configuration {
+            workspace["configuration"] = json!(configuration);
+        }
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": initialization_options,
+                "capabilities": {
+                    "workspace": workspace,
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn initialize_with_configuration_and_document_changes(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("configuration-document-changes-initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": initialization_options,
+                "capabilities": {
+                    "workspace": {
+                        "configuration": true,
+                        "workspaceFolders": true,
+                        "workspaceEdit": {"documentChanges": true}
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
+    fn initialize_with_configuration_capability_and_folders(
+        &mut self,
+        root: &Path,
+        folders: &[&Path],
+        configuration: bool,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let workspace_folders = folders
+            .iter()
+            .map(|folder| {
+                json!({
+                    "uri": uri(folder),
+                    "name": folder.display().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let id = RequestId::from("configuration-folders-initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "workspaceFolders": workspace_folders,
+                "capabilities": {
+                    "workspace": {
+                        "workspaceFolders": true,
+                        "configuration": configuration,
                     }
                 }
             }),
@@ -1011,6 +1547,114 @@ fn position_after(source: &str, needle: &str, occurrence: usize) -> Position {
     )
 }
 
+fn apply_completion_item(source: &str, item: &Value) -> String {
+    let mut edits = Vec::new();
+    let primary: TextEdit =
+        serde_json::from_value(item["textEdit"].clone()).expect("completion primary text edit");
+    edits.push(primary);
+    if let Some(additional) = item["additionalTextEdits"].as_array() {
+        edits.extend(
+            additional
+                .iter()
+                .cloned()
+                .map(|edit| serde_json::from_value(edit).expect("completion additional text edit")),
+        );
+    }
+    let mut byte_edits = edits
+        .into_iter()
+        .map(|edit| {
+            let start = text::position_to_offset(source, edit.range.start)
+                .expect("completion edit start is a UTF-16 boundary");
+            let end = text::position_to_offset(source, edit.range.end)
+                .expect("completion edit end is a UTF-16 boundary");
+            (start, end, edit.new_text)
+        })
+        .collect::<Vec<_>>();
+    byte_edits.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+    let mut result = source.to_owned();
+    for (start, end, new_text) in byte_edits {
+        result.replace_range(start..end, &new_text);
+    }
+    result
+}
+
+fn expand_lsp_snippet(snippet: &str) -> String {
+    let mut expanded = String::with_capacity(snippet.len());
+    let bytes = snippet.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                if let Some(next) = snippet[index + 1..].chars().next() {
+                    expanded.push(next);
+                    index += 1 + next.len_utf8();
+                } else {
+                    expanded.push('\\');
+                    index += 1;
+                }
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'0') => index += 2,
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                let mut end = index + 2;
+                let mut escaped = false;
+                while end < bytes.len() {
+                    if escaped {
+                        escaped = false;
+                    } else if bytes[end] == b'\\' {
+                        escaped = true;
+                    } else if bytes[end] == b'}' {
+                        break;
+                    }
+                    end += 1;
+                }
+                if end >= bytes.len() {
+                    expanded.push('$');
+                    index += 1;
+                    continue;
+                }
+                let body = &snippet[index + 2..end];
+                let default = body.split_once(':').map_or(body, |(_, default)| default);
+                expanded.push_str(&unescape_lsp_snippet_literal(default));
+                index = end + 1;
+            }
+            _ => {
+                let character = snippet[index..].chars().next().expect("snippet character");
+                expanded.push(character);
+                index += character.len_utf8();
+            }
+        }
+    }
+    expanded
+}
+
+fn unescape_lsp_snippet_literal(value: &str) -> String {
+    let mut unescaped = String::with_capacity(value.len());
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            unescaped.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            unescaped.push(character);
+        }
+    }
+    if escaped {
+        unescaped.push('\\');
+    }
+    unescaped
+}
+
+fn apply_expanded_completion_item(source: &str, item: &Value) -> String {
+    let mut expanded = item.clone();
+    let snippet = expanded["textEdit"]["newText"]
+        .as_str()
+        .expect("snippet text");
+    expanded["textEdit"]["newText"] = json!(expand_lsp_snippet(snippet));
+    apply_completion_item(source, &expanded)
+}
+
 fn final_qualified_type_position(source: &str, qualified_name: &str) -> Position {
     let start = position_of(source, qualified_name, 0);
     let prefix = qualified_name
@@ -1030,6 +1674,31 @@ fn result_locations(response: Response) -> Vec<Value> {
 }
 
 #[cfg(feature = "test-support")]
+fn collect_partial_response(
+    server: &mut TestServer,
+    request_id: &RequestId,
+    token: &Value,
+) -> (Vec<Value>, Response) {
+    let mut items = Vec::new();
+    loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                assert_eq!(&notification.params["token"], token);
+                let chunk = notification.params["value"]
+                    .as_array()
+                    .expect("partial progress value must be an array");
+                assert!(!chunk.is_empty(), "partial chunks must not be empty");
+                items.extend(chunk.iter().cloned());
+            }
+            Message::Response(response) if &response.id == request_id => {
+                return (items, response);
+            }
+            other => server.pending.push_back(other),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
 fn assert_queue_overflow(response: Response) {
     let error = response.error.expect("analysis queue overflow error");
     assert_eq!(error.code, -32803);
@@ -1037,6 +1706,18 @@ fn assert_queue_overflow(response: Response) {
 }
 
 fn location_signature(location: &Value) -> (String, u32, u32, u32, u32) {
+    (
+        location["uri"].as_str().unwrap_or_default().to_owned(),
+        location["range"]["start"]["line"].as_u64().unwrap() as u32,
+        location["range"]["start"]["character"].as_u64().unwrap() as u32,
+        location["range"]["end"]["line"].as_u64().unwrap() as u32,
+        location["range"]["end"]["character"].as_u64().unwrap() as u32,
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn symbol_signature(symbol: &Value) -> (String, u32, u32, u32, u32) {
+    let location = &symbol["location"];
     (
         location["uri"].as_str().unwrap_or_default().to_owned(),
         location["range"]["start"]["line"].as_u64().unwrap() as u32,
@@ -1123,6 +1804,24 @@ fn workspace_symbol_source(unit_name: &str, variable_count: usize) -> String {
     let mut source = format!("unit {unit_name};\ninterface\nvar\n");
     for index in 0..variable_count {
         source.push_str(&format!("  Symbol{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+    source
+}
+
+#[cfg(feature = "test-support")]
+fn wide_workspace_symbol_source(
+    unit_name: &str,
+    prefix: &str,
+    variable_count: usize,
+    name_width: usize,
+) -> String {
+    let mut source = format!("unit {unit_name};\ninterface\nvar\n");
+    for index in 0..variable_count {
+        source.push_str(&format!(
+            "  {prefix}{index}_{}: Integer;\n",
+            "x".repeat(name_width)
+        ));
     }
     source.push_str("implementation\nend.\n");
     source
@@ -1930,17 +2629,3298 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
     let capabilities = &result["capabilities"];
     assert_eq!(capabilities["positionEncoding"], "utf-16");
     assert_eq!(capabilities["textDocumentSync"]["change"], 2);
-    assert_eq!(capabilities["declarationProvider"], true);
-    assert_eq!(capabilities["definitionProvider"], true);
-    assert_eq!(capabilities["implementationProvider"], true);
-    assert_eq!(capabilities["documentSymbolProvider"], true);
-    assert_eq!(capabilities["workspaceSymbolProvider"], true);
-    assert_eq!(capabilities["referencesProvider"], true);
-    assert_eq!(capabilities["documentHighlightProvider"], true);
-    assert_eq!(capabilities["hoverProvider"], true);
-    assert_eq!(capabilities["typeDefinitionProvider"], true);
-    assert_eq!(capabilities["documentFormattingProvider"], true);
+    assert_eq!(
+        capabilities["declarationProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(capabilities["definitionProvider"]["workDoneProgress"], true);
+    assert_eq!(
+        capabilities["implementationProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["documentSymbolProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["workspaceSymbolProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(capabilities["referencesProvider"]["workDoneProgress"], true);
+    assert_eq!(
+        capabilities["documentHighlightProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["selectionRangeProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(capabilities["hoverProvider"]["workDoneProgress"], true);
+    assert_eq!(
+        capabilities["typeDefinitionProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["foldingRangeProvider"]["workDoneProgress"],
+        true
+    );
+    assert_eq!(
+        capabilities["documentFormattingProvider"]["workDoneProgress"],
+        true
+    );
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn workspace_symbol_request_reports_string_work_done_progress_in_order() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(
+        &source,
+        "unit Main;\ninterface\ntype\n  TMain = class\n  end;\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(root.path()),
+            "capabilities": {
+                "window": {"workDoneProgress": true}
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    let initialize_result = initialize.result.expect("initialize result");
+    assert_eq!(
+        initialize_result["capabilities"]["workspaceSymbolProvider"]["workDoneProgress"],
+        true
+    );
+    server.send_notification("initialized", json!({}));
+
+    let request_id = RequestId::from("workspace-symbol-progress".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/symbol",
+        json!({"query": "TMain", "workDoneToken": "symbols-progress"}),
+    );
+
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], "symbols-progress");
+    assert_eq!(begin["value"]["kind"], "begin");
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], "symbols-progress");
+    assert_eq!(report["value"]["kind"], "report");
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "workspace symbol failed: {response:?}"
+    );
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "symbols-progress");
+    assert_eq!(end["value"]["kind"], "end");
+
+    let integer_request_id = RequestId::from("workspace-symbol-integer-progress".to_string());
+    server.send_request(
+        integer_request_id.clone(),
+        "workspace/symbol",
+        json!({"query": "TMain", "workDoneToken": 37}),
+    );
+    let integer_begin = server.notification("$/progress");
+    assert_eq!(integer_begin["token"], 37);
+    assert_eq!(integer_begin["value"]["kind"], "begin");
+    let integer_report = server.notification("$/progress");
+    assert_eq!(integer_report["token"], 37);
+    assert_eq!(integer_report["value"]["kind"], "report");
+    let integer_response = server.response(&integer_request_id);
+    assert!(integer_response.error.is_none());
+    let integer_end = server.notification("$/progress");
+    assert_eq!(integer_end["token"], 37);
+    assert_eq!(integer_end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn workspace_symbol_partial_result_string_token_chunks_without_final_duplicates() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = workspace_symbol_source("Main", 400);
+    write_file(&source, &text);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let partial_id = RequestId::from("workspace-symbol-partial".to_string());
+    server.send_request(
+        partial_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "symbols-partial"}),
+    );
+
+    let mut partial_items = Vec::new();
+    let final_result = loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                assert_eq!(notification.params["token"], "symbols-partial");
+                let value = notification.params["value"]
+                    .as_array()
+                    .expect("partial result progress value must be an array");
+                assert!(
+                    !value.is_empty(),
+                    "non-empty output must use non-empty chunks"
+                );
+                assert!(
+                    value.len() <= 128,
+                    "partial result chunk exceeds the item bound"
+                );
+                assert!(
+                    serde_json::to_vec(value)
+                        .expect("partial result chunk must encode")
+                        .len()
+                        <= 64 * 1024,
+                    "partial result chunk exceeds the encoded byte bound"
+                );
+                partial_items.extend(value.iter().cloned());
+            }
+            Message::Response(response) if response.id == partial_id => {
+                break response.result.expect("partial final result");
+            }
+            other => server.pending.push_back(other),
+        }
+    };
+    assert!(final_result.as_array().expect("final array").is_empty());
+    assert!(
+        partial_items.len() > 1,
+        "the bounded delivery should produce multiple chunks/items"
+    );
+
+    let ordinary_id = RequestId::from("workspace-symbol-ordinary".to_string());
+    server.send_request(
+        ordinary_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol"}),
+    );
+    let ordinary = server
+        .response(&ordinary_id)
+        .result
+        .expect("ordinary result")
+        .as_array()
+        .expect("ordinary array")
+        .clone();
+    assert_eq!(partial_items, ordinary);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn oversized_partial_item_fails_only_its_request_and_keeps_the_session_alive() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(
+        &source,
+        &format!(
+            "unit Main; interface var Symbol{}: Integer; implementation end.\n",
+            "x".repeat(70_000)
+        ),
+    );
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let partial_id = RequestId::from("oversized-partial".to_string());
+    server.send_request(
+        partial_id.clone(),
+        "workspace/symbol",
+        json!({
+            "query": "Symbol",
+            "partialResultToken": "oversized-partial-token",
+            "workDoneToken": "oversized-work-done"
+        }),
+    );
+
+    let mut progress_kinds = Vec::new();
+    let response = loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                if notification.params["token"] == "oversized-work-done" {
+                    progress_kinds.push(
+                        notification.params["value"]["kind"]
+                            .as_str()
+                            .expect("work-done progress kind")
+                            .to_owned(),
+                    );
+                }
+            }
+            Message::Response(response) if response.id == partial_id => break response,
+            other => server.pending.push_back(other),
+        }
+    };
+    assert_eq!(
+        response
+            .error
+            .expect("oversized partial request must fail")
+            .code,
+        -32803
+    );
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "oversized-work-done");
+    assert_eq!(end["value"]["kind"], "end");
+    progress_kinds.push(
+        end["value"]["kind"]
+            .as_str()
+            .expect("work-done end kind")
+            .to_owned(),
+    );
+    assert_eq!(progress_kinds, ["begin", "report", "end"]);
+
+    let healthy_id = RequestId::from("healthy-after-oversized".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "the oversized partial request must not terminate the session: {healthy:?}"
+    );
+    assert_eq!(
+        healthy
+            .result
+            .expect("healthy symbol result")
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn oversized_ordinary_result_is_request_scoped_and_keeps_the_session_alive() {
+    let root = tempfile::tempdir().expect("workspace");
+    for unit in 0..10 {
+        let mut source = format!("unit Unit{unit};\ninterface\nvar\n");
+        for index in 0..800 {
+            source.push_str(&format!(
+                "  Symbol{unit}_{index}_{}: Integer;\n",
+                "x".repeat(1_000)
+            ));
+        }
+        source.push_str("implementation\nend.\n");
+        write_file(&root.path().join(format!("Unit{unit}.pas")), &source);
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let large_id = RequestId::from("ordinary-large-result".to_string());
+    server.send_request(
+        large_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol"}),
+    );
+    let large = server.response(&large_id);
+    assert_eq!(
+        large
+            .error
+            .expect("oversized ordinary result must fail")
+            .code,
+        -32803,
+        "a valid result that exceeds the bounded control budget must fail only its request"
+    );
+
+    let healthy_id = RequestId::from("ordinary-large-result-follow-up".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol0_0_"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "an oversized ordinary result must not terminate the session: {healthy:?}"
+    );
+    assert_eq!(
+        healthy
+            .result
+            .expect("healthy ordinary result")
+            .as_array()
+            .expect("healthy ordinary array")
+            .len(),
+        1
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn references_partial_result_integer_token_matches_complete_result_with_declaration() {
+    let (_temp, main, provider, main_source, _provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root");
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let partial_id = RequestId::from("references-partial-integer".to_string());
+    server.send_request(
+        partial_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&main_source, "PublicRoutine", 0),
+            "context": {"includeDeclaration": true},
+            "partialResultToken": 77
+        }),
+    );
+    let (partial_items, partial_response) =
+        collect_partial_response(&mut server, &partial_id, &json!(77));
+    assert!(
+        partial_response.error.is_none(),
+        "partial references failed"
+    );
+    assert!(
+        partial_response
+            .result
+            .expect("partial final references")
+            .as_array()
+            .expect("partial final array")
+            .is_empty()
+    );
+
+    let ordinary_id = RequestId::from("references-ordinary-after-partial".to_string());
+    server.send_request(
+        ordinary_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&main_source, "PublicRoutine", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let ordinary_items = result_locations(server.response(&ordinary_id));
+    assert_eq!(partial_items, ordinary_items);
+    assert!(
+        partial_items
+            .iter()
+            .any(|location| location["uri"] == uri(&provider).to_string()),
+        "declaration-inclusive references must retain the provider declaration"
+    );
+    let unique = partial_items
+        .iter()
+        .map(location_signature)
+        .collect::<HashSet<_>>();
+    assert_eq!(unique.len(), partial_items.len());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn empty_partial_workspace_result_has_only_the_final_empty_response() {
+    let root = tempfile::tempdir().expect("workspace");
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("empty-partial-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Missing", "partialResultToken": "empty-partial"}),
+    );
+    let (items, response) = collect_partial_response(&mut server, &id, &json!("empty-partial"));
+    assert!(items.is_empty());
+    assert!(
+        response.error.is_none(),
+        "empty partial request failed: {response:?}"
+    );
+    assert_eq!(response.result, Some(Value::Array(Vec::new())));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn malformed_partial_result_token_is_rejected_without_analysis() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Main.pas"),
+        "unit Main; interface implementation end.\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("malformed-partial-token".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main", "partialResultToken": {"not": "a token"}}),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("malformed partial token error");
+    assert_eq!(error.code, -32602);
+    assert!(error.message.contains("partialResultToken"));
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn partial_and_work_done_tokens_use_separate_progress_payloads() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 400));
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let id = RequestId::from("partial-and-workdone".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({
+            "query": "Symbol",
+            "workDoneToken": "work-done",
+            "partialResultToken": "partial-items"
+        }),
+    );
+
+    let mut partial_items = Vec::new();
+    let mut work_kinds = Vec::new();
+    let response = loop {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                let token = &notification.params["token"];
+                let value = &notification.params["value"];
+                if token == "partial-items" {
+                    partial_items.extend(
+                        value
+                            .as_array()
+                            .expect("partial token must carry arrays")
+                            .iter()
+                            .cloned(),
+                    );
+                } else {
+                    assert_eq!(token, "work-done");
+                    work_kinds.push(
+                        value["kind"]
+                            .as_str()
+                            .expect("work progress kind")
+                            .to_owned(),
+                    );
+                }
+            }
+            Message::Response(response) if response.id == id => break response,
+            other => server.pending.push_back(other),
+        }
+    };
+    assert!(response.error.is_none(), "combined progress request failed");
+    assert_eq!(response.result, Some(Value::Array(Vec::new())));
+    assert!(!partial_items.is_empty());
+    assert_eq!(work_kinds, ["begin", "report"]);
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "work-done");
+    assert_eq!(end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn active_partial_token_collision_is_rejected_and_token_can_be_reused() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 1_200));
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let first_id = RequestId::from("partial-token-owner".to_string());
+    server.send_request(
+        first_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "reused-token"}),
+    );
+    let first_chunk = server.notification("$/progress");
+    assert_eq!(first_chunk["token"], "reused-token");
+    assert!(first_chunk["value"].as_array().is_some());
+
+    let collision_id = RequestId::from("partial-token-collision".to_string());
+    server.send_request(
+        collision_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "reused-token"}),
+    );
+    let collision = server.response(&collision_id);
+    let collision_error = collision.error.expect("active token collision error");
+    assert_eq!(collision_error.code, -32803);
+    assert!(collision_error.message.contains("progress token"));
+
+    let (items, response) =
+        collect_partial_response(&mut server, &first_id, &json!("reused-token"));
+    assert!(response.error.is_none(), "original partial request failed");
+    assert!(!items.is_empty());
+
+    let reused_id = RequestId::from("partial-token-reused".to_string());
+    server.send_request(
+        reused_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol1199", "partialResultToken": "reused-token"}),
+    );
+    let (_reused_items, reused_response) =
+        collect_partial_response(&mut server, &reused_id, &json!("reused-token"));
+    assert!(
+        reused_response.error.is_none(),
+        "finished token must be reusable"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_partial_delivery_stops_future_chunks_and_returns_request_canceled() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = workspace_symbol_source("Main", 3_000);
+    write_file(&source, &text);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("cancel-partial-delivery".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "cancel-partial"}),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "cancel-partial");
+    assert!(first["value"].as_array().is_some());
+
+    server.send_notification("$/cancelRequest", json!({"id": id}));
+    let response = server.response(&id);
+    let error = response.error.expect("partial cancellation error");
+    assert_eq!(error.code, -32800);
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn source_change_between_partial_chunks_fails_without_a_successful_final_response() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = workspace_symbol_source("Main", 2_000);
+    write_file(&source, &text);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let id = RequestId::from("stale-partial-delivery".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "stale-partial"}),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "stale-partial");
+    assert!(first["value"].as_array().is_some());
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source), "version": 2},
+            "contentChanges": [{"text": text}]
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("stale partial delivery error");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("stale"));
+    server.assert_no_response(&id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unnotified_disk_change_between_workspace_symbol_chunks_fails_closed() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 3_000));
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("unnotified-disk-symbols".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "disk-symbols"}),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "disk-symbols");
+    write_file(&source, "unit Main; interface implementation end.\n");
+
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("unnotified disk change must fail the partial request");
+    assert_eq!(error.code, -32803);
+    assert!(
+        response.result.is_none(),
+        "stale delivery must not claim success"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unnotified_disk_change_between_reference_chunks_fails_closed() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = format!(
+        "unit Main;\ninterface\nvar Target: Integer;\nimplementation\nprocedure Run;\nbegin\n{}end;\nend.\n",
+        "Target := Target + 1;\n".repeat(1_000)
+    );
+    write_file(&source, &text);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("unnotified-disk-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "position": {"line": 2, "character": 5},
+            "context": {"includeDeclaration": true},
+            "partialResultToken": "disk-references"
+        }),
+    );
+    let first = server.notification("$/progress");
+    assert_eq!(first["token"], "disk-references");
+    write_file(&source, "unit Main; interface implementation end.\n");
+
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("unnotified disk change must fail the partial request");
+    assert_eq!(error.code, -32803);
+    assert!(
+        response.result.is_none(),
+        "stale delivery must not claim success"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn generated_work_done_tokens_avoid_active_partial_tokens() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = workspace_symbol_source("Main", 1_000);
+    write_file(&source, &text);
+    let (mut server, workspace_symbols, diagnostics) =
+        TestServer::launch_with_workspace_symbols_and_diagnostics_barriers(environment);
+    server.initialize_with_progress(&root);
+
+    let request_id = RequestId::from("generated-token-collision".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/symbol",
+        json!({
+            "query": "Symbol",
+            "partialResultToken": "pascal-lsp-progress-1"
+        }),
+    );
+    workspace_symbols.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let create = server.request("window/workDoneProgress/create");
+    let generated_token = create.params["token"].clone();
+    assert_ne!(
+        generated_token,
+        json!("pascal-lsp-progress-1"),
+        "server progress allocation must reserve the partial-token namespace"
+    );
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], generated_token);
+    assert_eq!(begin["value"]["kind"], "begin");
+
+    workspace_symbols.release();
+    diagnostics.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none()
+            || response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == -32803),
+        "partial request must terminate after the controlled state change: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn coalesced_partial_recipients_keep_independent_tokens_and_ordinary_results() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, &workspace_symbol_source("Main", 1_000));
+    let (mut server, barrier) = TestServer::launch_with_workspace_symbols_barrier(root);
+    let root_path = source.parent().expect("workspace root");
+    server.initialize(root_path, Value::Null);
+
+    let first_id = RequestId::from("coalesced-partial-one".to_string());
+    let second_id = RequestId::from("coalesced-partial-two".to_string());
+    let ordinary_id = RequestId::from("coalesced-ordinary".to_string());
+    let query = "Symbol";
+    server.send_request(
+        first_id.clone(),
+        "workspace/symbol",
+        json!({"query": query, "partialResultToken": "coalesced-one"}),
+    );
+    barrier.wait_until_entered();
+    server.send_request(
+        second_id.clone(),
+        "workspace/symbol",
+        json!({"query": query, "partialResultToken": "coalesced-two"}),
+    );
+    server.send_request(
+        ordinary_id.clone(),
+        "workspace/symbol",
+        json!({"query": query}),
+    );
+    barrier.release();
+
+    let mut first_items = Vec::new();
+    let mut second_items = Vec::new();
+    let mut first_response = None;
+    let mut second_response = None;
+    let mut ordinary_response = None;
+    while first_response.is_none() || second_response.is_none() || ordinary_response.is_none() {
+        match server.next_message() {
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                let chunk = notification.params["value"]
+                    .as_array()
+                    .expect("coalesced partial chunk");
+                if notification.params["token"] == "coalesced-one" {
+                    first_items.extend(chunk.iter().cloned());
+                } else if notification.params["token"] == "coalesced-two" {
+                    second_items.extend(chunk.iter().cloned());
+                } else {
+                    panic!(
+                        "unexpected coalesced token: {:?}",
+                        notification.params["token"]
+                    );
+                }
+            }
+            Message::Response(response) if response.id == first_id => {
+                first_response = Some(response)
+            }
+            Message::Response(response) if response.id == second_id => {
+                second_response = Some(response)
+            }
+            Message::Response(response) if response.id == ordinary_id => {
+                ordinary_response = Some(response)
+            }
+            other => server.pending.push_back(other),
+        }
+    }
+    assert!(
+        first_response
+            .as_ref()
+            .expect("first response")
+            .error
+            .is_none()
+    );
+    assert!(
+        second_response
+            .as_ref()
+            .expect("second response")
+            .error
+            .is_none()
+    );
+    assert!(
+        ordinary_response
+            .as_ref()
+            .expect("ordinary response")
+            .error
+            .is_none()
+    );
+    let ordinary_items = ordinary_response
+        .and_then(|response| response.result)
+        .expect("ordinary result")
+        .as_array()
+        .expect("ordinary result array")
+        .clone();
+    assert_eq!(first_items, ordinary_items);
+    assert_eq!(second_items, ordinary_items);
+    assert_eq!(
+        first_items
+            .iter()
+            .map(symbol_signature)
+            .collect::<HashSet<_>>()
+            .len(),
+        first_items.len()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn coalesced_work_done_lifecycles_survive_a_paused_stdout_queue() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Main.pas"),
+        &workspace_symbol_source("Main", 7_000),
+    );
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let flood_id = RequestId::from("paused-output-flood".to_string());
+    server.send_request(
+        flood_id,
+        "workspace/symbol",
+        json!({"query": "Symbol", "partialResultToken": "paused-flood"}),
+    );
+    server.pause_stdout();
+    thread::sleep(Duration::from_secs(2));
+
+    let expected_ids = (0..30)
+        .map(|index| RequestId::from(format!("paused-coalesced-{index}")))
+        .collect::<HashSet<_>>();
+    for (index, id) in expected_ids.iter().enumerate() {
+        server.send_request(
+            id.clone(),
+            "workspace/symbol",
+            json!({
+                "query": "Missing",
+                "partialResultToken": format!("paused-partial-{index}"),
+                "workDoneToken": format!("paused-work-done-{index}")
+            }),
+        );
+    }
+    server.resume_stdout();
+
+    let mut responses = HashSet::new();
+    let mut work_done_ends = HashMap::<String, usize>::new();
+    let lifecycle_deadline = Instant::now() + Duration::from_secs(15);
+    while responses.len() < expected_ids.len() || work_done_ends.len() < expected_ids.len() {
+        assert!(
+            Instant::now() < lifecycle_deadline,
+            "coalesced lifecycle did not drain: responses={}, ends={}, pending={:?}",
+            responses.len(),
+            work_done_ends.len(),
+            server.pending
+        );
+        match server.next_message() {
+            Message::Response(response) if expected_ids.contains(&response.id) => {
+                assert!(
+                    response.error.is_none(),
+                    "every admitted coalesced request needs a terminal success: {response:?}"
+                );
+                assert!(responses.insert(response.id));
+            }
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                if notification.params["value"]["kind"] == "end"
+                    && notification.params["token"]
+                        .as_str()
+                        .is_some_and(|token| token.starts_with("paused-work-done-"))
+                {
+                    let token = notification.params["token"]
+                        .as_str()
+                        .expect("work-done token")
+                        .to_string();
+                    *work_done_ends.entry(token).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(responses.len(), expected_ids.len());
+    assert!(
+        work_done_ends.values().all(|count| *count == 1),
+        "each admitted work-done token must end exactly once: {work_done_ends:?}"
+    );
+
+    let healthy_id = RequestId::from("paused-output-follow-up".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Missing"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "the session must remain usable after the coalesced control burst: {healthy:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn large_ordinary_results_survive_temporary_control_byte_pressure() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Flood.pas"),
+        &wide_workspace_symbol_source("Flood", "Flood", 7_000, 0),
+    );
+    for index in 0..3 {
+        write_file(
+            &root.path().join(format!("Large{index}.pas")),
+            &wide_workspace_symbol_source(&format!("Large{index}"), "Large", 1_000, 1_500),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+
+    let flood_id = RequestId::from("temporary-byte-flood".to_string());
+    server.send_request(
+        flood_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Flood", "partialResultToken": "temporary-flood"}),
+    );
+    server.pause_stdout();
+    thread::sleep(Duration::from_secs(2));
+
+    let ordinary_ids = [
+        RequestId::from("large-ordinary-1".to_string()),
+        RequestId::from("large-ordinary-2".to_string()),
+    ];
+    for (index, id) in ordinary_ids.iter().enumerate() {
+        server.send_request(
+            id.clone(),
+            "workspace/symbol",
+            json!({
+                "query": "Large",
+                "workDoneToken": format!("large-ordinary-work-{index}")
+            }),
+        );
+    }
+    thread::sleep(Duration::from_secs(1));
+    server.resume_stdout();
+
+    let expected_ids = ordinary_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut responses = HashMap::new();
+    let mut work_done_ends = HashMap::<String, usize>::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while responses.len() < expected_ids.len() || work_done_ends.len() < expected_ids.len() {
+        assert!(
+            Instant::now() < deadline,
+            "large ordinary lifecycle did not drain: responses={}, ends={}, pending={:?}",
+            responses.len(),
+            work_done_ends.len(),
+            server.pending
+        );
+        match server.next_message() {
+            Message::Response(response) if expected_ids.contains(&response.id) => {
+                assert!(
+                    response.error.is_none(),
+                    "individually valid ordinary result was not preserved: {response:?}"
+                );
+                let result = response
+                    .result
+                    .expect("large ordinary result")
+                    .as_array()
+                    .expect("large ordinary result array")
+                    .len();
+                assert_eq!(result, 3_003);
+                assert!(responses.insert(response.id, result).is_none());
+            }
+            Message::Notification(notification) if notification.method == "$/progress" => {
+                if notification.params["value"]["kind"] == "end"
+                    && notification.params["token"]
+                        .as_str()
+                        .is_some_and(|token| token.starts_with("large-ordinary-work-"))
+                {
+                    let token = notification.params["token"]
+                        .as_str()
+                        .expect("large ordinary work-done token")
+                        .to_string();
+                    *work_done_ends.entry(token).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(responses.len(), expected_ids.len());
+    assert_eq!(
+        work_done_ends,
+        HashMap::from([
+            ("large-ordinary-work-0".to_string(), 1),
+            ("large-ordinary-work-1".to_string(), 1),
+        ])
+    );
+
+    server.send_notification("$/cancelRequest", json!({"id": flood_id}));
+    let _ = server.response(&flood_id);
+
+    let healthy_id = RequestId::from("temporary-byte-follow-up".to_string());
+    server.send_request(
+        healthy_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Missing"}),
+    );
+    let healthy = server.response(&healthy_id);
+    assert!(
+        healthy.error.is_none(),
+        "session must remain usable after deferred large results: {healthy:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelled_partial_validators_are_bounded_until_they_retire() {
+    let root = tempfile::tempdir().expect("workspace");
+    write_file(
+        &root.path().join("Main.pas"),
+        &workspace_symbol_source("Main", 64),
+    );
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    let root_path = server
+        ._environment
+        .as_ref()
+        .expect("test environment")
+        .path()
+        .to_path_buf();
+    server.initialize(&root_path, Value::Null);
+
+    let mut admitted = 0;
+    let mut rejected = None;
+    for index in 0..40 {
+        let id = RequestId::from(format!("retiring-validator-{index}"));
+        server.send_request(
+            id.clone(),
+            "workspace/symbol",
+            json!({
+                "query": format!("Symbol{index}"),
+                "partialResultToken": format!("retiring-partial-{index}")
+            }),
+        );
+        if let Some(response) = server.response_with_timeout(&id, Duration::from_millis(100)) {
+            rejected = response.error;
+            break;
+        }
+        barrier.wait_for_entries(index + 1);
+        server.send_notification("$/cancelRequest", json!({"id": id}));
+        let response = server.response(&id);
+        assert_eq!(
+            response.error.expect("cancellation response").code,
+            -32800,
+            "an admitted request must be cancelled before the next replacement"
+        );
+        admitted += 1;
+    }
+
+    let error = rejected.expect("retiring validator admission must eventually be bounded");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        admitted, 33,
+        "retiring validators must consume the existing 33-recipient admission budget"
+    );
+    barrier.release();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn server_indexing_progress_requires_create_ack_and_closes_after_diagnostics() {
+    let root = tempfile::tempdir().expect("workspace");
+    let root_path = root.path().to_path_buf();
+    let source = root_path.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(root);
+    let initialize_id = RequestId::from("server-progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root_path),
+            "capabilities": {
+                "window": {"workDoneProgress": true},
+                "workspace": {"configuration": true}
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+    let configuration = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        configuration.id,
+        json!([{"projectFile": null}]),
+    )));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let create = server.request("window/workDoneProgress/create");
+    let token = create.params["token"].clone();
+    assert!(token.is_string(), "server progress token must be opaque");
+    barrier.wait_until_entered();
+    server.assert_no_progress();
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+
+    let begin = match server.next_message() {
+        Message::Notification(notification) => {
+            assert_eq!(notification.method, "$/progress");
+            notification.params
+        }
+        other => panic!("expected progress begin notification, got {other:?}"),
+    };
+    assert_eq!(begin["token"], token);
+    assert_eq!(begin["value"]["kind"], "begin");
+    assert_eq!(begin["value"]["title"], "Indexing workspace");
+    let report = match server.next_message() {
+        Message::Notification(notification) => {
+            assert_eq!(notification.method, "$/progress");
+            notification.params
+        }
+        other => panic!("expected progress report notification, got {other:?}"),
+    };
+    assert_eq!(report["token"], token);
+    assert_eq!(report["value"]["kind"], "report");
+    barrier.release();
+    let diagnostic = match server.next_message() {
+        Message::Notification(notification) => notification,
+        other => panic!("expected diagnostics before progress end, got {other:?}"),
+    };
+    assert_eq!(diagnostic.method, "textDocument/publishDiagnostics");
+    assert_eq!(diagnostic.params["uri"], uri(&source).to_string());
+    let end = match server.next_message() {
+        Message::Notification(notification) => {
+            assert_eq!(notification.method, "$/progress");
+            notification.params
+        }
+        other => panic!("expected progress end notification, got {other:?}"),
+    };
+    assert_eq!(end["token"], token);
+    assert_eq!(end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn interleaved_configuration_and_progress_responses_route_by_request_type() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    let initialize_id = RequestId::from("interleaved-routing-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {
+                "window": {"workDoneProgress": true},
+                "workspace": {"configuration": true}
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+    let initial_configuration = server.request("workspace/configuration");
+    server.send(Message::Response(Response::new_ok(
+        initial_configuration.id,
+        json!([{"projectFile": null}]),
+    )));
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let create = server.request("window/workDoneProgress/create");
+    barrier.wait_until_entered();
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let refreshed_configuration = server.request("workspace/configuration");
+    assert_eq!(refreshed_configuration.method, "workspace/configuration");
+
+    // Deliver the progress-create response while a Task20 configuration
+    // request is pending, then deliver the configuration response.  The
+    // response IDs must be routed by their request registries, not by arrival
+    // order or generic error handling.
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+    server.send(Message::Response(Response::new_ok(
+        refreshed_configuration.id,
+        json!([{"projectFile": null}]),
+    )));
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["value"]["kind"], "begin");
+    let token = begin["token"].clone();
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], token);
+    assert_eq!(report["value"]["kind"], "report");
+
+    barrier.release();
+    assert!(
+        server
+            .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+            .is_some(),
+        "interleaved configuration must not block diagnostics"
+    );
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], token);
+    assert_eq!(end["value"]["kind"], "end");
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn late_server_progress_create_ack_after_success_is_ignored() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    let initialize_id = RequestId::from("late-create-success-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let create = server.request("window/workDoneProgress/create");
+    let token = create.params["token"].clone();
+    barrier.wait_until_entered();
+    barrier.release();
+    assert!(
+        server
+            .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+            .is_some(),
+        "diagnostics must complete while create acknowledgement is pending"
+    );
+
+    // The computation is terminal before the client acknowledges creation.
+    // Synchronize after sending the late response so the assertion observes
+    // the server's response-dispatch path, not merely the outbound queue.
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+    let sync_id = RequestId::from("late-create-success-sync".to_string());
+    server.send_request(
+        sync_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main"}),
+    );
+    let sync = server.response(&sync_id);
+    assert!(sync.error.is_none(), "sync request failed: {sync:?}");
+    server.assert_no_progress();
+    assert!(!token.is_null(), "server create token must be present");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn late_server_progress_create_ack_after_invalidation_is_ignored() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    let initialize_id = RequestId::from("late-create-invalidation-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let create = server.request("window/workDoneProgress/create");
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    let cleared = server
+        .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+        .expect("closing the document must clear diagnostics");
+    assert!(
+        cleared["diagnostics"].as_array().is_some_and(Vec::is_empty),
+        "close must publish an empty diagnostic set: {cleared:?}"
+    );
+    barrier.release();
+
+    // Invalidation retires the pending create as well as the worker target;
+    // acknowledging it later must not resurrect an active lifecycle.
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+    let sync_id = RequestId::from("late-create-invalidation-sync".to_string());
+    server.send_request(
+        sync_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main"}),
+    );
+    let sync = server.response(&sync_id);
+    assert!(sync.error.is_none(), "sync request failed: {sync:?}");
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn denied_duplicate_and_unknown_progress_create_responses_are_harmless() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize_with_progress(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let create = server.request("window/workDoneProgress/create");
+    barrier.wait_until_entered();
+
+    server.send(Message::Response(Response::new_err(
+        create.id.clone(),
+        -32603,
+        "progress denied".to_string(),
+    )));
+    // A duplicate response for a denied request and an unrelated response ID
+    // must not be routed to configuration, watcher, or analysis state.
+    server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+    server.send(Message::Response(Response::new_ok(
+        RequestId::from("pascal-lsp-progress-create-unknown".to_string()),
+        Value::Null,
+    )));
+
+    barrier.release();
+    assert!(
+        server
+            .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+            .is_some(),
+        "denied progress creation must not block diagnostics"
+    );
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_server_diagnostic_progress_discards_old_result_and_retries() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize_with_progress(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let first_create = server.request("window/workDoneProgress/create");
+    let first_token = first_create.params["token"].clone();
+    barrier.wait_until_entered();
+    server.send(Message::Response(Response::new_ok(
+        first_create.id,
+        Value::Null,
+    )));
+    let first_begin = server.notification("$/progress");
+    assert_eq!(first_begin["token"], first_token);
+    assert_eq!(first_begin["value"]["kind"], "begin");
+    let first_report = server.notification("$/progress");
+    assert_eq!(first_report["token"], first_token);
+    assert_eq!(first_report["value"]["kind"], "report");
+
+    server.send_notification(
+        "window/workDoneProgress/cancel",
+        json!({"token": first_token}),
+    );
+    let first_end = server.notification("$/progress");
+    assert_eq!(first_end["token"], first_token);
+    assert_eq!(first_end["value"]["kind"], "end");
+    server.assert_no_notification("textDocument/publishDiagnostics");
+
+    let second_create = server.request("window/workDoneProgress/create");
+    let second_token = second_create.params["token"].clone();
+    assert_ne!(
+        first_token, second_token,
+        "a cancelled token must not be reused"
+    );
+    server.assert_no_notification("textDocument/publishDiagnostics");
+    server.send(Message::Response(Response::new_ok(
+        second_create.id,
+        Value::Null,
+    )));
+    barrier.release();
+
+    let diagnostics = server
+        .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+        .expect("fresh diagnostic retry must publish once");
+    assert_eq!(diagnostics["uri"], uri(&source).to_string());
+    let second_begin = server.notification("$/progress");
+    assert_eq!(second_begin["token"], second_token);
+    assert_eq!(second_begin["value"]["kind"], "begin");
+    let second_report = server.notification("$/progress");
+    assert_eq!(second_report["token"], second_token);
+    assert_eq!(second_report["value"]["kind"], "report");
+    let second_end = server.notification("$/progress");
+    assert_eq!(second_end["token"], second_token);
+    assert_eq!(second_end["value"]["kind"], "end");
+    server.assert_no_notification("textDocument/publishDiagnostics");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rapid_diagnostic_invalidation_retires_old_progress_before_fresh_retry() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let initial = "unit Main;\ninterface\nimplementation\nend.\n";
+    let changed = "unit Main;\ninterface\nprocedure Run;\nimplementation\nend.\n";
+    write_file(&source, initial);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize_with_progress(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": initial
+            }
+        }),
+    );
+
+    let first_create = server.request("window/workDoneProgress/create");
+    let first_token = first_create.params["token"].clone();
+    barrier.wait_until_entered();
+    server.send(Message::Response(Response::new_ok(
+        first_create.id,
+        Value::Null,
+    )));
+    let first_begin = server.notification("$/progress");
+    assert_eq!(first_begin["token"], first_token);
+    assert_eq!(first_begin["value"]["kind"], "begin");
+    let first_report = server.notification("$/progress");
+    assert_eq!(first_report["token"], first_token);
+    assert_eq!(first_report["value"]["kind"], "report");
+
+    // Two source invalidations arrive before the cancelled worker is released;
+    // only the live diagnostic computation may own the first token.
+    for version in [2, 3] {
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&source), "version": version},
+                "contentChanges": [{"text": format!("{changed}\n// version {version}\n")}]
+            }),
+        );
+    }
+    let sync_id = RequestId::from("rapid-invalidation-sync".to_string());
+    server.send_request(sync_id.clone(), "workspace/symbol", json!({"query": "Run"}));
+    let sync = server.response(&sync_id);
+    assert!(
+        sync.error.is_none(),
+        "invalidation synchronization failed: {sync:?}"
+    );
+    let first_end = server.notification("$/progress");
+    assert_eq!(first_end["token"], first_token);
+    assert_eq!(first_end["value"]["kind"], "end");
+
+    // Force the fresh retry to use the same deterministic worker barrier;
+    // the cancelled worker exits by observing its flag, while the retry waits
+    // for an explicit release below.
+    let _ = fs::remove_file(&barrier.release);
+    let second_create = server.request("window/workDoneProgress/create");
+    let second_token = second_create.params["token"].clone();
+    assert_ne!(first_token, second_token);
+    server.send(Message::Response(Response::new_ok(
+        second_create.id,
+        Value::Null,
+    )));
+    let second_begin = server.notification("$/progress");
+    assert_eq!(second_begin["token"], second_token);
+    assert_eq!(second_begin["value"]["kind"], "begin");
+    let second_report = server.notification("$/progress");
+    assert_eq!(second_report["token"], second_token);
+    assert_eq!(second_report["value"]["kind"], "report");
+
+    barrier.release();
+    let diagnostics = server
+        .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+        .expect("fresh retry must publish diagnostics");
+    assert_eq!(diagnostics["uri"], uri(&source).to_string());
+    assert_eq!(
+        diagnostics["version"], 3,
+        "retry must publish the newest version"
+    );
+    let second_end = server.notification("$/progress");
+    assert_eq!(second_end["token"], second_token);
+    assert_eq!(second_end["value"]["kind"], "end");
+    server.assert_no_progress();
+    server.assert_no_notification("textDocument/publishDiagnostics");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn shutdown_retires_unacknowledged_server_progress_creation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize_with_progress(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _create = server.request("window/workDoneProgress/create");
+    barrier.wait_until_entered();
+
+    server.shutdown();
+    server.assert_no_progress();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn active_client_token_collision_isolated_and_reusable_after_completion() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize_with_progress(&root);
+    let token = json!(-37);
+
+    let first_id = RequestId::from("token-collision-first".to_string());
+    let mut first_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    first_params["workDoneToken"] = token.clone();
+    server.send_request(first_id.clone(), "textDocument/definition", first_params);
+    barrier.wait_until_entered();
+    let first_begin = server.notification("$/progress");
+    assert_eq!(first_begin["token"], token);
+    let first_report = server.notification("$/progress");
+    assert_eq!(first_report["token"], token);
+
+    let second_id = RequestId::from("token-collision-second".to_string());
+    let mut second_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    second_params["workDoneToken"] = token.clone();
+    server.send_request(second_id.clone(), "textDocument/definition", second_params);
+    server.assert_no_progress();
+
+    server.send_notification("window/workDoneProgress/cancel", json!({"token": -37}));
+    let first_response = server.response(&first_id);
+    assert_eq!(
+        first_response.error.expect("first cancellation").code,
+        -32800
+    );
+    let first_end = server.notification("$/progress");
+    assert_eq!(first_end["token"], token);
+    assert_eq!(first_end["value"]["kind"], "end");
+
+    barrier.release();
+    let second_response = server.response(&second_id);
+    assert!(
+        second_response.error.is_none(),
+        "surviving coalesced request failed: {second_response:?}"
+    );
+    server.assert_no_progress();
+
+    let third_id = RequestId::from("token-collision-reuse".to_string());
+    let mut third_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    third_params["workDoneToken"] = token.clone();
+    server.send_request(third_id.clone(), "textDocument/definition", third_params);
+    let third_begin = server.notification("$/progress");
+    assert_eq!(third_begin["token"], token);
+    let third_report = server.notification("$/progress");
+    assert_eq!(third_report["token"], token);
+    let third_response = server.response(&third_id);
+    assert!(
+        third_response.error.is_none(),
+        "reuse request failed: {third_response:?}"
+    );
+    let third_end = server.notification("$/progress");
+    assert_eq!(third_end["token"], token);
+    assert_eq!(third_end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn ignored_server_progress_creation_is_bounded_without_blocking_analysis() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch_with_environment(environment);
+    server.initialize_with_progress(&root);
+    let mut creates = Vec::new();
+    for version in 1..=33 {
+        if version == 1 {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&source),
+                        "languageId": "pascal",
+                        "version": version,
+                        "text": text
+                    }
+                }),
+            );
+        } else {
+            server.send_notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri(&source), "version": version},
+                    "contentChanges": [{"text": format!("{text}\n{version}")}]
+                }),
+            );
+        }
+        if version <= 32 {
+            creates.push(server.request("window/workDoneProgress/create"));
+        }
+        assert!(
+            server
+                .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+                .is_some(),
+            "diagnostic {version} must complete without a create acknowledgement"
+        );
+    }
+    assert_eq!(creates.len(), 32);
+    assert!(
+        creates
+            .iter()
+            .all(|request| request.method == "window/workDoneProgress/create")
+    );
+
+    // Wait for diagnostic 33 before checking the create channel.  Any create
+    // request for that operation is emitted at dispatch, before its
+    // diagnostic publication, and is therefore either buffered here or
+    // observed before the synchronized response below.  This avoids using a
+    // short absence window ahead of the workspace's diagnostic debounce.
+    let inspect_id = RequestId::from("ignored-create-bound-inspect".to_string());
+    server.send_request(
+        inspect_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main"}),
+    );
+    let inspect = server.response(&inspect_id);
+    assert!(
+        inspect.error.is_none(),
+        "post-diagnostic synchronization failed: {inspect:?}"
+    );
+    let extra_creates = server.pending_request_count("window/workDoneProgress/create");
+    assert_eq!(
+        creates.len() + extra_creates,
+        32,
+        "all emitted create requests must be counted after diagnostic completion"
+    );
+    server.assert_no_request("window/workDoneProgress/create");
+
+    // A late acknowledgement for a terminal operation is consumed as a
+    // bounded tombstone, not as a new visible lifecycle.
+    server.send(Message::Response(Response::new_ok(
+        creates[0].id.clone(),
+        Value::Null,
+    )));
+    let sync_id = RequestId::from("ignored-create-bound-sync".to_string());
+    server.send_request(
+        sync_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main"}),
+    );
+    let sync = server.response(&sync_id);
+    assert!(sync.error.is_none(), "sync request failed: {sync:?}");
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn client_progress_token_collision_does_not_claim_server_diagnostic_progress() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let other = root.join("Other.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    let other_source = "unit Other;\ninterface\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+    write_file(&other, other_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize_with_progress(&root);
+    let request_id = RequestId::from("client-server-token-collision".to_string());
+    let mut params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    params["workDoneToken"] = json!("pascal-lsp-progress-1");
+    server.send_request(request_id.clone(), "textDocument/definition", params);
+    barrier.wait_until_entered();
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], "pascal-lsp-progress-1");
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], "pascal-lsp-progress-1");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&other),
+                "languageId": "pascal",
+                "version": 1,
+                "text": other_source
+            }
+        }),
+    );
+    assert!(
+        server
+            .diagnostic_with_timeout(&uri(&other), IO_TIMEOUT)
+            .is_some(),
+        "diagnostic computation must continue despite token collision"
+    );
+    let sync_id = RequestId::from("client-server-token-collision-sync".to_string());
+    server.send_request(
+        sync_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Other"}),
+    );
+    let sync = server.response(&sync_id);
+    assert!(
+        sync.error.is_none(),
+        "collision synchronization failed: {sync:?}"
+    );
+    // create is a JSON-RPC request, not a notification.  Check the correct
+    // channel after a response synchronization so a buffered forbidden
+    // request cannot hide behind a short absence window.
+    server.assert_no_request("window/workDoneProgress/create");
+
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "navigation failed: {response:?}");
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "pascal-lsp-progress-1");
+    assert_eq!(end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn stale_and_worker_error_results_each_end_progress_once() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let stale_id = RequestId::from("stale-progress-request".to_string());
+    let mut stale_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    stale_params["workDoneToken"] = json!("stale-progress");
+    server.send_request(stale_id.clone(), "textDocument/definition", stale_params);
+    barrier.wait_until_entered();
+    let stale_begin = server.notification("$/progress");
+    assert_eq!(stale_begin["token"], "stale-progress");
+    let stale_report = server.notification("$/progress");
+    assert_eq!(stale_report["token"], "stale-progress");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let sync_id = RequestId::from("stale-progress-sync".to_string());
+    server.send_request(
+        sync_id.clone(),
+        "workspace/symbol",
+        json!({"query": "PublicRoutine"}),
+    );
+    let sync = server.response(&sync_id);
+    assert!(
+        sync.error.is_none(),
+        "stale synchronization failed: {sync:?}"
+    );
+    barrier.release();
+    let stale_response = server.response(&stale_id);
+    assert!(
+        stale_response.error.is_some(),
+        "stale result must not be delivered as success"
+    );
+    let stale_end = server.notification("$/progress");
+    assert_eq!(stale_end["token"], "stale-progress");
+    assert_eq!(stale_end["value"]["kind"], "end");
+    server.assert_no_progress();
+
+    let missing = root.join("missing.pas");
+    let error_id = RequestId::from("worker-error-progress".to_string());
+    server.send_request(
+        error_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&missing)},
+            "options": {"tabSize": 2, "insertSpaces": true},
+            "workDoneToken": "worker-error-progress"
+        }),
+    );
+    let error_begin = server.notification("$/progress");
+    assert_eq!(error_begin["token"], "worker-error-progress");
+    let error_report = server.notification("$/progress");
+    assert_eq!(error_report["token"], "worker-error-progress");
+    let error_response = server.response(&error_id);
+    assert!(
+        error_response.error.is_some(),
+        "worker error must be returned to the request"
+    );
+    let error_end = server.notification("$/progress");
+    assert_eq!(error_end["token"], "worker-error-progress");
+    assert_eq!(error_end["value"]["kind"], "end");
+    server.assert_no_progress();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn shutdown_ends_begun_client_progress_exactly_once() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("shutdown-progress-client".to_string());
+    let mut params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    params["workDoneToken"] = json!("shutdown-progress");
+    server.send_request(request_id, "textDocument/definition", params);
+    barrier.wait_until_entered();
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], "shutdown-progress");
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], "shutdown-progress");
+
+    let shutdown_id = RequestId::from("shutdown-progress-request".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+    let shutdown = server.response(&shutdown_id);
+    assert!(shutdown.error.is_none(), "shutdown failed: {shutdown:?}");
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "shutdown-progress");
+    assert_eq!(end["value"]["kind"], "end");
+    server.assert_no_progress();
+
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server.child.wait().expect("wait for shutdown server");
+    assert!(status.success(), "server exited unsuccessfully: {status}");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn client_without_server_progress_support_gets_no_indexing_progress_creation() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = server.diagnostic_with_timeout(&uri(&source), IO_TIMEOUT);
+    assert!(!server.pending.iter().any(|message| {
+        matches!(
+            message,
+            Message::Request(request) if request.method == "window/workDoneProgress/create"
+        )
+    }));
+    assert!(!server.pending.iter().any(|message| {
+        matches!(
+            message,
+            Message::Notification(notification) if notification.method == "$/progress"
+        )
+    }));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_request_progress_closes_only_that_recipient() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    let initialize_id = RequestId::from("cancel-progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let request_id = RequestId::from("cancel-progress-request".to_string());
+    let mut params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    params["workDoneToken"] = json!("cancel-me");
+    server.send_request(request_id.clone(), "textDocument/definition", params);
+    barrier.wait_until_entered();
+
+    let begin = server.notification("$/progress");
+    assert_eq!(begin["token"], "cancel-me");
+    assert_eq!(begin["value"]["kind"], "begin");
+    let report = server.notification("$/progress");
+    assert_eq!(report["token"], "cancel-me");
+    assert_eq!(report["value"]["kind"], "report");
+
+    server.send_notification(
+        "window/workDoneProgress/cancel",
+        json!({"token": "cancel-me"}),
+    );
+    let response = server.response(&request_id);
+    assert_eq!(response.error.expect("cancel response").code, -32800);
+    let end = server.notification("$/progress");
+    assert_eq!(end["token"], "cancel-me");
+    assert_eq!(end["value"]["kind"], "end");
+
+    barrier.release();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn coalesced_progress_tokens_remain_isolated_when_one_request_cancels() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    let initialize_id = RequestId::from("coalesced-progress-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let first_id = RequestId::from("coalesced-progress-first".to_string());
+    let mut first_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    first_params["workDoneToken"] = json!("first-progress");
+    server.send_request(first_id.clone(), "textDocument/definition", first_params);
+    barrier.wait_until_entered();
+    let first_begin = server.notification("$/progress");
+    assert_eq!(first_begin["token"], "first-progress");
+    let _ = server.notification("$/progress");
+
+    let second_id = RequestId::from("coalesced-progress-second".to_string());
+    let mut second_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    second_params["workDoneToken"] = json!("second-progress");
+    server.send_request(second_id.clone(), "textDocument/definition", second_params);
+    let second_begin = server.notification("$/progress");
+    assert_eq!(second_begin["token"], "second-progress");
+    let second_report = server.notification("$/progress");
+    assert_eq!(second_report["token"], "second-progress");
+    assert_eq!(second_report["value"]["message"], "Analysis started");
+
+    server.send_notification("$/cancelRequest", json!({"id": second_id}));
+    let second_response = server.response(&second_id);
+    assert_eq!(
+        second_response.error.expect("second cancellation").code,
+        -32800
+    );
+    let second_end = server.notification("$/progress");
+    assert_eq!(second_end["token"], "second-progress");
+    assert_eq!(second_end["value"]["kind"], "end");
+
+    barrier.release();
+    let first_response = server.response(&first_id);
+    assert!(
+        first_response.error.is_none(),
+        "first request failed: {first_response:?}"
+    );
+    let first_end = server.notification("$/progress");
+    assert_eq!(first_end["token"], "first-progress");
+    assert_eq!(first_end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+fn run_queued_progress_cancellation(cancel_with_work_done_token: bool) {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize_with_progress(&root);
+
+    let first_id = RequestId::from("queued-cancel-blocker-first".to_string());
+    let mut first_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    first_params["workDoneToken"] = json!("queued-cancel-blocker-first-progress");
+    server.send_request(first_id.clone(), "textDocument/definition", first_params);
+    let second_id = RequestId::from("queued-cancel-blocker-second".to_string());
+    let mut second_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    second_params["workDoneToken"] = json!("queued-cancel-blocker-second-progress");
+    server.send_request(second_id.clone(), "textDocument/declaration", second_params);
+    barrier.wait_for_entries(2);
+
+    let blocker_tokens = [
+        "queued-cancel-blocker-first-progress",
+        "queued-cancel-blocker-second-progress",
+    ];
+    let mut blocker_events = HashSet::new();
+    for _ in 0..4 {
+        let event = server.notification("$/progress");
+        let token = event["token"].as_str().expect("blocker progress token");
+        assert!(blocker_tokens.contains(&token));
+        let kind = event["value"]["kind"].as_str().expect("progress kind");
+        assert!(matches!(kind, "begin" | "report"));
+        if kind == "report" {
+            assert_eq!(event["value"]["message"], "Analysis started");
+        }
+        blocker_events.insert((token.to_string(), kind.to_string()));
+    }
+    assert_eq!(blocker_events.len(), 4);
+
+    let queued_id = RequestId::from("queued-cancel-recipient".to_string());
+    let mut queued_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    queued_params["workDoneToken"] = json!("queued-cancel-progress");
+    server.send_request(
+        queued_id.clone(),
+        "textDocument/implementation",
+        queued_params,
+    );
+    let queued_begin = server.notification("$/progress");
+    assert_eq!(queued_begin["token"], "queued-cancel-progress");
+    assert_eq!(queued_begin["value"]["message"], "Queued for analysis");
+
+    if cancel_with_work_done_token {
+        server.send_notification(
+            "window/workDoneProgress/cancel",
+            json!({"token": "queued-cancel-progress"}),
+        );
+    } else {
+        server.send_notification("$/cancelRequest", json!({"id": queued_id}));
+    }
+    let queued_response = server.response(&queued_id);
+    assert_eq!(
+        queued_response.error.expect("queued cancellation").code,
+        -32800
+    );
+    let queued_end = server.notification("$/progress");
+    assert_eq!(queued_end["token"], "queued-cancel-progress");
+    assert_eq!(queued_end["value"]["kind"], "end");
+    server.assert_no_progress();
+
+    barrier.release();
+    for id in [first_id, second_id] {
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "blocker request failed: {response:?}"
+        );
+    }
+    let mut blocker_ends = HashSet::new();
+    for _ in 0..2 {
+        let end = server.notification("$/progress");
+        let token = end["token"].as_str().expect("blocker end token");
+        assert!(blocker_tokens.contains(&token));
+        assert_eq!(end["value"]["kind"], "end");
+        blocker_ends.insert(token.to_string());
+    }
+    assert_eq!(blocker_ends.len(), 2);
+    assert_eq!(
+        fs::read(&barrier.entered)
+            .expect("queued cancellation barrier entries")
+            .len(),
+        2,
+        "cancelled queued work must not dispatch a third worker"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_request_cancellation_ends_its_progress_without_dispatch() {
+    run_queued_progress_cancellation(false);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_work_done_progress_cancellation_ends_without_dispatch() {
+    run_queued_progress_cancellation(true);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn coalesced_running_recipient_receives_started_progress() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    let initialize_id = RequestId::from("coalesced-running-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(&root),
+            "capabilities": {"window": {"workDoneProgress": true}}
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let first_id = RequestId::from("coalesced-running-first".to_string());
+    let mut first_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    first_params["workDoneToken"] = json!("coalesced-running-first-progress");
+    server.send_request(first_id.clone(), "textDocument/definition", first_params);
+    barrier.wait_until_entered();
+    let first_begin = server.notification("$/progress");
+    assert_eq!(first_begin["token"], "coalesced-running-first-progress");
+    let first_report = server.notification("$/progress");
+    assert_eq!(first_report["token"], "coalesced-running-first-progress");
+    assert_eq!(first_report["value"]["message"], "Analysis started");
+
+    let second_id = RequestId::from("coalesced-running-second".to_string());
+    let mut second_params = navigation_params(&main, main_source, "PublicRoutine", 0);
+    second_params["workDoneToken"] = json!("coalesced-running-second-progress");
+    server.send_request(second_id.clone(), "textDocument/definition", second_params);
+    let second_begin = server.notification("$/progress");
+    assert_eq!(second_begin["token"], "coalesced-running-second-progress");
+    let second_report = server.notification("$/progress");
+    assert_eq!(second_report["token"], "coalesced-running-second-progress");
+    assert_eq!(second_report["value"]["kind"], "report");
+    assert_eq!(second_report["value"]["message"], "Analysis started");
+
+    barrier.release();
+    let first_response = server.response(&first_id);
+    assert!(
+        first_response.error.is_none(),
+        "first request failed: {first_response:?}"
+    );
+    let first_end = server.notification("$/progress");
+    assert_eq!(first_end["token"], "coalesced-running-first-progress");
+    assert_eq!(first_end["value"]["kind"], "end");
+    let second_response = server.response(&second_id);
+    assert!(
+        second_response.error.is_none(),
+        "second request failed: {second_response:?}"
+    );
+    let second_end = server.notification("$/progress");
+    assert_eq!(second_end["token"], "coalesced-running-second-progress");
+    assert_eq!(second_end["value"]["kind"], "end");
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_return_an_inner_to_outer_structural_chain() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Selection.pas");
+    let source = "unit Selection;\ninterface\ntype\n  TWidget = class\n    Value: Integer;\n  end;\nimplementation\nprocedure TWidget.Run;\nbegin\n  Value := Other.Bar[0] + 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    assert_eq!(
+        initialize["capabilities"]["selectionRangeProvider"]["workDoneProgress"],
+        true
+    );
+
+    let position = position_of(source, "Bar", 0);
+    let id = RequestId::from("selection-ranges".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position, position]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "selection range request failed: {response:?}"
+    );
+    let result = response.result.expect("selection range result");
+    let ranges = result.as_array().expect("selection range array");
+    assert_eq!(
+        ranges.len(),
+        2,
+        "request order and duplicates must be preserved"
+    );
+    assert_eq!(
+        ranges[0], ranges[1],
+        "duplicate positions must produce duplicate results"
+    );
+    assert_eq!(
+        ranges[0]["range"],
+        json!({
+            "start": position,
+            "end": Position::new(position.line, position.character + 3)
+        }),
+        "the innermost range must be the identifier under the cursor"
+    );
+
+    let mut chain = Vec::new();
+    let mut current = &ranges[0];
+    loop {
+        chain.push(current["range"].clone());
+        let Some(parent) = current.get("parent") else {
+            break;
+        };
+        current = parent;
+    }
+    assert!(chain.len() >= 5, "structural chain is too short: {chain:?}");
+    let point = |value: &Value| {
+        (
+            value["line"].as_u64().expect("selection line"),
+            value["character"].as_u64().expect("selection character"),
+        )
+    };
+    for pair in chain.windows(2) {
+        let outer_start = point(&pair[1]["start"]);
+        let inner_start = point(&pair[0]["start"]);
+        let inner_end = point(&pair[0]["end"]);
+        let outer_end = point(&pair[1]["end"]);
+        assert!(
+            outer_start <= inner_start && inner_end <= outer_end && pair[1] != pair[0],
+            "selection parents must strictly contain their children: {chain:?}"
+        );
+    }
+    assert_eq!(
+        chain.last().expect("document fallback range"),
+        &json!({
+            "start": Position::new(0, 0),
+            "end": pascal_lsp::text::offset_to_position(source, source.len())
+                .expect("document end position")
+        }),
+        "the outermost selection must cover the document"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_accept_crlf_line_comments_in_mixed_position_batches() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionComment.pas");
+    let source = "unit U;\r\n// hello\r\ninterface\r\nimplementation\r\nend.\r\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("selection-comment-crlf".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [
+                {"line": 1, "character": 3},
+                {"line": 1, "character": 8},
+                {"line": 2, "character": 0}
+            ]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "CRLF comment selection failed: {response:?}"
+    );
+    let result = response.result.expect("selection result");
+    let ranges = result.as_array().expect("selection array");
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(
+        ranges[0]["range"],
+        json!({
+            "start": {"line": 1, "character": 0},
+            "end": {"line": 1, "character": 8}
+        })
+    );
+    assert_eq!(
+        ranges[1]["range"]["start"],
+        json!({"line": 0, "character": 0})
+    );
+    assert_eq!(
+        ranges[2]["range"]["start"],
+        json!({"line": 2, "character": 0})
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn selection_range_cancellation_returns_the_standard_request_canceled_error() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionCancel.pas");
+    let source = "unit SelectionCancel;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_selection_barrier(temp);
+    server.initialize(source_path.parent().expect("workspace root"), Value::Null);
+    let id = RequestId::from("selection-cancelled".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(source, "Value", 0)]
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": "selection-cancelled"}));
+    let error = server
+        .response(&id)
+        .error
+        .expect("cancelled selection request must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_reject_invalid_positions_without_partial_results() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionInvalid.pas");
+    write_file(
+        &source_path,
+        "unit SelectionInvalid;\ninterface\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let invalid_params_id = RequestId::from("selection-invalid-params".to_string());
+    server.send_request(
+        invalid_params_id.clone(),
+        "textDocument/selectionRange",
+        json!({}),
+    );
+    assert_eq!(
+        server
+            .response(&invalid_params_id)
+            .error
+            .expect("invalid selection parameters error")
+            .code,
+        -32602
+    );
+
+    let invalid_position_id = RequestId::from("selection-invalid-position".to_string());
+    server.send_request(
+        invalid_position_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [{"line": 0, "character": 10_000}]
+        }),
+    );
+    let invalid_position_error = server
+        .response(&invalid_position_id)
+        .error
+        .expect("invalid selection position error");
+    assert_eq!(invalid_position_error.code, -32803);
+    assert!(
+        invalid_position_error
+            .message
+            .contains("valid UTF-16 source boundary")
+    );
+
+    let oversized_id = RequestId::from("selection-oversized".to_string());
+    server.send_request(
+        oversized_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": vec![json!({"line": 0, "character": 0}); 257]
+        }),
+    );
+    let oversized_error = server
+        .response(&oversized_id)
+        .error
+        .expect("oversized selection request error");
+    assert_eq!(oversized_error.code, -32803);
+    assert!(oversized_error.message.contains("more than 256 positions"));
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_return_a_valid_empty_source_range() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionEmpty.pas");
+    write_file(&source_path, "");
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("selection-empty".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [{"line": 0, "character": 0}]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "empty selection request failed: {response:?}"
+    );
+    assert_eq!(
+        response.result.expect("empty selection result"),
+        json!([{
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 0}
+            }
+        }])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn selection_ranges_are_syntax_only_and_do_not_require_imports() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SelectionUnresolvedImport.pas");
+    let source = "unit SelectionUnresolvedImport;\ninterface\nuses MissingSelectionProvider;\nimplementation\nprocedure Run;\nbegin\n  MissingSelectionProvider.Value := 1;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("selection-unresolved-import".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(source, "Value", 0)]
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "unresolved imports must not block syntax selection ranges: {response:?}"
+    );
+    assert_eq!(
+        response
+            .result
+            .expect("selection result")
+            .as_array()
+            .expect("selection array")
+            .len(),
+        1
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn blocked_selection_ranges_do_not_block_unrelated_lsp_requests() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("SelectionConcurrent.pas");
+    let source = "unit SelectionConcurrent;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := Other.Bar[0];\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_selection_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let selection_id = RequestId::from("blocked-selection".to_string());
+    server.send_request(
+        selection_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(source, "Bar", 0)]
+        }),
+    );
+    barrier.wait_until_entered();
+
+    let symbols_id = RequestId::from("while-selection-is-blocked".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none() && symbols.result.is_some(),
+        "unrelated request was blocked by selection ranges: {symbols:?}"
+    );
+
+    barrier.release();
+    let selection = server.response(&selection_id);
+    assert!(
+        selection.error.is_none() && selection.result.is_some(),
+        "selection range request failed after release: {selection:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn requested_open_document_change_discards_blocked_selection_ranges() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("SelectionStale.pas");
+    let first_source = "unit SelectionStale;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := 1;\nend;\nend.\n";
+    let second_source = first_source.replace("Value", "ChangedValue");
+    write_file(&source_path, first_source);
+
+    let (mut server, barrier) = TestServer::launch_with_selection_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_source
+            }
+        }),
+    );
+
+    let request_id = RequestId::from("stale-selection".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "positions": [position_of(first_source, "Value", 0)]
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("requested source change must stale selection ranges");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+    server.shutdown();
+}
+
+fn folding_ranges_request(
+    server: &mut TestServer,
+    request_name: &str,
+    source_path: &Path,
+) -> Vec<Value> {
+    let id = RequestId::from(request_name.to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    response
+        .result
+        .expect("folding range result")
+        .as_array()
+        .expect("folding range array")
+        .clone()
+}
+
+fn assert_folding_ranges_non_crossing(ranges: &[Value], include_characters: bool) {
+    let point = |range: &Value, prefix: &str| {
+        let line = range[format!("{prefix}Line")]
+            .as_u64()
+            .expect("folding range line");
+        let character = include_characters
+            .then(|| {
+                range[format!("{prefix}Character")]
+                    .as_u64()
+                    .expect("character-mode folding range character")
+            })
+            .unwrap_or_default();
+        (line, character)
+    };
+
+    for (left_index, left) in ranges.iter().enumerate() {
+        let left_start = point(left, "start");
+        let left_end = point(left, "end");
+        for (right_index, right) in ranges.iter().enumerate().skip(left_index + 1) {
+            let right_start = point(right, "start");
+            let right_end = point(right, "end");
+            let crossing =
+                (left_start < right_start && right_start < left_end && left_end < right_end)
+                    || (right_start < left_start && left_start < right_end && right_end < left_end);
+            assert!(
+                !crossing,
+                "folding ranges {left_index} and {right_index} cross: {left:?} vs {right:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn folding_ranges_return_multiline_syntax_ranges_over_the_protocol() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Folding.pas");
+    let source = "unit Folding;\ninterface\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  if True then\n  begin\n    Value := 1;\n  end;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), Value::Null);
+    assert_eq!(
+        initialize["capabilities"]["foldingRangeProvider"]["workDoneProgress"],
+        true
+    );
+
+    let id = RequestId::from("folding-ranges".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 4 && range["endLine"] == 10 }),
+        "routine range missing from response: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 5 && range["endLine"] == 10 }),
+        "begin range missing from response: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 6 && range["endLine"] == 9 }),
+        "if range missing from response: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_reconcile_crossing_implementation_and_region_candidates() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingCrossing.pas");
+    let source = "unit X;\ninterface\nimplementation\n{$REGION R}\nprocedure P;\nbegin\nend;\n{$ENDREGION}\nend.\n";
+    write_file(&source_path, source);
+
+    let mut character_server = TestServer::launch();
+    character_server.initialize(temp.path(), Value::Null);
+    let character_ranges = folding_ranges_request(
+        &mut character_server,
+        "folding-crossing-characters",
+        &source_path,
+    );
+    assert_folding_ranges_non_crossing(&character_ranges, true);
+    assert!(
+        character_ranges.iter().any(|range| {
+            range["kind"] == "region"
+                && range["startLine"] == 3
+                && range["startCharacter"] == 0
+                && range["endLine"] == 7
+                && range["endCharacter"] == 12
+        }),
+        "balanced region range must be preserved: {character_ranges:?}"
+    );
+    assert!(
+        character_ranges.iter().any(|range| {
+            range["startLine"] == 4
+                && range["startCharacter"] == 0
+                && range["endLine"] == 6
+                && range["endCharacter"] == 4
+        }),
+        "routine range nested inside the region must be preserved: {character_ranges:?}"
+    );
+    assert!(
+        character_ranges.iter().any(|range| {
+            range["startLine"] == 2
+                && range["startCharacter"] == 0
+                && range["endLine"] == 7
+                && range["endCharacter"] == 12
+        }),
+        "implementation section must be extended over trailing region trivia: {character_ranges:?}"
+    );
+    character_server.shutdown();
+
+    let mut line_only_server = TestServer::launch();
+    line_only_server
+        .initialize_with_folding_capabilities(temp.path(), json!({"lineFoldingOnly": true}));
+    let line_only_ranges = folding_ranges_request(
+        &mut line_only_server,
+        "folding-crossing-line-only",
+        &source_path,
+    );
+    assert_folding_ranges_non_crossing(&line_only_ranges, false);
+    assert!(
+        line_only_ranges.iter().all(|range| {
+            !range.as_object().is_some_and(|range| {
+                range.contains_key("startCharacter") || range.contains_key("endCharacter")
+            })
+        }),
+        "line-only folding ranges must omit character fields: {line_only_ranges:?}"
+    );
+    assert!(
+        line_only_ranges.iter().any(|range| {
+            range["kind"] == "region" && range["startLine"] == 3 && range["endLine"] == 7
+        }),
+        "line-only region range must be preserved: {line_only_ranges:?}"
+    );
+    assert!(
+        line_only_ranges
+            .iter()
+            .any(|range| { range["startLine"] == 2 && range["endLine"] == 7 }),
+        "line-only implementation section must include the trailing region directive: {line_only_ranges:?}"
+    );
+    line_only_server.shutdown();
+
+    let mut zero_limit_server = TestServer::launch();
+    zero_limit_server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 0}));
+    let zero_limit_ranges = folding_ranges_request(
+        &mut zero_limit_server,
+        "folding-crossing-zero-limit",
+        &source_path,
+    );
+    assert!(
+        zero_limit_ranges.is_empty(),
+        "zero range limit must remain empty"
+    );
+    zero_limit_server.shutdown();
+
+    let mut small_limit_server = TestServer::launch();
+    small_limit_server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 2}));
+    let small_limit_ranges = folding_ranges_request(
+        &mut small_limit_server,
+        "folding-crossing-small-limit",
+        &source_path,
+    );
+    assert!(
+        small_limit_ranges.len() <= 2,
+        "small range limit must be honored: {small_limit_ranges:?}"
+    );
+    assert_folding_ranges_non_crossing(&small_limit_ranges, true);
+    small_limit_server.shutdown();
+}
+
+#[test]
+fn folding_range_client_capabilities_filter_kinds_and_characters() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingOptions.pas");
+    let source = "unit FoldingOptions;\ninterface\nimplementation\n{$REGION 'body'}\n{comment\n  continues}\nprocedure Run;\nbegin\n  Value := 1;\nend;\n{$ENDREGION}\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(
+        temp.path(),
+        json!({
+            "lineFoldingOnly": true,
+            "foldingRangeKind": {"valueSet": ["region"]}
+        }),
+    );
+    let id = RequestId::from("folding-options".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges.iter().any(|range| range["kind"] == "region"),
+        "region range missing: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .all(|range| range.get("kind") != Some(&json!("comment"))),
+        "unsupported comment range returned: {ranges:?}"
+    );
+    assert!(
+        ranges.iter().all(|range| {
+            !range.as_object().is_some_and(|range| {
+                range.contains_key("startCharacter") || range.contains_key("endCharacter")
+            })
+        }),
+        "line-only ranges must omit character fields: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_range_zero_limit_returns_an_empty_result() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingZeroLimit.pas");
+    let source =
+        "unit FoldingZeroLimit;\ninterface\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 0}));
+    let id = RequestId::from("folding-zero-limit".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("folding range result"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn folding_range_limit_prefers_outer_meaningful_ranges() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingLimit.pas");
+    let source = "unit FoldingLimit;\ninterface\nprocedure Decl;\nimplementation\nprocedure Run;\nbegin\n  if True then\n  begin\n  end;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(temp.path(), json!({"rangeLimit": 2}));
+    let id = RequestId::from("folding-limit".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert_eq!(ranges.len(), 2, "range limit must be honored: {ranges:?}");
+    assert_eq!(
+        ranges
+            .iter()
+            .map(|range| (range["startLine"].as_u64(), range["endLine"].as_u64()))
+            .collect::<Vec<_>>(),
+        vec![(Some(3), Some(9)), (Some(4), Some(9))]
+    );
+    server.shutdown();
+}
+
+#[test]
+fn line_only_folding_does_not_hide_code_after_a_closing_token() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingLineOnly.pas");
+    let source = "unit FoldingLineOnly;\ninterface\nimplementation\nprocedure Run;\nbegin\n  if True then begin\n    Value := 1;\n  end; Value := 2;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_folding_capabilities(temp.path(), json!({"lineFoldingOnly": true}));
+    let id = RequestId::from("folding-line-only".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "folding range request failed: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 5 && range["endLine"] == 6 }),
+        "if body should stop before the line containing unrelated code: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .all(|range| { !(range["startLine"] == 5 && range["endLine"] == 7) }),
+        "line-only folding must not hide unrelated closing-line code: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_use_authoritative_open_overlay_then_restore_disk_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingOverlay.pas");
+    let disk_source =
+        "unit FoldingOverlay;\ninterface\nimplementation\nprocedure Run; begin end;\nend.\n";
+    let overlay_source = "unit FoldingOverlay;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Value := 1;\nend;\nend.\n";
+    write_file(&source_path, disk_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": overlay_source
+            }
+        }),
+    );
+
+    let open_id = RequestId::from("folding-overlay-open".to_string());
+    server.send_request(
+        open_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let open_response = server.response(&open_id);
+    assert!(
+        open_response.error.is_none(),
+        "open overlay request failed: {open_response:?}"
+    );
+    let open_result = open_response.result.expect("open folding result");
+    let open_ranges = open_result.as_array().expect("open folding array");
+    assert!(
+        open_ranges
+            .iter()
+            .any(|range| { range["startLine"] == 3 && range["endLine"] == 6 }),
+        "folding must use the open overlay: {open_ranges:?}"
+    );
+
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let close_id = RequestId::from("folding-overlay-close".to_string());
+    server.send_request(
+        close_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let close_response = server.response(&close_id);
+    assert!(
+        close_response.error.is_none(),
+        "closed overlay request failed: {close_response:?}"
+    );
+    let close_result = close_response.result.expect("closed folding result");
+    let close_ranges = close_result.as_array().expect("closed folding array");
+    assert!(
+        close_ranges
+            .iter()
+            .all(|range| { !(range["startLine"] == 3 && range["endLine"] == 6) }),
+        "folding must return to disk source after close: {close_ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_do_not_require_imports_to_resolve() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingMissingImport.pas");
+    let source = "unit FoldingMissingImport;\ninterface\nuses MissingProvider;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("folding-missing-import".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "missing import must not block folding: {response:?}"
+    );
+    let result = response.result.expect("folding range result");
+    let ranges = result.as_array().expect("folding range array");
+    assert!(
+        ranges
+            .iter()
+            .any(|range| { range["startLine"] == 4 && range["endLine"] == 6 }),
+        "routine range missing when an import is unresolved: {ranges:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn folding_ranges_reject_invalid_and_non_file_documents() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingInvalid.pas");
+    write_file(
+        &source_path,
+        "unit FoldingInvalid;\ninterface\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let invalid_id = RequestId::from("folding-invalid-params".to_string());
+    server.send_request(invalid_id.clone(), "textDocument/foldingRange", json!({}));
+    assert_eq!(
+        server
+            .response(&invalid_id)
+            .error
+            .expect("invalid folding parameters error")
+            .code,
+        -32602
+    );
+
+    let non_file_id = RequestId::from("folding-non-file".to_string());
+    server.send_request(
+        non_file_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": "https://example.test/Folding.pas"}}),
+    );
+    let non_file_error = server
+        .response(&non_file_id)
+        .error
+        .expect("non-file folding error");
+    assert_eq!(non_file_error.code, -32803);
+    server.shutdown();
+}
+
+#[test]
+fn folding_range_cancellation_handles_thousands_of_nodes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("FoldingMany.pas");
+    let mut source = String::from("unit FoldingMany;\ninterface\nvar\n");
+    for index in 0..4_000 {
+        source.push_str(&format!("  Value{index}: Integer;\n"));
+    }
+    source.push_str("implementation\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("folding-cancelled".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri(&source_path)}}),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": "folding-cancelled"}));
+    let error = server
+        .response(&id)
+        .error
+        .expect("cancelled folding request must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
     server.shutdown();
 }
 
@@ -2578,9 +6558,1977 @@ fn initialize_advertises_standard_completion_and_signature_help() {
         capabilities["completionProvider"]["triggerCharacters"],
         json!(["."])
     );
+    assert_eq!(capabilities["completionProvider"]["resolveProvider"], true);
     assert_eq!(
         capabilities["signatureHelpProvider"]["triggerCharacters"],
         json!(["(", ","])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_are_negotiated_from_exact_routine_parameters() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("CompletionSnippets.pas");
+    let source = "unit CompletionSnippets;\ninterface\nprocedure Run(&Value$, A, B: Integer; Optional: string = 'default');\nprocedure Zero;\nimplementation\nprocedure Run(&Value$, A, B: Integer; Optional: string = 'default');\nbegin\nend;\nprocedure Zero;\nbegin\nend;\nprocedure Caller;\nbegin\n  Ru\n  Ze\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    for (name, snippet_support, expected_snippet) in [
+        (
+            "snippet-true",
+            Some(true),
+            Some("Run(${1:&Value\\$}, ${2:A}, ${3:B}, ${4:Optional})$0"),
+        ),
+        ("snippet-false", Some(false), None),
+        ("snippet-absent", None, None),
+    ] {
+        let mut server = TestServer::launch();
+        server.initialize_with_completion_capabilities(
+            temp.path(),
+            snippet_support,
+            json!([]),
+            json!(["plaintext"]),
+        );
+        let request_id = RequestId::from(name.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, "  Ru", 0)
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let item = response.result.expect("completion result")["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == "Run")
+            .cloned()
+            .expect("Run completion item");
+        assert_eq!(item["label"], "Run");
+        assert_eq!(item["filterText"], Value::Null);
+        assert_eq!(item["sortText"], Value::Null);
+        match expected_snippet {
+            Some(expected) => {
+                assert!(item["insertText"].is_null());
+                assert_eq!(item["insertTextFormat"], 2);
+                assert_eq!(item["textEdit"]["newText"], expected);
+            }
+            None => {
+                assert!(item["insertText"].is_null());
+                assert!(item["insertTextFormat"].is_null());
+                assert_eq!(item["textEdit"]["newText"], "Run");
+            }
+        }
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_snippets_remain_conservative_for_existing_calls_and_address_of() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("SnippetContexts.pas");
+    let source = "unit SnippetContexts;\ninterface\ntype\n  TWidget = class\n    procedure Member(Value: Integer);\n  end;\nprocedure Run(Value: Integer);\nprocedure Zero;\nimplementation\nprocedure TWidget.Member(Value: Integer);\nbegin\nend;\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Zero;\nbegin\nend;\nprocedure Caller;\nvar\n  Widget: TWidget;\nbegin\n  Widget.Mem;\n  Ze;\n  @Run;\n  Run (* intervening comment *) ();\nend;\nend.\n";
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request = |server: &mut TestServer, id: &str, needle: &str| {
+        let request_id = RequestId::from(id.to_owned());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, needle, 0)
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        response.result.expect("completion result")["items"]
+            .as_array()
+            .expect("completion items")
+            .to_owned()
+    };
+    let find = |items: &[Value], label: &str| {
+        items
+            .iter()
+            .find(|item| item["label"] == label)
+            .cloned()
+            .unwrap_or_else(|| panic!("{label} completion item missing: {items:?}"))
+    };
+
+    let member = find(
+        &request(&mut server, "member-snippet", "  Widget.Mem"),
+        "Member",
+    );
+    assert_eq!(member["textEdit"]["newText"], "Member(${1:Value})$0");
+    assert_eq!(member["insertTextFormat"], 2);
+
+    let zero = find(&request(&mut server, "zero-snippet", "  Ze"), "Zero");
+    assert_eq!(zero["textEdit"]["newText"], "Zero()$0");
+    assert_eq!(zero["insertTextFormat"], 2);
+
+    let address_of = find(&request(&mut server, "address-of", "  @Run"), "Run");
+    assert_eq!(address_of["textEdit"]["newText"], "Run");
+    assert!(address_of["insertTextFormat"].is_null());
+
+    let existing_call = find(&request(&mut server, "existing-call", "  Run"), "Run");
+    assert_eq!(existing_call["textEdit"]["newText"], "Run");
+    assert!(existing_call["insertTextFormat"].is_null());
+
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_for_procedure_value_contexts() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("ProcedureValueContexts.pas");
+    let source = "unit ProcedureValueContexts;\ninterface\ntype\n  TProc = procedure(Value: Integer);\n  TWidget = class\n    procedure Method(Value: Integer);\n  end;\nprocedure Run(Value: Integer);\nprocedure Take(Callback: TProc);\nimplementation\nprocedure TWidget.Method(Value: Integer);\nbegin\nend;\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Take(Callback: TProc);\nbegin\nend;\nprocedure Caller;\nvar\n  Callback: TProc;\n  Widget: TWidget;\nbegin\n  Ru;\n  Callback := Ru;\n  Take(Ru);\n  @Ru;\n  Callback := Widget.Me;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request = |server: &mut TestServer, id: &str, needle: &str, label: &str| {
+        let request_id = RequestId::from(id.to_owned());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == label)
+            .cloned()
+            .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+    };
+
+    let statement = request(&mut server, "procedure-value-statement", "  Ru", "Run");
+    assert_eq!(statement["textEdit"]["newText"], "Run(${1:Value})$0");
+    assert_eq!(statement["insertTextFormat"], 2);
+
+    for (id, needle, label, replacement) in [
+        (
+            "procedure-assignment",
+            "Callback := Ru",
+            "Run",
+            "Callback := Run",
+        ),
+        ("procedure-argument", "Take(Ru", "Run", "Take(Run"),
+        ("procedure-address-of", "  @Ru", "Run", "  @Run"),
+        (
+            "method-pointer-assignment",
+            "Callback := Widget.Me",
+            "Method",
+            "Callback := Widget.Method",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, label);
+        assert_eq!(item["textEdit"]["newText"], label);
+        assert!(item["insertTextFormat"].is_null());
+        assert_eq!(
+            apply_completion_item(source, &item),
+            source.replace(needle, replacement)
+        );
+    }
+
+    assert_eq!(
+        apply_expanded_completion_item(source, &statement),
+        source.replace("  Ru;\n", "  Run(Value);\n")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_require_a_proven_expression_call_role() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("CallEligibility.pas");
+    let source = "unit CallEligibility;\ninterface\nfunction Make(Value: Integer): Integer;\nfunction Other(Value: Integer): Integer;\nfunction UseResult(Value: Integer): Integer;\nprocedure Run(Value: Integer);\nimplementation\nfunction Make(Value: Integer): Integer;\nbegin\n  Result := Value;\nend;\nfunction Other(Value: Integer): Integer;\nbegin\n  Result := Value;\nend;\nfunction UseResult(Value: Integer): Integer;\nbegin\n  Result := Ma;\nend;\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nvar\n  Value, Index: Integer;\nbegin\n  Ru;\n  Value := Make(1) + Ma;\n  if Ma > 0 then\n    Value := Value;\n  for Index := 1 to Ma do\n    Value := Value;\n  Ma := Value;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize, label: &str| {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&source_path)},
+                    "position": position_after(source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            let result = response.result.expect("completion result");
+            result["items"]
+                .as_array()
+                .expect("completion items")
+                .iter()
+                .find(|item| item["label"] == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+        };
+
+    let statement = request(&mut server, "eligibility-statement", "  Ru", 0, "Run");
+    assert_eq!(statement["textEdit"]["newText"], "Run(${1:Value})$0");
+    assert_eq!(statement["insertTextFormat"], 2);
+
+    let nested = request(
+        &mut server,
+        "eligibility-nested-expression",
+        " + Ma",
+        0,
+        "Make",
+    );
+    assert_eq!(nested["textEdit"]["newText"], "Make(${1:Value})$0");
+    assert_eq!(
+        apply_expanded_completion_item(source, &nested),
+        source.replace(" + Ma;\n", " + Make(Value);\n")
+    );
+
+    for (id, needle) in [
+        ("eligibility-condition", "if Ma"),
+        ("eligibility-loop-end", "to Ma"),
+    ] {
+        let item = request(&mut server, id, needle, 0, "Make");
+        assert_eq!(item["textEdit"]["newText"], "Make(${1:Value})$0");
+        assert_eq!(item["insertTextFormat"], 2);
+    }
+
+    let result_rhs = request(
+        &mut server,
+        "eligibility-function-result-rhs",
+        "Result := Ma",
+        0,
+        "Make",
+    );
+    assert_eq!(result_rhs["textEdit"]["newText"], "Make(${1:Value})$0");
+    assert_eq!(result_rhs["insertTextFormat"], 2);
+
+    let result_assignment = request(
+        &mut server,
+        "eligibility-result-assignment",
+        "  Ma",
+        0,
+        "Make",
+    );
+    assert_eq!(result_assignment["textEdit"]["newText"], "Make");
+    assert!(result_assignment["insertTextFormat"].is_null());
+    assert_eq!(
+        apply_completion_item(source, &result_assignment),
+        source.replace("  Ma := Value;\n", "  Make := Value;\n")
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_preserve_inner_expected_types_and_index_destinations() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("NestedExpectedCompletion.pas");
+    let source = r#"unit NestedExpectedCompletion;
+interface
+type
+  TProc = procedure(Value: Integer);
+  TProcArray = array[0..1] of TProc;
+  TIntArray = array[0..1] of Integer;
+function Count(Callback: TProc): Integer;
+function Make(Value: Integer): Integer;
+procedure Consume(Value: Integer);
+function Opaque(Callback: TUnresolved): Integer;
+procedure Run(Value: Integer);
+implementation
+function Count(Callback: TProc): Integer;
+begin
+  Result := 1;
+end;
+function Make(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+procedure Consume(Value: Integer);
+begin
+end;
+function Opaque(Callback: TUnresolved): Integer;
+begin
+  Result := 1;
+end;
+procedure Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  Value, Index: Integer;
+  Callbacks: TProcArray;
+  Values: TIntArray;
+begin
+  Value := Count(Ru);
+  Consume(Count(Ru));
+  Consume(Ma);
+  Consume(Opaque(Ru));
+  Value := Ma;
+  Callbacks[Index] := Ru;
+  Callbacks[0] := Ru;
+  Values[Index] := Ma;
+  Values[0] := Ma;
+  Unknown[Index] := Ru;
+end;
+end.
+"#;
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize, label: &str| {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&source_path)},
+                    "position": position_after(source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            let result = response.result.expect("completion result");
+            result["items"]
+                .as_array()
+                .expect("completion items")
+                .iter()
+                .find(|item| item["label"] == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+        };
+    let mut failures = Vec::new();
+
+    for (id, needle, occurrence, original, replacement) in [
+        (
+            "nested-procedure-value",
+            "Count(Ru",
+            0,
+            "Value := Count(Ru);",
+            "Value := Count(Run);",
+        ),
+        (
+            "double-nested-procedure-value",
+            "Count(Ru",
+            1,
+            "Consume(Count(Ru));",
+            "Consume(Count(Run));",
+        ),
+        (
+            "unknown-nested-expected-value",
+            "Opaque(Ru",
+            0,
+            "Consume(Opaque(Ru));",
+            "Consume(Opaque(Run));",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, occurrence, "Run");
+        if item["textEdit"]["newText"] != "Run" || !item["insertTextFormat"].is_null() {
+            failures.push(format!(
+                "{id}: expected plain Run, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replacen(original, replacement, 1);
+        if expanded != expected {
+            failures.push(format!("{id}: expanded source was {expanded:?}"));
+        }
+    }
+
+    for (id, needle, occurrence) in [
+        ("nonprocedural-nested-value", "Consume(Ma", 0),
+        ("nonprocedural-indexed-value", "Values[Index] := Ma", 0),
+        ("nonprocedural-literal-indexed-value", "Values[0] := Ma", 0),
+        ("genuine-function-rvalue", "Value := Ma", 0),
+    ] {
+        let item = request(&mut server, id, needle, occurrence, "Make");
+        if item["textEdit"]["newText"] != "Make(${1:Value})$0" || item["insertTextFormat"] != 2 {
+            failures.push(format!(
+                "{id}: expected Make snippet, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+    }
+
+    for (id, needle, occurrence, replacement) in [
+        (
+            "indexed-procedure-value",
+            "Callbacks[Index] := Ru",
+            0,
+            "Callbacks[Index] := Run",
+        ),
+        (
+            "literal-indexed-procedure-value",
+            "Callbacks[0] := Ru",
+            0,
+            "Callbacks[0] := Run",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, occurrence, "Run");
+        if item["textEdit"]["newText"] != "Run" || !item["insertTextFormat"].is_null() {
+            failures.push(format!(
+                "{id}: expected plain Run, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replace(needle, replacement);
+        if expanded != expected {
+            failures.push(format!("{id}: expanded source was {expanded:?}"));
+        }
+    }
+
+    let unproven = request(
+        &mut server,
+        "unproven-indexed-destination",
+        "Unknown[Index] := Ru",
+        0,
+        "Run",
+    );
+    if unproven["textEdit"]["newText"] != "Run" || !unproven["insertTextFormat"].is_null() {
+        failures.push(format!(
+            "unproven-indexed-destination: expected plain Run, got {}",
+            unproven["textEdit"]["newText"]
+        ));
+    }
+    let expanded = apply_completion_item(source, &unproven);
+    let expected = source.replace("Unknown[Index] := Ru", "Unknown[Index] := Run");
+    if expanded != expected {
+        failures.push(format!(
+            "unproven-indexed-destination: expanded source was {expanded:?}"
+        ));
+    }
+
+    assert!(failures.is_empty(), "completion regressions: {failures:#?}");
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_project_full_indexed_destination_types() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("MultiIndexCompletion.pas");
+    let source = r#"unit MultiIndexCompletion;
+interface
+type
+  TProc = procedure(Value: Integer);
+  TProcArray = array[0..1] of TProc;
+  TMatrix = array[0..1] of TProcArray;
+  TDeclaredMatrix = array[0..1, 0..1] of TProc;
+  TScalarMatrix = array[0..1, 0..1] of Integer;
+  TCycleA = array[0..1] of TCycleB;
+  TCycleB = array[0..1] of TCycleA;
+function Make(Value: Integer): Integer;
+procedure Run(Value: Integer);
+implementation
+function Make(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+procedure Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  Matrix: TMatrix;
+  DeclaredMatrix: TDeclaredMatrix;
+  ScalarMatrix: TScalarMatrix;
+  Cycle: TCycleA;
+  Index: Integer;
+begin
+  Matrix[Index,0] := Ru;
+  Matrix[Index][0] := Ru;
+  DeclaredMatrix[Index,0] := Ru;
+  ScalarMatrix[Index,0] := Ma;
+  Matrix[Index,0,1] := Ru;
+  Matrix[Index,] := Ru;
+  Cycle[Index,0] := Ru;
+end;
+end.
+"#;
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+
+    let request =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize, label: &str| {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&source_path)},
+                    "position": position_after(source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            let result = response.result.expect("completion result");
+            result["items"]
+                .as_array()
+                .expect("completion items")
+                .iter()
+                .find(|item| item["label"] == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+        };
+    let mut failures = Vec::new();
+
+    for (id, needle, replacement) in [
+        (
+            "named-comma-indices",
+            "Matrix[Index,0] := Ru",
+            "Matrix[Index,0] := Run",
+        ),
+        (
+            "chained-indices",
+            "Matrix[Index][0] := Ru",
+            "Matrix[Index][0] := Run",
+        ),
+        (
+            "declared-multidimensional",
+            "DeclaredMatrix[Index,0] := Ru",
+            "DeclaredMatrix[Index,0] := Run",
+        ),
+        (
+            "excess-indices",
+            "Matrix[Index,0,1] := Ru",
+            "Matrix[Index,0,1] := Run",
+        ),
+        (
+            "malformed-indices",
+            "Matrix[Index,] := Ru",
+            "Matrix[Index,] := Run",
+        ),
+        (
+            "cyclic-array-indices",
+            "Cycle[Index,0] := Ru",
+            "Cycle[Index,0] := Run",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, 0, "Run");
+        if item["textEdit"]["newText"] != "Run" || !item["insertTextFormat"].is_null() {
+            failures.push(format!(
+                "{id}: expected plain Run, got {}",
+                item["textEdit"]["newText"]
+            ));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replacen(needle, replacement, 1);
+        if expanded != expected {
+            failures.push(format!(
+                "{id}: expanded source was {expanded:?}, expected {expected:?}"
+            ));
+        }
+    }
+
+    let scalar = request(
+        &mut server,
+        "scalar-element",
+        "ScalarMatrix[Index,0] := Ma",
+        0,
+        "Make",
+    );
+    if scalar["textEdit"]["newText"] != "Make(${1:Value})$0" || scalar["insertTextFormat"] != 2 {
+        failures.push(format!(
+            "scalar-element: expected Make snippet, got {}",
+            scalar["textEdit"]["newText"]
+        ));
+    }
+
+    assert!(failures.is_empty(), "completion regressions: {failures:#?}");
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_fail_closed_for_terminal_type_aliases() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("TerminalAliasCompletion.pas");
+    let source = r#"unit TerminalAliasCompletion;
+interface
+type
+  TProc = procedure(Value: Integer);
+  TProcAlias = TProc;
+  TProcAliasChain = TProcAlias;
+  TProcRow = array[0..1] of TProcAliasChain;
+  TProcMatrix = array[0..1] of TProcRow;
+  TScalarLeaf = Integer;
+  TScalarLeafAlias = TScalarLeaf;
+  TScalarRow = array[0..1] of TScalarLeafAlias;
+  TScalarMatrix = array[0..1] of TScalarRow;
+  TResidualBase = array[0..1] of Integer;
+  TResidualAlias = TResidualBase;
+  TResidualOuter = array[0..1] of TResidualAlias;
+  TUnknownAlias = TMissingType;
+  TUnknownRow = array[0..1] of TUnknownAlias;
+  TCycleA = array[0..1] of TCycleB;
+  TCycleB = TCycleA;
+function Make(Value: Integer): Integer;
+procedure Run(Value: Integer);
+implementation
+function Make(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+procedure Run(Value: Integer);
+begin
+end;
+procedure Caller;
+var
+  ProcMatrix: TProcMatrix;
+  ScalarMatrix: TScalarMatrix;
+  Residual: TResidualOuter;
+  Unknown: TUnknownRow;
+  Cycle: TCycleA;
+  Index: Integer;
+begin
+  ProcMatrix[Index,0] := Ru;
+  ScalarMatrix[Index,0] := Ma;
+  Residual[Index] := Ma;
+  Unknown[Index] := Ru;
+  Cycle[Index] := Ru;
+end;
+end.
+"#;
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request = |server: &mut TestServer, id: &str, needle: &str, label: &str| {
+        let request_id = RequestId::from(id.to_owned());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == label)
+            .cloned()
+            .unwrap_or_else(|| panic!("{label} completion item missing: {result:?}"))
+    };
+
+    let mut failures = Vec::new();
+    for (id, needle, replacement, label) in [
+        (
+            "procedural-terminal-alias-chain",
+            "ProcMatrix[Index,0] := Ru",
+            "ProcMatrix[Index,0] := Run",
+            "Run",
+        ),
+        (
+            "residual-array-terminal-alias",
+            "Residual[Index] := Ma",
+            "Residual[Index] := Make",
+            "Make",
+        ),
+        (
+            "unknown-terminal-alias",
+            "Unknown[Index] := Ru",
+            "Unknown[Index] := Run",
+            "Run",
+        ),
+        (
+            "cyclic-terminal-alias",
+            "Cycle[Index] := Ru",
+            "Cycle[Index] := Run",
+            "Run",
+        ),
+    ] {
+        let item = request(&mut server, id, needle, label);
+        if item["textEdit"]["newText"] != label || !item["insertTextFormat"].is_null() {
+            failures.push(format!("{id}: expected plain {label}, got {item}"));
+        }
+        let expanded = apply_completion_item(source, &item);
+        let expected = source.replacen(needle, replacement, 1);
+        if expanded != expected {
+            failures.push(format!("{id}: expanded source was {expanded:?}"));
+        }
+    }
+
+    let scalar = request(
+        &mut server,
+        "scalar-terminal-alias-chain",
+        "ScalarMatrix[Index,0] := Ma",
+        "Make",
+    );
+    if scalar["textEdit"]["newText"] != "Make(${1:Value})$0" || scalar["insertTextFormat"] != 2 {
+        failures.push(format!(
+            "scalar-terminal-alias-chain: expected Make snippet, got {scalar}"
+        ));
+    }
+    let expanded = apply_expanded_completion_item(source, &scalar);
+    let expected = source.replacen(
+        "ScalarMatrix[Index,0] := Ma",
+        "ScalarMatrix[Index,0] := Make(Value)",
+        1,
+    );
+    if expanded != expected {
+        failures.push(format!(
+            "scalar-terminal-alias-chain: expanded source was {expanded:?}"
+        ));
+    }
+
+    assert!(failures.is_empty(), "completion regressions: {failures:#?}");
+
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_for_non_expression_syntax_roles() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let cases = [
+        (
+            "label",
+            "unit LabelRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  goto Ru;\nend;\nend.\n",
+            "goto Ru",
+        ),
+        (
+            "loop-target",
+            "unit LoopTargetRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nvar\n  Value: Integer;\nbegin\n  for Ru := 1 to 2 do\n    Value := Value;\nend;\nend.\n",
+            "for Ru",
+        ),
+        (
+            "left-qualification",
+            "unit LeftQualificationRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  Ru.Member;\nend;\nend.\n",
+            "  Ru",
+        ),
+        (
+            "uncertain",
+            "unit UncertainRole;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Caller;\nbegin\n  Ru ???;\nend;\nend.\n",
+            "  Ru",
+        ),
+    ];
+
+    for (id, source, needle) in cases {
+        let source_path = temp.path().join(format!("{id}.pas"));
+        write_file(&source_path, source);
+        let mut server = TestServer::launch();
+        server.initialize_with_completion_capabilities(
+            temp.path(),
+            Some(true),
+            json!([]),
+            json!(["plaintext"]),
+        );
+        let request_id = RequestId::from(format!("non-expression-{id}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let item = response.result.expect("completion result")["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == "Run")
+            .cloned()
+            .unwrap_or_else(|| panic!("Run completion item missing for {id}"));
+        assert_eq!(item["textEdit"]["newText"], "Run");
+        assert!(item["insertTextFormat"].is_null());
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_snippets_keep_utf16_mid_token_ranges_and_crlf_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("CrLfSnippets.pas");
+    let source = concat!(
+        "unit CrLfSnippets;\r\n",
+        "interface\r\n",
+        "procedure Run(Value: Integer);\r\n",
+        "implementation\r\n",
+        "procedure Run(Value: Integer);\r\n",
+        "begin\r\n",
+        "end;\r\n",
+        "procedure Caller;\r\n",
+        "begin\r\n",
+        "  (* 😀 *) RuSuffix\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("crlf-mid-token-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  (* 😀 *) Ru", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Run")
+        .cloned()
+        .expect("Run completion item");
+    assert_eq!(item["textEdit"]["newText"], "Run(${1:Value})$0");
+    assert_eq!(item["insertTextFormat"], 2);
+    assert_eq!(
+        item["textEdit"]["range"],
+        json!({
+            "start": {"line": 9, "character": 11},
+            "end": {"line": 9, "character": 19}
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_for_ambiguous_overloads() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("OverloadSnippets.pas");
+    let source = "unit OverloadSnippets;\ninterface\nprocedure Pick(NumberValue: Integer); overload;\nprocedure Pick(TextValue: string); overload;\nimplementation\nprocedure Pick(NumberValue: Integer);\nbegin\nend;\nprocedure Pick(TextValue: string);\nbegin\nend;\nprocedure Caller;\nbegin\n  Pi;\nend;\nend.\n";
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("ambiguous-overload-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Pi", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Pick")
+        .cloned()
+        .expect("Pick completion item");
+    assert_eq!(item["textEdit"]["newText"], "Pick");
+    assert!(item["insertTextFormat"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_for_cross_unit_overloads() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("CrossUnitOverloadProvider.pas");
+    let main_path = temp.path().join("CrossUnitOverloadConsumer.pas");
+    let provider_source = "unit CrossUnitOverloadProvider;\ninterface\nprocedure Pick(NumberValue: Integer); overload;\nprocedure Pick(TextValue: string); overload;\nimplementation\nprocedure Pick(NumberValue: Integer);\nbegin\nend;\nprocedure Pick(TextValue: string);\nbegin\nend;\nend.\n";
+    let main_source = "unit CrossUnitOverloadConsumer;\ninterface\nuses CrossUnitOverloadProvider;\nimplementation\nprocedure Caller;\nbegin\n  Pi\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("cross-unit-overload-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Pi", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Pick")
+        .cloned()
+        .expect("cross-unit Pick completion item");
+    assert_eq!(item["textEdit"]["newText"], "Pick");
+    assert!(item["insertTextFormat"].is_null());
+    assert_eq!(
+        apply_completion_item(main_source, &item),
+        main_source.replace("  Pi\n", "  Pick\n")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_do_not_add_statement_terminators_inside_expressions() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("NestedSnippet.pas");
+    let source = "unit NestedSnippet;\ninterface\nfunction Make(Value: Integer): Integer;\nimplementation\nfunction Make(Value: Integer): Integer;\nbegin\n  Result := Value;\nend;\nprocedure Caller;\nvar\n  Value: Integer;\nbegin\n  Value := Make(1) + Ma;\nend;\nend.\n";
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("nested-expression-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, " + Ma", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Make")
+        .cloned()
+        .expect("Make completion item");
+    assert_eq!(item["textEdit"]["newText"], "Make(${1:Value})$0");
+    assert!(
+        !item["textEdit"]["newText"]
+            .as_str()
+            .expect("snippet text")
+            .contains(';')
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_in_routine_declarations() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("DeclarationSnippet.pas");
+    let source = "unit DeclarationSnippet;\ninterface\nprocedure Run(Value: Integer);\nprocedure Ru;\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Ru;\nbegin\nend;\nend.\n";
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("declaration-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "procedure Ru", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Run")
+        .cloned()
+        .expect("Run completion item");
+    assert_eq!(item["textEdit"]["newText"], "Run");
+    assert!(item["insertTextFormat"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_defers_negotiated_fields_and_restores_stable_item() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DeferredCompletion.pas");
+    let source = "unit DeferredCompletion;\ninterface\n/// <summary>Returns the value.</summary>\n/// <param name=\"Name\">Lookup name.</param>\nfunction Documented(Name: string): Integer;\nimplementation\nfunction Documented(Name: string): Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  Doc\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut eager_server = TestServer::launch();
+    let eager_initialize = eager_server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    assert_eq!(
+        eager_initialize["capabilities"]["completionProvider"]["resolveProvider"],
+        true
+    );
+    let eager_id = RequestId::from("completion-eager".to_string());
+    eager_server.send_request(
+        eager_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Doc", 0)
+        }),
+    );
+    let eager = eager_server.response(&eager_id);
+    assert!(eager.error.is_none(), "eager completion failed: {eager:?}");
+    let eager_item = eager.result.expect("eager completion result")["items"]
+        .as_array()
+        .expect("eager completion items")
+        .iter()
+        .find(|item| item["label"] == "Documented")
+        .cloned()
+        .expect("eager documented item");
+    assert!(eager_item["documentation"].is_string());
+    assert!(
+        eager_item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Documented"))
+    );
+    assert!(eager_item["data"].is_null());
+    eager_server.shutdown();
+
+    let mut deferred_server = TestServer::launch();
+    let initialize = deferred_server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!(["documentation", "detail"]),
+        json!(["markdown", "plaintext"]),
+    );
+    assert_eq!(
+        initialize["capabilities"]["completionProvider"]["resolveProvider"],
+        true
+    );
+    let request_id = RequestId::from("completion-deferred".to_string());
+    deferred_server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Doc", 0)
+        }),
+    );
+    let response = deferred_server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "deferred completion failed: {response:?}"
+    );
+    let initial = response.result.expect("deferred completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("deferred completion items")
+        .iter()
+        .find(|item| item["label"] == "Documented")
+        .cloned()
+        .expect("deferred documented item");
+    assert!(item["documentation"].is_null());
+    assert!(item["detail"].is_null());
+    assert!(item["data"].is_object());
+    assert_eq!(item["textEdit"]["newText"], "Documented(${1:Name})$0");
+    assert_eq!(item["insertTextFormat"], 2);
+    let original_edit = item["textEdit"].clone();
+    let original_kind = item["kind"].clone();
+    let original_insert_text = item["insertText"].clone();
+    let original_filter_text = item["filterText"].clone();
+    let original_additional_edits = item["additionalTextEdits"].clone();
+    let mut resolve_item = item.clone();
+    resolve_item["label"] = json!("ForgedLabel");
+    resolve_item["detail"] = json!("Forged detail");
+    resolve_item["textEdit"]["newText"] = json!("FORGED_EDIT");
+    resolve_item["sortText"] = json!("forged-sort");
+    resolve_item["kind"] = json!(1);
+    resolve_item["insertText"] = json!("FORGED_INSERT");
+    resolve_item["filterText"] = json!("forged-filter");
+    resolve_item["additionalTextEdits"] = json!([]);
+
+    let resolve_id = RequestId::from("completion-resolve".to_string());
+    deferred_server.send_request(resolve_id.clone(), "completionItem/resolve", resolve_item);
+    let resolved = deferred_server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "completion resolve failed: {resolved:?}"
+    );
+    let resolved = resolved.result.expect("resolved completion item");
+    assert_eq!(resolved["label"], "Documented");
+    assert_eq!(resolved["textEdit"], original_edit);
+    assert_eq!(resolved["textEdit"]["newText"], "Documented(${1:Name})$0");
+    assert_eq!(resolved["insertTextFormat"], 2);
+    assert_eq!(resolved["kind"], original_kind);
+    assert_eq!(resolved["insertText"], original_insert_text);
+    assert_eq!(resolved["filterText"], original_filter_text);
+    assert_eq!(resolved["additionalTextEdits"], original_additional_edits);
+    assert_eq!(resolved["documentation"]["kind"], "markdown");
+    assert!(
+        resolved["documentation"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("Returns the value."))
+    );
+    assert!(
+        resolved["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Documented"))
+    );
+    deferred_server.shutdown();
+}
+
+#[test]
+fn completion_resolution_accepts_unchanged_open_source_after_unrelated_overlay_edit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("OpenDeferredCompletion.pas");
+    let unrelated_path = temp.path().join("Unrelated.pas");
+    let source = "unit OpenDeferredCompletion;\ninterface\n/// <summary>Returns the open value.</summary>\nfunction OpenDocumented: Integer;\nimplementation\nfunction OpenDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  OpenDoc\nend;\nend.\n";
+    write_file(&source_path, source);
+    write_file(
+        &unrelated_path,
+        "unit Unrelated; interface implementation end.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let completion_id = RequestId::from("open-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  OpenDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("open completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("open completion items")
+        .iter()
+        .find(|item| item["label"] == "OpenDocumented")
+        .cloned()
+        .expect("open documented item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit Unrelated; interface implementation end.\n"
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("open-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "open resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("open resolved item");
+    assert_eq!(resolved["label"], "OpenDocumented");
+    assert!(
+        resolved["documentation"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("open value"))
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_rejects_a_project_context_switch() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main_path = temp.path().join("ContextCompletion.pas");
+    let project_a = temp.path().join("A.dproj");
+    let project_b = temp.path().join("B.dproj");
+    let source = "unit ContextCompletion;\ninterface\n/// <summary>Context-bound value.</summary>\nfunction ContextDocumented: Integer;\nimplementation\nfunction ContextDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  ContextDoc\nend;\nend.\n";
+    write_file(&main_path, source);
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>ContextCompletion.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let select_a_id = RequestId::from("context-select-a".to_string());
+    server.send_request(
+        select_a_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "projectUri": uri(&project_a)
+        }),
+    );
+    assert!(server.response(&select_a_id).error.is_none());
+
+    let completion_id = RequestId::from("context-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(source, "  ContextDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("context completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("context completion items")
+        .iter()
+        .find(|item| item["label"] == "ContextDocumented")
+        .cloned()
+        .expect("context documented item");
+
+    let select_b_id = RequestId::from("context-select-b".to_string());
+    server.send_request(
+        select_b_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "projectUri": uri(&project_b)
+        }),
+    );
+    assert!(server.response(&select_b_id).error.is_none());
+
+    let resolve_id = RequestId::from("context-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("context switch must invalidate completion resolution");
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_rejects_a_provider_disk_change_without_watcher_notification() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main_path = temp.path().join("Main.pas");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Caller;\nbegin\n  ProviderDoc\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\n/// <summary>Provider documentation.</summary>\nfunction ProviderDocumented: Integer;\nimplementation\nfunction ProviderDocumented: Integer;\nbegin\n  Result := 1;\nend;\nend.\n";
+    write_file(&main_path, main_source);
+    write_file(&provider_path, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["plaintext"]),
+    );
+    let completion_id = RequestId::from("provider-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  ProviderDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("provider completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("provider completion items")
+        .iter()
+        .find(|item| item["label"] == "ProviderDocumented")
+        .cloned()
+        .expect("provider documented item");
+
+    write_file(
+        &provider_path,
+        "unit Provider;\ninterface\n/// <summary>Changed provider documentation.</summary>\nfunction ProviderDocumented: Integer;\nimplementation\nfunction ProviderDocumented: Integer;\nbegin\n  Result := 2;\nend;\nend.\n",
+    );
+    let resolve_id = RequestId::from("provider-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("provider disk change must invalidate resolution");
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_defers_only_the_negotiated_field_in_plaintext() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("PlainCompletion.pas");
+    let source = "unit PlainCompletion;\ninterface\n/// <summary>Plain documentation.</summary>\nfunction PlainDocumented: Integer;\nimplementation\nfunction PlainDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  PlainDoc\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation"]),
+        json!(["plaintext"]),
+    );
+    let completion_id = RequestId::from("plain-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  PlainDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("plain completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("plain completion items")
+        .iter()
+        .find(|item| item["label"] == "PlainDocumented")
+        .cloned()
+        .expect("plain documented item");
+    assert!(item["documentation"].is_null());
+    let eager_detail = item["detail"]
+        .as_str()
+        .expect("eager plain detail")
+        .to_owned();
+
+    let resolve_id = RequestId::from("plain-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "plain resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("plain resolved item");
+    assert!(resolved["documentation"].is_string());
+    assert_eq!(resolved["detail"].as_str(), Some(eager_detail.as_str()));
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_preserves_generic_member_specialization() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("GenericProvider.pas");
+    let main_path = temp.path().join("GenericMain.pas");
+    let provider_source = "unit GenericProvider;\ninterface\ntype\n  TBox<T> = class\n    Value: T;\n  end;\nimplementation\nend.\n";
+    let main_source = "unit GenericMain;\ninterface\nuses GenericProvider;\nimplementation\nprocedure Caller;\nvar\n  Box: TBox<Integer>;\nbegin\n  Box.Va\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("generic-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Box.Va", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("generic completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("generic completion items")
+        .iter()
+        .find(|item| item["label"] == "Value")
+        .cloned()
+        .expect("generic Value item");
+    assert!(item["detail"].is_null());
+
+    let resolve_id = RequestId::from("generic-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "generic resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("generic resolved item");
+    assert!(
+        resolved["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Value: Integer"))
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_use_generic_member_signatures() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("GenericSnippetProvider.pas");
+    let main_path = temp.path().join("GenericSnippetMain.pas");
+    let provider_source = "unit GenericSnippetProvider;\ninterface\ntype\n  TBox<T> = class\n    procedure Put(Value: T);\n  end;\nimplementation\nprocedure TBox<T>.Put(Value: T);\nbegin\nend;\nend.\n";
+    let main_source = "unit GenericSnippetMain;\ninterface\nuses GenericSnippetProvider;\nimplementation\nprocedure Caller;\nvar\n  Box: TBox<Integer>;\nbegin\n  Box.Pu;\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("generic-member-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Box.Pu", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Put")
+        .cloned()
+        .expect("Put completion item");
+    assert_eq!(item["textEdit"]["newText"], "Put(${1:Value})$0");
+    assert_eq!(item["insertTextFormat"], 2);
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_stay_plain_when_generic_suffix_is_already_typed() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("GenericSuffixSnippet.pas");
+    let source = "unit GenericSuffixSnippet;\ninterface\ntype\n  TFactory = class\n    function Make<T>: T;\n  end;\nimplementation\nfunction TFactory.Make<T>: T;\nbegin\nend;\nprocedure Caller;\nvar\n  Factory: TFactory;\nbegin\n  Factory.Ma<Integer>;\n  Factory.Ma;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request = |server: &mut TestServer, id: &str, occurrence: usize| {
+        let request_id = RequestId::from(id.to_owned());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": position_after(source, "Factory.Ma", occurrence),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .find(|item| item["label"] == "Make")
+            .cloned()
+            .unwrap_or_else(|| panic!("Make completion item missing: {result:?}"))
+    };
+
+    for (id, occurrence) in [("generic-suffix", 1), ("generic-unresolved", 2)] {
+        let item = request(&mut server, id, occurrence);
+        assert_eq!(item["textEdit"]["newText"], "Make");
+        assert!(item["insertTextFormat"].is_null());
+    }
+
+    let suffix_item = request(&mut server, "generic-suffix-expanded", 1);
+    assert_eq!(
+        apply_expanded_completion_item(source, &suffix_item),
+        source.replace("Factory.Ma<Integer>", "Factory.Make<Integer>")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_snippets_follow_the_nearest_visible_shadowed_routine() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("ShadowedRoutineSnippet.pas");
+    let source = "unit ShadowedRoutineSnippet;\ninterface\nprocedure Run(Text: string);\nimplementation\nprocedure Run(Text: string);\nbegin\nend;\nprocedure Caller;\n  procedure Run(Number: Integer);\n  begin\n  end;\nbegin\n  Ru;\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!([]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("shadowed-routine-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Ru", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Run")
+        .cloned()
+        .expect("Run completion item");
+    assert!(
+        item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Number: Integer")),
+        "nearest routine detail missing: {item}"
+    );
+    assert_eq!(item["textEdit"]["newText"], "Run(${1:Number})$0");
+    assert_eq!(item["insertTextFormat"], 2);
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_preserves_the_exact_overloaded_declaration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("OverloadedProvider.pas");
+    let main_path = temp.path().join("OverloadedMain.pas");
+    let provider_source = "unit OverloadedProvider;\ninterface\n/// <summary>Integer overload documentation.</summary>\nfunction Pick(Value: Integer): Integer; overload;\n/// <summary>String overload documentation.</summary>\nfunction Pick(Value: string): Integer; overload;\nimplementation\nfunction Pick(Value: Integer): Integer;\nbegin\n  Result := Value;\nend;\nfunction Pick(Value: string): Integer;\nbegin\n  Result := Length(Value);\nend;\nend.\n";
+    let main_source = "unit OverloadedMain;\ninterface\nuses OverloadedProvider;\nimplementation\nprocedure Caller;\nbegin\n  Pi\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("overloaded-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Pi", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("overloaded completion result");
+    let items = initial["items"]
+        .as_array()
+        .expect("overloaded completion items");
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "Pick")
+        .cloned()
+        .expect("overloaded Pick item");
+    assert!(item["documentation"].is_null());
+    assert!(item["detail"].is_null());
+
+    let resolve_id = RequestId::from("overloaded-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "overloaded resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("overloaded resolved item");
+    assert_eq!(
+        resolved["detail"],
+        "function Pick(Value: Integer): Integer;"
+    );
+    assert_eq!(
+        resolved["documentation"]["value"],
+        "Integer overload documentation."
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_preserves_the_exact_helper_declaration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("HelperCompletion.pas");
+    let source = "unit HelperCompletion;\ninterface\ntype\n  TWidget = class\n  end;\n  TWidgetHelper = class helper for TWidget\n    /// <summary>Helper method documentation.</summary>\n    procedure Assist(Value: Integer);\n  end;\n\nprocedure Caller;\n\nimplementation\n\nprocedure TWidgetHelper.Assist(Value: Integer);\nbegin\nend;\n\nprocedure Caller;\nvar\n  Widget: TWidget;\nbegin\n  Widget.Assist(1);\n  Widget.\nend;\n\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("helper-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Widget.", 1)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("helper completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("helper completion items")
+        .iter()
+        .find(|item| item["label"] == "Assist")
+        .cloned()
+        .expect("helper Assist item");
+    assert!(item["documentation"].is_null());
+    assert!(item["detail"].is_null());
+    assert_eq!(item["textEdit"]["newText"], "Assist(${1:Value})$0");
+    assert_eq!(item["insertTextFormat"], 2);
+
+    let resolve_id = RequestId::from("helper-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "helper resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("helper resolved item");
+    assert_eq!(resolved["detail"], "procedure Assist(Value: Integer);");
+    assert_eq!(
+        resolved["documentation"]["value"],
+        "Helper method documentation."
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_rejects_a_requester_overlay_changed_after_completion() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("RequesterCompletion.pas");
+    let source = "unit RequesterCompletion;\ninterface\n/// <summary>Requester documentation.</summary>\nfunction RequesterDocumented: Integer;\nimplementation\nfunction RequesterDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  RequesterDoc\nend;\nend.\n";
+    let changed_source = source.replace("RequesterDoc\n", "RequesterChanged\n");
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("requester-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  RequesterDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("requester completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("requester completion items")
+        .iter()
+        .find(|item| item["label"] == "RequesterDocumented")
+        .cloned()
+        .expect("requester documented item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": changed_source
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("requester-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "requester overlay change must invalidate resolution: {response:?}"
+    );
+    assert_eq!(response.error.expect("requester stale error").code, -32803);
+    server.shutdown();
+}
+
+#[test]
+fn completion_resolution_rejects_a_provider_overlay_change() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main_path = temp.path().join("OverlayMain.pas");
+    let provider_path = temp.path().join("OverlayProvider.pas");
+    let main_source = "unit OverlayMain;\ninterface\nuses OverlayProvider;\nimplementation\nprocedure Caller;\nbegin\n  OverlayDoc\nend;\nend.\n";
+    let provider_source = "unit OverlayProvider;\ninterface\n/// <summary>Original provider documentation.</summary>\nfunction OverlayDocumented: Integer;\nimplementation\nfunction OverlayDocumented: Integer;\nbegin\n  Result := 1;\nend;\nend.\n";
+    let changed_provider = provider_source.replace(
+        "Original provider documentation",
+        "Changed provider documentation",
+    );
+    write_file(&main_path, main_source);
+    write_file(&provider_path, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+    let completion_id = RequestId::from("provider-overlay-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  OverlayDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("provider overlay completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("provider overlay completion items")
+        .iter()
+        .find(|item| item["label"] == "OverlayDocumented")
+        .cloned()
+        .expect("provider overlay completion item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": changed_provider
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("provider-overlay-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("provider overlay change must invalidate resolution");
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_resolution_cancellation_returns_once_while_worker_is_in_flight() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("CancelledCompletion.pas");
+    let source = "unit CancelledCompletion;\ninterface\n/// <summary>Cancellation documentation.</summary>\nfunction CancelledDocumented: Integer;\nimplementation\nfunction CancelledDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  CancelledDoc\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_completion_resolution_barrier(environment);
+    server.initialize_with_completion_resolve_properties(
+        &root,
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("cancelled-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  CancelledDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("cancelled completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("cancelled completion items")
+        .iter()
+        .find(|item| item["label"] == "CancelledDocumented")
+        .cloned()
+        .expect("cancelled documented item");
+
+    let resolve_id = RequestId::from("cancelled-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": resolve_id.clone()}));
+    let response = server.response(&resolve_id);
+    let error = response.error.expect("cancelled resolve error");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    barrier.release();
+    server.assert_no_response(&resolve_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_resolution_rejects_stale_non_cancelled_worker_delivery() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source_path = root.join("StaleCompletion.pas");
+    let source = "unit StaleCompletion;\ninterface\n/// <summary>Original documentation.</summary>\nfunction OriginalDocumented: Integer;\nimplementation\nfunction OriginalDocumented: Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nbegin\n  OriginalDoc\nend;\nend.\n";
+    let changed_source = source.replace("OriginalDoc", "ChangedDoc");
+    write_file(&source_path, source);
+
+    let (mut server, barrier) = TestServer::launch_with_completion_resolution_barrier(environment);
+    server.initialize_with_completion_resolve_properties(
+        &root,
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("stale-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  OriginalDoc", 0)
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("stale completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("stale completion items")
+        .iter()
+        .find(|item| item["label"] == "OriginalDocumented")
+        .cloned()
+        .expect("stale completion item");
+
+    let resolve_id = RequestId::from("stale-completion-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": changed_source
+            }
+        }),
+    );
+    barrier.release();
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .expect("a changed workspace must reject the non-cancelled worker result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
     );
     server.shutdown();
 }
@@ -2620,6 +8568,1571 @@ fn completion_request_returns_semantic_items_and_plain_text_edits() {
             "start": {"line": 6, "character": 2},
             "end": {"line": 6, "character": 11},
         })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_imports_an_interface_symbol_with_crlf_and_non_bmp_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("AutoImportProvider.pas");
+    let main_path = temp.path().join("AutoImportInterface.pas");
+    let provider_source = concat!(
+        "unit AutoImportProvider;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TImportedType = class\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "end.\r\n",
+    );
+    let main_source = concat!(
+        "unit AutoImportInterface;\r\n",
+        "interface\r\n",
+        "// 😀 keep this comment\r\n",
+        "type\r\n",
+        "  TConsumer = class\r\n",
+        "    procedure Use(Value: TImportedType);\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "procedure TConsumer.Use(Value: TImportedType);\r\n",
+        "begin\r\n",
+        "  Value := Value;\r\n",
+        "end;\r\n",
+        "procedure Probe;\r\n",
+        "var\r\n",
+        "  ImportedValue: TImportedType;\r\n",
+        "begin\r\n",
+        "  ImportedValue := nil;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let request_id = RequestId::from("auto-import-interface".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TImported", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let result = response.result.expect("completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "TImportedType")
+        .cloned()
+        .expect("unimported interface type completion item");
+    assert!(
+        item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("AutoImportProvider")),
+        "auto-import item must identify its provider: {item}"
+    );
+    let additional = item["additionalTextEdits"]
+        .as_array()
+        .expect("auto-import additional edits");
+    assert_eq!(additional.len(), 1);
+    assert_eq!(additional[0]["newText"], "uses AutoImportProvider;\r\n");
+    assert_eq!(
+        additional[0]["range"],
+        json!({
+            "start": {"line": 2, "character": 0},
+            "end": {"line": 2, "character": 0},
+        })
+    );
+    let original_edit = item["textEdit"].clone();
+    let original_additional = item["additionalTextEdits"].clone();
+    let resolve_id = RequestId::from("auto-import-interface-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item.clone());
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "auto-import completion resolve failed: {resolved:?}"
+    );
+    let resolved = resolved.result.expect("resolved auto-import item");
+    assert_eq!(resolved["textEdit"], original_edit);
+    assert_eq!(resolved["additionalTextEdits"], original_additional);
+    let applied = apply_completion_item(main_source, &item);
+    assert!(applied.contains("interface\r\nuses AutoImportProvider;\r\n// 😀 keep this comment"));
+    assert!(applied.contains("Value: TImportedType"));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied
+            }
+        }),
+    );
+    let definition_id = RequestId::from("auto-import-interface-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "ImportedValue :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "applied source binding locations: {locations:?}\n{applied}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_routine_snippet_keeps_its_uses_edit_on_resolve() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("AutoImportRoutineProvider.pas");
+    let main_path = temp.path().join("AutoImportRoutineConsumer.pas");
+    let provider_source = "unit AutoImportRoutineProvider;\ninterface\nprocedure Execute(Value: Integer);\nimplementation\nprocedure Execute(Value: Integer);\nbegin\nend;\nend.\n";
+    let main_source = "unit AutoImportRoutineConsumer;\ninterface\nimplementation\nprocedure Caller;\nvar\n  Value: Integer;\nbegin\n  Exe\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_capabilities(
+        temp.path(),
+        Some(true),
+        json!(["detail"]),
+        json!(["plaintext"]),
+    );
+    let request_id = RequestId::from("auto-import-routine-snippet".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "  Exe", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "Execute")
+        .cloned()
+        .expect("auto-import routine completion item");
+    assert_eq!(item["textEdit"]["newText"], "Execute(${1:Value})$0");
+    assert_eq!(item["insertTextFormat"], 2);
+    let original_edit = item["textEdit"].clone();
+    let original_additional = item["additionalTextEdits"].clone();
+    assert_eq!(original_additional.as_array().map(Vec::len), Some(1));
+
+    let mut resolve_item = item.clone();
+    resolve_item["textEdit"]["newText"] = json!("FORGED_EDIT");
+    resolve_item["additionalTextEdits"] = json!([]);
+    let resolve_id = RequestId::from("auto-import-routine-snippet-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", resolve_item);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "auto-import routine resolve failed: {resolved:?}"
+    );
+    let resolved = resolved.result.expect("resolved auto-import routine item");
+    assert_eq!(resolved["textEdit"], original_edit);
+    assert_eq!(resolved["textEdit"]["newText"], "Execute(${1:Value})$0");
+    assert_eq!(resolved["insertTextFormat"], 2);
+    assert_eq!(resolved["additionalTextEdits"], original_additional);
+
+    let applied = apply_expanded_completion_item(main_source, &item);
+    assert!(applied.contains("implementation\nuses AutoImportRoutineProvider;\n"));
+    assert!(applied.contains("  Execute(Value)\n"));
+    assert!(!applied.contains("${1:Value}"));
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_imports_an_implementation_symbol_after_existing_interface_uses() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let existing_path = temp.path().join("ExistingUnit.pas");
+    let provider_path = temp.path().join("AutoImportProvider.pas");
+    let main_path = temp.path().join("AutoImportImplementation.pas");
+    let existing_source = "unit ExistingUnit;\r\ninterface\r\nimplementation\r\nend.\r\n";
+    let provider_source = concat!(
+        "unit AutoImportProvider;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TImportedType = class\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "end.\r\n",
+    );
+    let main_source = concat!(
+        "unit AutoImportImplementation;\r\n",
+        "interface\r\n",
+        "uses\r\n",
+        "  ExistingUnit in 'ExistingUnit.pas'; // preserve this comment\r\n",
+        "implementation\r\n",
+        "// implementation comment\r\n",
+        "procedure Run;\r\n",
+        "var\r\n",
+        "  Value: TImported;\r\n",
+        "begin\r\n",
+        "  Value := Value;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&existing_path, existing_source);
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("auto-import-implementation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TImported", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let result = response.result.expect("completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "TImportedType")
+        .cloned()
+        .expect("unimported implementation procedure completion item");
+    assert!(
+        item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("AutoImportProvider")),
+        "auto-import item must identify its provider: {item}"
+    );
+    let additional = item["additionalTextEdits"]
+        .as_array()
+        .expect("auto-import additional edits");
+    assert_eq!(additional.len(), 1);
+    assert_eq!(additional[0]["newText"], "uses AutoImportProvider;\r\n");
+    assert_eq!(
+        additional[0]["range"],
+        json!({
+            "start": {"line": 5, "character": 0},
+            "end": {"line": 5, "character": 0},
+        })
+    );
+    let applied = apply_completion_item(main_source, &item);
+    assert!(
+        applied.contains("implementation\r\nuses AutoImportProvider;\r\n// implementation comment")
+    );
+    assert!(applied.contains("ExistingUnit in 'ExistingUnit.pas'; // preserve this comment"));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("auto-import-implementation-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "applied implementation binding: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_appends_to_an_existing_implementation_uses_clause() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let existing_path = temp.path().join("ExistingUnit.pas");
+    let provider_path = temp.path().join("Append").join("Provider.pas");
+    let main_path = temp.path().join("AppendConsumer.pas");
+    write_file(
+        &existing_path,
+        "unit ExistingUnit;\r\ninterface\r\nimplementation\r\nend.\r\n",
+    );
+    write_file(
+        &provider_path,
+        concat!(
+            "unit Append.Provider;\r\n",
+            "interface\r\n",
+            "type\r\n",
+            "  TAppendedType = class\r\n",
+            "  end;\r\n",
+            "implementation\r\n",
+            "end.\r\n",
+        ),
+    );
+    let main_source = concat!(
+        "unit AppendConsumer;\r\n",
+        "interface\r\n",
+        "implementation\r\n",
+        "uses\r\n",
+        "  ExistingUnit in 'ExistingUnit.pas'; // keep implementation comment\r\n",
+        "procedure Run;\r\n",
+        "var\r\n",
+        "  Value: TAppended;\r\n",
+        "begin\r\n",
+        "  Value := Value;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("auto-import-append".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TAppended", 0),
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "completion failed: {response:?}");
+    let item = response.result.expect("completion result")["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "TAppendedType")
+        .cloned()
+        .expect("appended auto-import item");
+    assert_eq!(
+        item["additionalTextEdits"][0]["newText"],
+        ",\r\n  Append.Provider"
+    );
+    assert_eq!(
+        item["additionalTextEdits"][0]["range"],
+        json!({
+            "start": {"line": 4, "character": 36},
+            "end": {"line": 4, "character": 36},
+        })
+    );
+    let applied = apply_completion_item(main_source, &item);
+    assert!(applied.contains(
+        "  ExistingUnit in 'ExistingUnit.pas',\r\n  Append.Provider; // keep implementation comment"
+    ));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("auto-import-append-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "appended implementation binding: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_omits_ambiguous_private_and_conditional_providers() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    write_file(
+        &temp.path().join("ConditionalProvider.pas"),
+        concat!(
+            "unit ConditionalProvider;\n",
+            "interface\n",
+            "{$IFDEF NEVER_DEFINED}\n",
+            "type\n",
+            "  TConditionalType = class\n",
+            "  end;\n",
+            "{$ENDIF}\n",
+            "implementation\n",
+            "end.\n",
+        ),
+    );
+    write_file(
+        &temp.path().join("PrivateProvider.pas"),
+        concat!(
+            "unit PrivateProvider;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure HiddenProcedure;\n",
+            "begin\n",
+            "end;\n",
+            "end.\n",
+        ),
+    );
+    write_file(
+        &temp.path().join("DuplicateProviderA.pas"),
+        concat!(
+            "unit DuplicateProvider;\n",
+            "interface\n",
+            "type\n",
+            "  TDuplicateType = class\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+    );
+    write_file(
+        &temp.path().join("DuplicateProviderB.pas"),
+        concat!(
+            "unit DuplicateProvider;\n",
+            "interface\n",
+            "type\n",
+            "  TOtherType = class\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+    );
+    for (file_name, unit_name) in [
+        ("SharedProviderA.pas", "SharedProviderA"),
+        ("SharedProviderB.pas", "SharedProviderB"),
+    ] {
+        write_file(
+            &temp.path().join(file_name),
+            &format!(
+                "unit {unit_name};\ninterface\ntype\n  TSharedType = class\n  end;\nimplementation\nend.\n"
+            ),
+        );
+    }
+    write_file(
+        &temp.path().join("ShadowProvider.pas"),
+        "unit ShadowProvider;\ninterface\ntype\n  TShadowType = class\n  end;\nimplementation\nend.\n",
+    );
+    let main_path = temp.path().join("NegativeAutoImportConsumer.pas");
+    let main_source = concat!(
+        "unit NegativeAutoImportConsumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure ConditionalCase;\n",
+        "var\n",
+        "  Value: TConditional;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "procedure PrivateCase;\n",
+        "begin\n",
+        "  HiddenProc;\n",
+        "end;\n",
+        "procedure DuplicateCase;\n",
+        "var\n",
+        "  Value: TDuplicate;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "procedure SharedCase;\n",
+        "var\n",
+        "  Value: TShared;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "procedure ShadowCase;\n",
+        "var\n",
+        "  TShadowType: Integer;\n",
+        "begin\n",
+        "  TShadow;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let completion =
+        |server: &mut TestServer, id: &str, needle: &str, occurrence: usize| -> Value {
+            let request_id = RequestId::from(id.to_owned());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&main_path)},
+                    "position": position_after(main_source, needle, occurrence),
+                }),
+            );
+            let response = server.response(&request_id);
+            assert!(response.error.is_none(), "completion failed: {response:?}");
+            response.result.expect("completion result")
+        };
+    let conditional = completion(&mut server, "auto-negative-conditional", "TConditional", 0);
+    assert!(
+        conditional["items"]
+            .as_array()
+            .expect("conditional completion items")
+            .iter()
+            .all(|item| item["label"] != "TConditionalType")
+    );
+    let private = completion(&mut server, "auto-negative-private", "HiddenProc", 0);
+    assert!(
+        private["items"]
+            .as_array()
+            .expect("private completion items")
+            .iter()
+            .all(|item| item["label"] != "HiddenProcedure")
+    );
+    let duplicate = completion(&mut server, "auto-negative-unit", "TDuplicate", 0);
+    assert!(
+        duplicate["items"]
+            .as_array()
+            .expect("ambiguous-unit completion items")
+            .iter()
+            .all(|item| item["label"] != "TDuplicateType")
+    );
+    let shared = completion(&mut server, "auto-negative-symbol", "TShared", 0);
+    assert!(
+        shared["items"]
+            .as_array()
+            .expect("ambiguous-symbol completion items")
+            .iter()
+            .all(|item| item["label"] != "TSharedType")
+    );
+    let shadow = completion(&mut server, "auto-negative-shadow", "TShadow", 1);
+    let shadow_item = shadow["items"]
+        .as_array()
+        .expect("shadow completion items")
+        .iter()
+        .find(|item| item["label"] == "TShadowType")
+        .expect("local shadow completion item");
+    assert!(shadow_item["additionalTextEdits"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_omits_malformed_uses_and_does_not_duplicate_imports() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    for unit_name in ["ExistingUnit", "BrokenUnit"] {
+        write_file(
+            &temp.path().join(format!("{unit_name}.pas")),
+            &format!("unit {unit_name};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+    write_file(
+        &temp.path().join("MalformedProvider.pas"),
+        "unit MalformedProvider;\ninterface\ntype\n  TMalformedType = class\n  end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &temp.path().join("DuplicateProvider.pas"),
+        "unit DuplicateProvider;\ninterface\ntype\n  TDuplicateImported = class\n  end;\nimplementation\nend.\n",
+    );
+    let malformed_path = temp.path().join("MalformedUsesConsumer.pas");
+    let malformed_source = concat!(
+        "unit MalformedUsesConsumer;\n",
+        "interface\n",
+        "uses ExistingUnit BrokenUnit;\n",
+        "type\n",
+        "  TConsumer = class\n",
+        "    Value: TMalformed;\n",
+        "  end;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    let duplicate_path = temp.path().join("DuplicateUsesConsumer.pas");
+    let duplicate_source = concat!(
+        "unit DuplicateUsesConsumer;\n",
+        "interface\n",
+        "uses DuplicateProvider;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var\n",
+        "  Value: TDuplicateImported;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&malformed_path, malformed_source);
+    write_file(&duplicate_path, duplicate_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("auto-import-malformed-uses".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&malformed_path)},
+            "position": position_after(malformed_source, "TMalformed", 0),
+        }),
+    );
+    let malformed = server.response(&request_id);
+    assert!(
+        malformed.error.is_none(),
+        "completion failed: {malformed:?}"
+    );
+    let malformed_result = malformed.result.expect("malformed completion result");
+    assert!(
+        malformed_result["items"]
+            .as_array()
+            .expect("malformed completion items")
+            .iter()
+            .all(|item| item["label"] != "TMalformedType"),
+        "malformed uses unexpectedly offered a target: {malformed_result}"
+    );
+
+    let request_id = RequestId::from("auto-import-duplicate-uses".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&duplicate_path)},
+            "position": position_after(duplicate_source, "TDuplicateImported", 0),
+        }),
+    );
+    let duplicate = server.response(&request_id);
+    assert!(
+        duplicate.error.is_none(),
+        "completion failed: {duplicate:?}"
+    );
+    let duplicate_result = duplicate.result.expect("duplicate completion result");
+    let duplicate_item = duplicate_result["items"]
+        .as_array()
+        .expect("duplicate completion items")
+        .iter()
+        .find(|item| item["label"] == "TDuplicateImported")
+        .expect("already imported completion item");
+    assert!(duplicate_item["additionalTextEdits"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_resolution_rejects_a_late_ambiguous_unit_overlay() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("LateAmbiguityConsumer.pas");
+    let late_path = temp.path().join("LateProvider.pas");
+    let provider_source = "unit Provider;\ninterface\ntype\n  TLateTargetType = class\n  end;\nimplementation\nend.\n";
+    let main_source = concat!(
+        "unit LateAmbiguityConsumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var\n",
+        "  Value: TLateTarget;\n",
+        "begin\n",
+        "  Value := Value;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_completion_resolve_properties(
+        temp.path(),
+        json!(["documentation", "detail"]),
+        json!(["markdown"]),
+    );
+    let completion_id = RequestId::from("late-unit-ambiguity-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TLateTarget", 0),
+        }),
+    );
+    let initial = server
+        .response(&completion_id)
+        .result
+        .expect("late ambiguity completion result");
+    let item = initial["items"]
+        .as_array()
+        .expect("late ambiguity completion items")
+        .iter()
+        .find(|item| item["label"] == "TLateTargetType")
+        .cloned()
+        .expect("late ambiguity auto-import item");
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&late_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit Provider; interface implementation end.\n"
+            }
+        }),
+    );
+    let resolve_id = RequestId::from("late-unit-ambiguity-resolve".to_string());
+    server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+    let response = server.response(&resolve_id);
+    let error = response
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("late ambiguous unit must invalidate resolution: {response:?}"));
+    assert_eq!(error.code, -32803);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_auto_import_resolution_rejects_provider_set_changes_during_worker() {
+    let provider_source =
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n";
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: TTarget;\n",
+        "begin Value := nil; end;\n",
+        "end.\n",
+    );
+    let negative_source = "unit Other;\ninterface\nimplementation\nend.\n";
+
+    for (case_name, change, new_overlay, expected_resolve_error, expect_fresh_item) in [
+        (
+            "negative-unit",
+            Some("unit Provider;\ninterface\nimplementation\nend.\n"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "negative-symbol",
+            Some("unit Other;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "new-overlay",
+            None,
+            Some(("New.pas", "unit Provider; interface implementation end.\n")),
+            true,
+            false,
+        ),
+        (
+            "unrelated-overlay",
+            Some("unit Other;\ninterface\nimplementation\nend.\n// unrelated\n"),
+            None,
+            false,
+            true,
+        ),
+    ] {
+        let environment = tempfile::tempdir().expect("isolated server environment");
+        let root = environment.path().join("workspace");
+        fs::create_dir_all(&root).expect("workspace root");
+        let provider_path = root.join("Provider.pas");
+        let consumer_path = root.join("Consumer.pas");
+        let other_path = root.join("Other.pas");
+        write_file(&provider_path, provider_source);
+        write_file(&consumer_path, consumer_source);
+        write_file(&other_path, negative_source);
+
+        let (mut server, barrier) =
+            TestServer::launch_with_completion_resolution_barrier(environment);
+        server.initialize_with_completion_resolve_properties(
+            &root,
+            json!(["documentation", "detail"]),
+            json!(["markdown"]),
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&other_path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": negative_source,
+                }
+            }),
+        );
+        let completion_id = RequestId::from(format!("provider-set-{case_name}-completion"));
+        server.send_request(
+            completion_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&consumer_path)},
+                "position": position_after(consumer_source, "TTarget", 0),
+            }),
+        );
+        let initial = server
+            .response(&completion_id)
+            .result
+            .expect("provider-set completion result");
+        let item = initial["items"]
+            .as_array()
+            .expect("provider-set completion items")
+            .iter()
+            .find(|item| item["label"] == "TTargetType")
+            .cloned()
+            .unwrap_or_else(|| panic!("provider-set candidate missing in {case_name}: {initial}"));
+
+        let resolve_id = RequestId::from(format!("provider-set-{case_name}-resolve"));
+        server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+        barrier.wait_until_entered();
+        if let Some(changed) = change {
+            server.send_notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri(&other_path), "version": 2},
+                    "contentChanges": [{"text": changed}],
+                }),
+            );
+        }
+        if let Some((name, text)) = new_overlay {
+            let path = root.join(name);
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&path),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": text,
+                    }
+                }),
+            );
+        }
+        // An unknown request is handled synchronously by the protocol loop;
+        // its response establishes that the preceding overlay notification was
+        // consumed while the resolve worker is paused.
+        let sync_id = RequestId::from(format!("provider-set-{case_name}-sync"));
+        server.send_request(sync_id.clone(), "review/sync", json!({}));
+        let sync = server.response(&sync_id);
+        assert!(
+            sync.error.is_some(),
+            "sync probe unexpectedly succeeded: {sync:?}"
+        );
+        barrier.release();
+        let resolved = server.response(&resolve_id);
+        assert_eq!(
+            resolved.error.is_some(),
+            expected_resolve_error,
+            "resolve result for {case_name}: {resolved:?}"
+        );
+
+        let fresh_id = RequestId::from(format!("provider-set-{case_name}-fresh"));
+        server.send_request(
+            fresh_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&consumer_path)},
+                "position": position_after(consumer_source, "TTarget", 0),
+            }),
+        );
+        let fresh = server
+            .response(&fresh_id)
+            .result
+            .expect("fresh provider-set completion result");
+        let has_item = fresh["items"]
+            .as_array()
+            .expect("fresh provider-set completion items")
+            .iter()
+            .any(|item| item["label"] == "TTargetType");
+        assert_eq!(
+            has_item, expect_fresh_item,
+            "fresh result for {case_name}: {fresh}"
+        );
+        server.shutdown();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn completion_auto_import_resolution_rejects_notification_free_negative_disk_changes() {
+    let mut provider_source = String::from("unit Provider;\ninterface\ntype TTargetType = class\n");
+    for index in 0..1500 {
+        writeln!(provider_source, "  Field{index}: Integer;").expect("provider source formatting");
+    }
+    provider_source.push_str("end;\nimplementation\nend.\n");
+    let consumer_sources = [
+        (
+            "ordinary",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value: TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+        (
+            "line-comment-dot",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value:\n",
+                "// .\n",
+                "  TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+        (
+            "brace-comment-dot",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value:\n",
+                "{ .\n",
+                "}\n",
+                "  TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+        (
+            "paren-comment-dot",
+            concat!(
+                "unit Consumer;\n",
+                "interface\n",
+                "implementation\n",
+                "procedure Run;\n",
+                "var Value:\n",
+                "(* .\n",
+                "*)\n",
+                "  TTarget;\n",
+                "begin Value := nil; end;\n",
+                "end.\n",
+            ),
+        ),
+    ];
+    let negative_source = "unit AOther;\ninterface\nimplementation\nend.\n";
+
+    for (source_case, consumer_source) in consumer_sources {
+        for (case_name, changed_source) in [
+            (
+                "duplicate-unit",
+                negative_source.replace("unit AOther;", "unit Provider;"),
+            ),
+            (
+                "competing-symbol",
+                "unit AOther;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n"
+                    .to_string(),
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let provider_path = temp.path().join("Provider.pas");
+            let consumer_path = temp.path().join("Consumer.pas");
+            let negative_path = temp.path().join("AOther.pas");
+            write_file(&provider_path, &provider_source);
+            write_file(&consumer_path, consumer_source);
+            write_file(&negative_path, negative_source);
+
+            let mut server = TestServer::launch();
+            server.initialize_with_completion_resolve_properties(
+                temp.path(),
+                json!(["documentation", "detail"]),
+                json!(["markdown"]),
+            );
+            let completion_id = RequestId::from(format!(
+                "disk-negative-{source_case}-{case_name}-completion"
+            ));
+            server.send_request(
+                completion_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&consumer_path)},
+                    "position": position_after(consumer_source, "TTarget", 0),
+                }),
+            );
+            let initial = server
+                .response(&completion_id)
+                .result
+                .expect("disk-negative completion result");
+            let item = initial["items"]
+                .as_array()
+                .expect("disk-negative completion items")
+                .iter()
+                .find(|item| item["label"] == "TTargetType")
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "disk-negative provider completion item missing for {source_case}/{case_name}: {initial}"
+                    )
+                });
+
+            let watch_path = CString::new(negative_path.to_string_lossy().as_bytes())
+                .expect("negative provider watch path");
+            let fd = unsafe { inotify_init1(0) };
+            assert!(fd >= 0, "inotify_init1 failed");
+            let watch = unsafe { inotify_add_watch(fd, watch_path.as_ptr(), IN_CLOSE_NOWRITE) };
+            assert!(watch >= 0, "inotify_add_watch failed");
+            let changed_path = negative_path.clone();
+            let (mutated_sender, mutated_receiver) = mpsc::channel();
+            let watcher = thread::spawn(move || {
+                wait_for_close_events(fd, 1);
+                write_file(&changed_path, &changed_source);
+                mutated_sender.send(()).expect("notify disk mutation");
+            });
+
+            let resolve_id =
+                RequestId::from(format!("disk-negative-{source_case}-{case_name}-resolve"));
+            server.send_request(resolve_id.clone(), "completionItem/resolve", item);
+            mutated_receiver
+                .recv_timeout(IO_TIMEOUT)
+                .expect("resolve must read the negative provider before the mutation");
+            let resolved = server.response(&resolve_id);
+            watcher.join().expect("disk mutation watcher");
+            assert_eq!(
+                resolved.error.as_ref().map(|error| error.code),
+                Some(-32803),
+                "notification-free {source_case}/{case_name} disk mutation was accepted: {resolved:?}"
+            );
+
+            let fresh_id =
+                RequestId::from(format!("disk-negative-{source_case}-{case_name}-fresh"));
+            server.send_request(
+                fresh_id.clone(),
+                "textDocument/completion",
+                json!({
+                    "textDocument": {"uri": uri(&consumer_path)},
+                    "position": position_after(consumer_source, "TTarget", 0),
+                }),
+            );
+            let fresh = server
+                .response(&fresh_id)
+                .result
+                .expect("fresh disk-negative completion result");
+            assert!(
+                fresh["items"]
+                    .as_array()
+                    .expect("fresh disk-negative completion items")
+                    .iter()
+                    .all(|item| item["label"] != "TTargetType"),
+                "fresh {source_case}/{case_name} completion retained the ambiguous candidate: {fresh}"
+            );
+            server.shutdown();
+        }
+    }
+}
+
+#[test]
+fn completion_auto_import_requires_project_unit_binding_and_preserves_namespace_binding() {
+    let assert_omitted = |case_name: &str, files: &[(&str, &str)], project: Option<&str>| {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        for (name, source) in files {
+            let path = temp.path().join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("fixture parent");
+            }
+            write_file(&path, source);
+        }
+        if let Some(project) = project {
+            write_file(&temp.path().join("App.dproj"), project);
+        }
+        let main_path = temp.path().join("Consumer.pas");
+        let main_source = files
+            .iter()
+            .find(|(name, _)| *name == "Consumer.pas")
+            .map(|(_, source)| *source)
+            .expect("consumer fixture");
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(main_source, "TTarget", 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "{case_name} completion failed: {response:?}"
+        );
+        let result = response.result.expect("binding-proof completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("binding-proof completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "unproven provider binding unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    };
+
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: TTarget;\n",
+        "begin Value := nil; end;\n",
+        "end.\n",
+    );
+    let provider_source =
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n";
+    let empty_other = "unit Other; interface implementation end.\n";
+
+    assert_omitted(
+        "filename-mismatch",
+        &[
+            ("WrongFilename.pas", provider_source),
+            ("Consumer.pas", consumer_source),
+        ],
+        None,
+    );
+    assert_omitted(
+        "project-subdirectory-without-search-path",
+        &[
+            ("sub/Provider.pas", provider_source),
+            ("Consumer.pas", consumer_source),
+        ],
+        Some(
+            "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource></PropertyGroup></Project>",
+        ),
+    );
+    assert_omitted(
+        "unit-alias-redirect",
+        &[
+            ("Provider.pas", provider_source),
+            ("Other.pas", empty_other),
+            ("Consumer.pas", consumer_source),
+        ],
+        Some(
+            "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitAlias>Provider=Other</DCC_UnitAlias></PropertyGroup></Project>",
+        ),
+    );
+
+    let temp = tempfile::tempdir().expect("namespace workspace");
+    let namespace_provider = temp.path().join("Vendor.Provider.pas");
+    let empty_provider = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("Consumer.pas");
+    write_file(
+        &namespace_provider,
+        "unit Vendor.Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &empty_provider,
+        empty_other.replace("Other", "Provider").as_str(),
+    );
+    write_file(
+        &temp.path().join("App.dproj"),
+        concat!(
+            "<Project><PropertyGroup>",
+            "<MainSource>Consumer.pas</MainSource>",
+            "<DCC_Namespace>Vendor</DCC_Namespace>",
+            "</PropertyGroup></Project>"
+        ),
+    );
+    write_file(&main_path, consumer_source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("namespace-binding-completion".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(consumer_source, "TTarget", 0),
+        }),
+    );
+    let result = server
+        .response(&request_id)
+        .result
+        .expect("namespace completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("namespace completion items")
+        .iter()
+        .find(|item| item["label"] == "TTargetType")
+        .cloned()
+        .expect("namespace provider completion item");
+    assert_eq!(
+        item["additionalTextEdits"][0]["newText"],
+        "uses Vendor.Provider;\n"
+    );
+    let applied = apply_completion_item(consumer_source, &item);
+    assert!(applied.contains("uses Vendor.Provider;"));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("namespace-binding-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "namespace binding locations: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&namespace_provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn completion_auto_import_omits_unsafe_absent_uses_in_comments_and_same_line_declarations() {
+    let provider_source =
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n";
+    let cases = [
+        (
+            "brace-comment-implementation",
+            concat!(
+                "unit Consumer;\ninterface\n",
+                "implementation { open comment\nclosed }\n",
+                "procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+            "TTarget",
+        ),
+        (
+            "paren-comment-interface",
+            concat!(
+                "unit Consumer;\n",
+                "interface (* open comment\nclosed *)\n",
+                "type TAlias = TTarget;\nimplementation\nend.\n",
+            ),
+            "TTarget",
+        ),
+        (
+            "same-line-implementation",
+            concat!(
+                "unit Consumer;\ninterface\n",
+                "implementation procedure Run;\n",
+                "var Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+            "TTarget",
+        ),
+    ];
+    for (case_name, source, needle) in cases {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        write_file(&temp.path().join("Provider.pas"), provider_source);
+        let main_path = temp.path().join("Consumer.pas");
+        write_file(&main_path, source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "{case_name} completion failed: {response:?}"
+        );
+        let result = response.result.expect("unsafe insertion completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("unsafe insertion completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "unsafe absent-uses insertion unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_auto_import_omits_dangling_and_repeated_uses_alias_operators() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    write_file(
+        &temp.path().join("Provider.pas"),
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &temp.path().join("Existing.pas"),
+        "unit Existing; interface implementation end.\n",
+    );
+    let cases = [
+        ("dangling", "uses Existing := ;\n"),
+        ("repeated", "uses Existing := Existing := ;\n"),
+    ];
+    for (case_name, uses_clause) in cases {
+        let source = format!(
+            "unit Consumer;\ninterface\nimplementation\n{uses_clause}procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n"
+        );
+        let main_path = temp.path().join(format!("{case_name}.pas"));
+        write_file(&main_path, &source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("malformed-{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(&source, "TTarget", 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        if let Some(error) = response.error {
+            assert!(
+                error
+                    .message
+                    .contains("assistance dependency scan incomplete"),
+                "unexpected {case_name} completion failure: {error:?}"
+            );
+            server.shutdown();
+            continue;
+        }
+        let result = response.result.expect("malformed uses completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("malformed uses completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "malformed uses unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_auto_import_omits_uses_clauses_enclosed_by_conditionals() {
+    let temp = tempfile::tempdir().expect("conditional workspace");
+    write_file(
+        &temp.path().join("Provider.pas"),
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    write_file(
+        &temp.path().join("Existing.pas"),
+        "unit Existing; interface implementation end.\n",
+    );
+    write_file(
+        &temp.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>ImplementationConsumer.pas</MainSource><DCC_Define>FOO</DCC_Define></PropertyGroup></Project>",
+    );
+    let cases = [
+        (
+            "implementation-active",
+            "ImplementationConsumer.pas",
+            concat!(
+                "unit ImplementationConsumer;\ninterface\nimplementation\n",
+                "{$IFDEF FOO}\nuses Existing;\n{$ENDIF}\n",
+                "procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+        ),
+        (
+            "interface-active",
+            "InterfaceConsumer.pas",
+            concat!(
+                "unit InterfaceConsumer;\ninterface\n",
+                "{$IFDEF FOO}\nuses Existing;\n{$ENDIF}\n",
+                "type TAlias = TTarget;\nimplementation\nend.\n",
+            ),
+        ),
+        (
+            "implementation-nested",
+            "NestedConsumer.pas",
+            concat!(
+                "unit NestedConsumer;\ninterface\nimplementation\n",
+                "{$IFDEF FOO}\n{$IFDEF BAR}\nuses Existing;\n{$ENDIF}\n{$ENDIF}\n",
+                "procedure Run;\nvar Value: TTarget;\nbegin Value := nil; end;\nend.\n",
+            ),
+        ),
+    ];
+    for (case_name, file_name, source) in cases {
+        let path = temp.path().join(file_name);
+        write_file(&path, source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        let request_id = RequestId::from(format!("{case_name}-completion"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "position": position_after(source, "TTarget", 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        if let Some(error) = response.error {
+            assert!(
+                error
+                    .message
+                    .contains("assistance dependency scan incomplete"),
+                "unexpected {case_name} completion failure: {error:?}"
+            );
+            server.shutdown();
+            continue;
+        }
+        let result = response.result.expect("conditional completion result");
+        assert!(
+            result["items"]
+                .as_array()
+                .expect("conditional completion items")
+                .iter()
+                .all(|item| item["label"] != "TTargetType"),
+            "conditionally enclosed uses unexpectedly offered a candidate in {case_name}: {result}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn completion_auto_import_uses_the_prefix_before_a_middle_of_token_caret() {
+    let temp = tempfile::tempdir().expect("middle-token workspace");
+    let provider_path = temp.path().join("Provider.pas");
+    let main_path = temp.path().join("Consumer.pas");
+    write_file(
+        &provider_path,
+        "unit Provider;\ninterface\ntype TTargetType = class end;\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: TTargetWrong;\n",
+        "begin Value := nil; end;\n",
+        "end.\n",
+    );
+    write_file(&main_path, source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let start = position_of(source, "TTargetWrong", 0);
+    let prefix_position = Position::new(
+        start.line,
+        start.character + "TTarget".encode_utf16().count() as u32,
+    );
+    let request_id = RequestId::from("middle-token-completion".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": prefix_position,
+        }),
+    );
+    let result = server
+        .response(&request_id)
+        .result
+        .expect("middle-token completion result");
+    let item = result["items"]
+        .as_array()
+        .expect("middle-token completion items")
+        .iter()
+        .find(|item| item["label"] == "TTargetType")
+        .cloned()
+        .expect("middle-token auto-import item");
+    let applied = apply_completion_item(source, &item);
+    assert!(
+        applied.contains("Value: TTargetType;"),
+        "applied middle-token edit: {applied}"
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main_path),
+                "languageId": "pascal",
+                "version": 2,
+                "text": applied,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("middle-token-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/typeDefinition",
+        navigation_params(&main_path, &applied, "Value :=", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "middle-token binding locations: {locations:?}"
+    );
+    assert_eq!(locations[0]["uri"], uri(&provider_path).to_string());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completion_auto_import_discovery_reports_a_bounded_catalogue_as_incomplete() {
+    let environment = tempfile::tempdir().expect("isolated test environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    let main_path = root.join("BoundedConsumer.pas");
+    write_file(
+        &root.join("BoundedProvider.pas"),
+        "unit BoundedProvider;\ninterface\ntype\n  TBoundedType = class\n  end;\nimplementation\nend.\n",
+    );
+    let main_source = "unit BoundedConsumer;\ninterface\nimplementation\nprocedure Run;\nvar\n  Value: TBounded;\nbegin\n  Value := Value;\nend;\nend.\n";
+    write_file(&main_path, main_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_filename_catalogue_limit(environment, 1);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("auto-import-bounded".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main_path)},
+            "position": position_after(main_source, "TBounded", 0),
+        }),
+    );
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "bounded completion failed: {response:?}"
+    );
+    let result = response.result.expect("bounded completion result");
+    assert_eq!(result["isIncomplete"], true);
+    assert!(
+        result["items"]
+            .as_array()
+            .expect("bounded completion items")
+            .iter()
+            .all(|item| item["label"] != "TBoundedType")
     );
     server.shutdown();
 }
@@ -3720,6 +11233,145 @@ fn hover_negotiates_markdown_when_the_client_advertises_it() {
 }
 
 #[test]
+fn documentation_formats_are_negotiated_independently_for_all_assistance_endpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("DocumentationFormats.pas");
+    let source = "unit DocumentationFormats;\ninterface\n/// <summary>Returns <c>the value</c>.</summary>\n/// <param name=\"Name\">The lookup name.</param>\nfunction ValueFor(Name: string): Integer;\nprocedure Caller;\nimplementation\nfunction ValueFor(Name: string): Integer;\nbegin\n  Result := 1;\nend;\nprocedure Caller;\nvar\n  /// <summary>Local value.</summary>\n  LocalValue: Integer;\nbegin\n  Loc\n  ValueFor('text' );\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("documentation-formats-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(temp.path()),
+            "capabilities": {
+                "general": {"positionEncodings": ["utf-16"]},
+                "textDocument": {
+                    "hover": {"contentFormat": ["plaintext"]},
+                    "completion": {
+                        "completionItem": {"documentationFormat": ["markdown"]}
+                    },
+                    "signatureHelp": {
+                        "signatureInformation": {
+                            "documentationFormat": ["markdown", "plaintext"]
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    server.send_notification("initialized", json!({}));
+
+    let hover_id = RequestId::from("documentation-formats-hover".to_string());
+    server.send_request(
+        hover_id.clone(),
+        "textDocument/hover",
+        navigation_params(&source_path, source, "ValueFor", 0),
+    );
+    let hover = server.response(&hover_id);
+    assert!(hover.error.is_none(), "hover failed: {hover:?}");
+    let hover_contents = &hover.result.expect("hover result")["contents"];
+    assert_eq!(hover_contents["kind"], "plaintext");
+    assert!(
+        hover_contents["value"]
+            .as_str()
+            .expect("hover plaintext")
+            .contains("Returns the value.")
+    );
+
+    let completion_id = RequestId::from("documentation-formats-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "  Loc", 0),
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "completion failed: {completion:?}"
+    );
+    let completion_result = completion.result.expect("completion result");
+    let completion_item = completion_result["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|item| item["label"] == "LocalValue")
+        .cloned()
+        .unwrap_or_else(|| panic!("documented completion item missing: {completion_result}"));
+    assert_eq!(completion_item["documentation"]["kind"], "markdown");
+    assert_eq!(completion_item["documentation"]["value"], "Local value.");
+
+    let signature_id = RequestId::from("documentation-formats-signature".to_string());
+    server.send_request(
+        signature_id.clone(),
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_after(source, "ValueFor('text' ", 0),
+        }),
+    );
+    let signature = server.response(&signature_id);
+    assert!(signature.error.is_none(), "signature failed: {signature:?}");
+    let signature = signature.result.expect("signature result");
+    assert_eq!(
+        signature["signatures"][0]["documentation"],
+        json!({"kind": "markdown", "value": "Returns `the value`."})
+    );
+    assert_eq!(
+        signature["signatures"][0]["parameters"][0]["documentation"],
+        json!({"kind": "markdown", "value": "The lookup name."})
+    );
+    server.shutdown();
+}
+
+#[test]
+fn bounded_documentation_expansion_keeps_the_server_responsive() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("BoundedDocumentation.pas");
+    let names = std::iter::repeat_n("X", 1500).collect::<Vec<_>>().join(",");
+    let value = "x".repeat(60_000);
+    let source = format!(
+        "unit BoundedDocumentation;\ninterface\n/// <param name=\"{names}\">{value}</param>\nprocedure Safe;\nimplementation\nprocedure Safe;\nbegin\nend;\nend.\n"
+    );
+    write_file(&source_path, &source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    for request_id in [
+        RequestId::from("bounded-documentation-first".to_string()),
+        RequestId::from("bounded-documentation-second".to_string()),
+    ] {
+        server.send_request(
+            request_id.clone(),
+            "textDocument/hover",
+            navigation_params(&source_path, &source, "Safe", 0),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "bounded hover failed: {response:?}"
+        );
+        assert!(
+            response.result.is_some(),
+            "bounded hover returned no result"
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
 fn hover_markdown_escapes_backtick_fences_inside_multiline_comments() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("FenceHover.pas");
@@ -3849,6 +11501,81 @@ fn hover_uses_an_unsaved_provider_overlay_for_imported_declarations() {
         .expect("plaintext hover value");
     assert!(value.contains("OverlayValue: Integer"), "{value}");
     assert!(!value.contains("DiskValue"), "{value}");
+    server.shutdown();
+}
+
+#[test]
+fn provider_overlay_documentation_refreshes_after_did_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let disk_provider = "unit Provider;\ninterface\ntype\n  TWidget = class\n    property OverlayValue: Integer;\n  end;\nimplementation\nend.\n";
+    let overlay_v1 = "unit Provider;\ninterface\ntype\n  TWidget = class\n    /// <summary>First overlay documentation.</summary>\n    property OverlayValue: Integer;\n  end;\nimplementation\nend.\n";
+    let overlay_v2 = "unit Provider;\ninterface\ntype\n  TWidget = class\n    /// <summary>Updated overlay documentation.</summary>\n    property OverlayValue: Integer;\n  end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Widget: Provider.TWidget;\nbegin\n  Log(Widget.OverlayValue);\nend;\nend.\n";
+    write_file(&provider, disk_provider);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 3,
+                "text": overlay_v1
+            }
+        }),
+    );
+
+    let first_id = RequestId::from("overlay-documentation-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/hover",
+        navigation_params(&consumer, consumer_source, "OverlayValue", 0),
+    );
+    let first = server.response(&first_id);
+    assert!(first.error.is_none(), "first hover failed: {first:?}");
+    let first_result = first.result.expect("first hover");
+    let first_value = first_result["contents"]["value"]
+        .as_str()
+        .expect("first hover text")
+        .to_owned();
+    assert!(
+        first_value.contains("First overlay documentation."),
+        "{first_value}"
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&provider), "version": 4},
+            "contentChanges": [{"text": overlay_v2}]
+        }),
+    );
+    let second_id = RequestId::from("overlay-documentation-second".to_string());
+    server.send_request(
+        second_id.clone(),
+        "textDocument/hover",
+        navigation_params(&consumer, consumer_source, "OverlayValue", 0),
+    );
+    let second = server.response(&second_id);
+    assert!(second.error.is_none(), "second hover failed: {second:?}");
+    let second_result = second.result.expect("second hover");
+    let second_value = second_result["contents"]["value"]
+        .as_str()
+        .expect("second hover text")
+        .to_owned();
+    assert!(
+        second_value.contains("Updated overlay documentation."),
+        "{second_value}"
+    );
+    assert!(
+        !second_value.contains("First overlay documentation."),
+        "{second_value}"
+    );
     server.shutdown();
 }
 
@@ -4405,6 +12132,695 @@ fn references_include_unopened_consumers() {
     assert_eq!(locations[0]["uri"], uri(&consumer).to_string());
     assert_eq!(locations[1]["uri"], uri(&consumer).to_string());
     assert_eq!(locations[2]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn references_and_highlights_map_source_bearing_include_occurrences() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+    let include_source = "const SharedValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let references_id = RequestId::from("include-expanded-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let references = server.response(&references_id);
+    assert!(references.error.is_none(), "{references:?}");
+    assert_exact_location_signatures(
+        references
+            .result
+            .as_ref()
+            .expect("reference result")
+            .as_array()
+            .expect("reference array"),
+        vec![
+            expected_location_signature(&include, include_source, "SharedValue", 0),
+            expected_location_signature(&main, main_source, "SharedValue", 0),
+        ],
+    );
+
+    let highlights_id = RequestId::from("include-expanded-highlights".to_string());
+    server.send_request(
+        highlights_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0)
+        }),
+    );
+    let highlights = server.response(&highlights_id);
+    assert!(highlights.error.is_none(), "{highlights:?}");
+    let highlight_ranges = highlights
+        .result
+        .as_ref()
+        .expect("highlight result")
+        .as_array()
+        .expect("highlight array");
+    assert_eq!(highlight_ranges.len(), 1);
+    assert_eq!(
+        highlight_ranges[0]["range"],
+        json!({
+            "start": {"line": 6, "character": 6},
+            "end": {"line": 6, "character": 17}
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn fresh_include_references_recover_a_single_owning_root_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Use.inc");
+    let main_source = "unit Main;\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let include_source = "Log(RootValue);\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("fresh-include-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&include)},
+            "position": position_of(include_source, "RootValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_exact_location_signatures(
+        response
+            .result
+            .as_ref()
+            .expect("reference result")
+            .as_array()
+            .expect("reference array"),
+        vec![
+            expected_location_signature(&include, include_source, "RootValue", 0),
+            expected_location_signature(&main, main_source, "RootValue", 0),
+        ],
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_include_expansion_prefers_an_open_overlay() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  OverlayValue := 1;\nend;\nend.\n";
+    let disk_include = "const DiskValue = 1;\n";
+    let overlay_include = "const OverlayValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&include, disk_include);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&include),
+                "languageId": "pascal",
+                "version": 3,
+                "text": overlay_include
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let id = RequestId::from("include-overlay-navigation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "OverlayValue", 0),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_exact_location_signatures(
+        response
+            .result
+            .as_ref()
+            .expect("navigation result")
+            .as_array()
+            .expect("navigation array"),
+        vec![expected_location_signature(
+            &include,
+            overlay_include,
+            "OverlayValue",
+            0,
+        )],
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_include_prefers_a_local_overlay_before_a_later_disk_search_path() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let sub = temp.path().join("sub");
+    let lib = temp.path().join("lib");
+    fs::create_dir_all(&sub).expect("sub directory");
+    fs::create_dir_all(&lib).expect("lib directory");
+    let main = sub.join("Main.pas");
+    let local_include = sub.join("Shared.inc");
+    let disk_include = lib.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  OverlayValue := 1;\nend;\nend.\n";
+    let overlay_source = "const OverlayValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&disk_include, "const DiskValue = 1;\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"sourcePaths": ["lib"]}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&local_include),
+                "languageId": "pascal",
+                "version": 1,
+                "text": overlay_source
+            }
+        }),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let id = RequestId::from("local-overlay-before-search-path".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "OverlayValue", 0),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "navigation failed: {response:?}");
+    assert_exact_location_signatures(
+        response
+            .result
+            .as_ref()
+            .expect("navigation result")
+            .as_array()
+            .unwrap(),
+        vec![expected_location_signature(
+            &local_include,
+            overlay_source,
+            "OverlayValue",
+            0,
+        )],
+    );
+    server.shutdown();
+}
+
+#[test]
+fn unknown_conditional_source_does_not_publish_confident_lint_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let source = "unit Main;\ninterface\n{$IFDEF UNKNOWN}\nconst bad_const = 1;\n{$ENDIF}\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &temp.path().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        !diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn shared_include_diagnostics_survive_closing_one_root() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let a = temp.path().join("A.pas");
+    let b = temp.path().join("B.pas");
+    let shared = temp.path().join("Shared.inc");
+    let a_source = "unit A;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let b_source = "unit B;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let shared_source = "const bad_const = 1;\n";
+    write_file(&a, a_source);
+    write_file(&b, b_source);
+    write_file(&shared, shared_source);
+    write_file(
+        &temp.path().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (path, source, version) in [(&a, a_source, 1), (&b, b_source, 1)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": version,
+                    "text": source
+                }
+            }),
+        );
+        let _ = diagnostics_for_uri(&mut server, &uri(&shared));
+    }
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&a)}}),
+    );
+    let remaining = diagnostics_for_uri(&mut server, &uri(&shared));
+    assert!(
+        remaining["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn navigation_rejects_a_changed_include_overlay_before_delivery() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let shared = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    let shared_v1 = "const SharedValue = 1;\n";
+    let shared_v2 = "\n\nconst SharedValue = 1;\n";
+    write_file(&main, main_source);
+    write_file(&shared, shared_v1);
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    for (path, source, version) in [(&shared, shared_v1, 1), (&main, main_source, 1)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": version,
+                    "text": source
+                }
+            }),
+        );
+    }
+    let id = RequestId::from("stale-include-navigation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "SharedValue", 0),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&shared), "version": 2},
+            "contentChanges": [{"text": shared_v2}]
+        }),
+    );
+    let symbols_id = RequestId::from("synchronize-new-include-position".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "symbol synchronization failed: {symbols:?}"
+    );
+    assert!(
+        symbols.result.is_some(),
+        "symbol synchronization returned no result: {symbols:?}"
+    );
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "stale include navigation must be rejected"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_reverse_contexts_share_the_10000_reference_cap() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let a = temp.path().join("A.pas");
+    let b = temp.path().join("B.pas");
+    let shared = temp.path().join("Shared.inc");
+    let mut a_source = String::from(
+        "unit A;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    let mut b_source = String::from(
+        "unit B;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..5_000 {
+        a_source.push_str("  Log(SharedValue);\n");
+        b_source.push_str("  Log(SharedValue);\n");
+    }
+    a_source.push_str("end;\nend.\n");
+    b_source.push_str("end;\nend.\n");
+    let shared_source = "const SharedValue = 1;\n";
+    write_file(&a, &a_source);
+    write_file(&b, &b_source);
+    write_file(&shared, shared_source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (path, source) in [(&a, &a_source), (&b, &b_source)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source
+                }
+            }),
+        );
+    }
+    let id = RequestId::from("source-bearing-reference-cap".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&shared)},
+            "position": {"line": 0, "character": 6},
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("aggregate reference result must fail closed");
+    assert!(error.message.contains("10000"), "{error:?}");
+    assert!(response.result.is_none());
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_reverse_contexts_count_deduplicated_physical_results() {
+    for (uses_a, uses_b, partial) in [
+        (5_000usize, 4_999usize, false),
+        (5_000usize, 4_999usize, true),
+        (5_001usize, 5_000usize, true),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let a = temp.path().join("A.pas");
+        let b = temp.path().join("B.pas");
+        let shared = temp.path().join("Shared.inc");
+        let make_root = |unit: &str, uses: usize| {
+            let mut source = format!(
+                "unit {unit};\ninterface\n{{$I Shared.inc}}\nimplementation\nprocedure Run;\nbegin\n"
+            );
+            for _ in 0..uses {
+                source.push_str("  Log(SharedValue);\n");
+            }
+            source.push_str("end;\nend.\n");
+            source
+        };
+        let a_source = make_root("A", uses_a);
+        let b_source = make_root("B", uses_b);
+        let shared_source = "const SharedValue = 1;\n";
+        write_file(&a, &a_source);
+        write_file(&b, &b_source);
+        write_file(&shared, shared_source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        for (path, source) in [(&a, &a_source), (&b, &b_source)] {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(path),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            );
+        }
+
+        let id = RequestId::from(format!(
+            "physical-reference-count-{uses_a}-{uses_b}-{partial}"
+        ));
+        let mut params = json!({
+            "textDocument": {"uri": uri(&shared)},
+            "position": {"line": 0, "character": 6},
+            "context": {"includeDeclaration": true}
+        });
+        if partial {
+            params["partialResultToken"] =
+                json!(format!("physical-reference-partial-{uses_a}-{uses_b}"));
+        }
+        server.send_request(id.clone(), "textDocument/references", params);
+        let response = server.response(&id);
+        let over_limit = uses_a + uses_b + 1 > 10_000;
+        if over_limit {
+            let error = response
+                .error
+                .expect("over-limit reverse contexts must fail closed");
+            assert!(error.message.contains("10000"), "{error:?}");
+            assert!(response.result.is_none());
+            assert!(
+                server
+                    .take_partial_items(&format!("physical-reference-partial-{uses_a}-{uses_b}"))
+                    .is_empty()
+            );
+        } else if partial {
+            assert!(response.error.is_none(), "{response:?}");
+            let token = format!("physical-reference-partial-{uses_a}-{uses_b}");
+            let items = server.take_partial_items(&token);
+            assert_eq!(items.len(), uses_a + uses_b + 1);
+            assert_eq!(response.result, Some(json!([])));
+        } else {
+            assert!(
+                response.error.is_none(),
+                "{uses_a}+{uses_b} physical references must fit the response bound: {response:?}"
+            );
+            assert_eq!(
+                response
+                    .result
+                    .expect("ordinary references result")
+                    .as_array()
+                    .expect("ordinary references array")
+                    .len(),
+                uses_a + uses_b + 1
+            );
+        }
+        server.shutdown();
+    }
+}
+
+#[test]
+fn source_bearing_repeated_include_deduplicates_before_reference_cap() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let main = temp.path().join("Main.pas");
+    let uses = temp.path().join("Uses.inc");
+    let mut uses_source = String::new();
+    for _ in 0..4_999 {
+        uses_source.push_str("  Log(SharedValue);\n");
+    }
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "const SharedValue = 1;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "{$I Uses.inc}\n",
+        "{$I Uses.inc}\n",
+        "{$I Uses.inc}\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&main, main_source);
+    write_file(&uses, &uses_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("repeated-include-reference-cap".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("repeated include references");
+    let locations = result.as_array().expect("reference array");
+    assert_eq!(locations.len(), 5_000);
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&uses).to_string())
+            .count(),
+        4_999
+    );
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&main).to_string())
+            .count(),
+        1
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_mixed_roots_and_repeated_includes_deduplicate_physical_results() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let a = temp.path().join("A.pas");
+    let b = temp.path().join("B.pas");
+    let declaration = temp.path().join("Shared.inc");
+    let uses = temp.path().join("Uses.inc");
+    let make_root = |unit: &str| {
+        format!(
+            "unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nprocedure Run;\nbegin\n{{$I Uses.inc}}\n{{$I Uses.inc}}\nend;\nend.\n"
+        )
+    };
+    let mut uses_source = String::new();
+    for _ in 0..5_000 {
+        uses_source.push_str("  Log(SharedValue);\n");
+    }
+    let a_source = make_root("A");
+    let b_source = make_root("B");
+    write_file(&a, &a_source);
+    write_file(&b, &b_source);
+    write_file(&declaration, "const SharedValue = 1;\n");
+    write_file(&uses, &uses_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("mixed-root-repeated-reference-cap".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&declaration)},
+            "position": {"line": 0, "character": 6},
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("mixed-root references");
+    let locations = result.as_array().expect("reference array");
+    assert_eq!(locations.len(), 5_001);
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&uses).to_string())
+            .count(),
+        5_000
+    );
+    assert_eq!(
+        locations
+            .iter()
+            .filter(|location| location["uri"] == uri(&declaration).to_string())
+            .count(),
+        1
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_bearing_repeated_include_maps_non_bmp_crlf_ranges_once() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let main = temp.path().join("Main.pas");
+    let uses = temp.path().join("Uses.inc");
+    let main_source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "const SharedValue = 1;\r\n",
+        "implementation\r\n",
+        "procedure Run;\r\n",
+        "begin\r\n",
+        "{$I Uses.inc}\r\n",
+        "{$I Uses.inc}\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    let uses_source = "// 💩\r\n  Log(SharedValue);\r\n";
+    write_file(&main, main_source);
+    write_file(&uses, uses_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("repeated-include-non-bmp-crlf".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(main_source, "SharedValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("non-BMP CRLF references");
+    let locations = result.as_array().expect("reference array");
+    assert_exact_location_signatures(
+        locations,
+        vec![
+            expected_location_signature(&uses, uses_source, "SharedValue", 0),
+            expected_location_signature(&main, main_source, "SharedValue", 0),
+        ],
+    );
     server.shutdown();
 }
 
@@ -14768,6 +23184,197 @@ fn diagnostics_normalize_bare_carriage_returns_for_lint_positions() {
 }
 
 #[test]
+fn diagnostics_expand_source_bearing_includes_and_publish_physical_ranges() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let include_source = "const bad_const = 1;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+    let diagnostic = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "constant-naming")
+        .expect("constant naming diagnostic");
+    assert_eq!(diagnostic["range"]["start"]["line"], 0);
+    assert_eq!(diagnostic["range"]["start"]["character"], 6);
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_preserve_unicode_and_crlf_ranges_in_included_sources() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let include_source = "😀\r\nconst bad_const = 1;\r\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&include));
+    let diagnostic = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "constant-naming")
+        .expect("constant naming diagnostic");
+    assert_eq!(diagnostic["range"]["start"]["line"], 1);
+    assert_eq!(diagnostic["range"]["start"]["character"], 6);
+    assert_eq!(diagnostic["range"]["end"]["character"], 15);
+    server.shutdown();
+}
+
+#[test]
+fn removing_a_source_bearing_include_clears_its_published_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let with_include = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    let without_include = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&main, with_include);
+    write_file(&include, "const bad_const = 1;\n");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": with_include
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "constant-naming" })
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": without_include}]
+        }),
+    );
+    let cleared = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        cleared["diagnostics"].as_array().unwrap().is_empty(),
+        "removed include diagnostics were not cleared: {cleared}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn changed_include_content_invalidates_and_recomputes_root_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
+    write_file(&main, main_source);
+    write_file(&include, "const bad_const = 1;\n");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "constant-naming" })
+    );
+
+    write_file(&include, "const GoodConst = 1;\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&include), "type": 2}]}),
+    );
+    let updated = diagnostics_for_uri(&mut server, &uri(&include));
+    assert!(
+        updated["diagnostics"].as_array().unwrap().is_empty(),
+        "changed include diagnostics were not recomputed: {updated}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn formatting_reads_unopened_disk_documents_without_writing_them() {
     let (_temp, main, _provider, _main_source, _provider_source) = standard_workspace();
     let root = main.parent().expect("workspace root");
@@ -14793,6 +23400,35 @@ fn formatting_reads_unopened_disk_documents_without_writing_them() {
     assert_eq!(
         fs::read_to_string(&format_path).expect("read original"),
         format_source
+    );
+    server.shutdown();
+}
+
+#[test]
+fn formatting_rejects_include_sources_without_editing_them() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let include = temp.path().join("Shared.inc");
+    let source = "procedure Run;\nbegin\nLog(1);\nend;\n";
+    write_file(&include, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("format-include-rejected".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&include)},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("include formatting must be rejected");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("unsupported Pascal file extension"));
+    assert_eq!(
+        fs::read_to_string(&include).expect("include source"),
+        source
     );
     server.shutdown();
 }
@@ -16938,6 +25574,63 @@ fn public_rename_rejects_an_unresolved_include_in_an_unrelated_source() {
     assert!(
         error.message.to_ascii_lowercase().contains("include"),
         "unexpected unresolved unrelated include error: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn creating_a_previously_missing_include_revalidates_rename_resolution() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let optional = root.join("Optional.inc");
+    let provider_source =
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\n{$I Optional.inc}\nprocedure Use;\nbegin\n  Log(badConst);\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let first_id = RequestId::from("missing-include-before-create".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let first = server.response(&first_id);
+    assert!(
+        first
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.to_ascii_lowercase().contains("include")),
+        "missing include must block the initial rename: {first:?}"
+    );
+
+    write_file(&optional, "{$DEFINE SAFE}\n");
+    let second_id = RequestId::from("missing-include-after-create".to_string());
+    server.send_request(
+        second_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "badConst", 0),
+            "newName": "GoodConst"
+        }),
+    );
+    let second = server.response(&second_id);
+    assert!(
+        second.error.is_none(),
+        "created include remained stale: {second:?}"
+    );
+    assert_eq!(
+        workspace_edit_uris(&second.result.expect("rename result")),
+        HashSet::from([uri(&provider).to_string(), uri(&consumer).to_string()])
     );
     server.shutdown();
 }
@@ -19204,6 +27897,371 @@ fn absent_provider_overlay_invalidates_blocked_empty_navigation_result() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn nested_absent_provider_overlay_invalidates_blocked_empty_navigation_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let nested_root = root.join("nested");
+    let main = root.join("Main.pas");
+    let provider = nested_root.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let provider_source = "unit ReviewTask12Provider;\ninterface\nprocedure ReviewTask12Routine;\nimplementation\nprocedure ReviewTask12Routine;\nbegin\nend;\nend.\n";
+    fs::create_dir_all(&nested_root).expect("existing nested source root");
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("nested-absent-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("nested fulfilled negative provider lookup must stale the old result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+
+    let fresh_request_id = RequestId::from("nested-absent-provider-navigation-fresh".to_string());
+    server.send_request(
+        fresh_request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    let locations = result_locations(server.response(&fresh_request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn incomplete_filename_catalogue_invalidates_absent_nested_provider_overlay() {
+    const CATALOGUE_LIMIT: usize = 8;
+
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let existing_directory = root.join("crates");
+    let main = root.join("Main.pas");
+    let provider = existing_directory.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let provider_source = "unit ReviewTask12Provider;\ninterface\nprocedure ReviewTask12Routine;\nimplementation\nprocedure ReviewTask12Routine;\nbegin\nend;\nend.\n";
+    fs::create_dir_all(&existing_directory).expect("existing source directory");
+    write_file(&main, main_source);
+    for index in 0..CATALOGUE_LIMIT {
+        fs::write(
+            existing_directory.join(format!("CataloguePadding{index:05}.txt")),
+            [],
+        )
+        .expect("catalogue padding file");
+    }
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_filename_catalogue_limit(
+            environment,
+            CATALOGUE_LIMIT,
+        );
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("incomplete-catalogue-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("incomplete catalogue provider overlay must stale the old result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+
+    let fresh_request_id =
+        RequestId::from("incomplete-catalogue-provider-navigation-fresh".to_string());
+    server.send_request(
+        fresh_request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    let locations = result_locations(server.response(&fresh_request_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_nested_and_outside_provider_changes_do_not_stale_blocked_navigation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let nested_root = root.join("nested");
+    let outside_root = environment.path().join("outside");
+    let main = root.join("Main.pas");
+    let unrelated_nested = nested_root.join("DifferentProvider.pas");
+    let outside_provider = outside_root.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let unrelated_source = "unit DifferentProvider;\ninterface\nimplementation\nend.\n";
+    fs::create_dir_all(&nested_root).expect("existing nested source root");
+    fs::create_dir_all(&outside_root).expect("existing outside source root");
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+
+    let request_id = RequestId::from("unrelated-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated_nested),
+                "languageId": "pascal",
+                "version": 1,
+                "text": unrelated_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&outside_provider), "type": 1}]}),
+    );
+    let unrelated_ack = root.join("UnrelatedAck.pas");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated_ack),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit UnrelatedAck;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "unrelated provider changes must not stale the result: {response:?}"
+    );
+    assert!(result_locations(response).is_empty());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn excluded_nested_provider_change_does_not_stale_blocked_navigation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let excluded_root = root.join("excluded");
+    let main = root.join("Main.pas");
+    let provider = excluded_root.join("ReviewTask12Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    fs::create_dir_all(&excluded_root).expect("existing excluded source root");
+    write_file(&main, main_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, json!({"exclude": ["excluded/**"]}));
+
+    let request_id = RequestId::from("excluded-provider-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&provider), "type": 1}]}),
+    );
+    let excluded_ack = root.join("ExcludedAck.pas");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&excluded_ack),
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit ExcludedAck;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "excluded provider changes must not stale the result: {response:?}"
+    );
+    assert!(result_locations(response).is_empty());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn native_case_distinct_provider_changes_preserve_stale_invalidation_across_event_orders() {
+    let main_source = "unit Main;\ninterface\nuses ReviewTask12Provider;\nimplementation\nprocedure Run;\nbegin\n  ReviewTask12Routine;\nend;\nend.\n";
+    let provider_source = "unit ReviewTask12Provider;\ninterface\nprocedure ReviewTask12Routine;\nimplementation\nprocedure ReviewTask12Routine;\nbegin\nend;\nend.\n";
+
+    for (label, allowed_first) in [("allowed-first", true), ("excluded-first", false)] {
+        let environment = tempfile::tempdir().expect("isolated server environment");
+        let root = environment.path().join("workspace");
+        let nested_root = root.join("nested");
+        let main = root.join("Main.pas");
+        let allowed_provider = nested_root.join("ReviewTask12Provider.pas");
+        let excluded_provider = nested_root.join("REVIEWTASK12PROVIDER.pas");
+        fs::create_dir_all(&nested_root).expect("existing nested source root");
+        write_file(&main, main_source);
+
+        let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+        server.initialize(
+            &root,
+            json!({
+                "exclude": ["nested/REVIEWTASK12PROVIDER.pas"]
+            }),
+        );
+
+        let request_id = RequestId::from(format!("case-distinct-provider-{label}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+        );
+        barrier.wait_until_entered();
+
+        if allowed_first {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&allowed_provider),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": provider_source
+                    }
+                }),
+            );
+            let _ = server.notification("textDocument/publishDiagnostics");
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({
+                    "changes": [{"uri": uri(&excluded_provider), "type": 1}]
+                }),
+            );
+        } else {
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({
+                    "changes": [{"uri": uri(&excluded_provider), "type": 1}]
+                }),
+            );
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&allowed_provider),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": provider_source
+                    }
+                }),
+            );
+            let _ = server.notification("textDocument/publishDiagnostics");
+        }
+
+        let acknowledgement = root.join(format!("{label}-ack.pas"));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&acknowledgement),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": "unit Acknowledgement;\ninterface\nimplementation\nend.\n"
+                }
+            }),
+        );
+        let _ = server.notification("textDocument/publishDiagnostics");
+
+        barrier.release();
+        let response = server.response(&request_id);
+        let error = match response.error {
+            Some(error) => error,
+            None => panic!("{label}: native allowed change was lost: {response:?}"),
+        };
+        assert_eq!(error.code, -32803, "{label}");
+        assert_eq!(
+            error.message, "analysis result became stale; retry the request",
+            "{label}"
+        );
+
+        let fresh_request_id = RequestId::from(format!("case-distinct-provider-{label}-fresh"));
+        server.send_request(
+            fresh_request_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "ReviewTask12Routine", 0),
+        );
+        let locations = result_locations(server.response(&fresh_request_id));
+        assert_eq!(locations.len(), 1, "{label}");
+        assert_eq!(
+            locations[0]["uri"],
+            uri(&allowed_provider).to_string(),
+            "{label}"
+        );
+        server.shutdown();
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn unrelated_configuration_change_does_not_discard_blocked_formatting_result() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
@@ -20257,11 +29315,12 @@ fn newer_document_version_supersedes_a_queued_observation_once() {
     barrier.wait_for_entries(2);
 
     let old_id = RequestId::from("superseded-old".to_string());
-    server.send_request(
-        old_id.clone(),
-        "textDocument/definition",
-        navigation_params(&main, first_source, "PublicRoutine", 0),
-    );
+    let mut old_params = navigation_params(&main, first_source, "PublicRoutine", 0);
+    old_params["workDoneToken"] = json!("superseded-old-progress");
+    server.send_request(old_id.clone(), "textDocument/definition", old_params);
+    let old_begin = server.notification("$/progress");
+    assert_eq!(old_begin["token"], "superseded-old-progress");
+    assert_eq!(old_begin["value"]["message"], "Queued for analysis");
     server.send_notification(
         "textDocument/didChange",
         json!({
@@ -20270,19 +29329,26 @@ fn newer_document_version_supersedes_a_queued_observation_once() {
         }),
     );
     let new_id = RequestId::from("superseded-new".to_string());
-    server.send_request(
-        new_id.clone(),
-        "textDocument/definition",
-        navigation_params(&main, &second_source, "ChangedRoutine", 0),
-    );
+    let mut new_params = navigation_params(&main, &second_source, "ChangedRoutine", 0);
+    new_params["workDoneToken"] = json!("superseded-new-progress");
+    server.send_request(new_id.clone(), "textDocument/definition", new_params);
 
     let old_response = server
         .response_with_timeout(&old_id, Duration::from_secs(1))
         .expect("superseded request response");
     assert_eq!(old_response.error.expect("superseded error").code, -32800);
     server.assert_no_response(&old_id);
+    let old_end = server.notification("$/progress");
+    assert_eq!(old_end["token"], "superseded-old-progress");
+    assert_eq!(old_end["value"]["kind"], "end");
+    let new_begin = server.notification("$/progress");
+    assert_eq!(new_begin["token"], "superseded-new-progress");
+    assert_eq!(new_begin["value"]["message"], "Queued for analysis");
 
     barrier.release();
+    let new_report = server.notification("$/progress");
+    assert_eq!(new_report["token"], "superseded-new-progress");
+    assert_eq!(new_report["value"]["message"], "Analysis started");
     let new_response = server.response(&new_id);
     assert!(
         new_response.error.is_none(),
@@ -20293,6 +29359,10 @@ fn newer_document_version_supersedes_a_queued_observation_once() {
         1,
         "newer version must still be dispatched"
     );
+    let new_end = server.notification("$/progress");
+    assert_eq!(new_end["token"], "superseded-new-progress");
+    assert_eq!(new_end["value"]["kind"], "end");
+    server.assert_no_progress();
     server.shutdown();
 }
 
@@ -20822,4 +29892,1648 @@ fn cancellation_takes_precedence_over_stale_generation_for_formatting() {
         .expect("cancelled formatting must respond");
     assert_eq!(response.error.expect("cancellation error").code, -32800);
     server.assert_no_response(&request_id);
+}
+
+#[test]
+fn configuration_pull_is_negotiated_after_initialized_with_scope_and_namespace() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+
+    let request = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration pull request after initialized");
+    assert_eq!(request.params["items"][0]["section"], "pascalLsp");
+    assert_eq!(
+        request.params["items"][0]["scopeUri"],
+        uri(root).to_string()
+    );
+    server.send(Message::Response(Response::new_ok(
+        request.id,
+        json!([{"projectFile": null}]),
+    )));
+    server.shutdown();
+}
+
+#[test]
+fn configuration_pull_waits_for_the_initialized_notification() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("configuration-lifecycle-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(root),
+            "capabilities": {
+                "workspace": {
+                    "configuration": true
+                }
+            }
+        }),
+    );
+    let initialize = server.response(&initialize_id);
+    assert!(
+        initialize.error.is_none(),
+        "initialize failed: {initialize:?}"
+    );
+    assert!(
+        server
+            .request_with_timeout("workspace/configuration", Duration::from_millis(100))
+            .is_none(),
+        "configuration must not be pulled before initialized"
+    );
+
+    server.send_notification("initialized", json!({}));
+    let request = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration pull after initialized");
+    server.send(Message::Response(Response::new_ok(request.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn multi_root_configuration_uses_the_documented_global_scope() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(&first).expect("first workspace folder");
+    fs::create_dir_all(&second).expect("second workspace folder");
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability_and_folders(
+        &first,
+        &[first.as_path(), second.as_path()],
+        true,
+    );
+    let request = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("global configuration pull request");
+    assert!(
+        request.params["items"][0]["scopeUri"].is_null(),
+        "global runtime settings must not use one root's scope for every root"
+    );
+    server.send(Message::Response(Response::new_ok(request.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn adding_a_workspace_folder_switches_a_global_configuration_pull_to_unscoped() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(&first).expect("first workspace folder");
+    fs::create_dir_all(&second).expect("second workspace folder");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(&first, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    assert_eq!(
+        initial.params["items"][0]["scopeUri"],
+        uri(&first).to_string()
+    );
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+
+    server.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{"uri": uri(&second), "name": "second"}],
+                "removed": []
+            }
+        }),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("workspace-folder configuration refresh");
+    assert!(
+        refresh.params["items"][0]["scopeUri"].is_null(),
+        "global runtime settings must become unscoped after a second root is added"
+    );
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn pushed_configuration_is_used_without_pull_capability() {
+    for capability in [Some(false), None] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let project = root.join("App.dproj");
+        write_file(&main, "unit Main; interface implementation end.");
+        write_file(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        server.initialize_with_configuration_capability(root, capability, Value::Null);
+        assert!(
+            server
+                .request_with_timeout("workspace/configuration", Duration::from_millis(100))
+                .is_none(),
+            "push-only clients must not receive a pull request"
+        );
+        server.send_notification(
+            "workspace/didChangeConfiguration",
+            json!({"settings": {"pascalLsp": {"projectFile": "App.dproj"}}}),
+        );
+
+        let id = RequestId::from("pushed-configuration-context".to_string());
+        server.send_request(
+            id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&main)}}),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "project context failed: {response:?}"
+        );
+        assert_eq!(
+            response.result.expect("project context")["selectionMode"],
+            "configured"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn configuration_refresh_coalesces_and_discards_an_obsolete_pull_reply() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+    let first = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+
+    for _ in 0..2 {
+        server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    }
+    server.send(Message::Response(Response::new_ok(
+        first.id,
+        json!([{"projectFile": "A.dproj"}]),
+    )));
+
+    let second = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("coalesced configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        second.id,
+        json!([{"projectFile": "B.dproj"}]),
+    )));
+
+    let id = RequestId::from("coalesced-configuration-context".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "project context failed: {response:?}"
+    );
+    assert_eq!(
+        response.result.expect("project context")["selectedProjectUri"],
+        uri(&project_b).to_string()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_invalidates_an_inflight_navigation_at_the_delivery_barrier() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main; interface uses Provider; implementation procedure Run; begin ProviderRoutine; end; end.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit Provider; interface procedure ProviderRoutine; implementation procedure ProviderRoutine; begin end; end.\n",
+    );
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_configuration(environment);
+    server.initialize_with_configuration_capability(&root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+
+    let request_id = RequestId::from("runtime-stale-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ProviderRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let update = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration refresh pull");
+    server.send(Message::Response(Response::new_ok(
+        update.id,
+        json!([{"maxFiles": 1}]),
+    )));
+    barrier.release();
+
+    let response = server.response(&request_id);
+    assert_eq!(response.error.expect("stale navigation error").code, -32803);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn identical_runtime_configuration_does_not_stale_an_inflight_navigation() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main; interface uses Provider; implementation procedure Run; begin ProviderRoutine; end; end.\n";
+    write_file(&main, main_source);
+    write_file(
+        &provider,
+        "unit Provider; interface procedure ProviderRoutine; implementation procedure ProviderRoutine; begin end; end.\n",
+    );
+
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier_and_configuration(environment);
+    server.initialize_with_configuration_capability(&root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        initial.id,
+        json!([{"maxFiles": 1}]),
+    )));
+
+    let request_id = RequestId::from("runtime-identical-navigation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "ProviderRoutine", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let update = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("configuration refresh pull");
+    server.send(Message::Response(Response::new_ok(
+        update.id,
+        json!([{"maxFiles": 1}]),
+    )));
+    barrier.release();
+
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "identical runtime settings must not stale a request: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_preserves_malformed_fields_and_null_resets_to_initialization() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(
+        root,
+        Some(false),
+        json!({"pascalLsp": {"projectFile": "B.dproj"}}),
+    );
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"projectFile": "A.dproj"}}}),
+    );
+    let configured_id = RequestId::from("runtime-configured-context".to_string());
+    server.send_request(
+        configured_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let configured = server.response(&configured_id);
+    assert_eq!(
+        configured.result.expect("configured context")["selectedProjectUri"],
+        uri(&project_a).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"projectFile": 7, "maxFiles": 2}}}),
+    );
+    let retained_id = RequestId::from("runtime-malformed-context".to_string());
+    server.send_request(
+        retained_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let retained = server.response(&retained_id);
+    assert_eq!(
+        retained.result.expect("retained context")["selectedProjectUri"],
+        uri(&project_a).to_string(),
+        "a malformed projectFile must not erase the valid runtime project"
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": null}}),
+    );
+    let reset_id = RequestId::from("runtime-reset-context".to_string());
+    server.send_request(
+        reset_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let reset = server.response(&reset_id);
+    assert_eq!(
+        reset.result.expect("reset context")["selectedProjectUri"],
+        uri(&project_b).to_string(),
+        "null must restore the initialization projectFile fallback"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pushed_runtime_configuration_refreshes_open_document_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source = "unit Main; interface implementation end.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(false), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let initial =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        initial["diagnostics"].as_array().is_some_and(Vec::is_empty),
+        "baseline diagnostics should be empty: {initial}"
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"projectFile": "Missing.dproj"}}}),
+    );
+    let refreshed =
+        server.notification_with_timeout("textDocument/publishDiagnostics", Duration::from_secs(2));
+    assert!(
+        refreshed["diagnostics"].as_array().is_some(),
+        "runtime configuration should publish a diagnostic refresh: {refreshed}"
+    );
+    assert_eq!(refreshed["uri"], uri(&main).to_string());
+    assert_eq!(refreshed["version"], 1);
+    server.shutdown();
+}
+
+#[test]
+fn configuration_errors_and_duplicate_replies_keep_the_last_valid_runtime_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project_a = root.join("A.dproj");
+    let project_b = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project in [&project_a, &project_b] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+    let first = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        first.id.clone(),
+        json!([{"projectFile": "A.dproj"}]),
+    )));
+
+    let configured_id = RequestId::from("error-preservation-configured".to_string());
+    server.send_request(
+        configured_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert_eq!(
+        server
+            .response(&configured_id)
+            .result
+            .expect("configured context")["selectedProjectUri"],
+        uri(&project_a).to_string()
+    );
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let second = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("refresh configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        first.id,
+        json!([{"projectFile": "B.dproj"}]),
+    )));
+    server.send(Message::Response(Response::new_err(
+        second.id,
+        -32603,
+        "configuration unavailable".to_string(),
+    )));
+
+    let retained_id = RequestId::from("error-preservation-retained".to_string());
+    server.send_request(
+        retained_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert_eq!(
+        server
+            .response(&retained_id)
+            .result
+            .expect("retained context")["selectedProjectUri"],
+        uri(&project_a).to_string(),
+        "configuration errors and duplicate old replies must not overwrite valid state"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn an_empty_configuration_pull_result_preserves_the_last_valid_runtime_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let project = root.join("A.dproj");
+    let other_project = root.join("B.dproj");
+    write_file(&main, "unit Main; interface implementation end.");
+    for project_path in [&project, &other_project] {
+        write_file(
+            project_path,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        initial.id,
+        json!([{"projectFile": "A.dproj"}]),
+    )));
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("refresh configuration pull");
+    server.send(Message::Response(Response::new_ok(refresh.id, json!([]))));
+
+    let id = RequestId::from("empty-configuration-result-context".to_string());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert_eq!(
+        response.result.expect("project context")["selectedProjectUri"],
+        uri(&project).to_string(),
+        "an empty response array must not reset the last valid runtime value"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_preserves_a_closed_shared_owner_for_navigation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let fixture = shared_owner_fixture(temp.path());
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let select_id = RequestId::from("runtime-shared-owner-select-a".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let load_id = RequestId::from("runtime-shared-owner-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    let before_context_id = RequestId::from("runtime-shared-owner-before-context".to_string());
+    server.send_request(
+        before_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.shared)}}),
+    );
+    let before_context = server.response(&before_context_id);
+    assert_eq!(
+        before_context.result.expect("shared owner context")["selectedProjectUri"],
+        uri(&fixture.a_project).to_string()
+    );
+
+    server.send_request(
+        RequestId::from("runtime-shared-owner-before-navigation".to_string()),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    let before_navigation = result_locations(server.response(&RequestId::from(
+        "runtime-shared-owner-before-navigation".to_string(),
+    )));
+    assert_eq!(
+        before_navigation[0]["uri"],
+        uri(&fixture.a_config).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+
+    let after_context_id = RequestId::from("runtime-shared-owner-after-context".to_string());
+    server.send_request(
+        after_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.shared)}}),
+    );
+    let after_context = server.response(&after_context_id);
+    let after_context = after_context
+        .result
+        .expect("shared owner context after update");
+    assert_eq!(after_context["selectionMode"], "directory");
+    assert_eq!(
+        after_context["selectedProjectUri"],
+        uri(&fixture.a_project).to_string()
+    );
+
+    let after_navigation_id = RequestId::from("runtime-shared-owner-after-navigation".to_string());
+    server.send_request(
+        after_navigation_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    let after_navigation = result_locations(server.response(&after_navigation_id));
+    assert_eq!(after_navigation.len(), 1);
+    assert_eq!(
+        after_navigation[0]["uri"],
+        uri(&fixture.a_config).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_recomputes_an_open_shared_owner_without_adopting_a_peer() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let fixture = open_shared_owner_fixture(temp.path());
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let select_id = RequestId::from("runtime-open-shared-owner-select-a".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let load_id = RequestId::from("runtime-open-shared-owner-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&fixture.shared),
+                "languageId": "pascal",
+                "version": 1,
+                "text": &fixture.shared_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let navigation_id = RequestId::from("runtime-open-shared-owner-navigation".to_string());
+    server.send_request(
+        navigation_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    let locations = result_locations(server.response(&navigation_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&fixture.a_config).to_string());
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_keeps_a_removed_shared_owner_invalid() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let fixture = shared_owner_fixture(temp.path());
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let select_id = RequestId::from("runtime-removed-shared-owner-select-a".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.a_main)},
+            "projectUri": uri(&fixture.a_project)
+        }),
+    );
+    assert!(server.response(&select_id).error.is_none());
+
+    let load_id = RequestId::from("runtime-removed-shared-owner-load".to_string());
+    server.send_request(
+        load_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.a_main, &fixture.main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&load_id))[0]["uri"],
+        uri(&fixture.shared).to_string()
+    );
+
+    fs::remove_file(&fixture.a_project).expect("remove selected project");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&fixture.a_project), "type": 3}]}),
+    );
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+
+    let navigation_id = RequestId::from("runtime-removed-shared-owner-navigation".to_string());
+    server.send_request(
+        navigation_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&fixture.shared, &fixture.shared_source, "ConfigRoutine", 0),
+    );
+    assert!(
+        result_locations(server.response(&navigation_id)).is_empty(),
+        "a removed owner must remain invalid after runtime invalidation"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn scoped_runtime_configuration_does_not_leak_across_workspace_folder_changes() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(&first).expect("first workspace folder");
+    fs::create_dir_all(&second).expect("second workspace folder");
+    let first_main = first.join("Main.pas");
+    let second_main = second.join("Main.pas");
+    let first_project = first.join("App.dproj");
+    let second_project = second.join("App.dproj");
+    let project =
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>";
+    write_file(&first_main, "unit Main; interface implementation end.");
+    write_file(&second_main, "unit Main; interface implementation end.");
+    write_file(&first_project, project);
+    write_file(&second_project, project);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_configuration_capability(&first, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial scoped configuration pull");
+    server.send(Message::Response(Response::new_ok(
+        initial.id,
+        json!([{"projectFile": "App.dproj"}]),
+    )));
+
+    let first_context_id = RequestId::from("scoped-runtime-first-context".to_string());
+    server.send_request(
+        first_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&first_main)}}),
+    );
+    assert_eq!(
+        server
+            .response(&first_context_id)
+            .result
+            .expect("first context")["selectedProjectUri"],
+        uri(&first_project).to_string()
+    );
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let stale_refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("scoped refresh before folder change");
+    server.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{"uri": uri(&second), "name": "second"}],
+                "removed": []
+            }
+        }),
+    );
+    server.send(Message::Response(Response::new_ok(
+        stale_refresh.id,
+        json!([{"projectFile": "App.dproj"}]),
+    )));
+
+    let unscoped = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("unscoped configuration pull after adding a root");
+    assert!(unscoped.params["items"][0]["scopeUri"].is_null());
+    server.send(Message::Response(Response::new_err(
+        unscoped.id,
+        -32603,
+        "settings unavailable".to_string(),
+    )));
+
+    let second_context_id = RequestId::from("scoped-runtime-second-context".to_string());
+    server.send_request(
+        second_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&second_main)}}),
+    );
+    let second_context = server
+        .response(&second_context_id)
+        .result
+        .expect("second context after scoped error");
+    assert_ne!(second_context["selectionMode"], "configured");
+    assert_ne!(
+        second_context["selectedProjectUri"],
+        uri(&first_project).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [{"uri": uri(&first), "name": "first"}]
+            }
+        }),
+    );
+    let replacement = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("single-root replacement configuration pull");
+    assert_eq!(
+        replacement.params["items"][0]["scopeUri"],
+        uri(&second).to_string()
+    );
+    server.send(Message::Response(Response::new_ok(
+        replacement.id,
+        json!([]),
+    )));
+
+    let replacement_context_id = RequestId::from("scoped-runtime-replacement-context".to_string());
+    server.send_request(
+        replacement_context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&second_main)}}),
+    );
+    let replacement_context = server
+        .response(&replacement_context_id)
+        .result
+        .expect("replacement context");
+    assert_ne!(
+        replacement_context["selectedProjectUri"],
+        uri(&first_project).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn runtime_configuration_preserves_watched_deletions_until_a_create_or_change_event() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source =
+        "unit Provider; interface procedure Run; implementation procedure Run; begin end; end.\n";
+    let main_source =
+        "unit Main; interface uses Provider; implementation procedure Use; begin Run; end; end.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let before_id = RequestId::from("runtime-delete-before".to_string());
+    server.send_request(
+        before_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&before_id))[0]["uri"],
+        uri(&provider).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&provider), "type": 3}]}),
+    );
+    let deleted_id = RequestId::from("runtime-delete-after-event".to_string());
+    server.send_request(
+        deleted_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert!(result_locations(server.response(&deleted_id)).is_empty());
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"maxFiles": 9999}}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let after_runtime_id = RequestId::from("runtime-delete-after-runtime".to_string());
+    server.send_request(
+        after_runtime_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert!(
+        result_locations(server.response(&after_runtime_id)).is_empty(),
+        "runtime invalidation must not resurrect a watched-deleted source"
+    );
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&provider), "type": 1}]}),
+    );
+    let recovered_id = RequestId::from("runtime-delete-after-create".to_string());
+    server.send_request(
+        recovered_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&recovered_id))[0]["uri"],
+        uri(&provider).to_string()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_preparation_does_not_block_protocol_shutdown() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_capability(&root, Some(true), Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("runtime configuration refresh");
+    server.send(Message::Response(Response::new_ok(
+        refresh.id,
+        json!([{"exclude": ["generated/**"]}]),
+    )));
+    barrier.wait_until_entered();
+
+    let ping_id = RequestId::from("configuration-preparation-ping".to_string());
+    server.send_request(ping_id.clone(), "review/ping", Value::Null);
+    let ping = server
+        .response_with_timeout(&ping_id, Duration::from_secs(1))
+        .expect("protocol request while configuration is prepared");
+    assert_eq!(ping.error.expect("unknown method error").code, -32601);
+
+    let shutdown_id = RequestId::from("configuration-preparation-shutdown".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+    let shutdown = server
+        .response_with_timeout(&shutdown_id, Duration::from_secs(1))
+        .expect("shutdown while configuration is prepared");
+    assert!(shutdown.error.is_none(), "shutdown failed: {shutdown:?}");
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server
+        .child
+        .wait()
+        .expect("wait for configuration shutdown");
+    assert!(status.success(), "server exited unsuccessfully: {status}");
+}
+
+#[cfg(feature = "test-support")]
+fn begin_configuration_preparation(
+    server: &mut TestServer,
+    settings: Value,
+    barrier: &TestBarrier,
+) {
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": settings.clone()}}),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("runtime configuration refresh");
+    server.send(Message::Response(Response::new_ok(
+        refresh.id,
+        json!([settings]),
+    )));
+    barrier.wait_until_entered();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_rejects_a_deferred_rename_after_document_identity_changes() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let alpha_source = "unit Main; interface var Alpha: Integer; implementation procedure Run; begin Alpha := 1; end; end.\n";
+    let beta_source = alpha_source.replace("Alpha", "BetaVariable");
+    write_file(&main, alpha_source);
+
+    let (mut server, configuration_barrier, navigation_barrier) =
+        TestServer::launch_with_navigation_and_configuration_preparation_barriers(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": alpha_source
+            }
+        }),
+    );
+
+    begin_configuration_preparation(
+        &mut server,
+        json!({"maxFiles": 9999}),
+        &configuration_barrier,
+    );
+    let prepare_id = RequestId::from("deferred-alpha-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareRename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(alpha_source, "Alpha", 0)
+        }),
+    );
+    let rename_id = RequestId::from("deferred-alpha-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(alpha_source, "Alpha", 0),
+            "newName": "Renamed"
+        }),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": beta_source}]
+        }),
+    );
+
+    let ping_id = RequestId::from("deferred-rename-ordering-ping".to_string());
+    server.send_request(ping_id.clone(), "review/ping", Value::Null);
+    let ping = server
+        .response_with_timeout(&ping_id, Duration::from_secs(1))
+        .expect("later document change must be processed while preparation is held");
+    assert_eq!(ping.error.expect("unknown method error").code, -32601);
+
+    configuration_barrier.release();
+    navigation_barrier.wait_until_entered();
+    navigation_barrier.release();
+    let prepare = server.response(&prepare_id);
+    let prepare_error = prepare.error.expect("stale prepareRename must fail");
+    assert_eq!(prepare_error.code, -32803);
+    let rename = server.response(&rename_id);
+    let rename_error = rename.error.expect("stale rename must fail");
+    assert_eq!(rename_error.code, -32803);
+    assert!(
+        !rename
+            .result
+            .is_some_and(|value| value.to_string().contains("Renamed"))
+    );
+
+    let recovery_id = RequestId::from("deferred-beta-recovery".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&beta_source, "BetaVariable", 0),
+            "newName": "Renamed"
+        }),
+    );
+    let recovery = server.response(&recovery_id);
+    assert!(
+        recovery.error.is_none(),
+        "current-document rename failed: {recovery:?}"
+    );
+    assert!(
+        recovery
+            .result
+            .expect("recovery edit")
+            .to_string()
+            .contains("Renamed")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_rejects_a_deferred_rename_after_same_version_close_and_reopen() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source = "unit Main; interface var Alpha: Integer; implementation procedure Run; begin Alpha := 1; end; end.\n";
+    write_file(&main, source);
+
+    let (mut server, configuration_barrier, navigation_barrier) =
+        TestServer::launch_with_navigation_and_configuration_preparation_barriers(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    begin_configuration_preparation(
+        &mut server,
+        json!({"maxFiles": 9999}),
+        &configuration_barrier,
+    );
+
+    let rename_id = RequestId::from("same-version-reopen-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Alpha", 0),
+            "newName": "Renamed"
+        }),
+    );
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    configuration_barrier.release();
+    navigation_barrier.wait_until_entered();
+    navigation_barrier.release();
+
+    let response = server.response(&rename_id);
+    assert_eq!(
+        response
+            .error
+            .expect("same-version reopen must stale the request")
+            .code,
+        -32803
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_cancellation_allows_deferred_request_id_reuse() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main; interface procedure Run; implementation procedure Run; begin end; end.\n";
+    write_file(&main, source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    begin_configuration_preparation(&mut server, json!({"maxFiles": 9999}), &barrier);
+
+    let reused_id = RequestId::from("configuration-deferred-reused-id".to_string());
+    server.send_request(
+        reused_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": reused_id.clone()}));
+    let cancelled = server.response(&reused_id);
+    assert_eq!(cancelled.error.expect("cancellation error").code, -32800);
+
+    server.send_request(
+        reused_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.release();
+    let response = server.response(&reused_id);
+    assert!(
+        response.error.is_none(),
+        "reused deferred request failed: {response:?}"
+    );
+    server.assert_no_response(&reused_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_request_flood_cannot_displace_a_document_change() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source_v1 = "unit Main; interface var Alpha: Integer; implementation procedure Run; begin Alpha := 1; end; end.\n";
+    let source_v2 = source_v1.replace("Alpha", "Bravo");
+    let source_v3 = source_v1.replace("Alpha", "Charlie");
+    write_file(&main, source_v1);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, Value::Null);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source_v1
+            }
+        }),
+    );
+    begin_configuration_preparation(&mut server, json!({"maxFiles": 9999}), &barrier);
+
+    let request_ids = (0..64)
+        .map(|index| RequestId::from(format!("flooded-document-symbol-{index}")))
+        .collect::<Vec<_>>();
+    for request_id in &request_ids {
+        server.send_request(
+            request_id.clone(),
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": uri(&main)}}),
+        );
+    }
+
+    let excess_id = RequestId::from("flooded-document-symbol-excess".to_string());
+    server.send_request(
+        excess_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let before_edit_ping_id = RequestId::from("flooded-before-edit-ping".to_string());
+    server.send_request(before_edit_ping_id.clone(), "review/ping", Value::Null);
+    let excess = server
+        .response_with_timeout(&excess_id, Duration::from_secs(1))
+        .expect("excess request must be rejected while preparation is held");
+    assert_eq!(
+        excess.error.expect("excess request error").code,
+        -32802,
+        "request capacity must remain bounded"
+    );
+    let before_edit_ping = server
+        .response_with_timeout(&before_edit_ping_id, Duration::from_secs(1))
+        .expect("server must remain responsive before the edit");
+    assert_eq!(
+        before_edit_ping.error.expect("unknown method error").code,
+        -32601
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": source_v2}]
+        }),
+    );
+    let after_edit_ping_id = RequestId::from("flooded-after-edit-ping".to_string());
+    server.send_request(after_edit_ping_id.clone(), "review/ping", Value::Null);
+    let after_edit_ping = server
+        .response_with_timeout(&after_edit_ping_id, Duration::from_secs(1))
+        .expect("a valid edit must not terminate the server");
+    assert_eq!(
+        after_edit_ping.error.expect("unknown method error").code,
+        -32601
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 3},
+            "contentChanges": [{"text": source_v3}]
+        }),
+    );
+
+    barrier.release();
+    let mut cancelled = 0;
+    for request_id in &request_ids {
+        let response = server.response(request_id);
+        if let Some(error) = response.error {
+            assert!(
+                error.code == -32802 || error.code == -32803,
+                "only retryable or stale flood requests may be rejected: {error:?}"
+            );
+            if error.code == -32802 {
+                cancelled += 1;
+            }
+        }
+    }
+    assert_eq!(
+        cancelled, 2,
+        "the two notifications must reclaim exactly two request slots"
+    );
+
+    let symbols_id = RequestId::from("flooded-document-symbol-v3".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "the final document overlay must remain authoritative after the flood: {symbols:?}"
+    );
+    assert!(
+        symbols
+            .result
+            .expect("document symbols")
+            .to_string()
+            .contains("Charlie")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_open_after_an_increased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let disk_source = "unit Main; interface implementation end.\n";
+    let overlay_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    write_file(&main, disk_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 64}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 10000}), &barrier);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": overlay_source
+            }
+        }),
+    );
+    let ping_id = RequestId::from("did-open-increase-ping".to_string());
+    server.send_request(ping_id.clone(), "review/ping", Value::Null);
+    let ping = server
+        .response_with_timeout(&ping_id, Duration::from_secs(1))
+        .expect("didOpen must not block protocol progress");
+    assert_eq!(ping.error.expect("unknown method error").code, -32601);
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-open-increase-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "increased limit lost didOpen: {symbols:?}"
+    );
+    let symbol_result = symbols.result.expect("document symbols");
+    let names = symbol_result
+        .as_array()
+        .expect("symbol array")
+        .iter()
+        .filter_map(|symbol| symbol["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"OverlayOnly"));
+    assert!(names.contains(&"Run"));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_open_after_a_decreased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let disk_source = "unit Main; interface implementation end.\n";
+    let oversized_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    let recovered_source = "unit Main; interface var R: Integer; implementation end.\n";
+    write_file(&main, disk_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server
+        .initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 10000}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 64}), &barrier);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": oversized_source
+            }
+        }),
+    );
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-open-decrease-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert_eq!(
+        symbols
+            .error
+            .expect("decreased limit must reject overlay")
+            .code,
+        -32803
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": recovered_source}]
+        }),
+    );
+    let recovery_id = RequestId::from("did-open-decrease-recovery".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let recovery = server.response(&recovery_id);
+    assert!(
+        recovery.error.is_none(),
+        "full replacement must recover: {recovery:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_change_after_an_increased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let short_source = "unit Main; interface implementation end.\n";
+    let oversized_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    write_file(&main, short_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server.initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 64}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": short_source
+            }
+        }),
+    );
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 10000}), &barrier);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": oversized_source}]
+        }),
+    );
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-change-increase-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "increased limit lost didChange: {symbols:?}"
+    );
+    assert!(
+        symbols
+            .result
+            .expect("document symbols")
+            .to_string()
+            .contains("OverlayOnly")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn runtime_configuration_processes_did_change_after_a_decreased_file_limit() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let oversized_source = "unit Main; interface var OverlayOnly: Integer; implementation procedure Run; begin OverlayOnly := 1; end; end.\n";
+    let recovered_source = "unit Main; interface var R: Integer; implementation end.\n";
+    write_file(&main, oversized_source);
+
+    let (mut server, barrier) =
+        TestServer::launch_with_configuration_preparation_barrier(environment);
+    server
+        .initialize_with_configuration_and_document_changes(&root, json!({"maxFileBytes": 10000}));
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration pull");
+    server.send(Message::Response(Response::new_ok(initial.id, Value::Null)));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": oversized_source
+            }
+        }),
+    );
+    begin_configuration_preparation(&mut server, json!({"maxFileBytes": 64}), &barrier);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": oversized_source}]
+        }),
+    );
+    barrier.release();
+
+    let symbols_id = RequestId::from("did-change-decrease-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert_eq!(
+        symbols
+            .error
+            .expect("decreased limit must reject change")
+            .code,
+        -32803
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 3},
+            "contentChanges": [{"text": recovered_source}]
+        }),
+    );
+    let recovery_id = RequestId::from("did-change-decrease-recovery".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let recovery = server.response(&recovery_id);
+    assert!(
+        recovery.error.is_none(),
+        "full replacement must recover: {recovery:?}"
+    );
+    server.shutdown();
 }

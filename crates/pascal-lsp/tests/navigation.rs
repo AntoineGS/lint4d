@@ -1,6 +1,6 @@
 use lsp_types::{
-    CompletionItemKind, CompletionTextEdit, HoverContents, Location, MarkedString, Position, Range,
-    Url,
+    CompletionItemKind, CompletionTextEdit, Documentation as LspDocumentation, HoverContents,
+    Location, MarkedString, MarkupKind, Position, Range, Url,
 };
 use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
@@ -68,6 +68,287 @@ fn locations_at(
 fn assert_location_start(location: &Location, expected_uri: &Url, expected: Position) {
     assert_eq!(&location.uri, expected_uri);
     assert_eq!(location.range.start, expected);
+}
+
+#[test]
+fn workspace_navigation_expands_a_source_bearing_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&include, "const SharedValue = 1;\n").expect("include source");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let include_uri = Url::from_file_path(&include).expect("include URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    let locations = workspace.navigate(
+        &root_uri,
+        position_of(source, "SharedValue :=", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(
+        locations,
+        vec![Location::new(
+            include_uri,
+            Range::new(Position::new(0, 6), Position::new(0, 17)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_uses_define_side_effects_from_an_include() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let include = temp.path().join("Defines.inc");
+    let source = "unit Main;\ninterface\n{$I Defines.inc}\n{$IFDEF ENABLED}\nconst EnabledValue = 1;\n{$ENDIF}\nimplementation\nprocedure Run;\nbegin\n  EnabledValue := 1;\nend;\nend.\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&include, "{$DEFINE ENABLED}\n").expect("include source");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let include_uri = Url::from_file_path(&include).expect("include URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(source, "EnabledValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            root_uri,
+            Range::new(Position::new(4, 6), Position::new(4, 18)),
+        )]
+    );
+    assert!(include_uri.to_file_path().is_ok());
+}
+
+#[test]
+fn workspace_navigation_expands_a_nested_include_after_a_shared_define() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let defines = temp.path().join("Defines.inc");
+    let conditional = temp.path().join("Conditional.inc");
+    let nested = temp.path().join("Nested.inc");
+    let source = "unit Main;\ninterface\n{$I Defines.inc}\n{$I Conditional.inc}\nimplementation\nprocedure Run;\nbegin\n  NestedValue := 1;\nend;\nend.\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&defines, "{$DEFINE ENABLED}\n").expect("define include");
+    fs::write(
+        &conditional,
+        "{$IFDEF ENABLED}\n{$I Nested.inc}\n{$ENDIF}\n",
+    )
+    .expect("conditional include");
+    fs::write(&nested, "const NestedValue = 1;\n").expect("nested include");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let nested_uri = Url::from_file_path(&nested).expect("nested URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(source, "NestedValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            nested_uri,
+            Range::new(Position::new(0, 6), Position::new(0, 17)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_expands_same_file_conditionals_after_define_and_undef() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let defines = temp.path().join("Defines.inc");
+    let disables = temp.path().join("Disables.inc");
+    let value = temp.path().join("Value.inc");
+    let source = "unit Main;\ninterface\n{$I Defines.inc}\n{$IFDEF ENABLED}\n{$I Value.inc}\n{$ENDIF}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&defines, "{$DEFINE ENABLED}\n").expect("define include");
+    fs::write(&value, "const SharedValue = 1;\n").expect("value include");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let value_uri = Url::from_file_path(&value).expect("value URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(source, "SharedValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            value_uri.clone(),
+            Range::new(Position::new(0, 6), Position::new(0, 17)),
+        )]
+    );
+
+    fs::write(&disables, "{$UNDEF ENABLED}\n").expect("undef include");
+    let undef_source = "unit Main;\ninterface\n{$I Disables.inc}\n{$IFNDEF ENABLED}\n{$I Value.inc}\n{$ENDIF}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    workspace
+        .change_document(root_uri.clone(), undef_source.to_owned(), 2)
+        .expect("change root");
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(undef_source, "SharedValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            value_uri,
+            Range::new(Position::new(0, 6), Position::new(0, 17)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_fails_closed_for_adjacent_unknown_include_activity() {
+    for (name, conditional) in [
+        (
+            "AdjacentUnknown",
+            "{$IFDEF UNKNOWN}{$I Missing.inc}{$ENDIF}\n",
+        ),
+        (
+            "SeparatedUnknown",
+            "{$IFDEF UNKNOWN}\n{$I Missing.inc}\n{$ENDIF}\n",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("Main.pas");
+        let source = format!(
+            "unit {name};\ninterface\nconst RootValue = 1;\n{conditional}implementation\nprocedure Run;\nbegin\n  Log(RootValue);\nend;\nend.\n"
+        );
+        fs::write(&root, &source).expect("root source");
+        let root_uri = Url::from_file_path(&root).expect("root URI");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(root_uri.clone(), source.clone(), 1)
+            .expect("open root");
+
+        assert!(
+            workspace
+                .navigate(
+                    &root_uri,
+                    position_of(&source, "RootValue);", 0),
+                    NavigationTarget::Declaration,
+                )
+                .is_empty(),
+            "unknown include activity must remain incomplete for {name}"
+        );
+    }
+}
+
+#[test]
+fn include_navigation_rejects_owner_discovery_at_and_over_its_bound() {
+    for extra_harmless_owners in [254usize, 255] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let include = root.join("Use.inc");
+        let owner_a = root.join("A.pas");
+        let owner_z = root.join("Z.pas");
+        let owner_source = |unit: &str| {
+            format!(
+                "unit {unit};\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{{$I Use.inc}}\nend;\nend.\n"
+            )
+        };
+        fs::write(&owner_a, owner_source("A")).expect("A source");
+        fs::write(&owner_z, owner_source("Z")).expect("Z source");
+        fs::write(&include, "Log(RootValue);\n").expect("include source");
+        for index in 0..extra_harmless_owners {
+            let path = root.join(format!("M{index:03}.pas"));
+            fs::write(
+                path,
+                format!("unit M{index:03};\ninterface\nimplementation\nend.\n"),
+            )
+            .expect("harmless owner source");
+        }
+
+        let include_uri = Url::from_file_path(&include).expect("include URI");
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let locations = workspace.navigate(
+            &include_uri,
+            position_of("Log(RootValue);\n", "RootValue", 0),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "owner discovery must not treat a bounded subset as unique ({extra_harmless_owners} harmless owners)"
+        );
+    }
+}
+
+#[test]
+fn include_navigation_recovers_its_single_owning_root_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let include = temp.path().join("Use.inc");
+    let root_source = "unit Main;\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let include_source = "Log(RootValue);\n";
+    fs::write(&root, root_source).expect("root source");
+    fs::write(&include, include_source).expect("include source");
+    let include_uri = Url::from_file_path(&include).expect("include URI");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+
+    assert_eq!(
+        workspace.navigate(
+            &include_uri,
+            position_of(include_source, "RootValue", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            root_uri,
+            Range::new(Position::new(2, 6), Position::new(2, 15)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_maps_include_ranges_with_unicode_and_crlf() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("Main.pas");
+    let include = temp.path().join("Shared.inc");
+    let source = "unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    let include_source = "😀\r\nconst SharedValue = 1;\r\n";
+    fs::write(&root, source).expect("root source");
+    fs::write(&include, include_source).expect("include source");
+    let root_uri = Url::from_file_path(&root).expect("root URI");
+    let include_uri = Url::from_file_path(&include).expect("include URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(root_uri.clone(), source.to_owned(), 1)
+        .expect("open root");
+
+    assert_eq!(
+        workspace.navigate(
+            &root_uri,
+            position_of(source, "SharedValue :=", 0),
+            NavigationTarget::Declaration,
+        ),
+        vec![Location::new(
+            include_uri,
+            Range::new(Position::new(1, 6), Position::new(1, 17)),
+        )]
+    );
 }
 
 #[test]
@@ -13246,6 +13527,270 @@ fn document_symbols_survive_parser_recovery_after_valid_declarations() {
     assert!(names.contains(&"VisibleThing"));
 }
 
+#[test]
+fn folding_ranges_cover_multiline_pascal_constructs_without_single_line_noise() {
+    let source_uri = uri("FoldingRanges");
+    let source = "unit FoldingRanges;\ninterface\ntype\n  TRecord = record\n    Value: Integer;\n  end;\n  TWidget = class\n  public\n    procedure Run;\n  end;\nimplementation\nprocedure TWidget.Run;\nbegin\n  if True then\n  begin\n    while True do\n    begin\n    end;\n  end;\nend;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("folding source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("folding ranges are available");
+    let spans = ranges
+        .iter()
+        .map(|range| (range.start_line, range.end_line))
+        .collect::<Vec<_>>();
+    assert!(
+        spans.contains(&(3, 5)),
+        "record declaration is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(6, 9)),
+        "class declaration is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(11, 19)),
+        "routine declaration is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(12, 19)),
+        "outer begin block is foldable: {spans:?}"
+    );
+    assert!(spans.contains(&(13, 18)), "if block is foldable: {spans:?}");
+    assert!(
+        spans.contains(&(15, 17)),
+        "while block is foldable: {spans:?}"
+    );
+    assert!(
+        !spans.contains(&(8, 8)),
+        "single-line declarations are not foldable: {spans:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_include_nested_regions_and_multiline_comments_only() {
+    let source_uri = uri("FoldingCommentsAndRegions");
+    let source = "unit FoldingCommentsAndRegions;\ninterface\nimplementation\nconst Text = '{$REGION not-a-region}';\n{comment text\n  continues}\n{$REGION Outer}\n{$REGION Inner}\nprocedure Run;\nbegin\nend;\n{$ENDREGION}\n{$ENDREGION}\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("comment and region source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("comment and region ranges are available");
+    let comments = ranges
+        .iter()
+        .filter(|range| range.kind == Some(lsp_types::FoldingRangeKind::Comment))
+        .collect::<Vec<_>>();
+    let regions = ranges
+        .iter()
+        .filter(|range| range.kind == Some(lsp_types::FoldingRangeKind::Region))
+        .collect::<Vec<_>>();
+    assert_eq!(comments.len(), 1, "only the real comment folds: {ranges:?}");
+    assert_eq!(comments[0].start_line, 4);
+    assert_eq!(comments[0].end_line, 5);
+    assert_eq!(
+        regions.len(),
+        2,
+        "nested regions must both fold: {ranges:?}"
+    );
+    assert!(
+        regions
+            .iter()
+            .any(|range| (range.start_line, range.end_line) == (6, 12)),
+        "outer region range missing: {regions:?}"
+    );
+    assert!(
+        regions
+            .iter()
+            .any(|range| (range.start_line, range.end_line) == (7, 11)),
+        "inner region range missing: {regions:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_tag_multiline_uses_as_imports() {
+    let source_uri = uri("FoldingImports");
+    let source = "unit FoldingImports;\ninterface\nuses\n  FirstUnit,\n  SecondUnit;\nimplementation\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("uses source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("import folding ranges are available");
+    assert!(
+        ranges.iter().any(|range| {
+            range.kind == Some(lsp_types::FoldingRangeKind::Imports)
+                && (range.start_line, range.end_line) == (2, 4)
+        }),
+        "multiline uses range missing: {ranges:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_preserve_crlf_and_utf16_positions() {
+    let source_uri = uri("FoldingUtf16");
+    let source =
+        "unit FoldingUtf16;\r\ninterface\r\nimplementation\r\n{\r\n  body\r\n  😀}\r\nend.\r\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("CRLF comment source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("CRLF comment ranges are available");
+    let comment = ranges
+        .iter()
+        .find(|range| range.kind == Some(lsp_types::FoldingRangeKind::Comment))
+        .expect("multiline comment range");
+    assert_eq!(
+        (
+            comment.start_line,
+            comment.start_character,
+            comment.end_line,
+            comment.end_character,
+        ),
+        (3, Some(0), 5, Some(5))
+    );
+}
+
+#[test]
+fn folding_ranges_cover_try_and_case_blocks() {
+    let source_uri = uri("FoldingTryCase");
+    let source = "unit FoldingTryCase;\ninterface\nimplementation\nprocedure Run;\nbegin\n  try\n    case Value of\n      1:\n      begin\n      end;\n    else\n      Value := 2;\n    end;\n  finally\n    Value := 3;\n  end;\nend;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("try/case source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("try/case ranges are available");
+    let spans = ranges
+        .iter()
+        .map(|range| (range.start_line, range.end_line))
+        .collect::<Vec<_>>();
+    assert!(spans.contains(&(5, 15)), "try block is foldable: {spans:?}");
+    assert!(
+        spans.contains(&(6, 12)),
+        "case block is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(8, 9)),
+        "case arm block is foldable: {spans:?}"
+    );
+}
+
+#[test]
+fn folding_ranges_do_not_cross_inactive_or_unknown_conditional_text() {
+    let source_uri = uri("FoldingConditionals");
+    let source = "unit FoldingConditionals;\ninterface\nimplementation\n{$IFDEF HIDDEN}\nprocedure Hidden;\nbegin\nend;\n{$ENDIF}\nprocedure Visible;\nbegin\nend;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("conditional source parses");
+
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("conditional folding ranges are available");
+    assert!(
+        ranges.iter().all(|range| range.start_line >= 8),
+        "inactive procedure must not produce a range: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|range| (range.start_line, range.end_line) == (8, 10)),
+        "active procedure remains foldable: {ranges:?}"
+    );
+
+    let malformed_uri = uri("FoldingMalformedConditional");
+    let malformed = "unit FoldingMalformedConditional;\ninterface\nimplementation\n{$IFDEF HIDDEN}\nprocedure Hidden;\nbegin\nend;\n";
+    index
+        .update(malformed_uri.clone(), malformed.to_owned())
+        .expect("malformed conditional source parses");
+    assert!(
+        index
+            .folding_ranges(&malformed_uri)
+            .expect("malformed conditional ranges are available")
+            .is_empty(),
+        "malformed conditional text must not create speculative ranges"
+    );
+}
+
+#[test]
+fn folding_ranges_include_unit_lifecycle_sections_and_ignore_unmatched_regions() {
+    let source_uri = uri("FoldingSections");
+    let source = "unit FoldingSections;\ninterface\nimplementation\ninitialization\n  StartUp;\nfinalization\n  ShutDown;\nend.\n";
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("lifecycle source parses");
+    let ranges = index
+        .folding_ranges(&source_uri)
+        .expect("lifecycle ranges are available");
+    let spans = ranges
+        .iter()
+        .map(|range| (range.start_line, range.end_line))
+        .collect::<Vec<_>>();
+    assert!(
+        spans.contains(&(3, 4)),
+        "initialization section is foldable: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(5, 6)),
+        "finalization section is foldable: {spans:?}"
+    );
+
+    let malformed_uri = uri("FoldingUnmatchedRegion");
+    let malformed = "unit FoldingUnmatchedRegion;\ninterface\nimplementation\n{$REGION never-closed}\nprocedure Run;\nbegin\nend;\nend.\n";
+    index
+        .update(malformed_uri.clone(), malformed.to_owned())
+        .expect("unmatched region source parses");
+    assert!(
+        index
+            .folding_ranges(&malformed_uri)
+            .expect("unmatched region ranges are available")
+            .iter()
+            .all(|range| range.kind != Some(lsp_types::FoldingRangeKind::Region)),
+        "unmatched regions must not produce speculative ranges"
+    );
+}
+
+#[test]
+fn folding_ranges_reject_excessive_syntax_depth() {
+    let source_uri = uri("FoldingDepth");
+    let depth = 160;
+    let mut source =
+        String::from("unit FoldingDepth;\ninterface\nimplementation\nprocedure Run;\nbegin\n");
+    for _ in 0..depth {
+        source.push_str("if True then begin\n");
+    }
+    for _ in 0..depth {
+        source.push_str("end;\n");
+    }
+    source.push_str("end;\nend.\n");
+
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source)
+        .expect("deep folding source parses");
+    let error = index
+        .folding_ranges(&source_uri)
+        .expect_err("excessive folding depth must fail closed");
+    assert!(
+        error.contains("folding syntax hierarchy"),
+        "unexpected folding depth error: {error}"
+    );
+}
+
 fn deeply_nested_symbol_source(depth: usize) -> String {
     let mut source = String::from("unit DeepSymbols;\ninterface\nimplementation\nprocedure P0;\n");
     for index in 1..depth {
@@ -13805,6 +14350,465 @@ end.
             .is_none(),
         "strings must not produce hover content"
     );
+}
+
+#[test]
+fn hover_includes_adjacent_xml_documentation_for_the_resolved_declaration() {
+    let source = r#"unit DocumentationHover;
+interface
+/// <summary>Returns <c>the value</c> for <paramref name="Name"/>.</summary>
+function ValueFor(Name: string): Integer;
+implementation
+function ValueFor(Name: string): Integer;
+begin
+  Result := 1;
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationHover");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("documentation source parses");
+
+    let hover = index
+        .hover(&source_uri, position_of(source, "ValueFor", 0))
+        .expect("documented declaration hover");
+
+    assert_eq!(
+        hover_text(&hover),
+        "`DocumentationHover`\n\n```pascal\nfunction ValueFor(Name: string): Integer;\n```\n\nReturns `the value` for `Name`."
+    );
+}
+
+#[test]
+fn completion_includes_markdown_documentation_for_the_resolved_declaration() {
+    let source = r#"unit DocumentationCompletion;
+interface
+/// <summary>Returns <c>the value</c>.</summary>
+function ValueFor(Name: string): Integer;
+procedure Caller;
+implementation
+function ValueFor(Name: string): Integer;
+begin
+  Result := 1;
+end;
+procedure Caller;
+begin
+  Val
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationCompletion");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("completion documentation source parses");
+
+    let completion = index
+        .completion(&source_uri, position_after(source, "  Val", 0))
+        .expect("documented completion");
+    let item = completion
+        .items
+        .iter()
+        .find(|item| item.label == "ValueFor")
+        .expect("documented function completion item");
+
+    assert_eq!(
+        item.documentation,
+        Some(LspDocumentation::MarkupContent(lsp_types::MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "Returns `the value`.".to_owned(),
+        }))
+    );
+}
+
+#[test]
+fn signature_help_includes_markdown_summary_and_parameter_documentation() {
+    let source = r#"unit DocumentationSignature;
+interface
+/// <summary>Returns <c>the value</c>.</summary>
+/// <param name="Name">The lookup name.</param>
+/// <returns>The integer result.</returns>
+function ValueFor(Name: string): Integer;
+procedure Caller;
+implementation
+function ValueFor(Name: string): Integer;
+begin
+  Result := 1;
+end;
+procedure Caller;
+begin
+  ValueFor('text' );
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationSignature");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("signature documentation source parses");
+
+    let signature = index
+        .signature_help(&source_uri, position_after(source, "ValueFor('text' ", 0))
+        .expect("documented signature help")
+        .expect("documented signature");
+    assert_eq!(signature.signatures.len(), 1);
+    assert_eq!(
+        signature.signatures[0].documentation,
+        Some(LspDocumentation::MarkupContent(lsp_types::MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "Returns `the value`.\n\n**Returns**\n\nThe integer result.".to_owned(),
+        }))
+    );
+    assert_eq!(
+        signature.signatures[0].parameters.as_ref().unwrap()[0].documentation,
+        Some(LspDocumentation::MarkupContent(lsp_types::MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "The lookup name.".to_owned(),
+        }))
+    );
+}
+
+#[test]
+fn documentation_pairs_declarations_and_definitions_without_crossing_overloads() {
+    let source = r#"unit DocumentationPairing;
+interface
+/// <summary>Integer declaration.</summary>
+function Pick(Value: Integer): Integer; overload;
+function Fallback(Value: Integer): Integer;
+/// <summary>String declaration.</summary>
+function Pick(Value: string): string; overload;
+implementation
+/// <summary>Integer implementation.</summary>
+function Pick(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+/// <summary>Fallback implementation.</summary>
+function Fallback(Value: Integer): Integer;
+begin
+  Result := Value;
+end;
+/// <summary>String implementation.</summary>
+function Pick(Value: string): string;
+begin
+  Result := Value;
+end;
+procedure Caller;
+begin
+  Pick(1);
+  Fallback(1);
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationPairing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("documentation pairing source parses");
+
+    let pick = index
+        .hover(&source_uri, position_of(source, "Pick(1)", 0))
+        .expect("overload documentation hover");
+    let pick_text = hover_text(&pick);
+    assert!(pick_text.contains("Integer declaration."), "{pick_text}");
+    assert!(pick_text.contains("String declaration."), "{pick_text}");
+    assert!(
+        !pick_text.contains("Integer implementation."),
+        "{pick_text}"
+    );
+    assert!(!pick_text.contains("String implementation."), "{pick_text}");
+
+    let fallback = index
+        .hover(&source_uri, position_of(source, "Fallback(1)", 0))
+        .expect("implementation fallback hover");
+    let fallback_text = hover_text(&fallback);
+    assert!(
+        fallback_text.contains("Fallback implementation."),
+        "{fallback_text}"
+    );
+}
+
+#[test]
+fn documentation_attaches_to_types_fields_and_properties() {
+    let source = r#"unit DocumentationMembers;
+interface
+type
+  /// <summary>Widget type.</summary>
+  TWidget = class
+    /// <summary>Stored field.</summary>
+    Field: Integer;
+    /// <summary>Visible property.</summary>
+    property Name: string;
+  end;
+procedure Caller;
+implementation
+procedure Caller;
+var
+  Widget: TWidget;
+begin
+  Widget.Field := 1;
+  Widget.Name := 'widget';
+end;
+end.
+"#;
+    let source_uri = uri("DocumentationMembers");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("documented members source parses");
+
+    let type_hover = index
+        .hover(&source_uri, position_of(source, "TWidget", 1))
+        .expect("type documentation hover");
+    assert!(hover_text(&type_hover).contains("Widget type."));
+
+    let field_hover = index
+        .hover(&source_uri, position_of(source, "Field", 1))
+        .expect("field documentation hover");
+    assert!(hover_text(&field_hover).contains("Stored field."));
+
+    let property_hover = index
+        .hover(&source_uri, position_of(source, "Name", 1))
+        .expect("property documentation hover");
+    assert!(hover_text(&property_hover).contains("Visible property."));
+}
+
+#[test]
+fn documentation_license_markers_reject_whole_groups_and_keep_next_group() {
+    let cases = [
+        (
+            "line-first",
+            "/// Copyright 2026\n/// <summary>Permission granted to redistribute this file.</summary>\n/// <remarks>Line group.</remarks>",
+        ),
+        (
+            "line-middle",
+            "/// <summary>Line group.</summary>\n/// Copyright 2026\n/// <remarks>Permission granted to redistribute this file.</remarks>",
+        ),
+        (
+            "line-last",
+            "/// <summary>Line group.</summary>\n/// <remarks>Permission granted to redistribute this file.</remarks>\n/// Copyright 2026",
+        ),
+        (
+            "block-first",
+            "(* Copyright 2026\n   <summary>Permission granted to redistribute this file.</summary>\n   <remarks>Block group.</remarks> *)",
+        ),
+        (
+            "block-middle",
+            "(* <summary>Block group.</summary>\n   Copyright 2026\n   <remarks>Permission granted to redistribute this file.</remarks> *)",
+        ),
+        (
+            "block-last",
+            "(* <summary>Block group.</summary>\n   <remarks>Permission granted to redistribute this file.</remarks>\n   Copyright 2026 *)",
+        ),
+    ];
+
+    for (index, (label, comment)) in cases.into_iter().enumerate() {
+        let unit = format!("LicenseGroup{index}");
+        let source = format!(
+            "unit {unit};\ninterface\n{comment}\nprocedure Run;\n/// <summary>Separate next declaration.</summary>\nprocedure Next;\nimplementation\nprocedure Run;\nbegin\nend;\nprocedure Next;\nbegin\nend;\nend.\n"
+        );
+        let source_uri = uri(&unit);
+        let mut index = NavigationIndex::new();
+        index
+            .update(source_uri.clone(), source.clone())
+            .unwrap_or_else(|error| panic!("{label} source parses: {error}"));
+
+        let run_hover = index
+            .hover(&source_uri, position_of(&source, "Run", 0))
+            .unwrap_or_else(|| panic!("{label} Run hover"));
+        let run_text = hover_text(&run_hover);
+        assert!(
+            !run_text.contains("Permission granted"),
+            "{label}: {run_text}"
+        );
+
+        let next_hover = index
+            .hover(&source_uri, position_of(&source, "Next", 0))
+            .unwrap_or_else(|| panic!("{label} Next hover"));
+        assert!(
+            hover_text(&next_hover).contains("Separate next declaration."),
+            "{label}: {}",
+            hover_text(&next_hover)
+        );
+    }
+}
+
+#[test]
+fn documentation_pairing_keeps_generic_and_nongeneric_overloads_distinct() {
+    let source = r#"unit GenericDocumentationPairing;
+interface
+function Pick: Integer; overload;
+function Pick<T>: T; overload;
+implementation
+/// <summary>Generic implementation.</summary>
+function Pick<T>: T;
+begin
+  Result := Default(T);
+end;
+procedure Caller;
+begin
+  Pick<Integer>;
+end;
+end.
+"#;
+    let source_uri = uri("GenericDocumentationPairing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic documentation pairing source parses");
+
+    let generic_hover = index
+        .hover(&source_uri, position_of(source, "Pick<T>", 0))
+        .expect("generic documentation hover");
+    let generic_text = hover_text(&generic_hover);
+    assert!(
+        generic_text.contains("Generic implementation."),
+        "{generic_text}"
+    );
+    assert!(!generic_text.contains("Non-generic"), "{generic_text}");
+
+    let nongeneric_hover = index
+        .hover(&source_uri, position_of(source, "Pick: Integer", 0))
+        .expect("non-generic documentation hover");
+    let nongeneric_text = hover_text(&nongeneric_hover);
+    assert!(
+        !nongeneric_text.contains("Generic implementation."),
+        "{nongeneric_text}"
+    );
+}
+
+#[test]
+fn generic_method_constraint_pairing_supports_omitted_and_repeated_constraints() {
+    let source = r#"unit GenericMethodConstraintPairing;
+interface
+type
+  TBase = class
+  end;
+  TFoo = class
+    /// <summary>Class-constrained declaration.</summary>
+    procedure Pick<T: class>;
+    /// <summary>Named-constrained declaration.</summary>
+    procedure PickBase<T: TBase>;
+    /// <summary>Repeated class declaration.</summary>
+    procedure Keep<T: class>; overload;
+    /// <summary>Repeated named declaration.</summary>
+    procedure Keep<T: TBase>; overload;
+    /// <summary>Ambiguous class declaration.</summary>
+    procedure Ambiguous<T: class>; overload;
+    /// <summary>Ambiguous named declaration.</summary>
+    procedure Ambiguous<T: TBase>; overload;
+  end;
+implementation
+procedure TFoo.Pick<T>;
+begin
+end;
+procedure TFoo.PickBase<T>;
+begin
+end;
+procedure TFoo.Keep<T: class>;
+begin
+end;
+procedure TFoo.Keep<T: TBase>;
+begin
+end;
+procedure TFoo.Ambiguous<T>;
+begin
+end;
+end.
+"#;
+    let source_uri = uri("GenericMethodConstraintPairing");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic method constraint source parses");
+
+    for (declaration, implementation, documentation) in [
+        (
+            "Pick<T: class>",
+            "Pick<T>;",
+            "Class-constrained declaration.",
+        ),
+        (
+            "PickBase<T: TBase>",
+            "PickBase<T>;",
+            "Named-constrained declaration.",
+        ),
+    ] {
+        let declaration_position = position_of(source, declaration, 0);
+        let implementation_position = position_of(source, implementation, 0);
+        let hover = index
+            .hover(&source_uri, implementation_position)
+            .expect("omitted-constraint implementation hover");
+        assert!(
+            hover_text(&hover).contains(documentation),
+            "{declaration}: {}",
+            hover_text(&hover)
+        );
+        for target in [
+            NavigationTarget::Definition,
+            NavigationTarget::Implementation,
+        ] {
+            let locations = index.navigate(&source_uri, declaration_position, target);
+            assert_eq!(
+                locations.len(),
+                1,
+                "{declaration} {target:?}: {locations:?}"
+            );
+            assert_location_start(&locations[0], &source_uri, implementation_position);
+        }
+    }
+
+    for (declaration, implementation, documentation) in [
+        (
+            "Keep<T: class>",
+            "Keep<T: class>;",
+            "Repeated class declaration.",
+        ),
+        (
+            "Keep<T: TBase>",
+            "Keep<T: TBase>;",
+            "Repeated named declaration.",
+        ),
+    ] {
+        let declaration_position = position_of(source, declaration, 0);
+        let implementation_position = position_of(source, implementation, 1);
+        let hover = index
+            .hover(&source_uri, implementation_position)
+            .expect("repeated-constraint implementation hover");
+        assert!(
+            hover_text(&hover).contains(documentation),
+            "{declaration}: {}",
+            hover_text(&hover)
+        );
+        for target in [
+            NavigationTarget::Definition,
+            NavigationTarget::Implementation,
+        ] {
+            let locations = index.navigate(&source_uri, declaration_position, target);
+            assert_eq!(
+                locations.len(),
+                1,
+                "{declaration} {target:?}: {locations:?}"
+            );
+            assert_location_start(&locations[0], &source_uri, implementation_position);
+        }
+    }
+
+    for declaration in ["Ambiguous<T: class>", "Ambiguous<T: TBase>"] {
+        let locations = index.navigate(
+            &source_uri,
+            position_of(source, declaration, 0),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(locations.len(), 1, "{declaration}: {locations:?}");
+        assert!(
+            !locations.iter().any(|location| {
+                location.range.start == position_of(source, "Ambiguous<T>;", 0)
+            })
+        );
+    }
 }
 
 #[test]

@@ -28,8 +28,11 @@ overload model, not a parallel compiler. It covers assignments and bound
 routine-call arguments whose types are proven from source, built-in literals,
 safe numeric widening, character/string conversion, `nil` to class/interface
 references, pointers, callable types, and dynamic arrays, class/interface
-upcasts with known ancestry, indexed/dereferenced writable elements, and
-exact writable `var`/`out` arguments.
+upcasts with known ancestry, proven indexed/dereferenced addressed storage,
+proven default-property result types, and exact writable `var`/`out` arguments.
+Direct property expressions are not proven writable, while proven pointer
+targets and dynamic-array elements retain their addressed-storage semantics;
+unsupported property storage and unresolved index children remain unknown.
 Grouped parameters and omitted defaults are honored.
 An overload call is diagnosed only when every applicable retained candidate is
 proven incompatible; one compatible, ambiguous, unsupported, or uncertain
@@ -48,6 +51,7 @@ diagnostics. The new codes are:
 Aliases whose target type is not proven, unresolved by-reference identities,
 non-`nil` pointer/variant/anonymous callable conversions, enum/record
 compatibility beyond retained identity, unmodeled record operators,
+unsupported default-property storage relationships,
 compiler-dependent conversions, conditional or parser-recovery states,
 unresolved values, and incomplete imports/receivers/helpers/ancestry remain
 silent. A mismatch is not published merely because an unresolved implicit

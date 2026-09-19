@@ -31,6 +31,7 @@ struct ArgumentInfo {
     span: Span,
     ty: Option<TypeIdentity>,
     writability: Writability,
+    storage: StorageProvenance,
     nil_literal: bool,
 }
 
@@ -39,6 +40,21 @@ enum Writability {
     Writable,
     NonWritable,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageProvenance {
+    Direct,
+    Property,
+    Addressed,
+    Value,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElementInference {
+    identity: TypeIdentity,
+    default_property: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1339,6 +1355,7 @@ fn infer_argument(
             span: argument_span,
             ty: Some(ty),
             writability: Writability::NonWritable,
+            storage: StorageProvenance::Value,
             nil_literal: false,
         });
     }
@@ -1362,6 +1379,7 @@ fn infer_argument(
                 },
             )),
             writability: Writability::NonWritable,
+            storage: StorageProvenance::Value,
             nil_literal: false,
         });
     }
@@ -1370,6 +1388,7 @@ fn infer_argument(
             span: argument_span,
             ty: Some(TypeIdentity::Builtin(BuiltinType::Boolean)),
             writability: Writability::NonWritable,
+            storage: StorageProvenance::Value,
             nil_literal: false,
         });
     }
@@ -1378,6 +1397,7 @@ fn infer_argument(
             span: argument_span,
             ty: None,
             writability: Writability::NonWritable,
+            storage: StorageProvenance::Value,
             nil_literal: true,
         });
     }
@@ -1402,25 +1422,32 @@ fn infer_argument(
             cancel,
             budget,
         )?;
-        let ty = element_type_for_expression(
+        let element = element_type_for_expression(
             index,
             current_uri,
             current_document,
             operand,
+            None,
             state,
             depth.saturating_add(1),
             cancel,
             budget,
         )?;
-        let writability = if ty.is_some() {
-            base.writability
+        let ty = element.as_ref().map(|element| element.identity.clone());
+        let storage = if ty.is_some() && is_pointer_identity(base.ty.as_ref()) {
+            StorageProvenance::Addressed
         } else {
-            Writability::Unknown
+            StorageProvenance::Unknown
         };
         return Ok(ArgumentInfo {
             span: argument_span,
             ty,
-            writability,
+            writability: if storage == StorageProvenance::Addressed {
+                Writability::Writable
+            } else {
+                Writability::Unknown
+            },
+            storage,
             nil_literal: false,
         });
     }
@@ -1428,6 +1455,18 @@ fn infer_argument(
         let Some(entity) = node.child_by_field_name("entity") else {
             return Ok(unknown_argument(argument_span));
         };
+        if !subscript_children_are_proven(
+            index,
+            current_uri,
+            current_document,
+            node,
+            state,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )? {
+            return Ok(unknown_argument(argument_span));
+        }
         let base = infer_argument(
             index,
             current_uri,
@@ -1438,25 +1477,24 @@ fn infer_argument(
             cancel,
             budget,
         )?;
-        let ty = element_type_for_expression(
+        let element = element_type_for_expression(
             index,
             current_uri,
             current_document,
             entity,
+            node.child_by_field_name("args"),
             state,
             depth.saturating_add(1),
             cancel,
             budget,
         )?;
-        let writability = if ty.is_some() {
-            base.writability
-        } else {
-            Writability::Unknown
-        };
+        let ty = element.as_ref().map(|element| element.identity.clone());
+        let (writability, storage) = subscript_storage_provenance(&base, element.as_ref());
         return Ok(ArgumentInfo {
             span: argument_span,
             ty,
             writability,
+            storage,
             nil_literal: false,
         });
     }
@@ -1479,6 +1517,11 @@ fn infer_argument(
                 Writability::NonWritable
             } else {
                 Writability::Unknown
+            },
+            storage: if ty.is_some() {
+                StorageProvenance::Value
+            } else {
+                StorageProvenance::Unknown
             },
             ty,
             nil_literal: false,
@@ -1506,6 +1549,7 @@ fn infer_argument(
             span: argument_span,
             ty: None,
             writability: Writability::Unknown,
+            storage: StorageProvenance::Unknown,
             nil_literal: false,
         });
     }
@@ -1514,6 +1558,7 @@ fn infer_argument(
             span: argument_span,
             ty: None,
             writability: Writability::Unknown,
+            storage: StorageProvenance::Unknown,
             nil_literal: false,
         });
     }
@@ -1523,6 +1568,9 @@ fn infer_argument(
     let mut binding_unknown = false;
     let mut writable = false;
     let mut non_writable = false;
+    let mut direct_storage = false;
+    let mut property_storage = false;
+    let mut value_storage = false;
     for candidate in candidates {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -1533,6 +1581,7 @@ fn infer_argument(
         };
         if is_assignable_symbol(symbol) {
             writable = true;
+            direct_storage = true;
         } else if matches!(
             symbol.kind,
             SymbolKind::Constant
@@ -1542,6 +1591,11 @@ fn infer_argument(
                 | SymbolKind::Property
         ) {
             non_writable = true;
+            if symbol.kind == SymbolKind::Property {
+                property_storage = true;
+            } else {
+                value_storage = true;
+            }
         } else {
             binding_unknown = true;
         }
@@ -1578,6 +1632,21 @@ fn infer_argument(
     } else {
         Writability::Unknown
     };
+    let result_storage =
+        identifier_is_result && !binding_unknown && !property_storage && !value_storage;
+    let storage = if binding_unknown
+        || (direct_storage as u8 + property_storage as u8 + value_storage as u8 > 1)
+    {
+        StorageProvenance::Unknown
+    } else if direct_storage || result_storage {
+        StorageProvenance::Direct
+    } else if property_storage {
+        StorageProvenance::Property
+    } else if value_storage {
+        StorageProvenance::Value
+    } else {
+        StorageProvenance::Unknown
+    };
     Ok(ArgumentInfo {
         span: argument_span,
         ty: if !unknown && identities.len() == 1 {
@@ -1586,6 +1655,7 @@ fn infer_argument(
             None
         },
         writability,
+        storage,
         nil_literal: false,
     })
 }
@@ -1595,12 +1665,13 @@ fn unknown_argument(span: Span) -> ArgumentInfo {
         span,
         ty: None,
         writability: Writability::Unknown,
+        storage: StorageProvenance::Unknown,
         nil_literal: false,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn element_type_for_expression(
+fn subscript_children_are_proven(
     index: &NavigationIndex,
     current_uri: &Url,
     current_document: &Document,
@@ -1609,7 +1680,101 @@ fn element_type_for_expression(
     depth: usize,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<Option<TypeIdentity>, String> {
+) -> Result<bool, String> {
+    if depth >= super::MAX_RECEIVER_RECURSION_DEPTH {
+        return Ok(false);
+    }
+    let Some(arguments) = node.child_by_field_name("args") else {
+        return Ok(false);
+    };
+    budget.require_work(arguments.named_child_count(), cancel)?;
+    for child in (0..arguments.named_child_count()).filter_map(|index| arguments.named_child(index))
+    {
+        check_navigation_cancel(cancel)?;
+        if child.kind() == "legacyFormat" {
+            continue;
+        }
+        let info = infer_argument(
+            index,
+            current_uri,
+            current_document,
+            child,
+            state,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )?;
+        #[cfg(test)]
+        super::test_cancel_after_semantic_subscript_child_if_requested(cancel);
+        check_navigation_cancel(cancel)?;
+        if info.ty.is_none() || info.nil_literal {
+            return Ok(false);
+        }
+        if state_has_uncertainty(state) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn type_identity_kind(identity: Option<&TypeIdentity>) -> Option<TypeKind> {
+    match identity {
+        Some(TypeIdentity::Named { kind, .. }) => Some(*kind),
+        Some(TypeIdentity::Builtin(_)) | Some(TypeIdentity::IntegerLiteral(_)) | None => None,
+    }
+}
+
+fn is_pointer_identity(identity: Option<&TypeIdentity>) -> bool {
+    type_identity_kind(identity) == Some(TypeKind::Pointer)
+}
+
+fn subscript_storage_provenance(
+    base: &ArgumentInfo,
+    element: Option<&ElementInference>,
+) -> (Writability, StorageProvenance) {
+    let Some(element) = element else {
+        return (Writability::Unknown, StorageProvenance::Unknown);
+    };
+    if element.default_property {
+        return (Writability::Unknown, StorageProvenance::Property);
+    }
+    let result = match type_identity_kind(base.ty.as_ref()) {
+        Some(TypeKind::DynamicArray) => match base.storage {
+            StorageProvenance::Direct
+            | StorageProvenance::Addressed
+            | StorageProvenance::Property => (Writability::Writable, StorageProvenance::Addressed),
+            StorageProvenance::Value => (Writability::Unknown, StorageProvenance::Unknown),
+            StorageProvenance::Unknown => (Writability::Unknown, StorageProvenance::Unknown),
+        },
+        Some(TypeKind::Array) => match base.storage {
+            StorageProvenance::Direct | StorageProvenance::Addressed => {
+                (Writability::Writable, StorageProvenance::Addressed)
+            }
+            StorageProvenance::Property => (Writability::Unknown, StorageProvenance::Unknown),
+            StorageProvenance::Value | StorageProvenance::Unknown => {
+                (Writability::Unknown, StorageProvenance::Unknown)
+            }
+        },
+        Some(TypeKind::Class) | Some(TypeKind::Interface) | Some(TypeKind::Other) => {
+            (Writability::Unknown, StorageProvenance::Unknown)
+        }
+        _ => (Writability::Unknown, StorageProvenance::Unknown),
+    };
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn element_type_for_expression(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    current_document: &Document,
+    node: Node<'_>,
+    access_arguments: Option<Node<'_>>,
+    state: &mut ResolutionState,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<ElementInference>, String> {
     if depth >= super::MAX_RECEIVER_RECURSION_DEPTH {
         return Ok(None);
     }
@@ -1642,7 +1807,7 @@ fn element_type_for_expression(
         let Some(shape) = symbol.type_shape.as_ref() else {
             return Ok(None);
         };
-        let identity = shape_element_identity(
+        let Some(identity) = shape_element_identity(
             index,
             &candidate,
             symbol,
@@ -1651,8 +1816,12 @@ fn element_type_for_expression(
             cancel,
             budget,
             &mut HashSet::new(),
-        )?;
-        let Some(identity) = identity else {
+            access_arguments,
+            current_uri,
+            current_document,
+            node.start_byte(),
+        )?
+        else {
             return Ok(None);
         };
         if result.as_ref().is_some_and(|current| current != &identity) {
@@ -1661,6 +1830,148 @@ fn element_type_for_expression(
         result = Some(identity);
     }
     Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn default_property_result_type(
+    index: &NavigationIndex,
+    instance: &TypeInstance,
+    access_arguments: Option<Node<'_>>,
+    current_uri: &Url,
+    current_document: &Document,
+    offset: usize,
+    state: &mut ResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TypeIdentity>, String> {
+    let Some(access_arguments) = access_arguments else {
+        return Ok(None);
+    };
+    check_navigation_cancel(cancel)?;
+    budget.require_work(access_arguments.named_child_count(), cancel)?;
+    let mut actual_index_count: usize = 0;
+    for index in 0..access_arguments.named_child_count() {
+        check_navigation_cancel(cancel)?;
+        if access_arguments
+            .named_child(index)
+            .is_some_and(|child| child.kind() != "legacyFormat")
+        {
+            actual_index_count = actual_index_count.saturating_add(1);
+        }
+    }
+    let allow_implementation = instance.uri == *current_uri
+        && matches!(
+            current_document.region_at(offset),
+            Region::Implementation | Region::Other
+        );
+    let lookup = index.member_candidates_for_type_in_context_with_budget(
+        current_uri,
+        current_document,
+        offset,
+        &instance.uri,
+        &instance.key,
+        instance.scope,
+        &instance.substitution,
+        None,
+        allow_implementation,
+        cancel,
+        budget,
+    )?;
+    if !lookup.ancestry_known || !lookup.ambiguous_names.is_empty() {
+        return Ok(None);
+    }
+    let mut properties = Vec::new();
+    for member in lookup.candidates {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(member_symbol) = index.symbol(&member) else {
+            return Ok(None);
+        };
+        if member_symbol.kind == SymbolKind::Property
+            && property_is_default_indexed(index, &member, actual_index_count, cancel, budget)?
+        {
+            properties.push(member);
+        }
+    }
+    let Some(property) = properties.first().filter(|_| properties.len() == 1) else {
+        return Ok(None);
+    };
+    let Some(property_symbol) = index.symbol(property) else {
+        return Ok(None);
+    };
+    symbol_type(
+        index,
+        property,
+        property_symbol,
+        &instance.substitution,
+        state,
+        cancel,
+        budget,
+    )
+}
+
+fn property_is_default_indexed(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    actual_index_count: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    let Some(document) = index.documents.get(&candidate.uri) else {
+        return Ok(false);
+    };
+    let Some(symbol) = index.symbol(candidate) else {
+        return Ok(false);
+    };
+    let Some(node) = document.tree.root_node().named_descendant_for_byte_range(
+        symbol.declaration_span.start,
+        symbol.declaration_span.end,
+    ) else {
+        return Ok(false);
+    };
+    let mut declaration = node;
+    while declaration.kind() != "declProp" {
+        let Some(parent) = declaration.parent() else {
+            return Ok(false);
+        };
+        declaration = parent;
+    }
+    let Some(arguments) = declaration.child_by_field_name("args") else {
+        return Ok(false);
+    };
+    budget.require_work(arguments.named_child_count(), cancel)?;
+    let mut declared_index_count: usize = 0;
+    for index in 0..arguments.named_child_count() {
+        check_navigation_cancel(cancel)?;
+        if arguments
+            .named_child(index)
+            .is_some_and(|child| child.kind() == "declArg")
+        {
+            declared_index_count = declared_index_count.saturating_add(1);
+        }
+    }
+    if declared_index_count != actual_index_count {
+        return Ok(false);
+    }
+    let mut pending = vec![declaration];
+    while let Some(current) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if current.kind() == "kDefault" {
+            return Ok(true);
+        }
+        let mut cursor = current.walk();
+        pending.extend(
+            current
+                .children(&mut cursor)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev(),
+        );
+    }
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1673,11 +1984,19 @@ fn shape_element_identity(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
     visited: &mut HashSet<(Url, String)>,
-) -> Result<Option<TypeIdentity>, String> {
+    access_arguments: Option<Node<'_>>,
+    current_uri: &Url,
+    current_document: &Document,
+    offset: usize,
+) -> Result<Option<ElementInference>, String> {
     match shape {
-        TypeShape::Pointer(element) | TypeShape::Array { element, .. } => {
-            scalar_identity_from_shape(index, candidate, symbol, element, state, cancel, budget)
-        }
+        TypeShape::Pointer(element) | TypeShape::Array { element, .. } => Ok(
+            scalar_identity_from_shape(index, candidate, symbol, element, state, cancel, budget)?
+                .map(|identity| ElementInference {
+                    identity,
+                    default_property: false,
+                }),
+        ),
         TypeShape::Named(type_ref) => {
             let Some(document) = index.documents.get(&candidate.uri) else {
                 return Ok(None);
@@ -1708,20 +2027,35 @@ fn shape_element_identity(
                 return Ok(None);
             };
             match receiver {
-                Receiver::Builtin(builtin) => Ok(Some(TypeIdentity::Builtin(builtin))),
-                Receiver::IntegerLiteral(value) => Ok(Some(TypeIdentity::IntegerLiteral(value))),
+                Receiver::Builtin(builtin) if builtin == BuiltinType::String => {
+                    Ok(Some(ElementInference {
+                        identity: TypeIdentity::Builtin(builtin),
+                        default_property: false,
+                    }))
+                }
+                Receiver::Builtin(_) => Ok(None),
+                Receiver::IntegerLiteral(_) => Ok(None),
                 Receiver::Type(instance) => {
-                    let identity = TypeIdentity::Named {
-                        uri: instance.uri.clone(),
-                        key: instance.key.clone(),
-                        kind: instance.kind,
-                        args: instance
-                            .parameter_names
-                            .iter()
-                            .filter_map(|name| instance.substitution.get(name))
-                            .filter_map(super::type_identity_from_resolved_type)
-                            .collect(),
-                    };
+                    if matches!(
+                        instance.kind,
+                        TypeKind::Class | TypeKind::Interface | TypeKind::Record
+                    ) {
+                        return Ok(default_property_result_type(
+                            index,
+                            &instance,
+                            access_arguments,
+                            current_uri,
+                            current_document,
+                            offset,
+                            state,
+                            cancel,
+                            budget,
+                        )?
+                        .map(|identity| ElementInference {
+                            identity,
+                            default_property: true,
+                        }));
+                    }
                     if !matches!(
                         instance.kind,
                         TypeKind::Pointer
@@ -1730,7 +2064,7 @@ fn shape_element_identity(
                             | TypeKind::Callable
                             | TypeKind::Other
                     ) {
-                        return Ok(Some(identity));
+                        return Ok(None);
                     }
                     let key = (instance.uri.clone(), instance.key.clone());
                     if !visited.insert(key) {
@@ -1764,6 +2098,10 @@ fn shape_element_identity(
                         cancel,
                         budget,
                         visited,
+                        access_arguments,
+                        current_uri,
+                        current_document,
+                        offset,
                     )
                 }
                 Receiver::Unit(_) => Ok(None),

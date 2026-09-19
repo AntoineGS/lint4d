@@ -59,6 +59,7 @@ thread_local! {
     static TEST_SEMANTIC_GENERIC_SYMBOL_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_ANCESTRY_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY: Cell<bool> = const { Cell::new(false) };
+    static TEST_CANCEL_AFTER_SEMANTIC_SUBSCRIPT_CHILD: Cell<bool> = const { Cell::new(false) };
     static TEST_DOCUMENT_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -162,6 +163,34 @@ fn test_record_semantic_ancestry_visit() {
 fn test_cancel_after_semantic_ancestry_if_requested(cancel: &AtomicBool) {
     if TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(Cell::get) && test_semantic_ancestry_visits() > 0 {
         TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(|enabled| enabled.set(false));
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+struct TestSemanticSubscriptCancellationGuard(bool);
+
+#[cfg(test)]
+fn test_cancel_after_semantic_subscript_child() -> TestSemanticSubscriptCancellationGuard {
+    let previous = TEST_CANCEL_AFTER_SEMANTIC_SUBSCRIPT_CHILD.with(|enabled| {
+        let previous = enabled.get();
+        enabled.set(true);
+        previous
+    });
+    TestSemanticSubscriptCancellationGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestSemanticSubscriptCancellationGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_AFTER_SEMANTIC_SUBSCRIPT_CHILD.with(|enabled| enabled.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn test_cancel_after_semantic_subscript_child_if_requested(cancel: &AtomicBool) {
+    if TEST_CANCEL_AFTER_SEMANTIC_SUBSCRIPT_CHILD.with(Cell::get) {
+        TEST_CANCEL_AFTER_SEMANTIC_SUBSCRIPT_CHILD.with(|enabled| enabled.set(false));
         cancel.store(true, Ordering::Relaxed);
     }
 }
@@ -14340,6 +14369,192 @@ mod tests {
             diagnostics.is_empty(),
             "differing candidate element types remain uncertain: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn round3_r3_distinguishes_container_access_from_addressed_storage() {
+        let uri = Url::parse("file:///tmp/semantic-round3-r3-addressed-storage.pas")
+            .expect("R3 addressed-storage URI");
+        let source = concat!(
+            "unit SemanticRound3R3AddressedStorage;\n",
+            "interface\n",
+            "type\n",
+            "  PInt = ^Integer;\n",
+            "  TStatic = array[0..1] of Integer;\n",
+            "  TDynamic = array of Integer;\n",
+            "  TInt = Integer;\n",
+            "  TBox = class\n",
+            "    FValue: Integer;\n",
+            "    FPtr: PInt;\n",
+            "    FStatic: TStatic;\n",
+            "    FDynamic: TDynamic;\n",
+            "    property Value: Integer read FValue;\n",
+            "    property Ptr: PInt read FPtr;\n",
+            "    property StaticItems: TStatic read FStatic;\n",
+            "    property Items: TDynamic read FDynamic;\n",
+            "  end;\n",
+            "procedure Take(var Value: Integer);\n",
+            "procedure TakeOut(out Value: Integer);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var A: array[0..1] of Integer; P: ^Integer; Box: TBox; Scalar: TInt; B: Boolean;\n",
+            "begin\n",
+            "  Take(A[0]); TakeOut(P^);\n",
+            "  Take(Box.Ptr^); TakeOut(Box.Ptr^); Take(Box.Items[0]);\n",
+            "  Take(Box.StaticItems[0]);\n",
+            "  Take(Scalar[0]);\n",
+            "  Take(Box.Value); TakeOut(Box.Value); Take(1);\n",
+            "  B := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 addressed-storage fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 addressed-storage diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "incompatible argument: expected 'Integer', found 'non-writable expression'",
+                "incompatible argument: expected 'Integer', found 'non-writable expression'",
+                "incompatible argument: expected 'Integer', found 'non-writable expression'",
+                "type mismatch: cannot assign 'integer literal' to 'Boolean'",
+            ],
+            "pointer and dynamic-array property targets are addressed storage, while unsupported static-property elements stay unknown: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round3_r3_resolves_default_property_result_types_without_container_fallback() {
+        let uri = Url::parse("file:///tmp/semantic-round3-r3-default-property.pas")
+            .expect("R3 default-property URI");
+        let source = concat!(
+            "unit SemanticRound3R3DefaultProperty;\n",
+            "interface\n",
+            "type\n",
+            "  TBox = class\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "    procedure SetItem(Index: Integer; Value: Integer);\n",
+            "    property Items[Index: Integer]: Integer read GetItem write SetItem; default;\n",
+            "  end;\n",
+            "  TReadOnlyBox = class\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "    property Items[Index: Integer]: Integer read GetItem; default;\n",
+            "  end;\n",
+            "  TNoDefault = class\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "    property Items[Index: Integer]: Integer read GetItem;\n",
+            "  end;\n",
+            "procedure Take(Value: Integer);\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "procedure Mutate(var Value: Integer);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer; Box: TBox; ReadOnlyBox: TReadOnlyBox; UnknownBox: TNoDefault;\n",
+            "begin\n",
+            "  I := Box[0]; Take(Box[0]);\n",
+            "  I := ReadOnlyBox[0]; Take(ReadOnlyBox[0]);\n",
+            "  TakeBoolean(Box[0]); TakeBoolean(ReadOnlyBox[0]);\n",
+            "  Mutate(ReadOnlyBox[0]); Mutate(UnknownBox[0]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 default-property fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 default-property diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "incompatible argument: expected 'Boolean', found 'Integer'",
+                "incompatible argument: expected 'Boolean', found 'Integer'",
+            ],
+            "default getter/setter properties prove their result type, while unsupported default-property storage remains unknown: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round3_r3_suppresses_outer_element_claims_when_an_index_child_is_unresolved() {
+        let uri = Url::parse("file:///tmp/semantic-round3-r3-unresolved-index-child.pas")
+            .expect("R3 unresolved-index URI");
+        let source = concat!(
+            "unit SemanticRound3R3UnresolvedIndexChild;\n",
+            "interface\n",
+            "type TRec = record Known: Integer; end;\n",
+            "procedure Take(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var B: Boolean; A: array[0..1] of Integer; R: TRec;\n",
+            "begin\n",
+            "  B := A[R.Missing];\n",
+            "  Take(A[R.Missing]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 unresolved-index fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 unresolved-index diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["missing member 'Missing'", "missing member 'Missing'",],
+            "an unresolved index child prevents an outer element mismatch cascade: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round3_r3_index_child_inference_honors_cancellation_during_child_traversal() {
+        let uri = Url::parse("file:///tmp/semantic-round3-r3-index-cancelled.pas")
+            .expect("R3 cancellation URI");
+        let source = concat!(
+            "unit SemanticRound3R3IndexCancelled;\n",
+            "interface\n",
+            "procedure Take(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var A: array[0..1] of Integer; I: Integer;\n",
+            "begin\n",
+            "  I := A[A[A[A[A[A[0]]]]]];\n",
+            "  Take(A[A[A[A[A[A[0]]]]]]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 cancellation fixture parses");
+        let cancel = AtomicBool::new(false);
+        let _cancel_guard = test_cancel_after_semantic_subscript_child();
+
+        let error = index
+            .semantic_diagnostics_with_cancel(&uri, &cancel)
+            .expect_err("cancelled index inference must stop");
+
+        assert_eq!(error, "request cancelled");
     }
 
     #[test]

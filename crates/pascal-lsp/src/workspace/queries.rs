@@ -1413,6 +1413,7 @@ fn completion_observations_equal(
         && (left.open || left.content_hash == right.content_hash)
         && left.parsed_text_hash == right.parsed_text_hash
         && left.candidate_membership == right.candidate_membership
+        && left.candidate_observations == right.candidate_observations
         && left.read_policy == right.read_policy
         && left.path_entry == right.path_entry
         && left.include_payload == right.include_payload

@@ -1,6 +1,6 @@
 //! LSP adapter for the request-scoped shared Pascal resolver.
 
-use super::rename::{OverlayInput, SourceRecord, WorkspaceInput};
+use super::rename::{OverlayInput, ResolverCandidateObservation, SourceRecord, WorkspaceInput};
 use super::{DiskStamp, MAX_DEPENDENCY_WORK, absolute_path, canonical_file_uri, path_stamp_result};
 use lsp_types::Url;
 use pascal_core::resolver::{
@@ -439,6 +439,7 @@ pub(crate) fn source_record_for_loaded(
             parsed_text_hash: Some(parsed_text_hash),
             content_bytes: None,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy: Some(context.read_policy.clone()),
             path_entry: context.path_entry_for(&source.path),
             include_payload,
@@ -468,6 +469,7 @@ pub(crate) fn source_record_for_loaded(
             parsed_text_hash: Some(parsed_text_hash),
             content_bytes: None,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy: Some(read_policy.clone()),
             path_entry: Some(path_entry.clone()),
             include_payload,
@@ -507,6 +509,7 @@ fn payload_record(
             parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy: Some(read_policy.clone()),
             path_entry: Some(path_entry.clone()),
             include_payload: false,
@@ -533,6 +536,7 @@ fn payload_record(
             parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy: Some(context.read_policy.clone()),
             path_entry: context.path_entry_for(path),
             include_payload: false,
@@ -546,22 +550,34 @@ fn payload_record(
 }
 
 pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<SourceRecord> {
-    let (path, stamp, missing_provider_candidate, directory_observation) = match observation {
-        ResolutionObservation::Directory {
-            path,
-            stamp,
-            complete: _,
-            entry: _,
-        } => (path, stamp.clone(), false, true),
-        ResolutionObservation::Candidate {
-            path,
-            stamp,
-            present,
-            entry: _,
-        } => (path, stamp.clone(), !present, false),
-        ResolutionObservation::Metadata(_) | ResolutionObservation::ProjectRead(_) => return None,
-        ResolutionObservation::Payload { .. } => return None,
-    };
+    let (path, stamp, missing_provider_candidate, directory_observation, candidate_observation) =
+        match observation {
+            ResolutionObservation::Directory {
+                path,
+                stamp,
+                complete: _,
+                entry: _,
+            } => (path, stamp.clone(), false, true, None),
+            ResolutionObservation::Candidate {
+                path,
+                stamp,
+                present,
+                entry: _,
+            } => (
+                path,
+                stamp.clone(),
+                !present,
+                false,
+                Some(ResolverCandidateObservation {
+                    path: path.clone(),
+                    present: *present,
+                }),
+            ),
+            ResolutionObservation::Metadata(_) | ResolutionObservation::ProjectRead(_) => {
+                return None;
+            }
+            ResolutionObservation::Payload { .. } => return None,
+        };
     let uri = Url::from_file_path(path).ok()?;
     Some(SourceRecord {
         uri,
@@ -575,6 +591,7 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
         parsed_text_hash: None,
         content_bytes: None,
         candidate_membership: None,
+        candidate_observations: candidate_observation.into_iter().collect(),
         read_policy: None,
         path_entry: None,
         include_payload: false,
@@ -680,6 +697,7 @@ pub(crate) fn report_records(
             parsed_text_hash: None,
             content_bytes,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy,
             path_entry,
             include_payload: false,
@@ -726,7 +744,9 @@ pub(crate) fn merge_source_record(
         // same path from disk first.  Do not combine the disk revision with
         // the open document: that would make stale-result validation reject
         // every valid overlay computation.
+        let candidate_observations = std::mem::take(&mut existing.candidate_observations);
         *existing = incoming;
+        merge_candidate_observations(&mut existing.candidate_observations, candidate_observations);
         return;
     }
     if existing.text.is_empty() && !incoming.text.is_empty() {
@@ -762,6 +782,10 @@ pub(crate) fn merge_source_record(
     if existing.candidate_membership.is_none() {
         existing.candidate_membership = incoming.candidate_membership.clone();
     }
+    merge_candidate_observations(
+        &mut existing.candidate_observations,
+        incoming.candidate_observations,
+    );
     if existing.read_policy.is_none() {
         existing.read_policy = incoming.read_policy.clone();
     }
@@ -772,6 +796,26 @@ pub(crate) fn merge_source_record(
     existing.include_payload |= incoming.include_payload;
     existing.missing_provider_candidate |= incoming.missing_provider_candidate;
     existing.directory_observation |= incoming.directory_observation;
+}
+
+fn merge_candidate_observations(
+    target: &mut Vec<ResolverCandidateObservation>,
+    incoming: Vec<ResolverCandidateObservation>,
+) {
+    for observation in incoming {
+        if target.iter().any(|existing| {
+            existing
+                .path
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&observation.path.to_string_lossy())
+        }) {
+            continue;
+        }
+        if target.len() >= super::rename::MAX_RESOLVER_CANDIDATE_OBSERVATIONS {
+            break;
+        }
+        target.push(observation);
+    }
 }
 
 pub(crate) fn merge_report_into_context(context: &mut ProjectContext, report: &ResolutionReport) {

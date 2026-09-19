@@ -1008,6 +1008,18 @@ struct SharedLintRequest<'a> {
     cancel: &'a AtomicBool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedLintCoordinateSpace {
+    Expanded,
+    Root,
+}
+
+#[derive(Debug)]
+struct SharedLintResult {
+    diagnostics: Vec<pascal_core::Diagnostic>,
+    coordinate_space: SharedLintCoordinateSpace,
+}
+
 impl Workspace {
     pub fn new(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Self {
         let (overrides, warnings) = production_override_session();
@@ -3399,6 +3411,7 @@ impl Workspace {
                 parsed_text_hash: None,
                 content_bytes: None,
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: Some(context.read_policy.clone()),
                 path_entry: Some(path_entry),
                 include_payload: false,
@@ -3681,6 +3694,7 @@ impl Workspace {
                 parsed_text_hash: Some(rename::text_content_hash(text)),
                 content_bytes: None,
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
@@ -3721,6 +3735,7 @@ impl Workspace {
                 parsed_text_hash: Some(rename::text_content_hash(text)),
                 content_bytes: None,
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: Some(read_policy.clone()),
                 path_entry: Some(path_entry.clone()),
                 include_payload: false,
@@ -3817,7 +3832,7 @@ impl Workspace {
                 let Some(record) = resolver::observation_record(observation) else {
                     continue;
                 };
-                records.entry(record.uri.clone()).or_insert(record);
+                resolver::merge_source_record(records, record);
             }
         }
         for warning in &report.warnings {
@@ -3882,6 +3897,7 @@ impl Workspace {
                     parsed_text_hash: None,
                     content_bytes: content.clone(),
                     candidate_membership: None,
+                    candidate_observations: Vec::new(),
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
@@ -5874,6 +5890,7 @@ impl Workspace {
                         parsed_text_hash: None,
                         content_bytes: None,
                         candidate_membership: None,
+                        candidate_observations: Vec::new(),
                         read_policy: None,
                         path_entry: None,
                         include_payload: false,
@@ -5929,6 +5946,7 @@ impl Workspace {
                     parsed_text_hash: None,
                     content_bytes: None,
                     candidate_membership: None,
+                    candidate_observations: Vec::new(),
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
@@ -6450,6 +6468,13 @@ impl Workspace {
                         change.generation > source_generation && matches && allows && accepted
                     })
                 });
+            let candidate_observation_changed =
+                record.candidate_observations.iter().any(|candidate| {
+                    self.source_change_observations.values().any(|change| {
+                        change.generation > source_generation
+                            && paths_equal_ci(&change.path, &candidate.path)
+                    })
+                });
             let auto_import_scope_changed = record.auto_import_scopes.iter().any(|scope| {
                 self.source_change_observations.values().any(|change| {
                     if change.generation <= source_generation {
@@ -6488,6 +6513,7 @@ impl Workspace {
             if dependency_changed
                 || missing_provider_candidate_changed
                 || missing_provider_scope_changed
+                || candidate_observation_changed
                 || auto_import_scope_changed
                 || configuration_changed
             {
@@ -6825,7 +6851,7 @@ impl Workspace {
                 vec![server_diagnostic(&error, DiagnosticSeverity::ERROR)],
             ));
         }
-        let raw = self.run_shared_lint_with_cancel(SharedLintRequest {
+        let lint_result = self.run_shared_lint_with_cancel(SharedLintRequest {
             uri,
             path: &path,
             source: source.as_bytes(),
@@ -6836,7 +6862,20 @@ impl Workspace {
             cancel,
         })?;
         check_workspace_cancel(Some(cancel))?;
-        let line_index = DiagnosticLineIndex::new(&normalized.text);
+        let root_normalized = (lint_result.coordinate_space == SharedLintCoordinateSpace::Root)
+            .then(|| normalize_line_endings_with_offsets(&source));
+        let line_index_source = root_normalized
+            .as_ref()
+            .map_or(normalized.text.as_str(), |source| source.text.as_str());
+        let line_index = DiagnosticLineIndex::new(line_index_source);
+        let root_conditional = root_normalized.as_ref().map(|_| {
+            pascal_core::conditional::analyze_with_cancel(&source, &context.defines, cancel)
+        });
+        let unknown_spans = root_conditional
+            .as_ref()
+            .map_or(&conditional.unknown_spans, |conditional| {
+                &conditional.unknown_spans
+            });
         let expansion = self
             .expansions
             .get(uri)
@@ -6847,7 +6886,7 @@ impl Workspace {
             self.include_expansion_limits().max_work,
         );
         let mut mapped = HashMap::<Url, Vec<LspDiagnostic>>::new();
-        for diagnostic in raw {
+        for diagnostic in lint_result.diagnostics {
             check_workspace_cancel(Some(cancel))?;
             let Some(normalized_range) = line_index.byte_range(
                 diagnostic.line,
@@ -6857,17 +6896,19 @@ impl Workspace {
             ) else {
                 continue;
             };
-            let Some(&start) = normalized.raw_offsets.get(normalized_range.start) else {
+            let raw_offsets = root_normalized
+                .as_ref()
+                .map_or(&normalized.raw_offsets, |source| &source.raw_offsets);
+            let Some(&start) = raw_offsets.get(normalized_range.start) else {
                 continue;
             };
-            let Some(&end) = normalized.raw_offsets.get(normalized_range.end) else {
+            let Some(&end) = raw_offsets.get(normalized_range.end) else {
                 continue;
             };
             if start >= end {
                 continue;
             }
-            if conditional
-                .unknown_spans
+            if unknown_spans
                 .iter()
                 .any(|unknown| unknown.start < end && start < unknown.end)
             {
@@ -6876,6 +6917,32 @@ impl Workspace {
                 // fail-closed policy used by navigation and edits: withhold
                 // the uncertain item rather than publishing a confident
                 // warning for one speculative branch.
+                continue;
+            }
+            if lint_result.coordinate_space == SharedLintCoordinateSpace::Root {
+                let Some(start) = text::offset_to_position(&source, start) else {
+                    continue;
+                };
+                let Some(end) = text::offset_to_position(&source, end) else {
+                    continue;
+                };
+                let severity = match diagnostic.severity {
+                    Severity::Error => DiagnosticSeverity::ERROR,
+                    Severity::Warning => DiagnosticSeverity::WARNING,
+                    Severity::Hint => DiagnosticSeverity::HINT,
+                };
+                mapped
+                    .entry(uri.clone())
+                    .or_default()
+                    .push(LspDiagnostic::new(
+                        Range::new(start, end),
+                        Some(severity),
+                        Some(NumberOrString::String(diagnostic.rule_id)),
+                        Some("lint4d".to_string()),
+                        diagnostic.message,
+                        None,
+                        None,
+                    ));
                 continue;
             }
             let span = match expansion
@@ -6926,7 +6993,7 @@ impl Workspace {
     fn run_shared_lint_with_cancel(
         &mut self,
         request: SharedLintRequest<'_>,
-    ) -> Result<Vec<pascal_core::Diagnostic>, String> {
+    ) -> Result<SharedLintResult, String> {
         let SharedLintRequest {
             uri,
             path,
@@ -6939,19 +7006,33 @@ impl Workspace {
         } = request;
         check_workspace_cancel(Some(cancel))?;
         let input = self.analysis_input();
-        let run_file_local = || {
-            lint4d::engine::run_lint_with_cfg_project(
+        let run_file_local = |lint_source: &[u8], coordinate_space| SharedLintResult {
+            diagnostics: lint4d::engine::run_lint_with_cfg_project(
                 &FileInfo::new(path.to_path_buf()),
                 lint_source,
                 config,
                 None,
                 None,
                 &lint4d::rules::RuleRegistry::new(),
-            )
+            ),
+            coordinate_space,
         };
         let source_text = match std::str::from_utf8(source) {
             Ok(source_text) => source_text,
-            Err(_) => return Ok(run_file_local()),
+            Err(_) => {
+                return Ok(run_file_local(
+                    lint_source,
+                    SharedLintCoordinateSpace::Expanded,
+                ));
+            }
+        };
+        let root_lint_source = || {
+            let root_conditional = pascal_core::conditional::analyze_with_cancel(
+                source_text,
+                &context.defines,
+                cancel,
+            );
+            normalize_line_endings(&root_conditional.projected_source).into_bytes()
         };
         let mut source_index = NavigationIndex::new();
         match source_index.update_with_defines_with_cancel(
@@ -6962,17 +7043,33 @@ impl Workspace {
         ) {
             Ok(()) => {}
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-            Err(_) => return Ok(run_file_local()),
+            Err(_) => {
+                let root_lint_source = root_lint_source();
+                return Ok(run_file_local(
+                    &root_lint_source,
+                    SharedLintCoordinateSpace::Root,
+                ));
+            }
         }
         let (source_tree, _) = match parser::parse_file(&FileInfo::new(path.to_path_buf()), source)
         {
             Ok(parsed) => parsed,
-            Err(_) => return Ok(run_file_local()),
+            Err(_) => {
+                let root_lint_source = root_lint_source();
+                return Ok(run_file_local(
+                    &root_lint_source,
+                    SharedLintCoordinateSpace::Root,
+                ));
+            }
         };
         let Some(unit_name) =
             lint4d::rules::helpers::extract_unit_name(source_tree.root_node(), source)
         else {
-            return Ok(run_file_local());
+            let root_lint_source = root_lint_source();
+            return Ok(run_file_local(
+                &root_lint_source,
+                SharedLintCoordinateSpace::Root,
+            ));
         };
         let mut resolver =
             resolver::resolver_for_context(context.clone(), input.roots.clone(), &input, cancel);
@@ -7003,7 +7100,11 @@ impl Workspace {
                 self.warn(format!(
                     "could not resolve project CFG for {uri}: {error}; using file-local CFG"
                 ));
-                return Ok(run_file_local());
+                let root_lint_source = root_lint_source();
+                return Ok(run_file_local(
+                    &root_lint_source,
+                    SharedLintCoordinateSpace::Root,
+                ));
             }
         };
         check_workspace_cancel(Some(cancel))?;
@@ -7026,33 +7127,46 @@ impl Workspace {
                 self.warn(format!(
                     "could not build project CFG for {uri}: {error}; using file-local CFG"
                 ));
-                return Ok(run_file_local());
+                let root_lint_source = root_lint_source();
+                return Ok(run_file_local(
+                    &root_lint_source,
+                    SharedLintCoordinateSpace::Root,
+                ));
             }
         };
         check_workspace_cancel(Some(cancel))?;
-        if !project_complete && context.discovery_complete {
-            // A complete project context with an incomplete dependency walk
-            // cannot support trustworthy project-CFG diagnostics.  Context
-            // discovery itself may still be incomplete (for example while a
-            // selected project is missing its declared main source); retain
-            // the established file-local fallback in that case.
-            return Ok(Vec::new());
+        if !project_complete {
+            // An incomplete dependency walk cannot support trustworthy
+            // project-CFG diagnostics. Keep only file-local diagnostics from
+            // the physical source rather than linting expanded includes with
+            // guessed project facts.
+            let root_lint_source = root_lint_source();
+            return Ok(run_file_local(
+                &root_lint_source,
+                SharedLintCoordinateSpace::Root,
+            ));
         }
         if source != lint_source {
             // Keep resolver coordinates and CFG snapshot bytes identical. The
             // expanded representation is still used for the conservative
             // file-local fallback so include diagnostics can be mapped to
             // their physical sources.
-            return Ok(run_file_local());
+            return Ok(run_file_local(
+                lint_source,
+                SharedLintCoordinateSpace::Expanded,
+            ));
         }
-        Ok(lint4d::engine::run_lint_with_cfg_project(
-            &FileInfo::new(path.to_path_buf()),
-            lint_source,
-            config,
-            None,
-            Some(&snapshot),
-            &lint4d::rules::RuleRegistry::new(),
-        ))
+        Ok(SharedLintResult {
+            diagnostics: lint4d::engine::run_lint_with_cfg_project(
+                &FileInfo::new(path.to_path_buf()),
+                lint_source,
+                config,
+                None,
+                Some(&snapshot),
+                &lint4d::rules::RuleRegistry::new(),
+            ),
+            coordinate_space: SharedLintCoordinateSpace::Expanded,
+        })
     }
 }
 
@@ -7610,6 +7724,16 @@ fn source_record_matches_change(
     let changed_uri = canonical_file_uri(changed_uri);
     if source_record_dependency_uri(record) == changed_uri {
         return true;
+    }
+
+    if let Ok(changed_path) = changed_uri.to_file_path() {
+        if record
+            .candidate_observations
+            .iter()
+            .any(|candidate| paths_equal_ci(&candidate.path, &changed_path))
+        {
+            return true;
+        }
     }
 
     let observed_directory = record.directory_observation || record.candidate_membership.is_some();
@@ -8292,6 +8416,7 @@ mod tests {
             parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy: None,
             path_entry: None,
             include_payload: false,

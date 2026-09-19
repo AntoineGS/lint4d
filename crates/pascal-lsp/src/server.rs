@@ -1260,6 +1260,7 @@ fn compact_completion_records(
             }),
             content_bytes: None,
             candidate_membership: record.candidate_membership.clone(),
+            candidate_observations: record.candidate_observations.clone(),
             read_policy: record.read_policy.clone(),
             path_entry: record.path_entry.clone(),
             include_payload: record.include_payload,
@@ -1305,6 +1306,18 @@ fn candidate_membership_storage_bytes(
             .map(path_storage_bytes)
             .sum::<usize>(),
     )
+}
+
+fn candidate_observations_storage_bytes(
+    observations: &[crate::workspace::rename::ResolverCandidateObservation],
+) -> usize {
+    observations
+        .iter()
+        .map(|observation| {
+            size_of::<crate::workspace::rename::ResolverCandidateObservation>()
+                .saturating_add(path_storage_bytes(&observation.path))
+        })
+        .sum()
 }
 
 fn missing_provider_scope_storage_bytes(
@@ -1362,6 +1375,9 @@ fn compact_completion_record_bytes(record: &SourceRecord) -> usize {
                 .as_ref()
                 .map_or(0, candidate_membership_storage_bytes),
         )
+        .saturating_add(candidate_observations_storage_bytes(
+            &record.candidate_observations,
+        ))
         .saturating_add(
             record
                 .read_policy
@@ -8062,6 +8078,7 @@ mod tests {
             parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy: None,
             path_entry: None,
             include_payload: false,

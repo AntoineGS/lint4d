@@ -2779,6 +2779,105 @@ fn active_or_unknown_unresolved_includes_still_block_rename() {
 }
 
 #[test]
+fn conditional_include_rename_reuses_the_owner_define_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let include_path = temp.path().join("defs.inc");
+    let source = "unit Main;\ninterface\n{$DEFINE ENABLED}\n{$I defs.inc}\nconst BadConst = 1;\nimplementation\nend.\n";
+    let include = "{$IFDEF ENABLED}\nconst Other = 2;\n{$ENDIF}\n";
+    fs::write(&source_path, source).expect("root source");
+    fs::write(&include_path, include).expect("include source");
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open owner source");
+    let edit = workspace
+        .rename_edits(
+            &source_uri,
+            position_of(source, "BadConst", 0),
+            "GOOD_CONST",
+            false,
+        )
+        .expect("owner-defined include state must not block an unrelated rename");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![(
+            source_uri,
+            range_of(source, "BadConst", 0),
+            "GOOD_CONST".to_owned(),
+        )],
+    );
+}
+
+#[test]
+fn conditional_include_rename_reuses_the_owner_undef_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let include_path = temp.path().join("defs.inc");
+    let source = "unit Main;\ninterface\n{$UNDEF ENABLED}\n{$I defs.inc}\nconst BadConst = 1;\nimplementation\nend.\n";
+    let include = "{$IFDEF ENABLED}\nconst Other = 2;\n{$ENDIF}\n";
+    fs::write(&source_path, source).expect("root source");
+    fs::write(&include_path, include).expect("include source");
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open owner source");
+    let edit = workspace
+        .rename_edits(
+            &source_uri,
+            position_of(source, "BadConst", 0),
+            "GOOD_CONST",
+            false,
+        )
+        .expect("owner-undefined include state must not block an unrelated rename");
+    let changes = edit.changes.expect("plain workspace edit changes");
+    assert_exact_edits(
+        &changes,
+        vec![(
+            source_uri,
+            range_of(source, "BadConst", 0),
+            "GOOD_CONST".to_owned(),
+        )],
+    );
+}
+
+#[test]
+fn unknown_owner_include_state_still_blocks_rename() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("Main.pas");
+    let include_path = temp.path().join("defs.inc");
+    let source = "unit Main;\ninterface\n{$IFDEF UNKNOWN}\n{$DEFINE ENABLED}\n{$ENDIF}\n{$I defs.inc}\nconst BadConst = 1;\nimplementation\nend.\n";
+    let include = "{$IFDEF ENABLED}\nconst Other = 2;\n{$ENDIF}\n";
+    fs::write(&source_path, source).expect("root source");
+    fs::write(&include_path, include).expect("include source");
+    let source_uri = Url::from_file_path(&source_path).expect("source URI");
+
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(source_uri.clone(), source.to_owned(), 1)
+        .expect("open owner source");
+    assert!(
+        workspace
+            .rename_edits(
+                &source_uri,
+                position_of(source, "BadConst", 0),
+                "GOOD_CONST",
+                false,
+            )
+            .is_err(),
+        "unknown owner include state must remain fail-closed"
+    );
+}
+
+#[test]
 fn resolved_source_bearing_include_supports_physical_rename_edits() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root_path = temp.path().join("Main.pas");

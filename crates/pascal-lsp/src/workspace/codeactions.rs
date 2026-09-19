@@ -738,6 +738,7 @@ fn lint_configuration_for_input(
                 parsed_text_hash: None,
                 content_bytes: content_bytes.clone(),
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: Some(context.read_policy.clone()),
                 path_entry: super::context_path_entry(&context, path),
                 include_payload: false,

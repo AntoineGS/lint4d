@@ -65,7 +65,7 @@ const MAX_RENAME_INCLUDE_FILES: usize = 4_096;
 const MAX_RENAME_INCLUDE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RENAME_INCLUDE_DIRECTIVES: usize = 16_384;
 const MAX_RENAME_INCLUDE_ERRORS: usize = 256;
-const MAX_RENAME_INCLUDE_DEPTH: usize = 256;
+const MAX_RENAME_INCLUDE_DEPTH: usize = 64;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_RENAME_INCLUDE_OWNER_DISCOVERY: usize = 256;
 const MAX_SNAPSHOT_PHYSICAL_LOCATIONS: usize = 10_000;
@@ -187,6 +187,10 @@ pub(crate) struct SourceRecord {
     pub(crate) parsed_text_hash: Option<u64>,
     pub(crate) content_bytes: Option<Vec<u8>>,
     pub(crate) candidate_membership: Option<ProjectCandidateMembership>,
+    /// Bounded resolver candidate observations.  These are semantic lookup
+    /// inputs rather than directory-wide dependencies: a case-insensitive
+    /// provider overlay can change resolution even when it has no disk record.
+    pub(crate) candidate_observations: Vec<ResolverCandidateObservation>,
     /// The requester-scoped authorization used to read this closed source.
     /// Open overlays do not need these values because their payload is already
     /// supplied by the client and revalidation compares the overlay text.
@@ -213,6 +217,14 @@ pub(crate) struct SourceRecord {
     /// Bounded semantic observations used to prove that auto-import provider
     /// uniqueness remains fresh without invalidating on unrelated comments.
     pub(crate) auto_import_scopes: Vec<AutoImportProviderScope>,
+}
+
+pub(crate) const MAX_RESOLVER_CANDIDATE_OBSERVATIONS: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolverCandidateObservation {
+    pub(crate) path: PathBuf,
+    pub(crate) present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1723,6 +1735,7 @@ fn path_record_at(
         parsed_text_hash: None,
         content_bytes,
         candidate_membership,
+        candidate_observations: Vec::new(),
         read_policy,
         path_entry,
         include_payload,
@@ -1769,6 +1782,7 @@ pub(crate) fn source_for_input_with_cancel(
                 parsed_text_hash: Some(text_content_hash(&overlay.text)),
                 content_bytes: None,
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
@@ -1814,6 +1828,7 @@ pub(crate) fn source_for_input_with_owner(
                 parsed_text_hash: Some(text_content_hash(&overlay.text)),
                 content_bytes: None,
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
@@ -1873,6 +1888,7 @@ pub(crate) fn source_for_input_with_owner(
         parsed_text_hash: Some(text_content_hash(&disk.text)),
         content_bytes: None,
         candidate_membership: None,
+        candidate_observations: Vec::new(),
         read_policy: Some(read_policy),
         path_entry: Some(entry),
         include_payload: false,
@@ -2331,6 +2347,64 @@ fn binding_info_for_source(
             cancel,
         );
     Ok((info.map(|info| (info, self_contained)), ignored_or_empty))
+}
+
+fn conditional_branch_contains_identifier(
+    source: &str,
+    analysis: &conditional::ConditionalAnalysis,
+    names: &[String],
+) -> bool {
+    let mut open_conditions = Vec::new();
+    let mut conditional_ranges = Vec::new();
+    for directive in &analysis.directives {
+        match directive.kind {
+            ConditionalDirectiveKind::ConditionalStart => open_conditions.push(directive.end),
+            ConditionalDirectiveKind::ConditionalEnd => {
+                if let Some(start) = open_conditions.pop() {
+                    conditional_ranges.push(start..directive.start);
+                }
+            }
+            _ => {}
+        }
+    }
+    if conditional_ranges.is_empty() {
+        return false;
+    }
+
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        if start == index {
+            continue;
+        }
+        if analysis
+            .directives
+            .iter()
+            .any(|directive| start >= directive.start && index <= directive.end)
+        {
+            continue;
+        }
+        let Some(identifier) = source.get(start..index) else {
+            continue;
+        };
+        if names
+            .iter()
+            .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&')))
+            && conditional_ranges
+                .iter()
+                .any(|range| start >= range.start && index <= range.end)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn contains_any_identifier(source: &str, names: &[String]) -> bool {
@@ -3762,6 +3836,7 @@ pub(crate) fn build_snapshot(
                     parsed_text_hash: Some(text_content_hash(&overlay.text)),
                     content_bytes: None,
                     candidate_membership: None,
+                    candidate_observations: Vec::new(),
                     read_policy: Some(read_policy.clone()),
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
@@ -3850,6 +3925,7 @@ pub(crate) fn build_snapshot(
                     parsed_text_hash: Some(text_content_hash(&source)),
                     content_bytes: None,
                     candidate_membership: None,
+                    candidate_observations: Vec::new(),
                     read_policy: Some(read_policy.clone()),
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
@@ -4322,6 +4398,7 @@ pub(crate) fn build_snapshot(
                     parsed_text_hash: Some(text_content_hash(&overlay.text)),
                     content_bytes: None,
                     candidate_membership: None,
+                    candidate_observations: Vec::new(),
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
@@ -4358,6 +4435,7 @@ pub(crate) fn build_snapshot(
                     parsed_text_hash: Some(text_content_hash(&source)),
                     content_bytes: None,
                     candidate_membership: None,
+                    candidate_observations: Vec::new(),
                     read_policy: None,
                     path_entry: None,
                     include_payload: false,
@@ -4619,6 +4697,7 @@ fn retain_expansion_dependencies(
                 parsed_text_hash: Some(text_content_hash(&source)),
                 content_bytes: None,
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: Some(read_policy.clone()),
                 path_entry: Some(path_entry.clone()),
                 include_payload: false,
@@ -4668,6 +4747,7 @@ fn retain_expansion_dependencies(
                 parsed_text_hash: Some(text_content_hash(&source)),
                 content_bytes: None,
                 candidate_membership: None,
+                candidate_observations: Vec::new(),
                 read_policy: Some(read_policy.clone()),
                 path_entry: Some(path_entry.clone()),
                 include_payload: true,
@@ -5704,6 +5784,38 @@ struct IncludeInspection<'a> {
     context: &'a ProjectContext,
     owner_path: &'a Path,
     legacy_route: Option<LegacyRoute>,
+    conditional_environment: Option<conditional::ConditionalEnvironment>,
+}
+
+fn include_boundary_environments(
+    source: &str,
+    defines: &[String],
+    cancel: &AtomicBool,
+) -> HashMap<usize, Option<conditional::ConditionalEnvironment>> {
+    let mut environment = conditional::ConditionalEnvironment::from_defines(defines);
+    let mut boundaries = HashMap::new();
+    let mut previous_include = false;
+    let mut include =
+        |directive: &ConditionalDirective,
+         environment: &mut conditional::ConditionalEnvironment| {
+            let boundary = if previous_include {
+                None
+            } else {
+                Some(environment.clone())
+            };
+            boundaries.insert(directive.start, boundary);
+            previous_include = true;
+            // The auditor still walks nested includes separately.  Clearing
+            // the environment here prevents facts from before an unmodeled
+            // include from being reused after its boundary.
+            conditional::IncludeTransition {
+                complete: true,
+                environment_known: false,
+            }
+        };
+    let _ =
+        conditional::analyze_with_include_callback(source, &mut environment, cancel, &mut include);
+    boundaries
 }
 
 fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult, String> {
@@ -5794,6 +5906,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         }
 
         let context = auditor.context_for_source(&uri)?;
+        let boundary_environments = include_boundary_environments(source, &defines, auditor.cancel);
         for directive in include_directives {
             if auditor.stopped {
                 break;
@@ -5815,7 +5928,16 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                 auditor.stopped = true;
                 break;
             };
-            auditor.inspect_top_level(&uri, &directive, context_key, context)?;
+            auditor.inspect_top_level(
+                &uri,
+                &directive,
+                context_key,
+                context,
+                boundary_environments
+                    .get(&directive.start)
+                    .cloned()
+                    .flatten(),
+            )?;
         }
     }
 
@@ -6072,6 +6194,7 @@ impl IncludeAuditor<'_> {
         directive: &Directive,
         context_key: &ContextKey,
         context: &ProjectContext,
+        conditional_environment: Option<conditional::ConditionalEnvironment>,
     ) -> Result<(), String> {
         let Some(owner_path) = uri.to_file_path().ok().map(absolute_path) else {
             self.record_error(format!(
@@ -6120,6 +6243,7 @@ impl IncludeAuditor<'_> {
             context,
             owner_path: &owner_path,
             legacy_route,
+            conditional_environment,
         };
         let analysis = self.inspect_include_file(&source, inspection, 0)?;
         if !analysis.safe || (analysis.relevant && self.name_free_assistance) {
@@ -6186,6 +6310,7 @@ impl IncludeAuditor<'_> {
             context,
             owner_path,
             legacy_route,
+            conditional_environment: None,
         };
         self.inspect_include_file(&source, inspection, depth + 1)
     }
@@ -6282,13 +6407,25 @@ impl IncludeAuditor<'_> {
             );
         }
 
-        // The caller's project defines are not necessarily the state at this
-        // include boundary: the owner may have DEFINE/UNDEF directives, and
-        // preceding includes may have changed the environment. Until the
-        // auditor carries that state soundly, start include analysis with
-        // unknown facts rather than resurrecting stale project facts.
+        // Use the facts established at the owning include boundary.  When the
+        // boundary is unknown, the empty environment intentionally makes
+        // conditional facts unknown; it must not resurrect project defines.
         let include_text = shared_resolver::decode_source_bytes(&source.bytes);
-        let conditional = conditional::analyze_with_cancel(&include_text, &[], self.cancel);
+        let mut environment = inspection.conditional_environment.unwrap_or_default();
+        let mut nested_include =
+            |_directive: &ConditionalDirective,
+             _environment: &mut conditional::ConditionalEnvironment| {
+                conditional::IncludeTransition {
+                    complete: true,
+                    environment_known: false,
+                }
+            };
+        let conditional = conditional::analyze_with_include_callback(
+            &include_text,
+            &mut environment,
+            self.cancel,
+            &mut nested_include,
+        );
         if is_cancelled(self.cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
@@ -6299,11 +6436,17 @@ impl IncludeAuditor<'_> {
                 || conditional.pascal_condition_contains_identifier(self.candidate_names)
         };
         let conditional_candidate_is_uncertain = !self.name_free_assistance
+            && relevant
             && (self
                 .candidate_names
                 .iter()
                 .any(|name| conditional.unknown_contains_identifier(&include_text, name))
-                || conditional.pascal_condition_contains_identifier(self.candidate_names));
+                || conditional.pascal_condition_contains_identifier(self.candidate_names)
+                || conditional_branch_contains_identifier(
+                    &include_text,
+                    &conditional,
+                    self.candidate_names,
+                ));
         let include_directives = conditional
             .directives
             .iter()
@@ -9811,6 +9954,7 @@ mod tests {
             parsed_text_hash: None,
             content_bytes: None,
             candidate_membership: None,
+            candidate_observations: Vec::new(),
             read_policy: None,
             path_entry: None,
             include_payload: true,

@@ -12400,6 +12400,49 @@ fn unknown_conditional_source_does_not_publish_confident_lint_diagnostics() {
 }
 
 #[test]
+fn incomplete_project_dependencies_keep_file_local_lint_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let project = temp.path().join("App.dproj");
+    let source =
+        "unit Main;\ninterface\nuses MissingUnit;\nconst BadConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &temp.path().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        diagnostics["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming"),
+        "file-local naming diagnostics must survive an incomplete dependency graph: {diagnostics}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn shared_include_diagnostics_survive_closing_one_root() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let a = temp.path().join("A.pas");
@@ -12507,6 +12550,171 @@ fn navigation_rejects_a_changed_include_overlay_before_delivery() {
     assert!(
         response.error.is_some(),
         "stale include navigation must be rejected"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn configured_navigation_rejects_a_case_insensitive_competing_provider_overlay() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let competitor = root.join("PROVIDER.pas");
+    let project = root.join("App.dproj");
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Foo;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure Foo;\nimplementation\nprocedure Foo;\nbegin\nend;\nend.\n";
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+
+    let id = RequestId::from("configured-stale-provider-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Foo", 0),
+    );
+    barrier.wait_until_entered();
+
+    let competitor_source = "unit Provider;\ninterface\nprocedure Foo;\nimplementation\nprocedure Foo;\nbegin\nend;\nend.\n";
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&competitor),
+                "languageId": "pascal",
+                "version": 1,
+                "text": competitor_source
+            }
+        }),
+    );
+    let synchronization_id =
+        RequestId::from("configured-provider-overlay-synchronized".to_string());
+    server.send_request(
+        synchronization_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert!(server.response(&synchronization_id).error.is_none());
+
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "a stale configured-project definition must not publish the old provider: {response:?}"
+    );
+
+    let fresh_id = RequestId::from("configured-ambiguous-provider-definition".to_string());
+    server.send_request(
+        fresh_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, main_source, "Foo", 0),
+    );
+    assert!(result_locations(server.response(&fresh_id)).is_empty());
+    server.shutdown();
+}
+
+#[test]
+fn opening_a_case_insensitive_competing_provider_refreshes_consumer_diagnostics() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let provider = temp.path().join("Provider.pas");
+    let competitor = temp.path().join("PROVIDER.pas");
+    let project = temp.path().join("App.dproj");
+    let main_source =
+        "unit Main;\ninterface\nuses Provider;\nconst BadConst = 1;\nimplementation\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure Foo;\nimplementation\nprocedure Foo;\nbegin\nend;\nend.\n";
+    let competitor_source = provider_source;
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &temp.path().join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .expect("initial diagnostics array")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&competitor),
+                "languageId": "pascal",
+                "version": 1,
+                "text": competitor_source
+            }
+        }),
+    );
+    let _ = diagnostics_for_uri(&mut server, &uri(&competitor));
+    assert!(
+        server
+            .diagnostic_with_timeout(&uri(&main), Duration::from_secs(2))
+            .is_some(),
+        "opening a competing provider must refresh diagnostics for its consumer"
+    );
+
+    let unrelated = temp.path().join("Unrelated.pas");
+    let unrelated_source = "unit Unrelated; interface implementation end.\n";
+    write_file(&unrelated, unrelated_source);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated),
+                "languageId": "pascal",
+                "version": 1,
+                "text": unrelated_source
+            }
+        }),
+    );
+    let _ = diagnostics_for_uri(&mut server, &uri(&unrelated));
+    assert!(
+        server
+            .diagnostic_with_timeout(&uri(&main), Duration::from_millis(300))
+            .is_none(),
+        "an unrelated sibling overlay must not refresh the consumer"
     );
     server.shutdown();
 }

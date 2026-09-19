@@ -7490,15 +7490,34 @@ impl Workspace {
         physical_range: &std::ops::Range<usize>,
         budget: &mut crate::include_expansion::MappingBudget<'_>,
     ) -> Result<bool, String> {
+        let current_root_includes_physical = self
+            .expansions
+            .get(root_uri)
+            .is_some_and(|expansion| expansion.dependencies.contains(physical_uri));
         for (other_root, expansion) in &self.expansions {
-            if other_root == root_uri || !expansion.complete {
+            if other_root == root_uri {
                 continue;
             }
-            if expansion
+            let known_dependency = expansion.dependencies.contains(physical_uri);
+            let mapping_is_empty = expansion
                 .expanded
                 .reverse_range_with_budget(physical_uri, physical_range.clone(), budget)?
-                .is_empty()
-            {
+                .is_empty();
+            if !known_dependency && mapping_is_empty {
+                continue;
+            }
+            if !expansion.complete && current_root_includes_physical {
+                // A partial expansion proves ownership only through its
+                // retained prefix.  Its undiscovered suffix may still reach
+                // this physical include, so it cannot be ignored as a
+                // competing context merely because no reverse span was
+                // retained for it.
+                return Ok(false);
+            }
+            if mapping_is_empty {
+                // A complete expansion that merely depends on the same file
+                // but has no mapping for this range is not a competing
+                // semantic owner.
                 continue;
             }
             // ContextKey only describes project/configuration facts.  It does

@@ -7367,6 +7367,9 @@ fn handle_notification(
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri(uri.clone());
             effect.refresh_dependents(workspace, &uri, false);
+            for open_uri in workspace.open_document_uris() {
+                effect.refresh_uri(open_uri);
+            }
             Ok(effect)
         }
         "textDocument/didSave" => {
@@ -7381,6 +7384,9 @@ fn handle_notification(
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri(uri.clone());
             effect.refresh_dependents(workspace, &uri, true);
+            for open_uri in workspace.open_document_uris() {
+                effect.refresh_uri(open_uri);
+            }
             Ok(effect)
         }
         "textDocument/didClose" => {
@@ -7404,6 +7410,9 @@ fn handle_notification(
             effect.cancel_uri(uri.clone());
             if closed {
                 effect.refresh_dependents(workspace, &uri, true);
+                for open_uri in workspace.open_document_uris() {
+                    effect.refresh_uri(open_uri);
+                }
             }
             Ok(effect)
         }

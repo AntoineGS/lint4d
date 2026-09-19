@@ -17,10 +17,17 @@ The resolver reuses lexical bindings, selected imports, receiver/member lookup,
 helper and `with` precedence, ancestry, accessibility, and conditional state.
 Unknown or ambiguous imports/receivers, incomplete `with`/helper/owner lookup,
 unknown ancestry, an implicit-root runtime member surface not represented by
-the source index, compiler/implicit names, inaccessible members, parser
-recovery, unknown conditional branches, and exhausted traversal limits are
-deliberately silent. Built-in types and type-valued intrinsic arguments are
-not treated as unresolved value uses.
+the source index, inaccessible members, parser recovery, unknown conditional
+branches, and exhausted traversal limits are deliberately silent. The index
+does not claim to contain a complete compiler-provided `System` export
+catalogue: a source-backed `System` unit can establish positive bindings, but a
+failed unqualified value/call lookup remains incomplete and is silent rather
+than being closed by a hand-maintained intrinsic-name allowlist. When no
+implicit `System` source is available, the closed unqualified assignment-target
+path still diagnoses genuine missing source names; source-backed or ambiguous
+implicit namespaces remain incomplete on misses. Built-in types, casts, and
+type-valued intrinsic arguments are classified separately and are not treated
+as unresolved value uses.
 Declarations, type/generic parameters, routine directives, labels,
 named-argument syntax, units, strings, and comments are not treated as value
 uses. Generic-provider symbol scans are charged to the same semantic work and
@@ -33,8 +40,11 @@ Semantic diagnostics mapped from a physical include are retained only when
 the include's root-specific binding context is unambiguous. Equal project or
 configuration keys do not establish equal lexical bindings, so shared includes
 used by multiple roots are deliberately silent until one context can be
-proven. Opening another root refreshes previously published semantic claims;
-ordinary lint diagnostics remain independently aggregated per root.
+proven. A competing incomplete expansion is also a conflicting owner: its
+retained prefix is checked and its undiscovered suffix is treated as uncertain,
+so no false unique physical claim is published. Opening or changing another
+root refreshes previously published semantic claims; ordinary lint diagnostics
+remain independently aggregated per root.
 
 ## Build and Run
 

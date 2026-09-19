@@ -1021,6 +1021,7 @@ impl NavigationIndex {
         if state.member_lookup_incomplete
             || state.receiver_resolution_uncertain()
             || state.inaccessible_candidate
+            || state.implicit_system_namespace_incomplete
         {
             return Ok(SemanticProofStatus::Incomplete);
         }
@@ -1721,7 +1722,80 @@ impl NavigationIndex {
             return Ok(imported);
         }
 
+        let implicit_system =
+            self.implicit_system_references_with_budget(key, identifier, state, cancel, budget)?;
+        if !implicit_system.is_empty() {
+            return Ok(implicit_system);
+        }
+
         Ok(Vec::new())
+    }
+
+    fn implicit_system_references_with_budget(
+        &self,
+        key: &str,
+        identifier: Node<'_>,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let status = self.implicit_system_namespace_status();
+        let ImplicitSystemNamespaceStatus::SourceBacked { uri } = status else {
+            // The compiler's implicit System namespace is not represented by
+            // a complete source catalogue here.  A failed value lookup
+            // therefore cannot prove that the name is absent.  An
+            // unqualified assignment target is the one closed binding form:
+            // it must name a writable source declaration, so preserve the
+            // existing unresolved-name proof for genuine targets such as
+            // `Typoo := 1`.
+            if matches!(status, ImplicitSystemNamespaceStatus::Unavailable)
+                && is_assignment_target_identifier(identifier)
+            {
+                return Ok(Vec::new());
+            }
+            state.mark_implicit_system_namespace_incomplete();
+            return Ok(Vec::new());
+        };
+        let Some(provider) = self.documents.get(&uri) else {
+            state.mark_implicit_system_namespace_incomplete();
+            return Ok(Vec::new());
+        };
+        budget.require_work(
+            provider
+                .parser_recovery_spans
+                .len()
+                .saturating_add(provider.conditionals.unknown_spans.len()),
+            cancel,
+        )?;
+        if !provider.parser_recovery_spans.is_empty()
+            || !provider.conditionals.unknown_spans.is_empty()
+        {
+            state.mark_implicit_system_namespace_incomplete();
+            return Ok(Vec::new());
+        }
+
+        let candidates = self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
+        if candidates.is_empty() {
+            // Source-backed names are usable as positive evidence, but an
+            // arbitrary System.pas does not establish the compiler's full
+            // implicit export surface.
+            state.mark_implicit_system_namespace_incomplete();
+        }
+        Ok(candidates)
+    }
+
+    fn implicit_system_namespace_status(&self) -> ImplicitSystemNamespaceStatus {
+        let Some(urls) = self.units.get("system") else {
+            return ImplicitSystemNamespaceStatus::Unavailable;
+        };
+        let Some(uri) = urls.first().cloned() else {
+            return ImplicitSystemNamespaceStatus::Unavailable;
+        };
+        if urls.len() == 1 {
+            ImplicitSystemNamespaceStatus::SourceBacked { uri }
+        } else {
+            ImplicitSystemNamespaceStatus::Ambiguous
+        }
     }
 
     fn exported_references_for_key_with_budget(
@@ -8738,6 +8812,7 @@ struct ResolutionState {
     active_generic_constraints: HashSet<(Url, String)>,
     receiver_uncertain: bool,
     member_lookup_incomplete: bool,
+    implicit_system_namespace_incomplete: bool,
     inaccessible_candidate: bool,
     ambiguous: bool,
     with_receivers: Vec<WithReceiverSlot>,
@@ -8756,6 +8831,7 @@ impl ResolutionState {
             active_generic_constraints: HashSet::new(),
             receiver_uncertain: false,
             member_lookup_incomplete: false,
+            implicit_system_namespace_incomplete: false,
             inaccessible_candidate: false,
             ambiguous: false,
             with_receivers: Vec::new(),
@@ -8772,6 +8848,10 @@ impl ResolutionState {
 
     fn mark_member_lookup_incomplete(&mut self) {
         self.member_lookup_incomplete = true;
+    }
+
+    fn mark_implicit_system_namespace_incomplete(&mut self) {
+        self.implicit_system_namespace_incomplete = true;
     }
 
     fn mark_inaccessible_candidate(&mut self) {
@@ -12123,11 +12203,10 @@ fn is_non_value_identifier_with_budget(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
-    let name = canonical_name(&node_text(identifier, source));
+    let name = canonical_name(node_text_with_budget(identifier, source, cancel, budget)?);
     if is_declaration_identifier(identifier)
         || is_implicit_or_intrinsic_name(&name)
-        || overload::builtin_type(&name).is_some()
-        || is_type_valued_intrinsic_argument(identifier, source)
+        || is_type_valued_intrinsic_argument_with_budget(identifier, source, cancel, budget)?
     {
         return Ok(true);
     }
@@ -12175,7 +12254,7 @@ fn is_non_value_identifier_with_budget(
             && node
                 .child_by_field_name("operator")
                 .is_some_and(|operator| node_text(operator, source) == ":=")
-            && has_ancestor_kind(node, "exprCall")
+            && has_ancestor_kind_with_budget(node, "exprCall", cancel, budget)?
         {
             return Ok(true);
         }
@@ -12185,7 +12264,10 @@ fn is_non_value_identifier_with_budget(
 }
 
 fn is_implicit_or_intrinsic_name(name: &str) -> bool {
-    implicit_system_symbol_kind(name).is_some()
+    matches!(
+        name,
+        "self" | "result" | "inherited" | "exit" | "break" | "continue" | "raise"
+    )
 }
 
 fn is_implicit_tobject_member(name: &str) -> bool {
@@ -12227,71 +12309,57 @@ fn is_implicit_tobject_member(name: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImplicitSystemSymbolKind {
-    CompilerIntrinsic,
-    SystemRoutine,
-    SystemValue,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplicitSystemNamespaceStatus {
+    Unavailable,
+    Ambiguous,
+    /// A source-backed System unit can provide positive symbol evidence, but
+    /// it is not treated as a complete catalogue of compiler-provided names.
+    SourceBacked {
+        uri: Url,
+    },
 }
 
-/// Names supplied by the compiler's implicit `System` namespace.  This is a
-/// deliberately explicit model: an arbitrary failed call is still a useful
-/// unresolved-name diagnostic, while the language/runtime surface below is
-/// not represented by the source index when no `uses System` is written.
-fn implicit_system_symbol_kind(name: &str) -> Option<ImplicitSystemSymbolKind> {
-    let kind = match name {
-        "self" | "result" | "inherited" | "exit" | "break" | "continue" | "raise" => {
-            ImplicitSystemSymbolKind::CompilerIntrinsic
-        }
-        "abs" | "arctan" | "assert" | "assigned" | "beep" | "blockread" | "blockwrite" | "chr"
-        | "close" | "comparemem" | "concat" | "copy" | "cos" | "dec" | "delete" | "dispose"
-        | "eof" | "eoln" | "exp" | "filepos" | "filesize" | "fillchar" | "fillbyte"
-        | "filldword" | "fillword" | "finalize" | "freeandnil" | "freemem" | "getmem" | "halt"
-        | "high" | "inc" | "include" | "initialize" | "indexbyte" | "insert" | "int"
-        | "ioresult" | "length" | "ln" | "low" | "move" | "new" | "newstr" | "odd" | "ord"
-        | "paramstr" | "pred" | "random" | "randomize" | "read" | "readln" | "reallocmem"
-        | "reset" | "rewrite" | "round" | "seek" | "setlength" | "setstring" | "sin" | "sizeof"
-        | "sqr" | "sqrt" | "str" | "succ" | "swap" | "tan" | "trunc" | "typeinfo"
-        | "uniquestring" | "upcase" | "val" | "write" | "writeln" => {
-            ImplicitSystemSymbolKind::SystemRoutine
-        }
-        "abort" | "default" | "exceptobject" | "ismanagedtype" | "maxbyte" | "maxcardinal"
-        | "maxint" | "maxint64" | "maxlongint" | "maxnativeint" | "maxnativeuint" | "maxuint64"
-        | "maxword" | "minint" | "minint64" | "minlongint" | "minnativeint" | "minnativeuint"
-        | "minuint64" | "paramcount" | "pi" => ImplicitSystemSymbolKind::SystemValue,
-        _ => return None,
-    };
-    Some(kind)
-}
-
-fn is_type_valued_intrinsic_argument(identifier: Node<'_>, source: &str) -> bool {
-    let Some(builtin) = overload::builtin_type(&node_text(identifier, source)) else {
-        return false;
+fn is_type_valued_intrinsic_argument_with_budget(
+    identifier: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let Some(builtin) =
+        overload::builtin_type(node_text_with_budget(identifier, source, cancel, budget)?)
+    else {
+        return Ok(false);
     };
     let _ = builtin;
     let mut current = identifier.parent();
     while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         if node.kind() == "exprCall" {
             let Some(entity) = node.child_by_field_name("entity") else {
-                return false;
+                return Ok(false);
             };
-            let Some(parts) = qualified_name_parts(&entity, source) else {
-                return false;
+            let Some(parts) = qualified_name_parts_with_budget(entity, source, cancel, budget)?
+            else {
+                return Ok(false);
             };
             let Some(name) = parts.last() else {
-                return false;
+                return Ok(false);
             };
-            return matches!(
-                canonical_name(name).as_str(),
-                "default" | "high" | "ismanagedtype" | "low" | "sizeof" | "typeinfo"
-            );
+            let call_name = canonical_path(&parts);
+            return Ok(overload::builtin_type(&call_name).is_some()
+                || matches!(
+                    canonical_name(name).as_str(),
+                    "default" | "high" | "ismanagedtype" | "low" | "sizeof" | "typeinfo"
+                ));
         }
         if matches!(node.kind(), "assignment" | "block" | "statements") {
-            return false;
+            return Ok(false);
         }
         current = node.parent();
     }
-    false
+    Ok(false)
 }
 
 fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
@@ -12322,6 +12390,23 @@ fn member_expression_at(identifier: Node<'_>) -> Option<Node<'_>> {
 fn is_right_hand_member(dot: Node<'_>, identifier: Node<'_>) -> bool {
     dot.child_by_field_name("rhs")
         .is_some_and(|rhs| Span::from_node(rhs).contains(Span::from_node(identifier)))
+}
+
+fn is_assignment_target_identifier(identifier: Node<'_>) -> bool {
+    let span = Span::from_node(identifier);
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        if node.kind() == "assignment" {
+            return node
+                .child_by_field_name("lhs")
+                .is_some_and(|lhs| Span::from_node(lhs).contains(span));
+        }
+        if matches!(node.kind(), "block" | "statements") {
+            return false;
+        }
+        current = node.parent();
+    }
+    false
 }
 
 fn location_for_span(uri: &Url, source: &str, span: Span) -> Option<Location> {
@@ -12987,6 +13072,119 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(messages, vec!["unresolved identifier 'Typoo'"]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_do_not_close_the_unavailable_implicit_system_namespace() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-system-boundary.pas")
+            .expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsImplicitSystemBoundary;\n",
+            "interface\n",
+            "type TRec = record Value: Integer; end;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var S: set of Byte; I: Integer; R: TRec;\n",
+            "begin\n",
+            "  Exclude(S, 1);\n",
+            "  if IsConsole then ReadLn(Input, I);\n",
+            "  WriteLn(Output, I);\n",
+            "  I := Round(1.2);\n",
+            "  I := Integer(1);\n",
+            "  I := SizeOf(Integer);\n",
+            "  I := Low(Integer);\n",
+            "  I := High(Integer);\n",
+            "  R.Missing := 1;\n",
+            "  R.Integer := 1;\n",
+            "  Typoo := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("implicit System boundary fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "missing member 'Missing'",
+                "missing member 'Integer'",
+                "unresolved identifier 'Typoo'"
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_use_a_known_system_source_without_closing_compiler_exports() {
+        let system_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-known-system.pas").expect("System URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-diagnostics-known-system-consumer.pas")
+            .expect("consumer URI");
+        let system = concat!(
+            "unit System;\n",
+            "interface\n",
+            "const KnownSystem = 1; Round = 2;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Round: Integer;\n",
+            "begin\n",
+            "  Round := KnownSystem;\n",
+            "  UnknownCompilerExport := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(system_uri.clone(), system.to_owned())
+            .expect("known System source parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("known System consumer parses");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "known source-backed names resolve while unavailable compiler exports stay open: {diagnostics:?}"
+        );
+        let known_offset = consumer.find("KnownSystem").expect("known System name");
+        assert_eq!(
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &consumer_uri,
+                    text::offset_to_position(consumer, known_offset).expect("known position"),
+                    &AtomicBool::new(false),
+                )
+                .expect("known System proof status"),
+            SemanticProofStatus::Resolved
+        );
+        let shadowed_offset = consumer.find("Round :=").expect("shadowed System name");
+        assert_eq!(
+            index
+                .semantic_proof_status_at_with_cancel(
+                    &consumer_uri,
+                    text::offset_to_position(consumer, shadowed_offset).expect("shadow position"),
+                    &AtomicBool::new(false),
+                )
+                .expect("shadowed System proof status"),
+            SemanticProofStatus::Resolved
+        );
     }
 
     #[test]

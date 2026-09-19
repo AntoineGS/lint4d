@@ -1870,6 +1870,23 @@ fn diagnostics_for_uri(server: &mut TestServer, expected: &Url) -> Value {
     }
 }
 
+fn diagnostics_for_uri_until(
+    server: &mut TestServer,
+    expected: &Url,
+    timeout: Duration,
+    predicate: impl Fn(&Value) -> bool,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let publication = server.diagnostic_with_timeout(expected, remaining)?;
+        if predicate(&publication) {
+            return Some(publication);
+        }
+    }
+    None
+}
+
 struct SharedOwnerFixture {
     shared: PathBuf,
     a_main: PathBuf,
@@ -2487,6 +2504,217 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
                 );
             }
         }
+        server.shutdown();
+    }
+}
+
+#[test]
+fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and_overlays() {
+    let shared_source = "procedure Run; begin SharedName := 1; end;\n";
+    let a_empty = concat!(
+        "unit A;\n",
+        "interface\n",
+        "var SharedName: Integer;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let a_complete = concat!(
+        "unit A;\n",
+        "interface\n",
+        "var SharedName: Integer;\n",
+        "implementation\n",
+        "{$I Shared.inc}\n",
+        "end.\n",
+    );
+    let a_incomplete = concat!(
+        "unit A;\n",
+        "interface\n",
+        "var SharedName: Integer;\n",
+        "implementation\n",
+        "{$I Shared.inc}\n",
+        "{$I Missing.inc}\n",
+        "end.\n",
+    );
+    let b_source = concat!(
+        "unit B;\n",
+        "interface\n",
+        "implementation\n",
+        "{$I Shared.inc}\n",
+        "procedure Other; begin OwnTypoo := 1; end;\n",
+        "end.\n",
+    );
+
+    for open_order in [["A.pas", "B.pas"], ["B.pas", "A.pas"]] {
+        let root = tempfile::tempdir().expect("workspace");
+        let a = root.path().join("A.pas");
+        let b = root.path().join("B.pas");
+        let shared = root.path().join("Shared.inc");
+        write_file(&a, a_empty);
+        write_file(&b, b_source);
+        write_file(&shared, shared_source);
+
+        let mut server = TestServer::launch();
+        server.initialize(root.path(), Value::Null);
+        for file_name in open_order {
+            let path = root.path().join(file_name);
+            let source = if file_name == "A.pas" {
+                a_empty
+            } else {
+                b_source
+            };
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&path),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": source,
+                    }
+                }),
+            );
+            let root_diagnostics = diagnostics_for_uri(&mut server, &uri(&path));
+            if file_name == "B.pas" {
+                assert!(
+                    root_diagnostics["diagnostics"]
+                        .as_array()
+                        .expect("B diagnostics")
+                        .iter()
+                        .any(|diagnostic| diagnostic["message"]
+                            == "unresolved identifier 'OwnTypoo'"),
+                    "the competing root's independent local claim must remain visible: {root_diagnostics}"
+                );
+            }
+        }
+
+        let initial = server
+            .diagnostic_with_timeout(&uri(&shared), Duration::from_secs(1))
+            .expect("the sole include owner must publish the initial claim");
+        assert!(
+            initial["diagnostics"]
+                .as_array()
+                .expect("initial shared diagnostics")
+                .iter()
+                .any(|diagnostic| diagnostic["message"] == "unresolved identifier 'SharedName'"),
+            "initial claim should be visible before the competing root owns Shared.inc: {initial}"
+        );
+
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&a), "version": 2},
+                "contentChanges": [{"text": a_complete}],
+            }),
+        );
+        let complete = diagnostics_for_uri(&mut server, &uri(&a));
+        assert!(
+            complete["diagnostics"]
+                .as_array()
+                .expect("complete A diagnostics")
+                .iter()
+                .all(|diagnostic| diagnostic["message"]
+                    != "include expansion was incomplete; lint diagnostics were withheld")
+        );
+        let _ = diagnostics_for_uri(&mut server, &uri(&b));
+        assert!(
+            diagnostics_for_uri_until(
+                &mut server,
+                &uri(&shared),
+                Duration::from_secs(3),
+                |publication| {
+                    publication["diagnostics"]
+                        .as_array()
+                        .expect("shared diagnostics")
+                        .iter()
+                        .all(|diagnostic| {
+                            diagnostic["message"] != "unresolved identifier 'SharedName'"
+                        })
+                }
+            )
+            .is_some(),
+            "adding the competing include must retract the prior claim"
+        );
+
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&a), "version": 3},
+                "contentChanges": [{"text": a_incomplete}],
+            }),
+        );
+        let incomplete = diagnostics_for_uri(&mut server, &uri(&a));
+        assert!(
+            incomplete["diagnostics"]
+                .as_array()
+                .expect("incomplete A diagnostics")
+                .iter()
+                .any(|diagnostic| diagnostic["message"]
+                    == "include expansion was incomplete; lint diagnostics were withheld")
+        );
+        if let Some(publication) =
+            diagnostics_for_uri_until(&mut server, &uri(&shared), Duration::from_secs(1), |_| true)
+        {
+            assert!(
+                publication["diagnostics"]
+                    .as_array()
+                    .expect("shared diagnostics")
+                    .iter()
+                    .all(|diagnostic| diagnostic["message"] != "unresolved identifier 'SharedName'"),
+                "incomplete overlay must not restore a physical include claim: {publication}"
+            );
+        }
+
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&a), "version": 4},
+                "contentChanges": [{"text": a_complete}],
+            }),
+        );
+        let complete_again = diagnostics_for_uri(&mut server, &uri(&a));
+        assert!(
+            complete_again["diagnostics"]
+                .as_array()
+                .expect("complete A diagnostics after removing Missing.inc")
+                .iter()
+                .all(|diagnostic| diagnostic["message"]
+                    != "include expansion was incomplete; lint diagnostics were withheld")
+        );
+        if let Some(publication) =
+            diagnostics_for_uri_until(&mut server, &uri(&shared), Duration::from_secs(1), |_| true)
+        {
+            assert!(
+                publication["diagnostics"]
+                    .as_array()
+                    .expect("shared diagnostics")
+                    .iter()
+                    .all(|diagnostic| diagnostic["message"] != "unresolved identifier 'SharedName'"),
+                "removing the missing include must not restore a claim while both roots remain owners: {publication}"
+            );
+        }
+
+        server.send_notification(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": uri(&a)}}),
+        );
+        assert!(
+            diagnostics_for_uri_until(
+                &mut server,
+                &uri(&shared),
+                Duration::from_secs(3),
+                |publication| {
+                    publication["diagnostics"]
+                        .as_array()
+                        .expect("shared diagnostics after close")
+                        .iter()
+                        .any(|diagnostic| {
+                            diagnostic["message"] == "unresolved identifier 'SharedName'"
+                        })
+                }
+            )
+            .is_some(),
+            "closing the competing root must restore the sole-owner claim"
+        );
         server.shutdown();
     }
 }

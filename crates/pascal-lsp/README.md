@@ -33,6 +33,9 @@ proven default-property result types, and exact writable `var`/`out` arguments.
 Direct property expressions are not proven writable, while proven pointer
 targets and dynamic-array elements retain their addressed-storage semantics;
 unsupported property storage and unresolved index children remain unknown.
+Default-property result types require an accessible, unique declaration and a
+proven substitution for that property's declaring generic owner; unresolved or
+cyclic index aliases and incomplete index arguments remain unknown.
 Grouped parameters and omitted defaults are honored.
 An overload call is diagnosed only when every applicable retained candidate is
 proven incompatible; one compatible, ambiguous, unsupported, or uncertain

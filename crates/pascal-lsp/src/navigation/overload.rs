@@ -12,6 +12,7 @@ use tree_sitter::Node;
 
 const MAX_OVERLOAD_GROUPS: usize = 128;
 const MAX_OVERLOAD_ARGUMENTS: usize = 256;
+const MAX_INDEX_ALIAS_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct OverloadKey {
@@ -1707,7 +1708,20 @@ fn subscript_children_are_proven(
         #[cfg(test)]
         super::test_cancel_after_semantic_subscript_child_if_requested(cancel);
         check_navigation_cancel(cancel)?;
-        if info.ty.is_none() || info.nil_literal {
+        let Some(info_ty) = info.ty.as_ref() else {
+            return Ok(false);
+        };
+        if info.nil_literal
+            || !index_argument_type_is_proven(
+                index,
+                info_ty,
+                state,
+                depth,
+                cancel,
+                budget,
+                &mut HashSet::new(),
+            )?
+        {
             return Ok(false);
         }
         if state_has_uncertainty(state) {
@@ -1715,6 +1729,113 @@ fn subscript_children_are_proven(
         }
     }
     Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_argument_type_is_proven(
+    index: &NavigationIndex,
+    identity: &TypeIdentity,
+    state: &mut ResolutionState,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    visited: &mut HashSet<(Url, String)>,
+) -> Result<bool, String> {
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    if depth >= MAX_INDEX_ALIAS_DEPTH {
+        return Ok(false);
+    }
+    match identity {
+        TypeIdentity::Builtin(_) | TypeIdentity::IntegerLiteral(_) => Ok(true),
+        TypeIdentity::Named {
+            uri,
+            key,
+            kind,
+            args,
+        } => {
+            if *kind != TypeKind::Other {
+                return Ok(true);
+            }
+            budget.require_bytes(uri.as_str().len().saturating_add(key.len()), cancel)?;
+            let visit_key = (uri.clone(), key.clone());
+            if !visited.insert(visit_key.clone()) {
+                return Ok(false);
+            }
+            let result = (|| {
+                let Some(document) = index.documents.get(uri) else {
+                    return Ok(false);
+                };
+                let Some(indices) = document.type_symbol_indices.get(key) else {
+                    return Ok(false);
+                };
+                if indices.len() != 1 {
+                    return Ok(false);
+                }
+                let Some(symbol) = document.symbols.get(indices[0]) else {
+                    return Ok(false);
+                };
+                if symbol.kind != SymbolKind::Type || symbol.generic_parameter.is_some() {
+                    return Ok(false);
+                }
+                if symbol.generic_parameters.len() != args.len() {
+                    return Ok(false);
+                }
+                let mut substitution = GenericSubstitution::empty();
+                for (parameter, argument) in symbol.generic_parameters.iter().zip(args) {
+                    let Some(resolved) = resolved_type_from_identity(index, argument) else {
+                        return Ok(false);
+                    };
+                    substitution.insert(&parameter.name, resolved);
+                }
+                let type_offset = symbol
+                    .type_ref
+                    .as_ref()
+                    .map_or(symbol.span.start, |type_ref| type_ref.span.start);
+                let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+                    document.tree.root_node(),
+                    type_offset,
+                    cancel,
+                    budget,
+                    "indexed expression alias",
+                )?
+                else {
+                    return Ok(false);
+                };
+                let receivers = index.type_receivers_for_symbol_type_with_budget(
+                    uri,
+                    document,
+                    symbol,
+                    lookup_identifier,
+                    Some(symbol.scope),
+                    &substitution,
+                    state,
+                    cancel,
+                    budget,
+                )?;
+                if state_has_uncertainty(state) {
+                    return Ok(false);
+                }
+                let Some(resolved) = super::resolved_type_from_receivers(receivers) else {
+                    return Ok(false);
+                };
+                let Some(terminal) = super::type_identity_from_resolved_type(&resolved) else {
+                    return Ok(false);
+                };
+                index_argument_type_is_proven(
+                    index,
+                    &terminal,
+                    state,
+                    depth.saturating_add(1),
+                    cancel,
+                    budget,
+                    visited,
+                )
+            })();
+            visited.remove(&visit_key);
+            result
+        }
+    }
 }
 
 fn type_identity_kind(identity: Option<&TypeIdentity>) -> Option<TypeKind> {
@@ -1880,8 +2001,20 @@ fn default_property_result_type(
     if !lookup.ancestry_known || !lookup.ambiguous_names.is_empty() {
         return Ok(None);
     }
+    let candidates = index.filter_accessible_candidates_with_state_and_budget(
+        current_uri,
+        current_document,
+        offset,
+        lookup.candidates,
+        state,
+        cancel,
+        budget,
+    )?;
+    if state_has_uncertainty(state) {
+        return Ok(None);
+    }
     let mut properties = Vec::new();
-    for member in lookup.candidates {
+    for member in candidates {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         let Some(member_symbol) = index.symbol(&member) else {
@@ -1899,11 +2032,34 @@ fn default_property_result_type(
     let Some(property_symbol) = index.symbol(property) else {
         return Ok(None);
     };
+    let property_substitution = if let Some(owner_key) = property_symbol.owner_type.as_deref() {
+        // Parent type references belong to the declaring ancestry, not to a
+        // `with` scope at the use site.  Keep this provenance walk isolated so
+        // an exploratory member lookup cannot make a proven owner mapping
+        // appear incomplete in the outer expression.
+        let mut owner_state = ResolutionState::new();
+        owner_state.suppress_with_lookup = true;
+        index.member_owner_substitution_with_budget(
+            &instance.uri,
+            &instance.key,
+            &instance.substitution,
+            &property.uri,
+            owner_key,
+            &mut owner_state,
+            cancel,
+            budget,
+        )?
+    } else {
+        Some(instance.substitution.clone())
+    };
+    let Some(property_substitution) = property_substitution else {
+        return Ok(None);
+    };
     symbol_type(
         index,
         property,
         property_symbol,
-        &instance.substitution,
+        &property_substitution,
         state,
         cancel,
         budget,

@@ -14558,6 +14558,223 @@ mod tests {
     }
 
     #[test]
+    fn round4_r3_default_property_uses_its_declaring_generic_owner() {
+        let uri = Url::parse("file:///tmp/semantic-round4-r3-generic-default.pas")
+            .expect("R4 generic default-property URI");
+        let source = concat!(
+            "unit SemanticRound4R3GenericDefault;\n",
+            "interface\n",
+            "type\n",
+            "  TBase<T> = class\n",
+            "    function GetItem(Index: Integer): T;\n",
+            "    property Items[Index: Integer]: T read GetItem; default;\n",
+            "  end;\n",
+            "  TFixed<T> = class(TBase<Integer>) end;\n",
+            "  TForward<U> = class(TBase<U>) end;\n",
+            "procedure TakeInteger(Value: Integer);\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer; Fixed: TFixed<Boolean>; Forward: TForward<Boolean>; Direct: TBase<Integer>;\n",
+            "begin\n",
+            "  I := Fixed[0];\n",
+            "  TakeInteger(Fixed[0]);\n",
+            "  I := Direct[0];\n",
+            "  TakeInteger(Direct[0]);\n",
+            "  I := Forward[0];\n",
+            "  TakeInteger(Forward[0]);\n",
+            "  TakeBoolean(Forward[0]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R4 generic default-property fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R4 generic default-property diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "type mismatch: cannot assign 'Boolean' to 'Integer'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+            ],
+            "default-property types must use declaring-owner ancestry substitutions: {diagnostics:?}"
+        );
+        let fixed_start =
+            source.find("I := Forward[0]").expect("forward assignment") + "I := ".len();
+        let fixed_call_start = source
+            .find("TakeInteger(Forward[0])")
+            .expect("forward call")
+            + "TakeInteger(".len();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.span)
+                .collect::<Vec<_>>(),
+            vec![
+                SourceSpan {
+                    start: fixed_start,
+                    end: fixed_start + "Forward[0]".len(),
+                },
+                SourceSpan {
+                    start: fixed_call_start,
+                    end: fixed_call_start + "Forward[0]".len(),
+                },
+            ],
+            "only the substituted descendant should be diagnosed: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round4_r3_default_property_respects_inaccessible_candidates() {
+        let provider_uri = Url::parse("file:///tmp/semantic-round4-r3-private-provider.pas")
+            .expect("R4 private provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-round4-r3-private-consumer.pas")
+            .expect("R4 private consumer URI");
+        let provider = concat!(
+            "unit SemanticRound4R3PrivateProvider;\n",
+            "interface\n",
+            "type\n",
+            "  TPrivateBox = class\n",
+            "  private\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "    property Items[Index: Integer]: Integer read GetItem; default;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit SemanticRound4R3PrivateConsumer;\n",
+            "interface\n",
+            "uses SemanticRound4R3PrivateProvider;\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Imported: TPrivateBox;\n",
+            "begin\n",
+            "  TakeBoolean(Imported.Items[0]);\n",
+            "  TakeBoolean(Imported[0]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let local_uri = Url::parse("file:///tmp/semantic-round4-r3-strict-private.pas")
+            .expect("R4 strict-private URI");
+        let local = concat!(
+            "unit SemanticRound4R3StrictPrivate;\n",
+            "interface\n",
+            "type\n",
+            "  TStrictBox = class\n",
+            "  strict private\n",
+            "    function GetItem(Index: Integer): Integer;\n",
+            "    property Items[Index: Integer]: Integer read GetItem; default;\n",
+            "  end;\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Local: TStrictBox;\n",
+            "begin\n",
+            "  TakeBoolean(Local.Items[0]);\n",
+            "  TakeBoolean(Local[0]);\n",
+            "end;\n",
+            "end.\n",
+        );
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("R4 private provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("R4 private consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("SemanticRound4R3PrivateProvider".to_owned(), provider_uri)],
+        );
+        index
+            .update(local_uri.clone(), local.to_owned())
+            .expect("R4 strict-private fixture parses");
+
+        let imported_diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("R4 imported-private diagnostics complete");
+        assert!(
+            imported_diagnostics.is_empty(),
+            "private explicit and default properties must remain inaccessible: {imported_diagnostics:?}"
+        );
+
+        let local_diagnostics = index
+            .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
+            .expect("R4 strict-private diagnostics complete");
+        assert!(
+            local_diagnostics.is_empty(),
+            "strict-private explicit and default properties must remain inaccessible: {local_diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn round4_r3_requires_a_proven_index_argument_type() {
+        let uri = Url::parse("file:///tmp/semantic-round4-r3-index-arguments.pas")
+            .expect("R4 index-argument URI");
+        let source = concat!(
+            "unit SemanticRound4R3IndexArguments;\n",
+            "interface\n",
+            "type\n",
+            "  TValidIndex = Integer;\n",
+            "  TUnknownIndex = MissingType;\n",
+            "  TCycleA = TCycleB;\n",
+            "  TCycleB = TCycleA;\n",
+            "function GetIndex(Value: Integer): Integer;\n",
+            "procedure TakeBoolean(Value: Boolean);\n",
+            "procedure TakeInteger(Value: Integer);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var B: Boolean; I: Integer; A: array[0..1] of Boolean; Good: TValidIndex; Unknown: TUnknownIndex; Cycle: TCycleA;\n",
+            "begin\n",
+            "  I := A[Good];\n",
+            "  TakeInteger(A[Good]);\n",
+            "  B := A[Unknown];\n",
+            "  TakeInteger(A[Unknown]);\n",
+            "  B := A[Cycle];\n",
+            "  TakeInteger(A[Cycle]);\n",
+            "  B := A[GetIndex(True)];\n",
+            "  TakeBoolean(A[GetIndex(True)]);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R4 index-argument fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R4 index-argument diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "type mismatch: cannot assign 'Boolean' to 'Integer'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+            ],
+            "only valid aliases and child argument errors may support outer element claims: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn correction_r4_accepts_known_nil_references_and_suppresses_unknown_aliases() {
         let uri = Url::parse("file:///tmp/semantic-correction-r4.pas").expect("R4 URI");
         let source = concat!(

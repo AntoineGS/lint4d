@@ -50,6 +50,34 @@ diagnostics. The new codes are:
 | --- | --- |
 | Type mismatch | `pascal-type-mismatch` |
 | Incompatible argument | `pascal-incompatible-argument` |
+| Invalid explicit override | `pascal-invalid-override` |
+| Missing interface implementation | `pascal-missing-interface-implementation` |
+
+Override and interface diagnostics use the same complete source-backed ancestry,
+visibility, conditional-state, generic-substitution, cancellation, and traversal
+budgets as the other semantic diagnostics. An explicit `override` is reported
+only when a complete superclass chain proves that no matching inherited
+`virtual` or `dynamic` routine exists. Class/interface method identity includes
+routine kind, exact parameter types, `var`/`out`/`const` modes, generic arity,
+and function results. Supported method-resolution clauses, uniquely resolved
+interface `implements` delegations, and inherited implementations are followed;
+interface diamonds are deduplicated and cyclic ancestry is treated as
+incomplete.
+
+Missing-interface diagnostics are emitted only for concrete source-declared
+classes with complete source-declared interface ancestry. Abstract classes and
+abstract methods may defer obligations. The diagnostic range is the responsible
+method declaration, and include mappings retain a claim only when the physical
+owner is unambiguous. The pass is bounded by the semantic diagnostic node/work,
+byte, and 256-diagnostic limits described by the existing worker pipeline.
+
+Unsupported compiler-only `IInterface` members, unresolved or ambiguous
+providers, unknown conditional branches, parser recovery, inaccessible or
+overloaded candidates when identity is uncertain, unsupported generic
+constraints/variance, property delegation whose target cannot be proven, and
+exhausted ancestry or signature work remain silent. These checks do not attempt
+to replace Delphi's compiler or to diagnose declarations that are merely
+incomplete.
 
 Aliases whose target type is not proven, unresolved by-reference identities,
 non-`nil` pointer/variant/anonymous callable conversions, enum/record

@@ -7463,6 +7463,10 @@ impl Workspace {
                 SemanticDiagnosticKind::MissingMember => "pascal-missing-member",
                 SemanticDiagnosticKind::TypeMismatch => "pascal-type-mismatch",
                 SemanticDiagnosticKind::IncompatibleArgument => "pascal-incompatible-argument",
+                SemanticDiagnosticKind::InvalidOverride => "pascal-invalid-override",
+                SemanticDiagnosticKind::MissingInterfaceImplementation => {
+                    "pascal-missing-interface-implementation"
+                }
             };
             mapped.entry(span.uri).or_default().push(LspDiagnostic::new(
                 Range::new(start, end),

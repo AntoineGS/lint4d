@@ -288,6 +288,8 @@ pub(crate) enum SemanticDiagnosticKind {
     MissingMember,
     TypeMismatch,
     IncompatibleArgument,
+    InvalidOverride,
+    MissingInterfaceImplementation,
 }
 
 fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
@@ -296,6 +298,8 @@ fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
         SemanticDiagnosticKind::MissingMember => 1,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
+        SemanticDiagnosticKind::InvalidOverride => 4,
+        SemanticDiagnosticKind::MissingInterfaceImplementation => 5,
     }
 }
 
@@ -1029,7 +1033,9 @@ impl NavigationIndex {
                     format!("missing member '{name}'")
                 }
                 SemanticDiagnosticKind::TypeMismatch
-                | SemanticDiagnosticKind::IncompatibleArgument => continue,
+                | SemanticDiagnosticKind::IncompatibleArgument
+                | SemanticDiagnosticKind::InvalidOverride
+                | SemanticDiagnosticKind::MissingInterfaceImplementation => continue,
             };
             diagnostics.push(SemanticDiagnostic {
                 kind,
@@ -1132,6 +1138,13 @@ impl NavigationIndex {
                 });
             }
         }
+        let contract_diagnostics =
+            match self.contract_diagnostics_with_budget(uri, document, cancel, &mut budget) {
+                Ok(diagnostics) => diagnostics,
+                Err(error) if error == "request cancelled" => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            };
+        diagnostics.extend(contract_diagnostics);
         diagnostics.sort_by_key(|diagnostic| {
             (
                 diagnostic.span.start,
@@ -1140,6 +1153,1174 @@ impl NavigationIndex {
             )
         });
         Ok(diagnostics)
+    }
+
+    /// Check source-backed override and interface contracts.  The pass is
+    /// deliberately separate from ordinary member lookup because implemented
+    /// interfaces are not ordinary class members.  Unknown ancestry,
+    /// substitutions, visibility, conditional state, and unsupported
+    /// signatures suppress only the affected claim.
+    #[allow(clippy::too_many_lines)]
+    fn contract_diagnostics_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<SemanticDiagnostic>, String> {
+        let mut diagnostics = Vec::new();
+        let mut ancestry = ContractAncestryState::new();
+
+        let override_symbols = document
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| {
+                symbol.kind == SymbolKind::Routine
+                    && symbol.origin == Origin::Declaration
+                    && symbol.owner_type.is_some()
+                    && symbol.routine_directives.override_
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        budget.require_work(override_symbols.len(), cancel)?;
+
+        for symbol_index in override_symbols {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(symbol_index) else {
+                continue;
+            };
+            if document
+                .conditional_unknown_symbols
+                .get(symbol_index)
+                .copied()
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let Some(owner_key) = symbol.owner_type.as_deref() else {
+                continue;
+            };
+            let Some(owner_instance) = self.contract_type_instance(uri, owner_key) else {
+                continue;
+            };
+            if owner_instance.kind != TypeKind::Class {
+                continue;
+            }
+
+            let mut inherited = Vec::new();
+            if self.collect_superclass_routines_with_budget(
+                &owner_instance,
+                &mut ancestry,
+                &mut inherited,
+                cancel,
+                budget,
+            )? == AncestryStatus::Unknown
+            {
+                continue;
+            }
+
+            let mut exact_virtual = false;
+            let mut exact_nonvirtual = false;
+            let mut same_name = false;
+            let mut overloaded = false;
+            let mut uncertain = false;
+            for candidate in inherited
+                .iter()
+                .filter(|candidate| candidate.symbol_key == symbol.key)
+            {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                same_name = true;
+                if candidate.conditional_unknown(self) {
+                    uncertain = true;
+                    continue;
+                }
+                let Some(ancestor_symbol) = self.symbol(&candidate.candidate) else {
+                    uncertain = true;
+                    continue;
+                };
+                if ancestor_symbol.routine_directives.overload {
+                    overloaded = true;
+                }
+                if matches!(
+                    ancestor_symbol.visibility,
+                    Visibility::Private | Visibility::StrictPrivate
+                ) {
+                    uncertain = true;
+                    continue;
+                }
+                let contract_match = self.routines_contract_match(
+                    symbol,
+                    uri,
+                    &owner_instance.substitution,
+                    ancestor_symbol,
+                    &candidate.candidate.uri,
+                    &candidate.substitution,
+                    cancel,
+                    budget,
+                )?;
+                match contract_match {
+                    ContractMatch::Yes => {
+                        if ancestor_symbol.routine_directives.virtual_
+                            || ancestor_symbol.routine_directives.dynamic
+                        {
+                            exact_virtual = true;
+                        } else {
+                            exact_nonvirtual = true;
+                        }
+                    }
+                    ContractMatch::No => {}
+                    ContractMatch::Unknown => uncertain = true,
+                }
+            }
+
+            // A proven virtual/dynamic match wins over other overloads.  A
+            // private/unsupported/overloaded candidate is not proof of an
+            // invalid declaration, even when another candidate is a mismatch.
+            if exact_virtual || uncertain || overloaded {
+                continue;
+            }
+            let _ = (same_name, exact_nonvirtual);
+            if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
+                return Err("semantic diagnostics limit".to_owned());
+            }
+            let name = symbol.name.clone();
+            budget.require_bytes(name.len().saturating_mul(2), cancel)?;
+            diagnostics.push(SemanticDiagnostic {
+                kind: SemanticDiagnosticKind::InvalidOverride,
+                span: SourceSpan {
+                    start: symbol.span.start,
+                    end: symbol.span.end,
+                },
+                message: format!(
+                    "invalid override '{}': no inherited virtual or dynamic method matches",
+                    name
+                ),
+            });
+        }
+
+        let class_symbols = document
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| {
+                symbol.kind == SymbolKind::Type
+                    && symbol.type_kind == TypeKind::Class
+                    && symbol.owner_type.is_none()
+                    && symbol.generic_parameter.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        budget.require_work(class_symbols.len(), cancel)?;
+
+        for class_symbol_index in class_symbols {
+            check_navigation_cancel(cancel)?;
+            let Some(class_symbol) = document.symbols.get(class_symbol_index) else {
+                continue;
+            };
+            if document
+                .conditional_unknown_symbols
+                .get(class_symbol_index)
+                .copied()
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let Some(class_instance) = self.contract_type_instance(uri, &class_symbol.key) else {
+                continue;
+            };
+            let class_resolution = self.resolve_contract_type_with_budget(
+                &class_instance,
+                &mut ancestry,
+                cancel,
+                budget,
+            )?;
+            if class_resolution.status == AncestryStatus::Unknown {
+                continue;
+            }
+
+            let inherited_from_abstract_parent = if class_resolution.interfaces.is_empty() {
+                class_resolution
+                    .superclass
+                    .as_ref()
+                    .map(|parent| {
+                        self.contract_type_is_abstract_with_budget(parent, cancel, budget)
+                    })
+                    .transpose()?
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if class_resolution.interfaces.is_empty() && !inherited_from_abstract_parent {
+                continue;
+            }
+            if self.contract_type_is_abstract_with_budget(&class_instance, cancel, budget)? {
+                continue;
+            }
+
+            let mut requirements = Vec::new();
+            let mut collected_requirements = HashSet::new();
+            let mut interfaces = class_resolution.interfaces.clone();
+            if let Some(superclass) = class_resolution.superclass.clone() {
+                if self
+                    .resolve_contract_type_with_budget(&superclass, &mut ancestry, cancel, budget)?
+                    .status
+                    == AncestryStatus::Unknown
+                {
+                    continue;
+                }
+                interfaces.extend(self.contract_interfaces_from_class_with_budget(
+                    &superclass,
+                    &mut ancestry,
+                    cancel,
+                    budget,
+                )?);
+            }
+            let mut requirements_complete = true;
+            for interface in interfaces {
+                if self.collect_interface_requirements_with_budget(
+                    &interface,
+                    &mut ancestry,
+                    &mut collected_requirements,
+                    &mut requirements,
+                    cancel,
+                    budget,
+                )? == AncestryStatus::Unknown
+                {
+                    requirements_complete = false;
+                    break;
+                }
+            }
+            if !requirements_complete {
+                continue;
+            }
+
+            let mut surface = ContractClassSurface::default();
+            if self.collect_class_surface_with_budget(
+                &class_instance,
+                &mut ancestry,
+                &mut surface,
+                cancel,
+                budget,
+            )? == AncestryStatus::Unknown
+            {
+                continue;
+            }
+
+            let mut emitted_requirements = HashSet::new();
+            for requirement in requirements {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                let identity = requirement.identity(self, cancel, budget)?;
+                if !emitted_requirements.insert(identity) {
+                    continue;
+                }
+                if self.contract_delegation_status(
+                    &requirement,
+                    &class_instance,
+                    &surface.delegations,
+                    cancel,
+                    budget,
+                )? != ContractMatch::No
+                {
+                    continue;
+                }
+                let Some(interface_method) = self.symbol(&requirement.candidate) else {
+                    continue;
+                };
+                let method_name = match self
+                    .contract_method_resolution_name(&requirement, &surface.method_resolutions)
+                {
+                    Ok(Some(name)) => name,
+                    Ok(None) => interface_method.key.clone(),
+                    Err(_) => continue,
+                };
+                if self.contract_method_implementation_status(
+                    &requirement,
+                    &method_name,
+                    &surface.routines,
+                    cancel,
+                    budget,
+                )? != ContractMatch::No
+                {
+                    continue;
+                }
+                if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
+                    return Err("semantic diagnostics limit".to_owned());
+                }
+                let class_name = class_symbol.name.clone();
+                let method_name = interface_method.name.clone();
+                budget.require_bytes(
+                    class_name
+                        .len()
+                        .saturating_add(method_name.len())
+                        .saturating_mul(2),
+                    cancel,
+                )?;
+                diagnostics.push(SemanticDiagnostic {
+                    kind: SemanticDiagnosticKind::MissingInterfaceImplementation,
+                    span: SourceSpan {
+                        start: interface_method.span.start,
+                        end: interface_method.span.end,
+                    },
+                    message: format!(
+                        "class '{}' does not implement interface method '{}'",
+                        class_name, method_name
+                    ),
+                });
+            }
+        }
+
+        Ok(diagnostics)
+    }
+
+    fn contract_type_instance(&self, uri: &Url, key: &str) -> Option<TypeInstance> {
+        let document = self.documents.get(uri)?;
+        let indices = document.type_symbol_indices.get(key)?;
+        if indices.len() != 1 {
+            return None;
+        }
+        let index = *indices.first()?;
+        let symbol = document.symbols.get(index)?;
+        if symbol.kind != SymbolKind::Type
+            || !matches!(symbol.type_kind, TypeKind::Class | TypeKind::Interface)
+        {
+            return None;
+        }
+        Some(type_instance_from_symbol(
+            &Candidate {
+                uri: uri.clone(),
+                index,
+            },
+            symbol,
+        ))
+    }
+
+    fn resolve_contract_parent_with_budget(
+        &self,
+        owner: &TypeInstance,
+        parent: &ParentType,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<TypeInstance>, String> {
+        let Some(type_ref) = parent.type_ref.as_ref() else {
+            return Ok(None);
+        };
+        let Some(document) = self.documents.get(&owner.uri) else {
+            return Ok(None);
+        };
+        let Some(lookup_identifier) = self.contract_lookup_identifier_with_budget(
+            document,
+            type_ref.span,
+            cancel,
+            budget,
+            "contract ancestry",
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut resolution_state = ResolutionState::new();
+        let receivers = self.type_receivers_for_type_ref_with_budget(
+            &owner.uri,
+            document,
+            type_ref.span.start,
+            type_ref,
+            lookup_identifier,
+            None,
+            &owner.substitution,
+            &mut resolution_state,
+            cancel,
+            budget,
+        )?;
+        if resolution_state.receiver_resolution_uncertain() {
+            return Ok(None);
+        }
+        let Some(parent_instance) = unique_type_instance(receivers) else {
+            return Ok(None);
+        };
+        if matches!(parent_instance.kind, TypeKind::Class | TypeKind::Interface) {
+            Ok(Some(parent_instance))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn resolve_superclass_with_budget(
+        &self,
+        instance: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractParentResolution, String> {
+        if let Some(result) = ancestry.superclasses.get(instance) {
+            return Ok(result.clone());
+        }
+        if !ancestry.active_superclasses.insert(instance.clone()) {
+            return Ok(ContractParentResolution::Unknown);
+        }
+        let result = (|| {
+            let Some(document) = self.documents.get(&instance.uri) else {
+                return Ok(ContractParentResolution::Unknown);
+            };
+            let Some(entries) = document.type_ancestry.get(&instance.key) else {
+                return Ok(ContractParentResolution::Unknown);
+            };
+            if entries.len() != 1 || entries[0].kind != TypeKind::Class {
+                return Ok(ContractParentResolution::Unknown);
+            }
+            let mut superclass = None;
+            for parent in entries[0]
+                .parents
+                .iter()
+                .filter(|parent| parent.relation == ParentRelation::Superclass)
+            {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                let Some(parent_instance) =
+                    self.resolve_contract_parent_with_budget(instance, parent, cancel, budget)?
+                else {
+                    return Ok(ContractParentResolution::Unknown);
+                };
+                match parent_instance.kind {
+                    TypeKind::Class => {
+                        if superclass.is_some() {
+                            return Ok(ContractParentResolution::Unknown);
+                        }
+                        superclass = Some(parent_instance);
+                    }
+                    // Delphi permits an interface in the first parent slot;
+                    // it is not a superclass and does not affect override
+                    // proof.
+                    TypeKind::Interface => {}
+                    _ => return Ok(ContractParentResolution::Unknown),
+                }
+            }
+            Ok(ContractParentResolution::Resolved(superclass))
+        })();
+        ancestry.active_superclasses.remove(instance);
+        if let Ok(result) = &result {
+            ancestry
+                .superclasses
+                .insert(instance.clone(), result.clone());
+        }
+        result
+    }
+
+    fn collect_superclass_routines_with_budget(
+        &self,
+        instance: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        routines: &mut Vec<ContractRoutineCandidate>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<AncestryStatus, String> {
+        if !ancestry.active_superclass_routines.insert(instance.clone()) {
+            return Ok(AncestryStatus::Unknown);
+        }
+        let result = (|| {
+            let parent =
+                match self.resolve_superclass_with_budget(instance, ancestry, cancel, budget)? {
+                    ContractParentResolution::Resolved(parent) => parent,
+                    ContractParentResolution::Unknown => return Ok(AncestryStatus::Unknown),
+                };
+            let Some(parent) = parent else {
+                return Ok(AncestryStatus::Complete);
+            };
+            self.direct_contract_routines(&parent, routines, cancel, budget)?;
+            self.collect_superclass_routines_with_budget(
+                &parent, ancestry, routines, cancel, budget,
+            )
+        })();
+        ancestry.active_superclass_routines.remove(instance);
+        result
+    }
+
+    fn resolve_contract_type_with_budget(
+        &self,
+        instance: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractTypeResolution, String> {
+        if let Some(result) = ancestry.types.get(instance) {
+            return Ok(result.clone());
+        }
+        if !ancestry.active_types.insert(instance.clone()) {
+            return Ok(ContractTypeResolution::unknown());
+        }
+        let result = (|| {
+            let Some(document) = self.documents.get(&instance.uri) else {
+                return Ok(ContractTypeResolution::unknown());
+            };
+            let Some(indices) = document.type_symbol_indices.get(&instance.key) else {
+                return Ok(ContractTypeResolution::unknown());
+            };
+            if indices.len() != 1 {
+                return Ok(ContractTypeResolution::unknown());
+            }
+            let index = indices[0];
+            let Some(type_symbol) = document.symbols.get(index) else {
+                return Ok(ContractTypeResolution::unknown());
+            };
+            if type_symbol.kind != SymbolKind::Type
+                || type_symbol.type_kind != instance.kind
+                || document
+                    .conditional_unknown_symbols
+                    .get(index)
+                    .copied()
+                    .unwrap_or(true)
+            {
+                return Ok(ContractTypeResolution::unknown());
+            }
+            let Some(entries) = document.type_ancestry.get(&instance.key) else {
+                return Ok(ContractTypeResolution::unknown());
+            };
+            if entries.len() != 1 {
+                return Ok(ContractTypeResolution::unknown());
+            }
+            let entry = &entries[0];
+            if entry.parent_declared && entry.parents.is_empty() {
+                return Ok(ContractTypeResolution::unknown());
+            }
+            let mut result = ContractTypeResolution::complete();
+            for parent in &entry.parents {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                let Some(parent_instance) =
+                    self.resolve_contract_parent_with_budget(instance, parent, cancel, budget)?
+                else {
+                    return Ok(ContractTypeResolution::unknown());
+                };
+                match entry.kind {
+                    TypeKind::Class if parent_instance.kind == TypeKind::Class => {
+                        if result.superclass.is_some() {
+                            return Ok(ContractTypeResolution::unknown());
+                        }
+                        result.superclass = Some(parent_instance);
+                    }
+                    TypeKind::Class if parent_instance.kind == TypeKind::Interface => {
+                        result.interfaces.push(parent_instance);
+                    }
+                    TypeKind::Interface if parent_instance.kind == TypeKind::Interface => {
+                        result.interfaces.push(parent_instance);
+                    }
+                    _ => return Ok(ContractTypeResolution::unknown()),
+                }
+            }
+            for parent in result.superclass.iter().chain(result.interfaces.iter()) {
+                if self
+                    .resolve_contract_type_with_budget(parent, ancestry, cancel, budget)?
+                    .status
+                    == AncestryStatus::Unknown
+                {
+                    return Ok(ContractTypeResolution::unknown());
+                }
+            }
+            Ok(result)
+        })();
+        ancestry.active_types.remove(instance);
+        if let Ok(result) = &result {
+            ancestry.types.insert(instance.clone(), result.clone());
+        }
+        result
+    }
+
+    fn contract_interfaces_from_class_with_budget(
+        &self,
+        class: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<TypeInstance>, String> {
+        if !ancestry.active_class_interfaces.insert(class.clone()) {
+            return Ok(Vec::new());
+        }
+        let result = (|| {
+            let resolution =
+                self.resolve_contract_type_with_budget(class, ancestry, cancel, budget)?;
+            if resolution.status == AncestryStatus::Unknown {
+                return Ok(Vec::new());
+            }
+            let mut interfaces = resolution.interfaces;
+            if let Some(superclass) = resolution.superclass {
+                interfaces.extend(self.contract_interfaces_from_class_with_budget(
+                    &superclass,
+                    ancestry,
+                    cancel,
+                    budget,
+                )?);
+            }
+            Ok(interfaces)
+        })();
+        ancestry.active_class_interfaces.remove(class);
+        result
+    }
+
+    fn direct_contract_routines(
+        &self,
+        instance: &TypeInstance,
+        routines: &mut Vec<ContractRoutineCandidate>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<(), String> {
+        let Some(document) = self.documents.get(&instance.uri) else {
+            return Err("contract document is unavailable".to_owned());
+        };
+        let indices = document
+            .member_symbol_indices_by_owner
+            .get(&instance.key)
+            .cloned()
+            .unwrap_or_default();
+        budget.require_work(indices.len(), cancel)?;
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(index) else {
+                continue;
+            };
+            if symbol.kind != SymbolKind::Routine
+                || symbol.owner_type.as_deref() != Some(instance.key.as_str())
+            {
+                continue;
+            }
+            routines.push(ContractRoutineCandidate {
+                candidate: Candidate {
+                    uri: instance.uri.clone(),
+                    index,
+                },
+                substitution: instance.substitution.clone(),
+                symbol_key: symbol.key.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn collect_class_surface_with_budget(
+        &self,
+        instance: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        surface: &mut ContractClassSurface,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<AncestryStatus, String> {
+        if !ancestry.active_class_surfaces.insert(instance.clone()) {
+            return Ok(AncestryStatus::Unknown);
+        }
+        let result = (|| {
+            let resolution =
+                self.resolve_contract_type_with_budget(instance, ancestry, cancel, budget)?;
+            if resolution.status == AncestryStatus::Unknown {
+                return Ok(AncestryStatus::Unknown);
+            }
+            self.direct_contract_routines(instance, &mut surface.routines, cancel, budget)?;
+            let Some(document) = self.documents.get(&instance.uri) else {
+                return Ok(AncestryStatus::Unknown);
+            };
+            for method_resolution in document
+                .method_resolutions
+                .iter()
+                .filter(|resolution| resolution.class_owner == instance.key)
+            {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                surface.method_resolutions.push(method_resolution.clone());
+            }
+            for delegation in document
+                .interface_delegations
+                .iter()
+                .filter(|delegation| delegation.class_owner == instance.key)
+            {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                surface.delegations.push(delegation.clone());
+            }
+            if let Some(superclass) = resolution.superclass {
+                self.collect_class_surface_with_budget(
+                    &superclass,
+                    ancestry,
+                    surface,
+                    cancel,
+                    budget,
+                )
+            } else {
+                Ok(AncestryStatus::Complete)
+            }
+        })();
+        ancestry.active_class_surfaces.remove(instance);
+        result
+    }
+
+    fn collect_interface_requirements_with_budget(
+        &self,
+        interface: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        seen: &mut HashSet<(Candidate, GenericSubstitution)>,
+        requirements: &mut Vec<ContractRequirement>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<AncestryStatus, String> {
+        let identity = (
+            interface.uri.clone(),
+            interface.key.clone(),
+            interface.substitution.clone(),
+        );
+        if !ancestry.active_interfaces.insert(identity.clone()) {
+            return Ok(AncestryStatus::Unknown);
+        }
+        let result = (|| {
+            let resolution =
+                self.resolve_contract_type_with_budget(interface, ancestry, cancel, budget)?;
+            if resolution.status == AncestryStatus::Unknown || interface.kind != TypeKind::Interface
+            {
+                return Ok(AncestryStatus::Unknown);
+            }
+            for parent in resolution.interfaces {
+                if self.collect_interface_requirements_with_budget(
+                    &parent,
+                    ancestry,
+                    seen,
+                    requirements,
+                    cancel,
+                    budget,
+                )? == AncestryStatus::Unknown
+                {
+                    return Ok(AncestryStatus::Unknown);
+                }
+            }
+            let Some(document) = self.documents.get(&interface.uri) else {
+                return Ok(AncestryStatus::Unknown);
+            };
+            let indices = document
+                .member_symbol_indices_by_owner
+                .get(&interface.key)
+                .cloned()
+                .unwrap_or_default();
+            budget.require_work(indices.len(), cancel)?;
+            for index in indices {
+                check_navigation_cancel(cancel)?;
+                let Some(symbol) = document.symbols.get(index) else {
+                    continue;
+                };
+                if symbol.kind != SymbolKind::Routine
+                    || symbol.origin != Origin::Declaration
+                    || symbol.owner_type.as_deref() != Some(interface.key.as_str())
+                {
+                    continue;
+                }
+                if document
+                    .conditional_unknown_symbols
+                    .get(index)
+                    .copied()
+                    .unwrap_or(true)
+                    || symbol
+                        .generic_parameters
+                        .iter()
+                        .any(|parameter| parameter.constraint_unsupported)
+                {
+                    return Ok(AncestryStatus::Unknown);
+                }
+                let candidate = Candidate {
+                    uri: interface.uri.clone(),
+                    index,
+                };
+                if seen.insert((candidate.clone(), interface.substitution.clone())) {
+                    requirements.push(ContractRequirement {
+                        candidate,
+                        substitution: interface.substitution.clone(),
+                        interface: interface.clone(),
+                    });
+                }
+            }
+            Ok(AncestryStatus::Complete)
+        })();
+        ancestry.active_interfaces.remove(&identity);
+        result
+    }
+
+    fn contract_type_is_abstract_with_budget(
+        &self,
+        instance: &TypeInstance,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let Some(document) = self.documents.get(&instance.uri) else {
+            return Ok(true);
+        };
+        let Some(entries) = document.type_ancestry.get(&instance.key) else {
+            return Ok(true);
+        };
+        if entries.len() != 1 || entries[0].abstract_ {
+            return Ok(true);
+        }
+        let indices = document
+            .member_symbol_indices_by_owner
+            .get(&instance.key)
+            .cloned()
+            .unwrap_or_default();
+        budget.require_work(indices.len(), cancel)?;
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(index) else {
+                continue;
+            };
+            if symbol.kind != SymbolKind::Routine {
+                continue;
+            }
+            if document
+                .conditional_unknown_symbols
+                .get(index)
+                .copied()
+                .unwrap_or(true)
+            {
+                return Ok(true);
+            }
+            if symbol.routine_directives.abstract_ {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn contract_lookup_identifier_with_budget<'a>(
+        &self,
+        document: &'a Document,
+        span: Span,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        operation: &'static str,
+    ) -> Result<Option<Node<'a>>, String> {
+        let end = span.end.min(span.start.saturating_add(256));
+        for offset in span.start..end.max(span.start.saturating_add(1)) {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if let Some(identifier) = assistance::context_node_at_with_budget(
+                document.tree.root_node(),
+                offset,
+                cancel,
+                budget,
+                operation,
+            )? {
+                return Ok(Some(identifier));
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn routines_contract_match(
+        &self,
+        left: &Symbol,
+        left_uri: &Url,
+        left_substitution: &GenericSubstitution,
+        right: &Symbol,
+        right_uri: &Url,
+        right_substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        if left.routine_kind != right.routine_kind || left.is_static != right.is_static {
+            return Ok(ContractMatch::No);
+        }
+        // Generic method variance and constraint matching is compiler-specific;
+        // retaining it as unknown is safer than claiming either compatibility
+        // or absence.
+        if !left.generic_parameters.is_empty() || !right.generic_parameters.is_empty() {
+            return Ok(ContractMatch::Unknown);
+        }
+        if left.routine_parameters.len() != right.routine_parameters.len() {
+            return Ok(ContractMatch::No);
+        }
+        for (left_parameter, right_parameter) in left
+            .routine_parameters
+            .iter()
+            .zip(&right.routine_parameters)
+        {
+            if left_parameter.mode != right_parameter.mode {
+                return Ok(ContractMatch::No);
+            }
+            let parameter_match = self.contract_parameter_type_match(
+                left_uri,
+                left_parameter.type_ref.as_ref(),
+                left_substitution,
+                right_uri,
+                right_parameter.type_ref.as_ref(),
+                right_substitution,
+                cancel,
+                budget,
+            )?;
+            if parameter_match != ContractMatch::Yes {
+                return Ok(parameter_match);
+            }
+        }
+
+        match (
+            left.routine_kind,
+            left.result_type_ref.as_ref(),
+            right.result_type_ref.as_ref(),
+        ) {
+            (RoutineKind::Function | RoutineKind::Operator, Some(left), Some(right)) => self
+                .contract_parameter_type_match(
+                    left_uri,
+                    Some(left),
+                    left_substitution,
+                    right_uri,
+                    Some(right),
+                    right_substitution,
+                    cancel,
+                    budget,
+                ),
+            (RoutineKind::Function | RoutineKind::Operator, None, None) => {
+                Ok(ContractMatch::Unknown)
+            }
+            (RoutineKind::Function | RoutineKind::Operator, _, _) => Ok(ContractMatch::No),
+            (RoutineKind::Procedure | RoutineKind::Constructor | RoutineKind::Destructor, _, _) => {
+                Ok(
+                    if left.result_type_ref.is_none() == right.result_type_ref.is_none() {
+                        ContractMatch::Yes
+                    } else {
+                        ContractMatch::No
+                    },
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_parameter_type_match(
+        &self,
+        left_uri: &Url,
+        left_type: Option<&TypeRef>,
+        left_substitution: &GenericSubstitution,
+        right_uri: &Url,
+        right_type: Option<&TypeRef>,
+        right_substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        let (Some(left_type), Some(right_type)) = (left_type, right_type) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let Some(left_document) = self.documents.get(left_uri) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let Some(right_document) = self.documents.get(right_uri) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let Some(left_identifier) = self.contract_lookup_identifier_with_budget(
+            left_document,
+            left_type.span,
+            cancel,
+            budget,
+            "contract signature",
+        )?
+        else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let Some(right_identifier) = self.contract_lookup_identifier_with_budget(
+            right_document,
+            right_type.span,
+            cancel,
+            budget,
+            "contract signature",
+        )?
+        else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let mut left_state = ResolutionState::new();
+        let left_receivers = self.type_receivers_for_type_ref_with_budget(
+            left_uri,
+            left_document,
+            left_type.span.start,
+            left_type,
+            left_identifier,
+            None,
+            left_substitution,
+            &mut left_state,
+            cancel,
+            budget,
+        )?;
+        if left_state.receiver_resolution_uncertain() {
+            return Ok(ContractMatch::Unknown);
+        }
+        let mut right_state = ResolutionState::new();
+        let right_receivers = self.type_receivers_for_type_ref_with_budget(
+            right_uri,
+            right_document,
+            right_type.span.start,
+            right_type,
+            right_identifier,
+            None,
+            right_substitution,
+            &mut right_state,
+            cancel,
+            budget,
+        )?;
+        if right_state.receiver_resolution_uncertain() {
+            return Ok(ContractMatch::Unknown);
+        }
+        let (Some(left), Some(right)) = (
+            resolved_type_from_receivers(left_receivers),
+            resolved_type_from_receivers(right_receivers),
+        ) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        Ok(if left == right {
+            ContractMatch::Yes
+        } else {
+            ContractMatch::No
+        })
+    }
+
+    fn contract_method_implementation_status(
+        &self,
+        requirement: &ContractRequirement,
+        method_name: &str,
+        routines: &[ContractRoutineCandidate],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        let candidates = routines
+            .iter()
+            .filter(|candidate| candidate.symbol_key == method_name)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(ContractMatch::No);
+        }
+        let Some(requirement_symbol) = self.symbol(&requirement.candidate) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let mut unknown = false;
+        let mut overloaded = false;
+        for candidate in candidates {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if candidate.conditional_unknown(self) {
+                unknown = true;
+                continue;
+            }
+            let Some(symbol) = self.symbol(&candidate.candidate) else {
+                unknown = true;
+                continue;
+            };
+            if matches!(
+                symbol.visibility,
+                Visibility::Private | Visibility::StrictPrivate
+            ) {
+                unknown = true;
+                continue;
+            }
+            overloaded |= symbol.routine_directives.overload;
+            if symbol.routine_directives.abstract_ {
+                continue;
+            }
+            match self.routines_contract_match(
+                requirement_symbol,
+                &requirement.candidate.uri,
+                &requirement.substitution,
+                symbol,
+                &candidate.candidate.uri,
+                &candidate.substitution,
+                cancel,
+                budget,
+            )? {
+                ContractMatch::Yes => return Ok(ContractMatch::Yes),
+                ContractMatch::No => {}
+                ContractMatch::Unknown => unknown = true,
+            }
+        }
+        Ok(if unknown || overloaded {
+            ContractMatch::Unknown
+        } else {
+            ContractMatch::No
+        })
+    }
+
+    fn contract_method_resolution_name(
+        &self,
+        requirement: &ContractRequirement,
+        resolutions: &[MethodResolution],
+    ) -> Result<Option<String>, String> {
+        let Some(interface_method) = self.symbol(&requirement.candidate) else {
+            return Ok(None);
+        };
+        let matches = resolutions
+            .iter()
+            .filter(|resolution| {
+                resolution.interface_owner == requirement.interface.key
+                    && resolution.interface_method == interface_method.key
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        let first = matches[0].implementation_method.clone();
+        if matches
+            .iter()
+            .skip(1)
+            .any(|resolution| resolution.implementation_method != first)
+        {
+            return Err("ambiguous method-resolution clause".to_owned());
+        }
+        Ok(Some(first))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_delegation_status(
+        &self,
+        requirement: &ContractRequirement,
+        class: &TypeInstance,
+        delegations: &[InterfaceDelegation],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        let mut unknown = false;
+        for delegation in delegations {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(document) = self.documents.get(&class.uri) else {
+                return Ok(ContractMatch::Unknown);
+            };
+            let Some(identifier) = self.contract_lookup_identifier_with_budget(
+                document,
+                delegation.interface.span,
+                cancel,
+                budget,
+                "interface delegation",
+            )?
+            else {
+                unknown = true;
+                continue;
+            };
+            let mut state = ResolutionState::new();
+            let receivers = self.type_receivers_for_type_ref_with_budget(
+                &class.uri,
+                document,
+                delegation.interface.span.start,
+                &delegation.interface,
+                identifier,
+                None,
+                &class.substitution,
+                &mut state,
+                cancel,
+                budget,
+            )?;
+            if state.receiver_resolution_uncertain() {
+                unknown = true;
+                continue;
+            }
+            let Some(target) = unique_type_instance(receivers) else {
+                unknown = true;
+                continue;
+            };
+            if target.uri == requirement.interface.uri && target.key == requirement.interface.key {
+                return Ok(ContractMatch::Yes);
+            }
+        }
+        Ok(if unknown {
+            ContractMatch::Unknown
+        } else {
+            ContractMatch::No
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8860,6 +10041,7 @@ struct RoutineDirectives {
     override_: bool,
     reintroduce: bool,
     forward: bool,
+    abstract_: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8927,7 +10109,146 @@ struct TypeAncestry {
     kind: TypeKind,
     name_span: Span,
     parent_declared: bool,
+    abstract_: bool,
     parents: Vec<ParentType>,
+}
+
+#[derive(Debug, Clone)]
+struct MethodResolution {
+    class_owner: String,
+    interface_owner: String,
+    interface_method: String,
+    implementation_method: String,
+}
+
+#[derive(Debug, Clone)]
+struct InterfaceDelegation {
+    class_owner: String,
+    interface: TypeRef,
+}
+
+#[derive(Debug, Clone)]
+struct ContractTypeResolution {
+    status: AncestryStatus,
+    superclass: Option<TypeInstance>,
+    interfaces: Vec<TypeInstance>,
+}
+
+impl ContractTypeResolution {
+    fn complete() -> Self {
+        Self {
+            status: AncestryStatus::Complete,
+            superclass: None,
+            interfaces: Vec::new(),
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            status: AncestryStatus::Unknown,
+            superclass: None,
+            interfaces: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ContractParentResolution {
+    Resolved(Option<TypeInstance>),
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct ContractRoutineCandidate {
+    candidate: Candidate,
+    substitution: GenericSubstitution,
+    symbol_key: String,
+}
+
+impl ContractRoutineCandidate {
+    fn conditional_unknown(&self, index: &NavigationIndex) -> bool {
+        index.candidate_is_conditionally_unknown(&self.candidate)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContractRequirement {
+    candidate: Candidate,
+    substitution: GenericSubstitution,
+    interface: TypeInstance,
+}
+
+impl ContractRequirement {
+    fn identity(
+        &self,
+        index: &NavigationIndex,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractRequirementIdentity, String> {
+        let Some(symbol) = index.symbol(&self.candidate) else {
+            return Err("interface method disappeared".to_owned());
+        };
+        budget.require_bytes(
+            symbol.key.len().saturating_add(
+                symbol
+                    .routine_signature
+                    .as_deref()
+                    .unwrap_or_default()
+                    .len(),
+            ),
+            cancel,
+        )?;
+        Ok(ContractRequirementIdentity {
+            name: symbol.key.clone(),
+            signature: symbol.routine_signature.clone(),
+            result: symbol.result_type_name.clone(),
+            routine_kind: symbol.routine_kind,
+            generic_shape: generic_shape(&symbol.generic_parameters),
+            substitution: self.substitution.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ContractRequirementIdentity {
+    name: String,
+    signature: Option<String>,
+    result: Option<String>,
+    routine_kind: RoutineKind,
+    generic_shape: String,
+    substitution: GenericSubstitution,
+}
+
+#[derive(Debug, Default)]
+struct ContractClassSurface {
+    routines: Vec<ContractRoutineCandidate>,
+    method_resolutions: Vec<MethodResolution>,
+    delegations: Vec<InterfaceDelegation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractMatch {
+    Yes,
+    No,
+    Unknown,
+}
+
+#[derive(Debug, Default)]
+struct ContractAncestryState {
+    active_types: HashSet<TypeInstance>,
+    types: HashMap<TypeInstance, ContractTypeResolution>,
+    active_superclasses: HashSet<TypeInstance>,
+    superclasses: HashMap<TypeInstance, ContractParentResolution>,
+    active_superclass_routines: HashSet<TypeInstance>,
+    active_class_interfaces: HashSet<TypeInstance>,
+    active_class_surfaces: HashSet<TypeInstance>,
+    active_interfaces: HashSet<(Url, String, GenericSubstitution)>,
+}
+
+impl ContractAncestryState {
+    fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -9365,6 +10686,8 @@ pub(crate) struct ParsedDocument {
     routine_symbol_indices_by_body_scope: HashMap<usize, Vec<usize>>,
     exported_symbol_indices: Vec<usize>,
     interface_member_routine_keys: HashMap<String, HashSet<String>>,
+    method_resolutions: Vec<MethodResolution>,
+    interface_delegations: Vec<InterfaceDelegation>,
     generic_parameter_contexts: Vec<GenericParameterContext>,
     generic_parameter_intervals: SourceIntervalIndex,
     helpers: Vec<HelperDefinition>,
@@ -9610,6 +10933,8 @@ impl Document {
             conditional_unknown_symbols(root, &conditionals, &symbols);
         let helpers = collect_helpers(root, &source);
         let type_ancestry = collect_type_ancestry(root, &source);
+        let method_resolutions = collect_method_resolutions(root, &source);
+        let interface_delegations = collect_interface_delegations(root, &source);
         let unknown_class_owners = symbols
             .iter()
             .filter(|symbol| {
@@ -9780,6 +11105,8 @@ impl Document {
             routine_symbol_indices_by_body_scope,
             exported_symbol_indices,
             interface_member_routine_keys,
+            method_resolutions,
+            interface_delegations,
             generic_parameter_contexts,
             generic_parameter_intervals,
             helpers,
@@ -11378,6 +12705,7 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
                     kind: type_kind,
                     name_span: Span::from_node(name),
                     parent_declared: false,
+                    abstract_: type_declaration_is_abstract(type_node),
                     parents: Vec::new(),
                 });
             continue;
@@ -11440,10 +12768,69 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
                 kind: type_kind,
                 name_span: Span::from_node(name),
                 parent_declared,
+                abstract_: type_declaration_is_abstract(type_node),
                 parents,
             });
     }
     ancestry
+}
+
+fn collect_method_resolutions(root: Node<'_>, source: &str) -> Vec<MethodResolution> {
+    let mut resolutions = Vec::new();
+    for declaration in collect_nodes_matching(root, "declProc") {
+        let Some(class_owner) = enclosing_type(declaration, source) else {
+            continue;
+        };
+        let names = declaration_name_identifiers(declaration);
+        if names.len() < 2 || declaration.child_by_field_name("assign").is_none() {
+            continue;
+        }
+        let Some(implementation) = declaration
+            .child_by_field_name("assign")
+            .and_then(|assign| identifier_nodes(assign).last().copied())
+        else {
+            continue;
+        };
+        let Some(interface_owner) = names
+            .get(names.len().saturating_sub(2))
+            .map(|identifier| canonical_name(&node_text(*identifier, source)))
+        else {
+            continue;
+        };
+        let Some(interface_method) = names
+            .last()
+            .map(|identifier| canonical_name(&node_text(*identifier, source)))
+        else {
+            continue;
+        };
+        resolutions.push(MethodResolution {
+            class_owner,
+            interface_owner,
+            interface_method,
+            implementation_method: canonical_name(&node_text(implementation, source)),
+        });
+    }
+    resolutions
+}
+
+fn collect_interface_delegations(root: Node<'_>, source: &str) -> Vec<InterfaceDelegation> {
+    let mut delegations = Vec::new();
+    for declaration in collect_nodes_matching(root, "declProp") {
+        let Some(class_owner) = enclosing_type(declaration, source) else {
+            continue;
+        };
+        let mut cursor = declaration.walk();
+        for interface in declaration.children_by_field_name("implements", &mut cursor) {
+            let Some(type_ref) = type_ref_from_node(interface, source) else {
+                continue;
+            };
+            delegations.push(InterfaceDelegation {
+                class_owner: class_owner.clone(),
+                interface: type_ref,
+            });
+        }
+    }
+    delegations
 }
 
 fn type_shape_node(node: Node<'_>, type_kind: TypeKind) -> Option<Node<'_>> {
@@ -11462,6 +12849,10 @@ fn type_shape_node(node: Node<'_>, type_kind: TypeKind) -> Option<Node<'_>> {
         pending.extend(children.into_iter().rev());
     }
     None
+}
+
+fn type_declaration_is_abstract(type_node: Node<'_>) -> bool {
+    has_direct_child_kind(type_node, "kAbstract")
 }
 
 fn routine_kind(node: Node<'_>) -> RoutineKind {
@@ -11492,6 +12883,7 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kOverride" => directives.override_ = true,
         "kReintroduce" => directives.reintroduce = true,
         "kForward" => directives.forward = true,
+        "kAbstract" => directives.abstract_ = true,
         _ => {}
     });
     directives
@@ -13317,6 +14709,359 @@ mod tests {
             }
         );
         assert_eq!(diagnostics[0].message, "missing member 'Missing'");
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_an_override_without_a_matching_virtual_ancestor() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-invalid-override.pas")
+            .expect("override URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsInvalidOverride;\n",
+            "interface\n",
+            "type\n",
+            "  TBase = class\n",
+            "    procedure Run(Value: Integer); virtual;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Run(Value: string); override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Run(Value: Integer); begin end;\n",
+            "procedure TChild.Run(Value: string); begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("invalid override fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::InvalidOverride
+                    && diagnostic.message
+                        == "invalid override 'Run': no inherited virtual or dynamic method matches"
+            }),
+            "the incompatible explicit override must be diagnosed: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_a_missing_interface_method_once() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-missing-interface.pas")
+            .expect("interface URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsMissingInterface;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required(Value: Integer);\n",
+            "  end;\n",
+            "  TImplementation = class(TObject, IRequired)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("missing interface fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "one interface obligation: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics[0].kind,
+            SemanticDiagnosticKind::MissingInterfaceImplementation
+        );
+        assert_eq!(
+            diagnostics[0].message,
+            "class 'TImplementation' does not implement interface method 'Required'"
+        );
+        let method_start = source.find("procedure Required").expect("interface method");
+        assert_eq!(
+            diagnostics[0].span,
+            SourceSpan {
+                start: method_start + "procedure ".len(),
+                end: method_start + "procedure Required".len(),
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_a_valid_virtual_override_silent() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-valid-override.pas")
+            .expect("override URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsValidOverride;\n",
+            "interface\n",
+            "type\n",
+            "  TBase = class\n",
+            "    procedure Run(Value: Integer); virtual;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Run(Value: Integer); override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Run(Value: Integer); begin end;\n",
+            "procedure TChild.Run(Value: Integer); begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("valid override fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+            "valid overrides must remain silent: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_accept_an_inherited_interface_implementation() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-inherited-interface.pas")
+            .expect("interface URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsInheritedInterface;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TBase = class(TObject, IRequired)\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Required; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("inherited interface fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "inherited implementations must satisfy descendants: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_missing_methods_on_abstract_classes() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-abstract-interface.pas")
+            .expect("interface URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsAbstractInterface;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TAbstract = class abstract(TObject, IRequired)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("abstract interface fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "abstract classes may defer interface methods: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_deduplicate_interface_diamond_obligations() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-interface-diamond.pas")
+            .expect("interface URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsInterfaceDiamond;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRoot = interface\n",
+            "    procedure Hit;\n",
+            "  end;\n",
+            "  ILeft = interface(IRoot)\n",
+            "  end;\n",
+            "  IRight = interface(IRoot)\n",
+            "  end;\n",
+            "  TDiamond = class(TObject, ILeft, IRight)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("diamond fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
+                })
+                .count(),
+            1,
+            "a diamond obligation is reported once: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_cyclic_class_ancestry() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-class-cycle.pas").expect("cycle URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsClassCycle;\n",
+            "interface\n",
+            "type\n",
+            "  TFirst = class(TSecond)\n",
+            "    procedure Run; override;\n",
+            "  end;\n",
+            "  TSecond = class(TFirst)\n",
+            "    procedure Run; virtual;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TFirst.Run; begin end;\n",
+            "procedure TSecond.Run; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("cycle fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| { diagnostic.kind != SemanticDiagnosticKind::InvalidOverride }),
+            "cyclic ancestry must not produce a confident override claim: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_accept_supported_method_resolution_clauses() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-method-resolution.pas")
+            .expect("interface URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsMethodResolution;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TImplementation = class(TObject, IRequired)\n",
+            "    procedure IRequired.Required = DoRequired;\n",
+            "    procedure DoRequired;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TImplementation.DoRequired; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("method resolution fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "method resolution should satisfy the interface obligation: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_accept_interface_delegation() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-interface-delegation.pas")
+            .expect("interface URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsInterfaceDelegation;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TImplementation = class(TObject, IRequired)\n",
+            "  private\n",
+            "    FRequired: IRequired;\n",
+            "    property Delegate: IRequired read FRequired implements IRequired;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("delegation fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "interface delegation should satisfy the obligation: {diagnostics:?}"
+        );
     }
 
     #[test]

@@ -5924,6 +5924,21 @@ pub(super) fn identifier_at_with_budget<'a>(
     )
 }
 
+pub(super) fn context_node_at_with_budget<'a>(
+    root: Node<'a>,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    operation: &str,
+) -> Result<Option<Node<'a>>, String> {
+    let max_nodes = if operation == "signature help" {
+        MAX_SIGNATURE_NODES
+    } else {
+        MAX_COMPLETION_CONTEXT_NODES
+    };
+    node_at_offset(root, offset, cancel, budget, max_nodes, operation)
+}
+
 fn ignored_offset_with_budget(
     document: &Document,
     offset: usize,

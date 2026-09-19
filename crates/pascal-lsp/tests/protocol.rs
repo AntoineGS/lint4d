@@ -2292,6 +2292,98 @@ fn diagnostics_report_type_and_argument_mismatches_with_utf16_ranges() {
 }
 
 #[test]
+fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Main.pas");
+    let source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TObject = class\r\n",
+        "  end;\r\n",
+        "  TBase = class\r\n",
+        "    procedure Run(Value: Integer); virtual;\r\n",
+        "  end;\r\n",
+        "  IRequired = interface\r\n",
+        "    procedure Required;\r\n",
+        "  end;\r\n",
+        "  TChild = class(TBase)\r\n",
+        "    procedure Run(Value: string); override;\r\n",
+        "  end;\r\n",
+        "  TImplementation = class(TObject, IRequired)\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "procedure TBase.Run(Value: Integer); begin end;\r\n",
+        "procedure TChild.Run(Value: string); begin end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publication = diagnostics_for_uri(&mut server, &uri(&source_path));
+    let diagnostics = publication["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let invalid_override = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-invalid-override")
+        .expect("invalid override diagnostic");
+    assert_eq!(
+        invalid_override["message"],
+        "invalid override 'Run': no inherited virtual or dynamic method matches"
+    );
+    let override_start = position_of(source, "Run(Value: string)", 0);
+    assert_eq!(
+        invalid_override["range"],
+        json!({
+            "start": override_start,
+            "end": Position::new(override_start.line, override_start.character + 3),
+        })
+    );
+
+    let missing_interface = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+        .expect("missing interface implementation diagnostic");
+    assert_eq!(
+        missing_interface["message"],
+        "class 'TImplementation' does not implement interface method 'Required'"
+    );
+    let required_start = position_of(source, "Required", 1);
+    assert_eq!(
+        missing_interface["range"],
+        json!({
+            "start": required_start,
+            "end": Position::new(required_start.line, required_start.character + 8),
+        })
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic["code"] == "pascal-invalid-override"
+                    || diagnostic["code"] == "pascal-missing-interface-implementation"
+            })
+            .count(),
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
 fn diagnostics_map_missing_members_in_includes_to_the_physical_document() {
     let root = tempfile::tempdir().expect("workspace");
     let main = root.path().join("Main.pas");
@@ -2416,6 +2508,76 @@ fn diagnostics_map_type_mismatches_in_includes_to_physical_utf16_ranges() {
         json!({
             "start": start,
             "end": Position::new(start.line, start.character + 1),
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_map_invalid_overrides_in_includes_to_physical_crlf_utf16_ranges() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    let include = root.path().join("Contracts.inc");
+    let main_source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TBase = class\r\n",
+        "    procedure Run; virtual;\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "{$I Contracts.inc}\r\n",
+        "end.\r\n",
+    );
+    let include_source = concat!(
+        "{😀}\r\n",
+        "type\r\n",
+        "  TChild = class(TBase)\r\n",
+        "    procedure Run(Value: Integer); override;\r\n",
+        "  end;\r\n",
+    );
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+
+    let root_publication = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        root_publication["diagnostics"]
+            .as_array()
+            .expect("root diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-invalid-override")
+    );
+    let include_publication = diagnostics_for_uri(&mut server, &uri(&include));
+    let diagnostic = include_publication["diagnostics"]
+        .as_array()
+        .expect("include diagnostics")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-invalid-override")
+        .expect("physical include override diagnostic");
+    assert_eq!(
+        diagnostic["message"],
+        "invalid override 'Run': no inherited virtual or dynamic method matches"
+    );
+    let start = position_of(include_source, "Run(Value: Integer)", 0);
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": start,
+            "end": Position::new(start.line, start.character + 3),
         })
     );
     server.shutdown();

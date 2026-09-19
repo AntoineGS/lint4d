@@ -2599,6 +2599,24 @@ impl Workspace {
         self.open_documents.keys().cloned().collect()
     }
 
+    pub(crate) fn open_diagnostic_roots_with_semantic_claims(&self) -> Vec<Url> {
+        self.diagnostic_publications
+            .iter()
+            .filter(|(root_uri, publications)| {
+                self.open_documents.contains_key(*root_uri)
+                    && publications.values().flatten().any(|diagnostic| {
+                        matches!(
+                            diagnostic.code.as_ref(),
+                            Some(NumberOrString::String(code))
+                                if code == "pascal-unresolved-identifier"
+                                    || code == "pascal-missing-member"
+                        )
+                    })
+            })
+            .map(|(root_uri, _)| root_uri.clone())
+            .collect()
+    }
+
     pub(crate) fn replace_diagnostic_publications(
         &mut self,
         root_uri: &Url,
@@ -7310,6 +7328,7 @@ impl Workspace {
                 )],
             ));
         }
+        self.ensure_open_root_expansions_for_semantic_context(cancel)?;
 
         let normalized = normalize_line_endings_with_offsets(&conditional.projected_source);
         if let Err(error) = ensure_safe_tree_depth(&path, normalized.text.as_bytes()) {
@@ -7427,7 +7446,6 @@ impl Workspace {
                 uri,
                 &span.uri,
                 &span.range,
-                &context_key,
                 &mut mapping_budget,
             )? {
                 continue;
@@ -7470,7 +7488,6 @@ impl Workspace {
         root_uri: &Url,
         physical_uri: &Url,
         physical_range: &std::ops::Range<usize>,
-        context_key: &ContextKey,
         budget: &mut crate::include_expansion::MappingBudget<'_>,
     ) -> Result<bool, String> {
         for (other_root, expansion) in &self.expansions {
@@ -7484,9 +7501,12 @@ impl Workspace {
             {
                 continue;
             }
-            if expansion.context_key != *context_key {
-                return Ok(false);
-            }
+            // ContextKey only describes project/configuration facts.  It does
+            // not contain the root's lexical declarations, imported bindings,
+            // or include-local overlays.  A shared physical include therefore
+            // cannot carry a context-sensitive semantic absence claim merely
+            // because two roots happen to have equal configuration keys.
+            return Ok(false);
         }
         Ok(true)
     }
@@ -7686,6 +7706,55 @@ impl Workspace {
             Err(error) if error == CANCELLATION_MESSAGE => Err(error),
             Err(_) => Ok(Vec::new()),
         }
+    }
+
+    fn ensure_open_root_expansions_for_semantic_context(
+        &mut self,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let roots = self
+            .open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                document
+                    .text
+                    .as_ref()
+                    .map(|source| (uri.clone(), source.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (root_uri, source) in roots {
+            check_workspace_cancel(Some(cancel))?;
+            let context_key = self.context_for_uri_with_cancel(&root_uri, Some(cancel))?;
+            if self
+                .expansions
+                .get(&root_uri)
+                .is_some_and(|expansion| expansion.complete && expansion.context_key == context_key)
+            {
+                continue;
+            }
+            let Some(context) = self
+                .contexts
+                .get(&context_key)
+                .map(|state| state.context.clone())
+            else {
+                continue;
+            };
+            let mut expansion =
+                self.expand_source_with_cancel(&root_uri, &source, &context_key, Some(cancel))?;
+            let conditional_context = context.effective_conditional_context();
+            let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
+                expansion.expanded.text(),
+                &conditional_context,
+                cancel,
+            );
+            crate::include_expansion::reconcile_conditional_completeness(
+                &mut expansion,
+                &conditional,
+            );
+            self.store_expansion(&root_uri, &context_key, source, expansion);
+            self.record_expansion_analysis_sources(&root_uri, &context, cancel)?;
+        }
+        Ok(())
     }
 }
 

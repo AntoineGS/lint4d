@@ -7324,6 +7324,13 @@ fn handle_notification(
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri(uri.clone());
             effect.refresh_dependents(workspace, &uri, false);
+            // Opening another root can change the ownership set for a shared
+            // include even when no source dependency changed.  Recompute roots
+            // that have already published a context-sensitive semantic claim;
+            // ordinary lint-only roots retain their normal publication order.
+            for open_uri in workspace.open_diagnostic_roots_with_semantic_claims() {
+                effect.refresh_uri(open_uri);
+            }
             Ok(effect)
         }
         "textDocument/didChange" => {

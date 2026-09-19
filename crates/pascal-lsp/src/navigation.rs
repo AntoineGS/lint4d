@@ -56,6 +56,7 @@ thread_local! {
     static TEST_SEMANTIC_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_SHADOW_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_GENERIC_SYMBOL_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_DOCUMENT_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -108,6 +109,16 @@ pub(super) fn test_semantic_token_work_counters()
 #[cfg(test)]
 pub(super) fn test_record_semantic_node_visit() {
     TEST_SEMANTIC_NODE_VISITS.with(|value| value.set(value.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn test_reset_semantic_generic_symbol_visits() {
+    TEST_SEMANTIC_GENERIC_SYMBOL_VISITS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+fn test_semantic_generic_symbol_visits() -> usize {
+    TEST_SEMANTIC_GENERIC_SYMBOL_VISITS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -1234,7 +1245,9 @@ impl NavigationIndex {
             self.unit_references_with_budget(document, &unit_name, cancel, budget)
         } else if let Some(direct) = direct {
             Ok(direct)
-        } else if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+        } else if let Some(generic) = self
+            .generic_parameter_references_with_budget(uri, document, identifier, cancel, budget)?
+        {
             budget.require_work(generic.len(), cancel)?;
             budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
             Ok(generic)
@@ -1414,7 +1427,9 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
-        if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+        if let Some(generic) = self
+            .generic_parameter_references_with_budget(uri, document, identifier, cancel, budget)?
+        {
             budget.require_work(generic.len(), cancel)?;
             budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
             return Ok(generic);
@@ -1461,7 +1476,9 @@ impl NavigationIndex {
     ) -> Result<Vec<Candidate>, String> {
         budget.require_bytes(name.len(), cancel)?;
         let key = canonical_name(name);
-        if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
+        if let Some(generic) = self
+            .generic_parameter_references_with_budget(uri, document, identifier, cancel, budget)?
+        {
             budget.require_work(generic.len(), cancel)?;
             budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
             return Ok(generic
@@ -1477,7 +1494,10 @@ impl NavigationIndex {
                 uri, document, offset, name, state, cancel, budget,
             )? {
                 WithLookup::Found(candidates) => return Ok(candidates),
-                WithLookup::Unknown => return Ok(Vec::new()),
+                WithLookup::Unknown => {
+                    state.mark_member_lookup_incomplete();
+                    return Ok(Vec::new());
+                }
                 WithLookup::NotFound => {}
             }
         }
@@ -1525,14 +1545,17 @@ impl NavigationIndex {
         }
 
         if let Some(owner_type) = owner_type.as_deref() {
-            let helper_target = (!document.offset_is_in_helper_declaration(offset))
-                .then(|| {
-                    self.helper_target_for_owner_with_budget(
-                        uri, document, owner_type, cancel, budget,
-                    )
-                })
-                .transpose()?
-                .flatten();
+            let helper_target = if document.offset_is_in_helper_declaration(offset) {
+                OwnerHelperLookup::None
+            } else {
+                self.helper_target_for_owner_status_with_budget(
+                    uri, document, owner_type, cancel, budget,
+                )?
+            };
+            if helper_target == OwnerHelperLookup::Unknown {
+                state.mark_member_lookup_incomplete();
+            }
+            let helper_target = helper_target.selected();
             let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
                 helper_target.map_or_else(
                     || {
@@ -1582,6 +1605,16 @@ impl NavigationIndex {
                     budget,
                 )?
             };
+            if !members.ancestry_known
+                || (members.implicit_member_known && members.candidates.is_empty())
+                || !members.ambiguous_names.is_empty()
+                || members
+                    .candidates
+                    .iter()
+                    .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                state.mark_member_lookup_incomplete();
+            }
             if !members.candidates.is_empty() {
                 return Ok(members.candidates);
             }
@@ -1598,6 +1631,7 @@ impl NavigationIndex {
                 &key,
                 identifier,
                 owner_type.as_deref(),
+                state,
                 cancel,
                 budget,
             );
@@ -1634,6 +1668,7 @@ impl NavigationIndex {
                 owner_type.as_deref(),
                 &current,
             ) {
+                state.mark_receiver_uncertain();
                 return Ok(Vec::new());
             }
             return Ok(current);
@@ -1645,6 +1680,7 @@ impl NavigationIndex {
             &key,
             identifier,
             owner_type.as_deref(),
+            state,
             cancel,
             budget,
         )
@@ -1658,6 +1694,7 @@ impl NavigationIndex {
         key: &str,
         identifier: Node<'_>,
         owner_type: Option<&str>,
+        state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
@@ -1678,6 +1715,7 @@ impl NavigationIndex {
             if self
                 .is_unknown_global_fallback_for_owner(document, identifier, owner_type, &imported)
             {
+                state.mark_receiver_uncertain();
                 return Ok(Vec::new());
             }
             return Ok(imported);
@@ -1790,7 +1828,10 @@ impl NavigationIndex {
                         cancel,
                         budget,
                     )?;
-                    if !lookup.ancestry_known || lookup.ambiguous_names.contains(&key) {
+                    if !lookup.ancestry_known
+                        || (lookup.implicit_member_known && lookup.candidates.is_empty())
+                        || lookup.ambiguous_names.contains(&key)
+                    {
                         state.mark_member_lookup_incomplete();
                     }
                     if lookup
@@ -2136,6 +2177,8 @@ impl NavigationIndex {
             .symbols
             .iter()
             .filter(|symbol| {
+                #[cfg(test)]
+                test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
                 symbol.kind == SymbolKind::Routine
                     && !symbol.generic_parameters.is_empty()
                     && symbol.declaration_span.contains(span)
@@ -2154,6 +2197,8 @@ impl NavigationIndex {
             .iter()
             .enumerate()
             .filter(|(_, symbol)| {
+                #[cfg(test)]
+                test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
                 symbol.kind == SymbolKind::Type
                     && symbol.generic_parameter.as_deref() == Some(key.as_str())
                     && symbol
@@ -2167,6 +2212,72 @@ impl NavigationIndex {
             })
             .collect::<Vec<_>>();
         (!candidates.is_empty()).then_some(candidates)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generic_parameter_references_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Vec<Candidate>>, String> {
+        if is_identifier_in_qualified_path_with_budget(identifier, cancel, budget)? {
+            return Ok(None);
+        }
+        let span = Span::from_node(identifier);
+        let key = canonical_name(node_text_with_budget(
+            identifier,
+            &document.source,
+            cancel,
+            budget,
+        )?);
+        let mut routine_keys = HashSet::new();
+        for symbol in &document.symbols {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(symbol.key.len().saturating_add(symbol.name.len()), cancel)?;
+            #[cfg(test)]
+            test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
+            if symbol.kind == SymbolKind::Routine
+                && !symbol.generic_parameters.is_empty()
+                && symbol.declaration_span.contains(span)
+                && symbol
+                    .generic_parameters
+                    .iter()
+                    .any(|parameter| parameter.name == key)
+            {
+                if let Some(routine_key) = symbol.routine_key.as_ref() {
+                    routine_keys.insert(routine_key.clone());
+                }
+            }
+        }
+        if routine_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let mut candidates = Vec::new();
+        for (index, symbol) in document.symbols.iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(symbol.key.len().saturating_add(symbol.name.len()), cancel)?;
+            #[cfg(test)]
+            test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
+            if symbol.kind == SymbolKind::Type
+                && symbol.generic_parameter.as_deref() == Some(key.as_str())
+                && symbol
+                    .routine_key
+                    .as_ref()
+                    .is_some_and(|routine_key| routine_keys.contains(routine_key))
+            {
+                candidates.push(Candidate {
+                    uri: uri.clone(),
+                    index,
+                });
+            }
+        }
+        Ok((!candidates.is_empty()).then_some(candidates))
     }
 
     fn with_lookup_for_name(
@@ -2393,6 +2504,7 @@ impl NavigationIndex {
             instance.uri == *uri,
         );
         if !lookup.ancestry_known
+            || (lookup.implicit_member_known && lookup.candidates.is_empty())
             || lookup.ambiguous_names.contains(key)
             || lookup
                 .candidates
@@ -2687,6 +2799,7 @@ impl NavigationIndex {
             budget,
         )?;
         if !lookup.ancestry_known
+            || (lookup.implicit_member_known && lookup.candidates.is_empty())
             || lookup.ambiguous_names.contains(key)
             || lookup
                 .candidates
@@ -4993,7 +5106,8 @@ impl NavigationIndex {
                 budget,
             )?
         };
-        if !lookup.ancestry_known {
+        if !lookup.ancestry_known || (lookup.implicit_member_known && lookup.candidates.is_empty())
+        {
             state.mark_receiver_uncertain();
             state.active_members.remove(&resolution_key);
             return Ok(Vec::new());
@@ -5870,14 +5984,36 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Option<TypeInstance>, String> {
+        Ok(self
+            .helper_target_for_owner_status_with_budget(
+                helper_uri,
+                helper_document,
+                owner_key,
+                cancel,
+                budget,
+            )?
+            .selected())
+    }
+
+    fn helper_target_for_owner_status_with_budget(
+        &self,
+        helper_uri: &Url,
+        helper_document: &Document,
+        owner_key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<OwnerHelperLookup, String> {
         let helpers = helper_document
             .helpers
             .iter()
             .enumerate()
             .filter(|(_, helper)| helper.key == owner_key)
             .collect::<Vec<_>>();
+        if helpers.is_empty() {
+            return Ok(OwnerHelperLookup::None);
+        }
         if helpers.len() != 1 {
-            return Ok(None);
+            return Ok(OwnerHelperLookup::Unknown);
         }
         let (helper_index, helper) = helpers[0];
         let Some(mut target) = self.helper_target_instance_with_budget(
@@ -5888,13 +6024,13 @@ impl NavigationIndex {
             budget,
         )?
         else {
-            return Ok(None);
+            return Ok(OwnerHelperLookup::Unknown);
         };
         target.helper_owner = Some(HelperOwner {
             uri: helper_uri.clone(),
             index: helper_index,
         });
-        Ok(Some(target))
+        Ok(OwnerHelperLookup::Selected(target))
     }
 
     fn helper_target_for_owner(
@@ -6330,7 +6466,8 @@ impl NavigationIndex {
                 allow_implementation,
             )
         };
-        if !lookup.ancestry_known {
+        if !lookup.ancestry_known || (lookup.implicit_member_known && lookup.candidates.is_empty())
+        {
             state.mark_receiver_uncertain();
             state.active_members.remove(&resolution_key);
             return Vec::new();
@@ -6680,13 +6817,15 @@ impl NavigationIndex {
                 member_key,
                 allow_implementation,
             );
+            let implicit_root_member_known =
+                self.implicit_root_member_known(type_uri, type_key, member_key);
             let ancestry = if self.type_requires_ancestry(type_uri, type_key) {
                 self.resolve_type_ancestry(type_uri, type_key, state)
             } else {
                 complete_ancestry(Vec::new())
             };
             if ancestry.status != AncestryStatus::Complete {
-                MemberLookup::unknown(direct)
+                MemberLookup::unknown(direct).with_implicit_member_known(implicit_root_member_known)
             } else {
                 let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
                 let mut ancestry_known = true;
@@ -6707,8 +6846,10 @@ impl NavigationIndex {
                 }
                 if ancestry_known {
                     self.merge_member_candidates(direct, parent_lookups, member_key)
+                        .with_implicit_member_known(implicit_root_member_known)
                 } else {
                     MemberLookup::unknown(direct)
+                        .with_implicit_member_known(implicit_root_member_known)
                 }
             }
         };
@@ -6757,13 +6898,16 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?;
+            let implicit_root_member_known =
+                self.implicit_root_member_known(type_uri, type_key, member_key);
             let ancestry = if self.type_requires_ancestry(type_uri, type_key) {
                 self.resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?
             } else {
                 complete_ancestry(Vec::new())
             };
             if ancestry.status != AncestryStatus::Complete {
-                return Ok(MemberLookup::unknown(direct));
+                return Ok(MemberLookup::unknown(direct)
+                    .with_implicit_member_known(implicit_root_member_known));
             }
 
             let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
@@ -6787,8 +6931,9 @@ impl NavigationIndex {
             }
             Ok(if ancestry_known {
                 self.merge_member_candidates(direct, parent_lookups, member_key)
+                    .with_implicit_member_known(implicit_root_member_known)
             } else {
-                MemberLookup::unknown(direct)
+                MemberLookup::unknown(direct).with_implicit_member_known(implicit_root_member_known)
             })
         })();
         state.active_members.remove(&identity);
@@ -6894,6 +7039,27 @@ impl NavigationIndex {
             return true;
         };
         entries.len() != 1 || entries[0].parent_declared
+    }
+
+    fn implicit_root_member_known(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        member_key: Option<&str>,
+    ) -> bool {
+        let Some(member_key) = member_key else {
+            return false;
+        };
+        let Some(document) = self.documents.get(type_uri) else {
+            return false;
+        };
+        let Some(entries) = document.type_ancestry.get(type_key) else {
+            return false;
+        };
+        entries.len() == 1
+            && entries[0].kind == TypeKind::Class
+            && !entries[0].parent_declared
+            && is_implicit_tobject_member(member_key)
     }
 
     fn resolve_type_ancestry(
@@ -7335,13 +7501,17 @@ impl NavigationIndex {
         parent_lookups: Vec<MemberLookup>,
         member_key: Option<&str>,
     ) -> MemberLookup {
+        let implicit_member_known = parent_lookups
+            .iter()
+            .any(|lookup| lookup.implicit_member_known);
         if member_key.is_some() {
             let direct_has_routine = direct.iter().any(|candidate| {
                 self.symbol(candidate)
                     .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
             });
             if !direct.is_empty() && !direct_has_routine {
-                return MemberLookup::known(direct);
+                return MemberLookup::known(direct)
+                    .with_implicit_member_known(implicit_member_known);
             }
             let direct_routines = direct
                 .iter()
@@ -7396,7 +7566,8 @@ impl NavigationIndex {
                     .as_ref()
                     .is_some_and(|current| !candidate_sets_equal(current, &candidates))
                 {
-                    return MemberLookup::unknown(direct);
+                    return MemberLookup::unknown(direct)
+                        .with_implicit_member_known(implicit_member_known);
                 }
                 selected = Some(candidates);
             }
@@ -7404,7 +7575,7 @@ impl NavigationIndex {
             if let Some(selected) = selected {
                 result.extend(selected);
             }
-            return MemberLookup::known(result);
+            return MemberLookup::known(result).with_implicit_member_known(implicit_member_known);
         }
 
         let direct_keys: HashSet<String> = direct
@@ -7469,9 +7640,10 @@ impl NavigationIndex {
             }
         }
         if ambiguous_names.is_empty() {
-            MemberLookup::known(result)
+            MemberLookup::known(result).with_implicit_member_known(implicit_member_known)
         } else {
             MemberLookup::ambiguous(result, ambiguous_names)
+                .with_implicit_member_known(implicit_member_known)
         }
     }
 
@@ -8305,6 +8477,22 @@ enum HelperSelection {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerHelperLookup {
+    None,
+    Selected(TypeInstance),
+    Unknown,
+}
+
+impl OwnerHelperLookup {
+    fn selected(self) -> Option<TypeInstance> {
+        match self {
+            Self::Selected(target) => Some(target),
+            Self::None | Self::Unknown => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct HelperRank {
     target_specificity: usize,
@@ -8341,6 +8529,7 @@ struct TypeAncestryResolution {
 struct MemberLookup {
     candidates: Vec<Candidate>,
     ancestry_known: bool,
+    implicit_member_known: bool,
     ambiguous_names: HashSet<String>,
 }
 
@@ -8349,6 +8538,7 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: true,
+            implicit_member_known: false,
             ambiguous_names: HashSet::new(),
         }
     }
@@ -8357,6 +8547,7 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: false,
+            implicit_member_known: false,
             ambiguous_names: HashSet::new(),
         }
     }
@@ -8365,12 +8556,18 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: true,
+            implicit_member_known: false,
             ambiguous_names,
         }
     }
 
     fn with_ancestry_known(mut self, ancestry_known: bool) -> Self {
         self.ancestry_known &= ancestry_known;
+        self
+    }
+
+    fn with_implicit_member_known(mut self, implicit_member_known: bool) -> Self {
+        self.implicit_member_known |= implicit_member_known;
         self
     }
 }
@@ -11479,6 +11676,29 @@ fn is_identifier_in_qualified_path(identifier: Node<'_>, _source: &str) -> bool 
     false
 }
 
+fn is_identifier_in_qualified_path_with_budget(
+    identifier: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let span = Span::from_node(identifier);
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
+            && Span::from_node(node).contains(span)
+        {
+            let is_rhs = node
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| Span::from_node(rhs).contains(span));
+            return Ok(is_rhs);
+        }
+        current = node.parent();
+    }
+    Ok(false)
+}
+
 fn contains_uncommented_byte(source: &str, span: Span, needle: u8) -> bool {
     let bytes = source.as_bytes();
     let mut index = span.start.min(bytes.len());
@@ -11904,7 +12124,11 @@ fn is_non_value_identifier_with_budget(
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
     let name = canonical_name(&node_text(identifier, source));
-    if is_implicit_or_intrinsic_name(&name) {
+    if is_declaration_identifier(identifier)
+        || is_implicit_or_intrinsic_name(&name)
+        || overload::builtin_type(&name).is_some()
+        || is_type_valued_intrinsic_argument(identifier, source)
+    {
         return Ok(true);
     }
     let span = Span::from_node(identifier);
@@ -11961,85 +12185,113 @@ fn is_non_value_identifier_with_budget(
 }
 
 fn is_implicit_or_intrinsic_name(name: &str) -> bool {
+    implicit_system_symbol_kind(name).is_some()
+}
+
+fn is_implicit_tobject_member(name: &str) -> bool {
     matches!(
         name,
-        "self"
-            | "result"
-            | "inherited"
-            | "exit"
-            | "break"
-            | "continue"
-            | "abort"
-            | "abs"
-            | "arctan"
-            | "assert"
-            | "assigned"
-            | "beep"
-            | "blockread"
-            | "blockwrite"
-            | "chr"
-            | "close"
-            | "comparemem"
-            | "concat"
-            | "copy"
-            | "cos"
-            | "dec"
-            | "delete"
-            | "default"
-            | "dispose"
-            | "exceptobject"
-            | "eof"
-            | "eoln"
-            | "exp"
-            | "filepos"
-            | "filesize"
-            | "fillchar"
-            | "fillbyte"
-            | "filldword"
-            | "fillword"
-            | "finalize"
-            | "freeandnil"
-            | "freemem"
-            | "getmem"
-            | "halt"
-            | "high"
-            | "inc"
-            | "include"
-            | "initialize"
-            | "indexbyte"
-            | "insert"
-            | "int"
-            | "ioresult"
-            | "length"
-            | "ln"
-            | "low"
-            | "move"
-            | "new"
-            | "ord"
-            | "odd"
-            | "pi"
-            | "pred"
-            | "random"
-            | "randomize"
-            | "raise"
-            | "setlength"
-            | "seek"
-            | "sizeof"
-            | "sin"
-            | "sqr"
-            | "sqrt"
-            | "str"
-            | "succ"
-            | "tan"
-            | "typeinfo"
-            | "trunc"
-            | "uniquestring"
-            | "val"
-            | "write"
-            | "writeln"
-            | "read"
-            | "readln"
+        "afterconstruction"
+            | "beforedestruction"
+            | "cleanupinstance"
+            | "classinfo"
+            | "classname"
+            | "classnameis"
+            | "classparent"
+            | "classtype"
+            | "create"
+            | "defaultdie"
+            | "defaulthandler"
+            | "destroy"
+            | "dispatch"
+            | "equals"
+            | "fieldaddress"
+            | "free"
+            | "freeinstance"
+            | "gethashcode"
+            | "getinterface"
+            | "getinterfaceentry"
+            | "getinterfacetable"
+            | "inheritsfrom"
+            | "initinstance"
+            | "instance_size"
+            | "instancesize"
+            | "methodaddress"
+            | "methodname"
+            | "newinstance"
+            | "qualifiedclassname"
+            | "safecallexception"
+            | "tostring"
+            | "unitname"
+            | "unitscope"
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitSystemSymbolKind {
+    CompilerIntrinsic,
+    SystemRoutine,
+    SystemValue,
+}
+
+/// Names supplied by the compiler's implicit `System` namespace.  This is a
+/// deliberately explicit model: an arbitrary failed call is still a useful
+/// unresolved-name diagnostic, while the language/runtime surface below is
+/// not represented by the source index when no `uses System` is written.
+fn implicit_system_symbol_kind(name: &str) -> Option<ImplicitSystemSymbolKind> {
+    let kind = match name {
+        "self" | "result" | "inherited" | "exit" | "break" | "continue" | "raise" => {
+            ImplicitSystemSymbolKind::CompilerIntrinsic
+        }
+        "abs" | "arctan" | "assert" | "assigned" | "beep" | "blockread" | "blockwrite" | "chr"
+        | "close" | "comparemem" | "concat" | "copy" | "cos" | "dec" | "delete" | "dispose"
+        | "eof" | "eoln" | "exp" | "filepos" | "filesize" | "fillchar" | "fillbyte"
+        | "filldword" | "fillword" | "finalize" | "freeandnil" | "freemem" | "getmem" | "halt"
+        | "high" | "inc" | "include" | "initialize" | "indexbyte" | "insert" | "int"
+        | "ioresult" | "length" | "ln" | "low" | "move" | "new" | "newstr" | "odd" | "ord"
+        | "paramstr" | "pred" | "random" | "randomize" | "read" | "readln" | "reallocmem"
+        | "reset" | "rewrite" | "round" | "seek" | "setlength" | "setstring" | "sin" | "sizeof"
+        | "sqr" | "sqrt" | "str" | "succ" | "swap" | "tan" | "trunc" | "typeinfo"
+        | "uniquestring" | "upcase" | "val" | "write" | "writeln" => {
+            ImplicitSystemSymbolKind::SystemRoutine
+        }
+        "abort" | "default" | "exceptobject" | "ismanagedtype" | "maxbyte" | "maxcardinal"
+        | "maxint" | "maxint64" | "maxlongint" | "maxnativeint" | "maxnativeuint" | "maxuint64"
+        | "maxword" | "minint" | "minint64" | "minlongint" | "minnativeint" | "minnativeuint"
+        | "minuint64" | "paramcount" | "pi" => ImplicitSystemSymbolKind::SystemValue,
+        _ => return None,
+    };
+    Some(kind)
+}
+
+fn is_type_valued_intrinsic_argument(identifier: Node<'_>, source: &str) -> bool {
+    let Some(builtin) = overload::builtin_type(&node_text(identifier, source)) else {
+        return false;
+    };
+    let _ = builtin;
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if node.kind() == "exprCall" {
+            let Some(entity) = node.child_by_field_name("entity") else {
+                return false;
+            };
+            let Some(parts) = qualified_name_parts(&entity, source) else {
+                return false;
+            };
+            let Some(name) = parts.last() else {
+                return false;
+            };
+            return matches!(
+                canonical_name(name).as_str(),
+                "default" | "high" | "ismanagedtype" | "low" | "sizeof" | "typeinfo"
+            );
+        }
+        if matches!(node.kind(), "assignment" | "block" | "statements") {
+            return false;
+        }
+        current = node.parent();
+    }
+    false
 }
 
 fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
@@ -12655,6 +12907,198 @@ mod tests {
                 .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
                 .expect("semantic diagnostics complete")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_unknown_with_receivers_and_implicit_ancestry() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-incomplete-bindings.pas")
+            .expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsIncompleteBindings;\n",
+            "interface\n",
+            "type\n",
+            "  TBox = class(TUnknown)\n",
+            "    procedure Run;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBox.Run;\n",
+            "var X: TUnknown;\n",
+            "begin\n",
+            "  with X do Missing := 1;\n",
+            "  AncestorMethod;\n",
+            "  Self.AncestorMethod;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("incomplete binding fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                !matches!(
+                    diagnostic.message.as_str(),
+                    "unresolved identifier 'Missing'" | "unresolved identifier 'AncestorMethod'"
+                )
+            }),
+            "unknown receiver/ancestry must suppress claims: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_implicit_runtime_names_and_type_values() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-runtime.pas")
+            .expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsImplicitRuntime;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  I := Round(1.2);\n",
+            "  Writeln(ParamCount);\n",
+            "  Writeln(MaxInt);\n",
+            "  I := Integer(1);\n",
+            "  I := SizeOf(Integer);\n",
+            "  I := Low(Integer);\n",
+            "  I := High(Integer);\n",
+            "  Typoo := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("implicit runtime fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, vec!["unresolved identifier 'Typoo'"]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_missing_members_from_an_implicit_class_root() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-class-root.pas")
+            .expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsImplicitClassRoot;\n",
+            "interface\n",
+            "type TBox = class end;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Box: TBox;\n",
+            "begin\n",
+            "  Box.Free;\n",
+            "  Box.Create;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("implicit class root fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                !matches!(
+                    diagnostic.message.as_str(),
+                    "missing member 'Free'" | "missing member 'Create'"
+                )
+            }),
+            "implicit class root members are not proven absent: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_ignore_qualified_method_declaration_owners() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-method-owner.pas").expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsMethodOwner;\n",
+            "interface\n",
+            "type TBox = class\n",
+            "  procedure Run;\n",
+            "end;\n",
+            "implementation\n",
+            "procedure TBox.Run;\n",
+            "begin\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("method owner fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "declaration names and owners are not value uses: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_charge_provider_generic_symbol_scans() {
+        let provider_uri =
+            Url::parse("file:///tmp/semantic-budget-provider.pas").expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-budget-consumer.pas").expect("consumer URI");
+        let mut provider = String::from("unit Provider;\ninterface\nconst\n  C0 = 0;\n");
+        for index in 1..=3_000 {
+            writeln!(&mut provider, "  C{index} = {index};").expect("write provider symbol");
+        }
+        provider.push_str(
+            "type\n  TRec = record\n    Value: Integer;\n  end;\nvar Box: TRec;\nimplementation\nend.\n",
+        );
+        let mut consumer = String::from(
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n",
+        );
+        for _ in 0..100 {
+            consumer.push_str("  with Box do Value := 1;\n");
+        }
+        consumer.push_str("  Typoo := 1;\nend;\nend.\n");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider)
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer)
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("Provider".to_owned(), provider_uri)),
+        );
+        test_reset_semantic_generic_symbol_visits();
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("bounded semantic diagnostics complete");
+        let visits = test_semantic_generic_symbol_visits();
+
+        assert!(
+            diagnostics.is_empty() && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            "budget exhaustion must not publish a partial result after {visits} provider generic-symbol visits: {diagnostics:?}"
         );
     }
 

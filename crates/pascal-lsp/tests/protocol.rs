@@ -2398,6 +2398,100 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
 }
 
 #[test]
+fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
+    for open_order in [["A.pas", "B.pas"], ["B.pas", "A.pas"]] {
+        let root = tempfile::tempdir().expect("workspace");
+        let a = root.path().join("A.pas");
+        let b = root.path().join("B.pas");
+        let shared = root.path().join("Shared.inc");
+        let a_source = concat!(
+            "unit A;\n",
+            "interface\n",
+            "var SharedName: Integer;\n",
+            "implementation\n",
+            "{$I Shared.inc}\n",
+            "end.\n",
+        );
+        let b_source = concat!(
+            "unit B;\n",
+            "interface\n",
+            "implementation\n",
+            "{$I Shared.inc}\n",
+            "end.\n",
+        );
+        let shared_source = "procedure Run; begin SharedName := 1; end;\n";
+        write_file(&a, a_source);
+        write_file(&b, b_source);
+        write_file(&shared, shared_source);
+
+        let mut server = TestServer::launch();
+        server.initialize(root.path(), Value::Null);
+        for (index, file_name) in open_order.into_iter().enumerate() {
+            let path = root.path().join(file_name);
+            let source = if file_name == "A.pas" {
+                a_source
+            } else {
+                b_source
+            };
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&path),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": source,
+                    }
+                }),
+            );
+            let root_diagnostics = diagnostics_for_uri(&mut server, &uri(&path));
+            assert!(
+                root_diagnostics["diagnostics"].as_array().is_some(),
+                "root diagnostics publication must be retained: {root_diagnostics}"
+            );
+            if index == 0 {
+                // The first root may be the only known context.  The second
+                // root must force a fresh ownership decision below.
+                let _ = server.diagnostic_with_timeout(&uri(&shared), Duration::from_secs(1));
+                continue;
+            }
+
+            let include_diagnostics =
+                server.diagnostic_with_timeout(&uri(&shared), Duration::from_secs(1));
+            if open_order[0] == "B.pas" {
+                let diagnostics = include_diagnostics
+                    .as_ref()
+                    .expect("opening the second root must retract the first root claim");
+                assert!(
+                    diagnostics["diagnostics"]
+                        .as_array()
+                        .expect("include diagnostics")
+                        .iter()
+                        .all(|diagnostic| {
+                            !(diagnostic["code"] == "pascal-unresolved-identifier"
+                                && diagnostic["message"] == "unresolved identifier 'SharedName'")
+                        }),
+                    "shared include claim must be retracted for open order {open_order:?}: {diagnostics}"
+                );
+            } else if let Some(diagnostics) = include_diagnostics {
+                assert!(
+                    diagnostics["diagnostics"]
+                        .as_array()
+                        .expect("include diagnostics")
+                        .iter()
+                        .all(|diagnostic| {
+                            !(diagnostic["code"] == "pascal-unresolved-identifier"
+                                && diagnostic["message"] == "unresolved identifier 'SharedName'")
+                        }),
+                    "shared include claim must be suppressed for open order {open_order:?}: {diagnostics}"
+                );
+            }
+        }
+        server.shutdown();
+    }
+}
+
+#[test]
 fn numeric_compiler_version_rename_edits_only_the_active_branch() {
     let root = tempfile::tempdir().expect("workspace");
     let source_path = root.path().join("Probe.pas");

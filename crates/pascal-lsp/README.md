@@ -15,13 +15,26 @@ In addition to lint4d rules, diagnostics report `pascal-unresolved-identifier`
 and `pascal-missing-member` only when the bounded source model proves absence.
 The resolver reuses lexical bindings, selected imports, receiver/member lookup,
 helper and `with` precedence, ancestry, accessibility, and conditional state.
-Unknown or ambiguous imports/receivers, incomplete ancestry or helper lookup,
-compiler/implicit names, inaccessible members, parser recovery, unknown
-conditional branches, and exhausted traversal limits are deliberately silent.
+Unknown or ambiguous imports/receivers, incomplete `with`/helper/owner lookup,
+unknown ancestry, an implicit-root runtime member surface not represented by
+the source index, compiler/implicit names, inaccessible members, parser
+recovery, unknown conditional branches, and exhausted traversal limits are
+deliberately silent. Built-in types and type-valued intrinsic arguments are
+not treated as unresolved value uses.
 Declarations, type/generic parameters, routine directives, labels,
 named-argument syntax, units, strings, and comments are not treated as value
-uses. These diagnostics are source-based and do not attempt compiler-only type
-inference, interface/override checking, type mismatches, or quick fixes.
+uses. Generic-provider symbol scans are charged to the same semantic work and
+byte budgets; exhaustion discards the whole semantic result rather than
+publishing a partial scan. These diagnostics are source-based and do not
+attempt compiler-only type inference, interface/override checking, type
+mismatches, or quick fixes.
+
+Semantic diagnostics mapped from a physical include are retained only when
+the include's root-specific binding context is unambiguous. Equal project or
+configuration keys do not establish equal lexical bindings, so shared includes
+used by multiple roots are deliberately silent until one context can be
+proven. Opening another root refreshes previously published semantic claims;
+ordinary lint diagnostics remain independently aggregated per root.
 
 ## Build and Run
 

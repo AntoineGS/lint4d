@@ -2,7 +2,8 @@ use super::{
     AncestryResolutionState, AncestryStatus, AssistanceBudget, BuiltinType, Candidate, Document,
     GenericSubstitution, IntegerKind, NavigationIndex, Origin, ParameterMode, Receiver, Region,
     ResolutionState, ResolvedType, RoutineParameter, Span, Symbol, SymbolKind, TypeIdentity,
-    TypeInstance, TypeKind, TypeRef, assistance, canonical_name, check_navigation_cancel,
+    TypeInstance, TypeKind, TypeRef, TypeShape, assistance, canonical_name,
+    check_navigation_cancel,
 };
 use lsp_types::Url;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -29,8 +30,28 @@ pub(super) struct Selection {
 struct ArgumentInfo {
     span: Span,
     ty: Option<TypeIdentity>,
-    assignable: bool,
+    writability: Writability,
     nil_literal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writability {
+    Writable,
+    NonWritable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteralClassification {
+    Character,
+    String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compatibility {
+    Compatible,
+    Unknown,
+    Incompatible,
 }
 
 #[derive(Debug, Clone)]
@@ -425,31 +446,35 @@ fn score_group_detailed(
             cancel,
             budget,
         )?;
-        if matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out) && !argument.assignable
-        {
-            if uncertain {
-                return Ok(GroupOutcome::Incomplete);
-            }
-            let Some(expected) = expected.as_ref() else {
-                return Ok(GroupOutcome::Incomplete);
-            };
-            mismatches.push(ArgumentTypeMismatch {
-                span: argument_span(argument),
-                expected: type_identity_label(expected),
-                actual: "non-writable expression".to_owned(),
-            });
-            continue;
-        }
-        if argument.nil_literal {
-            match expected.as_ref() {
-                Some(TypeIdentity::Named {
-                    kind: TypeKind::Class | TypeKind::Interface,
-                    ..
-                }) => {
-                    cost = cost.saturating_add(1);
+        if matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out) {
+            match argument.writability {
+                Writability::Writable => {}
+                Writability::Unknown => return Ok(GroupOutcome::Incomplete),
+                Writability::NonWritable => {
+                    if uncertain {
+                        return Ok(GroupOutcome::Incomplete);
+                    }
+                    let Some(expected) = expected.as_ref() else {
+                        return Ok(GroupOutcome::Incomplete);
+                    };
+                    mismatches.push(ArgumentTypeMismatch {
+                        span: argument_span(argument),
+                        expected: type_identity_label(expected),
+                        actual: "non-writable expression".to_owned(),
+                    });
                     continue;
                 }
-                Some(expected) => {
+            }
+        }
+        if argument.nil_literal {
+            let Some(expected) = expected.as_ref() else {
+                uncertain = true;
+                continue;
+            };
+            match nil_compatibility(index, expected) {
+                Compatibility::Compatible => cost = cost.saturating_add(1),
+                Compatibility::Unknown => uncertain = true,
+                Compatibility::Incompatible => {
                     if uncertain {
                         return Ok(GroupOutcome::Incomplete);
                     }
@@ -458,33 +483,18 @@ fn score_group_detailed(
                         expected: type_identity_label(expected),
                         actual: "nil".to_owned(),
                     });
-                    continue;
-                }
-                None => {
-                    uncertain = true;
-                    continue;
                 }
             }
+            continue;
         }
         match (&argument.ty, expected.as_ref()) {
             (None, _) | (_, None) => uncertain = true,
             (Some(actual), Some(expected)) => {
                 if matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out) {
-                    if !exact_type_match(actual, expected) {
-                        if uncertain {
-                            return Ok(GroupOutcome::Incomplete);
-                        }
-                        mismatches.push(ArgumentTypeMismatch {
-                            span: argument_span(argument),
-                            expected: type_identity_label(expected),
-                            actual: type_identity_label(actual),
-                        });
-                    }
-                } else {
-                    match conversion(index, actual, expected, state, ancestry, cancel, budget)? {
-                        Conversion::Cost(value) => cost = cost.saturating_add(value),
-                        Conversion::Unknown => uncertain = true,
-                        Conversion::Incompatible => {
+                    match byref_type_match(actual, expected) {
+                        Compatibility::Compatible => {}
+                        Compatibility::Unknown => uncertain = true,
+                        Compatibility::Incompatible => {
                             if uncertain {
                                 return Ok(GroupOutcome::Incomplete);
                             }
@@ -493,6 +503,31 @@ fn score_group_detailed(
                                 expected: type_identity_label(expected),
                                 actual: type_identity_label(actual),
                             });
+                        }
+                    }
+                } else {
+                    match overload_conversion(
+                        index, actual, expected, state, ancestry, cancel, budget,
+                    )? {
+                        Conversion::Cost(value) => cost = cost.saturating_add(value),
+                        Conversion::Unknown => uncertain = true,
+                        Conversion::Incompatible => {
+                            match assignment_conversion(
+                                index, actual, expected, state, ancestry, cancel, budget,
+                            )? {
+                                Compatibility::Compatible => cost = cost.saturating_add(1),
+                                Compatibility::Unknown => uncertain = true,
+                                Compatibility::Incompatible => {
+                                    if uncertain {
+                                        return Ok(GroupOutcome::Incomplete);
+                                    }
+                                    mismatches.push(ArgumentTypeMismatch {
+                                        span: argument_span(argument),
+                                        expected: type_identity_label(expected),
+                                        actual: type_identity_label(actual),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -664,8 +699,10 @@ pub(super) fn analyze_assignment(
         cancel,
         budget,
     )?;
-    if !lhs_info.assignable {
-        return Ok(AssignmentAnalysis::Unsupported);
+    match lhs_info.writability {
+        Writability::Writable => {}
+        Writability::NonWritable => return Ok(AssignmentAnalysis::Unsupported),
+        Writability::Unknown => return Ok(AssignmentAnalysis::Incomplete),
     }
     let Some(expected) = lhs_info.ty else {
         return Ok(AssignmentAnalysis::Incomplete);
@@ -684,29 +721,21 @@ pub(super) fn analyze_assignment(
         return Ok(AssignmentAnalysis::Incomplete);
     }
     if rhs_info.nil_literal {
-        return Ok(
-            if matches!(
-                expected,
-                TypeIdentity::Named {
-                    kind: TypeKind::Class | TypeKind::Interface,
-                    ..
-                }
-            ) {
-                AssignmentAnalysis::Compatible
-            } else {
-                AssignmentAnalysis::Incompatible {
-                    expected: type_identity_label(&expected),
-                    actual: "nil".to_owned(),
-                }
+        return Ok(match nil_compatibility(index, &expected) {
+            Compatibility::Compatible => AssignmentAnalysis::Compatible,
+            Compatibility::Unknown => AssignmentAnalysis::Incomplete,
+            Compatibility::Incompatible => AssignmentAnalysis::Incompatible {
+                expected: type_identity_label(&expected),
+                actual: "nil".to_owned(),
             },
-        );
+        });
     }
     let Some(actual) = rhs_info.ty else {
         return Ok(AssignmentAnalysis::Incomplete);
     };
     let mut ancestry = AncestryResolutionState::new();
     Ok(
-        match conversion(
+        match assignment_conversion(
             index,
             &actual,
             &expected,
@@ -715,12 +744,12 @@ pub(super) fn analyze_assignment(
             cancel,
             budget,
         )? {
-            Conversion::Cost(_) => AssignmentAnalysis::Compatible,
-            Conversion::Incompatible => AssignmentAnalysis::Incompatible {
+            Compatibility::Compatible => AssignmentAnalysis::Compatible,
+            Compatibility::Incompatible => AssignmentAnalysis::Incompatible {
                 expected: type_identity_label(&expected),
                 actual: type_identity_label(&actual),
             },
-            Conversion::Unknown => AssignmentAnalysis::Incomplete,
+            Compatibility::Unknown => AssignmentAnalysis::Incomplete,
         },
     )
 }
@@ -1016,10 +1045,10 @@ pub(super) fn generic_constraints_satisfied(
             unknown = true;
             continue;
         };
-        match conversion(index, &actual, &expected, state, ancestry, cancel, budget)? {
-            Conversion::Cost(_) => {}
-            Conversion::Unknown => unknown = true,
-            Conversion::Incompatible => return Ok(ConstraintOutcome::Contradictory),
+        match assignment_conversion(index, &actual, &expected, state, ancestry, cancel, budget)? {
+            Compatibility::Compatible => {}
+            Compatibility::Unknown => unknown = true,
+            Compatibility::Incompatible => return Ok(ConstraintOutcome::Contradictory),
         }
     }
     Ok(if unknown {
@@ -1216,7 +1245,10 @@ fn parameter_type(
     budget: &mut AssistanceBudget,
 ) -> Result<Option<TypeIdentity>, String> {
     if parameter.type_ref.is_none() && parameter.type_name.is_none() {
-        return Ok(None);
+        return Ok(parameter
+            .type_shape
+            .as_ref()
+            .and_then(|shape| anonymous_shape_identity(&candidate.uri, shape)));
     }
     let Some(document) = index.documents.get(&candidate.uri) else {
         return Ok(None);
@@ -1237,7 +1269,13 @@ fn parameter_type(
             .as_ref()
             .map(TypeRef::display)
             .or_else(|| parameter.type_name.clone())
-            .and_then(|name| builtin_type(&name).map(TypeIdentity::Builtin)));
+            .and_then(|name| builtin_type(&name).map(TypeIdentity::Builtin))
+            .or_else(|| {
+                parameter
+                    .type_shape
+                    .as_ref()
+                    .and_then(|shape| anonymous_shape_identity(&candidate.uri, shape))
+            }));
     };
     let receivers = if let Some(type_ref) = parameter.type_ref.as_ref() {
         index.type_receivers_for_type_ref_with_budget(
@@ -1281,7 +1319,6 @@ fn infer_argument(
 ) -> Result<ArgumentInfo, String> {
     let argument_span = Span::from_node(node);
     let mut node = node;
-    let mut force_non_assignable = false;
     loop {
         check_navigation_cancel(cancel)?;
         if node.kind() == "exprParens" {
@@ -1289,15 +1326,6 @@ fn infer_argument(
                 return Ok(unknown_argument(argument_span));
             };
             budget.require_work(1, cancel)?;
-            node = operand;
-            continue;
-        }
-        if node.kind() == "exprUnary" {
-            let Some(operand) = node.named_child(0) else {
-                return Ok(unknown_argument(argument_span));
-            };
-            budget.require_work(1, cancel)?;
-            force_non_assignable = true;
             node = operand;
             continue;
         }
@@ -1310,28 +1338,30 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: Some(ty),
-            assignable: false,
+            writability: Writability::NonWritable,
             nil_literal: false,
         });
     }
     if matches!(kind, "literalString" | "literalChar") {
         let text = node_text(index, current_document, node, cancel, budget)?;
-        let is_character = if kind == "literalChar" {
-            true
+        let classification = if kind == "literalChar" {
+            Some(LiteralClassification::Character)
         } else {
-            let Some(is_character) = classify_literal_fragments(&text) else {
-                return Ok(unknown_argument(argument_span));
-            };
-            is_character
+            classify_literal_fragments(&text)
+        };
+        let Some(classification) = classification else {
+            return Ok(unknown_argument(argument_span));
         };
         return Ok(ArgumentInfo {
             span: argument_span,
-            ty: Some(TypeIdentity::Builtin(if is_character {
-                BuiltinType::Character
-            } else {
-                BuiltinType::String
-            })),
-            assignable: false,
+            ty: Some(TypeIdentity::Builtin(
+                if classification == LiteralClassification::Character {
+                    BuiltinType::Character
+                } else {
+                    BuiltinType::String
+                },
+            )),
+            writability: Writability::NonWritable,
             nil_literal: false,
         });
     }
@@ -1339,7 +1369,7 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: Some(TypeIdentity::Builtin(BuiltinType::Boolean)),
-            assignable: false,
+            writability: Writability::NonWritable,
             nil_literal: false,
         });
     }
@@ -1347,8 +1377,87 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: None,
-            assignable: false,
+            writability: Writability::NonWritable,
             nil_literal: true,
+        });
+    }
+    if kind == "exprUnary" {
+        let Some(operator) = node.child_by_field_name("operator") else {
+            return Ok(unknown_argument(argument_span));
+        };
+        let operator = node_text(index, current_document, operator, cancel, budget)?;
+        if operator != "^" {
+            return Ok(unknown_argument(argument_span));
+        }
+        let Some(operand) = node.child_by_field_name("operand") else {
+            return Ok(unknown_argument(argument_span));
+        };
+        let base = infer_argument(
+            index,
+            current_uri,
+            current_document,
+            operand,
+            state,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )?;
+        let ty = element_type_for_expression(
+            index,
+            current_uri,
+            current_document,
+            operand,
+            state,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )?;
+        let writability = if ty.is_some() {
+            base.writability
+        } else {
+            Writability::Unknown
+        };
+        return Ok(ArgumentInfo {
+            span: argument_span,
+            ty,
+            writability,
+            nil_literal: false,
+        });
+    }
+    if kind == "exprSubscript" {
+        let Some(entity) = node.child_by_field_name("entity") else {
+            return Ok(unknown_argument(argument_span));
+        };
+        let base = infer_argument(
+            index,
+            current_uri,
+            current_document,
+            entity,
+            state,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )?;
+        let ty = element_type_for_expression(
+            index,
+            current_uri,
+            current_document,
+            entity,
+            state,
+            depth.saturating_add(1),
+            cancel,
+            budget,
+        )?;
+        let writability = if ty.is_some() {
+            base.writability
+        } else {
+            Writability::Unknown
+        };
+        return Ok(ArgumentInfo {
+            span: argument_span,
+            ty,
+            writability,
+            nil_literal: false,
         });
     }
     if kind == "exprCall" || kind == "exprAs" {
@@ -1363,21 +1472,21 @@ fn infer_argument(
             budget,
             depth.saturating_add(1),
         )?;
+        let ty = receiver_type(index, receivers)?;
         return Ok(ArgumentInfo {
             span: argument_span,
-            ty: receiver_type(index, receivers)?,
-            assignable: false,
+            writability: if ty.is_some() {
+                Writability::NonWritable
+            } else {
+                Writability::Unknown
+            },
+            ty,
             nil_literal: false,
         });
     }
 
     let Some(identifier) = expression_identifier(node) else {
-        return Ok(ArgumentInfo {
-            span: argument_span,
-            ty: None,
-            assignable: false,
-            nil_literal: false,
-        });
+        return Ok(unknown_argument(argument_span));
     };
     let candidates = index.resolve_candidates_at_with_state_and_budget(
         current_uri,
@@ -1389,13 +1498,6 @@ fn infer_argument(
         cancel,
         budget,
     )?;
-    let assignable = !force_non_assignable
-        && (candidates
-            .iter()
-            .any(|candidate| index.symbol(candidate).is_some_and(is_assignable_symbol))
-            || node_text(index, current_document, identifier, cancel, budget)?
-                .eq_ignore_ascii_case("Result"));
-
     if candidates
         .iter()
         .any(|candidate| index.candidate_is_conditionally_unknown(candidate))
@@ -1403,20 +1505,46 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: None,
-            assignable,
+            writability: Writability::Unknown,
+            nil_literal: false,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(ArgumentInfo {
+            span: argument_span,
+            ty: None,
+            writability: Writability::Unknown,
             nil_literal: false,
         });
     }
 
     let mut identities = HashSet::new();
     let mut unknown = false;
+    let mut binding_unknown = false;
+    let mut writable = false;
+    let mut non_writable = false;
     for candidate in candidates {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         let Some(symbol) = index.symbol(&candidate) else {
             unknown = true;
+            binding_unknown = true;
             continue;
         };
+        if is_assignable_symbol(symbol) {
+            writable = true;
+        } else if matches!(
+            symbol.kind,
+            SymbolKind::Constant
+                | SymbolKind::EnumValue
+                | SymbolKind::Routine
+                | SymbolKind::Type
+                | SymbolKind::Property
+        ) {
+            non_writable = true;
+        } else {
+            binding_unknown = true;
+        }
         if matches!(
             symbol.kind,
             SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::Field | SymbolKind::Property
@@ -1439,6 +1567,17 @@ fn infer_argument(
             unknown = true;
         }
     }
+    let identifier_is_result = node_text(index, current_document, identifier, cancel, budget)?
+        .eq_ignore_ascii_case("Result");
+    let writability = if binding_unknown || (writable && non_writable) {
+        Writability::Unknown
+    } else if writable || identifier_is_result {
+        Writability::Writable
+    } else if non_writable {
+        Writability::NonWritable
+    } else {
+        Writability::Unknown
+    };
     Ok(ArgumentInfo {
         span: argument_span,
         ty: if !unknown && identities.len() == 1 {
@@ -1446,7 +1585,7 @@ fn infer_argument(
         } else {
             None
         },
-        assignable,
+        writability,
         nil_literal: false,
     })
 }
@@ -1455,9 +1594,233 @@ fn unknown_argument(span: Span) -> ArgumentInfo {
     ArgumentInfo {
         span,
         ty: None,
-        assignable: false,
+        writability: Writability::Unknown,
         nil_literal: false,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn element_type_for_expression(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    current_document: &Document,
+    node: Node<'_>,
+    state: &mut ResolutionState,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TypeIdentity>, String> {
+    if depth >= super::MAX_RECEIVER_RECURSION_DEPTH {
+        return Ok(None);
+    }
+    let Some(identifier) = expression_identifier(node) else {
+        return Ok(None);
+    };
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        current_document,
+        identifier.start_byte(),
+        identifier,
+        state,
+        depth.saturating_add(1),
+        cancel,
+        budget,
+    )?;
+    let mut result = None;
+    for candidate in candidates {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = index.symbol(&candidate) else {
+            return Ok(None);
+        };
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::Field | SymbolKind::Property
+        ) {
+            continue;
+        }
+        let Some(shape) = symbol.type_shape.as_ref() else {
+            return Ok(None);
+        };
+        let identity = shape_element_identity(
+            index,
+            &candidate,
+            symbol,
+            shape,
+            state,
+            cancel,
+            budget,
+            &mut HashSet::new(),
+        )?;
+        if result.as_ref() != identity.as_ref() {
+            return Ok(None);
+        }
+        result = identity;
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape_element_identity(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    symbol: &Symbol,
+    shape: &TypeShape,
+    state: &mut ResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    visited: &mut HashSet<(Url, String)>,
+) -> Result<Option<TypeIdentity>, String> {
+    match shape {
+        TypeShape::Pointer(element) | TypeShape::Array { element, .. } => {
+            scalar_identity_from_shape(index, candidate, symbol, element, state, cancel, budget)
+        }
+        TypeShape::Named(type_ref) => {
+            let Some(document) = index.documents.get(&candidate.uri) else {
+                return Ok(None);
+            };
+            let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+                document.tree.root_node(),
+                type_ref.span.start,
+                cancel,
+                budget,
+                "indexed expression type",
+            )?
+            else {
+                return Ok(None);
+            };
+            let receivers = index.type_receivers_for_type_ref_with_budget(
+                &candidate.uri,
+                document,
+                type_ref.span.start,
+                type_ref,
+                lookup_identifier,
+                Some(symbol.scope),
+                &GenericSubstitution::empty(),
+                state,
+                cancel,
+                budget,
+            )?;
+            let Some(receiver) = unique_receiver(receivers) else {
+                return Ok(None);
+            };
+            match receiver {
+                Receiver::Builtin(builtin) => Ok(Some(TypeIdentity::Builtin(builtin))),
+                Receiver::IntegerLiteral(value) => Ok(Some(TypeIdentity::IntegerLiteral(value))),
+                Receiver::Type(instance) => {
+                    let identity = TypeIdentity::Named {
+                        uri: instance.uri.clone(),
+                        key: instance.key.clone(),
+                        kind: instance.kind,
+                        args: instance
+                            .parameter_names
+                            .iter()
+                            .filter_map(|name| instance.substitution.get(name))
+                            .filter_map(super::type_identity_from_resolved_type)
+                            .collect(),
+                    };
+                    if !matches!(
+                        instance.kind,
+                        TypeKind::Pointer
+                            | TypeKind::Array
+                            | TypeKind::DynamicArray
+                            | TypeKind::Callable
+                            | TypeKind::Other
+                    ) {
+                        return Ok(Some(identity));
+                    }
+                    let key = (instance.uri.clone(), instance.key.clone());
+                    if !visited.insert(key) {
+                        return Ok(None);
+                    }
+                    let Some(type_document) = index.documents.get(&instance.uri) else {
+                        return Ok(None);
+                    };
+                    let Some(indices) = type_document.type_symbol_indices.get(&instance.key) else {
+                        return Ok(None);
+                    };
+                    if indices.len() != 1 {
+                        return Ok(None);
+                    }
+                    let type_candidate = Candidate {
+                        uri: instance.uri,
+                        index: indices[0],
+                    };
+                    let Some(type_symbol) = index.symbol(&type_candidate) else {
+                        return Ok(None);
+                    };
+                    let Some(type_shape) = type_symbol.type_shape.as_ref() else {
+                        return Ok(None);
+                    };
+                    shape_element_identity(
+                        index,
+                        &type_candidate,
+                        type_symbol,
+                        type_shape,
+                        state,
+                        cancel,
+                        budget,
+                        visited,
+                    )
+                }
+                Receiver::Unit(_) => Ok(None),
+            }
+        }
+        TypeShape::Callable | TypeShape::Unknown => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scalar_identity_from_shape(
+    index: &NavigationIndex,
+    candidate: &Candidate,
+    symbol: &Symbol,
+    shape: &TypeShape,
+    state: &mut ResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TypeIdentity>, String> {
+    match shape {
+        TypeShape::Named(type_ref) => {
+            let Some(document) = index.documents.get(&candidate.uri) else {
+                return Ok(None);
+            };
+            let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+                document.tree.root_node(),
+                type_ref.span.start,
+                cancel,
+                budget,
+                "indexed element type",
+            )?
+            else {
+                return Ok(None);
+            };
+            let receivers = index.type_receivers_for_type_ref_with_budget(
+                &candidate.uri,
+                document,
+                type_ref.span.start,
+                type_ref,
+                lookup_identifier,
+                Some(symbol.scope),
+                &GenericSubstitution::empty(),
+                state,
+                cancel,
+                budget,
+            )?;
+            let identity = receiver_type(index, receivers)?;
+            Ok(identity)
+        }
+        TypeShape::Pointer(_)
+        | TypeShape::Array { .. }
+        | TypeShape::Callable
+        | TypeShape::Unknown => Ok(None),
+    }
+}
+
+fn unique_receiver(receivers: Vec<Receiver>) -> Option<Receiver> {
+    (receivers.len() == 1)
+        .then(|| receivers.into_iter().next())
+        .flatten()
 }
 
 fn is_assignable_symbol(symbol: &Symbol) -> bool {
@@ -1474,10 +1837,6 @@ fn is_assignable_symbol(symbol: &Symbol) -> bool {
         SymbolKind::Property => false,
         _ => false,
     }
-}
-
-fn exact_type_match(actual: &TypeIdentity, expected: &TypeIdentity) -> bool {
-    actual == expected
 }
 
 fn infer_numeric_literal(text: &str) -> TypeIdentity {
@@ -1499,10 +1858,11 @@ fn infer_numeric_literal(text: &str) -> TypeIdentity {
         )))
 }
 
-fn classify_literal_fragments(text: &str) -> Option<bool> {
+fn classify_literal_fragments(text: &str) -> Option<LiteralClassification> {
     let mut remaining = text.trim();
     let mut fragments = 0usize;
-    let mut only_codepoint = false;
+    let mut character_fragment = false;
+    let mut character_value_is_certain = true;
     while !remaining.is_empty() {
         remaining = remaining.trim_start();
         if let Some(after_hash) = remaining.strip_prefix('#') {
@@ -1523,24 +1883,39 @@ fn classify_literal_fragments(text: &str) -> Option<bool> {
             }
             remaining = &digits[length..];
             fragments += 1;
-            only_codepoint = true;
+            character_fragment = true;
+            let value = if let Some(hex_digits) = after_hash.strip_prefix('$') {
+                &hex_digits[..length]
+            } else {
+                &after_hash[..length]
+            };
+            let radix = if after_hash.starts_with('$') { 16 } else { 10 };
+            character_value_is_certain = character_value_is_certain
+                && u32::from_str_radix(value, radix).is_ok_and(|value| value <= u8::MAX as u32);
             continue;
         }
         if remaining.starts_with('\'') {
             let bytes = remaining.as_bytes();
             let mut index = 1;
+            let mut logical_characters = 0usize;
             while index < bytes.len() {
                 if bytes[index] != b'\'' {
-                    index += 1;
+                    let character = remaining[index..].chars().next()?;
+                    logical_characters = logical_characters.saturating_add(1);
+                    if !character.is_ascii() {
+                        character_value_is_certain = false;
+                    }
+                    index += character.len_utf8();
                     continue;
                 }
                 if bytes.get(index + 1) == Some(&b'\'') {
+                    logical_characters = logical_characters.saturating_add(1);
                     index += 2;
                     continue;
                 }
                 remaining = &remaining[index + 1..];
                 fragments += 1;
-                only_codepoint = false;
+                character_fragment = logical_characters == 1;
                 break;
             }
             if index >= bytes.len() {
@@ -1550,7 +1925,16 @@ fn classify_literal_fragments(text: &str) -> Option<bool> {
         }
         return None;
     }
-    Some(fragments == 1 && only_codepoint)
+    if fragments != 1 {
+        return Some(LiteralClassification::String);
+    }
+    if character_fragment && character_value_is_certain {
+        Some(LiteralClassification::Character)
+    } else if character_fragment {
+        None
+    } else {
+        Some(LiteralClassification::String)
+    }
 }
 
 fn is_radix_integer(text: &str) -> bool {
@@ -1613,7 +1997,10 @@ fn symbol_type(
     budget: &mut AssistanceBudget,
 ) -> Result<Option<TypeIdentity>, String> {
     if symbol.type_ref.is_none() && symbol.type_name.is_none() {
-        return Ok(None);
+        return Ok(symbol
+            .type_shape
+            .as_ref()
+            .and_then(|shape| anonymous_shape_identity(&candidate.uri, shape)));
     }
     let Some(document) = index.documents.get(&candidate.uri) else {
         return Ok(None);
@@ -1631,7 +2018,13 @@ fn symbol_type(
             .as_ref()
             .map(TypeRef::display)
             .or_else(|| symbol.type_name.clone())
-            .and_then(|name| builtin_type(&name).map(TypeIdentity::Builtin)));
+            .and_then(|name| builtin_type(&name).map(TypeIdentity::Builtin))
+            .or_else(|| {
+                symbol
+                    .type_shape
+                    .as_ref()
+                    .and_then(|shape| anonymous_shape_identity(&candidate.uri, shape))
+            }));
     };
     let receivers = index.type_receivers_for_symbol_type_with_budget(
         &candidate.uri,
@@ -1680,6 +2073,35 @@ fn receiver_type(
         result = Some(identity);
     }
     Ok(result)
+}
+
+fn anonymous_shape_identity(uri: &Url, shape: &TypeShape) -> Option<TypeIdentity> {
+    let kind = match shape {
+        TypeShape::Pointer(_) => TypeKind::Pointer,
+        TypeShape::Array { dynamic: true, .. } => TypeKind::DynamicArray,
+        TypeShape::Array { dynamic: false, .. } => TypeKind::Array,
+        TypeShape::Callable => TypeKind::Callable,
+        TypeShape::Named(_) | TypeShape::Unknown => return None,
+    };
+    Some(TypeIdentity::Named {
+        uri: uri.clone(),
+        key: format!("<anonymous:{}>", shape_label(shape)),
+        kind,
+        args: Vec::new(),
+    })
+}
+
+fn shape_label(shape: &TypeShape) -> String {
+    match shape {
+        TypeShape::Named(type_ref) => type_ref.display(),
+        TypeShape::Pointer(element) => format!("pointer<{}>", shape_label(element)),
+        TypeShape::Array { element, dynamic } => {
+            let kind = if *dynamic { "dynamic-array" } else { "array" };
+            format!("{kind}<{}>", shape_label(element))
+        }
+        TypeShape::Callable => "callable".to_owned(),
+        TypeShape::Unknown => "unknown".to_owned(),
+    }
 }
 
 pub(super) fn builtin_type(name: &str) -> Option<BuiltinType> {
@@ -1738,7 +2160,11 @@ fn integer_conversion(actual: IntegerKind, expected: IntegerKind) -> Conversion 
         {
             Conversion::Cost(1)
         }
-        (Some(_), Some(_)) => Conversion::Incompatible,
+        // Range narrowing and signedness changes are legal Pascal integer
+        // conversions for an unknown runtime value.  They remain more
+        // expensive for overload ranking, but are not negative proof for an
+        // assignment or value argument.
+        (Some(_), Some(_)) => Conversion::Cost(2),
         _ => Conversion::Unknown,
     }
 }
@@ -1758,7 +2184,7 @@ fn integer_range(kind: IntegerKind) -> Option<(i128, i128)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conversion(
+fn overload_conversion(
     index: &NavigationIndex,
     actual: &TypeIdentity,
     expected: &TypeIdentity,
@@ -1839,7 +2265,7 @@ fn conversion(
         },
         (TypeIdentity::Builtin(_), TypeIdentity::Named { kind, .. })
         | (TypeIdentity::Named { kind, .. }, TypeIdentity::Builtin(_))
-            if matches!(kind, TypeKind::Other | TypeKind::String) =>
+            if !matches!(kind, TypeKind::Class | TypeKind::Interface) =>
         {
             Ok(Conversion::Unknown)
         }
@@ -1853,18 +2279,226 @@ fn conversion(
         (TypeIdentity::IntegerLiteral(_), TypeIdentity::IntegerLiteral(_)) => {
             Ok(Conversion::Unknown)
         }
-        (
-            TypeIdentity::IntegerLiteral(_),
-            TypeIdentity::Named {
-                kind: TypeKind::Other | TypeKind::String,
-                ..
-            },
-        ) => Ok(Conversion::Unknown),
+        (TypeIdentity::IntegerLiteral(_), TypeIdentity::Named { kind, .. })
+            if !matches!(kind, TypeKind::Class | TypeKind::Interface) =>
+        {
+            Ok(Conversion::Unknown)
+        }
         (TypeIdentity::IntegerLiteral(_), TypeIdentity::Named { .. })
         | (TypeIdentity::Named { .. }, TypeIdentity::IntegerLiteral(_))
         | (TypeIdentity::Builtin(_), TypeIdentity::IntegerLiteral(_)) => {
             Ok(Conversion::Incompatible)
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assignment_conversion(
+    index: &NavigationIndex,
+    actual: &TypeIdentity,
+    expected: &TypeIdentity,
+    state: &mut ResolutionState,
+    ancestry: &mut AncestryResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Compatibility, String> {
+    match (actual, expected) {
+        (TypeIdentity::IntegerLiteral(value), TypeIdentity::Builtin(expected)) => {
+            Ok(match expected {
+                BuiltinType::Integer(kind) => {
+                    compatibility_from_conversion(integer_literal_conversion(*value, *kind))
+                }
+                BuiltinType::Real => Compatibility::Compatible,
+                _ => Compatibility::Incompatible,
+            })
+        }
+        (TypeIdentity::Builtin(actual), TypeIdentity::Builtin(expected)) => {
+            Ok(match (actual, expected) {
+                (left, right) if left == right => Compatibility::Compatible,
+                (BuiltinType::Integer(_), BuiltinType::Real)
+                | (BuiltinType::Character, BuiltinType::String)
+                | (BuiltinType::Integer(_), BuiltinType::Integer(_)) => Compatibility::Compatible,
+                _ => Compatibility::Incompatible,
+            })
+        }
+        (
+            TypeIdentity::Named {
+                uri: actual_uri,
+                key: actual_key,
+                args: actual_args,
+                ..
+            },
+            TypeIdentity::Named {
+                uri: expected_uri,
+                key: expected_key,
+                args: expected_args,
+                ..
+            },
+        ) if actual_uri == expected_uri && actual_key == expected_key => {
+            Ok(if actual_args == expected_args {
+                Compatibility::Compatible
+            } else {
+                Compatibility::Incompatible
+            })
+        }
+        (
+            TypeIdentity::Named {
+                uri: actual_uri,
+                key: actual_key,
+                kind: actual_kind,
+                args: actual_args,
+            },
+            TypeIdentity::Named {
+                uri: expected_uri,
+                key: expected_key,
+                kind: expected_kind,
+                args: expected_args,
+            },
+        ) => Ok(
+            match upcast_distance(
+                index,
+                actual_uri,
+                actual_key,
+                *actual_kind,
+                actual_args,
+                expected_uri,
+                expected_key,
+                *expected_kind,
+                expected_args,
+                state,
+                ancestry,
+                cancel,
+                budget,
+            )? {
+                Upcast::Distance(_) => Compatibility::Compatible,
+                Upcast::No => Compatibility::Incompatible,
+                Upcast::Unknown => Compatibility::Unknown,
+            },
+        ),
+        (TypeIdentity::Builtin(_), TypeIdentity::Named { kind, .. })
+        | (TypeIdentity::Named { kind, .. }, TypeIdentity::Builtin(_))
+            if !matches!(kind, TypeKind::Class | TypeKind::Interface) =>
+        {
+            Ok(Compatibility::Unknown)
+        }
+        (TypeIdentity::Builtin(_), TypeIdentity::Named { .. })
+        | (TypeIdentity::Named { .. }, TypeIdentity::Builtin(_)) => Ok(Compatibility::Incompatible),
+        (TypeIdentity::IntegerLiteral(actual), TypeIdentity::IntegerLiteral(expected)) => {
+            Ok(if actual == expected {
+                Compatibility::Compatible
+            } else {
+                Compatibility::Unknown
+            })
+        }
+        (TypeIdentity::IntegerLiteral(_), TypeIdentity::Named { kind, .. })
+            if !matches!(kind, TypeKind::Class | TypeKind::Interface) =>
+        {
+            Ok(Compatibility::Unknown)
+        }
+        (TypeIdentity::IntegerLiteral(_), TypeIdentity::Named { .. })
+        | (TypeIdentity::Named { .. }, TypeIdentity::IntegerLiteral(_))
+        | (TypeIdentity::Builtin(_), TypeIdentity::IntegerLiteral(_)) => {
+            Ok(Compatibility::Incompatible)
+        }
+    }
+}
+
+fn compatibility_from_conversion(conversion: Conversion) -> Compatibility {
+    match conversion {
+        Conversion::Cost(_) => Compatibility::Compatible,
+        Conversion::Unknown => Compatibility::Unknown,
+        Conversion::Incompatible => Compatibility::Incompatible,
+    }
+}
+
+fn nil_compatibility(index: &NavigationIndex, expected: &TypeIdentity) -> Compatibility {
+    match expected {
+        TypeIdentity::Named { uri, key, kind, .. } => match kind {
+            TypeKind::Class
+            | TypeKind::Interface
+            | TypeKind::Pointer
+            | TypeKind::Callable
+            | TypeKind::DynamicArray => Compatibility::Compatible,
+            TypeKind::Other => {
+                let Some(document) = index.documents.get(uri) else {
+                    return Compatibility::Unknown;
+                };
+                let Some(indices) = document.type_symbol_indices.get(key) else {
+                    return Compatibility::Unknown;
+                };
+                if indices.len() != 1 {
+                    return Compatibility::Unknown;
+                }
+                let Some(symbol) = document.symbols.get(indices[0]) else {
+                    return Compatibility::Unknown;
+                };
+                match symbol.type_kind {
+                    TypeKind::Pointer | TypeKind::Callable | TypeKind::DynamicArray => {
+                        Compatibility::Compatible
+                    }
+                    TypeKind::Other => Compatibility::Unknown,
+                    _ => Compatibility::Incompatible,
+                }
+            }
+            TypeKind::Record
+            | TypeKind::Enum
+            | TypeKind::Array
+            | TypeKind::String
+            | TypeKind::File => Compatibility::Incompatible,
+        },
+        TypeIdentity::Builtin(_) | TypeIdentity::IntegerLiteral(_) => Compatibility::Incompatible,
+    }
+}
+
+fn byref_type_match(actual: &TypeIdentity, expected: &TypeIdentity) -> Compatibility {
+    if actual == expected {
+        return Compatibility::Compatible;
+    }
+    match (actual, expected) {
+        (
+            TypeIdentity::Builtin(BuiltinType::Integer(actual)),
+            TypeIdentity::Builtin(BuiltinType::Integer(expected)),
+        ) => match (
+            canonical_integer_kind(*actual),
+            canonical_integer_kind(*expected),
+        ) {
+            (Some(actual), Some(expected)) if actual == expected => Compatibility::Compatible,
+            (None, _) | (_, None) => Compatibility::Unknown,
+            _ => Compatibility::Incompatible,
+        },
+        (
+            TypeIdentity::Named {
+                kind: actual_kind, ..
+            },
+            TypeIdentity::Named {
+                kind: expected_kind,
+                ..
+            },
+        ) if matches!(
+            (actual_kind, expected_kind),
+            (
+                TypeKind::Other | TypeKind::Pointer | TypeKind::Callable | TypeKind::DynamicArray,
+                _
+            ) | (
+                _,
+                TypeKind::Other | TypeKind::Pointer | TypeKind::Callable | TypeKind::DynamicArray
+            )
+        ) =>
+        {
+            Compatibility::Unknown
+        }
+        _ => Compatibility::Incompatible,
+    }
+}
+
+fn canonical_integer_kind(kind: IntegerKind) -> Option<IntegerKind> {
+    match kind {
+        IntegerKind::Cardinal | IntegerKind::LongWord => Some(IntegerKind::Cardinal),
+        IntegerKind::Integer => Some(IntegerKind::Integer),
+        IntegerKind::NativeInt | IntegerKind::Int64 => None,
+        IntegerKind::NativeUInt | IntegerKind::UInt64 => None,
+        IntegerKind::Literal => None,
+        _ => Some(kind),
     }
 }
 
@@ -1891,7 +2525,7 @@ fn upcast_distance(
         (actual_kind, expected_kind),
         (TypeKind::Class, TypeKind::Class) | (TypeKind::Interface, TypeKind::Interface)
     ) {
-        return Ok(Upcast::No);
+        return Ok(Upcast::Unknown);
     }
 
     let actual = TypeIdentity::Named {
@@ -1932,6 +2566,47 @@ fn upcast_distance(
         let Some(entry) = entries.first().filter(|_| entries.len() == 1) else {
             return Ok(Upcast::Unknown);
         };
+        if entry.kind == TypeKind::Class && !entry.parent_declared {
+            // A rootless class can only have the implicit TObject ancestor.
+            // Consequently it cannot be a distinct rootless class (or any
+            // other explicitly declared class) when the expected type is not
+            // TObject.  Keep TObject itself unresolved when the selected
+            // System domain is unavailable: that relationship remains
+            // unknown rather than becoming a false negative proof.
+            if expected_kind == TypeKind::Class
+                && (uri != expected_uri || key != expected_key)
+                && expected_key != "tobject"
+            {
+                return Ok(Upcast::No);
+            }
+            if uri == expected_uri && key != expected_key {
+                if let Some(expected_document) = index.documents.get(expected_uri) {
+                    if expected_document
+                        .type_ancestry
+                        .get(expected_key)
+                        .is_some_and(|entries| {
+                            entries.len() == 1 && entries[0].kind == TypeKind::Class
+                        })
+                    {
+                        return Ok(Upcast::No);
+                    }
+                }
+            }
+            let Some(parent) = implicit_tobject_identity(
+                index,
+                uri,
+                document,
+                entry.name_span.start,
+                state,
+                cancel,
+                budget,
+            )?
+            else {
+                return Ok(Upcast::Unknown);
+            };
+            let next_distance = distance.saturating_add(1);
+            queue.push_back((parent, next_distance));
+        }
         let Some(ResolvedType::Named(instance)) = resolved_type_from_identity(index, &current)
         else {
             return Ok(Upcast::Unknown);
@@ -1946,15 +2621,28 @@ fn upcast_distance(
             let Some(type_ref) = parent.type_ref.as_ref() else {
                 return Ok(Upcast::Unknown);
             };
-            let receivers = index.type_receivers_for_type_ref(
+            let Some(lookup_identifier) = assistance::identifier_at_with_budget(
+                document.tree.root_node(),
+                type_ref.span.start,
+                cancel,
+                budget,
+                "ancestry parent type",
+            )?
+            else {
+                return Ok(Upcast::Unknown);
+            };
+            let receivers = index.type_receivers_for_type_ref_with_budget(
                 uri,
                 document,
                 type_ref.span.start,
                 type_ref,
+                lookup_identifier,
                 None,
                 &instance.substitution,
                 state,
-            );
+                cancel,
+                budget,
+            )?;
             let Some(parent) = super::resolved_type_from_receivers(receivers)
                 .and_then(|resolved| super::type_identity_from_resolved_type(&resolved))
             else {
@@ -1965,6 +2653,53 @@ fn upcast_distance(
         }
     }
     Ok(Upcast::No)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn implicit_tobject_identity(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    current_document: &Document,
+    offset: usize,
+    state: &mut ResolutionState,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<TypeIdentity>, String> {
+    let system_urls = index.visible_unit_urls_with_budget(
+        current_uri,
+        current_document,
+        offset,
+        "System",
+        cancel,
+        budget,
+    )?;
+    let Some(system_uri) = system_urls.first().filter(|_| system_urls.len() == 1) else {
+        return Ok(None);
+    };
+    let candidates =
+        index.type_candidates_in_unit_with_budget(system_uri, "TObject", false, cancel, budget)?;
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let candidate = &candidates[0];
+    if index.candidate_is_conditionally_unknown(candidate) {
+        return Ok(None);
+    }
+    let Some(Receiver::Type(instance)) = index.type_receiver_for_candidate(candidate) else {
+        return Ok(None);
+    };
+    let _ = state;
+    Ok(Some(TypeIdentity::Named {
+        uri: instance.uri,
+        key: instance.key,
+        kind: instance.kind,
+        args: instance
+            .parameter_names
+            .iter()
+            .filter_map(|name| instance.substitution.get(name))
+            .filter_map(super::type_identity_from_resolved_type)
+            .collect(),
+    }))
 }
 
 fn node_text(

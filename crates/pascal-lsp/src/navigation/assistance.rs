@@ -4290,7 +4290,10 @@ fn expected_value_from_receivers(
             Receiver::Type(instance) if instance.kind == TypeKind::Callable => callable = true,
             // A residual array is an intermediate/unsupported destination,
             // not proof that a scalar call is valid.
-            Receiver::Type(instance) if arrays_unknown && instance.kind == TypeKind::Array => {
+            Receiver::Type(instance)
+                if arrays_unknown
+                    && matches!(instance.kind, TypeKind::Array | TypeKind::DynamicArray) =>
+            {
                 unknown = true;
             }
             Receiver::Type(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => {
@@ -4343,7 +4346,7 @@ fn expected_value_from_indexed_receiver(
             TypeKind::Callable => Ok(ExpectedCompletionValue::Callable),
             // A fully indexed destination must not retain an array, and a
             // residual array is not evidence of a scalar call target.
-            TypeKind::Array => Ok(ExpectedCompletionValue::Unknown),
+            TypeKind::Array | TypeKind::DynamicArray => Ok(ExpectedCompletionValue::Unknown),
             // Type aliases are indexed as their declaration kind (Other), so
             // resolve only this terminal alias before classifying it.  An
             // absent/ambiguous target remains Unknown rather than becoming a
@@ -4355,6 +4358,7 @@ fn expected_value_from_indexed_receiver(
             | TypeKind::Record
             | TypeKind::Interface
             | TypeKind::Enum
+            | TypeKind::Pointer
             | TypeKind::String
             | TypeKind::File => Ok(ExpectedCompletionValue::NonCallable),
         },
@@ -6458,6 +6462,7 @@ mod tests {
             generic_parameter: None,
             type_name: None,
             type_ref: None,
+            type_shape: None,
             result_type_name: None,
             result_type_ref: None,
             result_type_span: None,

@@ -27,8 +27,9 @@ The type/argument pass is deliberately a small extension of the existing
 overload model, not a parallel compiler. It covers assignments and bound
 routine-call arguments whose types are proven from source, built-in literals,
 safe numeric widening, character/string conversion, `nil` to class/interface
-references, class/interface upcasts with known ancestry, and exact writable
-`var`/`out` arguments. Grouped parameters and omitted defaults are honored.
+references, pointers, callable types, and dynamic arrays, class/interface
+upcasts with known ancestry, and exact writable `var`/`out` arguments.
+Grouped parameters and omitted defaults are honored.
 An overload call is diagnosed only when every applicable retained candidate is
 proven incompatible; one compatible, ambiguous, unsupported, or uncertain
 candidate suppresses the claim. When all invalid candidates disagree about an
@@ -43,13 +44,13 @@ diagnostics. The new codes are:
 | Type mismatch | `pascal-type-mismatch` |
 | Incompatible argument | `pascal-incompatible-argument` |
 
-Aliases whose target type is not proven, pointers/variants/anonymous callable
-types, enum/record compatibility beyond retained identity, compiler-dependent
-conversions, conditional or parser-recovery states, unresolved values, and
-incomplete imports/receivers/helpers/ancestry remain silent. A mismatch is not
-published merely because an unresolved implicit `System` lookup occurred when
-both assignment types were independently proven; the unresolved value itself
-still remains incomplete.
+Aliases whose target type is not proven, non-`nil` pointer/variant/anonymous
+callable conversions, enum/record compatibility beyond retained identity,
+compiler-dependent conversions, conditional or parser-recovery states,
+unresolved values, and incomplete imports/receivers/helpers/ancestry remain
+silent. A mismatch is not published merely because an unresolved implicit
+`System` lookup occurred when both assignment types were independently proven;
+the unresolved value itself still remains incomplete.
 
 The resolver reuses lexical bindings, selected imports, receiver/member lookup,
 helper and `with` precedence, ancestry, accessibility, and conditional state.

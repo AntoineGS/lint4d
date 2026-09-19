@@ -57,6 +57,8 @@ thread_local! {
     static TEST_SEMANTIC_INTERVAL_QUERY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_SHADOW_CHECKS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_GENERIC_SYMBOL_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_SEMANTIC_ANCESTRY_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY: Cell<bool> = const { Cell::new(false) };
     static TEST_DOCUMENT_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -119,6 +121,49 @@ fn test_reset_semantic_generic_symbol_visits() {
 #[cfg(test)]
 fn test_semantic_generic_symbol_visits() -> usize {
     TEST_SEMANTIC_GENERIC_SYMBOL_VISITS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn test_reset_semantic_ancestry_visits() {
+    TEST_SEMANTIC_ANCESTRY_VISITS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+fn test_semantic_ancestry_visits() -> usize {
+    TEST_SEMANTIC_ANCESTRY_VISITS.with(Cell::get)
+}
+
+#[cfg(test)]
+struct TestSemanticCancellationGuard(bool);
+
+#[cfg(test)]
+fn test_cancel_after_semantic_ancestry() -> TestSemanticCancellationGuard {
+    let previous = TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(|enabled| {
+        let previous = enabled.get();
+        enabled.set(true);
+        previous
+    });
+    TestSemanticCancellationGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestSemanticCancellationGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(|enabled| enabled.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn test_record_semantic_ancestry_visit() {
+    TEST_SEMANTIC_ANCESTRY_VISITS.with(|value| value.set(value.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn test_cancel_after_semantic_ancestry_if_requested(cancel: &AtomicBool) {
+    if TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(Cell::get) && test_semantic_ancestry_visits() > 0 {
+        TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(|enabled| enabled.set(false));
+        cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -7673,6 +7718,8 @@ impl NavigationIndex {
             cancel,
         )?;
         state.active_types.insert(identity.clone());
+        #[cfg(test)]
+        test_record_semantic_ancestry_visit();
         let result = if entries.len() == 1 {
             self.resolve_type_ancestry_entry_with_budget(
                 type_uri,
@@ -8306,6 +8353,8 @@ pub(super) enum TypeKind {
     Interface,
     Enum,
     Array,
+    DynamicArray,
+    Pointer,
     Callable,
     String,
     File,
@@ -8346,6 +8395,18 @@ impl TypeRef {
                 .join(",")
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TypeShape {
+    Named(TypeRef),
+    Pointer(Box<TypeShape>),
+    Array {
+        element: Box<TypeShape>,
+        dynamic: bool,
+    },
+    Callable,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -8632,6 +8693,8 @@ pub(super) struct AssistanceBudget {
 }
 
 fn check_navigation_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(test)]
+    test_cancel_after_semantic_ancestry_if_requested(cancel);
     if cancel.load(Ordering::Relaxed) {
         Err("request cancelled".to_string())
     } else {
@@ -8730,6 +8793,7 @@ struct Symbol {
     generic_parameter: Option<String>,
     type_name: Option<String>,
     type_ref: Option<TypeRef>,
+    type_shape: Option<TypeShape>,
     result_type_name: Option<String>,
     result_type_ref: Option<TypeRef>,
     result_type_span: Option<Span>,
@@ -8754,6 +8818,7 @@ struct RoutineParameter {
     type_span: Option<Span>,
     type_name: Option<String>,
     type_ref: Option<TypeRef>,
+    type_shape: Option<TypeShape>,
     mode: ParameterMode,
     has_default: bool,
 }
@@ -9487,6 +9552,7 @@ impl Document {
                 generic_parameter: None,
                 type_name: None,
                 type_ref: None,
+                type_shape: None,
                 result_type_name: None,
                 result_type_ref: None,
                 result_type_span: None,
@@ -10500,6 +10566,9 @@ fn inject_abbreviated_parameters(
         let type_ref = node
             .child_by_field_name("type")
             .and_then(|type_node| type_ref_from_node(type_node, source));
+        let type_shape = node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_shape_from_node(type_node, source));
         for identifier in field_identifier_nodes(node, "name") {
             let name = node_text(identifier, source);
             if name.is_empty() {
@@ -10525,6 +10594,7 @@ fn inject_abbreviated_parameters(
                 generic_parameter: None,
                 type_name: type_name.clone(),
                 type_ref: type_ref.clone(),
+                type_shape: type_shape.clone(),
                 result_type_name: None,
                 result_type_ref: None,
                 result_type_span: None,
@@ -10599,6 +10669,7 @@ fn add_definition_symbol(
         generic_parameter: None,
         type_name: None,
         type_ref: None,
+        type_shape: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
         result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
@@ -10673,6 +10744,7 @@ fn add_routine_symbol(
         generic_parameter: None,
         type_name: None,
         type_ref: None,
+        type_shape: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
         result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
@@ -10730,6 +10802,7 @@ fn push_routine_generic_parameter_symbols(
             generic_parameter: Some(parameter.name.clone()),
             type_name: parameter.constraint.as_ref().map(TypeRef::display),
             type_ref: parameter.constraint.clone(),
+            type_shape: None,
             result_type_name: None,
             result_type_ref: None,
             result_type_span: None,
@@ -10786,6 +10859,9 @@ fn add_named_symbol(
     let type_ref = node
         .child_by_field_name("type")
         .and_then(|type_node| type_ref_from_node(type_node, source));
+    let type_shape = node
+        .child_by_field_name("type")
+        .and_then(|type_node| type_shape_from_node(type_node, source));
     let identifiers = if kind == SymbolKind::Type {
         declaration_name_identifiers(node)
     } else if matches!(node.kind(), "varDef" | "varAssignDef") {
@@ -10822,6 +10898,7 @@ fn add_named_symbol(
             generic_parameter: None,
             type_name: type_name.clone(),
             type_ref: type_ref.clone(),
+            type_shape: type_shape.clone(),
             result_type_name: None,
             result_type_ref: None,
             result_type_span: None,
@@ -10863,6 +10940,7 @@ fn add_named_symbol(
                 generic_parameter: Some(parameter.name),
                 type_name: parameter.constraint.as_ref().map(TypeRef::display),
                 type_ref: parameter.constraint,
+                type_shape: None,
                 result_type_name: None,
                 result_type_ref: None,
                 result_type_span: None,
@@ -10952,7 +11030,18 @@ fn type_kind_for_declaration(node: Node<'_>) -> TypeKind {
             "declEnum" => return TypeKind::Enum,
             "declRecord" => return TypeKind::Record,
             "declHelper" => return helper_kind(current),
-            "declArray" | "kArray" | "declSet" => return TypeKind::Array,
+            "declArray" => {
+                let has_range = (0..current.named_child_count())
+                    .filter_map(|index| current.named_child(index))
+                    .any(|child| child.kind() == "range");
+                return if has_range {
+                    TypeKind::Array
+                } else {
+                    TypeKind::DynamicArray
+                };
+            }
+            "declSet" | "kArray" => return TypeKind::Array,
+            "typerefPtr" => return TypeKind::Pointer,
             "declProcRef" | "kProcedure" | "kFunction" => return TypeKind::Callable,
             "declString" | "kString" => return TypeKind::String,
             "declFile" | "kFile" => return TypeKind::File,
@@ -11452,6 +11541,7 @@ fn direct_routine_parameters(node: Node<'_>, source: &str) -> Vec<RoutineParamet
             let type_span = type_node.map(Span::from_node);
             let type_name = type_node.and_then(|node| simple_type_path(node, source));
             let type_ref = type_node.and_then(|node| type_ref_from_node(node, source));
+            let type_shape = type_node.and_then(|node| type_shape_from_node(node, source));
             let mode = parameter_mode(group);
             let has_default = group.child_by_field_name("defaultValue").is_some();
             field_identifier_nodes(group, "name")
@@ -11461,6 +11551,7 @@ fn direct_routine_parameters(node: Node<'_>, source: &str) -> Vec<RoutineParamet
                     type_span,
                     type_name: type_name.clone(),
                     type_ref: type_ref.clone(),
+                    type_shape: type_shape.clone(),
                     mode,
                     has_default,
                 })
@@ -11566,6 +11657,43 @@ fn simple_type_path(node: Node<'_>, source: &str) -> Option<String> {
 
 fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
     type_ref_from_node_at_depth(node, source, 0)
+}
+
+fn type_shape_from_node(node: Node<'_>, source: &str) -> Option<TypeShape> {
+    let mut type_node = node;
+    while matches!(type_node.kind(), "type" | "typeref") {
+        type_node = first_named_child(type_node)?;
+    }
+    match type_node.kind() {
+        "identifier" | "typerefDot" | "typerefTpl" | "exprTpl" => {
+            type_ref_from_node(type_node, source).map(TypeShape::Named)
+        }
+        "typerefPtr" => type_node
+            .child_by_field_name("operand")
+            .and_then(|operand| type_shape_from_node(operand, source))
+            .map(|element| TypeShape::Pointer(Box::new(element))),
+        "declArray" => {
+            let has_range = (0..type_node.named_child_count())
+                .filter_map(|index| type_node.named_child(index))
+                .any(|child| child.kind() == "range");
+            let element = (0..type_node.named_child_count())
+                .filter_map(|index| type_node.named_child(index))
+                .filter(|child| child.kind() == "type")
+                .next_back()
+                .and_then(|element| type_shape_from_node(element, source))?;
+            Some(TypeShape::Array {
+                element: Box::new(element),
+                dynamic: !has_range,
+            })
+        }
+        "declProcRef" => Some(TypeShape::Callable),
+        "declString" => Some(TypeShape::Named(TypeRef {
+            path: vec!["string".to_owned()],
+            args: Vec::new(),
+            span: Span::from_node(node),
+        })),
+        _ => Some(TypeShape::Unknown),
+    }
 }
 
 fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Option<TypeRef> {
@@ -13835,6 +13963,400 @@ mod tests {
                         }
             }),
             "known argument mismatch must be reported at the actual expression: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r1_does_not_reject_integer_narrowing_or_synonyms() {
+        let uri = Url::parse("file:///tmp/semantic-correction-r1.pas").expect("R1 URI");
+        let source = concat!(
+            "unit SemanticCorrectionR1;\n",
+            "interface\n",
+            "procedure TakeValue(Value: Byte);\n",
+            "procedure TakeVar(var Value: Cardinal);\n",
+            "procedure TakeOut(out Value: LongWord);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var B: Byte; I: Integer; C: Cardinal; L: LongWord;\n",
+            "begin\n",
+            "  B := I; TakeValue(I); I := C; C := I;\n",
+            "  TakeVar(L); TakeOut(C);\n",
+            "  B := True; TakeValue(True);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R1 fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R1 diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "type mismatch: cannot assign 'Boolean' to 'Byte'",
+                "incompatible argument: expected 'Byte', found 'Boolean'",
+            ],
+            "integer range-dependent conversions and Cardinal/LongWord synonyms are not proof of incompatibility: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r2_types_character_literals_conservatively() {
+        let uri = Url::parse("file:///tmp/semantic-correction-r2.pas").expect("R2 URI");
+        let source = concat!(
+            "unit SemanticCorrectionR2;\n",
+            "interface\n",
+            "procedure Take(Value: Char);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var C: Char;\n",
+            "begin\n",
+            "  C := 'a'; Take('a'); C := #65; Take(#65);\n",
+            "  C := ''''; Take(''''); Take('ab'); Take('😀');\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R2 fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R2 diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["incompatible argument: expected 'Char', found 'String'"],
+            "single-character literals must be Char-compatible while uncertain-width literals stay silent: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r3_suppresses_unknown_lvalues_and_missing_member_cascades() {
+        let uri = Url::parse("file:///tmp/semantic-correction-r3.pas").expect("R3 URI");
+        let source = concat!(
+            "unit SemanticCorrectionR3;\n",
+            "interface\n",
+            "type TRec = record Known: Integer; end;\n",
+            "procedure Mutate(var Value: Integer);\n",
+            "procedure MutateOut(out Value: Integer);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var A: array[0..1] of Integer; P: ^Integer; R: TRec; B: Boolean;\n",
+            "begin\n",
+            "  Mutate(A[0]); MutateOut(A[1]); Mutate(P^);\n",
+            "  Mutate(UnknownValue); Mutate(UnknownCall()); Mutate(R.Missing);\n",
+            "  Mutate(1); Mutate(B);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "missing member 'Missing'",
+                "incompatible argument: expected 'Integer', found 'non-writable expression'",
+                "incompatible argument: expected 'Integer', found 'Boolean'",
+            ],
+            "indexed/dereferenced lvalues are writable, unresolved bindings are unknown, and missing members do not cascade: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r3_suppresses_incomplete_import_and_with_bindings() {
+        let uri = Url::parse("file:///tmp/semantic-correction-r3-incomplete.pas")
+            .expect("R3 incomplete URI");
+        let source = concat!(
+            "unit SemanticCorrectionR3Incomplete;\n",
+            "interface\n",
+            "uses MissingUnit;\n",
+            "type TUnknown = MissingType;\n",
+            "procedure Mutate(var Value: Integer);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var U: TUnknown;\n",
+            "begin\n",
+            "  Mutate(UnknownValue);\n",
+            "  with U do Mutate(Value);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R3 incomplete fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R3 incomplete diagnostics complete");
+
+        assert!(
+            diagnostics.is_empty(),
+            "incomplete imports and with receivers must suppress argument claims: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r4_accepts_known_nil_references_and_suppresses_unknown_aliases() {
+        let uri = Url::parse("file:///tmp/semantic-correction-r4.pas").expect("R4 URI");
+        let source = concat!(
+            "unit SemanticCorrectionR4;\n",
+            "interface\n",
+            "type\n",
+            "  PInt = ^Integer;\n",
+            "  TProc = procedure;\n",
+            "  TIntArray = array of Integer;\n",
+            "  TRec = record Value: Integer; end;\n",
+            "  TAlias = MissingType;\n",
+            "procedure TakeBool(Value: Boolean);\n",
+            "procedure TakeP(Value: PInt);\n",
+            "procedure TakeProc(Value: TProc);\n",
+            "procedure TakeArr(Value: TIntArray);\n",
+            "procedure TakeDirectP(Value: ^Integer);\n",
+            "procedure TakeDirectProc(Value: procedure);\n",
+            "procedure TakeDirectArr(Value: array of Integer);\n",
+            "procedure TakeRec(Value: TRec);\n",
+            "procedure TakeAlias(Value: TAlias);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var P: PInt; F: TProc; A: TIntArray; X: TAlias;\n",
+            "begin\n",
+            "  P := nil; F := nil; A := nil; X := nil;\n",
+            "  TakeP(nil); TakeProc(nil); TakeArr(nil); TakeAlias(nil);\n",
+            "  TakeDirectP(nil); TakeDirectProc(nil); TakeDirectArr(nil);\n",
+            "  TakeBool(nil); TakeRec(nil);\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R4 fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R4 diagnostics complete");
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            vec![
+                "incompatible argument: expected 'Boolean', found 'nil'",
+                "incompatible argument: expected 'trec', found 'nil'",
+            ],
+            "nil compatibility must use affirmative type evidence: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r5_suppresses_unmodeled_record_operators() {
+        let uri = Url::parse("file:///tmp/semantic-correction-r5.pas").expect("R5 URI");
+        let source = concat!(
+            "unit SemanticCorrectionR5;\n",
+            "interface\n",
+            "type TRec = record class operator Implicit(Value: Integer): TRec; end;\n",
+            "procedure Take(Value: TRec);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var R: TRec; I: Integer; B: Boolean;\n",
+            "begin\n",
+            "  R := I; Take(I); B := I;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("R5 fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("R5 diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
+            "record/operator conversions outside the modeled subset stay unknown: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r6_resolves_the_implicit_tobject_ancestor() {
+        let system_uri =
+            Url::parse("file:///tmp/semantic-correction-r6-system.pas").expect("System URI");
+        let main_uri = Url::parse("file:///tmp/semantic-correction-r6-main.pas").expect("Main URI");
+        let system = concat!(
+            "unit System;\n",
+            "interface\n",
+            "type TObject = class end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let main = concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses System;\n",
+            "type TChild = class end;\n",
+            "procedure Take(Value: TObject);\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Obj: TObject; Child: TChild; B: Boolean; I: Integer;\n",
+            "begin\n",
+            "  Obj := Child; Take(Child); B := I;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(system_uri.clone(), system.to_owned())
+            .expect("System fixture parses");
+        index
+            .update(main_uri.clone(), main.to_owned())
+            .expect("R6 fixture parses");
+        index.bind_imports(
+            &main_uri,
+            std::iter::once(("System".to_owned(), system_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&main_uri, &AtomicBool::new(false))
+            .expect("R6 diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
+            "a class with no explicit parent has a proven source-backed TObject ancestor: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r7_charges_upcast_parent_resolution_to_the_shared_budget() {
+        let provider_uri =
+            Url::parse("file:///tmp/semantic-correction-r7-provider.pas").expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-correction-r7-consumer.pas").expect("consumer URI");
+        let mut provider = String::from("unit Provider;\ninterface\nconst\n  C0 = 0;\n");
+        for index in 1..=3_000 {
+            writeln!(&mut provider, "  C{index} = {index};").expect("write provider symbol");
+        }
+        provider
+            .push_str("type TBase = class end; TChild = class(TBase) end;\nimplementation\nend.\n");
+        let mut consumer = String::from(
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Base: TBase; Child: TChild; B: Boolean; I: Integer;\nbegin\n",
+        );
+        for _ in 0..30 {
+            consumer.push_str("  Base := Child;\n");
+        }
+        consumer.push_str("  B := I;\nend;\nend.\n");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider)
+            .expect("provider fixture parses");
+        index
+            .update(consumer_uri.clone(), consumer)
+            .expect("R7 fixture parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("Provider".to_owned(), provider_uri)),
+        );
+        test_reset_semantic_generic_symbol_visits();
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("R7 diagnostics complete");
+        let visits = test_semantic_generic_symbol_visits();
+
+        assert!(
+            diagnostics.is_empty() && visits > 0 && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            "upcast parent lookup must consume the shared budget and discard partial results after {visits} provider visits: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn correction_r7_cancels_during_upcast_ancestry_resolution() {
+        let provider_uri = Url::parse("file:///tmp/semantic-correction-r7-cancel-provider.pas")
+            .expect("provider cancellation URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-correction-r7-cancel-consumer.pas")
+            .expect("consumer cancellation URI");
+        let provider = concat!(
+            "unit ProviderCancel;\n",
+            "interface\n",
+            "type TBase = class end; TChild = class(TBase) end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit ConsumerCancel;\n",
+            "interface\n",
+            "uses ProviderCancel;\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var Base: TBase; Child: TChild; B: Boolean; I: Integer;\n",
+            "begin\n",
+            "  Base := Child;\n",
+            "  B := I;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider cancellation fixture parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer cancellation fixture parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("ProviderCancel".to_owned(), provider_uri)),
+        );
+
+        test_reset_semantic_ancestry_visits();
+        let _cancel_guard = test_cancel_after_semantic_ancestry();
+        let cancel = AtomicBool::new(false);
+        let result = index.semantic_diagnostics_with_cancel(&consumer_uri, &cancel);
+
+        assert_eq!(
+            result.expect_err("cancellation during ancestry must discard diagnostics"),
+            "request cancelled"
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(
+            test_semantic_ancestry_visits() > 0,
+            "the cancellation must occur after ancestry work, not at request entry"
         );
     }
 

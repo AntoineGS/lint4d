@@ -1442,17 +1442,25 @@ impl NavigationIndex {
             }
             let mut requirements_complete = true;
             for interface in interfaces {
-                if self.collect_interface_requirements_with_budget(
+                let interface_requirements = self.collect_interface_requirements_with_budget(
                     &interface,
                     &mut ancestry,
-                    &mut collected_requirements,
-                    &mut requirements,
                     cancel,
                     budget,
-                )? == AncestryStatus::Unknown
-                {
+                )?;
+                if interface_requirements.status == AncestryStatus::Unknown {
                     requirements_complete = false;
                     break;
+                }
+                budget.require_work(interface_requirements.requirements.len(), cancel)?;
+                for requirement in interface_requirements.requirements {
+                    let identity = (
+                        requirement.candidate.clone(),
+                        requirement.substitution.clone(),
+                    );
+                    if collected_requirements.insert(identity) {
+                        requirements.push(requirement);
+                    }
                 }
             }
             if !requirements_complete {
@@ -2168,11 +2176,9 @@ impl NavigationIndex {
         &self,
         interface: &TypeInstance,
         ancestry: &mut ContractAncestryState,
-        seen: &mut HashSet<(Candidate, GenericSubstitution)>,
-        requirements: &mut Vec<ContractRequirement>,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<AncestryStatus, String> {
+    ) -> Result<ContractInterfaceRequirements, String> {
         #[cfg(test)]
         test_record_contract_interface_visit(cancel);
         let identity = (
@@ -2183,37 +2189,44 @@ impl NavigationIndex {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         if let Some(status) = ancestry.interface_requirements.get(&identity) {
-            return Ok(*status);
+            return Ok(status.clone());
         }
         if !ancestry.active_interfaces.insert(identity.clone()) {
-            return Ok(AncestryStatus::Unknown);
+            return Ok(ContractInterfaceRequirements::unknown());
         }
         if ancestry.active_interfaces.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
             ancestry.active_interfaces.remove(&identity);
-            return Ok(AncestryStatus::Unknown);
+            return Ok(ContractInterfaceRequirements::unknown());
         }
         let result = (|| {
             let resolution =
                 self.resolve_contract_type_with_budget(interface, ancestry, cancel, budget)?;
             if resolution.status == AncestryStatus::Unknown || interface.kind != TypeKind::Interface
             {
-                return Ok(AncestryStatus::Unknown);
+                return Ok(ContractInterfaceRequirements::unknown());
             }
+            let mut requirements = Vec::new();
+            let mut seen = HashSet::new();
             for parent in resolution.interfaces {
-                if self.collect_interface_requirements_with_budget(
-                    &parent,
-                    ancestry,
-                    seen,
-                    requirements,
-                    cancel,
-                    budget,
-                )? == AncestryStatus::Unknown
-                {
-                    return Ok(AncestryStatus::Unknown);
+                let parent_requirements = self.collect_interface_requirements_with_budget(
+                    &parent, ancestry, cancel, budget,
+                )?;
+                if parent_requirements.status == AncestryStatus::Unknown {
+                    return Ok(ContractInterfaceRequirements::unknown());
+                }
+                budget.require_work(parent_requirements.requirements.len(), cancel)?;
+                for requirement in parent_requirements.requirements {
+                    let requirement_identity = (
+                        requirement.candidate.clone(),
+                        requirement.substitution.clone(),
+                    );
+                    if seen.insert(requirement_identity) {
+                        requirements.push(requirement);
+                    }
                 }
             }
             let Some(document) = self.documents.get(&interface.uri) else {
-                return Ok(AncestryStatus::Unknown);
+                return Ok(ContractInterfaceRequirements::unknown());
             };
             let indices = document
                 .member_symbol_indices_by_owner
@@ -2242,7 +2255,7 @@ impl NavigationIndex {
                         .iter()
                         .any(|parameter| parameter.constraint_unsupported)
                 {
-                    return Ok(AncestryStatus::Unknown);
+                    return Ok(ContractInterfaceRequirements::unknown());
                 }
                 if self.contract_routine_signature_status(
                     &Candidate {
@@ -2254,7 +2267,7 @@ impl NavigationIndex {
                     budget,
                 )? == ContractMatch::Unknown
                 {
-                    return Ok(AncestryStatus::Unknown);
+                    return Ok(ContractInterfaceRequirements::unknown());
                 }
                 let candidate = Candidate {
                     uri: interface.uri.clone(),
@@ -2268,11 +2281,13 @@ impl NavigationIndex {
                     });
                 }
             }
-            Ok(AncestryStatus::Complete)
+            Ok(ContractInterfaceRequirements::complete(requirements))
         })();
         ancestry.active_interfaces.remove(&identity);
         if let Ok(status) = &result {
-            ancestry.interface_requirements.insert(identity, *status);
+            ancestry
+                .interface_requirements
+                .insert(identity, status.clone());
         }
         result
     }
@@ -2474,9 +2489,13 @@ impl NavigationIndex {
         {
             return Ok(ContractMatch::Unknown);
         }
-        if left.routine_directives.calling_convention != right.routine_directives.calling_convention
-        {
-            return Ok(ContractMatch::No);
+        match Self::calling_conventions_contract_match(
+            left.routine_directives.calling_convention,
+            right.routine_directives.calling_convention,
+        ) {
+            ContractMatch::Yes => {}
+            ContractMatch::No => return Ok(ContractMatch::No),
+            ContractMatch::Unknown => return Ok(ContractMatch::Unknown),
         }
         // Generic method variance and constraint matching is compiler-specific;
         // retaining it as unknown is safer than claiming either compatibility
@@ -2539,6 +2558,22 @@ impl NavigationIndex {
                     },
                 )
             }
+        }
+    }
+
+    fn calling_conventions_contract_match(
+        left: Option<CallingConvention>,
+        right: Option<CallingConvention>,
+    ) -> ContractMatch {
+        match (left, right) {
+            (None, None) => ContractMatch::Yes,
+            (Some(left), Some(right)) if left == right => ContractMatch::Yes,
+            (Some(_), Some(_)) => ContractMatch::No,
+            // An omitted convention is not itself an ABI.  A project/target
+            // context could establish that it means register, but NavigationIndex
+            // deliberately does not guess a platform default.  Keep the mixed
+            // pair uncertain so it cannot become a false absence proof.
+            (None, Some(_)) | (Some(_), None) => ContractMatch::Unknown,
         }
     }
 
@@ -10762,6 +10797,28 @@ impl ContractRequirement {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ContractInterfaceRequirements {
+    status: AncestryStatus,
+    requirements: Vec<ContractRequirement>,
+}
+
+impl ContractInterfaceRequirements {
+    fn complete(requirements: Vec<ContractRequirement>) -> Self {
+        Self {
+            status: AncestryStatus::Complete,
+            requirements,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            status: AncestryStatus::Unknown,
+            requirements: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ContractRequirementIdentity {
     name: String,
@@ -10816,7 +10873,7 @@ struct ContractAncestryState {
     active_class_interfaces: HashSet<TypeInstance>,
     active_class_surfaces: HashSet<TypeInstance>,
     active_interfaces: HashSet<ContractInterfaceIdentity>,
-    interface_requirements: HashMap<ContractInterfaceIdentity, AncestryStatus>,
+    interface_requirements: HashMap<ContractInterfaceIdentity, ContractInterfaceRequirements>,
     interface_coverage: HashMap<ContractInterfaceCoverageKey, ContractMatch>,
     active_interface_coverage: HashSet<ContractInterfaceCoverageKey>,
 }
@@ -15734,6 +15791,236 @@ mod tests {
     }
 
     #[test]
+    fn semantic_diagnostics_treat_default_register_conventions_conservatively() {
+        fn contract_diagnostics(source: &str, name: &str) -> Vec<SemanticDiagnostic> {
+            let uri = Url::parse(&format!("file:///tmp/{name}.pas")).expect("fixture URI");
+            let mut index = NavigationIndex::new();
+            index
+                .update(uri.clone(), source.to_owned())
+                .expect("calling convention fixture parses");
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+        }
+
+        let explicit_register_target = concat!(
+            "unit SemanticDiagnosticsRegisterTarget;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  TBase = class(TObject)\n",
+            "    procedure Run; register; virtual;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Run; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Run; begin end;\n",
+            "procedure TChild.Run; begin end;\n",
+            "end.\n",
+        );
+        assert!(
+            contract_diagnostics(
+                explicit_register_target,
+                "semantic-diagnostics-register-target"
+            )
+            .iter()
+            .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride)
+        );
+
+        let explicit_register_override = concat!(
+            "unit SemanticDiagnosticsRegisterOverride;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  TBase = class(TObject)\n",
+            "    procedure Run; virtual;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Run; register; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Run; begin end;\n",
+            "procedure TChild.Run; begin end;\n",
+            "end.\n",
+        );
+        assert!(
+            contract_diagnostics(
+                explicit_register_override,
+                "semantic-diagnostics-register-override"
+            )
+            .iter()
+            .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride)
+        );
+
+        let explicit_register_interface = concat!(
+            "unit SemanticDiagnosticsRegisterInterface;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required; register;\n",
+            "  end;\n",
+            "  TChild = class(TObject, IRequired)\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TChild.Required; begin end;\n",
+            "end.\n",
+        );
+        assert!(
+            contract_diagnostics(
+                explicit_register_interface,
+                "semantic-diagnostics-register-interface"
+            )
+            .iter()
+            .all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            })
+        );
+
+        let explicit_register_implementation = concat!(
+            "unit SemanticDiagnosticsRegisterImplementation;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TChild = class(TObject, IRequired)\n",
+            "    procedure Required; register;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TChild.Required; begin end;\n",
+            "end.\n",
+        );
+        assert!(
+            contract_diagnostics(
+                explicit_register_implementation,
+                "semantic-diagnostics-register-implementation"
+            )
+            .iter()
+            .all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            })
+        );
+
+        let explicit_incompatible_override = concat!(
+            "unit SemanticDiagnosticsIncompatibleConventionOverride;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  TBase = class(TObject)\n",
+            "    procedure Run; cdecl; virtual;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Run; register; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Run; begin end;\n",
+            "procedure TChild.Run; begin end;\n",
+            "end.\n",
+        );
+        assert_eq!(
+            contract_diagnostics(
+                explicit_incompatible_override,
+                "semantic-diagnostics-incompatible-convention-override"
+            )
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::InvalidOverride)
+            .count(),
+            1,
+            "two known explicit conventions remain incompatible"
+        );
+
+        let explicit_incompatible_interface = concat!(
+            "unit SemanticDiagnosticsIncompatibleConventionInterface;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required; cdecl;\n",
+            "  end;\n",
+            "  TChild = class(TObject, IRequired)\n",
+            "    procedure Required; register;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TChild.Required; begin end;\n",
+            "end.\n",
+        );
+        assert_eq!(
+            contract_diagnostics(
+                explicit_incompatible_interface,
+                "semantic-diagnostics-incompatible-convention-interface"
+            )
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
+            })
+            .count(),
+            1,
+            "two known explicit interface conventions remain incompatible"
+        );
+
+        let unsupported_override = concat!(
+            "unit SemanticDiagnosticsUnsupportedConventionOverride;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  TBase = class(TObject)\n",
+            "    procedure Run; winapi; virtual;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Run; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Run; begin end;\n",
+            "procedure TChild.Run; begin end;\n",
+            "end.\n",
+        );
+        assert!(
+            contract_diagnostics(
+                unsupported_override,
+                "semantic-diagnostics-unsupported-convention-override"
+            )
+            .iter()
+            .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride)
+        );
+
+        let unsupported_interface = concat!(
+            "unit SemanticDiagnosticsUnsupportedConventionInterface;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required; winapi;\n",
+            "  end;\n",
+            "  TChild = class(TObject, IRequired)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        assert!(
+            contract_diagnostics(
+                unsupported_interface,
+                "semantic-diagnostics-unsupported-convention-interface"
+            )
+            .iter()
+            .all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            })
+        );
+    }
+
+    #[test]
     fn semantic_diagnostics_accept_an_inherited_interface_implementation() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-inherited-interface.pas")
             .expect("interface URI");
@@ -15847,6 +16134,182 @@ mod tests {
                 .count(),
             1,
             "a diamond obligation is reported once: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_replay_interface_requirements_for_each_class() {
+        fn missing_classes(source: &str, name: &str) -> Vec<String> {
+            let uri = Url::parse(&format!("file:///tmp/{name}.pas")).expect("fixture URI");
+            let mut index = NavigationIndex::new();
+            index
+                .update(uri.clone(), source.to_owned())
+                .expect("interface requirement fixture parses");
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
+                })
+                .map(|diagnostic| diagnostic.message)
+                .collect()
+        }
+
+        let missing_missing = concat!(
+            "unit SemanticDiagnosticsMemoMissingMissing;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TFirst = class(TObject, IRequired)\n",
+            "  end;\n",
+            "  TSecond = class(TObject, IRequired)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let diagnostics =
+            missing_classes(missing_missing, "semantic-diagnostics-memo-missing-missing");
+        assert_eq!(diagnostics.len(), 2, "both classes have an obligation");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.starts_with("class 'TFirst'"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.starts_with("class 'TSecond'"))
+        );
+
+        let valid_first_missing_second = concat!(
+            "unit SemanticDiagnosticsMemoValidFirst;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TFirst = class(TObject, IRequired)\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TSecond = class(TObject, IRequired)\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TFirst.Required; begin end;\n",
+            "end.\n",
+        );
+        let diagnostics = missing_classes(
+            valid_first_missing_second,
+            "semantic-diagnostics-memo-valid-first-missing-second",
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "a later missing class remains visible"
+        );
+        assert!(diagnostics[0].starts_with("class 'TSecond'"));
+
+        let missing_first_valid_second = concat!(
+            "unit SemanticDiagnosticsMemoMissingFirst;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TFirst = class(TObject, IRequired)\n",
+            "  end;\n",
+            "  TSecond = class(TObject, IRequired)\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TSecond.Required; begin end;\n",
+            "end.\n",
+        );
+        let diagnostics = missing_classes(
+            missing_first_valid_second,
+            "semantic-diagnostics-memo-missing-first-valid-second",
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "source order must not alter obligations"
+        );
+        assert!(diagnostics[0].starts_with("class 'TFirst'"));
+
+        let inherited_shared = concat!(
+            "unit SemanticDiagnosticsMemoInherited;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRoot = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  IChild = interface(IRoot)\n",
+            "  end;\n",
+            "  TBase = class(TObject)\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TFirst = class(TBase, IChild)\n",
+            "  end;\n",
+            "  TSecond = class(TBase, IChild)\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TBase.Required; begin end;\n",
+            "end.\n",
+        );
+        assert!(
+            missing_classes(
+                inherited_shared,
+                "semantic-diagnostics-memo-inherited-shared",
+            )
+            .is_empty()
+        );
+
+        let generic_diamond = concat!(
+            "unit SemanticDiagnosticsMemoGenericDiamond;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRoot<T> = interface\n",
+            "    procedure Required(Value: T);\n",
+            "  end;\n",
+            "  ILeft<T> = interface(IRoot<T>)\n",
+            "  end;\n",
+            "  IRight<T> = interface(IRoot<T>)\n",
+            "  end;\n",
+            "  TFirst = class(TObject, ILeft<Integer>, IRight<Integer>)\n",
+            "  end;\n",
+            "  TSecond = class(TObject, ILeft<Integer>, IRight<Integer>)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let diagnostics =
+            missing_classes(generic_diamond, "semantic-diagnostics-memo-generic-diamond");
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "generic diamond requirements replay for both classes"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.starts_with("class 'TFirst'"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.starts_with("class 'TSecond'"))
         );
     }
 

@@ -59,6 +59,8 @@ thread_local! {
     static TEST_SEMANTIC_GENERIC_SYMBOL_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_SEMANTIC_ANCESTRY_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY: Cell<bool> = const { Cell::new(false) };
+    static TEST_CONTRACT_INTERFACE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_CANCEL_AFTER_CONTRACT_INTERFACE: Cell<bool> = const { Cell::new(false) };
     static TEST_CANCEL_AFTER_SEMANTIC_SUBSCRIPT_CHILD: Cell<bool> = const { Cell::new(false) };
     static TEST_DOCUMENT_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
@@ -163,6 +165,45 @@ fn test_record_semantic_ancestry_visit() {
 fn test_cancel_after_semantic_ancestry_if_requested(cancel: &AtomicBool) {
     if TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(Cell::get) && test_semantic_ancestry_visits() > 0 {
         TEST_CANCEL_AFTER_SEMANTIC_ANCESTRY.with(|enabled| enabled.set(false));
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn test_reset_contract_interface_visits() {
+    TEST_CONTRACT_INTERFACE_VISITS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+fn test_contract_interface_visits() -> usize {
+    TEST_CONTRACT_INTERFACE_VISITS.with(Cell::get)
+}
+
+#[cfg(test)]
+struct TestContractInterfaceCancellationGuard(bool);
+
+#[cfg(test)]
+fn test_cancel_after_contract_interface() -> TestContractInterfaceCancellationGuard {
+    let previous = TEST_CANCEL_AFTER_CONTRACT_INTERFACE.with(|enabled| {
+        let previous = enabled.get();
+        enabled.set(true);
+        previous
+    });
+    TestContractInterfaceCancellationGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestContractInterfaceCancellationGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_AFTER_CONTRACT_INTERFACE.with(|enabled| enabled.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn test_record_contract_interface_visit(cancel: &AtomicBool) {
+    TEST_CONTRACT_INTERFACE_VISITS.with(|value| value.set(value.get().saturating_add(1)));
+    if TEST_CANCEL_AFTER_CONTRACT_INTERFACE.with(Cell::get) {
+        TEST_CANCEL_AFTER_CONTRACT_INTERFACE.with(|enabled| enabled.set(false));
         cancel.store(true, Ordering::Relaxed);
     }
 }
@@ -314,6 +355,7 @@ const MAX_SEMANTIC_DIAGNOSTIC_NODES: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_WORK: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
+const MAX_CONTRACT_ANCESTRY_DEPTH: usize = 256;
 
 /// Metadata for one unit imported by a document's `uses` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1170,6 +1212,9 @@ impl NavigationIndex {
     ) -> Result<Vec<SemanticDiagnostic>, String> {
         let mut diagnostics = Vec::new();
         let mut ancestry = ContractAncestryState::new();
+        if !self.contract_document_complete_with_budget(uri, &mut ancestry, cancel, budget)? {
+            return Ok(diagnostics);
+        }
 
         let override_symbols = document
             .symbols
@@ -1205,6 +1250,21 @@ impl NavigationIndex {
                 continue;
             };
             if owner_instance.kind != TypeKind::Class {
+                continue;
+            }
+            if !contract_substitution_is_complete(&owner_instance) {
+                continue;
+            }
+            if self.contract_routine_signature_status(
+                &Candidate {
+                    uri: uri.clone(),
+                    index: symbol_index,
+                },
+                &owner_instance.substitution,
+                cancel,
+                budget,
+            )? == ContractMatch::Unknown
+            {
                 continue;
             }
 
@@ -1330,6 +1390,9 @@ impl NavigationIndex {
             let Some(class_instance) = self.contract_type_instance(uri, &class_symbol.key) else {
                 continue;
             };
+            if !contract_substitution_is_complete(&class_instance) {
+                continue;
+            }
             let class_resolution = self.resolve_contract_type_with_budget(
                 &class_instance,
                 &mut ancestry,
@@ -1420,6 +1483,7 @@ impl NavigationIndex {
                     &requirement,
                     &class_instance,
                     &surface.delegations,
+                    &mut ancestry,
                     cancel,
                     budget,
                 )? != ContractMatch::No
@@ -1461,8 +1525,8 @@ impl NavigationIndex {
                 diagnostics.push(SemanticDiagnostic {
                     kind: SemanticDiagnosticKind::MissingInterfaceImplementation,
                     span: SourceSpan {
-                        start: interface_method.span.start,
-                        end: interface_method.span.end,
+                        start: class_symbol.span.start,
+                        end: class_symbol.span.end,
                     },
                     message: format!(
                         "class '{}' does not implement interface method '{}'",
@@ -1495,6 +1559,168 @@ impl NavigationIndex {
             },
             symbol,
         ))
+    }
+
+    fn contract_document_complete_with_budget(
+        &self,
+        uri: &Url,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if let Some(result) = ancestry.contract_documents.get(uri) {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            return Ok(*result);
+        }
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if !ancestry.active_contract_documents.insert(uri.clone()) {
+            // A resolved, source-backed import cycle does not by itself make
+            // either unit incomplete.  The active-path guard only prevents
+            // recursive re-entry while the surrounding units are checked.
+            return Ok(true);
+        }
+        let result = (|| {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(document) = self.documents.get(uri) else {
+                return Ok(false);
+            };
+            if !document.parser_recovery_spans.is_empty()
+                || !document.conditionals.unknown_spans.is_empty()
+                || !document.opaque_ranges.is_empty()
+            {
+                return Ok(false);
+            }
+
+            let imports = document
+                .interface_uses
+                .iter()
+                .chain(document.implementation_uses.iter())
+                .cloned()
+                .collect::<HashSet<_>>();
+            budget.require_work(imports.len(), cancel)?;
+            for unit in imports {
+                check_navigation_cancel(cancel)?;
+                let key = canonical_name(&unit);
+                if document.unknown_imports.contains(&key) {
+                    return Ok(false);
+                }
+                let urls = self.unit_urls_for_import_with_budget(document, &key, cancel, budget)?;
+                if urls.len() != 1 {
+                    return Ok(false);
+                }
+                let Some(provider_uri) = urls.first() else {
+                    return Ok(false);
+                };
+                if !self.contract_document_complete_with_budget(
+                    provider_uri,
+                    ancestry,
+                    cancel,
+                    budget,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        ancestry.active_contract_documents.remove(uri);
+        if let Ok(result) = &result {
+            ancestry.contract_documents.insert(uri.clone(), *result);
+        }
+        result
+    }
+
+    fn authoritative_tobject_instance_with_budget(
+        &self,
+        owner_uri: &Url,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<TypeInstance>, String> {
+        if let Some(document) = self.documents.get(owner_uri) {
+            if document
+                .type_symbol_indices
+                .get("tobject")
+                .is_some_and(|indices| !indices.is_empty())
+            {
+                if !self
+                    .contract_document_complete_with_budget(owner_uri, ancestry, cancel, budget)?
+                {
+                    return Ok(None);
+                }
+                return self.validated_tobject_instance_in_document(owner_uri, cancel, budget);
+            }
+        }
+        let Some(urls) = self.units.get("system") else {
+            return Ok(None);
+        };
+        if urls.len() != 1 {
+            return Ok(None);
+        }
+        let system_uri = urls[0].clone();
+        if !self.contract_document_complete_with_budget(&system_uri, ancestry, cancel, budget)? {
+            return Ok(None);
+        }
+        self.validated_tobject_instance_in_document(&system_uri, cancel, budget)
+    }
+
+    fn validated_tobject_instance_in_document(
+        &self,
+        uri: &Url,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<TypeInstance>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(None);
+        };
+        let Some(indices) = document.type_symbol_indices.get("tobject") else {
+            return Ok(None);
+        };
+        if indices.len() != 1 {
+            return Ok(None);
+        }
+        budget.require_work(1, cancel)?;
+        let index = indices[0];
+        let Some(symbol) = document.symbols.get(index) else {
+            return Ok(None);
+        };
+        let Some(entries) = document.type_ancestry.get("tobject") else {
+            return Ok(None);
+        };
+        if symbol.kind != SymbolKind::Type
+            || symbol.type_kind != TypeKind::Class
+            || document
+                .conditional_unknown_symbols
+                .get(index)
+                .copied()
+                .unwrap_or(true)
+            || entries.len() != 1
+            || entries[0].kind != TypeKind::Class
+            || entries[0].parent_declared
+        {
+            return Ok(None);
+        }
+        Ok(Some(type_instance_from_symbol(
+            &Candidate {
+                uri: uri.clone(),
+                index,
+            },
+            symbol,
+        )))
+    }
+
+    fn contract_instance_is_authoritative_tobject(
+        &self,
+        instance: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        Ok(self
+            .authoritative_tobject_instance_with_budget(&instance.uri, ancestry, cancel, budget)?
+            .is_some_and(|root| root == *instance))
     }
 
     fn resolve_contract_parent_with_budget(
@@ -1553,13 +1779,32 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<ContractParentResolution, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         if let Some(result) = ancestry.superclasses.get(instance) {
             return Ok(result.clone());
         }
         if !ancestry.active_superclasses.insert(instance.clone()) {
             return Ok(ContractParentResolution::Unknown);
         }
+        if ancestry.active_superclasses.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
+            ancestry.active_superclasses.remove(instance);
+            return Ok(ContractParentResolution::Unknown);
+        }
         let result = (|| {
+            if self
+                .contract_instance_is_authoritative_tobject(instance, ancestry, cancel, budget)?
+            {
+                return Ok(ContractParentResolution::Resolved(None));
+            }
+            if !self.contract_document_complete_with_budget(
+                &instance.uri,
+                ancestry,
+                cancel,
+                budget,
+            )? {
+                return Ok(ContractParentResolution::Unknown);
+            }
             let Some(document) = self.documents.get(&instance.uri) else {
                 return Ok(ContractParentResolution::Unknown);
             };
@@ -1596,6 +1841,21 @@ impl NavigationIndex {
                     _ => return Ok(ContractParentResolution::Unknown),
                 }
             }
+            if superclass.is_none() {
+                let Some(root) = self.authoritative_tobject_instance_with_budget(
+                    &instance.uri,
+                    ancestry,
+                    cancel,
+                    budget,
+                )?
+                else {
+                    return Ok(ContractParentResolution::Unknown);
+                };
+                if root == *instance {
+                    return Ok(ContractParentResolution::Resolved(None));
+                }
+                superclass = Some(root);
+            }
             Ok(ContractParentResolution::Resolved(superclass))
         })();
         ancestry.active_superclasses.remove(instance);
@@ -1615,7 +1875,13 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<AncestryStatus, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         if !ancestry.active_superclass_routines.insert(instance.clone()) {
+            return Ok(AncestryStatus::Unknown);
+        }
+        if ancestry.active_superclass_routines.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
+            ancestry.active_superclass_routines.remove(instance);
             return Ok(AncestryStatus::Unknown);
         }
         let result = (|| {
@@ -1643,13 +1909,32 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<ContractTypeResolution, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         if let Some(result) = ancestry.types.get(instance) {
             return Ok(result.clone());
         }
         if !ancestry.active_types.insert(instance.clone()) {
             return Ok(ContractTypeResolution::unknown());
         }
+        if ancestry.active_types.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
+            ancestry.active_types.remove(instance);
+            return Ok(ContractTypeResolution::unknown());
+        }
         let result = (|| {
+            if self
+                .contract_instance_is_authoritative_tobject(instance, ancestry, cancel, budget)?
+            {
+                return Ok(ContractTypeResolution::complete());
+            }
+            if !self.contract_document_complete_with_budget(
+                &instance.uri,
+                ancestry,
+                cancel,
+                budget,
+            )? {
+                return Ok(ContractTypeResolution::unknown());
+            }
             let Some(document) = self.documents.get(&instance.uri) else {
                 return Ok(ContractTypeResolution::unknown());
             };
@@ -1708,6 +1993,20 @@ impl NavigationIndex {
                     _ => return Ok(ContractTypeResolution::unknown()),
                 }
             }
+            if entry.kind == TypeKind::Class && result.superclass.is_none() {
+                let Some(root) = self.authoritative_tobject_instance_with_budget(
+                    &instance.uri,
+                    ancestry,
+                    cancel,
+                    budget,
+                )?
+                else {
+                    return Ok(ContractTypeResolution::unknown());
+                };
+                if root != *instance {
+                    result.superclass = Some(root);
+                }
+            }
             for parent in result.superclass.iter().chain(result.interfaces.iter()) {
                 if self
                     .resolve_contract_type_with_budget(parent, ancestry, cancel, budget)?
@@ -1733,7 +2032,13 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<TypeInstance>, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         if !ancestry.active_class_interfaces.insert(class.clone()) {
+            return Ok(Vec::new());
+        }
+        if ancestry.active_class_interfaces.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
+            ancestry.active_class_interfaces.remove(class);
             return Ok(Vec::new());
         }
         let result = (|| {
@@ -1803,7 +2108,13 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<AncestryStatus, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         if !ancestry.active_class_surfaces.insert(instance.clone()) {
+            return Ok(AncestryStatus::Unknown);
+        }
+        if ancestry.active_class_surfaces.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
+            ancestry.active_class_surfaces.remove(instance);
             return Ok(AncestryStatus::Unknown);
         }
         let result = (|| {
@@ -1832,7 +2143,10 @@ impl NavigationIndex {
             {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
-                surface.delegations.push(delegation.clone());
+                let mut delegation = delegation.clone();
+                delegation.declaring_uri = Some(instance.uri.clone());
+                delegation.declaring_substitution = Some(instance.substitution.clone());
+                surface.delegations.push(delegation);
             }
             if let Some(superclass) = resolution.superclass {
                 self.collect_class_surface_with_budget(
@@ -1859,12 +2173,23 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<AncestryStatus, String> {
+        #[cfg(test)]
+        test_record_contract_interface_visit(cancel);
         let identity = (
             interface.uri.clone(),
             interface.key.clone(),
             interface.substitution.clone(),
         );
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if let Some(status) = ancestry.interface_requirements.get(&identity) {
+            return Ok(*status);
+        }
         if !ancestry.active_interfaces.insert(identity.clone()) {
+            return Ok(AncestryStatus::Unknown);
+        }
+        if ancestry.active_interfaces.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
+            ancestry.active_interfaces.remove(&identity);
             return Ok(AncestryStatus::Unknown);
         }
         let result = (|| {
@@ -1895,7 +2220,7 @@ impl NavigationIndex {
                 .get(&interface.key)
                 .cloned()
                 .unwrap_or_default();
-            budget.require_work(indices.len(), cancel)?;
+            budget.require_work(indices.len().max(1), cancel)?;
             for index in indices {
                 check_navigation_cancel(cancel)?;
                 let Some(symbol) = document.symbols.get(index) else {
@@ -1919,6 +2244,18 @@ impl NavigationIndex {
                 {
                     return Ok(AncestryStatus::Unknown);
                 }
+                if self.contract_routine_signature_status(
+                    &Candidate {
+                        uri: interface.uri.clone(),
+                        index,
+                    },
+                    &interface.substitution,
+                    cancel,
+                    budget,
+                )? == ContractMatch::Unknown
+                {
+                    return Ok(AncestryStatus::Unknown);
+                }
                 let candidate = Candidate {
                     uri: interface.uri.clone(),
                     index,
@@ -1934,6 +2271,9 @@ impl NavigationIndex {
             Ok(AncestryStatus::Complete)
         })();
         ancestry.active_interfaces.remove(&identity);
+        if let Ok(status) = &result {
+            ancestry.interface_requirements.insert(identity, *status);
+        }
         result
     }
 
@@ -1943,6 +2283,8 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<bool, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         let Some(document) = self.documents.get(&instance.uri) else {
             return Ok(true);
         };
@@ -2006,6 +2348,112 @@ impl NavigationIndex {
         Ok(None)
     }
 
+    fn contract_type_reference_status(
+        &self,
+        uri: &Url,
+        type_ref: &TypeRef,
+        substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let Some(lookup_identifier) = self.contract_lookup_identifier_with_budget(
+            document,
+            type_ref.span,
+            cancel,
+            budget,
+            "contract signature",
+        )?
+        else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let mut state = ResolutionState::new();
+        let receivers = self.type_receivers_for_type_ref_with_budget(
+            uri,
+            document,
+            type_ref.span.start,
+            type_ref,
+            lookup_identifier,
+            None,
+            substitution,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if state.receiver_resolution_uncertain() {
+            return Ok(ContractMatch::Unknown);
+        }
+        Ok(if resolved_type_from_receivers(receivers).is_some() {
+            ContractMatch::Yes
+        } else {
+            ContractMatch::Unknown
+        })
+    }
+
+    fn contract_routine_signature_status(
+        &self,
+        candidate: &Candidate,
+        substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        let Some(symbol) = self.symbol(candidate) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        if !symbol.generic_parameters.is_empty()
+            || symbol
+                .generic_parameters
+                .iter()
+                .any(|parameter| parameter.constraint_unsupported)
+            || symbol.routine_directives.calling_convention_unknown
+        {
+            return Ok(ContractMatch::Unknown);
+        }
+        for parameter in &symbol.routine_parameters {
+            if parameter
+                .type_shape
+                .as_ref()
+                .is_some_and(|shape| matches!(shape, TypeShape::Callable | TypeShape::Unknown))
+            {
+                return Ok(ContractMatch::Unknown);
+            }
+            let Some(type_ref) = parameter.type_ref.as_ref() else {
+                return Ok(ContractMatch::Unknown);
+            };
+            if self.contract_type_reference_status(
+                &candidate.uri,
+                type_ref,
+                substitution,
+                cancel,
+                budget,
+            )? != ContractMatch::Yes
+            {
+                return Ok(ContractMatch::Unknown);
+            }
+        }
+        if matches!(
+            symbol.routine_kind,
+            RoutineKind::Function | RoutineKind::Operator
+        ) {
+            let Some(result_type) = symbol.result_type_ref.as_ref() else {
+                return Ok(ContractMatch::Unknown);
+            };
+            if self.contract_type_reference_status(
+                &candidate.uri,
+                result_type,
+                substitution,
+                cancel,
+                budget,
+            )? != ContractMatch::Yes
+            {
+                return Ok(ContractMatch::Unknown);
+            }
+        }
+        Ok(ContractMatch::Yes)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn routines_contract_match(
         &self,
@@ -2019,6 +2467,15 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<ContractMatch, String> {
         if left.routine_kind != right.routine_kind || left.is_static != right.is_static {
+            return Ok(ContractMatch::No);
+        }
+        if left.routine_directives.calling_convention_unknown
+            || right.routine_directives.calling_convention_unknown
+        {
+            return Ok(ContractMatch::Unknown);
+        }
+        if left.routine_directives.calling_convention != right.routine_directives.calling_convention
+        {
             return Ok(ContractMatch::No);
         }
         // Generic method variance and constraint matching is compiler-specific;
@@ -2191,6 +2648,7 @@ impl NavigationIndex {
         };
         let mut unknown = false;
         let mut overloaded = false;
+        let mut abstract_match = false;
         for candidate in candidates {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
@@ -2210,9 +2668,6 @@ impl NavigationIndex {
                 continue;
             }
             overloaded |= symbol.routine_directives.overload;
-            if symbol.routine_directives.abstract_ {
-                continue;
-            }
             match self.routines_contract_match(
                 requirement_symbol,
                 &requirement.candidate.uri,
@@ -2223,12 +2678,15 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )? {
+                ContractMatch::Yes if symbol.routine_directives.abstract_ => {
+                    abstract_match = true;
+                }
                 ContractMatch::Yes => return Ok(ContractMatch::Yes),
                 ContractMatch::No => {}
                 ContractMatch::Unknown => unknown = true,
             }
         }
-        Ok(if unknown || overloaded {
+        Ok(if unknown || overloaded || abstract_match {
             ContractMatch::Unknown
         } else {
             ContractMatch::No
@@ -2264,12 +2722,81 @@ impl NavigationIndex {
         Ok(Some(first))
     }
 
+    fn contract_interface_covers_requirement(
+        &self,
+        target: &TypeInstance,
+        requirement: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        let identity = (
+            contract_interface_identity(target),
+            contract_interface_identity(requirement),
+        );
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if let Some(result) = ancestry.interface_coverage.get(&identity) {
+            return Ok(*result);
+        }
+        if target.kind != TypeKind::Interface || requirement.kind != TypeKind::Interface {
+            return Ok(ContractMatch::Unknown);
+        }
+        if contract_interface_identity(target) == contract_interface_identity(requirement) {
+            ancestry
+                .interface_coverage
+                .insert(identity, ContractMatch::Yes);
+            return Ok(ContractMatch::Yes);
+        }
+        if !ancestry.active_interface_coverage.insert(identity.clone()) {
+            return Ok(ContractMatch::Unknown);
+        }
+        if ancestry.active_interface_coverage.len() > MAX_CONTRACT_ANCESTRY_DEPTH {
+            ancestry.active_interface_coverage.remove(&identity);
+            return Ok(ContractMatch::Unknown);
+        }
+        let result = (|| {
+            let resolution =
+                self.resolve_contract_type_with_budget(target, ancestry, cancel, budget)?;
+            if resolution.status == AncestryStatus::Unknown {
+                return Ok(ContractMatch::Unknown);
+            }
+            let mut unknown = false;
+            for parent in resolution.interfaces {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                match self.contract_interface_covers_requirement(
+                    &parent,
+                    requirement,
+                    ancestry,
+                    cancel,
+                    budget,
+                )? {
+                    ContractMatch::Yes => return Ok(ContractMatch::Yes),
+                    ContractMatch::No => {}
+                    ContractMatch::Unknown => unknown = true,
+                }
+            }
+            Ok(if unknown {
+                ContractMatch::Unknown
+            } else {
+                ContractMatch::No
+            })
+        })();
+        ancestry.active_interface_coverage.remove(&identity);
+        if let Ok(result) = &result {
+            ancestry.interface_coverage.insert(identity, *result);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn contract_delegation_status(
         &self,
         requirement: &ContractRequirement,
         class: &TypeInstance,
         delegations: &[InterfaceDelegation],
+        ancestry: &mut ContractAncestryState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<ContractMatch, String> {
@@ -2277,7 +2804,12 @@ impl NavigationIndex {
         for delegation in delegations {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
-            let Some(document) = self.documents.get(&class.uri) else {
+            let declaring_uri = delegation.declaring_uri.as_ref().unwrap_or(&class.uri);
+            let declaring_substitution = delegation
+                .declaring_substitution
+                .as_ref()
+                .unwrap_or(&class.substitution);
+            let Some(document) = self.documents.get(declaring_uri) else {
                 return Ok(ContractMatch::Unknown);
             };
             let Some(identifier) = self.contract_lookup_identifier_with_budget(
@@ -2293,13 +2825,13 @@ impl NavigationIndex {
             };
             let mut state = ResolutionState::new();
             let receivers = self.type_receivers_for_type_ref_with_budget(
-                &class.uri,
+                declaring_uri,
                 document,
                 delegation.interface.span.start,
                 &delegation.interface,
                 identifier,
                 None,
-                &class.substitution,
+                declaring_substitution,
                 &mut state,
                 cancel,
                 budget,
@@ -2312,8 +2844,16 @@ impl NavigationIndex {
                 unknown = true;
                 continue;
             };
-            if target.uri == requirement.interface.uri && target.key == requirement.interface.key {
-                return Ok(ContractMatch::Yes);
+            match self.contract_interface_covers_requirement(
+                &target,
+                &requirement.interface,
+                ancestry,
+                cancel,
+                budget,
+            )? {
+                ContractMatch::Yes => return Ok(ContractMatch::Yes),
+                ContractMatch::Unknown => unknown = true,
+                ContractMatch::No => {}
             }
         }
         Ok(if unknown {
@@ -10042,6 +10582,17 @@ struct RoutineDirectives {
     reintroduce: bool,
     forward: bool,
     abstract_: bool,
+    calling_convention: Option<CallingConvention>,
+    calling_convention_unknown: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallingConvention {
+    Cdecl,
+    Stdcall,
+    Pascal,
+    Register,
+    Safecall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10125,6 +10676,8 @@ struct MethodResolution {
 struct InterfaceDelegation {
     class_owner: String,
     interface: TypeRef,
+    declaring_uri: Option<Url>,
+    declaring_substitution: Option<GenericSubstitution>,
 }
 
 #[derive(Debug, Clone)]
@@ -10226,6 +10779,24 @@ struct ContractClassSurface {
     delegations: Vec<InterfaceDelegation>,
 }
 
+type ContractInterfaceIdentity = (Url, String, GenericSubstitution);
+type ContractInterfaceCoverageKey = (ContractInterfaceIdentity, ContractInterfaceIdentity);
+
+fn contract_interface_identity(instance: &TypeInstance) -> ContractInterfaceIdentity {
+    (
+        instance.uri.clone(),
+        instance.key.clone(),
+        instance.substitution.clone(),
+    )
+}
+
+fn contract_substitution_is_complete(instance: &TypeInstance) -> bool {
+    instance
+        .parameter_names
+        .iter()
+        .all(|name| instance.substitution.get(name).is_some())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContractMatch {
     Yes,
@@ -10235,6 +10806,8 @@ enum ContractMatch {
 
 #[derive(Debug, Default)]
 struct ContractAncestryState {
+    active_contract_documents: HashSet<Url>,
+    contract_documents: HashMap<Url, bool>,
     active_types: HashSet<TypeInstance>,
     types: HashMap<TypeInstance, ContractTypeResolution>,
     active_superclasses: HashSet<TypeInstance>,
@@ -10242,7 +10815,10 @@ struct ContractAncestryState {
     active_superclass_routines: HashSet<TypeInstance>,
     active_class_interfaces: HashSet<TypeInstance>,
     active_class_surfaces: HashSet<TypeInstance>,
-    active_interfaces: HashSet<(Url, String, GenericSubstitution)>,
+    active_interfaces: HashSet<ContractInterfaceIdentity>,
+    interface_requirements: HashMap<ContractInterfaceIdentity, AncestryStatus>,
+    interface_coverage: HashMap<ContractInterfaceCoverageKey, ContractMatch>,
+    active_interface_coverage: HashSet<ContractInterfaceCoverageKey>,
 }
 
 impl ContractAncestryState {
@@ -12827,6 +13403,8 @@ fn collect_interface_delegations(root: Node<'_>, source: &str) -> Vec<InterfaceD
             delegations.push(InterfaceDelegation {
                 class_owner: class_owner.clone(),
                 interface: type_ref,
+                declaring_uri: None,
+                declaring_substitution: None,
             });
         }
     }
@@ -12884,6 +13462,14 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kReintroduce" => directives.reintroduce = true,
         "kForward" => directives.forward = true,
         "kAbstract" => directives.abstract_ = true,
+        "kCdecl" => directives.calling_convention = Some(CallingConvention::Cdecl),
+        "kStdcall" => directives.calling_convention = Some(CallingConvention::Stdcall),
+        "kPascal" => directives.calling_convention = Some(CallingConvention::Pascal),
+        "kRegister" => directives.calling_convention = Some(CallingConvention::Register),
+        "kSafecall" => directives.calling_convention = Some(CallingConvention::Safecall),
+        "kCppdecl" | "kCvar" | "kMwpascal" | "kMs_abi_default" | "kMs_abi_cdecl"
+        | "kSaveregisters" | "kSysv_abi_default" | "kSysv_abi_cdecl" | "kVectorcall"
+        | "kVarargs" | "kWinapi" => directives.calling_convention_unknown = true,
         _ => {}
     });
     directives
@@ -14719,7 +15305,9 @@ mod tests {
             "unit SemanticDiagnosticsInvalidOverride;\n",
             "interface\n",
             "type\n",
-            "  TBase = class\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  TBase = class(TObject)\n",
             "    procedure Run(Value: Integer); virtual;\n",
             "  end;\n",
             "  TChild = class(TBase)\n",
@@ -14789,13 +15377,323 @@ mod tests {
             diagnostics[0].message,
             "class 'TImplementation' does not implement interface method 'Required'"
         );
-        let method_start = source.find("procedure Required").expect("interface method");
+        let class_start = source
+            .find("TImplementation = class")
+            .expect("implementing class");
         assert_eq!(
             diagnostics[0].span,
             SourceSpan {
-                start: method_start + "procedure ".len(),
-                end: method_start + "procedure Required".len(),
+                start: class_start,
+                end: class_start + "TImplementation".len(),
             }
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_anchor_an_imported_interface_obligation_to_the_consumer_class() {
+        let provider_uri = Url::parse("file:///tmp/semantic-diagnostics-contract-provider.pas")
+            .expect("provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-diagnostics-contract-consumer.pas")
+            .expect("consumer URI");
+        let provider = concat!(
+            "unit ContractProvider;\n",
+            "interface\n",
+            "type\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit ContractConsumer;\n",
+            "interface\n",
+            "uses ContractProvider;\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  TChild = class(TObject, IRequired)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider fixture parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer fixture parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("ContractProvider".to_owned(), provider_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "one imported obligation: {diagnostics:?}"
+        );
+        let class_start = consumer.find("TChild = class").expect("consumer class");
+        assert_eq!(
+            diagnostics[0].span,
+            SourceSpan {
+                start: class_start,
+                end: class_start + "TChild".len(),
+            },
+            "foreign interface declarations must not be mapped as consumer offsets"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_an_implicit_tobject_override_unknown() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-tobject-override.pas")
+            .expect("implicit TObject URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsImplicitTObjectOverride;\n",
+            "interface\n",
+            "type\n",
+            "  TChild = class\n",
+            "    destructor Destroy; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "destructor TChild.Destroy; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("implicit TObject fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+            "an implicit TObject root is not a proven empty ancestor: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_use_a_source_backed_system_tobject_for_implicit_overrides() {
+        let system_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-contract-system.pas").expect("System URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-contract-system-consumer.pas")
+                .expect("consumer URI");
+        let system = concat!(
+            "unit System;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "    destructor Destroy; virtual;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit ContractSystemConsumer;\n",
+            "interface\n",
+            "uses System;\n",
+            "type\n",
+            "  TChild = class\n",
+            "    destructor Destroy; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "destructor TChild.Destroy; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(system_uri.clone(), system.to_owned())
+            .expect("System fixture parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer fixture parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("System".to_owned(), system_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+            "a complete source-backed TObject supplies Destroy: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_contract_claims_from_an_incomplete_provider() {
+        let provider_uri = Url::parse("file:///tmp/semantic-diagnostics-incomplete-provider.pas")
+            .expect("provider URI");
+        let consumer_uri = Url::parse("file:///tmp/semantic-diagnostics-incomplete-consumer.pas")
+            .expect("consumer URI");
+        let provider = concat!(
+            "unit IncompleteProvider;\n",
+            "interface\n",
+            "type\n",
+            "  TBase = class\n",
+            "    procedure ;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit IncompleteConsumer;\n",
+            "interface\n",
+            "uses IncompleteProvider;\n",
+            "type\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Run; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TChild.Run; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("incomplete provider parses with recovery");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer fixture parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("IncompleteProvider".to_owned(), provider_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+            "provider recovery must suppress absence proofs: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_contract_claims_with_missing_import_context() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-missing-contract-import.pas")
+            .expect("missing import URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsMissingContractImport;\n",
+            "interface\n",
+            "uses MissingUnit;\n",
+            "type\n",
+            "  TBase = class\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "    procedure Missing; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TChild.Missing; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("missing import fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+            "an unresolved import prevents a closed-world override proof: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_unknown_interface_obligation_signatures() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-unknown-contract-signature.pas")
+            .expect("unknown signature URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsUnknownContractSignature;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IUnknownType = interface\n",
+            "    procedure Required(Value: UnknownType);\n",
+            "  end;\n",
+            "  IGeneric = interface\n",
+            "    procedure Generic<T>(Value: T);\n",
+            "  end;\n",
+            "  TChild = class(TObject, IUnknownType, IGeneric)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("unknown signature fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "unknown obligation signatures cannot support a missing claim: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_suppress_contract_claims_for_an_uninstantiated_generic_owner() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-generic-contract-owner.pas")
+            .expect("generic owner URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsGenericContractOwner;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TGeneric<T: record> = class(TObject, IRequired)\n",
+            "    procedure Missing; override;\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TGeneric.Missing; begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("generic owner fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::InvalidOverride
+                    && diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "uninstantiated generic owners cannot support contract absence proofs: {diagnostics:?}"
         );
     }
 
@@ -14989,6 +15887,43 @@ mod tests {
     }
 
     #[test]
+    fn semantic_diagnostics_suppress_cyclic_interface_ancestry() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-interface-cycle.pas").expect("cycle URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsInterfaceCycle;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  ILeft = interface(IRight)\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  IRight = interface(ILeft)\n",
+            "  end;\n",
+            "  TChild = class(TObject, ILeft)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("interface cycle fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "cyclic interface ancestry must remain unknown: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn semantic_diagnostics_accept_supported_method_resolution_clauses() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-method-resolution.pas")
             .expect("interface URI");
@@ -15061,6 +15996,267 @@ mod tests {
                 diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
             }),
             "interface delegation should satisfy the obligation: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_accept_delegation_to_a_derived_interface() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-derived-interface-delegation.pas")
+            .expect("derived delegation URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsDerivedInterfaceDelegation;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRoot = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  IChild = interface(IRoot)\n",
+            "  end;\n",
+            "  TChild = class(TObject, IChild)\n",
+            "  private\n",
+            "    F: IChild;\n",
+            "    property Delegate: IChild read F implements IChild;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("derived delegation fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "delegating IChild supplies inherited IRoot methods: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_inherited_cross_unit_delegation_context() {
+        let provider_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-inherited-delegation-provider.pas")
+                .expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-diagnostics-inherited-delegation-consumer.pas")
+                .expect("consumer URI");
+        let provider = concat!(
+            "unit InheritedDelegationProvider;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRoot = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  IChild = interface(IRoot)\n",
+            "  end;\n",
+            "  TBase = class(TObject, IRoot)\n",
+            "  private\n",
+            "    F: IChild;\n",
+            "    property Delegate: IChild read F implements IChild;\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let consumer = concat!(
+            "unit InheritedDelegationConsumer;\n",
+            "interface\n",
+            "uses InheritedDelegationProvider;\n",
+            "type\n",
+            "  TChild = class(TBase, IRoot)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("delegation provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("delegation consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("InheritedDelegationProvider".to_owned(), provider_uri)),
+        );
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "inherited delegation must retain its provider owner context: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_defer_an_inherited_abstract_interface_method() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-inherited-abstract-interface.pas")
+            .expect("abstract inheritance URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsInheritedAbstractInterface;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  TBase = class abstract(TObject, IRequired)\n",
+            "    procedure Required; virtual; abstract;\n",
+            "  end;\n",
+            "  TChild = class(TBase)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("inherited abstract fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "an inherited abstract method defers the interface obligation: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_only_a_genuinely_missing_obligation_after_abstract_inheritance()
+    {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-abstract-inheritance-control.pas")
+            .expect("abstract control URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsAbstractInheritanceControl;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRequired = interface\n",
+            "    procedure Required;\n",
+            "  end;\n",
+            "  IOther = interface\n",
+            "    procedure Other;\n",
+            "  end;\n",
+            "  TBase = class abstract(TObject, IRequired)\n",
+            "    procedure Required; virtual; abstract;\n",
+            "  end;\n",
+            "  TChild = class(TBase, IOther)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("abstract control fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
+                })
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["class 'TChild' does not implement interface method 'Other'"],
+            "only the concrete child's unrelated obligation is missing: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_bound_empty_interface_diamond_traversal() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-empty-interface-diamond.pas")
+            .expect("empty diamond URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsEmptyInterfaceDiamond;\ninterface\ntype\n  TObject = class\n  end;\n",
+        );
+        source.push_str("  I0 = interface\n  end;\n  I1 = interface\n  end;\n");
+        for index in 2..=26 {
+            writeln!(
+                &mut source,
+                "  I{index} = interface(I{}, I{})\n  end;",
+                index - 1,
+                index - 2
+            )
+            .expect("write empty interface diamond");
+        }
+        source.push_str("  TChild = class(TObject, I26)\n  end;\nimplementation\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("empty diamond fixture parses");
+        test_reset_contract_interface_visits();
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+        let visits = test_contract_interface_visits();
+
+        assert!(
+            diagnostics.is_empty() && visits > 0 && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            "empty interface diamonds must be bounded by the semantic budget; visits={visits}, diagnostics={diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_cancel_during_interface_contract_traversal() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-contract-cancel.pas")
+            .expect("contract cancellation URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsContractCancel;\n",
+            "interface\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  IRoot = interface\n",
+            "  end;\n",
+            "  IChild = interface(IRoot)\n",
+            "  end;\n",
+            "  TChild = class(TObject, IChild)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("contract cancellation fixture parses");
+        test_reset_contract_interface_visits();
+        let _cancel_guard = test_cancel_after_contract_interface();
+        let cancel = AtomicBool::new(false);
+
+        let result = index.semantic_diagnostics_with_cancel(&uri, &cancel);
+
+        assert_eq!(
+            result.expect_err("contract traversal cancellation must discard diagnostics"),
+            "request cancelled"
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(
+            test_contract_interface_visits() > 0,
+            "cancellation must occur after a contract traversal visit"
         );
     }
 

@@ -2362,12 +2362,15 @@ fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
         missing_interface["message"],
         "class 'TImplementation' does not implement interface method 'Required'"
     );
-    let required_start = position_of(source, "Required", 1);
+    let required_start = position_of(source, "TImplementation = class", 0);
     assert_eq!(
         missing_interface["range"],
         json!({
             "start": required_start,
-            "end": Position::new(required_start.line, required_start.character + 8),
+            "end": Position::new(
+                required_start.line,
+                required_start.character + "TImplementation".encode_utf16().count() as u32,
+            ),
         })
     );
     assert_eq!(
@@ -2379,6 +2382,157 @@ fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
             })
             .count(),
         2
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_anchor_an_imported_interface_contract_to_the_consumer_physical_uri() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    let mut provider_source = String::from(
+        "unit Provider;\ninterface\ntype\n  IRequired = interface\n    procedure Required;\n  end;\nimplementation\n",
+    );
+    provider_source.push_str("end.\n");
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Provider;\n",
+        "type\n",
+        "  TObject = class\n",
+        "  end;\n",
+        "  TChild = class(TObject, IRequired)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&provider, &provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+
+    let publication = diagnostics_for_uri(&mut server, &uri(&main));
+    let diagnostics = publication["diagnostics"]
+        .as_array()
+        .expect("consumer diagnostics array");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+        .expect("consumer interface diagnostic");
+    let class_start = position_of(main_source, "TChild = class", 0);
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": class_start,
+            "end": Position::new(
+                class_start.line,
+                class_start.character + "TChild".encode_utf16().count() as u32,
+            ),
+        })
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+            .count(),
+        1
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_refresh_an_imported_interface_contract_after_a_provider_overlay_edit() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    let provider_disk = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "type\n",
+        "  IRequired = interface\n",
+        "    procedure Required;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let provider_overlay = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "type\n",
+        "  IRequired = interface\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Provider;\n",
+        "type\n",
+        "  TObject = class\n",
+        "  end;\n",
+        "  TChild = class(TObject, IRequired)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_disk);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let initial = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        initial["diagnostics"]
+            .as_array()
+            .expect("initial diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 2,
+                "text": provider_overlay,
+            }
+        }),
+    );
+    let refreshed = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        refreshed["diagnostics"]
+            .as_array()
+            .expect("refreshed diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-missing-interface-implementation"),
+        "provider overlay should remove the stale interface obligation: {refreshed}"
     );
     server.shutdown();
 }
@@ -2522,7 +2676,9 @@ fn diagnostics_map_invalid_overrides_in_includes_to_physical_crlf_utf16_ranges()
         "unit Main;\r\n",
         "interface\r\n",
         "type\r\n",
-        "  TBase = class\r\n",
+        "  TObject = class\r\n",
+        "  end;\r\n",
+        "  TBase = class(TObject)\r\n",
         "    procedure Run; virtual;\r\n",
         "  end;\r\n",
         "implementation\r\n",
@@ -2578,6 +2734,85 @@ fn diagnostics_map_invalid_overrides_in_includes_to_physical_crlf_utf16_ranges()
         json!({
             "start": start,
             "end": Position::new(start.line, start.character + 3),
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
+fn diagnostics_map_missing_interface_contracts_to_a_physical_include_class() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    let include = root.path().join("Contracts.inc");
+    let provider_source = concat!(
+        "unit Provider;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  IRequired = interface\r\n",
+        "    procedure Required;\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "end.\r\n",
+    );
+    let main_source = concat!(
+        "unit Main;\r\n",
+        "interface\r\n",
+        "uses Provider;\r\n",
+        "type\r\n",
+        "  TObject = class\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "{$I Contracts.inc}\r\n",
+        "end.\r\n",
+    );
+    let include_source = concat!(
+        "type {😀}\r\n",
+        "  TChild = class(TObject, IRequired)\r\n",
+        "  end;\r\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+
+    let root_publication = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        root_publication["diagnostics"]
+            .as_array()
+            .expect("root diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "pascal-missing-interface-implementation")
+    );
+    let include_publication = diagnostics_for_uri(&mut server, &uri(&include));
+    let diagnostic = include_publication["diagnostics"]
+        .as_array()
+        .expect("include diagnostics")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+        .expect("physical include interface diagnostic");
+    let class_start = position_of(include_source, "TChild = class", 0);
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": class_start,
+            "end": Position::new(
+                class_start.line,
+                class_start.character + "TChild".encode_utf16().count() as u32,
+            ),
         })
     );
     server.shutdown();

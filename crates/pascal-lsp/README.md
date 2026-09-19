@@ -57,24 +57,32 @@ Override and interface diagnostics use the same complete source-backed ancestry,
 visibility, conditional-state, generic-substitution, cancellation, and traversal
 budgets as the other semantic diagnostics. An explicit `override` is reported
 only when a complete superclass chain proves that no matching inherited
-`virtual` or `dynamic` routine exists. Class/interface method identity includes
+`virtual` or `dynamic` routine exists. An implicit class root is never treated as
+an empty chain: the pass requires a complete local/source-backed `TObject` fact
+or a unique complete `System.TObject`. Class/interface method identity includes
 routine kind, exact parameter types, `var`/`out`/`const` modes, generic arity,
-and function results. Supported method-resolution clauses, uniquely resolved
-interface `implements` delegations, and inherited implementations are followed;
-interface diamonds are deduplicated and cyclic ancestry is treated as
+calling-convention boundaries, and function results. Supported
+method-resolution clauses, uniquely resolved interface `implements`
+delegations (including inherited and derived-interface targets), and inherited
+implementations are followed; interface diamonds are memoized and charged on
+every visit, while cyclic or depth/budget-exhausted ancestry is treated as
 incomplete.
 
 Missing-interface diagnostics are emitted only for concrete source-declared
-classes with complete source-declared interface ancestry. Abstract classes and
-abstract methods may defer obligations. The diagnostic range is the responsible
-method declaration, and include mappings retain a claim only when the physical
-owner is unambiguous. The pass is bounded by the semantic diagnostic node/work,
-byte, and 256-diagnostic limits described by the existing worker pipeline.
+classes with complete source-declared interface ancestry, recursively complete
+providers/imports, and resolved obligation signatures. Abstract classes and
+inherited abstract methods may defer obligations. The diagnostic range is the
+responsible class declaration in the requesting source, never a foreign
+interface declaration; include mappings retain a claim only when the physical
+owner is unambiguous. The pass is bounded by the semantic diagnostic
+node/work, ancestry-depth, byte, and 256-diagnostic limits described by the
+existing worker pipeline.
 
 Unsupported compiler-only `IInterface` members, unresolved or ambiguous
-providers, unknown conditional branches, parser recovery, inaccessible or
-overloaded candidates when identity is uncertain, unsupported generic
-constraints/variance, property delegation whose target cannot be proven, and
+providers, recursively incomplete imports, unknown conditional branches,
+parser recovery, unresolved obligation signatures, inaccessible or overloaded
+candidates when identity is uncertain, unsupported generic constraints/variance
+or calling conventions, property delegation whose target cannot be proven, and
 exhausted ancestry or signature work remain silent. These checks do not attempt
 to replace Delphi's compiler or to diagnose declarations that are merely
 incomplete.
@@ -110,8 +118,8 @@ named-argument syntax, units, strings, and comments are not treated as value
 uses. Generic-provider symbol scans are charged to the same semantic work and
 byte budgets; exhaustion discards the whole semantic result rather than
 publishing a partial scan. These diagnostics are source-based and do not
-attempt compiler-only type inference, interface/override checking, general
-type checking, or quick fixes.
+attempt compiler-only type inference, general type checking beyond the listed
+contracts, or quick fixes.
 
 Semantic diagnostics mapped from a physical include are retained only when
 the include's root-specific binding context is unambiguous. Equal project or

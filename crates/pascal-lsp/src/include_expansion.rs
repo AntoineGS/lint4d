@@ -52,6 +52,10 @@ impl<'a> MappingBudget<'a> {
         }
         Ok(())
     }
+
+    pub(crate) fn cancellation(&self) -> &AtomicBool {
+        self.cancel
+    }
 }
 
 #[derive(Debug, Clone, Default)]

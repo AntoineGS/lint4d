@@ -95,3 +95,33 @@ The original RED reproductions remain under `/tmp/opencode` (including the
 R1-R9 probe logs named in the independent review); the repository regressions
 above are the corresponding GREEN checks. No merge, push, or Task24
 integration was performed.
+
+## Round-two corrective dispositions (R1, R4, R6, R9)
+
+The four remaining review boundaries were added as tests before the corrective
+implementation and were observed failing against `2a7fe5ad`. The focused GREEN
+set was rerun after the final implementation.
+
+| Finding | Corrective disposition and boundary evidence |
+| --- | --- |
+| R1 physical-owner closure | Include-containing rename targets now use the workspace snapshot, and every mapped physical edit is rejected when the same physical span is repeated across lexical include contexts. This closes cross-root/local repeated-include edits without returning a partial workspace edit. Evidence: `rename_rejects_a_cross_root_repeated_include_with_distinct_local_bindings`, plus the existing compatible-consumer and repeated-local regressions. |
+| R4 granular conditional/include completeness | Unknown activity on an include directive now remains fail-closed even when the conditional and include directives are adjacent; both compact and line-separated forms are covered. Evidence: `workspace_navigation_fails_closed_for_adjacent_unknown_include_activity`, alongside the source-order DEFINE/UNDEF and unknown-diagnostic regressions. |
+| R6 bounded owner discovery | Navigation owner discovery now has a named complete/incomplete outcome, deterministic candidate ordering, an explicit candidate bound, and fail-closed handling for incomplete catalogues/read/context failures. Rename snapshots also reject truncated owner discovery instead of treating the retained prefix as proof. Evidence: `include_navigation_rejects_owner_discovery_at_and_over_its_bound`, `fresh_include_references_recover_a_single_owning_root_context`, and `fresh_include_rename_rejects_bounded_owner_discovery`. |
+| R9 aggregate physical-result cap | Reverse-context resolution now uses one bounded discovery/work budget, applies per-context limits, deduplicates mapped physical locations before the final cap, and rejects over-cap results before partial delivery. Position-index caching keeps bounded mapping practical for large results. Evidence: `source_bearing_reverse_contexts_count_deduplicated_physical_results` (exact 10,000 ordinary and partial cases), `source_bearing_reverse_contexts_share_the_10000_reference_cap` (distributed 10,001 ordinary case), and `references_and_highlights_enforce_exact_10000_entry_boundaries`. |
+
+### Round-two evidence hashes
+
+- RED boundary probes:
+  - R1 `/tmp/opencode/task23-round2-red-r1.out` — SHA-256 `a76008c3334bf827d4dfaeaf361b709574ca7fcea812256709b3ee64a7c1eddc`
+  - R4 `/tmp/opencode/task23-round2-red-r4.out` — SHA-256 `3a0465ea8f173a0b3708733034eeaaaf0b39dd485a3e8891cb62ee1d4bcafb6e`
+  - R6 `/tmp/opencode/task23-round2-red-r6.out` — SHA-256 `72af927f6caad14ed72fdbf49f0519c416b7becb964c88012ad0081b0262312a`
+  - R9 `/tmp/opencode/task23-round2-red-r9.out` — SHA-256 `5bc62679944623517bd4bb53b9eeabcba903fc14b362af8570f160ddb10e1d01`
+- Final focused GREEN set `/tmp/opencode/task23-round2-focused-final.out` — SHA-256 `18909af1dd623b80862b148a01d6761b691cb91f89fb062bc94ae54145cb741f`
+- Final verification logs:
+  - workspace tests `/tmp/opencode/task23-round2-workspace-tests.out` — SHA-256 `7a159352c3ceb93223e1e14adaf67673fca886dbf7d5bee14767d14b45d9cfd2`
+  - all Pascal-LSP targets/features `/tmp/opencode/task23-round2-all-targets-all-features-final.out` — SHA-256 `1d0094b9d1e5071dbd8f75be61ec7047d138930e5bfe54b017319508ef6cec22`
+  - Clippy `/tmp/opencode/task23-round2-clippy-final.out` — SHA-256 `fbc8e54c9cca4bf0e4dc2bc96a7795b452ff322862f1a0730a03fe770deede16`
+  - workspace check `/tmp/opencode/task23-round2-check-final.out` — SHA-256 `41193aa58493f6d525dc819ae48f24da89d9381a8f9188d4d553835c1649ae05`
+  - focused final tests `/tmp/opencode/task23-round2-focused-final.out` — SHA-256 `18909af1dd623b80862b148a01d6761b691cb91f89fb062bc94ae54145cb741f`
+
+No merge, push, Task24 integration, or independent approval was performed.

@@ -2968,6 +2968,77 @@ fn rename_rejects_a_repeated_include_with_distinct_local_bindings() {
 }
 
 #[test]
+fn rename_rejects_a_cross_root_repeated_include_with_distinct_local_bindings() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let a_path = temp.path().join("A.pas");
+    let b_path = temp.path().join("B.pas");
+    let use_path = temp.path().join("Use.inc");
+    let a = "unit A;\ninterface\nimplementation\nprocedure Run;\nvar SharedValue: Integer;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let b = "unit B;\ninterface\nimplementation\nprocedure Run;\nvar SharedValue: Integer;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let use_source = "Log(SharedValue);\n";
+    fs::write(&a_path, a).expect("A source");
+    fs::write(&b_path, b).expect("B source");
+    fs::write(&use_path, use_source).expect("include source");
+    let a_uri = Url::from_file_path(&a_path).expect("A URI");
+    let mut workspace =
+        Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(a_uri.clone(), a.to_owned(), 1)
+        .expect("open A");
+
+    assert!(
+        workspace
+            .rename_edits(
+                &a_uri,
+                position_of(a, "SharedValue: Integer", 0),
+                "ChangedValue",
+                false,
+            )
+            .is_err(),
+        "a local include edit must be closed over every authorized root owner"
+    );
+}
+
+#[test]
+fn fresh_include_rename_rejects_bounded_owner_discovery() {
+    for extra_harmless_owners in [254usize, 255] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let include_path = temp.path().join("Use.inc");
+        let owner_source = |unit: &str| {
+            format!(
+                "unit {unit};\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{{$I Use.inc}}\nend;\nend.\n"
+            )
+        };
+        fs::write(temp.path().join("A.pas"), owner_source("A")).expect("A source");
+        fs::write(temp.path().join("Z.pas"), owner_source("Z")).expect("Z source");
+        let include_source = "Log(RootValue);\n";
+        fs::write(&include_path, include_source).expect("include source");
+        for index in 0..extra_harmless_owners {
+            fs::write(
+                temp.path().join(format!("M{index:03}.pas")),
+                format!("unit M{index:03};\ninterface\nimplementation\nend.\n"),
+            )
+            .expect("harmless owner source");
+        }
+
+        let include_uri = Url::from_file_path(&include_path).expect("include URI");
+        let mut workspace =
+            Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        assert!(
+            workspace
+                .rename_edits(
+                    &include_uri,
+                    position_of(include_source, "RootValue", 0),
+                    "ChangedValue",
+                    false,
+                )
+                .is_err(),
+            "rename must fail closed when owner discovery reaches its bound ({extra_harmless_owners})"
+        );
+    }
+}
+
+#[test]
 fn mixed_boolean_and_comparison_precedence_keeps_the_active_include_audited() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("MixedOperators.pas");

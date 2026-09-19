@@ -47,6 +47,12 @@ const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
 const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncludeOwnerDiscoveryOutcome {
+    Complete,
+    Incomplete,
+}
 const MAX_DIRECTORY_CATALOGUES: usize = 1024;
 const MAX_FILENAME_CATALOGUE_ENTRIES: usize = 10_000;
 const MAX_FILENAME_CATALOGUES: usize = 256;
@@ -1367,7 +1373,14 @@ impl Workspace {
             .ok()
             .is_some_and(|path| extension_is(&path, "inc"))
         {
-            self.discover_include_owners_with_cancel(uri, cancel)?;
+            if matches!(
+                self.discover_include_owners_with_cancel(uri, cancel)?,
+                IncludeOwnerDiscoveryOutcome::Incomplete
+            ) {
+                return Err(format!(
+                    "include owner discovery was incomplete for {uri}; refusing contextual navigation"
+                ));
+            }
             if self
                 .include_parents
                 .get(uri)
@@ -1411,77 +1424,93 @@ impl Workspace {
         &mut self,
         include_uri: &Url,
         cancel: &AtomicBool,
-    ) -> Result<(), String> {
+    ) -> Result<IncludeOwnerDiscoveryOutcome, String> {
         if self
             .include_parents
             .get(include_uri)
             .is_some_and(|parents| parents.len() > 1)
         {
-            return Ok(());
+            return Ok(IncludeOwnerDiscoveryOutcome::Complete);
         }
         let include_path = include_uri
             .to_file_path()
             .map(absolute_path)
             .map_err(|_| format!("include URI is not a file URI: {include_uri}"))?;
         let mut candidates = HashSet::new();
-        for (uri, document) in &self.open_documents {
-            if document.text.is_some()
-                && uri != include_uri
-                && uri
-                    .to_file_path()
-                    .ok()
-                    .is_some_and(|path| is_analyzable_source_path(&path))
-            {
-                candidates.insert(canonical_file_uri(uri));
+        let mut open_documents = self
+            .open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                (document.text.is_some()
+                    && uri != include_uri
+                    && uri
+                        .to_file_path()
+                        .ok()
+                        .is_some_and(|path| is_analyzable_source_path(&path)))
+                .then_some(canonical_file_uri(uri))
+            })
+            .collect::<Vec<_>>();
+        open_documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for uri in open_documents {
+            if candidates.insert(uri) && candidates.len() > MAX_INCLUDE_OWNER_DISCOVERY {
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
             }
         }
-        let root_paths = self
+        let mut root_paths = self
             .roots
             .iter()
             .map(|root| root.path.clone())
             .collect::<Vec<_>>();
+        root_paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
         for root_path in root_paths {
             check_workspace_cancel(Some(cancel))?;
             let catalogue = self.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
-            for paths in catalogue.entries.values() {
-                for path in paths {
-                    let path = absolute_path(path.clone());
-                    if path != include_path {
-                        if let Ok(uri) = Url::from_file_path(path) {
-                            candidates.insert(canonical_file_uri(&uri));
-                        }
+            if !catalogue.complete {
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
+            }
+            let mut paths = catalogue
+                .entries
+                .values()
+                .flatten()
+                .map(|path| absolute_path(path.clone()))
+                .collect::<Vec<_>>();
+            paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+            paths.dedup_by(|left, right| paths_equal_ci(left, right));
+            for path in paths {
+                if paths_equal_ci(&path, &include_path) {
+                    continue;
+                }
+                if let Ok(uri) = Url::from_file_path(path) {
+                    if candidates.insert(canonical_file_uri(&uri))
+                        && candidates.len() > MAX_INCLUDE_OWNER_DISCOVERY
+                    {
+                        return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
                     }
                 }
-            }
-            if candidates.len() >= MAX_INCLUDE_OWNER_DISCOVERY {
-                break;
             }
         }
         let mut candidates = candidates.into_iter().collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for (inspected, owner_uri) in candidates.into_iter().enumerate() {
+        for owner_uri in candidates {
             check_workspace_cancel(Some(cancel))?;
-            if inspected >= MAX_INCLUDE_OWNER_DISCOVERY {
-                self.warn(format!(
-                    "include owner discovery limit ({MAX_INCLUDE_OWNER_DISCOVERY}) reached for {include_uri}"
-                ));
-                break;
-            }
             let owner_context = match self.context_for_uri_with_cancel(&owner_uri, Some(cancel)) {
                 Ok(context) => context,
-                Err(_) => continue,
+                Err(_) => return Ok(IncludeOwnerDiscoveryOutcome::Incomplete),
             };
             if !self.ensure_supported_with_context(&owner_uri, &owner_context) {
-                continue;
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
             }
             let pins = HashSet::from([include_uri.clone(), owner_uri.clone()]);
-            let _loaded =
+            let loaded =
                 self.load_source_with_cancel(&owner_uri, &owner_context, &pins, Some(cancel))?;
+            if !loaded {
+                return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
+            }
         }
         // The requested source is still loaded as an ordinary document below
-        // when no owner was found.  That preserves direct-document behavior;
-        // contextual lookup only uses owners proved by an expansion.
-        Ok(())
+        // when no owner was found. Contextual lookup only uses owners proved by
+        // a complete, authorized search.
+        Ok(IncludeOwnerDiscoveryOutcome::Complete)
     }
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {

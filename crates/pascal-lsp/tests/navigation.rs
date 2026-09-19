@@ -218,6 +218,83 @@ fn workspace_navigation_expands_same_file_conditionals_after_define_and_undef() 
 }
 
 #[test]
+fn workspace_navigation_fails_closed_for_adjacent_unknown_include_activity() {
+    for (name, conditional) in [
+        (
+            "AdjacentUnknown",
+            "{$IFDEF UNKNOWN}{$I Missing.inc}{$ENDIF}\n",
+        ),
+        (
+            "SeparatedUnknown",
+            "{$IFDEF UNKNOWN}\n{$I Missing.inc}\n{$ENDIF}\n",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("Main.pas");
+        let source = format!(
+            "unit {name};\ninterface\nconst RootValue = 1;\n{conditional}implementation\nprocedure Run;\nbegin\n  Log(RootValue);\nend;\nend.\n"
+        );
+        fs::write(&root, &source).expect("root source");
+        let root_uri = Url::from_file_path(&root).expect("root URI");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(root_uri.clone(), source.clone(), 1)
+            .expect("open root");
+
+        assert!(
+            workspace
+                .navigate(
+                    &root_uri,
+                    position_of(&source, "RootValue);", 0),
+                    NavigationTarget::Declaration,
+                )
+                .is_empty(),
+            "unknown include activity must remain incomplete for {name}"
+        );
+    }
+}
+
+#[test]
+fn include_navigation_rejects_owner_discovery_at_and_over_its_bound() {
+    for extra_harmless_owners in [254usize, 255] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let include = root.join("Use.inc");
+        let owner_a = root.join("A.pas");
+        let owner_z = root.join("Z.pas");
+        let owner_source = |unit: &str| {
+            format!(
+                "unit {unit};\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{{$I Use.inc}}\nend;\nend.\n"
+            )
+        };
+        fs::write(&owner_a, owner_source("A")).expect("A source");
+        fs::write(&owner_z, owner_source("Z")).expect("Z source");
+        fs::write(&include, "Log(RootValue);\n").expect("include source");
+        for index in 0..extra_harmless_owners {
+            let path = root.join(format!("M{index:03}.pas"));
+            fs::write(
+                path,
+                format!("unit M{index:03};\ninterface\nimplementation\nend.\n"),
+            )
+            .expect("harmless owner source");
+        }
+
+        let include_uri = Url::from_file_path(&include).expect("include URI");
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let locations = workspace.navigate(
+            &include_uri,
+            position_of("Log(RootValue);\n", "RootValue", 0),
+            NavigationTarget::Declaration,
+        );
+        assert!(
+            locations.is_empty(),
+            "owner discovery must not treat a bounded subset as unique ({extra_harmless_owners} harmless owners)"
+        );
+    }
+}
+
+#[test]
 fn include_navigation_recovers_its_single_owning_root_context() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("Main.pas");

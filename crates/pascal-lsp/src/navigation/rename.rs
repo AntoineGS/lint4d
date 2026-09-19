@@ -15,6 +15,43 @@ use tree_sitter::Node;
 const MAX_BINDING_LOCATIONS: usize = 10_000;
 const CANCELLATION_MESSAGE: &str = "request cancelled";
 
+/// Shared work accounting for snapshot queries that combine several virtual
+/// include contexts.  This budget bounds scanning/resolution work; callers
+/// enforce the response-size limit separately after physical mapping and
+/// deduplication.
+#[derive(Debug)]
+pub(crate) struct BindingWorkBudget {
+    work: usize,
+    max_work: usize,
+}
+
+impl BindingWorkBudget {
+    pub(crate) fn new(max_work: usize) -> Self {
+        Self { work: 0, max_work }
+    }
+
+    pub(crate) fn charge(&mut self) -> Result<(), String> {
+        self.work = self
+            .work
+            .checked_add(1)
+            .ok_or_else(|| "binding resolution work accounting overflowed".to_string())?;
+        if self.work > self.max_work {
+            return Err(format!(
+                "binding resolution work limit ({}) reached",
+                self.max_work
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn charge_binding_work(work_budget: &mut Option<&mut BindingWorkBudget>) -> Result<(), String> {
+    if let Some(work_budget) = work_budget.as_deref_mut() {
+        work_budget.charge()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_CANCEL_AFTER_CHECKS: Cell<Option<usize>> = const { Cell::new(None) };
@@ -183,12 +220,21 @@ enum BindingGroup {
     Parameter(ParameterBindingKey),
 }
 
-#[derive(Clone, Copy)]
 struct BindingLocationOptions<'a> {
     document_uri: Option<&'a Url>,
     strict_resolution: bool,
     cancel: Option<&'a AtomicBool>,
     result_limit: Option<usize>,
+    work_budget: Option<&'a mut BindingWorkBudget>,
+}
+
+struct OccurrenceCollectionOptions<'a> {
+    document_uri: Option<&'a Url>,
+    include_declaration: bool,
+    strict_resolution: bool,
+    result_limit: Option<usize>,
+    cancel: Option<&'a AtomicBool>,
+    work_budget: Option<&'a mut BindingWorkBudget>,
 }
 
 impl NavigationIndex {
@@ -209,17 +255,19 @@ impl NavigationIndex {
                 strict_resolution: true,
                 cancel: None,
                 result_limit: Some(MAX_BINDING_LOCATIONS),
+                work_budget: None,
             },
         )
     }
 
-    pub(crate) fn binding_locations_with_cancel_and_limit(
+    pub(crate) fn binding_locations_with_cancel_and_limit_and_budget(
         &self,
         uri: &Url,
         position: lsp_types::Position,
         include_declaration: bool,
         cancel: &AtomicBool,
         result_limit: usize,
+        work_budget: &mut BindingWorkBudget,
     ) -> Result<Vec<lsp_types::Location>, String> {
         self.binding_locations_impl(
             uri,
@@ -230,15 +278,18 @@ impl NavigationIndex {
                 strict_resolution: true,
                 cancel: Some(cancel),
                 result_limit: Some(result_limit),
+                work_budget: Some(work_budget),
             },
         )
     }
 
-    pub(crate) fn binding_locations_in_document_with_cancel(
+    pub(crate) fn binding_locations_in_document_with_cancel_and_limit_and_budget(
         &self,
         uri: &Url,
         position: lsp_types::Position,
         cancel: &AtomicBool,
+        result_limit: usize,
+        work_budget: &mut BindingWorkBudget,
     ) -> Result<Vec<lsp_types::Location>, String> {
         self.binding_locations_impl(
             uri,
@@ -248,59 +299,10 @@ impl NavigationIndex {
                 document_uri: Some(uri),
                 strict_resolution: false,
                 cancel: Some(cancel),
-                result_limit: Some(MAX_BINDING_LOCATIONS),
+                result_limit: Some(result_limit),
+                work_budget: Some(work_budget),
             },
         )
-    }
-
-    /// Return a conservative syntactic upper bound for the number of
-    /// occurrences that could belong to the identifier selected at a
-    /// position.  Callers use this before binding resolution so several
-    /// expanded include contexts cannot each spend the full per-context
-    /// reference budget before the aggregate cap is enforced.
-    pub(crate) fn identifier_occurrence_upper_bound(
-        &self,
-        uri: &Url,
-        position: lsp_types::Position,
-        include_declaration: bool,
-        document_uri: Option<&Url>,
-    ) -> Result<usize, String> {
-        let document = self
-            .documents
-            .get(uri)
-            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
-        let offset = super::text::position_to_offset(&document.source, position)
-            .ok_or_else(|| "position is outside the source document".to_string())?;
-        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
-            return Ok(0);
-        };
-        if document.conditionals.is_unknown_at(offset) {
-            return Ok(0);
-        }
-        let selected_name = canonical_name(&node_text(identifier, &document.source));
-        let mut count = 0usize;
-        for (candidate_uri, candidate) in &self.documents {
-            if document_uri.is_some_and(|requested| requested != candidate_uri) {
-                continue;
-            }
-            for identifier in identifier_nodes(candidate.tree.root_node()) {
-                if has_ancestor_kind(identifier, "ppDirective") {
-                    continue;
-                }
-                if !include_declaration
-                    && candidate
-                        .symbols
-                        .iter()
-                        .any(|symbol| symbol.span == Span::from_node(identifier))
-                {
-                    continue;
-                }
-                if canonical_name(&node_text(identifier, &candidate.source)) == selected_name {
-                    count = count.saturating_add(1);
-                }
-            }
-        }
-        Ok(count)
     }
 
     fn binding_locations_impl(
@@ -336,15 +338,20 @@ impl NavigationIndex {
         }
 
         let (binding, _) = self.binding_plan(uri, position)?;
-        let occurrences = self.collect_occurrences_bounded(
-            &binding,
-            options.document_uri,
+        let mut occurrence_options = OccurrenceCollectionOptions {
+            document_uri: options.document_uri,
             include_declaration,
-            options.strict_resolution,
-            options.result_limit,
-            options.cancel,
-        )?;
-        self.locations_for_occurrences(&occurrences, options.cancel)
+            strict_resolution: options.strict_resolution,
+            result_limit: options.result_limit,
+            cancel: options.cancel,
+            work_budget: options.work_budget,
+        };
+        let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
+        self.locations_for_occurrences(
+            &occurrences,
+            occurrence_options.cancel,
+            &mut occurrence_options.work_budget,
+        )
     }
 
     fn selected_occurrence_is_supported(
@@ -782,8 +789,15 @@ impl NavigationIndex {
     ) -> Result<RenamePlan, String> {
         check_cancel(cancel)?;
         let (binding, selected_span) = self.binding_plan_with_cancel(uri, position, cancel)?;
-        let occurrences =
-            self.collect_occurrences_bounded(&binding, None, true, true, None, cancel)?;
+        let mut occurrence_options = OccurrenceCollectionOptions {
+            document_uri: None,
+            include_declaration: true,
+            strict_resolution: true,
+            result_limit: None,
+            cancel,
+            work_budget: None,
+        };
+        let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         if occurrences.is_empty() {
             return Err("rename binding has no source occurrences".to_string());
         }
@@ -857,11 +871,7 @@ impl NavigationIndex {
     fn collect_occurrences_bounded(
         &self,
         binding: &Binding,
-        document_uri: Option<&Url>,
-        include_declaration: bool,
-        strict_resolution: bool,
-        result_limit: Option<usize>,
-        cancel: Option<&AtomicBool>,
+        options: &mut OccurrenceCollectionOptions<'_>,
     ) -> Result<Vec<Occurrence>, String> {
         let mut documents: Vec<(&Url, &Document)> = self.documents.iter().collect();
         documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
@@ -872,11 +882,15 @@ impl NavigationIndex {
             HashMap::<UnqualifiedReferenceCacheKey, (Vec<Candidate>, bool)>::new();
         let binding_has_class_owner = self.has_class_owned_member(binding);
         for (uri, document) in documents {
-            check_cancel(cancel)?;
-            if document_uri.is_some_and(|requested| requested != uri) {
+            check_cancel(options.cancel)?;
+            charge_binding_work(&mut options.work_budget)?;
+            if options
+                .document_uri
+                .is_some_and(|requested| requested != uri)
+            {
                 continue;
             }
-            if strict_resolution
+            if options.strict_resolution
                 && document.opaque_ranges.iter().any(|range| {
                     binding
                         .names
@@ -892,7 +906,8 @@ impl NavigationIndex {
 
             let root = document.tree.root_node();
             for identifier in identifier_nodes(root) {
-                check_occurrence_cancel(cancel)?;
+                check_occurrence_cancel(options.cancel)?;
+                charge_binding_work(&mut options.work_budget)?;
                 let span = Span::from_node(identifier);
                 let name = canonical_name(&node_text(identifier, &document.source));
                 let is_binding_member = binding.contains_span(uri, span);
@@ -905,7 +920,7 @@ impl NavigationIndex {
                 if !document.parser_recovery_spans.is_empty()
                     && document.has_parser_recovery_near(span)
                 {
-                    if !strict_resolution && !is_binding_member {
+                    if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
                     return Err(format!(
@@ -917,7 +932,7 @@ impl NavigationIndex {
                 if has_ancestor_kind(identifier, "with")
                     || has_ancestor_kind(identifier, "inherited")
                 {
-                    if !strict_resolution && !is_binding_member {
+                    if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
                     if has_ancestor_kind(identifier, "inherited") || binding_has_class_owner {
@@ -927,7 +942,7 @@ impl NavigationIndex {
                         ));
                     }
                 }
-                if !include_declaration && is_binding_member {
+                if !options.include_declaration && is_binding_member {
                     continue;
                 }
                 let is_direct_declaration =
@@ -942,7 +957,7 @@ impl NavigationIndex {
                         || binding.kind == SymbolKind::Routine)
                     && self.has_foreign_class_owner(binding, uri, document, span.start)
                 {
-                    if !strict_resolution && !is_binding_member {
+                    if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
                     return Err(format!(
@@ -1003,7 +1018,7 @@ impl NavigationIndex {
                             && self.candidate_is_conditionally_unknown(candidate)
                     })
                 {
-                    if !strict_resolution && !is_binding_member {
+                    if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
                     return Err(format!(
@@ -1012,7 +1027,7 @@ impl NavigationIndex {
                     ));
                 }
                 if unknown_global_fallback {
-                    if !strict_resolution && !is_binding_member {
+                    if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
                     return Err(format!(
@@ -1029,7 +1044,7 @@ impl NavigationIndex {
                     && !is_binding_member
                 {
                     if candidates.is_empty() {
-                        if !strict_resolution {
+                        if !options.strict_resolution {
                             continue;
                         }
                         return Err(format!(
@@ -1041,7 +1056,7 @@ impl NavigationIndex {
                         continue;
                     }
                     if matching != candidates.len() {
-                        if !strict_resolution {
+                        if !options.strict_resolution {
                             continue;
                         }
                         return Err(format!(
@@ -1049,7 +1064,7 @@ impl NavigationIndex {
                             uri, span.start
                         ));
                     }
-                    if !strict_resolution {
+                    if !options.strict_resolution {
                         continue;
                     }
                 }
@@ -1058,7 +1073,7 @@ impl NavigationIndex {
                         if self.member_reference_uses_inherited_class_owner(
                             binding, uri, document, span.start, dot,
                         ) {
-                            if !strict_resolution && !is_binding_member {
+                            if !options.strict_resolution && !is_binding_member {
                                 continue;
                             }
                             return Err(format!(
@@ -1070,7 +1085,7 @@ impl NavigationIndex {
                 }
                 if matching > 0 {
                     if matching != candidates.len() {
-                        if !strict_resolution && !is_binding_member {
+                        if !options.strict_resolution && !is_binding_member {
                             continue;
                         }
                         return Err(format!(
@@ -1083,14 +1098,17 @@ impl NavigationIndex {
                         span,
                     };
                     if seen.insert((occurrence.uri.clone(), occurrence.span)) {
-                        if result_limit.is_some_and(|limit| occurrences.len() >= limit) {
+                        if options
+                            .result_limit
+                            .is_some_and(|limit| occurrences.len() >= limit)
+                        {
                             return Err(format!(
                                 "binding reference result exceeds the {MAX_BINDING_LOCATIONS}-entry limit"
                             ));
                         }
                         occurrences.push(occurrence);
                     }
-                } else if strict_resolution
+                } else if options.strict_resolution
                     && candidates.is_empty()
                     && (!has_ancestor_kind(identifier, "moduleName")
                         || binding.kind == SymbolKind::Unit)
@@ -1109,6 +1127,7 @@ impl NavigationIndex {
         &self,
         occurrences: &[Occurrence],
         cancel: Option<&AtomicBool>,
+        work_budget: &mut Option<&mut BindingWorkBudget>,
     ) -> Result<Vec<lsp_types::Location>, String> {
         let mut seen = HashSet::new();
         let mut locations = Vec::with_capacity(occurrences.len());
@@ -1135,6 +1154,7 @@ impl NavigationIndex {
                 };
                 for occurrence in &occurrences[group_start..group_end] {
                     check_location_cancel(cancel)?;
+                    charge_binding_work(work_budget)?;
                     if !seen.insert((occurrence.uri.clone(), occurrence.span)) {
                         continue;
                     }

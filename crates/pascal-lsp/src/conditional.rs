@@ -182,13 +182,13 @@ impl ConditionalAnalysis {
     /// directive blocks do not affect the parsed binding graph and may be
     /// carried through safely.
     pub(crate) fn unknown_activity_requires_fail_closed(&self) -> bool {
-        if self.unknown_spans.is_empty() {
-            return false;
-        }
         if self.directives.iter().any(|directive| {
             directive.activity == Truth::Unknown && directive.kind == DirectiveKind::Include
         }) {
             return true;
+        }
+        if self.unknown_spans.is_empty() {
+            return false;
         }
         self.unknown_spans.iter().any(|span| {
             self.projected_source

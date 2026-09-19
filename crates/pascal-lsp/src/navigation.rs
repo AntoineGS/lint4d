@@ -18,6 +18,7 @@ mod documentation;
 mod folding;
 mod overload;
 mod rename;
+pub(crate) use rename::BindingWorkBudget;
 mod selection;
 mod semantic_tokens;
 mod symbols;

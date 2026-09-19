@@ -849,6 +849,27 @@ impl TestServer {
         }
     }
 
+    fn take_partial_items(&mut self, token: &str) -> Vec<Value> {
+        let mut items = Vec::new();
+        let mut retained = VecDeque::new();
+        while let Some(message) = self.pending.pop_front() {
+            match message {
+                Message::Notification(notification)
+                    if notification.method == "$/progress"
+                        && notification.params.get("token").and_then(Value::as_str)
+                            == Some(token) =>
+                {
+                    if let Some(chunk) = notification.params["value"].as_array() {
+                        items.extend(chunk.iter().cloned());
+                    }
+                }
+                other => retained.push_back(other),
+            }
+        }
+        self.pending = retained;
+        items
+    }
+
     #[cfg(feature = "test-support")]
     fn diagnostic_with_timeout(&mut self, expected: &Url, timeout: Duration) -> Option<Value> {
         let expected = expected.to_string();
@@ -12151,6 +12172,45 @@ fn references_and_highlights_map_source_bearing_include_occurrences() {
 }
 
 #[test]
+fn fresh_include_references_recover_a_single_owning_root_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Use.inc");
+    let main_source = "unit Main;\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let include_source = "Log(RootValue);\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("fresh-include-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&include)},
+            "position": position_of(include_source, "RootValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_exact_location_signatures(
+        response
+            .result
+            .as_ref()
+            .expect("reference result")
+            .as_array()
+            .expect("reference array"),
+        vec![
+            expected_location_signature(&include, include_source, "RootValue", 0),
+            expected_location_signature(&main, main_source, "RootValue", 0),
+        ],
+    );
+    server.shutdown();
+}
+
+#[test]
 fn source_bearing_include_expansion_prefers_an_open_overlay() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main = temp.path().join("Main.pas");
@@ -12476,6 +12536,99 @@ fn source_bearing_reverse_contexts_share_the_10000_reference_cap() {
     assert!(error.message.contains("10000"), "{error:?}");
     assert!(response.result.is_none());
     server.shutdown();
+}
+
+#[test]
+fn source_bearing_reverse_contexts_count_deduplicated_physical_results() {
+    for (uses_a, uses_b, partial) in [
+        (5_000usize, 4_999usize, false),
+        (5_000usize, 4_999usize, true),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let a = temp.path().join("A.pas");
+        let b = temp.path().join("B.pas");
+        let shared = temp.path().join("Shared.inc");
+        let make_root = |unit: &str, uses: usize| {
+            let mut source = format!(
+                "unit {unit};\ninterface\n{{$I Shared.inc}}\nimplementation\nprocedure Run;\nbegin\n"
+            );
+            for _ in 0..uses {
+                source.push_str("  Log(SharedValue);\n");
+            }
+            source.push_str("end;\nend.\n");
+            source
+        };
+        let a_source = make_root("A", uses_a);
+        let b_source = make_root("B", uses_b);
+        let shared_source = "const SharedValue = 1;\n";
+        write_file(&a, &a_source);
+        write_file(&b, &b_source);
+        write_file(&shared, shared_source);
+        let mut server = TestServer::launch();
+        server.initialize(temp.path(), Value::Null);
+        for (path, source) in [(&a, &a_source), (&b, &b_source)] {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(path),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            );
+        }
+
+        let id = RequestId::from(format!(
+            "physical-reference-count-{uses_a}-{uses_b}-{partial}"
+        ));
+        let mut params = json!({
+            "textDocument": {"uri": uri(&shared)},
+            "position": {"line": 0, "character": 6},
+            "context": {"includeDeclaration": true}
+        });
+        if partial {
+            params["partialResultToken"] =
+                json!(format!("physical-reference-partial-{uses_a}-{uses_b}"));
+        }
+        server.send_request(id.clone(), "textDocument/references", params);
+        let response = server.response(&id);
+        let over_limit = uses_a + uses_b + 1 > 10_000;
+        if over_limit {
+            let error = response
+                .error
+                .expect("over-limit reverse contexts must fail closed");
+            assert!(error.message.contains("10000"), "{error:?}");
+            assert!(response.result.is_none());
+            assert!(
+                server
+                    .take_partial_items(&format!("physical-reference-partial-{uses_a}-{uses_b}"))
+                    .is_empty()
+            );
+        } else if partial {
+            assert!(response.error.is_none(), "{response:?}");
+            let token = format!("physical-reference-partial-{uses_a}-{uses_b}");
+            let items = server.take_partial_items(&token);
+            assert_eq!(items.len(), uses_a + uses_b + 1);
+            assert_eq!(response.result, Some(json!([])));
+        } else {
+            assert!(
+                response.error.is_none(),
+                "{uses_a}+{uses_b} physical references must fit the response bound: {response:?}"
+            );
+            assert_eq!(
+                response
+                    .result
+                    .expect("ordinary references result")
+                    .as_array()
+                    .expect("ordinary references array")
+                    .len(),
+                uses_a + uses_b + 1
+            );
+        }
+        server.shutdown();
+    }
 }
 
 #[test]

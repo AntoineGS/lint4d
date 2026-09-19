@@ -330,6 +330,20 @@ pub(crate) struct RenameSnapshot {
     pub(crate) mode: SnapshotMode,
 }
 
+fn cached_position_index<'a>(
+    cache: &'a mut HashMap<Url, text::PositionIndex>,
+    uri: &Url,
+    source: &str,
+    budget: &include_expansion::MappingBudget<'_>,
+) -> Result<&'a text::PositionIndex, String> {
+    if !cache.contains_key(uri) {
+        let index = text::PositionIndex::new_with_cancel(source, budget.cancellation())
+            .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
+        cache.insert(uri.clone(), index);
+    }
+    Ok(cache.get(uri).expect("position index was inserted"))
+}
+
 impl RenameSnapshot {
     fn virtual_query_positions_with_budget(
         &self,
@@ -392,6 +406,8 @@ impl RenameSnapshot {
         &self,
         location: Location,
         budget: &mut include_expansion::MappingBudget<'_>,
+        virtual_indexes: &mut HashMap<Url, text::PositionIndex>,
+        physical_indexes: &mut HashMap<Url, text::PositionIndex>,
     ) -> Result<Vec<Location>, String> {
         let Some(expansion) = self.expansions.get(&location.uri) else {
             return Ok(vec![location]);
@@ -399,11 +415,19 @@ impl RenameSnapshot {
         if !expansion.complete {
             return Ok(Vec::new());
         }
-        let Some(start) = text::position_to_offset(expansion.expanded.text(), location.range.start)
+        let virtual_index = cached_position_index(
+            virtual_indexes,
+            &location.uri,
+            expansion.expanded.text(),
+            budget,
+        )?;
+        let Some(start) =
+            virtual_index.position_to_offset(expansion.expanded.text(), location.range.start)
         else {
             return Ok(Vec::new());
         };
-        let Some(end) = text::position_to_offset(expansion.expanded.text(), location.range.end)
+        let Some(end) =
+            virtual_index.position_to_offset(expansion.expanded.text(), location.range.end)
         else {
             return Ok(Vec::new());
         };
@@ -415,28 +439,40 @@ impl RenameSnapshot {
             crate::include_expansion::VirtualMapping::Many(spans) => spans,
             crate::include_expansion::VirtualMapping::Unmapped => return Ok(Vec::new()),
         };
-        Ok(spans
-            .into_iter()
-            .filter_map(|span| {
-                let source = expansion
-                    .source_texts
-                    .get(&span.uri)
-                    .or_else(|| self.sources.get(&span.uri))?;
-                let start = text::offset_to_position(source, span.range.start)?;
-                let end = text::offset_to_position(source, span.range.end)?;
-                Some(Location::new(span.uri, Range::new(start, end)))
-            })
-            .collect())
+        let mut mapped = Vec::new();
+        for span in spans {
+            let Some(source) = expansion
+                .source_texts
+                .get(&span.uri)
+                .or_else(|| self.sources.get(&span.uri))
+            else {
+                continue;
+            };
+            let physical_index =
+                cached_position_index(physical_indexes, &span.uri, source, budget)?;
+            let Some(start) = physical_index.offset_to_position(source, span.range.start) else {
+                continue;
+            };
+            let Some(end) = physical_index.offset_to_position(source, span.range.end) else {
+                continue;
+            };
+            mapped.push(Location::new(span.uri, Range::new(start, end)));
+        }
+        Ok(mapped)
     }
 
     fn map_locations_with_budget(
         &self,
         locations: Vec<Location>,
         budget: &mut include_expansion::MappingBudget<'_>,
+        virtual_indexes: &mut HashMap<Url, text::PositionIndex>,
+        physical_indexes: &mut HashMap<Url, text::PositionIndex>,
     ) -> Result<Vec<Location>, String> {
         let mut mapped = locations
             .into_iter()
-            .map(|location| self.map_location_with_budget(location, budget))
+            .map(|location| {
+                self.map_location_with_budget(location, budget, virtual_indexes, physical_indexes)
+            })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
@@ -488,6 +524,8 @@ impl RenameSnapshot {
         cancel: &AtomicBool,
     ) -> Result<PrepareRenameResponse, String> {
         let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
         let mut ranges = Vec::new();
         for (query_uri, query_position) in
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?
@@ -496,8 +534,12 @@ impl RenameSnapshot {
             let PrepareRenameResponse::Range(range) = response else {
                 return Err("rename target has unsupported placeholder metadata".to_string());
             };
-            let locations =
-                self.map_location_with_budget(Location::new(query_uri, range), &mut budget)?;
+            let locations = self.map_location_with_budget(
+                Location::new(query_uri, range),
+                &mut budget,
+                &mut virtual_indexes,
+                &mut physical_indexes,
+            )?;
             if locations.len() != 1 {
                 return Err("rename target does not map to one physical source range".to_string());
             }
@@ -527,6 +569,8 @@ impl RenameSnapshot {
         cancel: &AtomicBool,
     ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
         let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
         let mut edits = HashMap::new();
         let query_positions =
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
@@ -546,13 +590,19 @@ impl RenameSnapshot {
                     if !expansion.complete {
                         return Err("rename include expansion is incomplete".to_string());
                     }
-                    let Some(start) =
-                        text::position_to_offset(expansion.expanded.text(), edit.range.start)
+                    let virtual_index = cached_position_index(
+                        &mut virtual_indexes,
+                        &edit_uri,
+                        expansion.expanded.text(),
+                        &budget,
+                    )?;
+                    let Some(start) = virtual_index
+                        .position_to_offset(expansion.expanded.text(), edit.range.start)
                     else {
                         return Err("rename edit starts outside the expanded source".to_string());
                     };
                     let Some(end) =
-                        text::position_to_offset(expansion.expanded.text(), edit.range.end)
+                        virtual_index.position_to_offset(expansion.expanded.text(), edit.range.end)
                     else {
                         return Err("rename edit ends outside the expanded source".to_string());
                     };
@@ -583,9 +633,13 @@ impl RenameSnapshot {
                         .get(&span.uri)
                         .or_else(|| self.sources.get(&span.uri))
                         .ok_or_else(|| format!("rename source was not retained: {}", span.uri))?;
-                    let start = text::offset_to_position(source, span.range.start)
+                    let physical_index =
+                        cached_position_index(&mut physical_indexes, &span.uri, source, &budget)?;
+                    let start = physical_index
+                        .offset_to_position(source, span.range.start)
                         .ok_or_else(|| "rename edit has an invalid physical start".to_string())?;
-                    let end = text::offset_to_position(source, span.range.end)
+                    let end = physical_index
+                        .offset_to_position(source, span.range.end)
                         .ok_or_else(|| "rename edit has an invalid physical end".to_string())?;
                     let mapped = TextEdit::new(Range::new(start, end), edit.new_text);
                     let target = edits.entry(span.uri).or_insert_with(Vec::new);
@@ -625,39 +679,31 @@ impl RenameSnapshot {
         let mut locations = Vec::new();
         let mut seen = HashSet::new();
         let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
+        let mut resolution_budget =
+            crate::navigation::BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
         let query_positions =
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
-        let mut upper_bound = 0usize;
-        for (query_uri, query_position) in &query_positions {
-            upper_bound =
-                upper_bound.saturating_add(self.index.identifier_occurrence_upper_bound(
-                    query_uri,
-                    *query_position,
-                    include_declaration,
-                    None,
-                )?);
-            if upper_bound > MAX_SNAPSHOT_BINDING_LOCATIONS {
-                return Err(format!(
-                    "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
-                ));
-            }
-        }
         for (query_uri, query_position) in query_positions {
-            let remaining = MAX_SNAPSHOT_BINDING_LOCATIONS.saturating_sub(locations.len());
-            if remaining == 0 {
-                return Err(format!(
-                    "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
-                ));
-            }
-            let query_locations = self.index.binding_locations_with_cancel_and_limit(
-                &query_uri,
-                query_position,
-                include_declaration,
-                cancel,
-                remaining,
-            )?;
+            resolution_budget.charge()?;
+            let query_locations = self
+                .index
+                .binding_locations_with_cancel_and_limit_and_budget(
+                    &query_uri,
+                    query_position,
+                    include_declaration,
+                    cancel,
+                    MAX_SNAPSHOT_BINDING_LOCATIONS,
+                    &mut resolution_budget,
+                )?;
             for location in query_locations {
-                for mapped in self.map_location_with_budget(location, &mut budget)? {
+                for mapped in self.map_location_with_budget(
+                    location,
+                    &mut budget,
+                    &mut virtual_indexes,
+                    &mut physical_indexes,
+                )? {
                     if is_cancelled(cancel) {
                         return Err(CANCELLATION_MESSAGE.to_string());
                     }
@@ -697,32 +743,37 @@ impl RenameSnapshot {
     ) -> Result<Vec<Location>, String> {
         let mut locations = Vec::new();
         let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut virtual_indexes = HashMap::new();
+        let mut physical_indexes = HashMap::new();
+        let mut resolution_budget =
+            crate::navigation::BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
         let query_positions =
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
-        let mut upper_bound = 0usize;
-        for (query_uri, query_position) in &query_positions {
-            upper_bound =
-                upper_bound.saturating_add(self.index.identifier_occurrence_upper_bound(
-                    query_uri,
-                    *query_position,
-                    true,
-                    Some(query_uri),
-                )?);
-            if upper_bound > MAX_SNAPSHOT_BINDING_LOCATIONS {
-                return Err(format!(
-                    "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
-                ));
-            }
-        }
         for (query_uri, query_position) in query_positions {
-            let query_locations = self.index.binding_locations_in_document_with_cancel(
-                &query_uri,
-                query_position,
-                cancel,
-            )?;
+            resolution_budget.charge()?;
+            let query_locations = self
+                .index
+                .binding_locations_in_document_with_cancel_and_limit_and_budget(
+                    &query_uri,
+                    query_position,
+                    cancel,
+                    MAX_SNAPSHOT_BINDING_LOCATIONS,
+                    &mut resolution_budget,
+                )?;
             locations.extend(query_locations);
         }
-        self.map_locations_with_budget(locations, &mut budget)
+        let locations = self.map_locations_with_budget(
+            locations,
+            &mut budget,
+            &mut virtual_indexes,
+            &mut physical_indexes,
+        )?;
+        if locations.len() > MAX_SNAPSHOT_BINDING_LOCATIONS {
+            return Err(format!(
+                "binding reference result exceeds the {MAX_SNAPSHOT_BINDING_LOCATIONS}-entry limit"
+            ));
+        }
+        Ok(locations)
     }
 }
 
@@ -2485,6 +2536,13 @@ pub(crate) fn may_contain_include_directive(source: &[u8]) -> bool {
         || source.windows(3).any(|window| window == b"(*$")
 }
 
+fn source_requires_include_owner_closure(uri: &Url, source: &str) -> bool {
+    uri.to_file_path().ok().is_some_and(|path| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("inc"))
+    }) || may_contain_include_directive(source.as_bytes())
+}
+
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -2530,6 +2588,7 @@ pub(crate) fn prepare_from_input(
             "rename target source changed while classifying; retry the request".to_string(),
         );
     }
+    let include_context = source_requires_include_owner_closure(&uri, &planning_source);
     let (mode, candidate_names, self_contained) = match binding_info {
         Some((info, self_contained)) => {
             let mut names = info.names;
@@ -2537,7 +2596,7 @@ pub(crate) fn prepare_from_input(
                 names.push(original_name.clone());
             }
             (
-                if info.local {
+                if info.local && !include_context {
                     SnapshotMode::Local
                 } else {
                     SnapshotMode::Workspace
@@ -2676,6 +2735,7 @@ pub(crate) fn rename_from_input(
             "rename target source changed while classifying; retry the request".to_string(),
         );
     }
+    let include_context = source_requires_include_owner_closure(&uri, &planning_source);
     let (mode, candidate_names, self_contained) = match binding_info {
         Some((info, self_contained)) => {
             let mut names = info.names;
@@ -2684,7 +2744,7 @@ pub(crate) fn rename_from_input(
             }
             names.push(new_name.to_string());
             (
-                if info.local {
+                if info.local && !include_context {
                     SnapshotMode::Local
                 } else {
                     SnapshotMode::Workspace
@@ -4836,6 +4896,15 @@ fn enumerate_sources(
                     .collect::<Vec<_>>();
                 owner_paths.sort_by_key(|path| path_key(path));
                 owner_paths.dedup_by(|left, right| paths_equal_ci(left, right));
+                if owner_paths.len() > MAX_RENAME_INCLUDE_OWNER_DISCOVERY {
+                    result.complete = false;
+                    result.reason.get_or_insert_with(|| {
+                        format!(
+                            "include owner discovery limit ({MAX_RENAME_INCLUDE_OWNER_DISCOVERY}) reached under {}",
+                            root_path.display()
+                        )
+                    });
+                }
                 for path in owner_paths
                     .into_iter()
                     .take(MAX_RENAME_INCLUDE_OWNER_DISCOVERY)

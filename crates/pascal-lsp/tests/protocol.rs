@@ -5806,6 +5806,152 @@ fn related_document_refresh_retires_an_already_open_owner_after_a_real_overlay_c
     server.shutdown();
 }
 
+fn assert_related_include_overlay_decoded_identity(label: &str, disk_bytes: Vec<u8>) {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let include_text = "// café\nconst badConst = 1;\n";
+    let changed_include_text = "// café\nconst BADCONST = 1;\n";
+    let with_include =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    write_bytes(&include, &disk_bytes);
+    write_file(&first, &with_include("A"));
+    write_file(&second, &with_include("B"));
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(format!("{label}-{id}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "decoded overlay transition pull failed: {response:?}"
+        );
+        response.result.expect("decoded overlay transition result")
+    };
+    let include_has_warning = |result: &Value| {
+        result["relatedDocuments"]
+            .as_object()
+            .and_then(|reports| reports.get(uri(&include).as_str()))
+            .and_then(|report| report["items"].as_array())
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming"))
+    };
+    let acknowledge_refresh = |server: &mut TestServer| {
+        let refresh = server.request("workspace/diagnostic/refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    };
+
+    let first_result = pull(&mut server, "initial-a", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("decoded overlay first result ID")
+        .to_string();
+    assert!(
+        include_has_warning(&first_result),
+        "initial {label} A-owner warning missing: {first_result}"
+    );
+    let second_result = pull(&mut server, "initial-b", &second, None);
+    assert!(
+        include_has_warning(&second_result),
+        "initial {label} owner warning missing: {second_result}"
+    );
+
+    // A's owner is removed from disk, while the include overlay is admitted
+    // with the same decoded text as the Latin-1 or UTF-8 disk source.
+    write_file(&first, "unit A;\ninterface\nimplementation\nend.\n");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&include),
+                "languageId": "pascal",
+                "version": 1,
+                "text": include_text
+            }
+        }),
+    );
+    acknowledge_refresh(&mut server);
+    let same_text = pull(&mut server, "same-text", &first, Some(first_id));
+    assert!(
+        include_has_warning(&same_text),
+        "same decoded {label} overlay must preserve B's warning: {same_text}"
+    );
+    let restored = pull(&mut server, "restore-b", &second, None);
+    assert!(
+        include_has_warning(&restored),
+        "pulling B after the same decoded {label} overlay must restore its warning: {restored}"
+    );
+
+    // A version-only full-document change is also a no-op for effective
+    // ownership and must not clear the still-current competing contribution.
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&include), "version": 2},
+            "contentChanges": [{"text": include_text}]
+        }),
+    );
+    acknowledge_refresh(&mut server);
+    let version_only = pull(
+        &mut server,
+        "version-only",
+        &first,
+        same_text["resultId"].as_str().map(str::to_owned),
+    );
+    assert!(
+        include_has_warning(&version_only) || version_only["kind"] == "unchanged",
+        "version-only decoded {label} overlay must preserve B's warning: {version_only}"
+    );
+
+    // A genuine decoded-text change must still retire the old contribution;
+    // the comparison must not simply stop validating overlays.
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&include), "version": 3},
+            "contentChanges": [{"text": changed_include_text}]
+        }),
+    );
+    acknowledge_refresh(&mut server);
+    let changed = pull(
+        &mut server,
+        "real-change",
+        &first,
+        version_only["resultId"].as_str().map(str::to_owned),
+    );
+    assert_eq!(
+        changed["relatedDocuments"][uri(&include).as_str()]["items"],
+        json!([]),
+        "real decoded {label} overlay change must clear B's warning: {changed}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn related_document_refresh_preserves_a_same_effective_utf8_include_overlay() {
+    assert_related_include_overlay_decoded_identity(
+        "utf8",
+        b"// caf\xc3\xa9\nconst badConst = 1;\n".to_vec(),
+    );
+}
+
+#[test]
+fn related_document_refresh_preserves_a_same_effective_latin1_include_overlay() {
+    assert_related_include_overlay_decoded_identity(
+        "latin1",
+        latin1("// café\nconst badConst = 1;\n"),
+    );
+}
+
 fn assert_shared_owner_noop_transition_preserves_warning(open_owner: bool) {
     let root = tempfile::tempdir().expect("workspace");
     let include = root.path().join("Shared.inc");

@@ -11,7 +11,7 @@ use super::{
     ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
     WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_analyzable_source_path,
     is_configuration_file, is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci,
-    path_starts_with_native, paths_equal_ci, read_disk_source,
+    path_starts_with_native, paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
 };
 use crate::NavigationIndex;
 use crate::include_expansion::{
@@ -1471,13 +1471,8 @@ fn revalidate_records(
                 !validate_transport_observations
                     && (record.content_hash.is_some() || record.include_payload)
             }) {
-                let text_changed = if record.text.is_empty() {
-                    record.content_hash.is_none_or(|expected| {
-                        super::content_hash_bytes(overlay.text.as_bytes()) != expected
-                    })
-                } else {
-                    overlay.text != record.text
-                } || parsed_source_changed(record, &overlay.text);
+                let text_changed =
+                    effective_overlay_text_changed(options, path, record, overlay, cancel)?;
                 if text_changed {
                     return Err(format!(
                         "source changed while resolving {}; retry the request",
@@ -1672,6 +1667,52 @@ fn revalidate_path_record(
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     Ok(())
+}
+
+fn effective_overlay_text_changed(
+    options: &WorkspaceOptions,
+    path: &Path,
+    record: &SourceRecord,
+    overlay: &OverlayInput,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    if let Some(expected) = record.parsed_text_hash {
+        return Ok(text_content_hash(&overlay.text) != expected);
+    }
+    if !record.text.is_empty() {
+        return Ok(overlay.text != record.text);
+    }
+
+    // `content_hash` is deliberately a raw-byte freshness witness.  A
+    // Latin-1 disk source and an identical UTF-8 overlay have different raw
+    // bytes but the same effective text, so acquire the bounded decoded source
+    // when the compact path record did not retain its parsed-text hash.
+    let (read_policy, path_entry) = record.payload_dependency().map_err(|error| {
+        format!(
+            "source text could not be revalidated for {}: {error}",
+            path.display()
+        )
+    })?;
+    let allow_legacy_payload =
+        matches!(&path_entry.provenance, ProjectPathProvenance::LegacyNative);
+    let current = read_disk_source_with_cancel(
+        path,
+        options.limits.max_file_bytes,
+        read_policy,
+        path_entry,
+        allow_legacy_payload,
+        Some(cancel),
+    )
+    .map_err(|error| {
+        format!(
+            "source text could not be revalidated for {}: {error}",
+            path.display()
+        )
+    })?;
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    Ok(overlay.text != current.text)
 }
 
 fn effective_path_stamp_matches(actual: &Option<PathStamp>, expected: &Option<PathStamp>) -> bool {

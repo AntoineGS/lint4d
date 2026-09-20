@@ -673,7 +673,6 @@ impl TestServer {
         }
     }
 
-    #[cfg(feature = "test-support")]
     fn response_with_timeout(
         &mut self,
         expected_id: &RequestId,
@@ -5371,6 +5370,232 @@ fn related_document_refresh_reconciles_a_changed_shared_owner() {
         .expect("changed shared include report");
     assert_eq!(cleared["kind"], "full");
     assert_eq!(cleared["items"], json!([]));
+    server.shutdown();
+}
+
+fn assert_shared_owner_noop_transition_preserves_warning(open_owner: bool) {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let root_source =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    let shared_text = "const badConst = 1;\n";
+    let second_text = root_source("B");
+    write_file(&include, shared_text);
+    write_file(&first, &root_source("A"));
+    write_file(&second, &second_text);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    if open_owner {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&second),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": second_text
+                }
+            }),
+        );
+        let refresh = server.request("workspace/diagnostic/refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    }
+
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "no-op owner pull failed: {response:?}"
+        );
+        response.result.expect("no-op owner pull result")
+    };
+
+    let first_result = pull(&mut server, "noop-owner-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("first root result ID")
+        .to_string();
+    let second_result = pull(&mut server, "noop-owner-b-first", &second, None);
+    assert!(
+        second_result["relatedDocuments"]
+            .as_object()
+            .expect("initial related reports")
+            .get(uri(&include).as_str())
+            .and_then(|report| report["items"].as_array())
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming")),
+        "initial owner must contribute the shared warning: {second_result}"
+    );
+
+    if open_owner {
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&second), "version": 2},
+                "contentChanges": [{"text": second_text}]
+            }),
+        );
+    } else {
+        write_file(&second, &second_text);
+        server.send_notification(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes": [{"uri": uri(&second), "type": 2}]}),
+        );
+    }
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+    let first_without_include = root_source("A").replace("{$I Shared.inc}", "");
+    write_file(&first, &first_without_include);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&first), "type": 2}]}),
+    );
+    let changed = pull(
+        &mut server,
+        if open_owner {
+            "noop-overlay-owner-a-refresh"
+        } else {
+            "noop-disk-owner-a-refresh"
+        },
+        &first,
+        Some(first_id),
+    );
+    let related = changed["relatedDocuments"]
+        .as_object()
+        .expect("related report after no-op owner transition");
+    let retained = related
+        .get(uri(&include).as_str())
+        .expect("shared report after no-op owner transition");
+    assert!(
+        retained["items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") }),
+        "a transport-only owner change must preserve the current warning: {changed}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn related_document_refresh_preserves_a_current_owner_after_noop_overlay_change() {
+    assert_shared_owner_noop_transition_preserves_warning(true);
+}
+
+#[test]
+fn related_document_refresh_preserves_a_current_owner_after_noop_disk_change() {
+    assert_shared_owner_noop_transition_preserves_warning(false);
+}
+
+#[test]
+fn related_document_refresh_retains_a_clear_after_a_failed_replacement() {
+    let root = tempfile::tempdir().expect("workspace");
+    let small = root.path().join("Small.inc");
+    let large = root.path().join("Large.inc");
+    let source = root.path().join("A.pas");
+    write_file(&small, "const badConst = 1;\n");
+    write_file(
+        &source,
+        "unit A;\ninterface\nimplementation\n{$I Small.inc}\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let first_id = RequestId::from("failed-replacement-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    let first = server.response(&first_id);
+    assert!(
+        first.error.is_none(),
+        "initial related pull failed: {first:?}"
+    );
+    let first_result = first.result.expect("initial related result");
+    assert!(
+        first_result["relatedDocuments"]
+            .as_object()
+            .expect("initial related documents")
+            .get(uri(&small).as_str())
+            .and_then(|report| report["items"].as_array())
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming"))
+    );
+    let first_result_id = first_result["resultId"]
+        .as_str()
+        .expect("initial root result ID")
+        .to_string();
+
+    let mut large_source = String::from("const\n");
+    for index in 0..10_001 {
+        large_source.push_str(&format!("badName{index:05} = {index};\n"));
+    }
+    write_file(&large, &large_source);
+    write_file(
+        &source,
+        "unit A;\ninterface\nimplementation\n{$I Large.inc}\nend.\n",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&source), "type": 2}]}),
+    );
+    let failed_id = RequestId::from("failed-replacement-oversized".to_string());
+    server.send_request(
+        failed_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": first_result_id
+        }),
+    );
+    let failed = server
+        .response_with_timeout(&failed_id, Duration::from_secs(30))
+        .expect("oversized replacement response");
+    let error = failed.error.expect("oversized replacement must fail");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error
+            .message
+            .contains("related diagnostic report item limit")
+    );
+
+    write_file(&source, "unit A;\ninterface\nimplementation\nend.\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&source), "type": 2}]}),
+    );
+    let recovery_id = RequestId::from("failed-replacement-recovery".to_string());
+    server.send_request(
+        recovery_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": first_result_id
+        }),
+    );
+    let recovery = server
+        .response_with_timeout(&recovery_id, Duration::from_secs(30))
+        .expect("recovery response");
+    assert!(
+        recovery.error.is_none(),
+        "recovery pull failed: {recovery:?}"
+    );
+    let recovery_result = recovery.result.expect("recovery result");
+    assert_eq!(
+        recovery_result["relatedDocuments"][uri(&small).as_str()]["items"],
+        json!([]),
+        "a failed replacement must retain the later clear: {recovery_result}"
+    );
     server.shutdown();
 }
 

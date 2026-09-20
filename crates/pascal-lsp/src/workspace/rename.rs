@@ -1336,7 +1336,7 @@ impl Workspace {
                         ));
                     }
                 }
-                revalidate_path_record(path, record, &cancel)?;
+                revalidate_path_record(path, record, &cancel, true)?;
                 continue;
             }
             if record.open {
@@ -1422,7 +1422,23 @@ pub(crate) fn revalidate_input(
     records: &[SourceRecord],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    revalidate_records(&input.options, &input.overlays, records, cancel)
+    revalidate_records(&input.options, &input.overlays, records, cancel, true)
+}
+
+/// Revalidate the effective source/context identity of retained diagnostics.
+///
+/// Protocol versions and filesystem stamps are observations that can change
+/// even when the bytes and effective source remain identical.  The ordinary
+/// validation path intentionally rejects those observations for operations
+/// whose edits depend on the exact captured transport state; related
+/// diagnostic ownership instead needs the effective identity so a no-op
+/// overlay or disk rewrite cannot clear another owner's still-current report.
+pub(crate) fn revalidate_effective_input(
+    input: &WorkspaceInput,
+    records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    revalidate_records(&input.options, &input.overlays, records, cancel, false)
 }
 
 pub(crate) fn revalidate_revalidation_input(
@@ -1430,7 +1446,7 @@ pub(crate) fn revalidate_revalidation_input(
     records: &[SourceRecord],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    revalidate_records(&input.options, &input.overlays, records, cancel)
+    revalidate_records(&input.options, &input.overlays, records, cancel, true)
 }
 
 fn revalidate_records(
@@ -1438,13 +1454,14 @@ fn revalidate_records(
     overlays: &HashMap<Url, OverlayInput>,
     records: &[SourceRecord],
     cancel: &AtomicBool,
+    validate_transport_observations: bool,
 ) -> Result<(), String> {
     for record in records {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         if let Some(path) = &record.path {
-            revalidate_path_record(path, record, cancel)?;
+            revalidate_path_record(path, record, cancel, validate_transport_observations)?;
             continue;
         }
         if record.open {
@@ -1464,7 +1481,10 @@ fn revalidate_records(
                     }
                 },
             ) || parsed_source_changed(record, &overlay.text);
-            if overlay.version != record.version.unwrap_or_default() || text_changed {
+            if (validate_transport_observations
+                && overlay.version != record.version.unwrap_or_default())
+                || text_changed
+            {
                 return Err(format!(
                     "source changed while resolving {}; retry the request",
                     record.uri
@@ -1506,7 +1526,10 @@ fn revalidate_records(
         let overlay_changed = overlays
             .get(&record.uri)
             .is_some_and(|overlay| overlay.text != current.text);
-        if disk_stamp(&path) != record.stamp || content_changed || overlay_changed {
+        if (validate_transport_observations && disk_stamp(&path) != record.stamp)
+            || content_changed
+            || overlay_changed
+        {
             return Err(format!(
                 "closed source changed while resolving {}; retry the request",
                 record.uri
@@ -1520,6 +1543,7 @@ fn revalidate_path_record(
     path: &Path,
     record: &SourceRecord,
     cancel: &AtomicBool,
+    validate_transport_observations: bool,
 ) -> Result<(), String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
@@ -1561,7 +1585,7 @@ fn revalidate_path_record(
         } else {
             path_stamp(path)
         };
-        if actual_path_stamp != record.path_stamp {
+        if validate_transport_observations && actual_path_stamp != record.path_stamp {
             let kind = if is_configuration_file(path) {
                 "configuration"
             } else {
@@ -8144,7 +8168,7 @@ mod tests {
         assert!(record.read_policy.is_some());
         assert!(record.path_entry.is_some());
         let cancel = AtomicBool::new(false);
-        super::revalidate_path_record(&candidate, &record, &cancel)
+        super::revalidate_path_record(&candidate, &record, &cancel, true)
             .expect("unchanged discarded candidate must revalidate");
 
         let original_mtime = fs::metadata(&candidate)
@@ -8159,7 +8183,7 @@ mod tests {
             .set_times(FileTimes::new().set_modified(original_mtime))
             .expect("restore candidate mtime");
 
-        let error = super::revalidate_path_record(&candidate, &record, &cancel)
+        let error = super::revalidate_path_record(&candidate, &record, &cancel, true)
             .expect_err("same-stamp discarded candidate mutation must stale");
         assert!(
             error.contains("changed") || error.contains("metadata"),

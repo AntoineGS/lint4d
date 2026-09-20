@@ -1849,14 +1849,17 @@ fn validate_related_owner_evidence(
                 if let Some(valid) = validated.get(&key) {
                     return *valid;
                 }
-                let valid =
-                    match rename::revalidate_input(input, dependency.records.as_slice(), cancel) {
-                        Ok(()) => true,
-                        Err(error) if error == rename::CANCELLATION_MESSAGE => {
-                            return false;
-                        }
-                        Err(_) => false,
-                    };
+                let valid = match rename::revalidate_effective_input(
+                    input,
+                    dependency.records.as_slice(),
+                    cancel,
+                ) {
+                    Ok(()) => true,
+                    Err(error) if error == rename::CANCELLATION_MESSAGE => {
+                        return false;
+                    }
+                    Err(_) => false,
+                };
                 validated.insert(key, valid);
                 valid
             });
@@ -1914,6 +1917,19 @@ struct RelatedOwnerValidation {
     dependencies: Vec<DiagnosticDependency>,
 }
 
+#[derive(Default)]
+struct RelatedOwnerReconciliation {
+    invalidated_roots: HashSet<Url>,
+    affected: HashSet<Url>,
+}
+
+struct RelatedOwnerTransaction {
+    root_uri: Url,
+    removed_roots: HashSet<Url>,
+    replacement: Option<RelatedDiagnosticOwner>,
+    reports: Vec<RelatedDiagnosticReport>,
+}
+
 struct RelatedDiagnosticReport {
     uri: Url,
     diagnostics: Vec<lsp_types::Diagnostic>,
@@ -1925,8 +1941,8 @@ impl DiagnosticPullStore {
         Self::default()
     }
 
-    fn replace_related_owner(
-        &mut self,
+    fn prepare_related_owner(
+        &self,
         root_uri: &Url,
         publications: impl IntoIterator<
             Item = (
@@ -1935,21 +1951,13 @@ impl DiagnosticPullStore {
                 Option<DiagnosticDependency>,
             ),
         >,
-        extra_affected: impl IntoIterator<Item = Url>,
-    ) -> Result<Vec<RelatedDiagnosticReport>, String> {
-        let was_present = self.related_owners.contains_key(root_uri);
-        let previous = self.related_owners.get(root_uri).cloned();
+        reconciliation: RelatedOwnerReconciliation,
+    ) -> Result<RelatedOwnerTransaction, String> {
         let publications = publications.into_iter().collect::<Vec<_>>();
         if publications.len() > MAX_DIAGNOSTIC_REPORT_ITEMS {
             return Err(
                 "related diagnostic contribution count exceeds the bounded limit".to_string(),
             );
-        }
-        if !was_present
-            && !publications.is_empty()
-            && self.related_owners.len() >= MAX_DIAGNOSTIC_RESULT_ENTRIES
-        {
-            return Err("related diagnostic owner capacity is full; retry the request".to_string());
         }
 
         let mut current = HashMap::with_capacity(publications.len());
@@ -1976,23 +1984,48 @@ impl DiagnosticPullStore {
                 retained_bytes,
             })
         };
-        let previous_bytes = previous.as_ref().map_or(0, |owner| owner.retained_bytes);
         let current_bytes = current_owner
             .as_ref()
             .map_or(0, |owner| owner.retained_bytes);
-        let previous_contributions = previous
-            .as_ref()
-            .map_or(0, |owner| owner.contributions.len());
         let current_contributions = current_owner
             .as_ref()
             .map_or(0, |owner| owner.contributions.len());
+        let mut removed_roots = reconciliation.invalidated_roots;
+        removed_roots.insert(root_uri.clone());
+        let mut removed_bytes = 0usize;
+        let mut removed_contributions = 0usize;
+        let mut removed_owner_count = 0usize;
+        let mut affected = reconciliation.affected;
+        for removed_root in &removed_roots {
+            let Some(owner) = self.related_owners.get(removed_root) else {
+                continue;
+            };
+            removed_owner_count = removed_owner_count.saturating_add(1);
+            removed_bytes = removed_bytes.saturating_add(owner.retained_bytes);
+            removed_contributions = removed_contributions.saturating_add(owner.contributions.len());
+            affected.extend(owner.contributions.keys().cloned());
+        }
+        affected.extend(
+            current_owner
+                .as_ref()
+                .into_iter()
+                .flat_map(|owner| owner.contributions.keys().cloned()),
+        );
+        let candidate_owner_count = self
+            .related_owners
+            .len()
+            .saturating_sub(removed_owner_count)
+            .saturating_add(usize::from(current_owner.is_some()));
+        if candidate_owner_count > MAX_DIAGNOSTIC_RESULT_ENTRIES {
+            return Err("related diagnostic owner capacity is full; retry the request".to_string());
+        }
         let retained_contributions = self
             .related_owners
             .values()
             .map(|owner| owner.contributions.len())
             .sum::<usize>();
         if retained_contributions
-            .saturating_sub(previous_contributions)
+            .saturating_sub(removed_contributions)
             .saturating_add(current_contributions)
             > MAX_DIAGNOSTIC_RELATED_CONTRIBUTIONS
         {
@@ -2002,7 +2035,7 @@ impl DiagnosticPullStore {
         }
         let candidate_total = self
             .retained_bytes
-            .saturating_sub(previous_bytes)
+            .saturating_sub(removed_bytes)
             .saturating_add(current_bytes);
         if candidate_total > MAX_DIAGNOSTIC_RESULT_BYTES {
             return Err(
@@ -2010,47 +2043,32 @@ impl DiagnosticPullStore {
                     .to_string(),
             );
         }
-        let previous_keys = previous
-            .as_ref()
-            .map(|owner| owner.contributions.keys().cloned().collect::<HashSet<_>>())
-            .unwrap_or_default();
-        let current_keys = current_owner
-            .as_ref()
-            .map(|owner| owner.contributions.keys().cloned().collect::<HashSet<_>>())
-            .unwrap_or_default();
-        let mut affected = previous_keys;
-        affected.extend(current_keys);
-        affected.extend(extra_affected);
+        let reports = self.related_reports_for_candidate(
+            affected,
+            root_uri,
+            current_owner.as_ref(),
+            &removed_roots,
+        )?;
+        Ok(RelatedOwnerTransaction {
+            root_uri: root_uri.clone(),
+            removed_roots,
+            replacement: current_owner,
+            reports,
+        })
+    }
 
-        if previous.is_some() {
-            self.retained_bytes = self.retained_bytes.saturating_sub(previous_bytes);
-            self.related_owners.remove(root_uri);
-        }
-        if let Some(owner) = current_owner {
-            self.retained_bytes = self.retained_bytes.saturating_add(owner.retained_bytes);
-            if !was_present {
-                self.related_owner_order.push_back(root_uri.clone());
+    fn commit_related_owner(&mut self, transaction: RelatedOwnerTransaction) {
+        for root_uri in &transaction.removed_roots {
+            if let Some(owner) = self.related_owners.remove(root_uri) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(owner.retained_bytes);
             }
-            self.related_owners.insert(root_uri.clone(), owner);
-        } else {
             self.related_owner_order.retain(|uri| uri != root_uri);
         }
-
-        match self.related_reports_for(affected) {
-            Ok(reports) => Ok(reports),
-            Err(error) => {
-                if let Some(owner) = self.related_owners.remove(root_uri) {
-                    self.retained_bytes = self.retained_bytes.saturating_sub(owner.retained_bytes);
-                }
-                self.related_owner_order.retain(|uri| uri != root_uri);
-                if let Some(previous) = previous {
-                    self.retained_bytes =
-                        self.retained_bytes.saturating_add(previous.retained_bytes);
-                    self.related_owner_order.push_back(root_uri.clone());
-                    self.related_owners.insert(root_uri.clone(), previous);
-                }
-                Err(error)
-            }
+        if let Some(owner) = transaction.replacement {
+            self.retained_bytes = self.retained_bytes.saturating_add(owner.retained_bytes);
+            self.related_owner_order
+                .push_back(transaction.root_uri.clone());
+            self.related_owners.insert(transaction.root_uri, owner);
         }
     }
 
@@ -2100,46 +2118,28 @@ impl DiagnosticPullStore {
     }
 
     fn reconcile_related_owners(
-        &mut self,
-        workspace: &Workspace,
+        &self,
         invalidated: impl IntoIterator<Item = Url>,
-    ) -> HashSet<Url> {
+    ) -> RelatedOwnerReconciliation {
         let invalidated = invalidated.into_iter().collect::<HashSet<_>>();
-        let stale_roots = self
-            .related_owners
-            .iter()
-            .filter_map(|(root_uri, owner)| {
-                let stale = invalidated.contains(root_uri)
-                    || owner.contributions.values().any(|contribution| {
-                        let Some(dependency) = contribution.dependency.as_ref() else {
-                            return true;
-                        };
-                        dependency.records.is_empty()
-                            || workspace
-                                .dependency_scoped_result_is_fresh(
-                                    dependency.source_generation,
-                                    dependency.configuration_generation,
-                                    dependency.records.as_slice(),
-                                )
-                                .is_err()
-                    });
-                stale.then(|| root_uri.clone())
-            })
-            .collect::<Vec<_>>();
         let mut affected = HashSet::new();
-        for root_uri in stale_roots {
-            if let Some(owner) = self.related_owners.remove(&root_uri) {
-                self.retained_bytes = self.retained_bytes.saturating_sub(owner.retained_bytes);
-                affected.extend(owner.contributions.into_keys());
+        for root_uri in &invalidated {
+            if let Some(owner) = self.related_owners.get(root_uri) {
+                affected.extend(owner.contributions.keys().cloned());
             }
-            self.related_owner_order.retain(|uri| uri != &root_uri);
         }
-        affected
+        RelatedOwnerReconciliation {
+            invalidated_roots: invalidated,
+            affected,
+        }
     }
 
-    fn related_reports_for(
+    fn related_reports_for_candidate(
         &self,
         affected: HashSet<Url>,
+        replacement_root: &Url,
+        replacement: Option<&RelatedDiagnosticOwner>,
+        removed_roots: &HashSet<Url>,
     ) -> Result<Vec<RelatedDiagnosticReport>, String> {
         let mut affected = affected.into_iter().collect::<Vec<_>>();
         affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -2153,7 +2153,16 @@ impl DiagnosticPullStore {
                 let mut dependency_records_bytes = 0usize;
                 let mut source_generation: Option<u64> = None;
                 let mut configuration_generation: Option<u64> = None;
-                let mut owners = self.related_owners.iter().collect::<Vec<_>>();
+                let mut owners = self
+                    .related_owners
+                    .iter()
+                    .filter(|(owner_uri, _)| {
+                        *owner_uri != replacement_root && !removed_roots.contains(*owner_uri)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(replacement) = replacement {
+                    owners.push((replacement_root, replacement));
+                }
                 owners.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
                 for (owner_uri, owner) in owners {
                     let Some(contribution) = owner.contributions.get(&uri) else {
@@ -2261,12 +2270,13 @@ impl DiagnosticPullStore {
         }
     }
 
-    fn insert(
-        &mut self,
+    fn preview_insert(
+        &self,
         uri: Url,
         version: Option<i32>,
         diagnostics: Vec<lsp_types::Diagnostic>,
         dependency: Option<&DiagnosticDependency>,
+        next_id: &mut u64,
     ) -> Result<DiagnosticResultCacheEntry, String> {
         let dependency_identity =
             dependency.map_or(&[][..], |dependency| dependency.identity.as_slice());
@@ -2289,8 +2299,8 @@ impl DiagnosticPullStore {
             })
             .map(|previous| previous.result_id.clone())
             .unwrap_or_else(|| {
-                self.next_id = self.next_id.wrapping_add(1);
-                format!("{SERVER_NAME}-diagnostic-{}", self.next_id)
+                *next_id = next_id.wrapping_add(1);
+                format!("{SERVER_NAME}-diagnostic-{next_id}")
             });
         let retained_bytes = size_of::<DiagnosticResultCacheEntry>()
             .saturating_add(uri.as_str().len())
@@ -2305,10 +2315,7 @@ impl DiagnosticPullStore {
             dependency.retained_bytes <= MAX_DIAGNOSTIC_DEPENDENCY_BYTES
                 && retained_bytes <= MAX_DIAGNOSTIC_RESULT_BYTES
         });
-        if let Some(previous) = previous {
-            let _ = self.remove(&previous.result_id);
-        }
-        let entry = DiagnosticResultCacheEntry {
+        Ok(DiagnosticResultCacheEntry {
             result_id: result_id.clone(),
             uri: uri.clone(),
             version,
@@ -2318,18 +2325,41 @@ impl DiagnosticPullStore {
             retained_bytes,
             cacheable,
             dependency: dependency.cloned(),
-        };
-        if !cacheable {
-            // Cache admission is an optimization.  An oversized or
-            // unavailable optional cache set must degrade to an uncached full
-            // report; mandatory validation evidence was retained separately.
-            return Ok(entry);
+        })
+    }
+
+    fn commit_entries(
+        &mut self,
+        entries: impl IntoIterator<Item = DiagnosticResultCacheEntry>,
+        next_id: u64,
+    ) {
+        for entry in entries {
+            if let Some(previous_id) = self.uri_to_result.get(&entry.uri).cloned() {
+                let _ = self.remove(&previous_id);
+            }
+            if !entry.cacheable {
+                continue;
+            }
+            self.retained_bytes = self.retained_bytes.saturating_add(entry.retained_bytes);
+            self.uri_to_result
+                .insert(entry.uri.clone(), entry.result_id.clone());
+            self.order.push_back(entry.result_id.clone());
+            self.entries.insert(entry.result_id.clone(), entry);
         }
-        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
-        self.uri_to_result.insert(uri, result_id.clone());
-        self.order.push_back(result_id.clone());
-        self.entries.insert(result_id, entry.clone());
+        self.next_id = next_id;
         self.evict_if_needed();
+    }
+
+    fn insert(
+        &mut self,
+        uri: Url,
+        version: Option<i32>,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+        dependency: Option<&DiagnosticDependency>,
+    ) -> Result<DiagnosticResultCacheEntry, String> {
+        let mut next_id = self.next_id;
+        let entry = self.preview_insert(uri, version, diagnostics, dependency, &mut next_id)?;
+        self.commit_entries(std::iter::once(entry.clone()), next_id);
         Ok(entry)
     }
 
@@ -7033,27 +7063,35 @@ fn send_document_diagnostics(
     analysis: DocumentDiagnosticsAnalysis,
     client_id: RequestId,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let publication = analysis
-        .publications
+    let DocumentDiagnosticsAnalysis {
+        uri,
+        previous_result_id,
+        related_document_support,
+        publications,
+        dependencies,
+        invalid_related_owners,
+    } = analysis;
+    let publication = publications
         .iter()
-        .find(|publication| publication.uri == analysis.uri)
+        .find(|publication| publication.uri == uri)
         .cloned()
         .unwrap_or_else(|| queries::DiagnosticPublication {
-            uri: analysis.uri.clone(),
+            uri: uri.clone(),
             version: None,
             diagnostics: Vec::new(),
         });
-    let previous = analysis
-        .previous_result_id
+    let previous = previous_result_id
         .as_deref()
         .and_then(|previous| diagnostic_results.get(previous))
         .cloned();
-    let root_dependency = analysis.dependencies.get(&publication.uri);
-    let entry = match diagnostic_results.insert(
+    let root_dependency = dependencies.get(&publication.uri);
+    let mut next_id = diagnostic_results.next_id;
+    let entry = match diagnostic_results.preview_insert(
         publication.uri,
         publication.version,
         publication.diagnostics,
         root_dependency,
+        &mut next_id,
     ) {
         Ok(entry) => entry,
         Err(error) => return send_error(connection, client_id, ErrorCode::RequestFailed, error),
@@ -7072,44 +7110,48 @@ fn send_document_diagnostics(
     let mut value = if unchanged {
         serde_json::json!({
             "kind": "unchanged",
-            "resultId": entry.result_id,
+            "resultId": entry.result_id.clone(),
         })
     } else {
         serde_json::json!({
             "kind": "full",
-            "resultId": entry.result_id,
-            "items": entry.diagnostics,
+            "resultId": entry.result_id.clone(),
+            "items": entry.diagnostics.clone(),
         })
     };
-    let affected =
-        diagnostic_results.reconcile_related_owners(workspace, analysis.invalid_related_owners);
-    if analysis.related_document_support {
-        let related_reports = match diagnostic_results.replace_related_owner(
-            &analysis.uri,
-            analysis
-                .publications
+    let related_publications = related_document_support
+        .then(|| {
+            publications
                 .into_iter()
                 .filter(|publication| publication.uri != entry.uri)
                 .map(|publication| {
-                    let dependency = analysis.dependencies.get(&publication.uri).cloned();
+                    let dependency = dependencies.get(&publication.uri).cloned();
                     (publication.uri, publication.diagnostics, dependency)
-                }),
-            affected,
-        ) {
-            Ok(reports) => reports,
-            Err(error) => {
-                return send_error(connection, client_id, ErrorCode::RequestFailed, error);
-            }
-        };
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let reconciliation = diagnostic_results.reconcile_related_owners(invalid_related_owners);
+    let owner_transaction = match diagnostic_results.prepare_related_owner(
+        &uri,
+        related_publications,
+        reconciliation,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => return send_error(connection, client_id, ErrorCode::RequestFailed, error),
+    };
+    let mut entries = vec![entry.clone()];
+    if related_document_support {
         let mut related = serde_json::Map::new();
-        for report in related_reports {
+        for report in &owner_transaction.reports {
             let dependency = report.dependency.as_ref();
             let report_uri = report.uri.clone();
-            let related_entry = match diagnostic_results.insert(
+            let related_entry = match diagnostic_results.preview_insert(
                 report_uri.clone(),
                 workspace.document_version(&report_uri),
-                report.diagnostics,
+                report.diagnostics.clone(),
                 dependency,
+                &mut next_id,
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -7120,22 +7162,43 @@ fn send_document_diagnostics(
                 related_entry.uri.to_string(),
                 serde_json::json!({
                     "kind": "full",
-                    "resultId": related_entry.result_id,
-                    "items": related_entry.diagnostics,
+                    "resultId": related_entry.result_id.clone(),
+                    "items": related_entry.diagnostics.clone(),
                 }),
             );
+            entries.push(related_entry);
         }
         if !related.is_empty() {
             if let Some(object) = value.as_object_mut() {
                 object.insert("relatedDocuments".to_string(), Value::Object(related));
             }
         }
-    } else if let Err(error) =
-        diagnostic_results.replace_related_owner(&analysis.uri, std::iter::empty(), affected)
-    {
-        return send_error(connection, client_id, ErrorCode::RequestFailed, error);
     }
-    send_ok(connection, client_id, value)
+    let fallback_id = client_id.clone();
+    match connection.send_result(Message::Response(Response::new_ok(client_id, value))) {
+        Ok(()) => {
+            // Both owner state and result-cache entries become visible only
+            // after the complete response has been admitted to bounded output.
+            // A failed replacement therefore retains the old owner/URI set so
+            // a later successful request can still deliver its clear.
+            diagnostic_results.commit_related_owner(owner_transaction);
+            diagnostic_results.commit_entries(entries, next_id);
+            Ok(())
+        }
+        Err(OutputError::MessageTooLarge) => send_error(
+            connection,
+            fallback_id,
+            ErrorCode::RequestFailed,
+            "analysis result exceeds the bounded LSP output size; retry with a narrower request",
+        ),
+        Err(OutputError::ResultBackpressure) => send_error(
+            connection,
+            fallback_id,
+            ErrorCode::RequestFailed,
+            "temporary LSP output capacity is full; retry the request after the client drains",
+        ),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
